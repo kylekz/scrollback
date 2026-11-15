@@ -8,17 +8,17 @@
 {"cmd": "bounds", "target": "shell/sidebar", "expect_result": [{"pointer": "/x", "equals": 0}, {"pointer": "/y", "equals": 40}, {"pointer": "/w", "equals": 248}, {"pointer": "/h", "equals": 860}]}
 {"cmd": "bounds", "target": "shell/main", "expect_result": [{"pointer": "/x", "equals": 248}, {"pointer": "/y", "equals": 40}, {"pointer": "/w", "equals": 1192}, {"pointer": "/h", "equals": 860}]}
 
-// The title bar's pieces: the search field is 460 wide, centred on the window (DESIGN §2).
-{"cmd": "bounds", "target": "titlebar/search", "expect_result": [{"pointer": "/x", "equals": 490}, {"pointer": "/w", "equals": 460}, {"pointer": "/h", "equals": 30}, {"pointer": "/visible", "not_equals": null}]}
+// The title bar's pieces: the search field is 460 wide, centred on the window (DESIGN §2). A fractional display scale (125%, 175%) rounds edges to whole device pixels, which can take a pixel off a size or move an edge by one.
+{"cmd": "bounds", "target": "titlebar/search", "expect_result": [{"pointer": "/x", "equals": 490}, {"pointer": "/w", "equals": 460}, {"pointer": "/h", "gte": 29}, {"pointer": "/h", "lte": 30}, {"pointer": "/visible", "not_equals": null}]}
 {"cmd": "bounds", "target": "titlebar/mark", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "bounds", "target": "titlebar/sync-all", "expect_result": [{"pointer": "/h", "equals": 24}, {"pointer": "/visible", "not_equals": null}]}
 {"cmd": "bounds", "target": "titlebar/settings", "expect_result": [{"pointer": "/w", "equals": 28}, {"pointer": "/h", "equals": 28}, {"pointer": "/visible", "not_equals": null}]}
 // The sidebar's button shows only while the window is too narrow to dock the sidebar.
 {"cmd": "bounds", "target": "titlebar/sidebar", "expect_error": "no target"}
-// Windows' caption buttons: 46 wide, the title bar's height inside its bottom hairline (one device pixel), flush right; macOS draws traffic lights instead.
-{"cmd": "bounds", "target": "titlebar/close", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "equals": 1394}, {"pointer": "/y", "equals": 0}, {"pointer": "/w", "equals": 46}, {"pointer": "/h", "gte": 39}, {"pointer": "/h", "lte": 40}]}
-{"cmd": "bounds", "target": "titlebar/max", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "equals": 1348}, {"pointer": "/w", "equals": 46}]}
-{"cmd": "bounds", "target": "titlebar/min", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "equals": 1302}, {"pointer": "/w", "equals": 46}]}
+// Windows' caption buttons: 46 wide and the title bar's height, flush right; macOS draws traffic lights instead. Each is a 40px box centred in the 39px the bar's bottom hairline leaves, so it reports half a pixel over at each end, which the display scale rounds to 39, 40 or 41 high from 0 or -1; the hairline and the window's edge are drawn over the overflow.
+{"cmd": "bounds", "target": "titlebar/close", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "equals": 1394}, {"pointer": "/y", "gte": -1}, {"pointer": "/y", "lte": 0}, {"pointer": "/w", "equals": 46}, {"pointer": "/h", "gte": 39}, {"pointer": "/h", "lte": 41}]}
+{"cmd": "bounds", "target": "titlebar/max", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "gte": 1348}, {"pointer": "/x", "lte": 1349}, {"pointer": "/w", "gte": 45}, {"pointer": "/w", "lte": 46}]}
+{"cmd": "bounds", "target": "titlebar/min", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "gte": 1302}, {"pointer": "/x", "lte": 1303}, {"pointer": "/w", "equals": 46}]}
 {"cmd": "bounds", "target": "titlebar/close", "platforms": ["macos"], "expect_error": "no target"}
 
 // The sidebar's empty state (DESIGN §4.1, §4.10): four library rows 32 high inside its 8px padding and 1px right border, then the section buttons.
