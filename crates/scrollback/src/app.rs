@@ -51,6 +51,11 @@ const ARCHIVE: &str = "archive";
 #[cfg_attr(not(feature = "automation"), expect(unused_variables))]
 fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
     sb_ui::init(cx)?;
+    // Before anything writes a date.
+    #[cfg(feature = "automation")]
+    if let Some(year) = cli.automation_calendar {
+        sb_ui::format::pin_calendar(year);
+    }
     // Light or dark and the material, before the first frame.
     sb_ui::appearance::init(MaterialSupport::probe(), cli.theme.unwrap_or_default(), cx);
     sb_ui::services::init(

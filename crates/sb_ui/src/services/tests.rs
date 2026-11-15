@@ -4,10 +4,10 @@ use std::rc::Rc;
 use gpui::{Entity, TestAppContext};
 use pretty_assertions::assert_eq;
 use sb_core::archive::Archive;
-use sb_core::catalogue::{Filed, Shelf};
+use sb_core::catalogue::{Filed, SessionId, Shelf};
 use sb_core::location::Location;
 use sb_core::sync::Progress;
-use sb_test_support::{Outline, ProjectsTree};
+use sb_test_support::{Outline, ProjectsTree, break_segment_commits, mend_segment_commits};
 
 use super::library::LibraryEvent;
 use super::sync::{SYNC_INTERVAL, local_name};
@@ -27,6 +27,38 @@ fn locations(sync: &Entity<SyncService>, cx: &mut TestAppContext) -> Vec<Locatio
     sync.read_with(cx, |sync, _| {
         sync.locations().expect("the locations are read").to_vec()
     })
+}
+
+/// The session at `at` of the shown page.
+fn id_at(library: &Entity<LibraryService>, at: usize, cx: &mut TestAppContext) -> SessionId {
+    library.read_with(cx, |library, _| {
+        library.sessions().expect("a page of sessions").sessions[at]
+            .id
+            .clone()
+    })
+}
+
+/// Whether the session `id` is starred: on the page shown, and in the catalogue.
+fn starred(
+    library: &Entity<LibraryService>,
+    id: &SessionId,
+    cx: &mut TestAppContext,
+) -> (bool, bool) {
+    let shown = library.read_with(cx, |library, _| {
+        let page = library.sessions().expect("a page of sessions");
+        page.sessions.iter().any(|it| it.id == *id && it.starred)
+    });
+    let kept = cx.update(|cx| {
+        let archive = cx.services().archive.read(cx).archive().cloned();
+        archive
+            .expect("the archive is open")
+            .catalogue()
+            .sessions(Shelf::Starred)
+            .unwrap()
+            .iter()
+            .any(|it| it.id == *id)
+    });
+    (shown, kept)
 }
 
 fn titles(library: &Entity<LibraryService>, cx: &mut TestAppContext) -> Vec<String> {
@@ -114,6 +146,104 @@ fn adding_this_machine_syncs_it_and_the_library_fills(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn this_machine_is_one_location_however_often_it_is_added(cx: &mut TestAppContext) {
+    init(machine(), cx);
+    let (sync, _) = services(cx);
+    // Twice before the first has landed, and once more after.
+    sync.update(cx, |sync, cx| {
+        sync.add_local(cx);
+        sync.add_local(cx);
+    });
+    cx.run_until_parked();
+    sync.update(cx, |sync, cx| sync.add_local(cx));
+    cx.run_until_parked();
+    assert_eq!(locations(&sync, cx).len(), 1);
+    let archived = cx.update(|cx| {
+        let archive = cx.services().archive.read(cx).archive().cloned().unwrap();
+        archive.catalogue().locations().unwrap().len()
+    });
+    assert_eq!(archived, 1);
+}
+
+#[gpui::test]
+fn a_stopped_first_sync_shows_what_it_copied_and_the_next_carries_on(cx: &mut TestAppContext) {
+    // More sessions than a pass stores in one batch, so that one stops between two.
+    let mut machine = ProjectsTree::new();
+    for at in 0..300 {
+        machine.outlined(&Outline {
+            project: "/home/user/code/app",
+            title: &format!("Session {at}"),
+            prompt: "One of many.",
+            model: "model-a",
+            day: (2026, 11, 1 + at % 28),
+            calls: 1,
+        });
+    }
+    init(machine, cx);
+    let (sync, library) = services(cx);
+    sync.update(cx, |sync, cx| {
+        sync.hold_after(1, Held::Stop);
+        sync.add_local(cx);
+    });
+    cx.run_until_parked();
+    let location = locations(&sync, cx).remove(0);
+    let copied = library.read_with(cx, |library, _| library.counts().all);
+    sync.read_with(cx, |sync, _| {
+        assert!(sync.is_settled());
+        // Stopping is not failing, and the location has not synced whole.
+        assert_eq!(sync.status(&location), LocationStatus::NeverSynced);
+    });
+    // What the pass stored before it stopped was indexed, and shows.
+    assert!(copied > 0 && copied < 300, "{copied} of 300 show");
+
+    sync.update(cx, |sync, cx| sync.sync_all(cx));
+    cx.run_until_parked();
+    let location = locations(&sync, cx).remove(0);
+    sync.read_with(cx, |sync, _| {
+        assert!(matches!(sync.status(&location), LocationStatus::Synced(_)));
+    });
+    library.read_with(cx, |library, _| assert_eq!(library.counts().all, 300));
+}
+
+#[gpui::test]
+fn a_failed_sync_says_why_and_the_next_one_clears_it(cx: &mut TestAppContext) {
+    init(machine(), cx);
+    let (sync, library) = services(cx);
+    break_segment_commits(&archive_dir(cx));
+    sync.update(cx, |sync, cx| sync.add_local(cx));
+    cx.run_until_parked();
+    let location = locations(&sync, cx).remove(0);
+    let why = sync.read_with(cx, |sync, _| {
+        assert!(sync.is_settled());
+        let LocationStatus::Failed(why) = sync.status(&location) else {
+            panic!("the pass could not store anything");
+        };
+        why
+    });
+    assert!(why.contains("the test stops this commit"), "{why}");
+    // The owner reads the agent's name, not its provider's id.
+    cx.update(|cx| {
+        let provider = &cx.services().providers[0];
+        assert!(why.starts_with(&format!("{}: ", provider.id())), "{why}");
+        let named = crate::agents::named(&why, cx);
+        assert!(
+            named.starts_with(&format!("{}: ", provider.display().name)),
+            "{named}"
+        );
+    });
+    library.read_with(cx, |library, _| assert_eq!(library.counts().all, 0));
+
+    mend_segment_commits(&archive_dir(cx));
+    sync.update(cx, |sync, cx| sync.sync(&location.id, cx));
+    cx.run_until_parked();
+    let location = locations(&sync, cx).remove(0);
+    sync.read_with(cx, |sync, _| {
+        assert!(matches!(sync.status(&location), LocationStatus::Synced(_)));
+    });
+    library.read_with(cx, |library, _| assert_eq!(library.counts().all, 3));
+}
+
+#[gpui::test]
 fn a_later_sync_brings_what_the_agent_wrote_since(cx: &mut TestAppContext) {
     init_library(cx);
     let (sync, library) = services(cx);
@@ -173,10 +303,14 @@ fn an_archive_that_doesnt_open_is_a_failure_and_none_is_made_in_its_place(cx: &m
     init_in(scratch, machine(), cx);
     let archive = cx.update(|cx| cx.services().archive.clone());
     archive.read_with(cx, |archive, _| {
-        let ArchiveState::Failed(why) = archive.state() else {
+        let ArchiveState::Failed(failure) = archive.state() else {
             panic!("the archive is locked");
         };
-        assert!(why.contains("open in another scrollback"), "{why}");
+        assert!(failure.locked);
+        assert!(
+            failure.why.contains("open in another scrollback"),
+            "{failure:?}"
+        );
     });
     cx.update(|cx| {
         assert_eq!(crate::pages::Showing::now(cx).key(), "archive-failed");
@@ -203,7 +337,10 @@ fn a_folder_that_holds_what_is_left_of_an_archive_gets_no_new_one(cx: &mut TestA
     init_in(scratch, machine(), cx);
     cx.update(|cx| {
         let archive = cx.services().archive.read(cx);
-        assert!(matches!(archive.state(), ArchiveState::Failed(_)));
+        let ArchiveState::Failed(failure) = archive.state() else {
+            panic!("no archive is made over what is left of one");
+        };
+        assert!(!failure.locked);
     });
     assert!(!dir.join("archive.json").exists());
 }
@@ -212,7 +349,8 @@ fn a_folder_that_holds_what_is_left_of_an_archive_gets_no_new_one(cx: &mut TestA
 fn a_star_shows_at_once_and_is_kept(cx: &mut TestAppContext) {
     init_library(cx);
     let (_, library) = services(cx);
-    library.update(cx, |library, cx| library.toggle_star(1, cx));
+    let second = id_at(&library, 1, cx);
+    library.update(cx, |library, cx| library.toggle_star(&second, 1, cx));
     // Before the catalogue has it.
     library.read_with(cx, |library, _| {
         assert!(library.sessions().unwrap().sessions[1].starred);
@@ -225,10 +363,104 @@ fn a_star_shows_at_once_and_is_kept(cx: &mut TestAppContext) {
     library.update(cx, |library, cx| library.show(Shelf::Starred, cx));
     cx.run_until_parked();
     assert_eq!(titles(&library, cx), ["Add retries to the fetcher"]);
-    library.update(cx, |library, cx| library.toggle_star(0, cx));
+    // The place it was drawn at may be out of date: it is found by what it is.
+    library.update(cx, |library, cx| library.toggle_star(&second, 7, cx));
     cx.run_until_parked();
     assert_eq!(titles(&library, cx), [""; 0]);
     library.read_with(cx, |library, _| assert_eq!(library.counts().starred, 0));
+}
+
+#[gpui::test(iterations = 30)]
+fn a_star_made_while_the_page_loads_is_not_undone_by_the_load(cx: &mut TestAppContext) {
+    init_library(cx);
+    let (_, library) = services(cx);
+    let first = id_at(&library, 0, cx);
+    // The load starts before the star is written, and may finish before or after it.
+    library.update(cx, |library, cx| {
+        library.reload(cx);
+        library.toggle_star(&first, 0, cx);
+    });
+    assert_eq!(starred(&library, &first, cx).0, true, "shown at once");
+    cx.run_until_parked();
+    assert_eq!(starred(&library, &first, cx), (true, true));
+    library.read_with(cx, |library, _| {
+        assert_eq!(library.counts().starred, 1);
+        assert!(library.is_settled());
+    });
+}
+
+#[gpui::test(iterations = 30)]
+fn quick_stars_are_written_in_the_order_they_were_made(cx: &mut TestAppContext) {
+    init_library(cx);
+    let (_, library) = services(cx);
+    let first = id_at(&library, 0, cx);
+    // On and off again before either is written.
+    library.update(cx, |library, cx| {
+        library.toggle_star(&first, 0, cx);
+        library.toggle_star(&first, 0, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(starred(&library, &first, cx), (false, false));
+    // And three: on, off, on.
+    library.update(cx, |library, cx| {
+        for _ in 0..3 {
+            library.toggle_star(&first, 0, cx);
+        }
+    });
+    cx.run_until_parked();
+    assert_eq!(starred(&library, &first, cx), (true, true));
+    library.read_with(cx, |library, _| assert_eq!(library.counts().starred, 1));
+}
+
+#[gpui::test(iterations = 30)]
+fn quick_renames_leave_the_last_name(cx: &mut TestAppContext) {
+    init_library(cx);
+    let (_, library) = services(cx);
+    library.update(cx, |library, cx| {
+        library.create_folder("New folder".into(), None, cx)
+    });
+    cx.run_until_parked();
+    let folder = library.read_with(cx, |library, _| library.folders()[0].id);
+    library.update(cx, |library, cx| {
+        library.rename_folder(folder, "first".into(), cx);
+        library.rename_folder(folder, "second".into(), cx);
+        library.reload(cx);
+        library.rename_folder(folder, "third".into(), cx);
+    });
+    cx.run_until_parked();
+    library.read_with(cx, |library, _| {
+        assert_eq!(library.folders()[0].name, "third");
+        assert!(library.is_settled());
+    });
+}
+
+#[gpui::test]
+fn what_the_owner_changed_is_written_when_the_app_quits(cx: &mut TestAppContext) {
+    init_library(cx);
+    let (sync, library) = services(cx);
+    let first = id_at(&library, 0, cx);
+    let archive = cx.update(|cx| cx.services().archive.read(cx).archive().cloned().unwrap());
+    // Nothing of this has reached the catalogue when the app is told to quit, mid-sync.
+    library.update(cx, |library, cx| {
+        library.toggle_star(&first, 0, cx);
+        library.create_folder("made at the last moment".into(), None, cx);
+    });
+    sync.update(cx, |sync, cx| sync.sync_all(cx));
+    cx.quit();
+    let catalogue = archive.catalogue();
+    let starred = catalogue.sessions(Shelf::Starred).unwrap();
+    assert_eq!(
+        starred.iter().map(|it| &it.id).collect::<Vec<_>>(),
+        [&first]
+    );
+    let folders = catalogue.folders().unwrap();
+    assert_eq!(
+        folders
+            .iter()
+            .map(|it| it.name.as_str())
+            .collect::<Vec<_>>(),
+        ["made at the last moment"]
+    );
 }
 
 #[gpui::test]
@@ -247,7 +479,8 @@ fn a_folder_made_from_an_unsorted_path_files_the_paths_sessions(cx: &mut TestApp
             .map(|group| (group.spellings[0].as_str(), group.sessions.len()))
             .collect();
         assert_eq!(sizes, [("/home/user/code/app", 2), ("/home/user/notes", 1)]);
-        groups[0].clone()
+        assert!(groups.iter().all(can_attach));
+        group_key(&groups[0])
     });
 
     let created = Rc::new(RefCell::new(Vec::new()));
@@ -257,7 +490,12 @@ fn a_folder_made_from_an_unsorted_path_files_the_paths_sessions(cx: &mut TestApp
             LibraryEvent::FolderCreated(folder) => created.borrow_mut().push(*folder),
         })
     });
-    library.update(cx, |library, cx| library.create_folder_from(&group, cx));
+    // A second click before the first has landed makes no second folder.
+    library.update(cx, |library, cx| {
+        library.create_folder_from(&group, cx);
+        assert!(library.is_creating(&group));
+        library.create_folder_from(&group, cx);
+    });
     cx.run_until_parked();
 
     let location = locations(&sync, cx)[0].id.clone();
@@ -272,6 +510,8 @@ fn a_folder_made_from_an_unsorted_path_files_the_paths_sessions(cx: &mut TestApp
             panic!("Unsorted is loaded");
         };
         assert_eq!(groups.len(), 1);
+        assert!(!library.is_creating(&group));
+        assert_eq!(library.refusal(&group), None);
         folder.id
     });
     assert_eq!(*created.borrow(), [folder], "the sidebar hears of it once");
@@ -295,6 +535,109 @@ fn a_folder_made_from_an_unsorted_path_files_the_paths_sessions(cx: &mut TestApp
                 .all(|session| session.filed == Filed::ByRule(folder))
         );
     });
+}
+
+#[gpui::test]
+fn a_folder_the_catalogue_refuses_is_not_made_and_the_group_says_why(cx: &mut TestAppContext) {
+    init_library(cx);
+    let (sync, library) = services(cx);
+    library.update(cx, |library, cx| library.show(Shelf::Unsorted, cx));
+    cx.run_until_parked();
+    let group = library.read_with(cx, |library, _| group_key(&library.groups()[0]));
+    // Behind the library's back the path goes to another folder: the page still offers it.
+    let location = locations(&sync, cx)[0].id.clone();
+    cx.update(|cx| {
+        let archive = cx.services().archive.read(cx).archive().cloned().unwrap();
+        let catalogue = archive.catalogue();
+        let elsewhere = catalogue.create_folder("elsewhere", None).unwrap();
+        catalogue
+            .attach_path(elsewhere, "/home/user/code/app", Some(&location))
+            .unwrap();
+    });
+    library.update(cx, |library, cx| library.create_folder_from(&group, cx));
+    cx.run_until_parked();
+    library.read_with(cx, |library, _| {
+        let names: Vec<_> = library.folders().iter().map(|it| &it.name).collect();
+        assert_eq!(names, ["elsewhere"], "no folder is left without its path");
+        let why = library.refusal(&group).expect("the refusal is kept");
+        assert!(why.contains("elsewhere"), "{why}");
+        assert!(!library.is_creating(&group));
+    });
+}
+
+#[gpui::test]
+fn sessions_with_no_path_and_those_at_the_root_offer_no_folder(cx: &mut TestAppContext) {
+    let mut machine = machine();
+    for project in ["/", "relative/path"] {
+        machine.outlined(&Outline {
+            project,
+            title: "Started somewhere no folder can claim",
+            prompt: "Where am I?",
+            model: "model-a",
+            day: (2026, 11, 1),
+            calls: 0,
+        });
+    }
+    init(machine, cx);
+    let (sync, library) = services(cx);
+    sync.update(cx, |sync, cx| sync.add_local(cx));
+    cx.run_until_parked();
+    library.update(cx, |library, cx| library.show(Shelf::Unsorted, cx));
+    cx.run_until_parked();
+    let unattachable: Vec<String> = library.read_with(cx, |library, _| {
+        library
+            .groups()
+            .iter()
+            .filter(|group| !can_attach(group))
+            .map(group_key)
+            .collect()
+    });
+    assert_eq!(unattachable.len(), 2);
+    // Asking anyway makes nothing.
+    library.update(cx, |library, cx| {
+        for group in &unattachable {
+            library.create_folder_from(group, cx);
+        }
+    });
+    cx.run_until_parked();
+    library.read_with(cx, |library, _| assert_eq!(library.folders(), []));
+}
+
+#[test]
+fn a_drives_group_is_written_in_its_drive_form() {
+    use sb_core::catalogue::PathGroup;
+    use sb_core::filing::{NormalPath, WSL_DRIVE_MOUNT};
+    let group = |project: &str, spellings: &[&str]| PathGroup {
+        project: NormalPath::new(project, Some(WSL_DRIVE_MOUNT)),
+        locations: Vec::new(),
+        spellings: spellings.iter().map(|it| it.to_string()).collect(),
+        sessions: Vec::new(),
+    };
+    let also = |others: &[&str]| others.iter().map(|it| it.to_string()).collect::<Vec<_>>();
+    // DESIGN §4.6: the drive's own spelling leads, whichever was recorded first.
+    assert_eq!(
+        group_path(&group(
+            "D:\\Projects\\fc",
+            &["/mnt/d/Projects/fc", "D:\\Projects\\fc"]
+        )),
+        Some((
+            "D:\\Projects\\fc".to_string(),
+            also(&["/mnt/d/Projects/fc"])
+        ))
+    );
+    // Recorded only through its mount, it is still shown as the drive's path.
+    assert_eq!(
+        group_path(&group("/mnt/d/Projects/fc", &["/mnt/d/Projects/fc"])),
+        Some((
+            "D:\\Projects\\fc".to_string(),
+            also(&["/mnt/d/Projects/fc"])
+        ))
+    );
+    assert_eq!(
+        group_path(&group("/home/user/code/app", &["/home/user/code/app"])),
+        Some(("/home/user/code/app".to_string(), Vec::new()))
+    );
+    assert_eq!(group_path(&group("", &[])), None);
 }
 
 #[gpui::test]

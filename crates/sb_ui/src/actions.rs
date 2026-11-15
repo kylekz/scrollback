@@ -77,7 +77,8 @@ pub mod sidebar {
             Expand,
             /// Move the keyboard to the page shown (`Enter`).
             Open,
-            /// Rename the selected folder in place (`F2`).
+            /// Rename the folder whose page is shown, in its row (`F2`, wherever the keyboard
+            /// is).
             Rename,
             /// Keep the name typed for the folder being renamed (`Enter`).
             KeepName,

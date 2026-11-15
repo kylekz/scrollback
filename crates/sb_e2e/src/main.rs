@@ -60,9 +60,17 @@ struct Home {
     env: Vec<(OsString, Option<OsString>)>,
 }
 
+/// The year the fixtures' newest sessions are dated in. The app writes its dates as seen
+/// from it, in UTC, so that a capture is the same in any year and on any machine.
+const CALENDAR: &str = "2026";
+
 impl Fixture<NoAction> for Home {
     fn env(&self) -> Vec<(OsString, Option<OsString>)> {
         self.env.clone()
+    }
+
+    fn args(&self) -> Vec<String> {
+        vec!["--automation-calendar".to_string(), CALENDAR.to_string()]
     }
 
     fn run(&mut self, action: &NoAction) -> Result<Value> {
@@ -76,9 +84,9 @@ impl RunnerApp for Scrollback {
     type Header = Header;
     type Action = NoAction;
     const HEADER_KEYS: &'static [&'static str] = &["fixture"];
-    /// Where the agent's provider looks for its transcripts, and the time zone dates are
-    /// shown in: the fixture's, so that no scenario depends on the machine it runs on.
-    const RESERVED_ENV: &'static [&'static str] = &["CLAUDE_CONFIG_DIR", "TZ"];
+    /// Where the agent's provider looks for its transcripts: the fixture's, so that no
+    /// scenario reads the machine it runs on.
+    const RESERVED_ENV: &'static [&'static str] = &["CLAUDE_CONFIG_DIR"];
 
     fn profile(&self) -> Profile {
         Profile {
@@ -98,12 +106,11 @@ impl RunnerApp for Scrollback {
     fn fixture(&self, header: &Header, cx: &FixtureCx) -> Result<Box<dyn Fixture<NoAction>>> {
         let home = cx.out_dir.join("home");
         let mut tree = ProjectsTree::in_home(&home);
-        let mut env: Vec<(OsString, Option<OsString>)> = tree
+        let env: Vec<(OsString, Option<OsString>)> = tree
             .vars()
             .iter()
             .map(|(name, value)| (name.into(), Some(value.into())))
             .collect();
-        env.push(("TZ".into(), Some("UTC".into())));
         match header.fixture {
             Library::Agent => fixture::agent(&mut tree),
             Library::AgentLarge => boards::agent(&mut tree),

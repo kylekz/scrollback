@@ -16,11 +16,20 @@
 //! **Keyboard.** It rests on the main area ([`MainArea`]'s focus handle), inside the shell's key
 //! context, so the shell's keys and the shown page's work at once. `F6` moves it between the
 //! sidebar and the main area, and so does `Ctrl B` while the sidebar is docked (DESIGN §4.1);
-//! `Enter` in the sidebar hands it to the page. The main area is the window's `Main` landmark,
-//! which is what assistive technology announces while nothing in it has the keyboard.
+//! `Enter` in the sidebar hands it to the page. `Tab` walks the title bar's buttons, the
+//! sidebar and its buttons, then the main area and the page's buttons, in that order
+//! (DESIGN §4.1), and `Enter` or `Space` presses the button that has the keyboard. The main
+//! area is the window's `Main` landmark, which is what assistive technology announces while
+//! nothing in it has the keyboard.
 //!
-//! The library's own keys work wherever the keyboard is: `Ctrl Shift N` makes a folder, `F5`
-//! syncs every location, `Alt ←` goes back from an opened session (DESIGN §5).
+//! **The keyboard is always on something drawn.** When what had it leaves the window (a
+//! button of a group that was filed, a sidebar that was hidden), it goes to the nearest thing
+//! around it that is still there, or to the main area. A folder renamed while the sidebar is
+//! hidden shows the sidebar over the main area for its row.
+//!
+//! The library's own keys work wherever the keyboard is: `Ctrl Shift N` makes a folder, `F2`
+//! renames the folder whose page is shown, `F5` syncs every location, `Alt ←` goes back from
+//! an opened session (DESIGN §5).
 
 pub mod title_bar;
 
@@ -30,16 +39,16 @@ mod tests;
 use anyhow::{Context as _, Result};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, Role, Size,
-    StatefulInteractiveElement as _, Styled as _, Subscription, TitlebarOptions, Window,
-    WindowBounds, WindowHandle, WindowOptions, deferred, div, point, prelude::FluentBuilder as _,
-    px, size,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, Size, Styled as _,
+    Subscription, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions, deferred,
+    div, point, prelude::FluentBuilder as _, px, size,
 };
 use gpui_appearance::Backing;
 use gpui_component::Root;
 
 use crate::actions::library::{Back, NewFolder, SyncAll};
 use crate::actions::shell::{Dismiss, FocusOther, ToggleSidebar};
+use crate::actions::sidebar::Rename;
 use crate::automation::AutomationTargetExt as _;
 use crate::keymap;
 use crate::pages::{MainArea, Showing};
@@ -78,7 +87,7 @@ pub struct Shell {
     main: Entity<MainArea>,
     /// Whether a narrow window shows the sidebar over its main area.
     sidebar_open: bool,
-    _observers: [Subscription; 5],
+    _observers: [Subscription; 6],
 }
 
 impl Shell {
@@ -103,13 +112,33 @@ impl Shell {
                 cx.observe(&sync, |_, _, cx| cx.notify()),
                 cx.observe(&library, |_, _, cx| cx.notify()),
                 cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
-                    // Picking a row closes a narrow window's overlay (DESIGN §2), and the
-                    // keyboard goes to the page with it.
-                    if std::mem::take(&mut this.sidebar_open) || matches!(event, SidebarEvent::Open)
-                    {
-                        this.main.focus_handle(cx).focus(window, cx);
+                    match event {
+                        // Picking a row closes a narrow window's overlay (DESIGN §2), and
+                        // the keyboard goes to the page with it.
+                        SidebarEvent::Picked => {
+                            if std::mem::take(&mut this.sidebar_open) {
+                                this.main.focus_handle(cx).focus(window, cx);
+                            }
+                        }
+                        SidebarEvent::Open => {
+                            this.sidebar_open = false;
+                            this.main.focus_handle(cx).focus(window, cx);
+                        }
+                        // The row that is renamed has the keyboard, so it must show.
+                        SidebarEvent::Renaming => {
+                            this.sidebar_open = this
+                                .sidebar_placement(window.viewport_size().width, cx)
+                                != SidebarPlacement::Docked;
+                        }
                     }
                     cx.notify();
+                }),
+                // What had the keyboard is gone from the window (module docs).
+                cx.on_focus_lost(window, |this, window, cx| {
+                    window
+                        .focus_lost_restore_target(cx)
+                        .unwrap_or_else(|| this.main.focus_handle(cx))
+                        .focus(window, cx);
                 }),
             ],
             sidebar,
@@ -181,6 +210,11 @@ impl Shell {
             .update(cx, |sidebar, cx| sidebar.new_folder(false, cx));
     }
 
+    fn rename(&mut self, _: &Rename, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.rename_shown(window, cx));
+    }
+
     pub(super) fn sync_all(&mut self, _: &SyncAll, _: &mut Window, cx: &mut Context<Self>) {
         let sync = cx.services().sync.clone();
         sync.update(cx, |sync, cx| sync.sync_all(cx));
@@ -196,7 +230,6 @@ impl Shell {
     fn render_main(&self, theme: &SbTheme) -> AnyElement {
         div()
             .id("main")
-            .role(Role::Main)
             .flex_1()
             .min_w_0()
             .h_full()
@@ -211,8 +244,6 @@ impl Shell {
     fn render_sidebar(&self, background: gpui::Hsla, theme: &SbTheme) -> AnyElement {
         div()
             .id("sidebar")
-            .role(Role::Navigation)
-            .aria_label("Library")
             .flex_none()
             .w(theme.sizes.sidebar_width)
             .h_full()
@@ -269,6 +300,8 @@ impl Render for Shell {
         if placement == SidebarPlacement::Docked {
             self.sidebar_open = false;
         }
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.keep_name_left_behind(window, cx));
         // A sidebar that isn't shown can't keep the keyboard.
         if placement == SidebarPlacement::Collapsed
             && self.sidebar.focus_handle(cx).contains_focused(window, cx)
@@ -282,6 +315,7 @@ impl Render for Shell {
             .on_action(cx.listener(Self::focus_other))
             .on_action(cx.listener(Self::dismiss))
             .on_action(cx.listener(Self::new_folder))
+            .on_action(cx.listener(Self::rename))
             .on_action(cx.listener(Self::sync_all))
             .on_action(cx.listener(Self::back))
             .relative()

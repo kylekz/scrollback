@@ -32,7 +32,7 @@ use super::{Shell, SidebarPlacement};
 use crate::actions::library::SyncAll;
 use crate::actions::shell::{Dismiss, ToggleSidebar};
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{DISABLED_OPACITY, icon, kbd, sync_glyph};
+use crate::components::{DISABLED_OPACITY, icon, kbd, sync_glyph, tab_stop};
 use crate::icons::SbIcon;
 use crate::keymap;
 use crate::pages::Showing;
@@ -54,10 +54,7 @@ impl Shell {
         let c = &theme.colors;
         let showing = Showing::now(cx);
         let first_run = showing == Showing::FirstRun;
-        let has_library = matches!(
-            showing,
-            Showing::Sessions | Showing::Unsorted | Showing::Session
-        );
+        let has_library = showing.is_library();
         let syncing = cx.services().sync.read(cx).is_syncing();
         div()
             .id("titlebar")
@@ -130,8 +127,7 @@ fn sidebar_button(
     let open = sidebar == SidebarPlacement::Overlay;
     // Open, it is on (`s3`) whether or not the pointer is over it.
     let fill = if open { c.s3 } else { c.s2 };
-    div()
-        .id("titlebar-sidebar")
+    tab_stop(div().id("titlebar-sidebar"), theme)
         .debug_selector(|| "titlebar-sidebar".into())
         .role(Role::Button)
         .aria_label(format!(
@@ -145,6 +141,8 @@ fn sidebar_button(
         .justify_center()
         .size(theme.sizes.control_height)
         .rounded(theme.radii.control)
+        .border_1()
+        .border_color(gpui::transparent_black())
         // A control inside the drag region.
         .occlude()
         .cursor_pointer()
@@ -155,7 +153,7 @@ fn sidebar_button(
         )
         .child(icon(
             SbIcon::PanelLeft,
-            px(16.),
+            theme.sizes.icon,
             if open { c.fg } else { c.fg2 },
         ))
         .automation_target("titlebar/sidebar")
@@ -227,7 +225,7 @@ fn search_field(theme: &SbTheme) -> AnyElement {
         .text_color(c.fg3)
         .opacity(DISABLED_OPACITY)
         .debug_selector(|| "titlebar-search".into())
-        .child(icon(SbIcon::Search, px(14.), c.fg3))
+        .child(icon(SbIcon::Search, theme.sizes.icon_sm, c.fg3))
         .child(
             div()
                 .flex_1()
@@ -271,16 +269,17 @@ fn sync_all_button(
             if !enabled {
                 this.opacity(DISABLED_OPACITY)
             } else if syncing {
-                this
+                tab_stop(this, theme)
             } else {
-                this.cursor_pointer()
+                tab_stop(this, theme)
+                    .cursor_pointer()
                     .hover(|style| style.bg(c.s3))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.sync_all(&SyncAll, window, cx);
                     }))
             }
         })
-        .child(sync_glyph(enabled && syncing, c.fg))
+        .child(sync_glyph(enabled && syncing, c.fg, theme))
         .child(if enabled && syncing {
             "Syncing…"
         } else {
@@ -306,7 +305,7 @@ fn settings_button(theme: &SbTheme) -> AnyElement {
         .size(theme.sizes.control_height)
         .rounded(theme.radii.control)
         .opacity(DISABLED_OPACITY)
-        .child(icon(SbIcon::Settings, px(16.), theme.colors.fg2))
+        .child(icon(SbIcon::Settings, theme.sizes.icon, theme.colors.fg2))
         .automation_target("titlebar/settings")
 }
 

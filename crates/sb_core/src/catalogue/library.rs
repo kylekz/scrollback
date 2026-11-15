@@ -34,10 +34,13 @@ pub struct LibraryCounts {
 
 /// The Unsorted sessions that started in one place: a project path at a location. The same
 /// path at two locations is two places, unless it is a drive's, which is one place from every
-/// location that sees the drive (a WSL distro and the Windows it runs on).
+/// location that sees the drive (a WSL distro and the Windows it runs on). The sessions that
+/// recorded no path are a place of their own at each location, and so are those of each path
+/// that names no directory (`/`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathGroup {
-    /// The path, as filing compares paths; `None` for the sessions that recorded none.
+    /// The path, as filing compares paths; `None` for the sessions that recorded none, or one
+    /// that names no directory, which no folder can claim.
     pub project: Option<NormalPath>,
     /// The locations its sessions are from: one, unless the path is a drive's.
     pub locations: Vec<LocationId>,
@@ -116,13 +119,19 @@ impl Catalogue {
     pub fn unsorted(&self) -> Result<Vec<PathGroup>> {
         let mut groups: Vec<PathGroup> = Vec::new();
         /* Where each place's group is: a place is a path, and its location unless the path is
-        a drive's. */
-        let mut places: HashMap<(Option<NormalPath>, Option<LocationId>), usize> = HashMap::new();
+        a drive's. A path filing can't compare is a place by how it was recorded, so that the
+        sessions with no path are not taken for those at `/`. */
+        type Place = (Option<NormalPath>, Option<LocationId>, Option<String>);
+        let mut places: HashMap<Place, usize> = HashMap::new();
         for session in self.sessions(Shelf::Unsorted)? {
             let on_drive = session.project.as_ref().is_some_and(NormalPath::is_drive);
             let location = (!on_drive).then(|| session.id.location.clone());
+            let recorded = match session.project {
+                Some(_) => None,
+                None => session.project_path.clone(),
+            };
             let at = *places
-                .entry((session.project.clone(), location))
+                .entry((session.project.clone(), location, recorded))
                 .or_insert_with(|| {
                     groups.push(PathGroup {
                         project: session.project.clone(),

@@ -1,7 +1,10 @@
 //! The header every library page starts with (DESIGN §2, §4.4–§4.6): the icon tile, the title
 //! at 24/600, and under it the page's stats or a line about it.
 
-use gpui::{AnyElement, IntoElement, ParentElement as _, SharedString, Styled as _, div, px};
+use gpui::{
+    AnyElement, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, SharedString,
+    Styled as _, div, px,
+};
 
 use crate::automation::AutomationTargetExt as _;
 use crate::components::page_tile;
@@ -9,6 +12,9 @@ use crate::format;
 use crate::icons::SbIcon;
 use crate::services::Stats;
 use crate::theme::{SbTheme, StyledText as _};
+
+/// The gap between a header's stats (`design/project/sb.css`, `.stats`).
+const STATS_GAP: Pixels = px(28.);
 
 /// What a header shows under its title.
 pub enum Under {
@@ -32,6 +38,7 @@ pub fn header(
         .flex()
         .items_start()
         .gap(theme.spacing.xl)
+        .debug_selector(|| "page-header".into())
         .child(page_tile(glyph, accent, theme))
         .child(
             div()
@@ -52,7 +59,7 @@ pub fn header(
                 .child(match under {
                     Under::Stats(stats) => div()
                         .flex()
-                        .gap(px(28.))
+                        .gap(STATS_GAP)
                         .children(stat_values(&stats).into_iter().map(|(value, label)| {
                             div()
                                 .flex()
@@ -76,13 +83,20 @@ pub fn header(
         .automation_target("page/header")
 }
 
-/// The four stats as their values and labels. A page with no sessions has no span and no
-/// locations to count (DESIGN §4.4, "Empty folder").
+/// The four stats as their values and labels, one of a thing in the singular. A page with no
+/// sessions has no span and no locations to count (DESIGN §4.4, "Empty folder").
 fn stat_values(stats: &Stats) -> [(String, &'static str); 4] {
     let dash = || "—".to_string();
+    let one = |of: u64, one, several| if of == 1 { one } else { several };
     [
-        (format::count(stats.sessions as u64), "sessions"),
-        (format::count(stats.calls), "tool calls"),
+        (
+            format::count(stats.sessions as u64),
+            one(stats.sessions as u64, "session", "sessions"),
+        ),
+        (
+            format::count(stats.calls),
+            one(stats.calls, "tool call", "tool calls"),
+        ),
         (
             stats
                 .span
@@ -95,7 +109,7 @@ fn stat_values(stats: &Stats) -> [(String, &'static str); 4] {
             } else {
                 format::count(stats.locations as u64)
             },
-            "locations",
+            one(stats.locations as u64, "location", "locations"),
         ),
     ]
 }
@@ -118,6 +132,20 @@ mod tests {
                 locations: 3,
             }),
             ["488", "52,914", "—", "3"]
+        );
+        assert_eq!(
+            stat_values(&Stats {
+                sessions: 1,
+                calls: 1,
+                span: None,
+                locations: 1,
+            })
+            .map(|(_, label)| label),
+            ["session", "tool call", "span", "location"]
+        );
+        assert_eq!(
+            stat_values(&Stats::default()).map(|(_, label)| label),
+            ["sessions", "tool calls", "span", "locations"]
         );
     }
 }

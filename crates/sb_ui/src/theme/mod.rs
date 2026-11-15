@@ -304,12 +304,24 @@ pub struct Sizes {
     pub control_height: Pixels,
     pub control_small_height: Pixels,
     pub input_height: Pixels,
-    /// A chip, and the taller one that holds a project path.
-    pub chip_height: Pixels,
+    /// The chip that holds a project path.
     pub path_chip_height: Pixels,
     /// A tag, and the lower one on a card's last line.
     pub tag_height: Pixels,
     pub tag_small_height: Pixels,
+    /// The widest a subfolder's tag is on a card before its name ends in an ellipsis.
+    pub tag_max_width: Pixels,
+    /// Icons (DESIGN §1.5): 12, 14, 16 and 18.
+    pub icon_xs: Pixels,
+    pub icon_sm: Pixels,
+    pub icon: Pixels,
+    pub icon_lg: Pixels,
+    /// The glyph of a page header's tile.
+    pub tile_glyph: Pixels,
+    /// A button of a card's hover bar.
+    pub hover_button: Pixels,
+    /// The reader's header.
+    pub reader_header_height: Pixels,
     /// A progress bar.
     pub bar_height: Pixels,
     /// A checkbox.
@@ -362,10 +374,17 @@ impl Default for Sizes {
             control_height: px(28.),
             control_small_height: px(24.),
             input_height: px(30.),
-            chip_height: px(22.),
             path_chip_height: px(28.),
             tag_height: px(18.),
             tag_small_height: px(16.),
+            tag_max_width: px(96.),
+            icon_xs: px(12.),
+            icon_sm: px(14.),
+            icon: px(16.),
+            icon_lg: px(18.),
+            tile_glyph: px(26.),
+            hover_button: px(26.),
+            reader_header_height: px(44.),
             bar_height: px(4.),
             checkbox: px(14.),
             dot: px(7.),
@@ -427,7 +446,8 @@ impl Default for Radii {
     }
 }
 
-/// The spacing scale 4 / 6 / 8 / 12 / 16 / 24 / 32 (DESIGN §1.4).
+/// The steps of the spacing scale 4 / 6 / 8 / 12 / 16 / 24 / 32 (DESIGN §1.4) that are drawn
+/// so far.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Spacing {
     pub xs: Pixels,
@@ -436,7 +456,6 @@ pub struct Spacing {
     pub lg: Pixels,
     pub xl: Pixels,
     pub xxl: Pixels,
-    pub xxxl: Pixels,
 }
 
 impl Default for Spacing {
@@ -448,7 +467,6 @@ impl Default for Spacing {
             lg: px(12.),
             xl: px(16.),
             xxl: px(24.),
-            xxxl: px(32.),
         }
     }
 }

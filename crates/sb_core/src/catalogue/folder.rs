@@ -53,17 +53,24 @@ impl Catalogue {
     /// folders may have the same name.
     pub fn create_folder(&self, name: &str, parent: Option<FolderId>) -> Result<FolderId> {
         let name = named(name)?;
+        self.db.write(|tx| create(tx, name, parent))
+    }
+
+    /// Makes a folder with a project path attached to it, as [`Catalogue::create_folder`] and
+    /// [`Catalogue::attach_path`] do, in one change: a path that is refused leaves no folder.
+    pub fn create_folder_with_path(
+        &self,
+        name: &str,
+        parent: Option<FolderId>,
+        typed: &str,
+        location: Option<&LocationId>,
+    ) -> Result<FolderId> {
+        let name = named(name)?;
+        let (typed, path) = typed_path(typed)?;
         self.db.write(|tx| {
-            if let Some(parent) = parent {
-                parent_of(tx, parent)?;
-            }
-            let parent = parent.map(|parent| parent.0);
-            tx.execute(
-                "INSERT INTO folder (parent_id, name, position)
-                 SELECT ?1, ?2, COALESCE(max(position) + 1, 0) FROM folder WHERE parent_id IS ?1",
-                params![parent, name],
-            )?;
-            Ok(FolderId(tx.last_insert_rowid()))
+            let folder = create(tx, name, parent)?;
+            attach(tx, folder, typed, &path, location)?;
+            Ok(folder)
         })
     }
 
@@ -183,41 +190,9 @@ impl Catalogue {
         typed: &str,
         location: Option<&LocationId>,
     ) -> Result<()> {
-        let typed = typed.trim();
-        let typed = typed
-            .strip_prefix('"')
-            .and_then(|typed| typed.strip_suffix('"'))
-            .map_or(typed, str::trim);
-        /* The drive mount is the default one for every location until a location can say its
-        own (PLAN §6.3). */
-        let path = NormalPath::new(typed, None)
-            .filter(NormalPath::is_absolute)
-            .ok_or_else(|| CatalogueError::NoPath(typed.to_string()))?;
-        self.db.write(|tx| {
-            parent_of(tx, folder)?;
-            let first = tx
-                .query_row(
-                    "SELECT f.id, f.name, p.typed FROM folder_path p
-                     JOIN folder f ON f.id = p.folder_id
-                     WHERE p.path = ?1 AND p.location_id IS ?2",
-                    params![path, location],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?;
-            if let Some((id, name, typed)) = first {
-                return Err(CatalogueError::PathAttached {
-                    folder: FolderId(id),
-                    name,
-                    typed,
-                });
-            }
-            tx.execute(
-                "INSERT INTO folder_path (folder_id, path, typed, location_id)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![folder.0, path, typed, location],
-            )?;
-            Ok(refile(tx)?)
-        })
+        let (typed, path) = typed_path(typed)?;
+        self.db
+            .write(|tx| attach(tx, folder, typed, &path, location))
     }
 
     /// Takes an attached path off its folder. The sessions it filed go where the rules now
@@ -268,6 +243,71 @@ impl Catalogue {
             Ok(folder.map(FolderId))
         })
     }
+}
+
+/// A project path as it is kept, and as filing compares it: without the white space around
+/// it and the double quotes a path copied from a file manager comes in. Refused when it
+/// names no directory or does not say where it is from the top.
+fn typed_path(typed: &str) -> Result<(&str, NormalPath)> {
+    let typed = typed.trim();
+    let typed = typed
+        .strip_prefix('"')
+        .and_then(|typed| typed.strip_suffix('"'))
+        .map_or(typed, str::trim);
+    /* The drive mount is the default one for every location until a location can say its
+    own (PLAN §6.3). */
+    let path = NormalPath::new(typed, None)
+        .filter(NormalPath::is_absolute)
+        .ok_or_else(|| CatalogueError::NoPath(typed.to_string()))?;
+    Ok((typed, path))
+}
+
+/// Makes the folder `name` in `parent`, or at the top, after the folders already there.
+fn create(connection: &Connection, name: &str, parent: Option<FolderId>) -> Result<FolderId> {
+    if let Some(parent) = parent {
+        parent_of(connection, parent)?;
+    }
+    let parent = parent.map(|parent| parent.0);
+    connection.execute(
+        "INSERT INTO folder (parent_id, name, position)
+         SELECT ?1, ?2, COALESCE(max(position) + 1, 0) FROM folder WHERE parent_id IS ?1",
+        params![parent, name],
+    )?;
+    Ok(FolderId(connection.last_insert_rowid()))
+}
+
+/// Attaches `path`, typed as `typed`, to a folder for `location` or for every location, and
+/// files by it. Refused when the path is attached already for that scope.
+fn attach(
+    connection: &Connection,
+    folder: FolderId,
+    typed: &str,
+    path: &NormalPath,
+    location: Option<&LocationId>,
+) -> Result<()> {
+    parent_of(connection, folder)?;
+    let first = connection
+        .query_row(
+            "SELECT f.id, f.name, p.typed FROM folder_path p
+             JOIN folder f ON f.id = p.folder_id
+             WHERE p.path = ?1 AND p.location_id IS ?2",
+            params![path, location],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if let Some((id, name, typed)) = first {
+        return Err(CatalogueError::PathAttached {
+            folder: FolderId(id),
+            name,
+            typed,
+        });
+    }
+    connection.execute(
+        "INSERT INTO folder_path (folder_id, path, typed, location_id)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![folder.0, path, typed, location],
+    )?;
+    Ok(refile(connection)?)
 }
 
 /// A folder's name as it is kept: without the white space around it.

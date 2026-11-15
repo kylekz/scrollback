@@ -16,8 +16,16 @@ use sb_core::archive::{Archive, ArchiveError};
 pub enum ArchiveState {
     Opening,
     Open(Arc<Archive>),
-    /// Why it didn't open, in the archive's words.
-    Failed(String),
+    Failed(Failure),
+}
+
+/// Why the archive didn't open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failure {
+    /// In the archive's words.
+    pub why: String,
+    /// Another scrollback has it open.
+    pub locked: bool,
 }
 
 pub struct ArchiveService {
@@ -76,7 +84,10 @@ impl ArchiveService {
                     Ok(archive) => ArchiveState::Open(Arc::new(archive)),
                     Err(error) => {
                         log::error!("the archive didn't open: {error}");
-                        ArchiveState::Failed(error.to_string())
+                        ArchiveState::Failed(Failure {
+                            why: error.to_string(),
+                            locked: matches!(error, ArchiveError::Locked(_)),
+                        })
                     }
                 };
                 cx.notify();

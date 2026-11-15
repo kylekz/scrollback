@@ -8,8 +8,8 @@
 
 use gpui::{
     AnyElement, App, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, Role, StatefulInteractiveElement as _, Styled as _, StyledText, Subscription, TextRun,
-    Window, div, font, prelude::FluentBuilder as _, px,
+    Pixels, Render, Role, StatefulInteractiveElement as _, Styled as _, StyledText, Subscription,
+    TextRun, Window, div, font, prelude::FluentBuilder as _, px,
 };
 
 use crate::agents;
@@ -20,6 +20,11 @@ use crate::icons::SbIcon;
 use crate::services::sync::{Survey, local_name};
 use crate::services::{ActiveServices as _, ArchiveService, SyncService};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
+
+/// The gap between the screen's sections, and a found row's padding at its sides
+/// (`design/project/E-First-Run`).
+const SECTION_GAP: Pixels = px(22.);
+const ROW_PADDING: Pixels = px(14.);
 
 /// What the screen says about scrollback, with the agents it archives named by their
 /// providers: one by its name, several as coding agents.
@@ -129,18 +134,21 @@ impl FirstRun {
         div()
             .id("first-run-machine")
             .role(Role::CheckBox)
+            // `Tab` reaches the row, and `Space` checks it.
+            .tab_index(0)
+            .focus_visible(|style| style.bg(c.s2))
             .flex()
             .items_center()
             .gap(theme.spacing.lg)
             .py(theme.spacing.lg)
-            .px(px(14.))
+            .px(ROW_PADDING)
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.checked = Some(!checked);
                 cx.notify();
             }))
             .child(checkbox(checked, theme))
-            .child(icon(SbIcon::Monitor, px(16.), c.fg2))
+            .child(icon(SbIcon::Monitor, theme.sizes.icon, c.fg2))
             .child(
                 div()
                     .flex_1()
@@ -216,7 +224,7 @@ impl FirstRun {
             .items_start()
             .gap(theme.spacing.sm)
             .text_spec(&theme.text.secondary)
-            .child(icon(SbIcon::Archive, px(14.), c.fg3))
+            .child(icon(SbIcon::Archive, theme.sizes.icon_sm, c.fg3))
             .child(
                 div()
                     .flex_1()
@@ -252,7 +260,7 @@ impl Render for FirstRun {
                     .w(theme.sizes.first_run_width)
                     .flex()
                     .flex_col()
-                    .gap(px(22.))
+                    .gap(SECTION_GAP)
                     .child(
                         div()
                             .flex()
@@ -299,10 +307,12 @@ impl Render for FirstRun {
                                     .when(ready, |this| {
                                         this.on_click(cx.listener(|this, _, _, cx| this.add(cx)))
                                     })
+                                    // It counts what is checked; with nothing checked there
+                                    // is nothing to count.
                                     .child(if self.is_checked(found) {
                                         "Add 1 location and sync"
                                     } else {
-                                        "Add 0 locations and sync"
+                                        "Add a location and sync"
                                     })
                                     .automation_target("first-run/add"),
                             ),

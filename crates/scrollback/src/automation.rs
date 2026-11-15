@@ -14,23 +14,33 @@
 //! - `shell`: `sidebar` (`docked`, `collapsed` or `overlay`, DESIGN §2), `window_material`
 //!   (what was applied to the window) and `window_native` (macOS: what AppKit reports, `forced`
 //!   light or dark or `null`, `opaque` and `vibrancy_view`; `null` elsewhere).
-//! - `page`: what the main area shows: `starting`, `archive-failed`, `first-run`, `sessions`
-//!   (All sessions, Starred or a folder), `unsorted` or `session` (an opened session).
+//! - `page`: what the main area shows: `starting`, `archive-failed`, `locations-failed`,
+//!   `first-run`, `sessions` (All sessions, Starred or a folder), `unsorted` or `session` (an
+//!   opened session).
 //! - `archive`: `dir`, and `state` (`opening`, `open` or `failed`, then with `error`).
-//! - `sync`: `syncing`, and `locations`, each with its `name`, `kind` and `state` (`syncing`,
-//!   `synced`, `failed` with `error`, or `never`).
+//! - `sync`: `syncing`, `indexing` (an index runs outside a pass), `held` (a pass waits at
+//!   `hold_sync`'s hold), and `locations`, each with its `name`, `kind` and `state` (`syncing`
+//!   with `progress`: the `items` to fetch and `items_done`, the `sessions` to index and
+//!   `sessions_done`; `synced`; `failed` with `error`; or `never`).
 //! - `library`: `shelf` (`all`, `starred`, `unsorted`, or `{"folder": name}`), `counts` (`all`,
 //!   `starred`, `unsorted`), `folders` (each with its `name`, its `parent`'s name and its
 //!   `sessions`, in the catalogue's order), `sessions` and `groups` (how many the shown page
-//!   lists, `null` while it loads or is of the other kind), and the titles of the `selected`
-//!   and the `open` session.
+//!   lists, `null` while it loads or is of the other kind), the titles of the `selected` and
+//!   the `open` session, and `error` (why the library couldn't be read, or `null`).
 //!
-//! Commands, each replying with `state.appearance` after the change. An argument a command
-//! doesn't have is an error, so a misspelt one never passes for a change:
+//! Commands. An argument a command doesn't have is an error, so a misspelt one never passes
+//! for a change. These reply with `state.appearance` after the change:
 //! - `pin_appearance {appearance}` pins `light` or `dark` whatever the mode and the OS say, so
 //!   a scenario looks the same on every machine; `null` lifts the pin.
 //! - `set_appearance {mode?, material?}` changes what scrollback asks for, as Settings ›
 //!   Appearance will (DESIGN §4.13).
+//!
+//! And these with `state.sync`, for a scenario that needs a pass in a known state whatever
+//! the machine's speed:
+//! - `hold_sync {after}` makes the next pass wait once it has stored `after` items. The app
+//!   is not settled while a pass waits: wait for `/sync/held` instead.
+//! - `release_sync {}` lets the waiting pass go on, and clears a hold no pass has reached.
+//!   Stopping the pass does too.
 
 use std::path::PathBuf;
 
@@ -41,7 +51,7 @@ use gpui_automation::AutomationHost;
 use sb_core::catalogue::{SessionId, Shelf};
 use sb_core::location::LocationKind;
 use sb_ui::Shell;
-use sb_ui::services::{ActiveServices as _, ArchiveState, LocationStatus, Page};
+use sb_ui::services::{ActiveServices as _, ArchiveState, Held, LocationStatus, Page};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -80,7 +90,12 @@ impl AutomationHost for ScrollbackAutomation {
     }
 
     fn commands(&self) -> &'static [&'static str] {
-        &["pin_appearance", "set_appearance"]
+        &[
+            "pin_appearance",
+            "set_appearance",
+            "hold_sync",
+            "release_sync",
+        ]
     }
 
     fn custom(
@@ -90,24 +105,32 @@ impl AutomationHost for ScrollbackAutomation {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Result<Value>> {
+        let service = cx.services().sync.clone();
         let result = match cmd {
-            "pin_appearance" => serde_json::from_value(args)
-                .map(|PinAppearance { appearance }| gpui_appearance::pin(appearance, cx)),
+            "pin_appearance" => serde_json::from_value(args).map(|PinAppearance { appearance }| {
+                gpui_appearance::pin(appearance, cx);
+                self::appearance(cx)
+            }),
             "set_appearance" => {
                 serde_json::from_value(args).map(|SetAppearance { mode, material }| {
                     let mut preferences = gpui_appearance::state(cx).preferences();
                     preferences.mode = mode.unwrap_or(preferences.mode);
                     preferences.material = material.unwrap_or(preferences.material);
                     gpui_appearance::set_preferences(preferences, cx);
+                    self::appearance(cx)
                 })
             }
+            "hold_sync" => serde_json::from_value(args).map(|HoldSync { after }| {
+                service.update(cx, |sync, _| sync.hold_after(after, Held::Pause));
+                sync(cx)
+            }),
+            "release_sync" => serde_json::from_value(args).map(|ReleaseSync {}| {
+                service.update(cx, |sync, _| sync.release());
+                sync(cx)
+            }),
             _ => return None,
         };
-        Some(
-            result
-                .map(|()| appearance(cx))
-                .with_context(|| format!("{cmd}'s arguments")),
-        )
+        Some(result.with_context(|| format!("{cmd}'s arguments")))
     }
 }
 
@@ -117,7 +140,7 @@ fn archive(cx: &App) -> Value {
     let (state, error) = match archive.state() {
         ArchiveState::Opening => ("opening", None),
         ArchiveState::Open(_) => ("open", None),
-        ArchiveState::Failed(error) => ("failed", Some(error)),
+        ArchiveState::Failed(failure) => ("failed", Some(&failure.why)),
     };
     json!({ "dir": archive.dir().display().to_string(), "state": state, "error": error })
 }
@@ -130,11 +153,11 @@ fn sync(cx: &App) -> Value {
         .unwrap_or_default()
         .iter()
         .map(|location| {
-            let (state, error) = match sync.status(location) {
-                LocationStatus::Syncing { .. } => ("syncing", None),
-                LocationStatus::Synced(_) => ("synced", None),
-                LocationStatus::Failed(error) => ("failed", Some(error)),
-                LocationStatus::NeverSynced => ("never", None),
+            let (state, error, progress) = match sync.status(location) {
+                LocationStatus::Syncing { progress, .. } => ("syncing", None, Some(progress)),
+                LocationStatus::Synced(_) => ("synced", None, None),
+                LocationStatus::Failed(error) => ("failed", Some(error), None),
+                LocationStatus::NeverSynced => ("never", None, None),
             };
             json!({
                 "name": location.name,
@@ -143,10 +166,21 @@ fn sync(cx: &App) -> Value {
                 },
                 "state": state,
                 "error": error,
+                "progress": progress.map(|progress| json!({
+                    "items": progress.items,
+                    "items_done": progress.items_done,
+                    "sessions": progress.sessions,
+                    "sessions_done": progress.sessions_done,
+                })),
             })
         })
         .collect();
-    json!({ "syncing": sync.is_syncing(), "locations": locations })
+    json!({
+        "syncing": sync.is_syncing(),
+        "indexing": sync.is_indexing(),
+        "held": sync.is_held(),
+        "locations": locations,
+    })
 }
 
 /// `state.library`.
@@ -197,6 +231,7 @@ fn library(cx: &App) -> Value {
         "groups": groups,
         "selected": library.selected().and_then(title_of),
         "open": library.open_session().and_then(|session| session.title.clone()),
+        "error": library.failure(),
     })
 }
 
@@ -240,6 +275,18 @@ struct SetAppearance {
     mode: Option<Mode>,
     material: Option<Material>,
 }
+
+/// `hold_sync {"after": items}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HoldSync {
+    after: usize,
+}
+
+/// `release_sync {}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseSync {}
 
 /// Starts automation on the main window.
 pub fn start(
@@ -290,5 +337,17 @@ mod tests {
         assert_eq!((neither.mode, neither.material), (None, None));
         assert!(parse(json!({"materail": "mica"})).is_err());
         assert!(parse(json!({"mode": "sepia"})).is_err());
+    }
+
+    #[test]
+    fn a_hold_needs_how_many_items_and_a_release_takes_nothing() {
+        let hold = |args: Value| serde_json::from_value::<HoldSync>(args);
+        assert_eq!(hold(json!({"after": 40})).unwrap().after, 40);
+        assert!(hold(json!({})).is_err());
+        assert!(hold(json!({"after": -1})).is_err());
+        assert!(hold(json!({"after": 40, "then": "stop"})).is_err());
+        let release = |args: Value| serde_json::from_value::<ReleaseSync>(args);
+        assert!(release(json!({})).is_ok());
+        assert!(release(json!({"after": 1})).is_err());
     }
 }

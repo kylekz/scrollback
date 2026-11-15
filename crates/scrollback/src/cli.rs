@@ -46,6 +46,13 @@ pub struct Cli {
     #[arg(long, requires = "automation_mode")]
     pub automation_background: bool,
 
+    #[cfg(feature = "automation")]
+    /// Under automation, write every date in UTC and as seen from this year, so that what a
+    /// scripted run captures is the same on any day and any machine. The e2e runner passes
+    /// the year its fixtures are dated in. Needs `--automation` or `--automation-pipe`.
+    #[arg(long, value_name = "YEAR", requires = "automation_mode")]
+    pub automation_calendar: Option<i32>,
+
     /// Window size in logical pixels, e.g. 1440x900 (minimum 960x600) [default: 1440x900].
     #[arg(long, value_name = "WxH")]
     pub window_size: Option<WindowSize>,
@@ -158,6 +165,20 @@ mod tests {
         assert!(parse(&["--automation-pipe", "p", "--automation-background"]).is_ok());
     }
 
+    #[cfg(feature = "automation")]
+    #[test]
+    fn a_pinned_calendar_is_a_year_and_needs_automation() {
+        assert_eq!(parse(&["--automation"]).unwrap().automation_calendar, None);
+        assert_eq!(
+            parse(&["--automation", "--automation-calendar", "2026"])
+                .unwrap()
+                .automation_calendar,
+            Some(2026)
+        );
+        assert!(parse(&["--automation-calendar", "2026"]).is_err());
+        assert!(parse(&["--automation", "--automation-calendar", "soon"]).is_err());
+    }
+
     #[cfg(not(feature = "automation"))]
     #[test]
     fn a_build_without_the_driver_has_no_automation_options() {
@@ -165,6 +186,7 @@ mod tests {
             assert!(parse(&[flag]).is_err(), "{flag}");
         }
         assert!(parse(&["--automation-pipe", "p"]).is_err());
+        assert!(parse(&["--automation-calendar", "2026"]).is_err());
     }
 
     #[test]

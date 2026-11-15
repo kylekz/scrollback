@@ -197,8 +197,15 @@ fn what_the_library_costs_at_fifty_thousand_sessions(cx: &mut TestAppContext) {
         eprintln!("UI thread: a frame of {name}: {:.2} ms", frame(cx));
     }
     // A star, shown at once.
+    let middle = library.read_with(cx, |library, _| {
+        library.sessions().unwrap().sessions[SESSIONS / 2]
+            .id
+            .clone()
+    });
     let (_, ms) = timed(|| {
-        library.update(cx, |library, cx| library.toggle_star(SESSIONS / 2, cx));
+        library.update(cx, |library, cx| {
+            library.toggle_star(&middle, SESSIONS / 2, cx)
+        });
     });
     eprintln!("UI thread: starring a session in the middle of the page: {ms:.3} ms");
     cx.executor().advance_clock(Duration::from_secs(1));

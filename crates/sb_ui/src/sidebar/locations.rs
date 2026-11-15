@@ -1,11 +1,14 @@
 //! The locations at the sidebar's foot (DESIGN §4.1): one row per location with its sync
-//! state, and the glyph that syncs them all. The rows open the locations sheet once there is
-//! one (PLAN §13).
+//! state, and the glyph that syncs them all. A location whose sessions are being indexed
+//! outside a pass says so as a syncing one does, and so does the index of every location
+//! that runs when the app starts, in a row of its own. Why a sync failed is the main area's
+//! to say in full (`crate::pages`); the row says that it did. The rows open the locations
+//! sheet once there is one (PLAN §13).
 
 use gpui::{
-    AnyElement, Context, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Role,
-    SharedString, StatefulInteractiveElement as _, Styled as _, div, prelude::FluentBuilder as _,
-    px,
+    AnyElement, Context, Div, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Role,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div,
+    prelude::FluentBuilder as _, px,
 };
 use sb_core::location::{Location, LocationKind};
 
@@ -16,6 +19,9 @@ use crate::format;
 use crate::icons::SbIcon;
 use crate::services::{LocationStatus, PassProgress};
 use crate::theme::{SbTheme, StyledText as _};
+
+/// The gap between the lines of a row that shows a bar (`design/project/sb.css`, `.loc`).
+const BUSY_GAP: gpui::Pixels = px(3.);
 
 /// What a syncing location's row says at its right: files while they are fetched, sessions
 /// while they are indexed, nothing while the location is scanned.
@@ -74,38 +80,113 @@ impl Sidebar {
             .flex()
             .flex_col()
             .gap(px(2.))
+            .children(locations.iter().map(|location| {
+                location_row(
+                    location,
+                    sync.status(location),
+                    sync.indexing(Some(&location.id)),
+                    now,
+                    theme,
+                )
+            }))
+            // The index of every location, while it has sessions to index.
             .children(
-                locations
-                    .iter()
-                    .map(|location| location_row(location, sync.status(location), now, theme)),
+                sync.indexing(None)
+                    .filter(PassProgress::is_indexing)
+                    .map(|progress| {
+                        busy(
+                            row("index", SbIcon::Layers, theme).aria_label("Indexing sessions"),
+                            "Session index",
+                            &progress,
+                            "indexing every location".to_string(),
+                            theme,
+                        )
+                        .automation_target("sidebar/index")
+                    }),
             )
             .into_any_element()
     }
 }
 
+/// What every row at the sidebar's foot starts as: its glyph, then what the caller adds.
+fn row(id: impl Into<SharedString>, glyph: SbIcon, theme: &SbTheme) -> Stateful<Div> {
+    div()
+        .id(id.into())
+        .role(Role::ListItem)
+        .flex()
+        .items_center()
+        .gap(theme.spacing.md)
+        .px(theme.spacing.md)
+        .rounded(theme.radii.row)
+        .whitespace_nowrap()
+        .child(icon(glyph, theme.sizes.icon, theme.colors.fg3))
+}
+
+/// A row's name (DESIGN §4.1: 12px at 500, `fg2`).
+fn name(name: &str, theme: &SbTheme) -> Div {
+    div()
+        .text_color(theme.colors.fg2)
+        .text_spec(&theme.text.control_small)
+        .child(name.to_string())
+}
+
+/// A row's second line.
+fn line(text: String, color: Hsla, theme: &SbTheme) -> Div {
+    div()
+        .min_w_0()
+        .overflow_hidden()
+        .text_ellipsis()
+        .text_color(color)
+        .text_spec(&theme.text.small)
+        .child(text)
+}
+
+/// A row with work in hand (DESIGN §4.1): 48 high, how far the work is at the right of its
+/// name, a bar, and what the work is under it.
+fn busy(
+    row: Stateful<Div>,
+    called: &str,
+    progress: &PassProgress,
+    says: String,
+    theme: &SbTheme,
+) -> Stateful<Div> {
+    let c = &theme.colors;
+    row.h(theme.sizes.location_row_syncing_height).child(
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(BUSY_GAP)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(name(called, theme))
+                    .children(doing(progress).map(|doing| {
+                        div()
+                            .ml_auto()
+                            .text_color(c.accent_text)
+                            .text_spec(&theme.text.count)
+                            .child(doing)
+                    })),
+            )
+            .child(progress_bar(progress.fraction(), theme))
+            .child(line(says, c.fg3, theme)),
+    )
+}
+
 /// A location's row (DESIGN §4.1): 40 high, its kind's icon, its name at 500, and its state
-/// on a second line; 48 high with a bar while it syncs.
+/// on a second line; 48 high with a bar while it syncs or is indexed.
 fn location_row(
     location: &Location,
     status: LocationStatus,
+    indexing: Option<PassProgress>,
     now: i64,
     theme: &SbTheme,
 ) -> AnyElement {
     let c = &theme.colors;
     let kind = kind_name(location.kind);
-    let name = div()
-        .text_color(c.fg2)
-        .text_spec(&theme.text.control_small)
-        .child(location.name.clone());
-    let line = |text: String, color: Hsla| {
-        div()
-            .min_w_0()
-            .overflow_hidden()
-            .text_ellipsis()
-            .text_color(color)
-            .text_spec(&theme.text.small)
-            .child(text)
-    };
     let dot = |fill: Option<Hsla>| {
         div()
             .flex_none()
@@ -117,77 +198,67 @@ fn location_row(
                 None => this.border(px(1.5)).border_color(c.fg3),
             })
     };
-    let row = div()
-        .id(SharedString::from(format!("location-{}", location.id)))
-        .role(Role::ListItem)
-        .flex()
-        .items_center()
-        .gap(theme.spacing.md)
-        .px(theme.spacing.md)
-        .rounded(theme.radii.row)
-        .whitespace_nowrap()
-        .child(icon(
-            match location.kind {
-                LocationKind::Local => SbIcon::Monitor,
-            },
-            px(16.),
-            c.fg3,
-        ));
+    let row = row(
+        format!("location-{}", location.id),
+        match location.kind {
+            LocationKind::Local => SbIcon::Monitor,
+        },
+        theme,
+    );
+    // A state that is one line under the name.
+    let resting = |row: Stateful<Div>, state: Div| {
+        row.h(theme.sizes.location_row_height).child(
+            div()
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .child(name(&location.name, theme))
+                .child(state),
+        )
+    };
     let target = format!("sidebar/location/{}", location.name);
-    match status {
-        LocationStatus::Syncing {
-            progress, first, ..
-        } => {
-            row.h(theme.sizes.location_row_syncing_height)
-                .aria_label(format!("{}: syncing", location.name))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap(px(3.))
-                        .child(div().flex().items_center().child(name).children(
-                            doing(&progress).map(|doing| {
-                                div()
-                                    .ml_auto()
-                                    .text_color(c.accent_text)
-                                    .text_spec(&theme.text.count)
-                                    .child(doing)
-                            }),
-                        ))
-                        .child(progress_bar(progress.fraction(), theme))
-                        .child(line(doing_line(location.kind, &progress, first), c.fg3)),
-                )
-        }
-        LocationStatus::Synced(at) => row
-            .h(theme.sizes.location_row_height)
-            .child(div().flex().flex_col().min_w_0().child(name).child(line(
+    match (status, indexing) {
+        (
+            LocationStatus::Syncing {
+                progress, first, ..
+            },
+            _,
+        ) => busy(
+            row.aria_label(format!("{}: syncing", location.name)),
+            &location.name,
+            &progress,
+            doing_line(location.kind, &progress, first),
+            theme,
+        ),
+        // What a stopped or a failed pass stored is being indexed.
+        (_, Some(progress)) => busy(
+            row.aria_label(format!("{}: indexing", location.name)),
+            &location.name,
+            &progress,
+            format!("{kind} · indexing"),
+            theme,
+        ),
+        (LocationStatus::Synced(at), None) => resting(
+            row,
+            line(
                 format!("{kind} · synced {}", format::ago(at, now)),
                 c.fg3,
-            )))
-            .child(dot(Some(c.green))),
-        LocationStatus::NeverSynced => row
-            .h(theme.sizes.location_row_height)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .min_w_0()
-                    .child(name)
-                    .child(line(format!("{kind} · not synced yet"), c.fg3)),
-            )
-            .child(dot(None)),
-        LocationStatus::Failed(why) => row.h(theme.sizes.location_row_height).child(
-            div().flex().flex_col().min_w_0().child(name).child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(theme.spacing.xs)
-                    .min_w_0()
-                    .child(icon(SbIcon::CircleAlert, px(12.), c.red))
-                    .child(line(format!("{kind} · failed · {why}"), c.red)),
+                theme,
             ),
+        )
+        .child(dot(Some(c.green))),
+        (LocationStatus::NeverSynced, None) => {
+            resting(row, line(format!("{kind} · not synced yet"), c.fg3, theme)).child(dot(None))
+        }
+        (LocationStatus::Failed(_), None) => resting(
+            row,
+            div()
+                .flex()
+                .items_center()
+                .gap(theme.spacing.xs)
+                .min_w_0()
+                .child(icon(SbIcon::CircleAlert, theme.sizes.icon_xs, c.red))
+                .child(line(format!("{kind} · last sync failed"), c.red, theme)),
         ),
     }
     .automation_target_with(move || target.clone().into())

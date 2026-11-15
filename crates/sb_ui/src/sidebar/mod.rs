@@ -7,11 +7,14 @@
 //!
 //! **The selected row** is the page shown: `↑` and `↓` show the page of the row above or
 //! below, `←` and `→` close and open a folder, and `Enter` hands the keyboard to the page.
-//! Trash has no page until the phase that builds it (PLAN §13), so its row shows its count of
-//! nothing and can't be picked.
+//! A folder whose page is shown may have no row, when a folder it is in was closed: then `↑`,
+//! `↓` and `←` go to the row that hides it, and `→` opens the folders it is in. `Tab` goes on
+//! from the rows to the sections' buttons. Trash has no page until the phase that builds it
+//! (PLAN §13), so its row is drawn disabled and can't be picked.
 //!
-//! **Renaming** (`F2`, and every new folder) happens in the folder's row: `Enter` keeps the
-//! name, `Esc` leaves the folder as it was named.
+//! **Renaming** (`F2` wherever the keyboard is, and every new folder) happens in the folder's
+//! row: `Enter` keeps the name and so does taking the keyboard elsewhere, `Esc` leaves the
+//! folder as it was named, and the arrows are the text field's. The field takes as many characters as a folder's name may have.
 //!
 //! The tree is a `uniform_list`, so a thousand folders cost what the visible rows do. Drag
 //! and drop arrives with the next task; [`tree::rows`] is where a drop finds its row.
@@ -29,13 +32,13 @@ use gpui::{
     ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
     UniformListScrollHandle, Window, div, prelude::FluentBuilder as _, px, uniform_list,
 };
-use gpui_component::input::{Input, InputEvent, InputState};
-use sb_core::catalogue::Shelf;
+use gpui_component::input::{Input, InputState};
+use sb_core::catalogue::{FOLDER_NAME_CHARS, Shelf};
 use sb_core::filing::FolderId;
 
-use crate::actions::sidebar::{Collapse, DropName, Expand, KeepName, Next, Open, Previous, Rename};
+use crate::actions::sidebar::{Collapse, DropName, Expand, KeepName, Next, Open, Previous};
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{count, icon, overline, sync_glyph};
+use crate::components::{count, icon, icon_button, overline, sync_glyph};
 use crate::icons::SbIcon;
 use crate::keymap;
 use crate::services::library::LibraryEvent;
@@ -45,6 +48,13 @@ use tree::TreeRow;
 
 /// How the library rows are drawn while they can't be opened (DESIGN §4.10).
 const DISABLED_ROWS_OPACITY: f32 = 0.55;
+
+/// How many levels of the tree are indented: a folder deeper than that lines up with the
+/// last, so that a deep tree keeps room for its names.
+const INDENTED_LEVELS: usize = 6;
+
+/// The sidebar's padding above its first row (`design/project/sb.css`, `.side`).
+const TOP_PADDING: gpui::Pixels = px(10.);
 
 /// The library rows, top to bottom (DESIGN §4.1): icon, name, automation target and the page
 /// each shows. Trash has none yet (module docs).
@@ -87,13 +97,15 @@ pub enum SidebarEvent {
     Picked,
     /// The keyboard goes to the page shown.
     Open,
+    /// A folder is being renamed in its row, which has the keyboard: a narrow window shows
+    /// the sidebar for it.
+    Renaming,
 }
 
 /// A folder being renamed in its row.
 struct Renaming {
     folder: FolderId,
     input: Entity<InputState>,
-    _input: Subscription,
 }
 
 pub struct Sidebar {
@@ -143,7 +155,7 @@ impl Sidebar {
             }),
             library,
             sync,
-            focus_handle: cx.focus_handle(),
+            focus_handle: cx.focus_handle().tab_stop(true),
             open: HashSet::new(),
             tree: Vec::new(),
             renaming: None,
@@ -195,13 +207,44 @@ impl Sidebar {
     }
 
     fn step(&mut self, by: isize, cx: &mut Context<Self>) {
+        // While a folder is renamed, an arrow its text field passes on is nobody's.
+        if self.renaming.is_some() {
+            return;
+        }
         let shelves = self.shelves(cx);
         let shown = self.library.read(cx).shelf();
-        let Some(at) = shelves.iter().position(|shelf| *shelf == shown) else {
-            return;
+        let next = match shelves.iter().position(|shelf| *shelf == shown) {
+            Some(at) => at
+                .checked_add_signed(by)
+                .and_then(|at| shelves.get(at))
+                .copied(),
+            None => self.hiding_row(cx),
         };
-        if let Some(next) = at.checked_add_signed(by).and_then(|at| shelves.get(at)) {
-            self.show(*next, cx);
+        if let Some(next) = next {
+            self.show(next, cx);
+        }
+    }
+
+    /// The row that hides the folder whose page is shown: the nearest folder it is inside
+    /// that has a row.
+    fn hiding_row(&self, cx: &App) -> Option<Shelf> {
+        let library = self.library.read(cx);
+        let Shelf::Folder(folder) = library.shelf() else {
+            return None;
+        };
+        tree::ancestors(library.folders(), folder)
+            .into_iter()
+            .find(|folder| self.row_of(*folder, cx).is_some())
+            .map(Shelf::Folder)
+    }
+
+    /// Opens the folders `folder` is inside, so that it has a row, and scrolls to the row.
+    fn reveal(&mut self, folder: FolderId, cx: &App) {
+        self.open
+            .extend(tree::ancestors(self.library.read(cx).folders(), folder));
+        self.rebuild(cx);
+        if let Some(at) = self.row_of(folder, cx) {
+            self.scroll.scroll_to_item(at, ScrollStrategy::Nearest);
         }
     }
 
@@ -222,7 +265,13 @@ impl Sidebar {
     }
 
     fn collapse(&mut self, _: &Collapse, _: &mut Window, cx: &mut Context<Self>) {
+        if self.renaming.is_some() {
+            return;
+        }
         let Some((folder, row)) = self.shown_row(cx) else {
+            if let Some(hiding) = self.hiding_row(cx) {
+                self.show(hiding, cx);
+            }
             return;
         };
         if row.open {
@@ -238,16 +287,29 @@ impl Sidebar {
     }
 
     fn expand(&mut self, _: &Expand, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some((folder, row)) = self.shown_row(cx)
-            && row.has_children
-            && !row.open
-        {
-            self.toggle(folder, cx);
+        if self.renaming.is_some() {
+            return;
+        }
+        match self.shown_row(cx) {
+            Some((folder, row)) if row.has_children && !row.open => self.toggle(folder, cx),
+            Some(_) => {}
+            None => {
+                if let Shelf::Folder(folder) = self.library.read(cx).shelf() {
+                    self.reveal(folder, cx);
+                    cx.notify();
+                }
+            }
         }
     }
 
-    fn open(&mut self, _: &Open, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(SidebarEvent::Open);
+    /// `Enter` on the rows hands the keyboard to the page; on one of the sidebar's buttons it
+    /// is left to press the button.
+    fn open(&mut self, _: &Open, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus_handle.is_focused(window) {
+            cx.emit(SidebarEvent::Open);
+        } else {
+            cx.propagate();
+        }
     }
 
     /// Opens or closes a folder without selecting it.
@@ -274,7 +336,8 @@ impl Sidebar {
         });
     }
 
-    fn rename_shown(&mut self, _: &Rename, window: &mut Window, cx: &mut Context<Self>) {
+    /// Renames the folder whose page is shown, in its row.
+    pub fn rename_shown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Shelf::Folder(folder) = self.library.read(cx).shelf() {
             self.rename(folder, window, cx);
         }
@@ -282,6 +345,13 @@ impl Sidebar {
 
     /// Starts renaming `folder` in its row, with its name selected.
     fn rename(&mut self, folder: FolderId, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .renaming
+            .as_ref()
+            .is_some_and(|renaming| renaming.folder == folder)
+        {
+            return;
+        }
         let Some(name) = self
             .library
             .read(cx)
@@ -291,29 +361,35 @@ impl Sidebar {
             return;
         };
         // A folder inside closed folders has no row to rename it in.
-        self.open
-            .extend(tree::ancestors(self.library.read(cx).folders(), folder));
-        self.rebuild(cx);
-        if let Some(at) = self.row_of(folder, cx) {
-            self.scroll.scroll_to_item(at, ScrollStrategy::Nearest);
-        }
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
+        self.reveal(folder, cx);
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(name)
+                // The field takes no more than the catalogue does.
+                .validate(|name, _| name.chars().count() <= FOLDER_NAME_CHARS)
+        });
         input.update(cx, |input, cx| {
             input.focus(window, cx);
             input.select_all(window, cx);
         });
-        self.renaming = Some(Renaming {
-            folder,
-            // Enter keeps the name, and so does leaving the row.
-            _input: cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
-                InputEvent::PressEnter { .. } | InputEvent::Blur => {
-                    this.end_rename(true, window, cx);
-                }
-                InputEvent::Change | InputEvent::Focus => {}
-            }),
-            input,
-        });
+        self.renaming = Some(Renaming { folder, input });
+        cx.emit(SidebarEvent::Renaming);
         cx.notify();
+    }
+
+    /**
+     * Keeps the name typed for a folder whose text field no longer has the keyboard: leaving
+     * the row keeps the name, as `Enter` does. The shell asks before every frame, because
+     * the field itself hears that it lost the keyboard only in an active window.
+     */
+    pub fn keep_name_left_behind(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .renaming
+            .as_ref()
+            .is_some_and(|renaming| !renaming.input.focus_handle(cx).is_focused(window))
+        {
+            self.end_rename(true, window, cx);
+        }
     }
 
     /// Ends a rename: with `keep`, the folder takes what was typed, unless that is nothing
@@ -370,6 +446,10 @@ impl Sidebar {
         row_base(selected, theme)
             .id(target)
             .role(Role::ListItem)
+            // A row with no page yet is drawn as the rows that can't be opened are.
+            .when(enabled && shelf.is_none(), |this| {
+                this.opacity(DISABLED_ROWS_OPACITY)
+            })
             .when_some(shelf.filter(|_| enabled), |this, shelf| {
                 this.cursor_pointer()
                     .when(!selected, |this| this.hover(|style| style.bg(c.s2)))
@@ -378,13 +458,18 @@ impl Sidebar {
                         cx.emit(SidebarEvent::Picked);
                     }))
             })
-            .child(icon(glyph, px(16.), if selected { c.fg2 } else { c.fg3 }))
+            .child(icon(
+                glyph,
+                theme.sizes.icon,
+                if selected { c.fg2 } else { c.fg3 },
+            ))
             .child(name)
             .child(count(value, count_color, theme))
             .automation_target(target)
     }
 
-    /// A folder's row: indented 18 per level with a 1px `line` guide, a chevron when it has
+    /// A folder's row: indented 18 per level, for [`INDENTED_LEVELS`] levels, with a 1px
+    /// `line` guide, a chevron when it has
     /// folders in it (a click on it opens or closes the folder without selecting it), the
     /// folder glyph, its name and the count of its sessions and its folders' (DESIGN §4.1).
     fn folder_row(&self, row: TreeRow, theme: &SbTheme, cx: &mut Context<Self>) -> AnyElement {
@@ -424,7 +509,7 @@ impl Sidebar {
                     } else {
                         SbIcon::ChevronRight
                     },
-                    px(12.),
+                    theme.sizes.icon_xs,
                     c.fg3,
                 ))
                 .automation_target_with({
@@ -454,7 +539,7 @@ impl Sidebar {
                         this.show(Shelf::Folder(id), cx);
                         cx.emit(SidebarEvent::Picked);
                     }))
-                    .children((0..row.depth).map(|_| {
+                    .children((0..row.depth.min(INDENTED_LEVELS)).map(|_| {
                         div()
                             .flex_none()
                             .h_full()
@@ -463,11 +548,16 @@ impl Sidebar {
                             .child(div().h_full().w(px(1.)).bg(c.line))
                     }))
                     .when(row.chevron_room, |this| {
-                        this.child(div().flex_none().size(px(12.)).children(chevron))
+                        this.child(
+                            div()
+                                .flex_none()
+                                .size(theme.sizes.icon_xs)
+                                .children(chevron),
+                        )
                     })
                     .child(icon(
                         SbIcon::Folder,
-                        px(16.),
+                        theme.sizes.icon,
                         if selected { c.fg2 } else { c.fg3 },
                     ))
                     .map(|this| match renaming {
@@ -556,20 +646,9 @@ fn header_button(
     target: &'static str,
     theme: &SbTheme,
 ) -> gpui::Stateful<Div> {
-    let c = &theme.colors;
-    div()
-        .id(target)
-        .role(Role::Button)
+    icon_button(target, theme.sizes.section_button, theme)
         .aria_label(label)
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
         .ml_auto()
-        .size(theme.sizes.section_button)
-        .rounded(theme.radii.control)
-        .cursor_pointer()
-        .hover(|style| style.bg(c.s2))
         .child(glyph)
 }
 
@@ -591,6 +670,9 @@ impl Render for Sidebar {
         let syncing = self.sync.read(cx).is_syncing();
         div()
             .id("sidebar-rows")
+            // The landmark is the element the keyboard rests on.
+            .role(Role::Navigation)
+            .aria_label("Library")
             .key_context(keymap::SIDEBAR)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::previous))
@@ -598,11 +680,10 @@ impl Render for Sidebar {
             .on_action(cx.listener(Self::collapse))
             .on_action(cx.listener(Self::expand))
             .on_action(cx.listener(Self::open))
-            .on_action(cx.listener(Self::rename_shown))
             .flex()
             .flex_col()
             .size_full()
-            .pt(px(10.))
+            .pt(TOP_PADDING)
             .px(theme.spacing.md)
             .pb(theme.spacing.md)
             .child(
@@ -629,7 +710,7 @@ impl Render for Sidebar {
                     .when(has_library, |this| {
                         this.child(
                             header_button(
-                                icon(SbIcon::Plus, px(14.), c.fg2),
+                                icon(SbIcon::Plus, theme.sizes.icon_sm, c.fg2),
                                 format!("New folder ({})", keymap::NEW_FOLDER.label()),
                                 "sidebar/new-folder",
                                 &theme,
@@ -678,7 +759,7 @@ impl Render for Sidebar {
                     .when(has_library, |this| {
                         this.child(
                             header_button(
-                                sync_glyph(syncing, c.fg2),
+                                sync_glyph(syncing, c.fg2, &theme),
                                 format!("Sync all locations ({})", keymap::SYNC_ALL.label()),
                                 "sidebar/sync-all",
                                 &theme,

@@ -528,7 +528,16 @@ fn sizes_radii_and_spacing_match_design() {
         [4., 6., 7., 8., 10., 12., 14., 999.].map(px)
     );
 
-    // The spacing scale 4 / 6 / 8 / 12 / 16 / 24 / 32.
+    // §1.5: icons at 12, 14, 16 and 18; §4.4: a 26px glyph in the tile and 26-square buttons
+    // in a card's hover bar; §1.4: the reader's header is 44 high.
+    assert_eq!(
+        [sizes.icon_xs, sizes.icon_sm, sizes.icon, sizes.icon_lg],
+        [12., 14., 16., 18.].map(px)
+    );
+    assert_eq!((sizes.tile_glyph, sizes.hover_button), (px(26.), px(26.)));
+    assert_eq!(sizes.reader_header_height, px(44.));
+
+    // The steps of the spacing scale 4 / 6 / 8 / 12 / 16 / 24 / 32 drawn so far.
     let spacing = Spacing::default();
     assert_eq!(
         [
@@ -537,10 +546,9 @@ fn sizes_radii_and_spacing_match_design() {
             spacing.md,
             spacing.lg,
             spacing.xl,
-            spacing.xxl,
-            spacing.xxxl
+            spacing.xxl
         ],
-        [4., 6., 8., 12., 16., 24., 32.].map(px)
+        [4., 6., 8., 12., 16., 24.].map(px)
     );
 }
 

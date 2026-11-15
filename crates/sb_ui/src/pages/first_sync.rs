@@ -3,18 +3,21 @@
 //! while there are no folders.
 
 use gpui::{
-    AnyElement, Context, IntoElement, ParentElement as _, StatefulInteractiveElement as _,
+    AnyElement, Context, IntoElement, ParentElement as _, Pixels, StatefulInteractiveElement as _,
     Styled as _, div, px,
 };
 use sb_core::catalogue::Shelf;
 
 use super::sessions::SessionsView;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{ButtonKind, button, icon, progress_bar};
+use crate::components::{BANNER_GAP, ButtonKind, button, icon, progress_bar};
 use crate::format;
 use crate::icons::SbIcon;
 use crate::services::{LocationStatus, PassProgress, SyncService};
 use crate::theme::{SbTheme, StyledText as _};
+
+/// The First sync card's padding above and below (`design/project/E-Edge-First-Sync`).
+const CARD_PADDING: Pixels = px(14.);
 
 /// How long a first sync runs before it says how long it has left (DESIGN §4.14).
 const ESTIMATE_AFTER_MS: i64 = 60_000;
@@ -99,7 +102,7 @@ pub fn card(first_sync: &FirstSync, theme: &SbTheme, cx: &Context<SessionsView>)
         .flex()
         .flex_col()
         .gap(theme.spacing.lg)
-        .py(px(14.))
+        .py(CARD_PADDING)
         .px(theme.spacing.xl)
         .rounded(theme.radii.card)
         .bg(c.s1)
@@ -126,7 +129,7 @@ pub fn card(first_sync: &FirstSync, theme: &SbTheme, cx: &Context<SessionsView>)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.sync.update(cx, |sync, _| sync.stop_all());
                         }))
-                        .child(icon(SbIcon::X, px(12.), c.fg))
+                        .child(icon(SbIcon::X, theme.sizes.icon_xs, c.fg))
                         .child("Stop")
                         .automation_target("first-sync/stop"),
                 ),
@@ -148,7 +151,7 @@ pub fn card(first_sync: &FirstSync, theme: &SbTheme, cx: &Context<SessionsView>)
                                 .items_center()
                                 .gap(theme.spacing.md)
                                 .text_spec(&theme.text.secondary)
-                                .child(icon(SbIcon::Monitor, px(14.), c.fg3))
+                                .child(icon(SbIcon::Monitor, theme.sizes.icon_sm, c.fg3))
                                 .child(
                                     div()
                                         .font_weight(theme.text.control.weight)
@@ -184,14 +187,14 @@ pub fn no_folders_banner(theme: &SbTheme, cx: &Context<SessionsView>) -> AnyElem
         .flex_none()
         .flex()
         .items_center()
-        .gap(px(10.))
+        .gap(BANNER_GAP)
         .py(theme.spacing.md)
         .px(theme.spacing.lg)
         .rounded(theme.radii.row)
         .bg(c.s1)
         .border_1()
         .border_color(c.line_subtle)
-        .child(icon(SbIcon::Inbox, px(14.), c.fg3))
+        .child(icon(SbIcon::Inbox, theme.sizes.icon_sm, c.fg3))
         .child(div().flex_1().min_w_0().text_color(c.fg2).child(
             "No folders yet, so everything lands in Unsorted, grouped by project path. Make \
              folders from those paths there.",

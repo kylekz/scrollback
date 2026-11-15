@@ -32,6 +32,20 @@ pub fn name(id: &str, cx: &App) -> String {
     display(id, cx).map_or_else(|| id.to_string(), |display| display.name.to_string())
 }
 
+/// Why a location's sync failed, each agent's part led by the agent's name: the catalogue
+/// records the parts joined by `; `, each led by its provider's id.
+pub fn named(why: &str, cx: &App) -> String {
+    why.split("; ")
+        .map(|part| match part.split_once(": ") {
+            Some((id, rest)) if provider(id, cx).is_some() => {
+                format!("{}: {rest}", name(id, cx))
+            }
+            _ => part.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// The first of a session's models, as its agent's provider writes it.
 pub fn model(id: &str, models: &[String], cx: &App) -> Option<String> {
     let model = models.first()?;
@@ -105,6 +119,12 @@ mod tests {
             assert_eq!(name("gone-agent", cx), "gone-agent");
             assert_eq!(display("gone-agent", cx), None);
             assert_eq!(model("gone-agent", &models, cx).as_deref(), Some("model-a"));
+            // A failure names its agent, never the provider's id.
+            assert_eq!(
+                named(&format!("{id}: no such folder; gone-agent: timed out"), cx),
+                format!("{}: no such folder; gone-agent: timed out", shown.name)
+            );
+            assert_eq!(named("the disk is full", cx), "the disk is full");
         });
     }
 }

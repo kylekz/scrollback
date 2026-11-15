@@ -68,7 +68,6 @@ sb_icons! {
     Settings => "settings",
     Star => "star",
     Trash => "trash-2",
-    TriangleAlert => "triangle-alert",
     X => "x",
 }
 

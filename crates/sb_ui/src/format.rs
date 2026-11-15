@@ -1,7 +1,22 @@
 //! How the views write numbers, dates, sizes and paths (DESIGN §4.1, §4.4, §4.6). Times are Unix
-//! milliseconds, as the catalogue keeps them, and are shown in the machine's time zone.
+//! milliseconds, as the catalogue keeps them, and are shown in the machine's time zone, a day
+//! of another year than this one with its year.
+//!
+//! A scripted run pins the calendar instead ([`pin_calendar`]), so that what it captures is
+//! the same in any year and on any machine.
 
-use chrono::{DateTime, Datelike as _, Local, TimeZone as _};
+use std::sync::OnceLock;
+
+use chrono::{DateTime, Datelike as _, FixedOffset, Local, TimeZone as _, Utc};
+
+/// The year a pinned calendar takes for this one.
+static PINNED_YEAR: OnceLock<i32> = OnceLock::new();
+
+/// Writes every date in UTC and as seen from `year`, whatever the machine's zone and clock
+/// say. The first call decides.
+pub fn pin_calendar(year: i32) {
+    PINNED_YEAR.get_or_init(|| year);
+}
 
 const MONTHS: [&str; 12] = [
     "January",
@@ -45,9 +60,18 @@ pub fn plural(value: usize, one: &str) -> String {
     )
 }
 
-/// The local time of `ms`; `None` for a time no calendar has.
-fn local(ms: i64) -> Option<DateTime<Local>> {
-    Local.timestamp_millis_opt(ms).single()
+/// The time of `ms` in the zone dates are shown in; `None` for a time no calendar has.
+fn local(ms: i64) -> Option<DateTime<FixedOffset>> {
+    if PINNED_YEAR.get().is_some() {
+        Utc.timestamp_millis_opt(ms)
+            .single()
+            .map(|time| time.fixed_offset())
+    } else {
+        Local
+            .timestamp_millis_opt(ms)
+            .single()
+            .map(|time| time.fixed_offset())
+    }
 }
 
 /// The calendar month `ms` falls in, as `(year, month)` with January as 1.
@@ -66,7 +90,11 @@ pub fn day(ms: i64, now: i64) -> String {
         return String::new();
     };
     let month = &MONTHS[time.month0() as usize][..3];
-    if local(now).is_some_and(|now| now.year() == time.year()) {
+    let this_year = PINNED_YEAR
+        .get()
+        .copied()
+        .or_else(|| local(now).map(|now| now.year()));
+    if this_year == Some(time.year()) {
         format!("{} {month}", time.day())
     } else {
         format!("{} {month} {}", time.day(), time.year())

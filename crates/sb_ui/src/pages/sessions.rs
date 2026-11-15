@@ -17,18 +17,20 @@ use std::rc::Rc;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, Pixels, Render, Role, ScrollStrategy, SharedString, Size,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, point,
     prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
-use sb_core::catalogue::{Filed, Session, Shelf};
+use sb_core::catalogue::{Filed, Session, SessionId, Shelf};
 
 use super::first_sync;
 use super::header::{Under, header};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{Tone, icon, location_tag, overline, tag, warn_chip};
+use crate::components::{
+    Tone, icon, location_tag, overline, tag, tag_width, text_width, warn_chip, warn_chip_width,
+};
 use crate::format;
 use crate::icons::SbIcon;
 use crate::keymap;
@@ -39,7 +41,9 @@ use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
 /// What the empty pages say (DESIGN §4.14).
 const NOTHING_STARRED: &str = "Star a session to keep it here.";
-const NOTHING_ARCHIVED: &str = "Nothing is archived yet. Sessions appear here as they are synced.";
+const NOTHING_ARCHIVED: &str = "Nothing is archived yet. Sessions appear here once a sync has \
+                                copied and indexed them.";
+const INDEXING: &str = "Indexing what was copied. Sessions appear here as they are indexed.";
 const EMPTY_FOLDER: &str = "Attach a project path above and its sessions file here now and after \
                             every sync. Or drag sessions here from any folder; sessions you place \
                             by hand stay put.";
@@ -47,10 +51,32 @@ const EMPTY_FOLDER: &str = "Attach a project path above and its sessions file he
 /// A card's padding at its sides (`design/project/sb.css`, `.scard`: 12px 14px).
 const CARD_PADDING: Pixels = px(14.);
 
-/// The narrowest card whose last line has room for a location's tag beside the model and the
-/// day, and for a subfolder's tag beside those. A narrower card leaves the location out.
-const LOCATION_FROM: Pixels = px(256.);
-const LOCATION_AND_FOLDER_FROM: Pixels = px(320.);
+/// What the chip of a session whose newer version is held back says.
+const HELD_BACK: &str = "held back";
+
+/// The narrowest a model's name is drawn, cut short; with less room it is left out.
+const MODEL_MIN: Pixels = px(40.);
+
+/// What of a card's last line shows where the line is short (DESIGN §4.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LastLine {
+    model: bool,
+    calls: bool,
+}
+
+/**
+ * What a card's last line has room for. The agent's mark, the location's tag, a subfolder's
+ * tag and the day always show, whole, and leave `room`. The model's name is `model` wide
+ * and the tool calls `calls`. When they don't both fit, the name is cut short, down to
+ * [`MODEL_MIN`]; then the calls are left out; then the name.
+ */
+fn last_line(room: Pixels, model: Pixels, calls: Pixels) -> LastLine {
+    let least = model.min(MODEL_MIN);
+    LastLine {
+        model: least <= room,
+        calls: least + calls <= room,
+    }
+}
 
 /// One item of the list of cards.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,11 +201,15 @@ pub struct SessionsView {
     pub(super) library: Entity<LibraryService>,
     pub(super) sync: Entity<SyncService>,
     scroll: VirtualListScrollHandle,
+    /// The page the list was last laid out for.
+    shelf: Shelf,
     rows: Vec<Row>,
     sizes: Rc<Vec<Size<Pixels>>>,
     columns: usize,
     /// How wide a card is, as far as the window's width says.
     card_width: Pixels,
+    /// The card under the pointer.
+    hovered: Option<SessionId>,
     /// The rows are of what the library held before it last changed.
     stale: bool,
     _observers: [Subscription; 2],
@@ -200,16 +230,24 @@ impl SessionsView {
             library,
             sync,
             scroll: VirtualListScrollHandle::new(),
+            shelf: Shelf::All,
             rows: Vec::new(),
             sizes: Rc::default(),
             columns: 0,
             card_width: px(0.),
+            hovered: None,
             stale: true,
         }
     }
 
-    /// Lays the rows out again when the sessions or the width changed.
+    /// Lays the rows out again when the sessions or the width changed. Another page than
+    /// the last starts at its top.
     fn lay_out(&mut self, window: &Window, theme: &SbTheme, cx: &App) {
+        let shelf = self.library.read(cx).shelf();
+        if shelf != self.shelf {
+            self.shelf = shelf;
+            self.scroll.base_handle().set_offset(point(px(0.), px(0.)));
+        }
         let viewport = window.viewport_size().width;
         let sidebar = if viewport >= theme.sizes.sidebar_collapse_width {
             theme.sizes.sidebar_width
@@ -249,42 +287,32 @@ impl SessionsView {
             .update(cx, |library, cx| library.select_index(to, cx));
     }
 
-    /// Opens the selected session.
-    pub fn open_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some(index) = self.library.read(cx).selected_index() {
-            self.open(index, cx);
-        }
+    /// The selected session and where it is on the page.
+    fn selected(&self, cx: &Context<Self>) -> Option<(SessionId, usize)> {
+        let library = self.library.read(cx);
+        Some((library.selected()?.clone(), library.selected_index()?))
     }
 
-    fn open(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.library.update(cx, |library, cx| {
-            if let Some(session) = library
-                .sessions()
-                .and_then(|page| page.sessions.get(index))
-                .cloned()
-            {
-                library.select_index(index, cx);
-                library.open(session, cx);
-            }
-        });
+    /// Opens the selected session.
+    pub fn open_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some((id, at)) = self.selected(cx) {
+            self.library
+                .update(cx, |library, cx| library.open_session_at(&id, at, cx));
+        }
     }
 
     /// Stars the selected session, or takes its star away.
     pub fn star_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some(index) = self.library.read(cx).selected_index() {
-            self.star(index, cx);
+        if let Some((id, at)) = self.selected(cx) {
+            self.library
+                .update(cx, |library, cx| library.toggle_star(&id, at, cx));
         }
-    }
-
-    fn star(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.library
-            .update(cx, |library, cx| library.toggle_star(index, cx));
     }
 
     fn render_rows(
         &mut self,
         range: Range<usize>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let theme = cx.sb_theme().clone();
@@ -303,11 +331,9 @@ impl SessionsView {
                     .w_full()
                     .flex()
                     .gap(theme.spacing.lg)
-                    .children(
-                        sessions
-                            .clone()
-                            .map(|index| self.card(index, &page.sessions[index], now, &theme, cx)),
-                    )
+                    .children(sessions.clone().map(|index| {
+                        self.card(index, &page.sessions[index], now, &theme, window, cx)
+                    }))
                     // A short row's cards stay as wide as a full one's: what fills the row
                     // takes a card's padding and border too.
                     .children((sessions.len()..self.columns).map(|_| {
@@ -332,11 +358,14 @@ impl SessionsView {
         session: &Session,
         now: i64,
         theme: &SbTheme,
+        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let c = &theme.colors;
         let library = self.library.read(cx);
         let selected = library.selected_index() == Some(index);
+        // The hover bar shows on the selected card and on the one under the pointer.
+        let barred = selected || self.hovered.as_ref() == Some(&session.id);
         let title: SharedString = session
             .title
             .clone()
@@ -360,23 +389,46 @@ impl SessionsView {
             }
             _ => None,
         };
-        let location = self
-            .sync
-            .read(cx)
-            .location(&session.id.location)
-            .filter(|_| {
-                self.card_width
-                    >= if subfolder.is_some() {
-                        LOCATION_AND_FOLDER_FROM
-                    } else {
-                        LOCATION_FROM
-                    }
-            });
-        let when = session
-            .ended
-            .or(session.started)
-            .map(|ended| format!("{} · ", format::day(ended, now)))
-            .unwrap_or_default();
+        let location = self.sync.read(cx).location(&session.id.location);
+        let by_hand = matches!(session.filed, Filed::ByHand(_));
+        let calls = format::plural(session.all.calls as usize, "call");
+        // The day always shows; a session that recorded no time has its calls in its place.
+        let (day, calls) = match session.ended.or(session.started) {
+            Some(ended) => (format::day(ended, now), format!(" · {calls}")),
+            None => (calls, String::new()),
+        };
+
+        /* What always shows on the last line, and the gaps between its pieces, leave this
+        much for the model's name and the tool calls ([`last_line`]). */
+        let gap = theme.spacing.sm;
+        let always = [
+            Some(theme.sizes.icon_xs),
+            Some(text_width(&day, &theme.text.count, window)),
+            location.map(|location| tag_width(&location.name, theme, window)),
+            subfolder.map(|folder| {
+                tag_width(&folder.name, theme, window).min(theme.sizes.tag_max_width)
+            }),
+            session
+                .held_back
+                .then(|| warn_chip_width(HELD_BACK, theme, window)),
+            by_hand.then_some(theme.sizes.icon_xs),
+        ];
+        let pieces = always.iter().flatten().count();
+        let room = self.card_width
+            - CARD_PADDING * 2.
+            - px(2.)
+            - always
+                .iter()
+                .flatten()
+                .fold(px(0.), |sum, width| sum + *width)
+            - gap * (pieces - 1) as f32;
+        let shows = last_line(
+            room,
+            text_width(&model, &theme.text.small, window) + gap,
+            text_width(&calls, &theme.text.count, window),
+        );
+
+        let id = session.id.clone();
         let star = div()
             .id(("star", index))
             .role(Role::Button)
@@ -388,17 +440,21 @@ impl SessionsView {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(26.))
+            .size(theme.sizes.hover_button)
             .rounded(theme.radii.control)
             .cursor_pointer()
             .hover(|style| style.bg(c.s3))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                this.star(index, cx);
+            .on_click(cx.listener({
+                let id = id.clone();
+                move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.library
+                        .update(cx, |library, cx| library.toggle_star(&id, index, cx));
+                }
             }))
             .child(icon(
                 SbIcon::Star,
-                px(14.),
+                theme.sizes.icon_sm,
                 if session.starred { c.yellow } else { c.fg2 },
             ))
             .automation_target_with(move || format!("card/{index}/star").into());
@@ -432,12 +488,27 @@ impl SessionsView {
                     })
                 }
             })
-            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                if event.click_count() > 1 {
-                    this.open(index, cx);
-                } else {
-                    this.library
-                        .update(cx, |library, cx| library.select_index(index, cx));
+            .on_hover(cx.listener({
+                let id = id.clone();
+                move |this, hovered: &bool, _, cx| {
+                    if *hovered {
+                        this.hovered = Some(id.clone());
+                    } else if this.hovered.as_ref() == Some(&id) {
+                        this.hovered = None;
+                    }
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener({
+                let id = id.clone();
+                move |this, event: &ClickEvent, _, cx| {
+                    this.library.update(cx, |library, cx| {
+                        if event.click_count() > 1 {
+                            library.open_session_at(&id, index, cx);
+                        } else {
+                            library.select_session(&id, index, cx);
+                        }
+                    });
                 }
             }))
             .child(
@@ -445,6 +516,10 @@ impl SessionsView {
                     .flex()
                     .items_center()
                     .gap(theme.spacing.sm)
+                    // The title ends short of the hover bar while the bar shows.
+                    .when(barred, |this| {
+                        this.pr(theme.sizes.hover_button + theme.spacing.sm)
+                    })
                     .child(
                         div()
                             .id(("title", index))
@@ -458,13 +533,16 @@ impl SessionsView {
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.open(index, cx);
+                                this.library.update(cx, |library, cx| {
+                                    library.open_session_at(&id, index, cx);
+                                });
                             }))
                             .child(title)
                             .automation_target_with(move || format!("card/{index}/title").into()),
                     )
-                    .when(session.starred, |this| {
-                        this.child(icon(SbIcon::Star, px(12.), c.yellow))
+                    // The bar's own star says so while it shows.
+                    .when(session.starred && !barred, |this| {
+                        this.child(icon(SbIcon::Star, theme.sizes.icon_xs, c.yellow))
                     }),
             )
             .child(
@@ -481,46 +559,45 @@ impl SessionsView {
                 div()
                     .flex()
                     .items_center()
-                    .gap(theme.spacing.sm)
+                    .gap(gap)
                     .h(theme.sizes.tag_small_height)
                     .text_color(c.fg3)
                     .text_spec(&theme.text.small)
                     .whitespace_nowrap()
-                    .child(agents::mark(&session.id.provider, px(12.), cx))
-                    // The day and the calls stay whole: a long location's name gives way
-                    // first, and a long model's after it.
-                    .child(
-                        div()
-                            .flex_shrink(0.001)
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(model),
-                    )
+                    .child(agents::mark(&session.id.provider, theme.sizes.icon_xs, cx))
+                    // Only the model's name gives way: everything else keeps its width.
+                    .when(shows.model, |this| {
+                        this.child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(model),
+                        )
+                    })
                     .children(location.map(|location| {
                         location_tag(location.name.clone(), location.kind, true, theme)
-                            .flex_shrink(1.)
-                            .min_w(px(36.))
                     }))
-                    .children(
-                        subfolder
-                            .map(|folder| tag(folder.name.clone(), Tone::Neutral, true, theme)),
-                    )
+                    .children(subfolder.map(|folder| {
+                        tag(folder.name.clone(), Tone::Neutral, true, theme)
+                            .max_w(theme.sizes.tag_max_width)
+                    }))
                     .when(session.held_back, |this| {
-                        this.child(warn_chip("held back", theme))
+                        this.child(warn_chip(HELD_BACK, theme))
                     })
-                    .child(div().flex_1().min_w_0())
                     .child(
                         div()
                             .flex_none()
+                            .ml_auto()
                             .text_spec(&theme.text.count)
-                            .child(format!(
-                                "{when}{}",
-                                format::plural(session.all.calls as usize, "call")
-                            )),
+                            .child(if shows.calls {
+                                format!("{day}{calls}")
+                            } else {
+                                day
+                            }),
                     )
-                    .when(matches!(session.filed, Filed::ByHand(_)), |this| {
-                        this.child(icon(SbIcon::Hand, px(12.), c.fg3))
+                    .when(by_hand, |this| {
+                        this.child(icon(SbIcon::Hand, theme.sizes.icon_xs, c.fg3))
                     }),
             )
             .child(
@@ -535,13 +612,11 @@ impl SessionsView {
                     .border_1()
                     .border_color(c.line)
                     .shadow(theme.shadows.card.clone())
-                    .map(|this| {
-                        if selected {
-                            this
-                        } else {
-                            this.opacity(0.)
-                                .group_hover("card", |style| style.opacity(1.))
-                        }
+                    /* Under the pointer it shows as soon as it is drawn; `hovered` follows
+                    with the pointer's next move. */
+                    .when(!barred, |this| {
+                        this.opacity(0.)
+                            .group_hover("card", |style| style.opacity(1.))
                     })
                     .child(star),
             )
@@ -559,7 +634,7 @@ fn paths_line(paths: &[PathChip], folder: &str, sync: &SyncService, theme: &SbTh
         .flex_wrap()
         .items_center()
         .gap(theme.spacing.md)
-        .child(icon(SbIcon::Link, px(14.), c.fg3))
+        .child(icon(SbIcon::Link, theme.sizes.icon_sm, c.fg3))
         .child(
             div()
                 .mr(theme.spacing.xs)
@@ -583,8 +658,10 @@ fn paths_line(paths: &[PathChip], folder: &str, sync: &SyncService, theme: &SbTh
                 .location
                 .as_ref()
                 .and_then(|location| sync.location(location));
+            // A long path gives way in its middle; its location and its count stay whole.
             div()
-                .flex_none()
+                .min_w_0()
+                .max_w_full()
                 .flex()
                 .items_center()
                 .gap(theme.spacing.sm)
@@ -603,9 +680,17 @@ fn paths_line(paths: &[PathChip], folder: &str, sync: &SyncService, theme: &SbTh
                     }
                     None => tag("any location", Tone::Neutral, false, theme).into_any_element(),
                 })
-                .child(div().text_spec(&theme.text.path).child(path.typed.clone()))
                 .child(
                     div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis_middle()
+                        .text_spec(&theme.text.path)
+                        .child(path.typed.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
                         .text_color(c.fg3)
                         .text_spec(&theme.text.count)
                         .child(format::count(path.sessions as u64)),
@@ -614,8 +699,14 @@ fn paths_line(paths: &[PathChip], folder: &str, sync: &SyncService, theme: &SbTh
         .automation_target("page/paths")
 }
 
+/// The empty folder's drop area (`design/project/sb.css`, `.empty`): the gap between its
+/// pieces, its tile and the width of its text.
+const EMPTY_GAP: Pixels = px(10.);
+const EMPTY_TILE: Pixels = px(48.);
+const EMPTY_TEXT_WIDTH: Pixels = px(460.);
+
 /// What a page says in place of its cards while it has none.
-fn empty(shelf: Shelf, folder: &str, theme: &SbTheme) -> AnyElement {
+fn empty(shelf: Shelf, folder: &str, indexing: bool, theme: &SbTheme) -> AnyElement {
     let c = &theme.colors;
     let centred = div()
         .flex_1()
@@ -624,7 +715,7 @@ fn empty(shelf: Shelf, folder: &str, theme: &SbTheme) -> AnyElement {
         .flex_col()
         .items_center()
         .justify_center()
-        .gap(px(10.));
+        .gap(EMPTY_GAP);
     match shelf {
         Shelf::Folder(_) => centred
             .mb(theme.spacing.xxl)
@@ -637,10 +728,10 @@ fn empty(shelf: Shelf, folder: &str, theme: &SbTheme) -> AnyElement {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(48.))
+                    .size(EMPTY_TILE)
                     .rounded(theme.radii.sheet)
                     .bg(c.s2)
-                    .child(icon(SbIcon::Folder, px(18.), c.fg3)),
+                    .child(icon(SbIcon::Folder, theme.sizes.icon_lg, c.fg3)),
             )
             .child(
                 div()
@@ -649,13 +740,15 @@ fn empty(shelf: Shelf, folder: &str, theme: &SbTheme) -> AnyElement {
             )
             .child(
                 div()
-                    .max_w(px(460.))
+                    .max_w(EMPTY_TEXT_WIDTH)
                     .text_center()
                     .text_color(c.fg2)
                     .child(EMPTY_FOLDER),
             ),
         _ => centred.text_color(c.fg2).child(if shelf == Shelf::Starred {
             NOTHING_STARRED
+        } else if indexing {
+            INDEXING
         } else {
             NOTHING_ARCHIVED
         }),
@@ -689,8 +782,8 @@ impl Render for SessionsView {
         let under = match &first_sync {
             Some(_) => Under::Line(
                 format!(
-                    "{} archived so far. Each one appears as soon as it is copied, and you \
-                     can open it right away.",
+                    "{} archived so far. Sessions appear here once their files are copied \
+                     and indexed, and you can open each right away.",
                     format::count(stats.sessions as u64)
                 )
                 .into(),
@@ -732,30 +825,38 @@ impl Render for SessionsView {
                 None => this,
                 // A first sync that has archived nothing yet says so in the header.
                 Some(page) if page.sessions.is_empty() && syncing_first => this,
-                Some(page) if page.sessions.is_empty() => this.child(empty(shelf, &title, &theme)),
+                Some(page) if page.sessions.is_empty() => {
+                    this.child(empty(shelf, &title, sync.is_indexing(), &theme))
+                }
                 Some(_) => this.child(
+                    // The scrollbar is in the page's side padding, clear of the cards.
                     div()
                         .relative()
                         .flex_1()
                         .min_h_0()
+                        .mr(-theme.sizes.page_side)
                         .child(
-                            v_virtual_list(
-                                cx.entity(),
-                                "cards",
-                                self.sizes.clone(),
-                                Self::render_rows,
-                            )
-                            .track_scroll(&self.scroll),
+                            div().size_full().pr(theme.sizes.page_side).child(
+                                v_virtual_list(
+                                    cx.entity(),
+                                    "cards",
+                                    self.sizes.clone(),
+                                    Self::render_rows,
+                                )
+                                .track_scroll(&self.scroll),
+                            ),
                         )
-                        // The overline of the month at the top, over the list.
+                        // The overline of the month at the top, over the list: the cards
+                        // under it take no clicks through it.
                         .children(pinned.map(|month| {
                             div()
                                 .absolute()
                                 .top_0()
                                 .left_0()
-                                .right_0()
+                                .right(theme.sizes.page_side)
                                 .h(theme.text.overline.line_height + theme.spacing.xl)
                                 .bg(theme.colors.bg_app)
+                                .occlude()
                                 .child(overline(&month, &theme))
                                 .automation_target("page/month")
                         }))
@@ -800,6 +901,35 @@ mod tests {
         assert_eq!(columns(px(624.), &theme), 3);
         assert_eq!(columns(px(623.), &theme), 2);
         assert_eq!(columns(px(300.), &theme), 2);
+    }
+
+    #[test]
+    fn a_short_last_line_cuts_the_model_then_drops_the_calls_then_the_model() {
+        let line = |room: f32| last_line(px(room), px(90.), px(50.));
+        let (both, model, neither) = (
+            LastLine {
+                model: true,
+                calls: true,
+            },
+            LastLine {
+                model: true,
+                calls: false,
+            },
+            LastLine {
+                model: false,
+                calls: false,
+            },
+        );
+        assert_eq!(line(140.), both);
+        // The name is cut short for as long as 40 of it and the calls fit.
+        assert_eq!(line(139.), both);
+        assert_eq!(line(90.), both);
+        assert_eq!(line(89.), model);
+        assert_eq!(line(40.), model);
+        assert_eq!(line(39.), neither);
+        // A name shorter than that is never cut: it shows whole or not at all.
+        assert_eq!(last_line(px(30.), px(24.), px(50.)), model);
+        assert_eq!(last_line(px(20.), px(24.), px(50.)), neither);
     }
 
     #[test]

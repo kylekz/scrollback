@@ -27,8 +27,10 @@ use sb_core::provider::Provider;
 use sb_core::transport::Transport;
 
 pub use archive::{ArchiveService, ArchiveState};
-pub use library::{LibraryService, Month, Page, PathChip, SessionsPage, Stats};
-pub use sync::{LocationStatus, PassProgress, SyncEvent, SyncService};
+pub use library::{
+    LibraryService, Month, Page, PathChip, SessionsPage, Stats, can_attach, group_key, group_path,
+};
+pub use sync::{Held, LocationStatus, PassProgress, SyncEvent, SyncService};
 
 /// The providers of the agents scrollback archives, as the services and the views share them.
 pub type Providers = Arc<Vec<Box<dyn Provider>>>;

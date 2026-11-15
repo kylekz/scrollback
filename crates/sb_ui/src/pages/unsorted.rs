@@ -1,12 +1,15 @@
 //! Unsorted (DESIGN §4.6): the sessions no folder claims, grouped by the project path and the
-//! location they started at. Each group can become a folder: **Create folder from this path**
-//! makes one named after the path's last component and attaches the path to it, which files
-//! the group there (PLAN §8).
+//! location they started at. A group whose path says where it is from the top can become a
+//! folder: **Create folder from this path** makes one named after the path's last component
+//! with the path attached to it, which files the group there (PLAN §8). The sessions that
+//! recorded no path are a group with nothing to make a folder from.
 //!
-//! The groups are a virtual list: a group's height follows from how many of its sessions show
-//! (five, until "Show all" is asked for; none while it is closed).
+//! **The list is virtual, by row.** Its items are the groups' heads and the sessions that show
+//! under them ([`items`]): five of a group until "Show all" is asked for, none while it is
+//! closed. So a group of thousands shown in full costs what the visible rows do.
 //!
-//! **Keyboard**: `↑` and `↓` move over the sessions that show, `Enter` opens the selected one.
+//! **Keyboard**: `↑` and `↓` move over the sessions that show, `Enter` opens the selected one,
+//! and `Tab` reaches each group's buttons.
 //!
 //! Attaching a group's path to an existing folder, dragging its chip, the filter and the
 //! sort come with later tasks.
@@ -16,23 +19,24 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
+    AnyElement, ClickEvent, Context, Div, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, Pixels, Render, Role, ScrollStrategy, SharedString, Size,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
     prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
-use sb_core::catalogue::{PathGroup, Session};
-use sb_core::filing::NormalPath;
+use sb_core::catalogue::{PathGroup, Session, SessionId};
 
 use super::header::{Under, header};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{ButtonKind, button, icon, location_tag};
+use crate::components::{ButtonKind, button, icon, icon_button, location_tag};
 use crate::format;
 use crate::icons::SbIcon;
-use crate::services::{ActiveServices as _, LibraryService, Page, SyncService};
+use crate::services::{
+    ActiveServices as _, LibraryService, SyncService, can_attach, group_key, group_path,
+};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
 /// How many of a group's sessions show until all are asked for (DESIGN §4.6).
@@ -40,27 +44,72 @@ const SHOWN: usize = 5;
 
 const EVERYTHING_FILED: &str = "Everything is filed.";
 
-/// What tells one group from another across loads: its path and its first location.
-fn key(group: &PathGroup) -> String {
-    format!(
-        "{}\n{}",
-        group.project.as_ref().map_or("", NormalPath::as_str),
-        group
-            .locations
-            .first()
-            .map_or("", |location| location.as_str())
-    )
+/// What the group of the sessions that recorded no project path is called.
+const NO_PATH: &str = "No project path";
+
+/// The gap between the page's header, its summary and its groups (`design/project/E-Unsorted`).
+const PAGE_GAP: Pixels = px(14.);
+
+/// A row's padding at its sides (`design/project/sb.css`, `.lrow`).
+const ROW_PADDING: Pixels = px(10.);
+
+/// The widths of a row's columns after its title: the model, the day, the tool calls.
+const MODEL_WIDTH: Pixels = px(132.);
+const DAY_WIDTH: Pixels = px(84.);
+const CALLS_WIDTH: Pixels = px(64.);
+
+/// One item of the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Item {
+    /// A group's head, as an index into the groups.
+    Head(usize),
+    /// Why the group's folder could not be made, under its head.
+    Refused(usize),
+    /// One of a group's sessions: the group, and the session's place in it.
+    Row(usize, usize),
+    /// "Show all" under a group's first sessions.
+    ShowAll(usize),
+}
+
+impl Item {
+    fn group(self) -> usize {
+        match self {
+            Self::Head(group)
+            | Self::Refused(group)
+            | Self::Row(group, _)
+            | Self::ShowAll(group) => group,
+        }
+    }
+}
+
+/// The list's items for groups given as how many sessions each has, how many of them show,
+/// and whether it has a refusal to show.
+pub fn items(groups: impl IntoIterator<Item = (usize, usize, bool)>) -> Vec<Item> {
+    let mut items = Vec::new();
+    for (at, (sessions, shown, refused)) in groups.into_iter().enumerate() {
+        items.push(Item::Head(at));
+        if refused {
+            items.push(Item::Refused(at));
+        }
+        items.extend((0..shown).map(|row| Item::Row(at, row)));
+        if shown > 0 && shown < sessions {
+            items.push(Item::ShowAll(at));
+        }
+    }
+    items
 }
 
 pub struct UnsortedView {
     library: Entity<LibraryService>,
     sync: Entity<SyncService>,
     scroll: VirtualListScrollHandle,
-    /// The groups that show all their sessions, and those that show none, by [`key`].
+    /// The groups that show all their sessions, and those that show none, by
+    /// [`group_key`].
     all: HashSet<String>,
     closed: HashSet<String>,
+    items: Vec<Item>,
     sizes: Rc<Vec<Size<Pixels>>>,
-    /// The sizes are of what the library held before it last changed.
+    /// The items are of what the library held before it last changed.
     stale: bool,
     _observers: [Subscription; 2],
 }
@@ -82,6 +131,7 @@ impl UnsortedView {
             scroll: VirtualListScrollHandle::new(),
             all: HashSet::new(),
             closed: HashSet::new(),
+            items: Vec::new(),
             sizes: Rc::default(),
             stale: true,
         }
@@ -89,7 +139,7 @@ impl UnsortedView {
 
     /// How many of a group's sessions show.
     fn shown(&self, group: &PathGroup) -> usize {
-        let key = key(group);
+        let key = group_key(group);
         if self.closed.contains(&key) {
             0
         } else if self.all.contains(&key) {
@@ -99,223 +149,269 @@ impl UnsortedView {
         }
     }
 
-    fn groups<'a>(&self, cx: &'a Context<Self>) -> &'a [PathGroup] {
-        match self.library.read(cx).page() {
-            Some(Page::Unsorted(groups)) => groups,
-            _ => &[],
-        }
-    }
-
-    /// Each group's height with the gap under it: its 44px head, a 34px row per session that
-    /// shows, one more for "Show all", inside its border.
+    /**
+     * Lists the items again when the groups or what shows of them changed. A group is a
+     * bordered section: its head is 44 high under the section's top border, each row under it
+     * 34, and the 12px gap to the next group is under its last item.
+     */
     fn lay_out(&mut self, theme: &SbTheme, cx: &Context<Self>) {
         if !self.stale {
             return;
         }
         self.stale = false;
+        let library = self.library.read(cx);
+        self.items = items(library.groups().iter().map(|group| {
+            (
+                group.sessions.len(),
+                self.shown(group),
+                library.refusal(&group_key(group)).is_some(),
+            )
+        }));
         let sizes = self
-            .groups(cx)
+            .items
             .iter()
-            .map(|group| {
-                let shown = self.shown(group);
-                let rows = shown + usize::from(shown > 0 && shown < group.sessions.len());
+            .enumerate()
+            .map(|(at, item)| {
+                let last = self.is_last(at);
+                let height = match item {
+                    Item::Head(_) => theme.sizes.group_head_height + px(1.),
+                    Item::Refused(_) | Item::Row(..) | Item::ShowAll(_) => {
+                        theme.sizes.list_row_height
+                    }
+                };
                 size(
                     px(0.),
-                    theme.sizes.group_head_height
-                        + theme.sizes.list_row_height * rows as f32
-                        + px(2.)
-                        + theme.spacing.lg,
+                    height + if last { theme.spacing.lg } else { px(0.) },
                 )
             })
             .collect();
         self.sizes = Rc::new(sizes);
     }
 
-    fn toggle(&mut self, group: usize, cx: &mut Context<Self>) {
-        let Some(key) = self.groups(cx).get(group).map(key) else {
-            return;
-        };
-        if !self.closed.remove(&key) {
-            self.closed.insert(key);
+    /// Whether the item at `at` is the last of its group.
+    fn is_last(&self, at: usize) -> bool {
+        self.items
+            .get(at + 1)
+            .is_none_or(|next| next.group() != self.items[at].group())
+    }
+
+    fn toggle(&mut self, group: String, cx: &mut Context<Self>) {
+        if !self.closed.remove(&group) {
+            self.closed.insert(group);
         }
         self.stale = true;
         cx.notify();
     }
 
-    fn show_all(&mut self, group: usize, cx: &mut Context<Self>) {
-        let Some(key) = self.groups(cx).get(group).map(key) else {
-            return;
-        };
-        self.all.insert(key);
+    fn show_all(&mut self, group: String, cx: &mut Context<Self>) {
+        self.all.insert(group);
         self.stale = true;
         cx.notify();
     }
 
-    fn create_folder(&mut self, group: usize, cx: &mut Context<Self>) {
-        self.library.update(cx, |library, cx| {
-            if let Some(Page::Unsorted(groups)) = library.page()
-                && let Some(group) = groups.get(group).cloned()
-            {
-                library.create_folder_from(&group, cx);
-            }
-        });
-    }
-
-    /// The sessions that show, top to bottom, each as its group and its place in it.
-    fn visible(&self, cx: &Context<Self>) -> Vec<(usize, usize)> {
-        self.groups(cx)
+    /// The session `id` of the groups, wherever a load has put it.
+    fn session<'a>(&self, id: &SessionId, cx: &'a Context<Self>) -> Option<&'a Session> {
+        self.library
+            .read(cx)
+            .groups()
             .iter()
-            .enumerate()
-            .flat_map(|(at, group)| (0..self.shown(group)).map(move |row| (at, row)))
-            .collect()
+            .flat_map(|group| &group.sessions)
+            .find(|session| session.id == *id)
     }
 
     /// Moves the selection over the sessions that show; with none selected, to the first.
     pub fn step(&mut self, by: isize, cx: &mut Context<Self>) {
-        let visible = self.visible(cx);
-        let groups = self.groups(cx);
+        let groups = self.library.read(cx).groups();
+        let rows: Vec<(usize, &Session)> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(at, item)| match *item {
+                Item::Row(group, row) => Some((at, groups.get(group)?.sessions.get(row)?)),
+                _ => None,
+            })
+            .collect();
         let selected = self.library.read(cx).selected();
-        let at = selected.and_then(|selected| {
-            visible
-                .iter()
-                .position(|(group, row)| groups[*group].sessions[*row].id == *selected)
-        });
+        let at = selected
+            .and_then(|selected| rows.iter().position(|(_, session)| session.id == *selected));
         let to = match at {
             Some(at) => at.checked_add_signed(by),
             None => Some(0),
         };
-        let Some((group, row)) = to.and_then(|to| visible.get(to)).copied() else {
+        let Some((item, session)) = to.and_then(|to| rows.get(to)) else {
             return;
         };
-        let id = groups[group].sessions[row].id.clone();
-        self.scroll.scroll_to_item(group, ScrollStrategy::Nearest);
+        let id = session.id.clone();
+        self.scroll.scroll_to_item(*item, ScrollStrategy::Nearest);
         self.library
             .update(cx, |library, cx| library.select(id, cx));
     }
 
     /// Opens the selected session.
     pub fn open_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(selected) = self.library.read(cx).selected() else {
-            return;
-        };
-        let session = self
-            .groups(cx)
-            .iter()
-            .flat_map(|group| &group.sessions)
-            .find(|session| session.id == *selected)
-            .cloned();
-        if let Some(session) = session {
-            self.library
-                .update(cx, |library, cx| library.open(session, cx));
+        if let Some(selected) = self.library.read(cx).selected().cloned() {
+            self.open(&selected, cx);
         }
     }
 
-    fn render_groups(
+    fn open(&mut self, id: &SessionId, cx: &mut Context<Self>) {
+        if let Some(session) = self.session(id, cx).cloned() {
+            self.library.update(cx, |library, cx| {
+                library.select(session.id.clone(), cx);
+                library.open(session, cx);
+            });
+        }
+    }
+
+    fn render_items(
         &mut self,
         range: Range<usize>,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let theme = cx.sb_theme().clone();
+        let c = &theme.colors;
         let now = format::now();
+        let groups = self.library.read(cx).groups();
         range
-            .filter_map(|at| Some((at, self.groups(cx).get(at)?)))
-            .map(|(at, group)| self.group(at, group, now, &theme, cx))
+            .filter_map(|at| {
+                let item = *self.items.get(at)?;
+                let group = groups.get(item.group())?;
+                let last = self.is_last(at);
+                // Every item draws its part of the section's border.
+                let part = div()
+                    .border_x_1()
+                    .border_b_1()
+                    .border_color(c.line_subtle)
+                    .overflow_hidden()
+                    .when(last, |this| this.rounded_b(theme.radii.card));
+                let part = match item {
+                    Item::Head(of) => self.head(part, (at, of), group, &theme, cx),
+                    Item::Refused(_) => refused(
+                        part,
+                        self.library
+                            .read(cx)
+                            .refusal(&group_key(group))
+                            .unwrap_or_default(),
+                        &theme,
+                    ),
+                    Item::Row(of, row) => self.row(
+                        part,
+                        at,
+                        (of, row),
+                        group.sessions.get(row)?,
+                        now,
+                        &theme,
+                        cx,
+                    ),
+                    Item::ShowAll(of) => self.show_all_row(part, at, of, group, &theme, cx),
+                };
+                Some(
+                    div()
+                        .w_full()
+                        .when(last, |this| this.pb(theme.spacing.lg))
+                        .child(part)
+                        .into_any_element(),
+                )
+            })
             .collect()
     }
 
-    /// One group (DESIGN §4.6): a bordered section whose head holds the path's chip, how many
-    /// sessions it has and what can be done with it, over its sessions as list rows.
-    fn group(
+    /// A group's head (DESIGN §4.6): what opens and closes it, the path's chip with where it
+    /// is from, how many sessions it has, the other ways they wrote the path, and the button
+    /// that makes a folder from it.
+    fn head(
         &self,
-        at: usize,
+        part: Div,
+        (at, index): (usize, usize),
         group: &PathGroup,
-        now: i64,
         theme: &SbTheme,
         cx: &Context<Self>,
     ) -> AnyElement {
         let c = &theme.colors;
         let sync = self.sync.read(cx);
-        let shown = self.shown(group);
-        let open = shown > 0;
-        let path = group.spellings.first().cloned();
-        let head = div()
-            .flex_none()
+        let library = self.library.read(cx);
+        let key = group_key(group);
+        let open = self.shown(group) > 0;
+        let path = group_path(group);
+        let creating = library.is_creating(&key);
+        part.border_t_1()
+            .rounded_t(theme.radii.card)
             .flex()
             .items_center()
             .gap(theme.spacing.md)
-            .h(theme.sizes.group_head_height)
+            .h(theme.sizes.group_head_height + px(1.))
             .pl(theme.spacing.sm)
-            .pr(px(10.))
+            .pr(ROW_PADDING)
             .bg(c.s1)
-            .border_b_1()
-            .border_color(c.line_subtle)
             .child(
-                div()
-                    .id(("group-toggle", at))
-                    .role(Role::Button)
-                    .aria_label(if open {
-                        "Hide sessions"
+                icon_button(
+                    ("group-toggle", at),
+                    theme.sizes.control_small_height,
+                    theme,
+                )
+                .aria_label(if open {
+                    "Hide sessions"
+                } else {
+                    "Show sessions"
+                })
+                .on_click(cx.listener({
+                    let key = key.clone();
+                    move |this, _, _, cx| this.toggle(key.clone(), cx)
+                }))
+                .child(icon(
+                    if open {
+                        SbIcon::ChevronDown
                     } else {
-                        "Show sessions"
-                    })
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .size(theme.sizes.control_small_height)
-                    .rounded(theme.radii.control)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(c.s2))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle(at, cx)))
-                    .child(icon(
-                        if open {
-                            SbIcon::ChevronDown
-                        } else {
-                            SbIcon::ChevronRight
-                        },
-                        px(14.),
-                        c.fg2,
-                    ))
-                    .automation_target_with(move || format!("unsorted/group/{at}/toggle").into()),
+                        SbIcon::ChevronRight
+                    },
+                    theme.sizes.icon_sm,
+                    c.fg2,
+                ))
+                .automation_target_with(move || format!("unsorted/group/{index}/toggle").into()),
             )
-            .child(
+            .map(|this| match &path {
                 // The path's chip. It becomes what is dragged onto a folder.
-                div()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap(theme.spacing.sm)
-                    .h(theme.sizes.path_chip_height)
-                    .pl(theme.spacing.xs)
-                    .pr(px(10.))
-                    .rounded(theme.radii.pill)
-                    .bg(c.s2)
-                    .border_1()
-                    .border_color(c.line_subtle)
-                    .whitespace_nowrap()
-                    .children(
-                        group
-                            .locations
-                            .iter()
-                            .filter_map(|location| sync.location(location))
-                            .map(|location| {
-                                location_tag(location.name.clone(), location.kind, false, theme)
-                            }),
-                    )
-                    .child(match &path {
-                        Some(path) => div()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .text_spec(&theme.text.path)
-                            .child(path.clone()),
-                        None => div()
-                            .text_color(c.fg2)
-                            .text_spec(&theme.text.secondary)
-                            .child("No project path"),
-                    }),
-            )
+                Some((shown, _)) => this.child(
+                    div()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap(theme.spacing.sm)
+                        .h(theme.sizes.path_chip_height)
+                        .pl(theme.spacing.xs)
+                        .pr(ROW_PADDING)
+                        .rounded(theme.radii.pill)
+                        .bg(c.s2)
+                        .border_1()
+                        .border_color(c.line_subtle)
+                        .whitespace_nowrap()
+                        .children(
+                            group
+                                .locations
+                                .iter()
+                                .filter_map(|location| sync.location(location))
+                                .map(|location| {
+                                    location_tag(location.name.clone(), location.kind, false, theme)
+                                }),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis_middle()
+                                .text_spec(&theme.text.path)
+                                .child(shown.clone()),
+                        ),
+                ),
+                None => this.child(
+                    div()
+                        .flex_none()
+                        .pl(theme.spacing.xs)
+                        .text_spec(&theme.text.row_title)
+                        .child(NO_PATH),
+                ),
+            })
             .child(
                 div()
                     .flex_none()
@@ -323,88 +419,62 @@ impl UnsortedView {
                     .text_spec(&theme.text.number)
                     .child(format::plural(group.sessions.len(), "session")),
             )
-            .when(group.spellings.len() > 1, |this| {
+            .children(
+                path.as_ref()
+                    .filter(|(_, others)| !others.is_empty())
+                    .map(|(_, others)| {
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_color(c.fg3)
+                            .text_spec(&theme.text.secondary)
+                            .child(format!("also as {}", others.join(", ")))
+                    }),
+            )
+            .child(div().flex_1())
+            .when(can_attach(group), |this| {
                 this.child(
-                    div()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .text_color(c.fg3)
-                        .text_spec(&theme.text.secondary)
-                        .child(format!("also as {}", group.spellings[1..].join(", "))),
+                    // Until the group has gone into its folder, a second click makes no second.
+                    button(
+                        ("create-folder", at),
+                        ButtonKind::Plain,
+                        true,
+                        !creating,
+                        theme,
+                    )
+                    .when(!creating, |this| {
+                        this.on_click(cx.listener(move |this, _, _, cx| {
+                            this.library
+                                .update(cx, |library, cx| library.create_folder_from(&key, cx));
+                        }))
+                    })
+                    .child(icon(SbIcon::FolderPlus, theme.sizes.icon_sm, c.fg))
+                    .child("Create folder from this path")
+                    .automation_target_with(move || {
+                        format!("unsorted/group/{index}/create-folder").into()
+                    }),
                 )
             })
-            .child(div().flex_1())
-            .when(path.is_some(), |this| {
-                this.child(
-                    button(("create-folder", at), ButtonKind::Plain, true, true, theme)
-                        .on_click(cx.listener(move |this, _, _, cx| this.create_folder(at, cx)))
-                        .child(icon(SbIcon::FolderPlus, px(14.), c.fg))
-                        .child("Create folder from this path")
-                        .automation_target_with(move || {
-                            format!("unsorted/group/{at}/create-folder").into()
-                        }),
-                )
-            });
-        // The list gives the group its height: the section and the 12px gap under it.
-        div()
-            .w_full()
-            .pb(theme.spacing.lg)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .rounded(theme.radii.card)
-                    .border_1()
-                    .border_color(c.line_subtle)
-                    .overflow_hidden()
-                    .child(head)
-                    .children(
-                        group.sessions[..shown]
-                            .iter()
-                            .enumerate()
-                            .map(|(row, session)| self.row(at, row, session, now, theme, cx)),
-                    )
-                    .when(open && shown < group.sessions.len(), |this| {
-                        this.child(
-                            div()
-                                .id(("show-all", at))
-                                .role(Role::Button)
-                                .flex()
-                                .items_center()
-                                .h(theme.sizes.list_row_height)
-                                .px(px(10.))
-                                .text_color(c.accent_text)
-                                .text_spec(&theme.text.row)
-                                .cursor_pointer()
-                                .hover(|style| style.bg(c.s1))
-                                .on_click(cx.listener(move |this, _, _, cx| this.show_all(at, cx)))
-                                .child(format!("Show all {}", group.sessions.len()))
-                                .automation_target_with(move || {
-                                    format!("unsorted/group/{at}/show-all").into()
-                                }),
-                        )
-                    })
-                    .automation_target_with(move || format!("unsorted/group/{at}").into()),
-            )
-            .into_any_element()
+            .automation_target_with(move || format!("unsorted/group/{index}").into())
     }
 
     /// A session's row (DESIGN §4.6): its title and the start of its prompt, its agent's mark
     /// and model, when it ended, and its tool calls.
+    #[expect(clippy::too_many_arguments)]
     fn row(
         &self,
-        group: usize,
-        row: usize,
+        part: Div,
+        at: usize,
+        (group, row): (usize, usize),
         session: &Session,
         now: i64,
         theme: &SbTheme,
         cx: &Context<Self>,
     ) -> AnyElement {
         let c = &theme.colors;
-        let library = self.library.read(cx);
-        let selected = library.selected() == Some(&session.id);
+        let selected = self.library.read(cx).selected() == Some(&session.id);
         let title: SharedString = session
             .title
             .clone()
@@ -412,17 +482,14 @@ impl UnsortedView {
             .into();
         let model = agents::model(&session.id.provider, &session.models, cx)
             .unwrap_or_else(|| agents::name(&session.id.provider, cx));
-        let (id, opened) = (session.id.clone(), session.clone());
-        div()
-            .id(("row", group * 100_000 + row))
+        let id = session.id.clone();
+        part.id(("row", at))
             .role(Role::ListItem)
             .flex()
             .items_center()
             .gap(theme.spacing.lg)
             .h(theme.sizes.list_row_height)
-            .px(px(10.))
-            .border_b_1()
-            .border_color(c.line_subtle)
+            .px(ROW_PADDING)
             .text_spec(&theme.text.row)
             .whitespace_nowrap()
             .cursor_pointer()
@@ -434,13 +501,13 @@ impl UnsortedView {
                 }
             })
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                let (id, opened) = (id.clone(), opened.clone());
-                this.library.update(cx, |library, cx| {
-                    library.select(id, cx);
-                    if event.click_count() > 1 {
-                        library.open(opened, cx);
-                    }
-                });
+                if event.click_count() > 1 {
+                    this.open(&id, cx);
+                } else {
+                    let id = id.clone();
+                    this.library
+                        .update(cx, |library, cx| library.select(id, cx));
+                }
             }))
             .child(
                 div()
@@ -471,19 +538,25 @@ impl UnsortedView {
             .child(
                 div()
                     .flex_none()
-                    .w(px(96.))
+                    .w(MODEL_WIDTH)
                     .flex()
                     .items_center()
                     .gap(theme.spacing.sm)
-                    .overflow_hidden()
                     .text_color(c.fg2)
-                    .child(agents::mark(&session.id.provider, px(12.), cx))
-                    .child(model),
+                    .child(agents::mark(&session.id.provider, theme.sizes.icon_xs, cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(model),
+                    ),
             )
             .child(
                 div()
                     .flex_none()
-                    .w(px(84.))
+                    .w(DAY_WIDTH)
                     .text_color(c.fg3)
                     .text_spec(&theme.text.number)
                     .child(
@@ -497,7 +570,7 @@ impl UnsortedView {
             .child(
                 div()
                     .flex_none()
-                    .w(px(64.))
+                    .w(CALLS_WIDTH)
                     .flex()
                     .justify_end()
                     .text_color(c.fg2)
@@ -506,6 +579,62 @@ impl UnsortedView {
             )
             .automation_target_with(move || format!("unsorted/row/{group}/{row}").into())
     }
+
+    /// The row that shows the rest of a group's sessions.
+    fn show_all_row(
+        &self,
+        part: Div,
+        at: usize,
+        of: usize,
+        group: &PathGroup,
+        theme: &SbTheme,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let c = &theme.colors;
+        let key = group_key(group);
+        part.id(("show-all", at))
+            .role(Role::Button)
+            .tab_index(0)
+            .flex()
+            .items_center()
+            .h(theme.sizes.list_row_height)
+            .px(ROW_PADDING)
+            .text_color(c.accent_text)
+            .text_spec(&theme.text.row)
+            .cursor_pointer()
+            .hover(|style| style.bg(c.s1))
+            .focus_visible(|style| style.bg(c.s2))
+            .on_click(cx.listener(move |this, _, _, cx| this.show_all(key.clone(), cx)))
+            .child(format!(
+                "Show all {}",
+                format::count(group.sessions.len() as u64)
+            ))
+            .automation_target_with(move || format!("unsorted/group/{of}/show-all").into())
+    }
+}
+
+/// The line under a group's head that says why its folder could not be made.
+fn refused(part: Div, why: &str, theme: &SbTheme) -> AnyElement {
+    let c = &theme.colors;
+    part.flex()
+        .items_center()
+        .gap(theme.spacing.md)
+        .h(theme.sizes.list_row_height)
+        .px(ROW_PADDING)
+        .bg(c.red_soft)
+        .text_color(c.red)
+        .text_spec(&theme.text.row)
+        .whitespace_nowrap()
+        .child(icon(SbIcon::CircleAlert, theme.sizes.icon_sm, c.red))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(format!("No folder was made: {why}.")),
+        )
+        .automation_target("unsorted/refused")
 }
 
 impl Render for UnsortedView {
@@ -513,14 +642,14 @@ impl Render for UnsortedView {
         let theme = cx.sb_theme().clone();
         self.lay_out(&theme, cx);
         let library = self.library.read(cx);
-        let loaded = matches!(library.page(), Some(Page::Unsorted(_)));
-        let groups = self.groups(cx);
+        let loaded = library.page().is_some();
+        let groups = library.groups();
         let sessions: usize = groups.iter().map(|group| group.sessions.len()).sum();
         div()
             .size_full()
             .flex()
             .flex_col()
-            .gap(px(14.))
+            .gap(PAGE_GAP)
             .pt(theme.sizes.page_top)
             .px(theme.sizes.page_side)
             .child(header(
@@ -552,18 +681,22 @@ impl Render for UnsortedView {
                         .automation_target("unsorted/summary"),
                 )
                 .child(
+                    // The scrollbar is in the page's side padding, clear of the rows.
                     div()
                         .relative()
                         .flex_1()
                         .min_h_0()
+                        .mr(-theme.sizes.page_side)
                         .child(
-                            v_virtual_list(
-                                cx.entity(),
-                                "groups",
-                                self.sizes.clone(),
-                                Self::render_groups,
-                            )
-                            .track_scroll(&self.scroll),
+                            div().size_full().pr(theme.sizes.page_side).child(
+                                v_virtual_list(
+                                    cx.entity(),
+                                    "groups",
+                                    self.sizes.clone(),
+                                    Self::render_items,
+                                )
+                                .track_scroll(&self.scroll),
+                            ),
                         )
                         .child(Scrollbar::vertical(&self.scroll)),
                 )
@@ -580,5 +713,37 @@ impl Render for UnsortedView {
                         .automation_target("page/empty"),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn a_group_is_its_head_and_the_sessions_that_show() {
+        // Seven sessions with five showing, two with both, three closed, one refused.
+        assert_eq!(
+            items([(7, 5, false), (2, 2, false), (3, 0, false), (1, 1, true)]),
+            [
+                Item::Head(0),
+                Item::Row(0, 0),
+                Item::Row(0, 1),
+                Item::Row(0, 2),
+                Item::Row(0, 3),
+                Item::Row(0, 4),
+                Item::ShowAll(0),
+                Item::Head(1),
+                Item::Row(1, 0),
+                Item::Row(1, 1),
+                Item::Head(2),
+                Item::Head(3),
+                Item::Refused(3),
+                Item::Row(3, 0),
+            ]
+        );
+        assert_eq!(items([]), []);
     }
 }

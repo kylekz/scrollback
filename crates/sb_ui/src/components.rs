@@ -6,14 +6,14 @@ use std::time::Duration;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Div, ElementId, Hsla, InteractiveElement as _,
     IntoElement, ParentElement as _, Pixels, Role, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Transformation, div, percentage,
-    prelude::FluentBuilder as _, px, relative, svg,
+    StatefulInteractiveElement as _, Styled as _, TextRun, Transformation, Window, div, font,
+    percentage, prelude::FluentBuilder as _, px, relative, svg,
 };
 use sb_core::location::LocationKind;
 
 use crate::format;
 use crate::icons::SbIcon;
-use crate::theme::{SbTheme, StyledText as _};
+use crate::theme::{SbTheme, StyledText as _, TextSpec};
 
 /// How a control that can't be used yet is drawn (`.btn:disabled`).
 pub const DISABLED_OPACITY: f32 = 0.45;
@@ -27,12 +27,30 @@ pub fn icon(icon: SbIcon, size: Pixels, color: Hsla) -> impl IntoElement {
         .text_color(color)
 }
 
+/// How wide `text` is on one line set in `spec`.
+pub fn text_width(text: &str, spec: &TextSpec, window: &Window) -> Pixels {
+    let mut font = font(spec.family.clone());
+    font.weight = spec.weight;
+    let run = TextRun {
+        len: text.len(),
+        font,
+        color: Hsla::default(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .shape_line(text.to_string().into(), spec.size, &[run], None)
+        .width
+}
+
 /// The sync glyph at 14px in `color`, turning while a pass runs (DESIGN §4.1).
-pub fn sync_glyph(syncing: bool, color: Hsla) -> AnyElement {
+pub fn sync_glyph(syncing: bool, color: Hsla, theme: &SbTheme) -> AnyElement {
     let glyph = svg()
         .flex_none()
         .path(SbIcon::RefreshCw.path())
-        .size(px(14.))
+        .size(theme.sizes.icon_sm)
         .text_color(color);
     if syncing {
         glyph
@@ -145,6 +163,11 @@ pub fn tag(label: impl Into<SharedString>, tone: Tone, small: bool, theme: &SbTh
         .child(label.into())
 }
 
+/// How wide [`tag`] draws `label`.
+pub fn tag_width(label: &str, theme: &SbTheme, window: &Window) -> Pixels {
+    text_width(label, &theme.text.tag, window) + theme.spacing.sm * 2.
+}
+
 /// The tag that names a location, in its kind's colours (`.tag.win` for this machine).
 pub fn location_tag(
     name: impl Into<SharedString>,
@@ -156,6 +179,11 @@ pub fn location_tag(
         LocationKind::Local => Tone::Accent,
     };
     tag(name, tone, small, theme)
+}
+
+/// How wide [`warn_chip`] draws `label`.
+pub fn warn_chip_width(label: &str, theme: &SbTheme, window: &Window) -> Pixels {
+    text_width(label, &theme.text.small, window) + theme.spacing.sm * 2.
 }
 
 /// A chip that warns (`.chip.warn`), as low as a card's last line.
@@ -174,6 +202,59 @@ pub fn warn_chip(label: &'static str, theme: &SbTheme) -> impl IntoElement {
         .whitespace_nowrap()
         .child(label)
 }
+
+/// Makes a control one the keyboard reaches with `Tab` (DESIGN §4.1), in the order it is
+/// drawn, and pressed with `Enter` or `Space`. While it has the keyboard its border is
+/// `accent`, so it needs one: a control drawn without gives itself a transparent one.
+pub fn tab_stop(control: Stateful<Div>, theme: &SbTheme) -> Stateful<Div> {
+    let accent = theme.colors.accent;
+    control
+        .tab_index(0)
+        .focus_visible(move |style| style.border_color(accent))
+}
+
+/// A square button that is only a glyph (`.ibtn`), `size` on a side. The caller gives it its
+/// glyph, its label for assistive technology and what a click does.
+pub fn icon_button(id: impl Into<ElementId>, size: Pixels, theme: &SbTheme) -> Stateful<Div> {
+    let hover = theme.colors.s2;
+    tab_stop(
+        div()
+            .id(id)
+            .role(Role::Button)
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(size)
+            .rounded(theme.radii.control)
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover)),
+        theme,
+    )
+}
+
+/// A banner that says something went wrong (`.banner.bad`: `red-soft`, an alert glyph in
+/// `red`, radius 8). The caller gives it its text and its button.
+pub fn bad_banner(theme: &SbTheme) -> Div {
+    let c = &theme.colors;
+    div()
+        .flex()
+        .items_center()
+        .gap(BANNER_GAP)
+        .py(theme.spacing.md)
+        .px(theme.spacing.lg)
+        .rounded(theme.radii.row)
+        .bg(c.red_soft)
+        .child(icon(SbIcon::CircleAlert, theme.sizes.icon_sm, c.red))
+}
+
+/// The gap between a banner's glyph, text and button (`.banner`).
+pub const BANNER_GAP: Pixels = px(10.);
+
+/// A button's padding at its sides (`.btn`).
+const BUTTON_PADDING: Pixels = px(10.);
 
 /// How a button is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,7 +299,7 @@ pub fn button(
                     .text_spec(&theme.text.control_small)
             } else {
                 this.h(theme.sizes.control_height)
-                    .px(px(10.))
+                    .px(BUTTON_PADDING)
                     .text_spec(&theme.text.control)
             }
         })
@@ -230,7 +311,9 @@ pub fn button(
         .whitespace_nowrap()
         .map(|this| {
             if enabled {
-                this.cursor_pointer().hover(move |style| style.bg(hover))
+                tab_stop(this, theme)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
             } else {
                 this.opacity(DISABLED_OPACITY)
             }
@@ -256,6 +339,9 @@ pub fn progress_bar(fraction: f32, theme: &SbTheme) -> impl IntoElement {
         )
 }
 
+/// The check in a checkbox (`.cb svg`).
+const CHECK_GLYPH: Pixels = px(10.);
+
 /// A checkbox (`.cb`: 14 square, radius 4), filled `accent` with a check when `checked`.
 pub fn checkbox(checked: bool, theme: &SbTheme) -> impl IntoElement {
     let c = &theme.colors;
@@ -270,7 +356,7 @@ pub fn checkbox(checked: bool, theme: &SbTheme) -> impl IntoElement {
         .border(px(1.5))
         .when(checked, |this| {
             this.bg(c.accent)
-                .child(icon(SbIcon::Check, px(10.), c.accent_ink))
+                .child(icon(SbIcon::Check, CHECK_GLYPH, c.accent_ink))
         })
 }
 
@@ -291,5 +377,5 @@ pub fn page_tile(glyph: SbIcon, accent: bool, theme: &SbTheme) -> impl IntoEleme
         .size(theme.sizes.page_tile)
         .rounded(theme.radii.tile)
         .bg(fill)
-        .child(icon(glyph, px(26.), color))
+        .child(icon(glyph, theme.sizes.tile_glyph, color))
 }
