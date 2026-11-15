@@ -15,7 +15,8 @@
 //! folder is its alone (it is named by its key); the folders above it are shared, and are
 //! removed only when that leaves them empty ([`crate::archive::Archive::delete_for_good`]).
 //! What is freed in the catalogue's file is overwritten, so of the session the catalogue keeps
-//! only its tombstone: its title, its project path and its items' keys.
+//! only its tombstone: its identity, its items' keys, its project path and when it ran, and
+//! nothing of what was said in it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -31,9 +32,10 @@ use crate::provider::ScannedItem;
  * What deleting a session for good removes: what the confirmation names (DESIGN §4.8), and
  * what [`crate::archive::Archive::delete_for_good`] is given back, to delete only that.
  *
- * The session's title and project path stay in its tombstone, for Settings to name it; and the
- * catalogue's backups made before the delete hold its row as it was (title, project path, the
- * start of its first prompt) until they age out of `backups/`. Its text is in no backup.
+ * Its project path and when it ran stay in its tombstone, for Settings to name it, and nothing
+ * of what was said in it. The catalogue's backups made before the delete hold its row as it
+ * was (its title, which may be the start of its first prompt, and its project path) until
+ * they age out of `backups/`. Its text is in no backup.
  */
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Deletion {
@@ -56,9 +58,10 @@ pub struct Tombstone {
     pub session: SessionId,
     /// When, in Unix milliseconds.
     pub deleted: i64,
-    /// What its row said when it was deleted.
-    pub title: Option<String>,
+    /// Where and when it ran, as its row said when it was deleted.
     pub project_path: Option<String>,
+    pub started: Option<i64>,
+    pub ended: Option<i64>,
 }
 
 /// The files of one deleted item that are still to be removed, in its folder under `files/`.
@@ -198,9 +201,6 @@ impl Catalogue {
             if deletion(tx, id)? != *shown {
                 return Err(CatalogueError::DeletionChanged(id.clone()));
             }
-            /* What is freed in the file is overwritten: nothing of the session is left in it
-            but its tombstone. */
-            tx.pragma_update(None, "secure_delete", true)?;
             let identity = params![id.location, id.provider, id.key];
             let items: Vec<(i64, String, String)> = tx
                 .prepare(
@@ -209,29 +209,30 @@ impl Catalogue {
                 )?
                 .query_map(identity, |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .collect::<rusqlite::Result<_>>()?;
-            let (title, project_path): (Option<String>, Option<String>) = tx
+            let (project_path, started, ended): (Option<String>, Option<i64>, Option<i64>) = tx
                 .query_row(
-                    "SELECT title, project_path FROM session
+                    "SELECT project_path, started_at, ended_at FROM session
                      WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
                     identity,
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?
                 .unwrap_or_default();
             tx.execute(
-                "INSERT INTO tombstone (location_id, provider, session, deleted_at, title,
-                                        project_path)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO tombstone (location_id, provider, session, deleted_at, project_path,
+                                        started_at, ended_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT (location_id, provider, session) DO UPDATE SET
-                     deleted_at = excluded.deleted_at, title = excluded.title,
-                     project_path = excluded.project_path",
+                     deleted_at = excluded.deleted_at, project_path = excluded.project_path,
+                     started_at = excluded.started_at, ended_at = excluded.ended_at",
                 params![
                     id.location,
                     id.provider,
                     id.key,
                     now_ms(),
-                    title,
-                    project_path
+                    project_path,
+                    started,
+                    ended
                 ],
             )?;
             for forget in [
@@ -278,7 +279,8 @@ impl Catalogue {
     pub fn tombstones(&self) -> Result<Vec<Tombstone>> {
         self.db.read(|c| {
             Ok(c.prepare(
-                "SELECT location_id, provider, session, deleted_at, title, project_path
+                "SELECT location_id, provider, session, deleted_at, project_path, started_at,
+                        ended_at
                  FROM tombstone ORDER BY deleted_at DESC, location_id, provider, session",
             )?
             .query_map([], |row| {
@@ -289,8 +291,9 @@ impl Catalogue {
                         key: row.get(2)?,
                     },
                     deleted: row.get(3)?,
-                    title: row.get(4)?,
-                    project_path: row.get(5)?,
+                    project_path: row.get(4)?,
+                    started: row.get(5)?,
+                    ended: row.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?)

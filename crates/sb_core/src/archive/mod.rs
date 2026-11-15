@@ -30,7 +30,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -171,8 +171,9 @@ pub struct Archive {
     dir: PathBuf,
     id: String,
     catalogue: Catalogue,
-    /// The search text, in a database of its own (`crate::search`).
-    search: SearchIndex,
+    /// The search text, in a database of its own (`crate::search`), once it could be opened:
+    /// a derived file never stops the archive opening ([`Archive::search_index`]).
+    search: Mutex<Option<Arc<SearchIndex>>>,
     /// The locations a sync is running on.
     syncing: Mutex<HashSet<LocationId>>,
     /// Held shared from a segment's move into place until its commit, and exclusively by
@@ -267,7 +268,14 @@ impl Archive {
         files and its text; finished before today's backup, which so holds no pending removal
         a restore could take for one still to do. */
         archive.remove_deleted()?;
-        archive.forget_deleted_text()?;
+        if let Err(error) = archive.forget_deleted_text() {
+            log::warn!("the search text of sessions deleted for good is left for later: {error}");
+        }
+        /* What a write before took out of either database is in no file once this is done. */
+        archive.catalogue.empty_log();
+        if let Ok(search) = archive.search_index() {
+            search.empty_log();
+        }
         archive.catalogue.daily_backup();
         Ok(archive)
     }
@@ -299,16 +307,31 @@ impl Archive {
             dir: dir.to_path_buf(),
             id,
             catalogue,
-            search: SearchIndex::open(dir)?,
+            search: Mutex::new(
+                SearchIndex::open(dir)
+                    .inspect_err(|error| log::warn!("search is not available: {error}"))
+                    .map(Arc::new)
+                    .ok(),
+            ),
             syncing: Mutex::default(),
             placing: RwLock::default(),
             _lock: lock,
         })
     }
 
-    /// The search text (`crate::search`).
-    pub(crate) fn search_index(&self) -> &SearchIndex {
-        &self.search
+    /// The search text (`crate::search`), opened now if it could not be before; or why it
+    /// can't be, which is also said in the log.
+    pub(crate) fn search_index(&self) -> Result<Arc<SearchIndex>, SearchError> {
+        let mut search = self.search.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(search) = &*search {
+            return Ok(Arc::clone(search));
+        }
+        let opened = Arc::new(SearchIndex::open(&self.dir).map_err(|error| {
+            log::warn!("search is not available: {error}");
+            SearchError::Unavailable(error.to_string())
+        })?);
+        *search = Some(Arc::clone(&opened));
+        Ok(opened)
     }
 
     /// Takes out of the search text every session that has no row in the catalogue: one
@@ -320,14 +343,15 @@ impl Archive {
             .into_iter()
             .map(|(id, _)| id)
             .collect();
-        let docs = self.search.docs()?;
+        let search = self.search_index()?;
+        let docs = search.docs()?;
         let all = docs.len();
         let gone: Vec<_> = docs.into_keys().filter(|id| !rows.contains(id)).collect();
         /* The index was emptied: so is the text, at once. */
         if !gone.is_empty() && gone.len() == all {
-            return Ok(self.search.clear()?);
+            return Ok(search.clear()?);
         }
-        Ok(self.search.forget(&gone)?)
+        Ok(search.forget(&gone)?)
     }
 
     pub fn dir(&self) -> &Path {
@@ -595,7 +619,10 @@ impl Archive {
     pub fn set_aside_uncatalogued(&self) -> Result<Vec<PathBuf>> {
         /* No segment is between its place and its commit while this looks and moves. */
         let _quiet = self.placing.write().unwrap_or_else(PoisonError::into_inner);
-        let uncatalogued = self.uncatalogued(&self.accounted(&self.catalogue.stored()?)?)?;
+        let uncatalogued = self.uncatalogued(
+            &self.accounted(&self.catalogue.stored()?)?,
+            &self.removing()?,
+        )?;
         if !uncatalogued.is_empty() && !self.catalogue.has_items()? {
             return Err(ArchiveError::NothingRecorded(self.dir.clone()));
         }
@@ -610,8 +637,13 @@ impl Archive {
     }
 
     /// Every path under `files/`, relative to the archive, that is not among `accounted`
-    /// ([`accounted`]). A folder that is not is one path, whatever it holds.
-    fn uncatalogued(&self, accounted: &HashSet<PathBuf>) -> Result<Vec<PathBuf>> {
+    /// ([`accounted`]), but what is in the folders of deleted items still to be removed,
+    /// `removing`. A folder that is not is one path, whatever it holds.
+    fn uncatalogued(
+        &self,
+        accounted: &HashSet<PathBuf>,
+        removing: &HashSet<PathBuf>,
+    ) -> Result<Vec<PathBuf>> {
         let mut uncatalogued = Vec::new();
         let mut folders = vec![PathBuf::from(layout::FILES)];
         while let Some(folder) = folders.pop() {
@@ -621,7 +653,7 @@ impl Archive {
                 let path = folder.join(entry.file_name());
                 let is_dir = entry.file_type().map_err(io_error("list", &dir))?.is_dir();
                 if accounted.contains(&path) {
-                    if is_dir {
+                    if is_dir && !removing.contains(&path) {
                         folders.push(path);
                     }
                 } else if !is_dir || holds_files(&self.dir.join(&path)) {
@@ -1171,7 +1203,7 @@ mod tests {
      * the removal pending, and the next start finishes it, before it makes the day's backup.
      * The deleted item's files and folders go, and its neighbour's in the same folder of
      * `files/` stay. A deleted item archived again before that start keeps the files it has
-     * again, and so does a file that holds other bytes than were deleted.
+     * again; one the catalogue records nothing in goes whole, whatever its bytes.
      */
     #[test]
     fn a_delete_for_good_cut_short_is_finished_at_the_next_start() {
@@ -1236,18 +1268,13 @@ mod tests {
         let archive = Archive::open(dir.path()).unwrap();
         assert!(!doomed_file.exists());
         assert!(!doomed_file.parent().unwrap().parent().unwrap().exists());
-        assert!(kept_file.is_file() && again_file.is_file() && other_file.is_file());
+        assert!(kept_file.is_file() && again_file.is_file() && !other_file.exists());
         assert!(archive.catalogue().removals().unwrap().is_empty());
         let report = archive
             .verify(&toolbox_process::CancelToken::new())
             .unwrap();
         assert_eq!((report.versions, report.damaged.len()), (2, 0));
-        /* Its folder, and the one that holds it, which holds no other item. */
-        let other = other_file.ancestors().nth(3).unwrap();
-        assert_eq!(
-            report.uncatalogued,
-            [other.strip_prefix(archive.dir()).unwrap()]
-        );
+        assert!(report.uncatalogued.is_empty(), "{:?}", report.uncatalogued);
         /* Today's backup was made once nothing was pending. */
         let backups = archive.dir().join("backups");
         let backup = fs::read_dir(&backups)
@@ -1305,5 +1332,62 @@ mod tests {
             catalogue.mark_as_read(&[(&stored[0], false)]).unwrap(),
             [true]
         );
+    }
+
+    /**
+     * A delete for good that stopped between its commit and taking the session's text out of
+     * the search index: the next start takes it out, and no other session's.
+     */
+    #[test]
+    fn the_text_of_a_session_deleted_before_a_crash_is_taken_out_at_the_next_start() {
+        use crate::catalogue::Indexed;
+        use crate::search::Text;
+        let (dir, archive, location) = archive();
+        let catalogue = archive.catalogue();
+        let sessions = ["doomed", "kept"].map(|key| SessionId {
+            location: location.clone(),
+            provider: "fixture".to_string(),
+            key: key.to_string(),
+        });
+        let items = sessions.each_ref().map(|id| ScannedItem {
+            kind: ItemKind::Transcript,
+            session: Some(id.key.clone()),
+            ..scanned(&format!("items/{}", id.key))
+        });
+        archive
+            .store(
+                items
+                    .iter()
+                    .map(|item| first(&archive, &location, item, b"bytes"))
+                    .collect(),
+            )
+            .unwrap();
+        for id in &sessions {
+            catalogue
+                .record_session(id, 1, Hash::of(b""), Indexed::Faulted("no parser"))
+                .unwrap();
+        }
+        let texts: Vec<Text> = catalogue
+            .made(None, None)
+            .unwrap()
+            .into_iter()
+            .map(|(id, made)| Text {
+                id,
+                made,
+                title: Some("a title".to_string()),
+                spans: Vec::new(),
+            })
+            .collect();
+        let search = archive.search_index().unwrap();
+        assert_eq!(search.record(&texts, |_| Ok(true)).unwrap(), 2);
+        catalogue.trash(&sessions[0]).unwrap();
+        catalogue
+            .delete_for_good(&catalogue.deletion(&sessions[0]).unwrap())
+            .unwrap();
+        drop((search, archive));
+
+        let archive = Archive::open(dir.path()).unwrap();
+        let docs = archive.search_index().unwrap().docs().unwrap();
+        assert_eq!(docs.into_keys().collect::<Vec<_>>(), [sessions[1].clone()]);
     }
 }

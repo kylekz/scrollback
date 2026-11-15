@@ -33,9 +33,11 @@ type Spans = BTreeMap<i64, u32>;
 
 impl Archive {
     /// How many sessions' text is not searchable yet, or is of what they were before: what
-    /// the palette's "Still indexing" line counts (DESIGN §4.9).
+    /// the palette's "Still indexing" line counts (DESIGN §4.9). A session the archive could
+    /// not be read for when its text was to be made is counted until an index of a start
+    /// reads it.
     pub fn unsearchable(&self) -> Result<usize, SearchError> {
-        let docs = self.search_index().docs()?;
+        let docs = self.search_index()?.docs()?;
         Ok(self
             .catalogue()
             .made(None, None)?
@@ -86,7 +88,8 @@ impl Archive {
             }
         };
         let every = (1u32 << terms.len()) - 1;
-        let (docs, sessions) = self.search_index().read(|c| {
+        let search = self.search_index()?;
+        let (docs, sessions) = search.read(|c| {
             let mut docs: Option<HashMap<i64, Spans>> = None;
             for (at, term) in terms.iter().enumerate() {
                 let found = if indexed(term) {
@@ -114,21 +117,24 @@ impl Archive {
                 });
             }
             let docs = docs.unwrap_or_default();
-            let mut identity =
-                c.prepare("SELECT location_id, provider, session FROM doc WHERE id = ?1")?;
+            /* The sessions the docs found are, in one read. */
             let mut sessions = HashMap::new();
-            for doc in docs.keys() {
-                let id = identity
-                    .query_row([doc], |row| {
-                        Ok(SessionId {
-                            location: row.get(0)?,
-                            provider: row.get(1)?,
-                            key: row.get(2)?,
-                        })
-                    })
-                    .optional()?;
-                if let Some(id) = id {
-                    sessions.insert(id, *doc);
+            let mut select = c.prepare("SELECT id, location_id, provider, session FROM doc")?;
+            let mut rows = select.query([])?;
+            let mut read = 0;
+            while let Some(row) = rows.next()? {
+                read += 1;
+                if read % CHECK_EVERY == 0 {
+                    stop()?;
+                }
+                let doc: i64 = row.get(0)?;
+                if docs.contains_key(&doc) {
+                    let id = SessionId {
+                        location: row.get(1)?,
+                        provider: row.get(2)?,
+                        key: row.get(3)?,
+                    };
+                    sessions.insert(id, doc);
                 }
             }
             Ok((docs, sessions))
@@ -166,39 +172,46 @@ impl Archive {
                 .map(|(id, _)| *id)
                 .take(limit.per_session)
                 .collect();
-            let shown = self.search_index().read(|c| {
+            let shown = search.read(|c| {
+                /* Of the session's doc still: a doc's id goes to another session's only once
+                this one's is forgotten, between that read and this. */
                 let mut span = c.prepare(
-                    "SELECT kind, subagent, turn, block, unattached, cut, text FROM span
-                     WHERE id = ?1",
+                    "SELECT s.kind, s.subagent, s.turn, s.block, s.unattached, s.cut, s.text
+                     FROM span s JOIN doc d ON d.id = ?2
+                     WHERE s.id = ?1 AND d.location_id = ?3 AND d.provider = ?4 AND d.session = ?5",
                 )?;
                 let mut shown = Vec::new();
-                for id in first {
+                for span_id in first {
                     stop()?;
                     let found = span
-                        .query_row([id], |row| {
-                            let kind: String = row.get(0)?;
-                            let at = match (row.get(2)?, row.get(3)?, row.get(4)?) {
-                                (Some(turn), Some(block), _) => Some(At::Block {
-                                    turn,
-                                    block: BlockId(block),
-                                }),
-                                (_, _, Some(place)) => Some(At::Unattached(place)),
-                                _ => None,
-                            };
-                            let text: String = row.get(6)?;
-                            Ok(match MatchKind::from_str(&kind) {
-                                None => None,
-                                Some(kind) => Some(Match {
-                                    kind,
-                                    subagent: row.get(1)?,
-                                    at,
-                                    cut: row.get(5)?,
-                                    snippet: snippet(&text, &terms),
-                                }),
-                            })
-                        })
+                        .query_row(
+                            params![span_id, doc, id.location, id.provider, id.key],
+                            |row| {
+                                let kind: String = row.get(0)?;
+                                let at = match (row.get(2)?, row.get(3)?, row.get(4)?) {
+                                    (Some(turn), Some(block), _) => Some(At::Block {
+                                        turn,
+                                        block: BlockId(block),
+                                    }),
+                                    (_, _, Some(place)) => Some(At::Unattached(place)),
+                                    _ => None,
+                                };
+                                let text: String = row.get(6)?;
+                                Ok(match MatchKind::from_str(&kind) {
+                                    None => None,
+                                    Some(kind) => Some(Match {
+                                        kind,
+                                        subagent: row.get(1)?,
+                                        at,
+                                        cut: row.get(5)?,
+                                        snippet: snippet(&text, &terms),
+                                    }),
+                                })
+                            },
+                        )
                         .optional()?
-                        .flatten();
+                        .flatten()
+                        .filter(|found| !found.snippet.hits.is_empty());
                     shown.extend(found);
                 }
                 Ok(shown)
@@ -213,15 +226,19 @@ impl Archive {
     }
 }
 
-/// The spans that hold `term`, which the index holds, by session: of `among` only, when given.
+/**
+ * The spans that hold `term`, which the index holds, by session: of `among` only, when given.
+ * The index says which spans have every run of three characters of the term (each one FTS5
+ * string: text, whatever it holds). For a term of three characters that is the answer, as the
+ * index folds text exactly as the term was ([`super::text`]); for a longer one, the text of
+ * each of those spans says whether it holds the term.
+ */
 fn looked_up(
     c: &Connection,
     term: &str,
     among: Option<&HashMap<i64, Spans>>,
     stop: &dyn Fn() -> Result<(), SearchError>,
 ) -> Result<HashMap<i64, Vec<i64>>, SearchError> {
-    /* Every run of three characters of the term, each one FTS5 string: text, whatever it
-    holds. The index says which spans have them all; their text says which hold the term. */
     let chars: Vec<char> = term.chars().collect();
     let runs: BTreeSet<String> = chars
         .windows(INDEXED_CHARS)
@@ -232,26 +249,31 @@ fn looked_up(
         .map(|run| format!("\"{}\"", run.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" ");
-    let mut select = c.prepare(
-        "SELECT s.id, s.text FROM span_text JOIN span s ON s.id = span_text.rowid
-         WHERE span_text MATCH ?1",
-    )?;
+    let mut select = c.prepare("SELECT rowid FROM span_text WHERE span_text MATCH ?1")?;
     let mut rows = select.query([matched])?;
-    let mut found: HashMap<i64, Vec<i64>> = HashMap::new();
-    let mut read = 0;
+    let mut candidates = Vec::new();
     while let Some(row) = rows.next()? {
-        read += 1;
-        if read % CHECK_EVERY == 0 {
+        if candidates.len() % CHECK_EVERY == 0 {
             stop()?;
         }
         let id: i64 = row.get(0)?;
-        let doc = id / SPANS;
-        if among.is_some_and(|among| !among.contains_key(&doc)) {
-            continue;
+        if among.is_none_or(|among| among.contains_key(&(id / SPANS))) {
+            candidates.push(id);
         }
-        if holds(text(row)?, term) {
-            found.entry(doc).or_default().push(id);
+    }
+    let mut found: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut text = c.prepare("SELECT text FROM span WHERE id = ?1")?;
+    for (read, id) in candidates.into_iter().enumerate() {
+        if chars.len() > INDEXED_CHARS {
+            if read % CHECK_EVERY == 0 {
+                stop()?;
+            }
+            let held = text.query_row([id], |row| Ok(holds(row.get_ref(0)?.as_str()?, term)))?;
+            if !held {
+                continue;
+            }
         }
+        found.entry(id / SPANS).or_default().push(id);
     }
     Ok(found)
 }

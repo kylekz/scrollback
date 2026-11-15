@@ -171,6 +171,11 @@ fn run(
         });
     }
     searchable(archive, location, providers, cancel, &mut report)?;
+    /* A log a read held when a delete for good was to empty it is emptied now. */
+    catalogue.retry_empty_log();
+    if let Ok(search) = archive.search_index() {
+        search.retry_empty_log();
+    }
     Ok(report)
 }
 
@@ -192,7 +197,10 @@ fn searchable(
     cancel: &CancelToken,
     report: &mut IndexReport,
 ) -> Result<(), SyncError> {
-    let search = archive.search_index();
+    /* Search that is not available is left to the next index; the library is not. */
+    let Ok(search) = archive.search_index() else {
+        return Ok(());
+    };
     let mut docs = search.docs()?;
     let mut batch: Vec<Text> = Vec::new();
     for provider in providers {
@@ -227,7 +235,7 @@ fn searchable(
 
 /// Writes `texts`, of those sessions whose rows are still what the texts were made of.
 fn record(archive: &Archive, texts: &[Text]) -> Result<usize, SyncError> {
-    Ok(archive.search_index().record(texts, |text| {
+    Ok(archive.search_index()?.record(texts, |text| {
         Ok(archive.catalogue().made_of(&text.id)?.as_deref() == Some(&*text.made))
     })?)
 }

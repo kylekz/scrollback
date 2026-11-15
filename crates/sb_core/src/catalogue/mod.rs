@@ -18,6 +18,7 @@ mod trash;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
@@ -30,6 +31,7 @@ use crate::filing::FolderId;
 use crate::hash::Hash;
 use crate::location::{Location, LocationId, LocationKind, Unreachable};
 use crate::provider::{ItemKind, ScannedItem};
+use crate::search::Log;
 
 pub use folder::{Folder, FolderPath};
 pub use library::{LibraryCounts, PathGroup, Shelf};
@@ -314,6 +316,8 @@ const LOCATION: &str = "id, kind, detail, name, last_attempt_at, last_success_at
 #[derive(Clone, Debug)]
 pub struct Catalogue {
     db: Database,
+    /// Its write-ahead log, emptied after a session is deleted for good.
+    log: Arc<Log>,
 }
 
 impl Catalogue {
@@ -322,9 +326,23 @@ impl Catalogue {
     pub(crate) fn open(dir: &Path) -> Result<Self> {
         let backups = backups(dir);
         let options = OpenOptions::new(&schema::SCHEMA).backups(&backups);
+        let db = Database::open(&dir.join(DATABASE), &options)?;
+        /* What a write frees is overwritten (PLAN §4.5), on the one connection that writes. */
+        db.write(|tx| Ok::<_, CatalogueError>(tx.pragma_update(None, "secure_delete", true)?))?;
         Ok(Self {
-            db: Database::open(&dir.join(DATABASE), &options)?,
+            db,
+            log: Arc::new(Log::new(dir.join(DATABASE))),
         })
+    }
+
+    /// Empties the catalogue's write-ahead log, so what a write took out is in no file.
+    pub(crate) fn empty_log(&self) {
+        self.log.empty();
+    }
+
+    /// Empties the log, if a read held it the last time it was to be emptied.
+    pub(crate) fn retry_empty_log(&self) {
+        self.log.retry();
     }
 
     /// Makes today's backup of the catalogue, unless there is one. One that can't be made is

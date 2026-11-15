@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
@@ -105,7 +106,7 @@ impl Text {
 #[derive(Debug)]
 pub(crate) struct SearchIndex {
     db: Database,
-    path: PathBuf,
+    log: Log,
     /// Held by whoever writes a session's text and checks first that the catalogue still has
     /// its row as it was made from, and by whoever forgets a session: so no text is written
     /// after the session it is of was deleted for good.
@@ -136,11 +137,23 @@ impl SearchIndex {
             }
             opened => opened?,
         };
+        /* What a write frees is overwritten, on the one connection that writes. */
+        db.write(|tx| Ok::<_, SearchError>(tx.pragma_update(None, "secure_delete", true)?))?;
         Ok(Self {
             db,
-            path,
+            log: Log::new(path),
             writing: Mutex::default(),
         })
+    }
+
+    /// Empties the database's write-ahead log ([`Log::empty`]).
+    pub(crate) fn empty_log(&self) {
+        self.log.empty();
+    }
+
+    /// Empties the log, if a read held it the last time it was to be emptied.
+    pub(crate) fn retry_empty_log(&self) {
+        self.log.retry();
     }
 
     pub(super) fn read<T>(
@@ -178,6 +191,16 @@ impl SearchIndex {
         texts: &[Text],
         still: impl Fn(&Text) -> Result<bool, SearchError>,
     ) -> Result<usize, SearchError> {
+        let written = self.write_texts(texts, still);
+        self.log.retry();
+        written
+    }
+
+    fn write_texts(
+        &self,
+        texts: &[Text],
+        still: impl Fn(&Text) -> Result<bool, SearchError>,
+    ) -> Result<usize, SearchError> {
         let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
         let mut kept = Vec::new();
         for text in texts {
@@ -189,7 +212,6 @@ impl SearchIndex {
             return Ok(0);
         }
         self.db.write(|tx| {
-            tx.pragma_update(None, "secure_delete", true)?;
             let mut doc = tx.prepare(
                 "INSERT INTO doc (location_id, provider, session, made) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT (location_id, provider, session) DO UPDATE SET made = excluded.made
@@ -254,7 +276,6 @@ impl SearchIndex {
         {
             let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
             self.db.write(|tx| {
-                tx.pragma_update(None, "secure_delete", true)?;
                 let mut find = tx.prepare(
                     "SELECT id FROM doc WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
                 )?;
@@ -270,7 +291,7 @@ impl SearchIndex {
                 Ok::<_, SearchError>(())
             })?;
         }
-        checkpoint(&self.path);
+        self.log.empty();
         Ok(())
     }
 
@@ -279,7 +300,6 @@ impl SearchIndex {
         {
             let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
             self.db.write(|tx| {
-                tx.pragma_update(None, "secure_delete", true)?;
                 tx.execute_batch(
                     "INSERT INTO span_text (span_text) VALUES ('delete-all');
                      DELETE FROM span;
@@ -288,32 +308,39 @@ impl SearchIndex {
                 Ok::<_, SearchError>(())
             })?;
         }
-        checkpoint(&self.path);
+        self.log.empty();
         Ok(())
     }
 
     /**
-     * Checks the index against the spans it indexes, and makes it again from them when it does
-     * not match. Returns whether it matched.
+     * Checks that the index holds an entry for each span and for nothing else, in a read, and
+     * makes it again from the spans when it does not: the derived index of a derived table.
+     * Returns whether it matched.
      */
     pub(crate) fn check(&self) -> Result<bool, SearchError> {
-        let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
-        self.db.write(|tx| {
-            match tx.execute(
-                "INSERT INTO span_text (span_text, rank) VALUES ('integrity-check', 1)",
+        let matches: bool = self.db.read(|c| {
+            Ok::<_, SearchError>(c.query_row(
+                "SELECT NOT EXISTS (
+                     SELECT 1 FROM span s LEFT JOIN span_text_docsize d ON d.id = s.id
+                     WHERE d.id IS NULL)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM span_text_docsize d LEFT JOIN span s ON s.id = d.id
+                     WHERE s.id IS NULL)",
                 [],
-            ) {
-                Ok(_) => Ok(true),
-                Err(rusqlite::Error::SqliteFailure(failure, _))
-                    if failure.code == rusqlite::ErrorCode::DatabaseCorrupt =>
-                {
-                    log::warn!("the search index does not match its text; it is made again");
-                    tx.execute("INSERT INTO span_text (span_text) VALUES ('rebuild')", [])?;
-                    Ok(false)
-                }
-                Err(error) => Err(error.into()),
-            }
-        })
+                |row| row.get(0),
+            )?)
+        })?;
+        if !matches {
+            log::warn!("the search index does not match its text; it is made again");
+            let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+            self.db.write(|tx| {
+                Ok::<_, SearchError>(
+                    tx.execute("INSERT INTO span_text (span_text) VALUES ('rebuild')", [])
+                        .map(drop)?,
+                )
+            })?;
+        }
+        Ok(matches)
     }
 }
 
@@ -342,30 +369,67 @@ fn start(text: &str, bytes: usize) -> &str {
 }
 
 /**
- * Moves everything in the write-ahead log of the database at `path` into the database and
- * empties the log, so what a write took out of the database is in no file any more. A read
- * that is under way holds the log; this is tried again for a moment, and then left to the next
- * time (said in the log).
+ * The write-ahead log of a database whose writes take things out that must leave no trace:
+ * emptied after such a write ([`Log::empty`]), and again after the next write if a read held it
+ * then ([`Log::retry`]).
  */
-pub(crate) fn checkpoint(path: &Path) {
-    let done = (|| {
-        let connection = Connection::open(path)?;
-        for _ in 0..50 {
-            let busy: i64 =
-                connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
-            if busy == 0 {
-                return Ok(true);
-            }
-            thread::sleep(Duration::from_millis(20));
+#[derive(Debug)]
+pub(crate) struct Log {
+    path: PathBuf,
+    /// The last time it was to be emptied, a read held it.
+    held: AtomicBool,
+}
+
+impl Log {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            held: AtomicBool::new(false),
         }
-        Ok::<_, rusqlite::Error>(false)
-    })();
-    match done {
-        Ok(true) => {}
-        Ok(false) => log::warn!(
-            "{}: a read held its log; it is emptied later",
-            path.display()
-        ),
-        Err(error) => log::warn!("{}: its log was not emptied: {error}", path.display()),
+    }
+
+    /**
+     * Moves everything in the log into the database and empties the log, so what a write took
+     * out of the database is in no file any more. A read under way holds the log: this tries
+     * again for a moment (never waiting on a lock), and then leaves it to [`Log::retry`],
+     * saying so in the log.
+     */
+    pub(crate) fn empty(&self) {
+        let emptied = (|| {
+            let connection = Connection::open(&self.path)?;
+            connection.busy_timeout(Duration::ZERO)?;
+            for _ in 0..TRIES {
+                let busy: i64 = connection
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+                    .unwrap_or(1);
+                if busy == 0 {
+                    return Ok(true);
+                }
+                thread::sleep(APART);
+            }
+            Ok::<_, rusqlite::Error>(false)
+        })();
+        let emptied = emptied.unwrap_or_else(|error| {
+            log::warn!("{}: {error}", self.path.display());
+            false
+        });
+        if !emptied {
+            log::warn!(
+                "{}: a read held its log; it is emptied after the next write",
+                self.path.display()
+            );
+        }
+        self.held.store(!emptied, Ordering::Relaxed);
+    }
+
+    /// Empties the log if the last time it was to be, a read held it.
+    pub(crate) fn retry(&self) {
+        if self.held.load(Ordering::Relaxed) {
+            self.empty();
+        }
     }
 }
+
+/// How often, and how far apart, emptying a log that a read holds is tried: a second in all.
+const TRIES: u32 = 10;
+const APART: Duration = Duration::from_millis(100);

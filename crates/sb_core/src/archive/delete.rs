@@ -1,15 +1,17 @@
 //! Deleting a session for good (PLAN §4.5): what the archive does once the catalogue has
-//! committed the delete ([`crate::catalogue::Catalogue::delete_for_good`]): the session's text
-//! leaves the search index, the files its items had leave `files/`, and what of them was set
-//! aside in `orphans/` before goes too, since those are the session's bytes all the same.
+//! committed the delete ([`crate::catalogue::Catalogue::delete_for_good`]): the files its items
+//! had leave `files/`, what of them was set aside in `orphans/` before goes too (those are the
+//! session's bytes all the same), and its text leaves the search index.
 //!
-//! A file is removed by its name in its item's folder, and only while it holds what the
-//! catalogue recorded it held when the session was deleted. So a file that is another's by now
-//! (the session was archived again into the same folder, and then a catalogue from before that
-//! was restored) stays. An item's folder that the catalogue records an item in again is not
-//! touched at all. Nothing is removed through a link. What can't be removed now stays pending,
-//! and every start tries again; until then verify counts it as what it is, not as a stray, and
-//! nothing sets it aside.
+//! What is removed is decided by the catalogue. A deleted item's folder is named by its key,
+//! which the tombstone says the owner deleted: while the catalogue records no item in that
+//! folder, everything in it goes, whatever its bytes (a damaged segment of the session is still
+//! the session's). Once the catalogue records an item there again (the session was archived
+//! anew, or a catalogue from before was restored that holds the removal still to do), only a
+//! file it does not record, and that holds the very bytes deleted, goes. Nothing is removed
+//! through a link: such an item stays to be removed, and verify reports it. What can't be
+//! removed now stays pending, and every start tries again; until then verify counts it as what
+//! it is, not as a stray, and nothing sets it aside.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
@@ -19,7 +21,7 @@ use std::slice;
 use std::sync::PoisonError;
 
 use super::{Archive, ArchiveError, Result, accounted, layout, segment};
-use crate::catalogue::{self, Deletion, ItemFile, Removal, Stored};
+use crate::catalogue::{Deletion, ItemFile, Removal, Stored};
 
 /// What deleting a session for good did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,7 +29,7 @@ pub struct Deleted {
     /// What was deleted: what the confirmation showed.
     pub deletion: Deletion,
     /// How many of the archive's files of it are still to be removed, as removing them failed
-    /// (another program holds them). Every start tries again.
+    /// (another program holds them) or would go through a link. Every start tries again.
     pub pending: usize,
 }
 
@@ -35,29 +37,39 @@ impl Archive {
     /**
      * Deletes a session in Trash for good (PLAN §4.5): `shown` is what the confirmation showed
      * the owner, and only that is deleted ([`crate::catalogue::CatalogueError::DeletionChanged`]
-     * otherwise). Its rows go and a tombstone takes their place, in one transaction; then its
-     * text leaves the search index, and the files the catalogue had for its items, and any of
-     * them set aside in `orphans/`, are removed. Its location is not synced meanwhile, and no
-     * file under `files/` is set aside, so nothing is stored in, or taken from, the folders
-     * this removes from. Nothing at a location is touched: the archive has no way to.
+     * otherwise). Its rows go and a tombstone takes their place, in one transaction; then the
+     * files the catalogue had for its items, and any of them set aside in `orphans/`, are
+     * removed, its text leaves the search index, and both databases' logs are emptied. Its
+     * location is not synced, and nothing under `files/` is stored or set aside, while its
+     * files are removed. Nothing at a location is touched: the archive has no way to.
      *
      * Once the delete is committed this returns `Ok`, whatever is left to do: what could not
      * be removed is counted in [`Deleted::pending`], said in the log, and done at a start.
      */
     pub fn delete_for_good(&self, shown: &Deletion) -> Result<Deleted> {
         let id = &shown.session;
-        let _syncing = self
-            .begin_sync(&id.location)
-            .ok_or_else(|| ArchiveError::Syncing(id.location.clone()))?;
-        let _quiet = self.placing.write().unwrap_or_else(PoisonError::into_inner);
-        self.catalogue.delete_for_good(shown)?;
-        if let Err(error) = self.search.forget(slice::from_ref(id)) {
-            log::warn!("the search text of a deleted session is left for the next start: {error}");
+        {
+            let _syncing = self
+                .begin_sync(&id.location)
+                .ok_or_else(|| ArchiveError::Syncing(id.location.clone()))?;
+            let _quiet = self.placing.write().unwrap_or_else(PoisonError::into_inner);
+            self.catalogue.delete_for_good(shown)?;
+            if let Err(error) = self.remove_deleted() {
+                log::warn!("files of a deleted session are left for the next start: {error}");
+            }
         }
-        crate::search::checkpoint(&self.dir.join(catalogue::DATABASE));
-        if let Err(error) = self.remove_deleted() {
-            log::warn!("files of a deleted session are left for the next start: {error}");
+        /* With no lock held: emptying a log may wait a moment on a read. */
+        match self.search_index() {
+            Ok(search) => {
+                if let Err(error) = search.forget(slice::from_ref(id)) {
+                    log::warn!("the text of a deleted session is left for the next start: {error}");
+                }
+            }
+            Err(error) => {
+                log::warn!("the text of a deleted session is left for the next start: {error}");
+            }
         }
+        self.catalogue.empty_log();
         let pending = self.catalogue.pending_removals().unwrap_or_else(|error| {
             log::warn!("{error}");
             shown.files
@@ -71,50 +83,74 @@ impl Archive {
     /// Removes the files of deleted items that are pending (the module docs).
     pub(super) fn remove_deleted(&self) -> Result<()> {
         for removal in self.catalogue.removals()? {
-            let rows: Vec<i64> = removal.files.iter().map(|(row, _)| *row).collect();
-            if self
-                .catalogue
-                .has_item_in(&removal.location, &removal.provider, &removal.folder)?
-            {
-                self.catalogue.removed(&rows)?;
-                continue;
-            }
-            let done = self.remove(&removal);
+            let done = if self.catalogue.has_item_in(
+                &removal.location,
+                &removal.provider,
+                &removal.folder,
+            )? {
+                self.remove_unrecorded(&removal)?
+            } else {
+                self.remove_all(&removal)
+            };
             self.catalogue.removed(&done)?;
         }
         Ok(())
     }
 
-    /// Removes what it can of one deleted item's files. Returns the rows of `removal` that
-    /// are done.
-    fn remove(&self, removal: &Removal) -> Vec<i64> {
+    /**
+     * Removes the folder of a deleted item that the catalogue records no item in, and what was
+     * set aside of it, and then the folders above it that that leaves empty. Returns the rows
+     * of `removal` that are done: all of them, or none.
+     */
+    fn remove_all(&self, removal: &Removal) -> Vec<i64> {
         let relative = layout::item_dir(&removal.location, &removal.provider, &removal.folder);
         let item = self.dir.join(&relative);
         let top = self.dir.join(layout::FILES);
-        let all: Vec<i64> = removal.files.iter().map(|(row, _)| *row).collect();
-        /* What a link leads to is not the archive's: none of it is touched. */
+        /* What a link leads to is not the archive's: nothing is removed through one. */
         let linked = item
             .ancestors()
             .take_while(|folder| *folder != top)
-            .any(is_link);
+            .any(is_link)
+            || fs::read_dir(&item)
+                .is_ok_and(|entries| entries.flatten().any(|entry| is_link(&entry.path())));
         if linked {
             log::warn!(
-                "{} is reached through a link; nothing in it is removed",
+                "{} is reached through a link: it is not removed",
                 item.display()
             );
-            return all;
+            return Vec::new();
         }
-        let failed = |path: &Path, error: io::Error| {
+        let removed = match fs::remove_dir_all(&item) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
+        .and_then(|()| remove_set_aside(&self.dir.join(layout::ORPHANS), &relative));
+        if let Err(error) = removed {
             log::warn!(
                 "could not remove {}: {error}; a start tries again",
-                path.display()
+                item.display()
             );
-        };
+            return Vec::new();
+        }
+        /* One that is not empty holds what is not this item's. */
+        for folder in item.ancestors().skip(1).take_while(|folder| *folder != top) {
+            let _ = fs::remove_dir(folder);
+        }
+        removal.files.iter().map(|(row, _)| *row).collect()
+    }
+
+    /**
+     * Removes, from the folder of a deleted item that the catalogue records an item in again,
+     * each segment that the catalogue does not record and that holds the bytes that were
+     * deleted. Returns the rows of `removal` that are done.
+     */
+    fn remove_unrecorded(&self, removal: &Removal) -> Result<Vec<i64>> {
+        let item = self.dir.join(layout::item_dir(
+            &removal.location,
+            &removal.provider,
+            &removal.folder,
+        ));
         let mut done = Vec::new();
-        let mut source = None;
-        /* Whether everything recorded of the item is gone from its folder: only then is the
-        folder the deleted item's alone, with its source.json and what was set aside of it. */
-        let mut gone = true;
         for (row, file) in &removal.files {
             let ItemFile::Segment {
                 version,
@@ -123,105 +159,50 @@ impl Archive {
                 hash,
             } = *file
             else {
-                source = Some(*row);
+                done.push(*row);
                 continue;
             };
+            let recorded = self.catalogue.has_segment(
+                &removal.location,
+                &removal.provider,
+                &removal.folder,
+                version,
+                offset,
+            )?;
             let folder = item.join(layout::version_dir(version));
             let path = folder.join(layout::segment_file(offset));
-            if is_link(&folder) {
+            if recorded || is_link(&folder) || !segment::holds(&path, length, hash).unwrap_or(false)
+            {
                 done.push(*row);
-                gone = false;
                 continue;
             }
-            match segment::holds(&path, length, hash) {
-                Ok(true) => match fs::remove_file(&path) {
-                    Ok(()) => done.push(*row),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => done.push(*row),
-                    Err(error) => {
-                        failed(&path, error);
-                        gone = false;
-                    }
-                },
-                /* Another's bytes now: not this deletion's to remove. */
-                Ok(false) => {
-                    done.push(*row);
-                    gone = false;
+            match fs::remove_file(&path) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                    log::warn!("could not remove {}: {error}", path.display());
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => done.push(*row),
-                Err(error) => {
-                    failed(&path, error);
-                    gone = false;
-                }
+                _ => done.push(*row),
             }
         }
-        if let Some(source) = source {
-            if !gone {
-                /* It stays with what stays; it is done when the rest is. */
-                if done.len() == removal.files.len() - 1 {
-                    done.push(source);
-                }
-            } else {
-                let orphans = self.dir.join(layout::ORPHANS).join(&relative);
-                let path = item.join(layout::SOURCE);
-                let removed =
-                    remove_set_aside(&orphans).and_then(|()| match fs::remove_file(&path) {
-                        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
-                        _ => Ok(()),
-                    });
-                match removed {
-                    Ok(()) => done.push(source),
-                    Err(error) => failed(&path, error),
-                }
-            }
-        }
-        /* The version folders, then the item's and those above it, while empty. */
-        let mut folders: BTreeSet<PathBuf> = removal
-            .files
-            .iter()
-            .filter_map(|(_, file)| match *file {
-                ItemFile::Segment { version, .. } => Some(item.join(layout::version_dir(version))),
-                ItemFile::Source => None,
-            })
-            .collect();
-        folders.extend(
-            item.ancestors()
-                .take_while(|folder| *folder != top)
-                .map(Path::to_path_buf),
-        );
-        for folder in folders.iter().rev() {
-            /* One that is not empty holds what is not this item's. */
-            let _ = fs::remove_dir(folder);
-        }
-        done
+        Ok(done)
     }
 
-    /// The files of deleted items still to be removed, relative to the archive.
-    pub(super) fn removing(&self) -> Result<Vec<PathBuf>> {
+    /// The folders of deleted items still to be removed, relative to the archive.
+    pub(super) fn removing(&self) -> Result<HashSet<PathBuf>> {
         Ok(self
             .catalogue
             .removals()?
             .into_iter()
-            .flat_map(|removal| {
-                let item = layout::item_dir(&removal.location, &removal.provider, &removal.folder);
-                removal.files.into_iter().map(move |(_, file)| match file {
-                    ItemFile::Source => item.join(layout::SOURCE),
-                    ItemFile::Segment {
-                        version, offset, ..
-                    } => item
-                        .join(layout::version_dir(version))
-                        .join(layout::segment_file(offset)),
-                })
-            })
+            .map(|removal| layout::item_dir(&removal.location, &removal.provider, &removal.folder))
             .collect())
     }
 
-    /// The paths under `files/` that `stored` accounts for, and those still to be removed
-    /// with the folders they are in: none of them is a stray.
+    /// The paths under `files/` that `stored` accounts for, and the folders of deleted items
+    /// still to be removed with the folders they are in: none of them is a stray.
     pub(super) fn accounted(&self, stored: &[Stored]) -> Result<HashSet<PathBuf>> {
         let mut accounted = accounted(stored);
-        for path in self.removing()? {
+        for item in self.removing()? {
             accounted.extend(
-                path.ancestors()
+                item.ancestors()
                     .take_while(|folder| !folder.as_os_str().is_empty())
                     .map(Path::to_path_buf),
             );
@@ -236,33 +217,50 @@ fn is_link(path: &Path) -> bool {
 }
 
 /**
- * Removes what was set aside from a deleted item's folder: under `orphans/`, at the item's
- * folder's place, and at the places numbered after it that a later set-aside took because that
- * one was taken (`<folder>.1`, …).
+ * Removes what was set aside, under `orphans`, from the item folder at `relative` (to the
+ * archive): a copy keeps the path it had, except that any part of it may have been numbered
+ * (`name.1`, …) where that name was taken, so each part is matched with its numbered forms.
  */
-fn remove_set_aside(orphans: &Path) -> io::Result<()> {
-    let (Some(parent), Some(name)) = (orphans.parent(), orphans.file_name()) else {
-        return Ok(());
-    };
-    let entries = match fs::read_dir(parent) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        entries => entries?,
-    };
-    let name = name.to_string_lossy();
-    for entry in entries {
-        let entry = entry?;
-        let found = entry.file_name().to_string_lossy().into_owned();
-        let numbered = found
-            .strip_prefix(&*name)
-            .and_then(|rest| rest.strip_prefix('.'))
-            .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()));
-        if found == name || numbered {
-            let path = entry.path();
-            if entry.file_type()?.is_dir() {
-                fs::remove_dir_all(&path)?;
-            } else {
-                fs::remove_file(&path)?;
+fn remove_set_aside(orphans: &Path, relative: &Path) -> io::Result<()> {
+    let parts: Vec<String> = relative
+        .iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect();
+    let mut found = BTreeSet::new();
+    let mut level = vec![orphans.to_path_buf()];
+    for (depth, part) in parts.iter().enumerate() {
+        let mut next = Vec::new();
+        for dir in &level {
+            let entries = match fs::read_dir(dir) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotADirectory => continue,
+                entries => entries?,
+            };
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let numbered = name
+                    .strip_prefix(part.as_str())
+                    .and_then(|rest| rest.strip_prefix('.'))
+                    .is_some_and(|number| {
+                        !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+                    });
+                if name == *part || numbered {
+                    if depth + 1 == parts.len() {
+                        found.insert(entry.path());
+                    } else if entry.file_type()?.is_dir() {
+                        next.push(entry.path());
+                    }
+                }
             }
+        }
+        level = next;
+    }
+    for path in found {
+        if fs::symlink_metadata(&path)?.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
         }
     }
     Ok(())

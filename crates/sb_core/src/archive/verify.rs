@@ -60,9 +60,9 @@ pub struct VerifyReport {
     /// What is under `files/` that the catalogue doesn't record, by its path relative to the
     /// archive. A folder is one path, whatever it holds; a folder that holds no file is none.
     pub uncatalogued: Vec<PathBuf>,
-    /// The files of sessions deleted for good that are still to be removed, as removing them
-    /// failed (another program holds them), by their paths relative to the archive. The next
-    /// start removes them.
+    /// The folders of items of sessions deleted for good that are still to be removed, as
+    /// removing them failed (another program holds a file in them) or would go through a link,
+    /// by their paths relative to the archive. Every start tries again.
     pub removing: Vec<PathBuf>,
     /// The search index did not match the text it indexes, and was made again from it.
     pub search_rebuilt: bool,
@@ -75,7 +75,8 @@ impl Archive {
         no segment is between its place and its commit: every file found is then either
         recorded or not going to be. */
         let removing = self.removing()?;
-        let mut uncatalogued = self.uncatalogued(&self.accounted(&self.catalogue.stored()?)?)?;
+        let mut uncatalogued =
+            self.uncatalogued(&self.accounted(&self.catalogue.stored()?)?, &removing)?;
         let stored = {
             let _quiet = self.placing.write().unwrap_or_else(PoisonError::into_inner);
             self.catalogue.stored()?
@@ -90,7 +91,11 @@ impl Archive {
                 .into_iter()
                 .filter(|path| self.dir.join(path).exists())
                 .collect(),
-            search_rebuilt: !self.search_index().check()?,
+            /* Search that is not available is the next start's to make again. */
+            search_rebuilt: match self.search_index() {
+                Ok(search) => !search.check()?,
+                Err(_) => false,
+            },
             ..VerifyReport::default()
         };
         let mut damaged = Vec::new();

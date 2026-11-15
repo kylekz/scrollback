@@ -298,6 +298,25 @@ impl<A: Agent> Bench<A> {
         assert!(report.uncatalogued.is_empty(), "{:?}", report.uncatalogued);
         assert!(report.removing.is_empty(), "{:?}", report.removing);
         assert!(!report.search_rebuilt);
+        self.assert_search_index_intact();
+    }
+
+    /// FTS5's own check of the search index against the text it indexes, on a copy.
+    pub fn assert_search_index_intact(&self) {
+        let copy = tempfile::tempdir().unwrap();
+        for suffix in ["", "-wal"] {
+            let name = format!("search.db{suffix}");
+            if self.dir().join(&name).exists() {
+                fs::copy(self.dir().join(&name), copy.path().join(&name)).unwrap();
+            }
+        }
+        toolbox_store::rusqlite::Connection::open(copy.path().join("search.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO span_text (span_text, rank) VALUES ('integrity-check', 1)",
+                [],
+            )
+            .unwrap();
     }
 
     /// Deletes the session `id` for good, as the owner does once the confirmation showed what
@@ -429,6 +448,13 @@ pub enum Meddle<'a> {
     NoProofs,
     /// Says its parser is of this version.
     ParserVersion(u32),
+    /// Runs something once, as it parses a session for the `nth` time (from 1), before it
+    /// does: the owner acting while an index parses.
+    AtParse {
+        nth: usize,
+        parsed: AtomicUsize,
+        action: Mutex<Option<Box<dyn FnOnce() + Send + 'a>>>,
+    },
     /// Its parser stops, with a panic, on the session that has the item of this key.
     FaultyParser(String),
     /// Says its parser is of the next version, and of each item what this makes of its key and
@@ -450,6 +476,14 @@ pub enum Meddle<'a> {
 impl<'a> Meddle<'a> {
     pub fn at(when: When, action: impl FnOnce() + Send + 'a) -> Self {
         Self::At(when, Mutex::new(Some(Box::new(action))))
+    }
+
+    pub fn at_parse(nth: usize, action: impl FnOnce() + Send + 'a) -> Self {
+        Self::AtParse {
+            nth,
+            parsed: AtomicUsize::new(0),
+            action: Mutex::new(Some(Box::new(action))),
+        }
     }
 
     pub fn second_proofs_unanswered(before_first: impl FnOnce() + Send + 'a) -> Self {
@@ -515,6 +549,16 @@ impl Provider for Meddling<'_> {
     }
 
     fn parse(&self, items: &dyn SessionItems) -> Transcript {
+        if let Meddle::AtParse {
+            nth,
+            parsed,
+            action,
+        } = &self.meddle
+            && parsed.fetch_add(1, Ordering::Relaxed) + 1 == *nth
+            && let Some(action) = action.lock().unwrap().take()
+        {
+            action();
+        }
         if let Meddle::FaultyParser(key) = &self.meddle
             && items.list().iter().any(|item| item.key == *key)
         {

@@ -30,6 +30,10 @@ for_both_agents!(
     the_search_text_is_made_again_when_it_is_missing_or_unreadable,
     a_session_in_trash_is_found_only_there_and_one_deleted_for_good_nowhere,
     the_first_matches_of_a_session_are_given_and_the_rest_counted,
+    a_term_in_any_script_is_found_as_the_index_folds_it,
+    a_long_term_is_marked_whole,
+    no_text_is_written_for_a_session_deleted_while_it_is_parsed,
+    a_search_index_that_cannot_be_opened_stops_nothing_but_search,
 );
 
 /// A bench with two sessions, each an exchange the tests look for.
@@ -46,10 +50,10 @@ fn bench<A: Agent + Default>() -> (Bench<A>, [String; 2]) {
     let second = agent.add_session(2);
     agent.exchange(
         &second,
-        "Rename the 解析器 widget, Café edition, for the Юг office",
+        "Rename the 解析器 widget, Café edition, for the Юг office: Tiếng Việt, ΟΔΟΣ, ᏣᎳᎩ",
         "cargo test -p widget",
         "ok",
-        "Done: the widget is renamed.",
+        "Done: the widget is renamed, abcab.",
     );
     let bench = Bench::new(agent);
     bench.sync();
@@ -747,4 +751,111 @@ fn in_names_a_page_before_a_folder_and_folder_names_a_folder() {
     assert_eq!(shelf("x"), Shelf::All);
     /* The last token of a kind is the one that counts. */
     assert_eq!(shelf("in:starred in:unsorted"), Shelf::Unsorted);
+}
+
+/**
+ * The text check and the index fold alike, in every script: what the index finds of a term is
+ * what the text holds. A span that has every run of three characters of a term without the
+ * term is no match.
+ */
+fn a_term_in_any_script_is_found_as_the_index_folds_it<A: Agent + Default>() {
+    let (bench, [_, second]) = bench::<A>();
+    for input in ["viet", "VIỆT", "οδος", "ΟΔΟΣ", "ᏣᎳᎩ"] {
+        assert_eq!(hits(&bench, input), [second.as_str()], "{input}");
+    }
+    assert_eq!(hits(&bench, "abcab"), [second.as_str()]);
+    assert_eq!(find(&bench, "abcabc").total_matches, 0);
+    bench.assert_verifies();
+}
+
+/// A term longer than the part of a span a snippet shows about it is shown, and marked, whole.
+fn a_long_term_is_marked_whole<A: Agent + Default>() {
+    let (mut bench, [first, _]) = bench::<A>();
+    let identifier = "a_very_long_identifier_name_that_runs_well_past_thirty_two_characters";
+    bench.agent.exchange(
+        &first,
+        &format!(
+            "{} {identifier} {}",
+            "words before it ".repeat(10),
+            "and after it ".repeat(10)
+        ),
+        "true",
+        "",
+        "Fine.",
+    );
+    bench.sync();
+    let results = find(&bench, identifier);
+    let snippet = &results.sessions[0].shown[0].snippet;
+    assert_eq!(&snippet.text[snippet.hits[0].clone()], identifier);
+    bench.assert_verifies();
+}
+
+/**
+ * The second step of an index parses a session and then writes its text, if the catalogue
+ * still has the session's row: one the owner deleted for good meanwhile gets none.
+ */
+fn no_text_is_written_for_a_session_deleted_while_it_is_parsed<A: Agent + Default>() {
+    let (mut bench, [first, _]) = bench::<A>();
+    let id = bench.session_id(&first);
+    bench.archive().catalogue().trash(&id).unwrap();
+    /* The search text is lost, so the next index makes it again, parsing as it goes. */
+    bench.close();
+    fs::remove_file(bench.dir().join("search.db")).unwrap();
+    for suffix in ["-wal", "-shm"] {
+        let _ = fs::remove_file(bench.dir().join(format!("search.db{suffix}")));
+    }
+    bench.reopen();
+    let archive = bench.archive();
+    let shown = archive.catalogue().deletion(&id).unwrap();
+    let docs = || {
+        let copy = tempfile::tempdir().unwrap();
+        for suffix in ["", "-wal"] {
+            let name = format!("search.db{suffix}");
+            if bench.dir().join(&name).exists() {
+                fs::copy(bench.dir().join(&name), copy.path().join(&name)).unwrap();
+            }
+        }
+        toolbox_store::rusqlite::Connection::open(copy.path().join("search.db"))
+            .unwrap()
+            .query_row("SELECT count(*) FROM doc", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    /* The first session is deleted as the second of the two is parsed for its text: after its
+    own text is made, or after it is found to have something to make text of. */
+    let made = bench.index_with(bench.meddling(common::Meddle::at_parse(2, || {
+        archive.delete_for_good(&shown).unwrap();
+    })));
+    assert_eq!(made.searchable, 1);
+    assert_eq!(docs(), 1);
+    assert_eq!(find(&bench, "parse_args in:all").total_sessions, 0);
+    bench.assert_verifies();
+}
+
+/**
+ * The search index is derived: one that can't be opened stops nothing but search, which says
+ * so; the archive opens, syncs and verifies, and once the index can be opened it is made again.
+ */
+fn a_search_index_that_cannot_be_opened_stops_nothing_but_search<A: Agent + Default>() {
+    let (mut bench, _) = bench::<A>();
+    bench.close();
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(bench.dir().join(format!("search.db{suffix}")));
+    }
+    let blocked = bench.dir().join("search.db");
+    fs::create_dir(&blocked).unwrap();
+    fs::write(blocked.join("in the way"), b"").unwrap();
+    bench.reopen();
+    assert_eq!(bench.sessions().len(), 2);
+    assert!(matches!(
+        try_find(&bench, "parse_args", Limit::default()),
+        Err(SearchError::Unavailable(_))
+    ));
+    bench.sync();
+    let report = bench.archive().verify(&CancelToken::new()).unwrap();
+    assert!(report.damaged.is_empty() && !report.search_rebuilt);
+
+    fs::remove_dir_all(&blocked).unwrap();
+    assert_eq!(bench.index().searchable, 2);
+    assert_eq!(find(&bench, "parse_args").total_sessions, 1);
+    bench.assert_verifies();
 }

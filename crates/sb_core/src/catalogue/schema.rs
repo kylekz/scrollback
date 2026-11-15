@@ -222,15 +222,17 @@ const SEARCH_AND_DELETING: &str = "
 -- When the owner moved the session to Trash, while it is there.
 ALTER TABLE session_state ADD COLUMN trashed_at INTEGER;
 
--- The owner's: a session deleted for good, when, and what it was called then, for Settings to
--- name it. Sync archives nothing of it again (tombstone_item) until the owner removes this.
+-- The owner's: a session deleted for good, when, and where and when it ran, for Settings to
+-- name it: nothing of what was said in it. Sync archives nothing of it again (tombstone_item)
+-- until the owner removes this.
 CREATE TABLE tombstone (
     location_id TEXT NOT NULL REFERENCES location (id),
     provider TEXT NOT NULL,
     session TEXT NOT NULL,
     deleted_at INTEGER NOT NULL,
-    title TEXT,
     project_path TEXT,
+    started_at INTEGER,
+    ended_at INTEGER,
     PRIMARY KEY (location_id, provider, session)
 ) STRICT, WITHOUT ROWID;
 

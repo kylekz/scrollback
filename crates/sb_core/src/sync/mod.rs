@@ -262,6 +262,8 @@ pub fn sync_location(
             index,
         });
     }
+    /* A log a read held when a delete for good was to empty it is emptied now. */
+    catalogue.retry_empty_log();
     Ok(passes)
 }
 

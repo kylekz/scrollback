@@ -16,6 +16,7 @@
 //! something last. A session's matches are its spans that hold a term, those that hold every
 //! term first, each lot in the order of the conversation.
 
+mod fold;
 mod run;
 mod store;
 mod text;
@@ -32,7 +33,7 @@ use crate::provider::ProviderId;
 use crate::transcript::{At, SpanKind};
 
 pub use run::{MOST_TERMS, TERM_CHARS};
-pub(crate) use store::{SearchIndex, Text, checkpoint};
+pub(crate) use store::{Log, SearchIndex, Text};
 
 #[derive(Debug, Error)]
 pub enum SearchError {
@@ -42,6 +43,10 @@ pub enum SearchError {
     Catalogue(#[from] CatalogueError),
     #[error("the search was cancelled")]
     Cancelled,
+    /// The search index could not be opened, for the reason given; the archive can, and the
+    /// next index tries again.
+    #[error("search is not available: {0}")]
+    Unavailable(String),
 }
 
 impl From<rusqlite::Error> for SearchError {
