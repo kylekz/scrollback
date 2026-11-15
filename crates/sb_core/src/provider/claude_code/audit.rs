@@ -11,6 +11,7 @@ use std::io::{BufRead as _, BufReader};
 use serde_json::Value;
 
 use super::parse::{BOOKKEEPING, BOUNDARY, CONTEXT, CONVERSATION, NOTICES, QUEUED, SILENT, TITLE};
+use super::said::unknown_element;
 use crate::provider::{Audit, SessionItems};
 use crate::transcript::{Content, Conversation, Ending, Subagent, Tokens, Transcript};
 
@@ -18,22 +19,35 @@ use crate::transcript::{Content, Conversation, Ending, Subagent, Tokens, Transcr
 /// subagents' conversations there wrote them.
 const SIDECHAIN: &str = "records marked isSidechain in a session's own transcript";
 
+/// A subagent's conversation made of such records, and one of those that the parser put
+/// under the call that started it.
+const INLINE: &str = "subagents kept in a session's own transcript";
+const ATTACHED: &str =
+    "subagents kept in a session's own transcript, under the call that started them";
+
 /// A record under a uuid that an earlier record of the transcript has.
 const REWRITTEN: &str = "records written again under a uuid already used";
 
-pub(super) fn audit(items: &dyn SessionItems, transcript: &Transcript) -> Audit {
+pub(in crate::provider) fn audit(items: &dyn SessionItems, transcript: &Transcript) -> Audit {
     let mut audit = Audit::default();
-    for what in [SIDECHAIN, REWRITTEN] {
+    for what in [SIDECHAIN, INLINE, ATTACHED, REWRITTEN] {
         audit.counts.insert(what.to_string(), 0);
     }
     let mut mismatches = BTreeSet::new();
-    if let Some(conversation) = &transcript.conversation {
-        check(items, conversation, true, &mut audit, &mut mismatches);
+    let own = transcript.conversation.as_ref();
+    /* The subagents kept in the session's own transcript that are under no call are counted
+    with it; the others have transcripts of their own. */
+    let (inline, others): (Vec<&Conversation>, Vec<&Conversation>) = transcript
+        .unattached
+        .iter()
+        .filter_map(Subagent::conversation)
+        .partition(|conversation| own.is_some_and(|own| own.item == conversation.item));
+    if let Some(own) = own {
+        *audit.counts.entry(INLINE.to_string()).or_default() += inline.len() as u64;
+        check(items, own, &inline, true, &mut audit, &mut mismatches);
     }
-    for subagent in &transcript.unattached {
-        if let Subagent::Read { conversation, .. } = subagent {
-            check(items, conversation, false, &mut audit, &mut mismatches);
-        }
+    for conversation in others {
+        check(items, conversation, &[], false, &mut audit, &mut mismatches);
     }
     audit.mismatches = mismatches.into_iter().collect();
     audit
@@ -49,33 +63,20 @@ struct Counts {
     tokens: Tokens,
 }
 
-/// Checks `conversation` and those of the subagents under its calls against their records.
+/// Checks `conversation`, with `beside`, the other conversations parsed from the same
+/// transcript, against the transcript's records; and those of the subagents under their
+/// calls against theirs.
 fn check(
     items: &dyn SessionItems,
     conversation: &Conversation,
+    beside: &[&Conversation],
     main: bool,
     audit: &mut Audit,
     mismatches: &mut BTreeSet<&'static str>,
 ) {
-    let mut parsed = Counts {
-        tokens: conversation.tokens,
-        ..Counts::default()
-    };
-    for block in conversation.blocks() {
-        match &block.content {
-            Content::Reply { .. } => parsed.replies += 1,
-            Content::Thinking { .. } => parsed.thinking += 1,
-            Content::ToolCall(call) => {
-                parsed.calls += 1;
-                parsed.results += usize::from(call.result.is_some());
-                for subagent in &call.subagents {
-                    if let Subagent::Read { conversation, .. } = subagent {
-                        check(items, conversation, false, audit, mismatches);
-                    }
-                }
-            }
-            _ => {}
-        }
+    let mut parsed = Counts::default();
+    for conversation in std::iter::once(&conversation).chain(beside) {
+        tally(items, conversation, &mut parsed, audit, mismatches);
     }
     /* A transcript that couldn't be read through can't be counted through either. */
     if matches!(conversation.ending, Ending::Unreadable(_)) {
@@ -93,6 +94,53 @@ fn check(
     ] {
         if differs {
             mismatches.insert(name);
+        }
+    }
+}
+
+/// Adds what `conversation` holds to `counts`, and with it what the subagents under its calls
+/// hold that were parsed from the same transcript. Those with a transcript of their own are
+/// checked against it.
+fn tally(
+    items: &dyn SessionItems,
+    conversation: &Conversation,
+    counts: &mut Counts,
+    audit: &mut Audit,
+    mismatches: &mut BTreeSet<&'static str>,
+) {
+    counts.tokens.add(conversation.tokens);
+    for block in conversation.blocks() {
+        match &block.content {
+            Content::Reply { .. } => counts.replies += 1,
+            Content::Thinking { .. } => counts.thinking += 1,
+            Content::Prompt {
+                text, from: None, ..
+            } => {
+                if let Some(tag) = unknown_element(text) {
+                    /* A tag of Claude Code's own making has a `-` in it. Any other may be
+                    something the user wrote, and is not named. */
+                    let named = if tag.contains('-') { tag } else { "(another)" };
+                    *audit
+                        .unknown
+                        .entry(format!("a prompt that starts with the element {named}"))
+                        .or_default() += 1;
+                }
+            }
+            Content::ToolCall(call) => {
+                counts.calls += 1;
+                counts.results += usize::from(call.result.is_some());
+                for inner in call.subagents.iter().filter_map(Subagent::conversation) {
+                    if inner.item == conversation.item {
+                        for what in [INLINE, ATTACHED] {
+                            *audit.counts.entry(what.to_string()).or_default() += 1;
+                        }
+                        tally(items, inner, counts, audit, mismatches);
+                    } else {
+                        check(items, inner, &[], false, audit, mismatches);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }

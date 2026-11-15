@@ -21,7 +21,7 @@ use crate::location::LocationId;
 use crate::provider::{Provider, ProviderError, ProviderId, Source, Unlisted};
 use crate::transport::Transport;
 
-pub use index::{IndexReport, index};
+pub use index::{IndexReport, index, index_session};
 
 #[derive(Debug, Error)]
 pub enum SyncError {
@@ -103,8 +103,6 @@ pub struct PassReport {
     pub bytes_fetched: u64,
     /// The bytes that went into segments.
     pub bytes_stored: u64,
-    /// What the pass indexed, once everything was stored.
-    pub index: IndexReport,
 }
 
 impl PassReport {
@@ -128,17 +126,24 @@ impl PassReport {
 #[derive(Debug)]
 pub struct Pass {
     pub provider: ProviderId,
+    /// What the pass archived, or why it stopped.
     pub outcome: Result<PassReport, SyncError>,
+    /// What was indexed once every pass was over, however this one ended: the provider's
+    /// sessions at the location whose items changed.
+    pub index: Result<IndexReport, SyncError>,
 }
 
 /**
  * Syncs `location`, reached through `transport`, with each of `providers` whose agent is there,
- * one after another (PLAN §5), each pass ending with the index of what it changed. One
- * provider's failure does not keep the others from their passes. `progress` is called as each
- * pass advances; `cancel` stops the sync at the next step, with [`SyncError::Cancelled`].
+ * one after another (PLAN §5). One provider's failure does not keep the others from their
+ * passes. `progress` is called as each pass advances; `cancel` stops the sync at the next step,
+ * with [`SyncError::Cancelled`].
  *
  * The attempt is recorded with the location, and so is how it ended: as a success only when
  * every pass could read everything its agent has there, and otherwise with what went wrong.
+ * Only then are the sessions the passes changed indexed, those of a pass that failed too:
+ * what it stored before it failed is archived, and the backup is on record whatever becomes
+ * of the index.
  */
 pub fn sync_location(
     archive: &Archive,
@@ -154,23 +159,15 @@ pub fn sync_location(
     let catalogue = archive.catalogue();
     catalogue.record_attempt(location)?;
     let scratch = archive.tmp();
-    let mut passes = Vec::new();
+    let mut stored = Vec::new();
     let mut problems = Vec::new();
     for provider in providers {
         let id = provider.id();
-        let stored = match provider.detect(transport, &scratch) {
+        let outcome = match provider.detect(transport, &scratch) {
             Ok(None) => continue,
             Ok(Some(mut source)) => pass(archive, location, id, source.as_mut(), cancel, progress),
             Err(error) => Err(error.into()),
         };
-        /* The source is done with: indexing reads the archive alone. */
-        let outcome = stored.and_then(|report| {
-            let indexed = std::slice::from_ref(provider);
-            Ok(PassReport {
-                index: index(archive, Some(location), indexed, cancel, progress)?,
-                ..report
-            })
-        });
         match &outcome {
             Err(SyncError::Cancelled) => return Err(SyncError::Cancelled),
             Err(error) => problems.push(format!("{id}: {error}")),
@@ -178,20 +175,29 @@ pub fn sync_location(
                 problems.extend(report.shortfall().map(|short| format!("{id}: {short}")));
             }
         }
-        passes.push(Pass {
-            provider: id,
-            outcome,
-        });
+        stored.push((provider, outcome));
     }
     if problems.is_empty() {
         catalogue.record_outcome(location, None)?;
     } else {
         catalogue.record_outcome(location, Some(&problems.join("; ")))?;
     }
+    let mut passes = Vec::new();
+    for (provider, outcome) in stored {
+        let index = index::changed(archive, location, provider.as_ref(), cancel, progress);
+        if matches!(index, Err(SyncError::Cancelled)) {
+            return Err(SyncError::Cancelled);
+        }
+        passes.push(Pass {
+            provider: provider.id(),
+            outcome,
+            index,
+        });
+    }
     Ok(passes)
 }
 
-/// One pass up to its index: scan, plan, fetch and store (PLAN §5).
+/// One pass: scan, plan, fetch and store (PLAN §5). Its index follows the last pass.
 fn pass(
     archive: &Archive,
     location: &LocationId,

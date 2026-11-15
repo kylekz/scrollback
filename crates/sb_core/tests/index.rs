@@ -1,17 +1,18 @@
-//! The index step of a pass, and indexing at a start (PLAN §5 step 5, §7.5, §12): the cases
-//! that apply to both shapes of source run against both, the file-tree agent and the made-up
-//! agent that keeps a database; the rest use what only one of the fixtures can write.
+//! Indexing (PLAN §5 step 5, §7.5, §12): what a pass indexes, what a start does, and what
+//! becomes of an index that stops or can't parse. The cases that apply to both shapes of
+//! source run against both, the file-tree agent and the made-up agent that keeps a database;
+//! the rest use what only one of the fixtures can write.
 
 mod common;
 
 use std::fs;
-use std::io::Read as _;
+use std::thread;
 
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
-use sb_core::catalogue::{CatalogueError, Filed, Session, Usage};
+use sb_core::catalogue::{Filed, Session, Usage};
 use sb_core::filing::NormalPath;
-use sb_core::provider::{ItemKind, Provider, SessionItems};
+use sb_core::provider::{ItemKind, Provider};
 use sb_core::sync::{IndexReport, Progress, SyncError, index};
 use sb_core::transcript::{self, Ending, INDEX_VERSION, SessionIndex, Totals};
 use sb_test_support::{Agent, DbAgent, FileAgent, Items, ProjectsTree, edit_catalogue};
@@ -22,12 +23,15 @@ use common::{Bench, Meddle, for_both_agents};
 for_both_agents!(
     a_pass_indexes_the_sessions_it_archived,
     a_session_that_grew_is_indexed_again_and_one_that_did_not_is_not,
-    a_new_version_of_the_parser_or_of_the_index_indexes_everything_again,
+    a_new_version_of_the_parser_or_of_the_index_is_for_a_start_to_take_to_everything,
     the_index_emptied_and_built_again_is_as_it_was_with_what_the_owner_did,
     an_index_that_stops_is_taken_up_from_the_catalogue,
-    a_session_its_parser_stops_on_is_recorded_and_the_others_are_indexed,
-    the_owner_chooses_the_version_that_is_read,
+    a_session_its_parser_stops_on_keeps_what_was_known_of_it,
     a_segment_that_is_not_as_recorded_ends_the_conversation_unreadable,
+    a_pass_that_fails_after_it_stored_indexes_what_it_stored,
+    a_sync_is_on_record_before_it_indexes,
+    two_indexes_at_once_leave_the_index_as_one_does,
+    a_classifier_that_changes_reaches_what_is_gone_from_its_source,
 );
 
 /// A bench whose agent has three sessions of different sizes.
@@ -72,6 +76,7 @@ fn assert_indexed_as(session: &Session, index: &SessionIndex) {
             &session.models,
             session.own,
             session.all,
+            session.unread,
         ),
         (
             &index.title,
@@ -84,6 +89,7 @@ fn assert_indexed_as(session: &Session, index: &SessionIndex) {
             &index.models,
             usage(&index.own),
             usage(&index.all),
+            index.unread,
         )
     );
     assert_eq!(session.failure, None);
@@ -120,6 +126,10 @@ fn a_pass_indexes_the_sessions_it_archived<A: Agent + Default>() {
         assert!(session.title.is_some(), "{key}");
         assert_eq!(session.id, bench.session_id(key));
         assert_eq!(session.main_item, Some(bench.item(key).id));
+        assert_eq!(
+            (session.reading_version, session.newest_version),
+            (Some(1), Some(1))
+        );
         assert_eq!(session.ending, Some(Ending::Whole));
         assert_eq!(
             (session.parser_version, session.index_version),
@@ -154,36 +164,55 @@ fn a_session_that_grew_is_indexed_again_and_one_that_did_not_is_not<A: Agent + D
         })
         .unwrap();
     assert_eq!(indexed, [1, 1]);
-    assert_eq!(passes[0].outcome.as_ref().unwrap().index.sessions, 1);
+    assert_eq!(passes[0].index.as_ref().unwrap().sessions, 1);
 
     assert_indexed_as(&bench.session(&keys[0]), &derived(&bench.agent, &keys[0]));
     for key in &keys[1..] {
         assert!(before.contains(&bench.session(key)), "{key}");
     }
+
+    /* One session indexed on its own, whatever its row says. */
+    assert_eq!(bench.index_session(&keys[1]).sessions, 1);
+    assert_eq!(bench.sessions().len(), 3);
+    assert!(before.contains(&bench.session(&keys[1])));
 }
 
-fn a_new_version_of_the_parser_or_of_the_index_indexes_everything_again<A: Agent + Default>() {
-    let (bench, keys) = bench::<A>();
+fn a_new_version_of_the_parser_or_of_the_index_is_for_a_start_to_take_to_everything<
+    A: Agent + Default,
+>() {
+    let (mut bench, keys) = bench::<A>();
     bench.sync();
     let before = bench.sessions();
     let parser = bench.agent.provider().parser_version();
+    let newer = |bench: &Bench<A>| bench.meddling(Meddle::ParserVersion(parser + 1));
 
-    /* A newer parser: a start finds every row made by the older one. */
-    let newer = || bench.meddling(Meddle::ParserVersion(parser + 1));
-    assert_eq!(bench.index_with(newer()).sessions, 3);
-    for key in &keys {
-        assert_eq!(bench.session(key).parser_version, parser + 1);
-    }
-    assert_eq!(bench.index_with(newer()).sessions, 0);
+    /* A pass indexes what it changed, and leaves what an older parser made to a start. */
+    bench.agent.append(&keys[0], 2);
+    assert_eq!(bench.synced_with(newer(&bench)).index.sessions, 1);
+    let by_newer = |bench: &Bench<A>| -> Vec<_> {
+        keys.iter()
+            .map(|key| bench.session(key).parser_version == parser + 1)
+            .collect()
+    };
+    assert_eq!(by_newer(&bench), [true, false, false]);
+
+    /* A start finds every row made by the older parser. */
+    assert_eq!(bench.index_with(newer(&bench)).sessions, 2);
+    assert_eq!(by_newer(&bench), [true, true, true]);
+    assert_eq!(bench.index_with(newer(&bench)).sessions, 0);
     assert_eq!(bench.index().sessions, 3);
-    assert_eq!(bench.sessions(), before);
+    for key in &keys[1..] {
+        assert!(before.contains(&bench.session(key)), "{key}");
+    }
 
     /* Rows made by an older index: the same. */
+    let before = bench.sessions();
     edit_catalogue(
         bench.dir(),
         "UPDATE session SET index_version = index_version - 1",
     );
     assert_ne!(bench.sessions(), before);
+    assert_eq!(bench.sync().index.sessions, 0);
     assert_eq!(bench.index().sessions, 3);
     assert_eq!(bench.sessions(), before);
 }
@@ -207,7 +236,11 @@ fn the_index_emptied_and_built_again_is_as_it_was_with_what_the_owner_did<A: Age
         .unwrap();
     let older = bench.versions(&keys[2]).remove(0);
     catalogue
-        .set_reading_version(&bench.session_id(&keys[2]), Some(older.id))
+        .set_reading_version(
+            &bench.session_id(&keys[2]),
+            bench.item(&keys[2]).id,
+            Some(older.id),
+        )
         .unwrap();
     assert_eq!(bench.index().sessions, 1);
     let before = (
@@ -218,6 +251,7 @@ fn the_index_emptied_and_built_again_is_as_it_was_with_what_the_owner_did<A: Age
     );
     assert_eq!(bench.session(&keys[1]).filed, Filed::ByHand(inner));
     assert!(bench.session(&keys[0]).starred);
+    assert_eq!(bench.session(&keys[2]).reading_version, Some(1));
 
     /* Emptied, the library lists nothing, and the owner's tables are as they were. */
     catalogue.drop_index().unwrap();
@@ -262,18 +296,18 @@ fn an_index_that_stops_is_taken_up_from_the_catalogue<A: Agent + Default>() {
     assert_eq!(bench.sessions().len(), 1);
     bench.reopen();
 
-    /* The next start indexes the two that are left, and the pass after it none. */
-    assert_eq!(bench.index().sessions, 2);
-    assert_eq!(bench.sync().index.sessions, 0);
+    /* The next pass indexes the two that are left, and a start after it none. */
+    assert_eq!(bench.sync().index.sessions, 2);
+    assert_eq!(bench.index().sessions, 0);
     for key in &keys {
         assert_indexed_as(&bench.session(key), &derived(&bench.agent, key));
     }
 }
 
-fn a_session_its_parser_stops_on_is_recorded_and_the_others_are_indexed<A: Agent + Default>() {
+fn a_session_its_parser_stops_on_keeps_what_was_known_of_it<A: Agent + Default>() {
     let (mut bench, keys) = bench::<A>();
-    let faulty = || bench.meddling(Meddle::FaultyParser(keys[1].clone()));
-    let report = bench.pass_with(faulty()).unwrap();
+    let faulty = |bench: &Bench<A>| bench.meddling(Meddle::FaultyParser(keys[1].clone()));
+    let report = bench.synced_with(faulty(&bench));
     assert_eq!(report.index.sessions, 3);
     let [(id, reason)] = &report.index.failed[..] else {
         panic!("{:?}", report.index.failed);
@@ -293,69 +327,33 @@ fn a_session_its_parser_stops_on_is_recorded_and_the_others_are_indexed<A: Agent
     bench.assert_mirrors(&keys);
 
     /* It is not parsed again as it is, and is once it changes. */
-    assert_eq!(bench.pass_with(faulty()).unwrap().index.sessions, 0);
+    assert_eq!(bench.synced_with(faulty(&bench)).index.sessions, 0);
     let key = keys[1].clone();
     bench.agent.append(&key, 2);
     assert_eq!(bench.sync().index.sessions, 1);
-    assert_indexed_as(&bench.session(&key), &derived(&bench.agent, &key));
-}
+    let parsed = bench.session(&key);
+    assert_indexed_as(&parsed, &derived(&bench.agent, &key));
 
-fn the_owner_chooses_the_version_that_is_read<A: Agent + Default>() {
-    let (mut bench, keys) = bench::<A>();
-    bench.sync();
-    let key = keys[0].clone();
-    let first = (derived(&bench.agent, &key), bench.agent.content(&key));
-    bench.agent.rewrite(&key);
-    assert_eq!(bench.sync().index.sessions, 1);
-    let second = (derived(&bench.agent, &key), bench.agent.content(&key));
-    let versions = bench.versions(&key);
-    let id = bench.session_id(&key);
+    /* A session that was indexed and is filed, and that the parser then stops on, keeps
+    what its row said and where it is: only why is new. */
     let catalogue = bench.archive().catalogue();
-    /* What a parser is given of the session's transcript. */
-    let read = || {
-        let items = bench.archive().session(&id).unwrap();
-        let mut content = Vec::new();
-        items
-            .open(&key, 0)
-            .unwrap()
-            .read_to_end(&mut content)
-            .unwrap();
-        let listed = items.list().iter().find(|item| item.key == key).unwrap();
-        assert_eq!(
-            (listed.kind, listed.length),
-            (ItemKind::Transcript, content.len() as u64)
-        );
-        content
-    };
-
-    /* The newest version is read, since it is not held back. */
-    assert_eq!((versions.len(), versions[1].held_back), (2, false));
-    assert!(read() == second.1);
-    assert_indexed_as(&bench.session(&key), &second.0);
-
-    /* The owner chooses the older one: it is read at once, and indexed by the next index. */
-    catalogue
-        .set_reading_version(&id, Some(versions[0].id))
-        .unwrap();
-    assert!(read() == first.1);
-    assert_indexed_as(&bench.session(&key), &second.0);
-    assert_eq!(bench.index().sessions, 1);
-    assert_indexed_as(&bench.session(&key), &first.0);
-    assert_eq!(bench.index().sessions, 0);
-
-    /* A version of another session's item is not this session's to read. */
-    let other = bench.versions(&keys[1]).remove(0).id;
-    assert!(matches!(
-        catalogue.set_reading_version(&id, Some(other)),
-        Err(CatalogueError::NotOfSession(version)) if version == other
-    ));
-    assert!(read() == first.1);
-
-    /* Back to the rule. */
-    catalogue.set_reading_version(&id, None).unwrap();
-    assert!(read() == second.1);
-    assert_eq!(bench.index().sessions, 1);
-    assert_indexed_as(&bench.session(&key), &second.0);
+    let folder = catalogue.create_folder("kept", None).unwrap();
+    catalogue.file_by_hand(&parsed.id, folder).unwrap();
+    bench.agent.append(&key, 2);
+    let report = bench.synced_with(faulty(&bench));
+    assert_eq!((report.index.sessions, report.index.failed.len()), (1, 1));
+    let failed = bench.session(&key);
+    assert!(failed.failure.is_some());
+    assert_eq!(
+        Session {
+            failure: None,
+            ..failed
+        },
+        Session {
+            filed: Filed::ByHand(folder),
+            ..parsed
+        }
+    );
 }
 
 fn a_segment_that_is_not_as_recorded_ends_the_conversation_unreadable<A: Agent + Default>() {
@@ -369,6 +367,7 @@ fn a_segment_that_is_not_as_recorded_ends_the_conversation_unreadable<A: Agent +
     fs::write(segment, "not what was stored").unwrap();
     bench.archive().catalogue().drop_index().unwrap();
 
+    /* What is stored is damaged: that is the session's state, and is indexed as it is. */
     let report = bench.index();
     assert_eq!((report.sessions, report.failed.len()), (1, 0));
     let session = bench.session(&key);
@@ -378,7 +377,122 @@ fn a_segment_that_is_not_as_recorded_ends_the_conversation_unreadable<A: Agent +
         session.ending
     );
     assert_eq!((&session.title, &session.failure), (&None, &None));
+    assert!(session.unread);
     assert_eq!(session.main_item, Some(bench.item(&key).id));
+    assert_eq!(bench.index().sessions, 0);
+}
+
+fn a_pass_that_fails_after_it_stored_indexes_what_it_stored<A: Agent + Default>() {
+    let mut agent = A::default();
+    for _ in 0..600 {
+        agent.add_session(1);
+    }
+    let bench = Bench::new(agent);
+    /* The connection drops once the first batch is stored. */
+    let pass = bench.pass(bench.meddling(Meddle::SecondProofsFail(Default::default())));
+    assert!(pass.outcome.is_err(), "{:?}", pass.outcome);
+    let stored = bench.items().len();
+    assert!((1..600).contains(&stored));
+    assert!(bench.location().last_error.is_some());
+
+    /* What the pass stored is archived, and so is indexed. */
+    assert_eq!(pass.index.unwrap().sessions, stored);
+    assert_eq!(bench.sessions().len(), stored);
+}
+
+fn a_sync_is_on_record_before_it_indexes<A: Agent + Default>() {
+    let (bench, _) = bench::<A>();
+    let cancel = CancelToken::new();
+    let stopped = bench.try_sync(&cancel, &mut |progress| {
+        if matches!(progress, Progress::Indexing { .. }) {
+            cancel.cancel();
+        }
+    });
+    assert!(matches!(stopped, Err(SyncError::Cancelled)), "{stopped:?}");
+    /* The backup was whole: the location says so, though nothing is indexed yet. */
+    let location = bench.location();
+    assert!(location.last_success.is_some());
+    assert_eq!(location.last_error, None);
+    assert!(bench.sessions().is_empty());
+    assert_eq!(bench.index().sessions, 3);
+}
+
+fn two_indexes_at_once_leave_the_index_as_one_does<A: Agent + Default>() {
+    let (bench, _) = bench::<A>();
+    bench.sync();
+    let before = bench.sessions();
+    bench.archive().catalogue().drop_index().unwrap();
+
+    let archive = bench.archive();
+    let providers = [bench.agent.provider(), bench.agent.provider()];
+    let indexed: Vec<usize> = thread::scope(|scope| {
+        let running: Vec<_> = providers
+            .into_iter()
+            .map(|provider| {
+                scope.spawn(move || {
+                    index(archive, None, &[provider], &CancelToken::new(), &mut |_| {})
+                        .unwrap()
+                        .sessions
+                })
+            })
+            .collect();
+        running
+            .into_iter()
+            .map(|index| index.join().unwrap())
+            .collect()
+    });
+    assert!(indexed.iter().sum::<usize>() >= 3, "{indexed:?}");
+    assert_eq!(bench.sessions(), before);
+    assert_eq!(bench.index().sessions, 0);
+}
+
+fn a_classifier_that_changes_reaches_what_is_gone_from_its_source<A: Agent + Default>() {
+    let (mut bench, keys) = bench::<A>();
+    bench.sync();
+    let before = bench.sessions();
+    let starred = bench.session_id(&keys[0]);
+    bench
+        .archive()
+        .catalogue()
+        .set_starred(&starred, true)
+        .unwrap();
+    /* One session is gone from its source: no scan will ever classify its items again. */
+    bench.agent.delete(&keys[1]);
+    assert_eq!(bench.sync().gone, 1);
+
+    /* A newer parser gives every session another id. A start says so of everything
+    archived: each session is listed once, under the new id, and what the owner decided
+    about it went with it. */
+    let moved = |bench: &Bench<A>| {
+        bench.meddling(Meddle::Classifier(|_, (kind, session)| {
+            (kind, session.map(|session| format!("moved/{session}")))
+        }))
+    };
+    assert_eq!(bench.index_with(moved(&bench)).sessions, 3);
+    let after = bench.sessions();
+    assert_eq!(after.len(), 3);
+    for (after, before) in after.iter().zip(&before) {
+        assert_eq!(after.id.key, format!("moved/{}", before.id.key));
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.starred, before.id == starred);
+    }
+    assert_eq!(bench.index_with(moved(&bench)).sessions, 0);
+
+    /* And back, by the parser it was. */
+    assert_eq!(bench.index().sessions, 3);
+    let back: Vec<_> = bench
+        .sessions()
+        .into_iter()
+        .map(|session| session.id)
+        .collect();
+    assert_eq!(
+        back,
+        before
+            .iter()
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(bench.session(&keys[0]).starred);
 }
 
 /// A bench on a file tree with nothing in it yet.
@@ -402,6 +516,13 @@ fn a_session_kept_as_files_is_indexed_with_its_title_path_and_counts() {
     let mut untitled = tree.session(r"D:\Projects\App", 0);
     untitled.transcript.prompt("What does this do?");
     untitled.transcript.reply("It syncs.");
+    /* A title that says nothing is none, and one of any length is kept by its start. */
+    let mut blank = tree.session("/mnt/d/Projects/App/docs", 0);
+    blank.transcript.prompt("Write the notes.");
+    blank.transcript.title("   ");
+    let mut long = tree.session("/srv/long", 0);
+    long.transcript.prompt("Name it.");
+    long.transcript.title(&"long title ".repeat(1000));
     /* A session's sidecar alone is no session. */
     tree.project_file(
         "/home/user/code/app",
@@ -415,8 +536,9 @@ fn a_session_kept_as_files_is_indexed_with_its_title_path_and_counts() {
         .unwrap();
 
     let report = bench.sync();
-    assert_eq!((report.index.sessions, report.index.filed), (2, 1));
+    assert_eq!((report.index.sessions, report.index.filed), (4, 1));
     let session = bench.session(&titled.key);
+    assert_eq!(session.id.key, titled.session_key());
     assert_eq!(
         (
             session.title.as_deref(),
@@ -453,6 +575,16 @@ fn a_session_kept_as_files_is_indexed_with_its_title_path_and_counts() {
         Some("d:/projects/app")
     );
     assert_eq!(session.filed, Filed::Unsorted);
+    let session = bench.session(&blank.key);
+    assert_eq!(session.title.as_deref(), Some("Write the notes."));
+    /* A path under the drive mount is the drive's. */
+    assert_eq!(
+        session.project.as_ref().map(NormalPath::as_str),
+        Some("d:/projects/app/docs")
+    );
+    let title = bench.session(&long.key).title.unwrap();
+    assert!(title.starts_with("long title long title"));
+    assert!(title.chars().count() <= 300, "{}", title.len());
 
     /* A subagent's transcript that grows is its session's change. */
     bench.agent.append_raw(&subagent, "{\"type\":\"mode\"}\n");
@@ -503,6 +635,24 @@ fn a_session_kept_in_a_database_is_indexed_with_its_title_path_and_counts() {
 }
 
 #[test]
+fn a_record_the_database_agent_wrote_badly_is_exported_and_kept() {
+    let mut bench = Bench::new(DbAgent::new());
+    let key = bench.agent.add_session(2);
+    bench.agent.call_raw(&key, "this is not JSON");
+    let report = bench.sync();
+    assert_eq!(
+        (
+            report.new_items,
+            report.index.sessions,
+            report.index.failed.len()
+        ),
+        (1, 1, 0)
+    );
+    bench.assert_mirrors(std::slice::from_ref(&key));
+    assert_indexed_as(&bench.session(&key), &derived(&bench.agent, &key));
+}
+
+#[test]
 fn a_session_without_its_transcript_is_indexed_from_its_subagents() {
     let mut bench = files();
     let mut session = bench.agent.tree_mut().session("/home/user/code/app", 4);
@@ -513,13 +663,86 @@ fn a_session_without_its_transcript_is_indexed_from_its_subagents() {
     let [indexed] = &bench.sessions()[..] else {
         panic!("{:?}", bench.sessions());
     };
-    assert_eq!(indexed.id.key, session.id);
+    assert_eq!(indexed.id.key, session.session_key());
     assert_eq!(
         (indexed.main_item, &indexed.ending, &indexed.failure),
         (None, &None, &None)
     );
+    assert_eq!(
+        (indexed.reading_version, indexed.newest_version),
+        (None, None)
+    );
     assert_eq!((indexed.own.calls, indexed.all.calls), (0, 2));
     assert!(indexed.started.is_some());
+}
+
+#[test]
+fn the_same_session_id_under_two_projects_is_two_sessions() {
+    let mut bench = files();
+    let mut first = bench.agent.tree_mut().session("/home/user/code/app", 0);
+    first.transcript.prompt("In the first folder.");
+    let copy = bench.agent.tree().project_file(
+        "/home/user/code/other",
+        &format!("{}.jsonl", first.id),
+        format!(
+            "{}\n",
+            json!({ "type": "user", "uuid": "u-1", "sessionId": first.id,
+                    "cwd": "/home/user/code/other",
+                    "message": { "role": "user", "content": "In the second folder." } })
+        )
+        .as_bytes(),
+    );
+
+    assert_eq!(bench.sync().index.sessions, 2);
+    let titles: Vec<_> = [&first.key, &copy]
+        .map(|key| bench.session(key).title.unwrap())
+        .into();
+    assert_eq!(titles, ["In the first folder.", "In the second folder."]);
+    assert_ne!(bench.session_id(&first.key), bench.session_id(&copy));
+}
+
+#[test]
+fn a_subagent_that_cannot_be_read_shows_on_its_sessions_row() {
+    let mut bench = files();
+    let mut session = bench.agent.tree_mut().session("/home/user/code/app", 4);
+    let subagent = session.subagent(8);
+    bench.sync();
+    assert!(!bench.session(&session.key).unread);
+    let [segment] = &bench.segment_files_of(&subagent)[..] else {
+        panic!("{:?}", bench.segment_files_of(&subagent));
+    };
+    fs::write(segment, "not what was stored").unwrap();
+
+    assert_eq!(bench.index_session(&session.key).failed.len(), 0);
+    let row = bench.session(&session.key);
+    /* The session's own conversation is whole; a part of the session is not. */
+    assert_eq!((&row.ending, row.unread), (&Some(Ending::Whole), true));
+    assert_eq!(row.all.calls, row.own.calls);
+}
+
+#[test]
+fn a_sidecar_that_was_rewritten_shorter_is_read_as_it_is_now() {
+    let mut bench = files();
+    let mut session = bench.agent.tree_mut().session("/home/user/code/app", 0);
+    session.transcript.prompt("Start.");
+    let title = session.title("A title that goes on for a good while");
+    bench.sync();
+    assert_eq!(
+        bench.session(&session.key).title.as_deref(),
+        Some("A title that goes on for a good while")
+    );
+
+    /* Shorter is no loss in what is not a transcript: the newest is what the agent meant. */
+    session.title("Short");
+    let report = bench.sync();
+    assert_eq!((report.new_versions, report.held_back), (1, 0));
+    assert_eq!(bench.versions(&title)[1].held_back, None);
+    assert_eq!(bench.item(&title).kind, ItemKind::Sidecar);
+    let row = bench.session(&session.key);
+    assert_eq!(
+        (row.title.as_deref(), row.held_back),
+        (Some("Short"), false)
+    );
 }
 
 #[test]
@@ -539,137 +762,60 @@ fn stale_sessions_are_indexed_newest_first_after_those_never_indexed() {
     assert_eq!(by_newer(&bench), [false, false, true]);
 
     /* A session with no row at all comes before every one that has an older row. */
-    let cancel = CancelToken::new();
     let added = bench.agent.add_session(2);
-    let stopped = bench.try_sync_with(newer(&bench), &cancel, &mut |progress| {
-        if matches!(progress, Progress::Indexed { .. }) {
-            cancel.cancel();
-        }
-    });
-    assert!(matches!(stopped, Err(SyncError::Cancelled)), "{stopped:?}");
+    bench.sync();
+    edit_catalogue(
+        bench.dir(),
+        &format!(
+            "DELETE FROM session WHERE session = '{}'",
+            bench.session_id(&added).key
+        ),
+    );
+    index_until(&bench, newer(&bench), 1).unwrap_err();
     assert_eq!(bench.session(&added).parser_version, parser + 1);
     assert_eq!(by_newer(&bench), [false, false, true]);
     assert_eq!(bench.index_with(newer(&bench)).sessions, 2);
 }
 
+#[cfg(unix)]
 #[test]
-fn a_version_that_no_longer_parses_is_held_back_however_long_it_grows() {
-    let mut agent = FileAgent::new();
-    let key = agent.add_session(12);
-    let mut bench = Bench::new(agent);
-    bench.sync();
-    let before = bench.session(&key);
-    let whole = bench.agent.content(&key);
+fn a_read_the_system_fails_is_tried_again_and_changes_nothing() {
+    use std::os::unix::fs::PermissionsExt as _;
 
-    /* The file is replaced by something longer that holds no conversation: no loss by its
-    length, and one by what it is. */
-    let garbage = "this is not a transcript\n".repeat(whole.len() / 20);
-    bench.agent.overwrite(&key, garbage.as_bytes());
-    let report = bench.sync();
-    assert_eq!(
-        (
-            report.new_versions,
-            report.held_back,
-            report.index.held_back
-        ),
-        (1, 0, 1)
-    );
-    let held = |bench: &Bench<FileAgent>| {
-        let newest = bench.versions(&key).remove(1);
-        (newest.held_back, newest.held_by_parse)
-    };
-    assert_eq!(held(&bench), (true, true));
-    /* The copy being read is still the one from before, and the session says so. */
-    assert_eq!(
-        bench.session(&key),
-        Session {
-            held_back: true,
-            ..before.clone()
-        }
-    );
-    let read = |bench: &Bench<FileAgent>| {
-        let mut content = Vec::new();
-        bench
-            .archive()
-            .session(&bench.session_id(&key))
-            .unwrap()
-            .open(&key, 0)
-            .unwrap()
-            .read_to_end(&mut content)
-            .unwrap();
-        content
-    };
-    assert!(read(&bench) == whole);
-
-    /* It grows, which would end a hold for its length; this one stays. */
-    bench.agent.append_raw(&key, &garbage);
-    let report = bench.sync();
-    assert_eq!((report.appended, report.index.held_back), (1, 0));
-    assert_eq!(held(&bench), (true, true));
-    assert!(read(&bench) == whole);
-    assert_eq!(bench.sync().index.sessions, 0);
-
-    /* The owner can read it all the same. */
-    let id = bench.session_id(&key);
-    let newest = bench.versions(&key).remove(1);
+    let mut bench = files();
+    let mut session = bench.agent.tree_mut().session("/home/user/code/app", 8);
+    let key = session.key.clone();
     let catalogue = bench.archive().catalogue();
-    catalogue.set_reading_version(&id, Some(newest.id)).unwrap();
-    assert_eq!(bench.index().sessions, 1);
-    let chosen = bench.session(&key);
-    assert_eq!((&chosen.title, chosen.held_back), (&None, false));
-    assert_eq!(held(&bench), (true, true));
-    catalogue.set_reading_version(&id, None).unwrap();
-    assert_eq!(bench.index().sessions, 1);
-    assert_eq!(bench.session(&key).title, before.title);
-
-    /* The agent goes on in the file, until it shows as much as the copy being read: the
-    version is no loss any more, and is the one read. */
-    bench.agent.session(&key).append(40);
-    let report = bench.sync();
-    assert_eq!((report.appended, report.index.sessions), (1, 1));
-    assert_eq!(held(&bench), (false, false));
-    assert!(read(&bench) == bench.agent.content(&key));
-    let after = bench.session(&key);
-    assert!(!after.held_back);
-    assert_indexed_as(&after, &derived(&bench.agent, &key));
-}
-
-#[test]
-fn a_database_session_that_lost_records_is_held_back_though_it_is_longer() {
-    let mut bench = Bench::new(DbAgent::new());
-    let key = bench.agent.add_session(10);
+    let folder = catalogue.create_folder("app", None).unwrap();
+    catalogue
+        .attach_path(folder, "/home/user/code/app", None)
+        .unwrap();
+    bench.sync();
+    session.append(4);
     bench.sync();
     let before = bench.session(&key);
+    assert_eq!(before.filed, Filed::ByRule(folder));
 
-    /* Half its records are gone and one long one is new: longer, and less of a session. */
-    bench.agent.truncate(&key, 5);
-    bench.agent.say(&key, "user", &"and then ".repeat(200));
-    let report = bench.sync();
+    /* The newest segment can't be opened just now: another program has it, say. */
+    let segments = bench.segment_files_of(&key);
+    let locked = segments.last().unwrap();
+    fs::set_permissions(locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let report = bench.index_session(&key);
+    assert_eq!((report.sessions, report.failed.len()), (1, 1));
+    /* Nothing the row said is lost, and the session stays filed. */
+    let failed = bench.session(&key);
+    assert!(failed.failure.is_some());
     assert_eq!(
-        (
-            report.new_versions,
-            report.held_back,
-            report.index.held_back
-        ),
-        (1, 0, 1)
-    );
-    let versions = bench.versions(&key);
-    assert!(versions[1].length > versions[0].length);
-    assert!(versions[1].held_back && versions[1].held_by_parse);
-    assert_eq!(
-        bench.session(&key),
         Session {
-            held_back: true,
-            ..before
-        }
+            failure: None,
+            ..failed
+        },
+        before
     );
-
-    /* Records are added until it holds as many as before: it is the copy that is read. */
-    bench.agent.append(&key, 4);
-    assert_eq!(bench.sync().index.sessions, 1);
-    let newest = bench.versions(&key).remove(1);
-    assert!(!newest.held_back && !newest.held_by_parse);
-    let after = bench.session(&key);
-    assert!(!after.held_back);
-    assert_indexed_as(&after, &derived(&bench.agent, &key));
+    /* It is tried again by every index until it can be read. */
+    assert_eq!(bench.index().failed.len(), 1);
+    assert_eq!(bench.sync().index.failed.len(), 1);
+    fs::set_permissions(locked, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(bench.index().sessions, 1);
+    assert_eq!(bench.session(&key), before);
 }

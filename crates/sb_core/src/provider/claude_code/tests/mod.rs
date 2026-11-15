@@ -4,10 +4,12 @@
 //! - [`conversation`]: the tree, its branches, and what is a prompt and what a note.
 //! - [`calls`]: tool calls, their results, images and stored content.
 //! - [`session`]: subagents, a session's facts, the index, and what can't be read.
+//! - [`shapes`]: what older releases wrote and what only some sessions have.
 
 mod calls;
 mod conversation;
 mod session;
+mod shapes;
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -59,7 +61,7 @@ impl Files {
                     .collect::<Vec<_>>()
                     .join("/");
                 let class = classify(&key);
-                (class.session.as_deref() == Some(&session.id)).then(|| SessionItem {
+                (class.session.as_deref() == Some(session.session_key())).then(|| SessionItem {
                     key,
                     kind: class.kind,
                     length: file.metadata().unwrap().len(),

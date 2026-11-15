@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::catalogue::{self, Catalogue, CatalogueError, Commit, Recorded, Stored, Target};
+use crate::hash::Hash;
 use crate::location::LocationId;
 
 pub use items::ArchivedSession;
@@ -355,7 +356,9 @@ impl Archive {
      * Stores a batch (PLAN §4.1): for each commit, puts its item on disk, with its folder, its
      * `source.json` and the range's segments in their places; makes all of it durable; and only
      * then commits all of them to the catalogue in one transaction. Returns, for each, whether
-     * a version it starts is held back.
+     * a version it starts is held back; or, for one whose files could not be put in their
+     * places (a file left there that another program holds, say), why: nothing of that one is
+     * recorded, and the others are stored all the same.
      *
      * A file already where one goes is one the catalogue never recorded: it is what a store
      * that was interrupted before its commit leaves. When it holds the very bytes that are
@@ -366,7 +369,7 @@ impl Archive {
      * only what the catalogue says too, so one that is not what it should be is set aside and
      * written again.
      */
-    pub(crate) fn store(&self, batch: Vec<(Commit<'_>, Vec<Sealed>)>) -> Result<Vec<bool>> {
+    pub(crate) fn store(&self, batch: Vec<(Commit<'_>, Vec<Sealed>)>) -> Result<Vec<Result<bool>>> {
         if batch.is_empty() {
             return Ok(Vec::new());
         }
@@ -376,58 +379,17 @@ impl Archive {
         that never got as far as its flush. */
         let mut folders = BTreeSet::new();
         let mut commits = Vec::new();
+        let mut unplaced = Vec::new();
         for (commit, segments) in batch {
-            let folder = item_folder(&commit.scanned.key);
-            let item = layout::item_dir(commit.location, commit.provider, &folder);
-            let item_dir = self.dir.join(&item);
-            self.make_folder(&item)?;
-            folders.extend(
-                item.ancestors()
-                    .take_while(|folder| !folder.as_os_str().is_empty())
-                    .map(|folder| self.dir.join(folder)),
-            );
-            let json = serde_json::to_vec_pretty(&SourceManifest {
-                provider: commit.provider,
-                location: commit.location.as_str(),
-                key: &commit.scanned.key,
-            })
-            .expect("a struct of text always serializes");
-            let source = item.join(layout::SOURCE);
-            /* An item that is recorded has had its `source.json` made durable. Before that,
-            one that is there goes through `place` like a segment, which also sets aside one
-            that is not this. */
-            if matches!(commit.target, Target::NewItem)
-                || !fs::read(self.dir.join(&source)).is_ok_and(|existing| existing == json)
-            {
-                let file =
-                    disk::new_file(&self.tmp(), &json).map_err(io_error("write", &item_dir))?;
-                self.place(file, &source, || Ok(false))?;
+            match self.put(&commit, segments, &mut folders) {
+                Ok(segments) => {
+                    commits.push(Recorded { commit, segments });
+                    unplaced.push(None);
+                }
+                /* The file system's refusal is this item's alone. */
+                Err(error @ ArchiveError::Io { .. }) => unplaced.push(Some(error)),
+                Err(error) => return Err(error),
             }
-
-            let version = item.join(layout::version_dir(commit.number));
-            let mut placed = Vec::new();
-            for sealed in segments {
-                self.make_folder(&version)?;
-                folders.insert(self.dir.join(&version));
-                self.place(
-                    sealed.file,
-                    &version.join(layout::segment_file(sealed.offset)),
-                    || {
-                        Ok(self.catalogue.has_segment(
-                            commit.location,
-                            commit.provider,
-                            &folder,
-                            commit.number,
-                            sealed.offset,
-                        )?)
-                    },
-                )?;
-                placed.push((sealed.offset, sealed.length, sealed.hash));
-            }
-            commits.push(Recorded {
-                commit,
-                segments: placed,
-            });
         }
         let files = self.dir.join(layout::FILES);
         folders
@@ -435,7 +397,72 @@ impl Archive {
             .try_for_each(|folder| disk::push_dir(folder))
             .and_then(|()| disk::settle(&files))
             .map_err(io_error("flush", &files))?;
-        Ok(self.catalogue.commit(&commits)?)
+        let mut held_back = self.catalogue.commit(&commits)?.into_iter();
+        Ok(unplaced
+            .into_iter()
+            .map(|unplaced| match unplaced {
+                Some(error) => Err(error),
+                None => Ok(held_back.next().unwrap_or(false)),
+            })
+            .collect())
+    }
+
+    /// Puts one commit's item on disk: its folder, its `source.json` and the range's
+    /// `segments`, each in its place ([`Archive::store`]). `folders` gains the folders whose
+    /// entries that relies on. Returns the segments as the catalogue records them.
+    fn put(
+        &self,
+        commit: &Commit<'_>,
+        segments: Vec<Sealed>,
+        folders: &mut BTreeSet<PathBuf>,
+    ) -> Result<Vec<(u64, u64, Hash)>> {
+        let folder = item_folder(&commit.scanned.key);
+        let item = layout::item_dir(commit.location, commit.provider, &folder);
+        let item_dir = self.dir.join(&item);
+        self.make_folder(&item)?;
+        folders.extend(
+            item.ancestors()
+                .take_while(|folder| !folder.as_os_str().is_empty())
+                .map(|folder| self.dir.join(folder)),
+        );
+        let json = serde_json::to_vec_pretty(&SourceManifest {
+            provider: commit.provider,
+            location: commit.location.as_str(),
+            key: &commit.scanned.key,
+        })
+        .expect("a struct of text always serializes");
+        let source = item.join(layout::SOURCE);
+        /* An item that is recorded has had its `source.json` made durable. Before that,
+        one that is there goes through `place` like a segment, which also sets aside one
+        that is not this. */
+        if matches!(commit.target, Target::NewItem)
+            || !fs::read(self.dir.join(&source)).is_ok_and(|existing| existing == json)
+        {
+            let file = disk::new_file(&self.tmp(), &json).map_err(io_error("write", &item_dir))?;
+            self.place(file, &source, || Ok(false))?;
+        }
+
+        let version = item.join(layout::version_dir(commit.number));
+        let mut placed = Vec::new();
+        for sealed in segments {
+            self.make_folder(&version)?;
+            folders.insert(self.dir.join(&version));
+            self.place(
+                sealed.file,
+                &version.join(layout::segment_file(sealed.offset)),
+                || {
+                    Ok(self.catalogue.has_segment(
+                        commit.location,
+                        commit.provider,
+                        &folder,
+                        commit.number,
+                        sealed.offset,
+                    )?)
+                },
+            )?;
+            placed.push((sealed.offset, sealed.length, sealed.hash));
+        }
+        Ok(placed)
     }
 
     /// Moves the whole, pushed `file` from `tmp/` to `relative` (to the archive, under
@@ -874,23 +901,42 @@ mod tests {
             let locked = if segment_locked { &segment } else { &source };
             fs::set_permissions(locked, fs::Permissions::from_mode(0o400)).unwrap();
 
-            let failed = archive.store(vec![first(&archive, &location, &scanned, b"first")]);
+            /* The item is not recorded, and the one stored with it is: what can't be done
+            with one item's files is that item's alone. */
+            let other = self::scanned("items/two");
+            let stored = archive
+                .store(vec![
+                    first(&archive, &location, &scanned, b"first"),
+                    first(&archive, &location, &other, b"other"),
+                ])
+                .unwrap();
             assert!(
                 matches!(
-                    failed,
-                    Err(ArchiveError::Io {
-                        action: "flush",
-                        ..
-                    })
+                    stored[..],
+                    [
+                        Err(ArchiveError::Io {
+                            action: "flush",
+                            ..
+                        }),
+                        Ok(false)
+                    ]
                 ),
-                "{failed:?}"
+                "{stored:?}"
             );
-            assert!(!archive.catalogue().has_items().unwrap());
+            let recorded = |scanned: &ScannedItem| {
+                archive
+                    .catalogue()
+                    .item(&location, "fixture", &scanned.key)
+                    .unwrap()
+                    .is_some()
+            };
+            assert!(!recorded(&scanned) && recorded(&other));
 
             fs::set_permissions(locked, fs::Permissions::from_mode(0o600)).unwrap();
             archive
                 .store(vec![first(&archive, &location, &scanned, b"first")])
                 .unwrap();
+            assert!(recorded(&scanned));
             assert_eq!(orphans(&archive), 0);
         }
     }

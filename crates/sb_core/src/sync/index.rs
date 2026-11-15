@@ -1,12 +1,20 @@
-//! Index (PLAN §5, step 5; §7.5): the sessions whose items changed are parsed by their
-//! provider and indexed by the one function that serves every agent
-//! ([`crate::transcript::index`]), and each is then filed (PLAN §8).
+//! Index (PLAN §5, step 5; §7.5): sessions are parsed by their provider and indexed by the one
+//! function that serves every agent ([`crate::transcript::index`]), and each is then filed
+//! (PLAN §8).
 //!
-//! Which sessions those are is read from the catalogue, never remembered: a session is indexed
-//! when it has no row, when its row was made by another version of its provider's parser or of
-//! the index, and when its row was made from other versions of its items than are read now. So
-//! a pass that stops before or while it indexes leaves sessions that the next pass, or
-//! [`index`] at a start, takes up, and a new parser reaches everything already archived.
+//! Which sessions are to be indexed is read from the catalogue, never remembered. A session's
+//! row says what it was made from (a fingerprint of the session's items as they were read) and
+//! by which versions of the parser and of the index.
+//!
+//! - **A pass** ends by indexing the sessions of its location and provider whose items are no
+//!   longer what their row was made from, or that have no row. So a pass that stops before or
+//!   while it indexes leaves sessions that the next pass takes up.
+//! - **[`index`]**, at a start and in the background, indexes those and every session whose
+//!   row was made by another version of the parser or of the index, which is how a new parser
+//!   reaches everything already archived. It first has each provider say again what every
+//!   archived item is, when its parser's version is not the one that last said.
+//! - **[`index_session`]** indexes one session at once: after the owner chose a version to
+//!   read, say.
 //!
 //! Sessions are indexed one at a time, each from its start with every subagent read, and each
 //! row is committed on its own. Nothing parsed is kept between two sessions, so the memory an
@@ -17,6 +25,7 @@
 //! are transcripts parsed: [`parses_worse`].
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::panic::{self, AssertUnwindSafe};
 
@@ -24,18 +33,18 @@ use toolbox_process::CancelToken;
 
 use super::{Progress, SyncError};
 use crate::archive::{Archive, ArchivedSession};
-use crate::catalogue::{Derived, Reading, SessionId, fingerprint};
+use crate::catalogue::{Derived, Held, Indexed, Reading, SessionId, Version, fingerprint};
 use crate::location::LocationId;
-use crate::provider::Provider;
-use crate::transcript::{self, Conversation, Ending};
+use crate::provider::{ItemKind, Provider};
+use crate::transcript::{self, Content, Conversation, Ending, Subagent, Transcript};
 
 /// What an index did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IndexReport {
-    /// The sessions parsed and indexed, those of `failed` included.
+    /// The sessions it tried to parse and index, those of `failed` included.
     pub sessions: usize,
-    /// The sessions whose provider could not parse them, each with why. Their rows say so
-    /// too, and they are tried again when their items or the parser change.
+    /// The sessions it could not parse, each with why: the parser stopped, or the archive
+    /// could not be read. Their rows say so too.
     pub failed: Vec<(SessionId, String)>,
     /// The sessions the rules moved into a folder.
     pub filed: usize,
@@ -47,14 +56,14 @@ pub struct IndexReport {
 /**
  * Indexes every session of `providers`' agents whose index is out of date (the module docs),
  * at `location` or, with `None`, at every location: the sessions not indexed yet first, then
- * the newest (PLAN §7.5). A pass ends with this for its location and provider; a start runs it
- * for all, which is how a new version of a parser or of the index reaches what is archived.
+ * the newest (PLAN §7.5). This is the index of a start, and the one that takes a new version
+ * of a parser or of the index to what is archived.
  *
  * `progress` hears how many sessions and bytes there are to index, and how far it is after
  * each session. `cancel` stops it before the next session, with [`SyncError::Cancelled`]; what
  * was indexed stays, and the rest is still out of date for the next run.
  *
- * Two indexes at once (a start's beside a pass's) do no harm, only the same work twice: a row
+ * Two indexes at once (this one beside a pass's) do no harm, only the same work twice: a row
  * says what it was made from, so one made from items that have changed since is out of date
  * for the next run.
  */
@@ -65,17 +74,63 @@ pub fn index(
     cancel: &CancelToken,
     progress: &mut dyn FnMut(&Progress),
 ) -> Result<IndexReport, SyncError> {
+    let providers: Vec<&dyn Provider> = providers.iter().map(Box::as_ref).collect();
+    run(archive, location, &providers, true, cancel, progress)
+}
+
+/// Indexes the sessions of `provider` at `location` whose items changed: what a pass ends with.
+pub(super) fn changed(
+    archive: &Archive,
+    location: &LocationId,
+    provider: &dyn Provider,
+    cancel: &CancelToken,
+    progress: &mut dyn FnMut(&Progress),
+) -> Result<IndexReport, SyncError> {
+    run(
+        archive,
+        Some(location),
+        &[provider],
+        false,
+        cancel,
+        progress,
+    )
+}
+
+/// Indexes the one session `id`, which is `provider`'s, whatever its row says: at once, for
+/// the row to follow what the owner chose to read ([`crate::catalogue::Catalogue`]).
+pub fn index_session(
+    archive: &Archive,
+    provider: &dyn Provider,
+    id: &SessionId,
+) -> Result<IndexReport, SyncError> {
+    let mut report = IndexReport::default();
+    session(archive, provider, id, &mut report)?;
+    Ok(report)
+}
+
+/// Indexes what is out of date; with `backlog`, also what another version of a parser or of
+/// the index made.
+fn run(
+    archive: &Archive,
+    location: Option<&LocationId>,
+    providers: &[&dyn Provider],
+    backlog: bool,
+    cancel: &CancelToken,
+    progress: &mut dyn FnMut(&Progress),
+) -> Result<IndexReport, SyncError> {
     if cancel.is_cancelled() {
         return Err(SyncError::Cancelled);
     }
+    let catalogue = archive.catalogue();
     let mut stale = Vec::new();
     for provider in providers {
-        let sessions = archive.catalogue().stale(
-            location,
-            provider.id().as_str(),
-            provider.parser_version(),
-        )?;
-        stale.extend(sessions.into_iter().map(|stale| (provider.as_ref(), stale)));
+        let (id, parser) = (provider.id(), provider.parser_version());
+        if backlog {
+            catalogue.reclassify(id.as_str(), parser, &|key| provider.classify(key))?;
+        }
+        let (sessions, gone) = catalogue.stale(location, id.as_str(), parser, backlog)?;
+        catalogue.forget_sessions(&gone)?;
+        stale.extend(sessions.into_iter().map(|stale| (*provider, stale)));
     }
     stale.sort_by_key(|(_, stale)| Reverse(stale.recency));
     progress(&Progress::Indexing {
@@ -89,7 +144,6 @@ pub fn index(
             return Err(SyncError::Cancelled);
         }
         session(archive, provider, &stale.id, &mut report)?;
-        report.sessions += 1;
         bytes += stale.bytes;
         progress(&Progress::Indexed {
             sessions: report.sessions,
@@ -108,52 +162,71 @@ fn session(
 ) -> Result<(), SyncError> {
     let catalogue = archive.catalogue();
     let mut readings = catalogue.session_items(id)?;
-    let mut held_back = false;
+    if !readings.iter().any(|reading| reading.kind.is_transcript()) {
+        /* Its items are another session's now, or no conversation's. */
+        return Ok(catalogue.forget_sessions(std::slice::from_ref(id))?);
+    }
+    report.sessions += 1;
     /* A provider's parser doesn't fail (PLAN §7.1), so what stops it on a session is a fault
     in it. That is caught here, for one session's fault to be that session's alone. */
     let parsed = panic::catch_unwind(AssertUnwindSafe(|| {
-        let mut transcript = provider.parse(&ArchivedSession::of(archive, &readings));
-        if let Some(held) = hold(
-            archive,
-            provider,
-            &readings,
-            transcript.conversation.as_ref(),
-        )? {
-            /* The main transcript is read at another version now. */
-            held_back = held;
-            readings = catalogue.session_items(id)?;
-            transcript = provider.parse(&ArchivedSession::of(archive, &readings));
+        let mut items = ArchivedSession::of(archive, &readings);
+        let mut transcript = provider.parse(&items);
+        if items.fault().is_none() {
+            let newly_held = hold(archive, provider, &readings, &transcript)?;
+            if let Some(newly_held) = newly_held {
+                /* Some transcript is read at another version now. */
+                report.held_back += newly_held;
+                readings = catalogue.session_items(id)?;
+                items = ArchivedSession::of(archive, &readings);
+                transcript = provider.parse(&items);
+            }
         }
-        transcript.read_subagents(provider, &ArchivedSession::of(archive, &readings));
+        transcript.read_subagents(provider, &items);
         let own = transcript.conversation.as_ref();
-        let main_item = own
-            .and_then(|own| main(&readings, own))
-            .map(|main| main.item);
-        Ok::<_, SyncError>((
-            main_item,
-            transcript::index(&transcript),
-            own.map(|own| own.ending.clone()),
-        ))
+        Ok::<_, SyncError>(match items.fault() {
+            Some(fault) => Err(fault),
+            None => Ok((
+                own.and_then(|own| {
+                    readings
+                        .iter()
+                        .position(|reading| *reading.key == *own.item)
+                }),
+                transcript::index(&transcript),
+                own.map(|own| own.ending.clone()),
+            )),
+        })
     }));
     let from = fingerprint(&readings);
     let parser = provider.parser_version();
-    match parsed {
-        Ok(derived) => {
-            let (main_item, index, ending) = derived?;
-            let derived = Derived {
-                main_item,
-                index: &index,
-                ending: ending.as_ref(),
-            };
-            report.filed += usize::from(catalogue.record_session(id, parser, from, Ok(derived))?);
-        }
+    let fault = match parsed {
+        Ok(read) => match read? {
+            Ok((main, index, ending)) => {
+                let derived = Derived {
+                    main: main.map(|main| &readings[main]),
+                    index: &index,
+                    ending: ending.as_ref(),
+                    held_back: readings.iter().any(|reading| {
+                        reading.kind.is_transcript() && reading.newest_held.is_some()
+                    }),
+                };
+                let filed = catalogue.record_session(id, parser, from, Indexed::Parsed(derived))?;
+                report.filed += usize::from(filed);
+                return Ok(());
+            }
+            Err(fault) => {
+                let reason = format!("the archive could not be read: {fault}");
+                catalogue.record_session(id, parser, from, Indexed::NotRead(&reason))?;
+                reason
+            }
+        },
         Err(fault) => {
             let reason = format!("its parser stopped: {}", said(fault.as_ref()));
-            catalogue.record_session(id, parser, from, Err(&reason))?;
-            report.failed.push((id.clone(), reason));
+            catalogue.record_session(id, parser, from, Indexed::Faulted(&reason))?;
+            reason
         }
-    }
-    report.held_back += usize::from(held_back);
+    };
+    report.failed.push((id.clone(), fault));
     Ok(())
 }
 
@@ -166,70 +239,167 @@ fn said(fault: &(dyn Any + Send)) -> &str {
         .unwrap_or("it did not say why")
 }
 
-/// The item `own`, a session's own conversation, was parsed from.
-fn main<'a>(readings: &'a [Reading], own: &Conversation) -> Option<&'a Reading> {
-    readings.iter().find(|reading| *reading.key == *own.item)
-}
-
 /**
- * Decides whether the newest version of the session's main transcript is held back for how it
- * parses (PLAN §4.2), from `own`, the session's own conversation as `readings` give it. The
- * newest version is parsed beside the copy that is read without it, which is the newest
+ * Decides, for each of the session's transcripts whose newest version may be a loss for how
+ * it parses, whether that version is held back (PLAN §4.2). `transcript` is the session as
+ * `readings` give it, with no subagent read.
+ *
+ * The newest version is parsed beside the copy that is read without it, which is the newest
  * version before it that is not held back. A version held back only for being shorter is a
- * loss already and is not parsed for this. Returns whether the version is held back for how
- * it parses, when that is not as it was.
+ * loss already, one the owner accepted is none, and neither is parsed for this. Nothing is
+ * decided from a read the operating system failed. Returns how many versions are newly held
+ * back, when any hold is not as it was.
  */
 fn hold(
     archive: &Archive,
     provider: &dyn Provider,
     readings: &[Reading],
-    own: Option<&Conversation>,
-) -> Result<Option<bool>, SyncError> {
-    let Some(main) = own
-        .and_then(|own| main(readings, own))
-        .filter(|main| main.newest_number > 1)
-    else {
-        return Ok(None);
-    };
+    transcript: &Transcript,
+) -> Result<Option<usize>, SyncError> {
     let catalogue = archive.catalogue();
-    let versions = catalogue.versions(main.item)?;
-    let Some((newest, reading)) = versions.split_last().and_then(|(newest, older)| {
-        let reading = older.iter().rev().find(|version| !version.held_back)?;
-        (!newest.held_back || newest.held_by_parse).then_some((newest, reading))
-    }) else {
-        return Ok(None);
-    };
-    let parsed = |version| {
-        provider
-            .parse(&ArchivedSession::of(archive, readings).at(&main.key, version))
-            .conversation
-    };
-    let worse = parsed(newest)
-        .zip(parsed(reading))
-        .is_some_and(|(newest, reading)| parses_worse(&newest, &reading));
-    if worse == newest.held_by_parse {
-        return Ok(None);
+    let own = transcript.conversation.as_ref();
+    let mut newly_held = None;
+    for reading in readings {
+        if !reading.kind.is_transcript()
+            || reading.newest_number == 1
+            || reading.newest_accepted
+            || reading.newest_held == Some(Held::Shorter)
+        {
+            continue;
+        }
+        let versions = catalogue.versions(reading.item)?;
+        let Some((newest, copy)) = versions.split_last().and_then(|(newest, older)| {
+            let copy = older.iter().rev().find(|older| older.held_back.is_none())?;
+            Some((newest, copy))
+        }) else {
+            continue;
+        };
+        /* The item's conversation as it is in `version`; `None` when the provider reads none
+        from it, or a read failed for a reason that is not the stored bytes. */
+        let conversation = |version: &Version| {
+            let own = own.filter(|own| *own.item == *reading.key);
+            if let Some(own) = own.filter(|_| reading.version == version.id) {
+                return Some(Cow::Borrowed(own));
+            }
+            let items = ArchivedSession::of(archive, readings).at(&reading.key, version);
+            let read = match (own, reading.kind) {
+                (Some(_), _) => provider.parse(&items).conversation,
+                (None, ItemKind::Subagent) => match provider.subagent(&items, &reading.key) {
+                    Subagent::Read { conversation, .. } => Some(*conversation),
+                    Subagent::Unread { .. } => None,
+                },
+                (None, _) => None,
+            };
+            read.filter(|_| items.fault().is_none()).map(Cow::Owned)
+        };
+        let Some((newer, copy)) = conversation(newest).zip(conversation(copy)) else {
+            continue;
+        };
+        let worse = parses_worse(&newer, &copy);
+        if catalogue.hold_for_parse(newest.id, newest.length, worse)? {
+            *newly_held.get_or_insert(0) += usize::from(worse);
+        }
     }
-    catalogue.hold_for_parse(newest.id, worse)?;
-    Ok(Some(worse))
+    Ok(newly_held)
 }
 
 /**
  * Whether a transcript "no longer parses" in its version `newer` where it did in `reading`,
  * the copy being read (PLAN §4.2): it can't be read to its end where the reading copy can, or
- * it shows fewer blocks than the reading copy does. What an agent appends or rewrites leaves
- * at least as many; a source that was emptied, cut short or replaced by something that is
- * not a transcript leaves fewer, however long it is.
+ * it holds fewer blocks the provider recognised, over every branch. What an agent appends
+ * only ever adds blocks, whichever branch they are on, so an append is never held back; a
+ * source that was emptied, cut short or replaced by something that is not a transcript holds
+ * fewer, however long it is and however many records it has that the provider doesn't know.
  */
 fn parses_worse(newer: &Conversation, reading: &Conversation) -> bool {
     let unreadable =
         |conversation: &Conversation| matches!(conversation.ending, Ending::Unreadable(_));
-    let shown = |conversation: &Conversation| -> usize {
+    let recognised = |conversation: &Conversation| {
         conversation
-            .turns()
+            .blocks()
             .iter()
-            .map(|turn| turn.blocks.len())
-            .sum()
+            .filter(|block| !matches!(block.content, Content::Unrecognised(_)))
+            .count()
     };
-    (unreadable(newer) && !unreadable(reading)) || shown(newer) < shown(reading)
+    (unreadable(newer) && !unreadable(reading)) || recognised(newer) < recognised(reading)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcript::{Builder, Encoding, Stored, Unrecognised};
+
+    fn reply() -> Content {
+        Content::Reply {
+            text: "Said.".to_string(),
+        }
+    }
+
+    fn unrecognised() -> Content {
+        Content::Unrecognised(Unrecognised {
+            kind: "hologram".to_string(),
+            misfit: None,
+            raw: Stored {
+                item: "item".into(),
+                offset: 0,
+                length: 0,
+                encoding: Encoding::Plain,
+            },
+        })
+    }
+
+    /// A conversation of `shown` blocks on the shown branch and `hidden` blocks off it.
+    fn conversation(shown: Vec<Content>, hidden: Vec<Content>, ending: Ending) -> Conversation {
+        let mut builder = Builder::new("item".into());
+        for content in shown {
+            builder.show(None, None, None, content);
+        }
+        for content in hidden {
+            builder.hide(None, None, None, content);
+        }
+        builder.finish(ending)
+    }
+
+    fn of(blocks: usize) -> Conversation {
+        conversation(vec![reply(); blocks], Vec::new(), Ending::Whole)
+    }
+
+    #[test]
+    fn a_version_parses_worse_with_fewer_blocks_the_provider_recognised() {
+        assert!(parses_worse(&of(2), &of(3)));
+        assert!(!parses_worse(&of(3), &of(3)));
+        assert!(!parses_worse(&of(4), &of(3)));
+        assert!(!parses_worse(&of(0), &of(0)));
+
+        /* Records the provider doesn't know are no conversation, however many there are. */
+        let unknown = conversation(
+            [vec![unrecognised(); 40], vec![reply()]].concat(),
+            Vec::new(),
+            Ending::Whole,
+        );
+        assert!(parses_worse(&unknown, &of(2)));
+        assert!(!parses_worse(&unknown, &of(1)));
+
+        /* A block on a branch that isn't shown is still there. */
+        let rewound = conversation(vec![reply()], vec![reply(); 3], Ending::Whole);
+        assert!(!parses_worse(&rewound, &of(4)));
+        assert!(parses_worse(&rewound, &of(5)));
+    }
+
+    #[test]
+    fn a_version_parses_worse_when_it_alone_cannot_be_read_through() {
+        let unreadable = |blocks| {
+            conversation(
+                vec![reply(); blocks],
+                Vec::new(),
+                Ending::Unreadable("damaged".to_string()),
+            )
+        };
+        assert!(parses_worse(&unreadable(5), &of(3)));
+        assert!(!parses_worse(&unreadable(5), &unreadable(3)));
+        assert!(!parses_worse(&of(3), &unreadable(3)));
+        /* A version that ends inside a record is one still being written. */
+        let unfinished = conversation(vec![reply(); 3], Vec::new(), Ending::MidRecord);
+        assert!(!parses_worse(&unfinished, &of(3)));
+    }
 }

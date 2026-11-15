@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::archive::{Problem, SEGMENT_BYTES};
-use sb_core::catalogue::Reason;
+use sb_core::catalogue::{Held, Reason};
 use sb_core::provider::ItemKind;
 use sb_core::sync::Progress;
 use sb_test_support::{Agent, FileAgent, ProjectsTree, edit_catalogue};
@@ -122,7 +122,10 @@ fn a_rewrite_is_held_back_by_what_was_stored_of_it_until_the_rest_arrives() {
     let report = bench.sync();
     assert_eq!((report.new_versions, report.held_back), (1, 1));
     let versions = bench.versions(&key);
-    assert_eq!((versions[1].length, versions[1].held_back), (3, true));
+    assert_eq!(
+        (versions[1].length, versions[1].held_back),
+        (3, Some(Held::Shorter))
+    );
 
     /* The line is finished: the version has outgrown the one being read, and is no longer
     held back for its length. It is for what it holds, which is no conversation. */
@@ -131,7 +134,7 @@ fn a_rewrite_is_held_back_by_what_was_stored_of_it_until_the_rest_arrives() {
     assert_eq!((report.appended, report.index.held_back), (1, 1));
     let version = &bench.versions(&key)[1];
     assert!(version.length > before.len() as u64);
-    assert!(version.held_back && version.held_by_parse);
+    assert_eq!(version.held_back, Some(Held::ParsesWorse));
     assert!(bench.read(&bench.versions(&key)[0]) == before);
     bench.assert_mirrors(&[key]);
 }
@@ -184,7 +187,7 @@ fn every_file_of_a_session_is_archived_under_its_session() {
     agent.tree_mut().record_bytes(4096);
     let transcript = agent.add_session(12);
     let session = agent.session(&transcript);
-    let id = session.id.clone();
+    let id = session.session_key().to_string();
     let subagent = session.subagent(6);
     let tool_result = session.tool_result(700_000);
     let title = session.title("A generated session");
@@ -273,6 +276,7 @@ fn every_file_under_a_project_is_archived_recognised_or_not() {
     fs::remove_dir(agent.tree().path(&no_folder).with_extension("")).unwrap();
     /* A released session's marker beside its transcript, and files of no session. */
     let id = agent.session(&transcript).id.clone();
+    let session = agent.session(&transcript).session_key().to_string();
     let tree = agent.tree();
     expected.push((
         tree.project_file(PROJECT, &format!("{id}.released.json"), b"{}"),
@@ -303,7 +307,7 @@ fn every_file_under_a_project_is_archived_recognised_or_not() {
             "{key}"
         );
     }
-    assert_eq!(bench.item(&transcript).session, Some(id));
+    assert_eq!(bench.item(&transcript).session, Some(session));
     let keys: Vec<_> = expected.into_iter().map(|(key, ..)| key).collect();
     bench.assert_mirrors(&keys);
 }
@@ -439,7 +443,7 @@ fn growth_that_holds_no_whole_line_is_not_counted_as_an_append() {
 fn what_an_unchanged_item_is_follows_the_provider() {
     let mut agent = FileAgent::new();
     let key = agent.add_session(4);
-    let id = agent.session(&key).id.clone();
+    let id = agent.session(&key).session_key().to_string();
     let bench = Bench::new(agent);
     bench.sync();
     /* As a build that classified it otherwise would have recorded it. */
@@ -555,12 +559,42 @@ mod unreadable {
     use std::path::Path;
 
     use pretty_assertions::assert_eq;
+    use sb_test_support::{break_segment_commits, mend_segment_commits};
 
     use super::*;
     use crate::common::{Meddle, When};
 
     fn set_mode(path: &Path, mode: u32) {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn a_leftover_that_cannot_be_flushed_fails_its_item_alone() {
+        let mut agent = FileAgent::new();
+        let (held, open) = (agent.add_session(4), agent.add_session(4));
+        let mut bench = Bench::new(agent);
+        bench.sync();
+        /* A store that was stopped before its commit leaves both appends' segments. */
+        bench.agent.append(&held, 2);
+        bench.agent.append(&open, 2);
+        break_segment_commits(bench.dir());
+        bench.pass_with(bench.agent.provider()).unwrap_err();
+        mend_segment_commits(bench.dir());
+        /* Another program has one of them open, in a way that lets nobody else write it. */
+        let leftover = bench.segment_files_of(&held).pop().unwrap();
+        set_mode(&leftover, 0o400);
+
+        let report = bench.pass_with(bench.agent.provider()).unwrap();
+        set_mode(&leftover, 0o644);
+        /* The other item's leftover is adopted and recorded; this one is tried again. */
+        assert_eq!((report.appended, report.failed.len()), (1, 1));
+        assert_eq!(report.failed[0].key, held);
+        assert_eq!(bench.segments(&bench.versions(&held)[0]).len(), 1);
+        assert_eq!(bench.segments(&bench.versions(&open)[0]).len(), 2);
+
+        assert_eq!(bench.sync().appended, 1);
+        bench.assert_mirrors(&[held, open]);
+        assert!(bench.orphans().is_empty());
     }
 
     #[test]

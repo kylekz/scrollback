@@ -8,7 +8,7 @@ use std::fs;
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::archive::ArchiveError;
-use sb_core::catalogue::Reason;
+use sb_core::catalogue::{Held, Reason};
 use sb_core::provider::ItemKind;
 use sb_core::sync::{Progress, SyncError};
 use sb_test_support::{Agent, break_segment_commits, mend_segment_commits};
@@ -67,7 +67,7 @@ fn first_sync_archives_every_item<A: Agent + Default>() {
                 versions[0].reason,
                 versions[0].held_back
             ),
-            (1, Reason::FirstSync, false)
+            (1, Reason::FirstSync, None)
         );
         assert_eq!(bench.segments(&versions[0]).len(), 1);
         assert_eq!(bench.item(key).kind, ItemKind::Transcript);
@@ -132,7 +132,7 @@ fn a_rewrite_starts_a_new_version<A: Agent + Default>() {
             versions[1].reason,
             versions[1].held_back
         ),
-        (2, Reason::Rewritten, false)
+        (2, Reason::Rewritten, None)
     );
     /* The earlier version is as it was. */
     assert!(bench.read(&versions[0]) == before);
@@ -168,7 +168,7 @@ fn a_truncation_starts_a_version_that_is_held_back_until_it_outgrows_the_one_rea
     let versions = bench.versions(&keys[2]);
     assert_eq!(
         (versions[1].reason, versions[1].held_back),
-        (Reason::Shrank, true)
+        (Reason::Shrank, Some(Held::Shorter))
     );
     assert!(bench.read(&versions[0]) == before);
     bench.assert_mirrors(&keys);
@@ -178,14 +178,14 @@ fn a_truncation_starts_a_version_that_is_held_back_until_it_outgrows_the_one_rea
     assert_eq!(bench.sync().appended, 1);
     let versions = bench.versions(&keys[2]);
     assert_eq!(versions.len(), 2);
-    assert!(versions[1].held_back);
+    assert_eq!(versions[1].held_back, Some(Held::Shorter));
 
     /* Once it is as long as the version being read, it is no loss any more. */
     bench.agent.append(&keys[2], 12);
     assert_eq!(bench.sync().appended, 1);
     let versions = bench.versions(&keys[2]);
     assert!(versions[1].length > versions[0].length);
-    assert!(!versions[1].held_back);
+    assert_eq!(versions[1].held_back, None);
     bench.assert_mirrors(&keys);
 }
 

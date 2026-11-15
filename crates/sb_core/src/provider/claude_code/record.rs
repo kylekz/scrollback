@@ -94,6 +94,8 @@ pub(super) struct Record<'a> {
     pub custom_title: Option<Text>,
     /// The record was put into the conversation by Claude Code, not typed by the user.
     pub is_meta: Option<bool>,
+    /// The record is of a subagent's conversation, not the session's own.
+    pub is_sidechain: Option<bool>,
     pub is_compact_summary: Option<bool>,
     pub thinking_duration_ms: Option<u64>,
     #[serde(borrow)]
@@ -266,11 +268,14 @@ pub(super) struct WriteResult<'a> {
     pub content: &'a RawValue,
 }
 
-/// The `toolUseResult` of a `Grep` or a `Glob`.
+/// The `toolUseResult` of a `Grep` or a `Glob`. A `Grep` says in `mode` what it was asked for:
+/// the matching lines (`content`), the files that have one, or a count.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct SearchResult {
+    pub mode: Option<String>,
     pub num_matches: Option<u64>,
+    pub num_lines: Option<u64>,
     pub num_files: Option<u64>,
 }
 
@@ -285,8 +290,8 @@ pub(super) struct Hunk<'a> {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct SubagentMeta {
-    pub agent_type: Option<String>,
-    pub description: Option<String>,
+    pub agent_type: Option<Text>,
+    pub description: Option<Text>,
     /// The call that started it. Subagents run by a workflow have none.
     pub tool_use_id: Option<String>,
 }
@@ -295,5 +300,5 @@ pub(super) struct SubagentMeta {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct TitleFile {
-    pub custom_title: String,
+    pub custom_title: Text,
 }

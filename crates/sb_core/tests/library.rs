@@ -12,9 +12,9 @@ use sb_core::catalogue::{Catalogue, CatalogueError, Filed, Folder, SessionId, Sh
 use sb_core::filing::{FolderId, NormalPath};
 use sb_core::location::{LocationId, LocationKind};
 use sb_core::sync::sync_location;
-use sb_test_support::{Agent, DbAgent, FileAgent};
+use sb_test_support::{Agent, DbAgent, FileAgent, read_catalogue};
 
-use common::Bench;
+use common::{Bench, Meddle};
 
 /// A new session of the made-up agent that started in `project`. Returns its transcript's key.
 fn started(agent: &mut DbAgent, project: &str) -> String {
@@ -466,4 +466,247 @@ fn the_library_lists_sessions_by_when_they_last_did_something() {
     assert_eq!(listed(catalogue, Shelf::Starred), ids[..1]);
     let counts = catalogue.library_counts().unwrap();
     assert_eq!((counts.all, counts.starred, counts.unsorted), (3, 1, 3));
+}
+
+#[test]
+fn unsorted_is_grouped_by_where_its_sessions_started() {
+    let mut bench = Bench::new(DbAgent::new());
+    let mut elsewhere = Elsewhere::new(&bench);
+    let keys = [
+        started(&mut bench.agent, "/home/user/code/app"),
+        started(&mut bench.agent, r"D:\Projects\App"),
+        started(&mut bench.agent, "/home/user/code/app/"),
+    ];
+    let there = [
+        started(&mut elsewhere.agent, "/home/user/code/app"),
+        started(&mut elsewhere.agent, "/mnt/d/Projects/App"),
+    ];
+    bench.sync();
+    elsewhere.sync(&bench);
+    let here: Vec<_> = keys.iter().map(|key| bench.session_id(key)).collect();
+    let there: Vec<_> = there.iter().map(|key| elsewhere.session_id(key)).collect();
+
+    let groups = bench.archive().catalogue().unsorted().unwrap();
+    let group = |project: &str, first: &SessionId| {
+        let group = groups
+            .iter()
+            .find(|group| group.sessions.iter().any(|session| session.id == *first))
+            .unwrap();
+        assert_eq!(
+            group.project.as_ref().map(NormalPath::as_str),
+            Some(project)
+        );
+        (
+            group.locations.clone(),
+            group.spellings.clone(),
+            group
+                .sessions
+                .iter()
+                .map(|s| s.id.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    let (ours, theirs) = (bench.location.clone(), elsewhere.location.clone());
+    assert_eq!(groups.len(), 3);
+    /* The same path on two machines is two places. */
+    assert_eq!(
+        group("/home/user/code/app", &here[0]),
+        (
+            vec![ours.clone()],
+            vec![
+                "/home/user/code/app".to_string(),
+                "/home/user/code/app/".to_string()
+            ],
+            vec![here[0].clone(), here[2].clone()],
+        )
+    );
+    assert_eq!(
+        group("/home/user/code/app", &there[0]),
+        (
+            vec![theirs.clone()],
+            vec!["/home/user/code/app".to_string()],
+            vec![there[0].clone()],
+        )
+    );
+    /* A drive is one place from wherever it is seen, however its path is written. Which
+    location's session is listed first is by the locations' ids. */
+    let (mut locations, mut spellings, sessions) = group("d:/projects/app", &here[1]);
+    let mut both = [ours, theirs];
+    for locations in [&mut locations[..], &mut both[..]] {
+        locations.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    }
+    spellings.sort();
+    assert_eq!(locations, both);
+    assert_eq!(spellings, ["/mnt/d/Projects/App", r"D:\Projects\App"]);
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions.contains(&here[1]) && sessions.contains(&there[1]));
+}
+
+#[test]
+fn a_path_is_the_same_however_the_drive_is_written() {
+    let mut bench = Bench::new(DbAgent::new());
+    let under_mount = started(&mut bench.agent, "/mnt/d/Projects/app/src");
+    bench.sync();
+    let id = bench.session_id(&under_mount);
+    let catalogue = bench.archive().catalogue();
+    let first = catalogue.create_folder("first", None).unwrap();
+    let second = catalogue.create_folder("second", None).unwrap();
+
+    /* Typed with white space around it, which is not part of the path. */
+    catalogue
+        .attach_path(first, "  D:\\Projects\\app \n", None)
+        .unwrap();
+    let paths = catalogue.folder_paths(first).unwrap();
+    assert_eq!(
+        (paths[0].attached.path.as_str(), paths[0].typed.as_str()),
+        ("d:/projects/app", r"D:\Projects\app")
+    );
+    /* A session that recorded the drive's mount in a WSL distro is under it. */
+    assert_eq!(filed(catalogue, &id), Filed::ByRule(first));
+
+    /* The mount's form of the path, and the form Windows writes to have a path taken as it
+    is, are the path that is attached already. */
+    for same in [
+        "/mnt/d/Projects/app",
+        r"\\?\D:\Projects\app",
+        "d:/projects/APP/",
+    ] {
+        assert!(
+            matches!(
+                catalogue.attach_path(second, same, None),
+                Err(CatalogueError::PathAttached { folder, .. }) if folder == first
+            ),
+            "{same}"
+        );
+    }
+
+    /* A path that does not say where it is from the top is no path to attach. */
+    for relative in ["code/app", "~/code/app", "./app", "app"] {
+        assert!(
+            matches!(
+                catalogue.attach_path(second, relative, None),
+                Err(CatalogueError::NoPath(_))
+            ),
+            "{relative}"
+        );
+    }
+    assert!(catalogue.folder_paths(second).unwrap().is_empty());
+}
+
+#[test]
+fn what_is_not_there_is_said_not_passed_over() {
+    let mut bench = Bench::new(DbAgent::new());
+    let catalogue = bench.archive().catalogue();
+    let folder = catalogue.create_folder("  work  ", None).unwrap();
+    catalogue.create_folder("b", None).unwrap();
+    catalogue.create_folder("c", None).unwrap();
+    assert_eq!(outline(&catalogue.folders().unwrap(), None), "work b c");
+    let missing = FolderId(folder.0 + 100);
+    let no_folder = |result: Result<(), CatalogueError>| matches!(result, Err(CatalogueError::NoFolder(id)) if id == missing);
+
+    /* A folder that is not there is not renamed, moved, deleted, put into or attached to. */
+    assert!(no_folder(catalogue.rename_folder(missing, "x")));
+    assert!(no_folder(catalogue.move_folder(missing, None, 0)));
+    assert!(no_folder(catalogue.move_folder(folder, Some(missing), 0)));
+    assert!(no_folder(catalogue.delete_folder(missing)));
+    assert!(no_folder(catalogue.attach_path(
+        missing,
+        "/home/user/code",
+        None
+    )));
+    assert!(no_folder(
+        catalogue.create_folder("x", Some(missing)).map(drop)
+    ));
+    assert_eq!(outline(&catalogue.folders().unwrap(), None), "work b c");
+
+    /* A name is some text, of no great length, and two folders may share one. */
+    for name in ["", "   ", &"n".repeat(201)] {
+        assert!(matches!(
+            catalogue.create_folder(name, None),
+            Err(CatalogueError::FolderName)
+        ));
+        assert!(matches!(
+            catalogue.rename_folder(folder, name),
+            Err(CatalogueError::FolderName)
+        ));
+    }
+    let twin = catalogue.create_folder("work", Some(folder)).unwrap();
+    catalogue.rename_folder(twin, &"n".repeat(200)).unwrap();
+    catalogue.rename_folder(twin, " work ").unwrap();
+    assert_eq!(
+        outline(&catalogue.folders().unwrap(), None),
+        "work(work) b c"
+    );
+
+    /* The folders a move leaves close up: the places among them have no gaps. */
+    catalogue.move_folder(twin, None, 1).unwrap();
+    catalogue.delete_folder(folder).unwrap();
+    assert_eq!(outline(&catalogue.folders().unwrap(), None), "work b c");
+    assert_eq!(
+        read_catalogue(bench.dir(), "SELECT position FROM folder ORDER BY position"),
+        ["0", "1", "2"]
+    );
+
+    /* Nothing is decided about a session of which nothing is archived, and nothing is kept
+    of the attempt: the session that arrives under that identity starts as any other. */
+    let key = started(&mut bench.agent, "/srv/x");
+    let id = SessionId {
+        location: bench.location.clone(),
+        provider: bench.agent.provider().id().to_string(),
+        key: key.strip_prefix("sessions/").unwrap().to_string(),
+    };
+    let catalogue = bench.archive().catalogue();
+    let no_session = |result: Result<(), CatalogueError>| matches!(result, Err(CatalogueError::NoSession(not_there)) if not_there == id);
+    assert!(no_session(catalogue.set_starred(&id, true)));
+    assert!(no_session(catalogue.file_by_hand(&id, twin)));
+    assert!(no_session(catalogue.file_automatically(&id).map(drop)));
+    assert_eq!(
+        read_catalogue(bench.dir(), "SELECT count(*) FROM session_state"),
+        ["0"]
+    );
+    bench.sync();
+    let session = bench.session(&key);
+    assert_eq!((session.filed, session.starred), (Filed::Unsorted, false));
+    assert!(matches!(
+        bench.archive().catalogue().file_by_hand(&id, missing),
+        Err(CatalogueError::NoFolder(_))
+    ));
+}
+
+#[test]
+fn a_session_the_parser_stops_on_stays_filed_and_is_filed_by_what_was_known() {
+    let mut bench = Bench::new(DbAgent::new());
+    let key = started(&mut bench.agent, "/home/user/code/app");
+    let catalogue = bench.archive().catalogue();
+    let app = catalogue.create_folder("app", None).unwrap();
+    catalogue
+        .attach_path(app, "/home/user/code/app", None)
+        .unwrap();
+    assert_eq!(bench.sync().index.filed, 1);
+    let id = bench.session_id(&key);
+    let before = bench.session(&key);
+    assert_eq!(before.filed, Filed::ByRule(app));
+
+    /* The session goes on, and the parser stops on it: it is where it was, with what was
+    known of it. */
+    bench.agent.say(&key, "user", "More.");
+    let report = bench.synced_with(bench.meddling(Meddle::FaultyParser(key.clone())));
+    assert_eq!((report.index.failed.len(), report.index.filed), (1, 0));
+    let failed = bench.session(&key);
+    assert!(failed.failure.is_some());
+    assert_eq!(
+        (&failed.title, &failed.project, failed.filed),
+        (&before.title, &before.project, Filed::ByRule(app))
+    );
+
+    /* A change of paths files it like any other, by the path its row still has. */
+    let catalogue = bench.archive().catalogue();
+    let attached = catalogue.folder_paths(app).unwrap().remove(0).attached;
+    catalogue.detach_path(&attached).unwrap();
+    assert_eq!(filed(catalogue, &id), Filed::Unsorted);
+    let code = catalogue.create_folder("code", None).unwrap();
+    catalogue
+        .attach_path(code, "/home/user/code", None)
+        .unwrap();
+    assert_eq!(filed(catalogue, &id), Filed::ByRule(code));
 }

@@ -9,8 +9,8 @@ use crate::transcript::Content;
 const TASK_NOTICE: &str = "task-notification";
 
 /// The tags Claude Code wraps what it puts in the user's place itself in. Each such element
-/// is a note.
-const WRAPPERS: [&str; 7] = [
+/// is a note. The last two are what a command the user ran in shell mode printed.
+const WRAPPERS: [&str; 9] = [
     "system-reminder",
     "side-sessions-event",
     "local-command-stdout",
@@ -18,7 +18,15 @@ const WRAPPERS: [&str; 7] = [
     "artifact-view-context",
     "fork-boilerplate",
     TASK_NOTICE,
+    "bash-stdout",
+    "bash-stderr",
 ];
+
+/// The tag around a command the user ran in shell mode, which is typed after a `!`.
+const SHELL_INPUT: &str = "bash-input";
+
+/// The tags of a slash command.
+const COMMAND: [&str; 3] = ["command-name", "command-message", "command-args"];
 
 /// The tags around a message from another session, whose `from-name` or `from` is its sender.
 const MESSAGES: [&str; 2] = ["cross-session-message", "agent-message"];
@@ -47,7 +55,8 @@ pub(super) struct Said {
  *   that sender, and its text is the message alone, without the markup around it.
  * - On a record marked `isMeta`, or starting with one of the bracketed notices Claude Code
  *   writes itself (an interruption), the rest is a note.
- * - A slash command is a prompt: the command as it was typed.
+ * - A slash command is a prompt: the command as it was typed. So is a command run in shell
+ *   mode, with the `!` it was typed after.
  */
 pub(super) fn said(text: &str, meta: bool, origin: Option<&Origin>) -> Said {
     let note = |kind: &str, text: &str| Content::Note {
@@ -62,6 +71,7 @@ pub(super) fn said(text: &str, meta: bool, origin: Option<&Origin>) -> Said {
     }
     let rest = rest.trim();
     let message = element(rest).filter(|element| MESSAGES.contains(&element.tag));
+    let shell = element(rest).filter(|element| element.tag == SHELL_INPUT);
     let prompt = match origin.filter(|origin| origin.kind != "human") {
         _ if rest.is_empty() => None,
         Some(origin) if origin.kind == TASK_NOTICE => {
@@ -93,9 +103,10 @@ pub(super) fn said(text: &str, meta: bool, origin: Option<&Origin>) -> Said {
                 notes.push(note(kind, rest));
                 None
             }
-            None => Some(match (command(rest), message) {
-                (Some(command), _) => (command, None),
-                (None, Some(message)) => (
+            None => Some(match (command(rest), shell, message) {
+                (Some(command), _, _) => (command, None),
+                (None, Some(shell), _) => (format!("!{}", shell.content.trim()), None),
+                (None, None, Some(message)) => (
                     message.content.trim().to_string(),
                     Some(
                         attribute(message.attributes, "from-name")
@@ -104,7 +115,7 @@ pub(super) fn said(text: &str, meta: bool, origin: Option<&Origin>) -> Said {
                             .to_string(),
                     ),
                 ),
-                (None, None) => (rest.to_string(), None),
+                (None, None, None) => (rest.to_string(), None),
             }),
         },
     };
@@ -138,6 +149,17 @@ fn element(text: &str) -> Option<Element<'_>> {
         content,
         rest,
     })
+}
+
+/// The tag of the element `text` starts with, when it is none this parser knows: neither one
+/// of Claude Code's own additions, nor a message, nor a command.
+pub(super) fn unknown_element(text: &str) -> Option<&str> {
+    let tag = element(text)?.tag;
+    let known = WRAPPERS.contains(&tag)
+        || MESSAGES.contains(&tag)
+        || COMMAND.contains(&tag)
+        || tag == SHELL_INPUT;
+    (!known).then_some(tag)
 }
 
 /// The value of the attribute `name` among an element's `attributes`.

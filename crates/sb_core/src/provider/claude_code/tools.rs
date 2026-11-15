@@ -174,9 +174,13 @@ pub(super) fn input(name: &str, raw: &RawValue, line: &Line) -> ToolInput {
 
 /**
  * The short form of the result of a call of a tool of the kind `kind`, where the record has
- * one. `text` is the result's first text, and `detail` its `toolUseResult`.
+ * one. `text` is the result's first text, `failed` whether the result is marked an error, and
+ * `detail` its `toolUseResult`.
  *
  * - A command's exit status is only in the text of a failed one, which starts `Exit code <n>`.
+ *   A command that worked and printed those words has none.
+ * - A search for matching lines found as many as it says, or as many lines; the files it
+ *   found them in are not its matches.
  * - The rest is read from `toolUseResult`: the lines a `Read` returned, the `+` and `-` lines
  *   of an `Edit`'s patch, whether a `Write` made the file and the lines of what it wrote, the
  *   matches of a `Grep` or the files of a `Glob`, and what a finished subagent's run came to.
@@ -184,11 +188,15 @@ pub(super) fn input(name: &str, raw: &RawValue, line: &Line) -> ToolInput {
 pub(super) fn brief(
     kind: ToolKind,
     text: Option<&RawValue>,
+    failed: bool,
     detail: Option<&RawValue>,
 ) -> Option<Brief> {
     match kind {
         ToolKind::Shell => {
-            let status = text?.get().strip_prefix("\"Exit code ")?;
+            let status = text
+                .filter(|_| failed)?
+                .get()
+                .strip_prefix("\"Exit code ")?;
             let digits = status.len()
                 - status
                     .trim_start_matches(|c: char| c.is_ascii_digit())
@@ -215,7 +223,11 @@ pub(super) fn brief(
         }),
         ToolKind::ContentSearch | ToolKind::FileSearch => {
             let found: SearchResult = typed(detail?)?;
-            found.num_matches.or(found.num_files).map(Brief::Matches)
+            match found.mode.as_deref() {
+                Some("content") => found.num_matches.or(found.num_lines),
+                _ => found.num_matches.or(found.num_files),
+            }
+            .map(Brief::Matches)
         }
         ToolKind::Subagent => {
             let ran: Launched = typed(detail?)?;

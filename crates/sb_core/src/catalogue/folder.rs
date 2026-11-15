@@ -4,13 +4,14 @@
 //! [`crate::filing`] decides which attached path claims a session; this is where the rules
 //! run. A session that is not filed by hand is always where the rules put it: they run on a
 //! session each time it is indexed, and over every indexed session when the attached paths
-//! change or a folder goes. A session whose row is missing (the index is being rebuilt), or
-//! says that it could not be parsed, stays where it is until it is indexed again.
+//! change or a folder goes, by the project path its row has. A session whose row is missing
+//! (the index is being rebuilt) stays where it is until it is indexed again, and so does one
+//! that an index could not parse: its row still has what the index before found.
 
 use toolbox_store::rusqlite::{self, Connection, OptionalExtension as _, params};
 
-use super::session::set_state;
-use super::{Catalogue, CatalogueError, Result, SessionId};
+use super::session::{archived, set_state};
+use super::{Catalogue, CatalogueError, FOLDER_NAME_CHARS, Result, SessionId};
 use crate::filing::{self, AttachedPath, FolderId, NormalPath};
 use crate::location::LocationId;
 
@@ -48,10 +49,15 @@ impl Catalogue {
         })
     }
 
-    /// Makes a folder in `parent`, or at the top, after the folders already there.
+    /// Makes a folder in `parent`, or at the top, after the folders already there. Two
+    /// folders may have the same name.
     pub fn create_folder(&self, name: &str, parent: Option<FolderId>) -> Result<FolderId> {
-        let parent = parent.map(|parent| parent.0);
+        let name = named(name)?;
         self.db.write(|tx| {
+            if let Some(parent) = parent {
+                parent_of(tx, parent)?;
+            }
+            let parent = parent.map(|parent| parent.0);
             tx.execute(
                 "INSERT INTO folder (parent_id, name, position)
                  SELECT ?1, ?2, COALESCE(max(position) + 1, 0) FROM folder WHERE parent_id IS ?1",
@@ -62,10 +68,15 @@ impl Catalogue {
     }
 
     pub fn rename_folder(&self, folder: FolderId, name: &str) -> Result<()> {
-        self.execute(
-            "UPDATE folder SET name = ?2 WHERE id = ?1",
-            params![folder.0, name],
-        )
+        let name = named(name)?;
+        self.db.write(|tx| {
+            parent_of(tx, folder)?;
+            tx.execute(
+                "UPDATE folder SET name = ?2 WHERE id = ?1",
+                params![folder.0, name],
+            )?;
+            Ok(())
+        })
     }
 
     /// Moves a folder into `parent`, or to the top, as the one at `position` among the
@@ -78,15 +89,13 @@ impl Catalogue {
         position: usize,
     ) -> Result<()> {
         self.db.write(|tx| {
-            let mut above = parent.map(|parent| parent.0);
+            let from = parent_of(tx, folder)?;
+            let mut above = parent;
             while let Some(id) = above {
-                if id == folder.0 {
+                if id == folder {
                     return Err(CatalogueError::FolderInItself);
                 }
-                above =
-                    tx.query_row("SELECT parent_id FROM folder WHERE id = ?1", [id], |row| {
-                        row.get(0)
-                    })?;
+                above = parent_of(tx, id)?.map(FolderId);
             }
             let parent = parent.map(|parent| parent.0);
             let mut siblings = children(tx, parent)?;
@@ -96,7 +105,9 @@ impl Catalogue {
                 "UPDATE folder SET parent_id = ?2 WHERE id = ?1",
                 params![folder.0, parent],
             )?;
-            Ok(order(tx, &siblings)?)
+            order(tx, &siblings)?;
+            /* The folders it left close up. */
+            Ok(order(tx, &children(tx, from)?)?)
         })
     }
 
@@ -105,11 +116,7 @@ impl Catalogue {
     /// the rules file them again.
     pub fn delete_folder(&self, folder: FolderId) -> Result<()> {
         self.db.write(|tx| {
-            let parent: Option<i64> = tx.query_row(
-                "SELECT parent_id FROM folder WHERE id = ?1",
-                [folder.0],
-                |row| row.get(0),
-            )?;
+            let parent = parent_of(tx, folder)?;
             let inside = children(tx, Some(folder.0))?;
             let siblings: Vec<i64> = children(tx, parent)?
                 .into_iter()
@@ -161,7 +168,9 @@ impl Catalogue {
     /**
      * Attaches the project path `typed` to a folder, for the sessions of `location` or of
      * every location, and files by it: the sessions in Unsorted and those a rule filed go
-     * where the rules now put them (PLAN §8).
+     * where the rules now put them (PLAN §8). The white space around the path is not part of
+     * it. A path that names no directory, or does not say where it is from the top (`~/code`,
+     * `code/app`), is [`CatalogueError::NoPath`].
      *
      * A path is attached once for a scope. A second attach, to any folder, is refused with
      * [`CatalogueError::PathAttached`], which names the folder that has it.
@@ -172,11 +181,14 @@ impl Catalogue {
         typed: &str,
         location: Option<&LocationId>,
     ) -> Result<()> {
-        /* Only this machine is a location so far. A path typed for a WSL distro is normalised
-        with the distro's drive mount (PLAN §6.3). */
+        let typed = typed.trim();
+        /* The drive mount is the default one for every location until a location can say its
+        own (PLAN §6.3). */
         let path = NormalPath::new(typed, None)
+            .filter(NormalPath::is_absolute)
             .ok_or_else(|| CatalogueError::NoPath(typed.to_string()))?;
         self.db.write(|tx| {
+            parent_of(tx, folder)?;
             let first = tx
                 .query_row(
                     "SELECT f.id, f.name, p.typed FROM folder_path p
@@ -218,10 +230,10 @@ impl Catalogue {
     /// Files a session in a folder by hand. No rule moves it from there (PLAN §8).
     pub fn file_by_hand(&self, session: &SessionId, folder: FolderId) -> Result<()> {
         self.db.write(|tx| {
-            Ok(
-                set_state(tx, session, &[("folder_id", &folder.0), ("by_hand", &true)])
-                    .map(drop)?,
-            )
+            archived(tx, session)?;
+            parent_of(tx, folder)?;
+            set_state(tx, session, &[("folder_id", &folder.0), ("by_hand", &true)])?;
+            Ok(())
         })
     }
 
@@ -229,6 +241,7 @@ impl Catalogue {
     /// file it in, if one's path claims it.
     pub fn file_automatically(&self, session: &SessionId) -> Result<Option<FolderId>> {
         self.db.write(|tx| {
+            archived(tx, session)?;
             let project: Option<NormalPath> = tx
                 .query_row(
                     "SELECT project FROM session
@@ -243,6 +256,27 @@ impl Catalogue {
             Ok(folder.map(FolderId))
         })
     }
+}
+
+/// A folder's name as it is kept: without the white space around it.
+fn named(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > FOLDER_NAME_CHARS {
+        return Err(CatalogueError::FolderName);
+    }
+    Ok(name)
+}
+
+/// The folder `folder` is in, `None` at the top. Fails when there is no such folder.
+fn parent_of(connection: &Connection, folder: FolderId) -> Result<Option<i64>> {
+    connection
+        .query_row(
+            "SELECT parent_id FROM folder WHERE id = ?1",
+            [folder.0],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(CatalogueError::NoFolder(folder))
 }
 
 /// Runs the rules on the session `id`, started in `project`, unless the owner filed it by
@@ -272,8 +306,8 @@ pub(super) fn file_by_rule(
     Ok(folder.is_some())
 }
 
-/// Runs the rules over every indexed session that is not filed by hand. One that could not
-/// be parsed has no project path to file it by, and stays where it is.
+/// Runs the rules over every indexed session that is not filed by hand, each by the project
+/// path its row has.
 fn refile(connection: &Connection) -> rusqlite::Result<()> {
     let attached = attached(connection)?;
     let filed: Vec<(SessionId, Option<NormalPath>, Option<i64>)> = connection
@@ -283,7 +317,7 @@ fn refile(connection: &Connection) -> rusqlite::Result<()> {
              LEFT JOIN session_state st
                ON st.location_id = s.location_id AND st.provider = s.provider
               AND st.session = s.session
-             WHERE COALESCE(st.by_hand, 0) = 0 AND s.failure IS NULL",
+             WHERE COALESCE(st.by_hand, 0) = 0",
         )?
         .query_map([], |row| {
             let id = SessionId {

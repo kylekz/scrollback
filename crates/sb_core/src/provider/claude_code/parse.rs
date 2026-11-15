@@ -32,6 +32,13 @@
 //!   records its `agentId`, which names its file, and a workflow's records the run its
 //!   subagents are filed under. Where a call that starts subagents has none by those, the
 //!   `.meta.json` beside each remaining transcript is read for the `tool_use` it names.
+//! - **Subagents inside the session's own transcript.** Earlier releases kept a subagent's
+//!   records there, each marked `isSidechain` and following the subagent's own first record,
+//!   not the conversation. They are never the session's conversation: each such tree of
+//!   records is a subagent's conversation, read with the session's, and it goes under the
+//!   one call that starts a subagent with the prompt the tree opens with, or among the
+//!   subagents no call is known to have started. This shape is from memory of those releases
+//!   and has not been checked against a transcript one of them wrote.
 //! - **Everything else.** Records, attachments and system notices of the kinds listed here as
 //!   holding no conversation are passed over. One of a kind this parser doesn't know is kept
 //!   as an `Unrecognised`: among the blocks when it has a `uuid`, beside the conversation
@@ -57,8 +64,8 @@ use super::tools::{self, WORKFLOW};
 use crate::provider::{ItemKind, SessionItem, SessionItems};
 use crate::transcript::{
     BlockId, Builder, Content, Conversation, Encoding, Ending, Facts, Image, Output, Stored,
-    Subagent, Tokens, ToolCall, ToolKind, ToolResult, ToolStatus, Transcript, Unreadable,
-    Unrecognised,
+    Subagent, Tokens, ToolCall, ToolInput, ToolKind, ToolResult, ToolStatus, Transcript,
+    Unreadable, Unrecognised,
 };
 
 /// The record types that carry the conversation.
@@ -153,7 +160,7 @@ pub(super) fn parse(items: &dyn SessionItems) -> Transcript {
     let read = list
         .iter()
         .find(|item| item.kind == ItemKind::Transcript)
-        .map(|item| Reading::of(items, &item.key, &saved(list)).finish(items));
+        .map(|item| Reading::of(items, &item.key, &saved(list), true).finish(items));
     let mut facts = Facts {
         agent: ID,
         title: None,
@@ -162,12 +169,15 @@ pub(super) fn parse(items: &dyn SessionItems) -> Transcript {
         entrypoint: None,
     };
     let mut claimed = HashSet::new();
+    let mut inline = Vec::new();
     let mut conversation = read.map(|read| {
-        facts.title = read.title;
+        /* A title that says nothing is none. */
+        facts.title = read.title.filter(|title| !title.trim().is_empty());
         facts.project_path = read.cwd;
         facts.branch = read.branch;
         facts.entrypoint = read.entrypoint;
         claimed = read.claimed;
+        inline = read.inline;
         read.conversation
     });
     if facts.title.is_none()
@@ -176,7 +186,11 @@ pub(super) fn parse(items: &dyn SessionItems) -> Transcript {
             .find(|item| item.key.ends_with("/custom-title.json"))
     {
         match sidecar::<TitleFile>(items, &file.key) {
-            Ok(title) => facts.title = title.map(|title| title.custom_title),
+            Ok(title) => {
+                facts.title = title
+                    .map(|title| title.custom_title.0)
+                    .filter(|title| !title.trim().is_empty());
+            }
             Err(reason) => {
                 if let Some(conversation) = &mut conversation {
                     conversation.unreadable.push(Unreadable {
@@ -199,12 +213,13 @@ pub(super) fn parse(items: &dyn SessionItems) -> Transcript {
         unattached: unattached
             .into_iter()
             .map(|key| Subagent::Unread { item: key.into() })
+            .chain(inline)
             .collect(),
     }
 }
 
 pub(super) fn subagent(items: &dyn SessionItems, key: &str) -> Subagent {
-    let mut conversation = Reading::of(items, key, &saved(items.list()))
+    let mut conversation = Reading::of(items, key, &saved(items.list()), false)
         .finish(items)
         .conversation;
     let meta = meta_key(key);
@@ -216,8 +231,8 @@ pub(super) fn subagent(items: &dyn SessionItems, key: &str) -> Subagent {
     });
     let meta = meta.unwrap_or_default();
     Subagent::Read {
-        kind: meta.agent_type,
-        description: meta.description,
+        kind: meta.agent_type.map(|Text(kind)| kind),
+        description: meta.description.map(|Text(description)| description),
         conversation: Box::new(conversation),
     }
 }
@@ -231,8 +246,8 @@ fn meta_key(key: &str) -> String {
     format!("{}.meta.json", key.strip_suffix(".jsonl").unwrap_or(key))
 }
 
-/// The small JSON file `key` of the session, when it is there and is what `T` reads. An error
-/// is why it couldn't be read.
+/// The small JSON file `key` of the session, when it is there. An error is why it couldn't be
+/// read, or that it isn't what `T` reads.
 fn sidecar<T: DeserializeOwned>(items: &dyn SessionItems, key: &str) -> Result<Option<T>, String> {
     if !items.list().iter().any(|item| item.key == key) {
         return Ok(None);
@@ -242,7 +257,9 @@ fn sidecar<T: DeserializeOwned>(items: &dyn SessionItems, key: &str) -> Result<O
         .open(key, 0)
         .and_then(|mut file| file.read_to_end(&mut json))
         .map_err(|error| error.to_string())?;
-    Ok(serde_json::from_slice(&json).ok())
+    serde_json::from_slice(&json)
+        .map(Some)
+        .map_err(|error| format!("it is not as expected ({:?})", error.classify()))
 }
 
 /// A record in the tree the `parentUuid`s make, with what it holds of the conversation.
@@ -252,6 +269,8 @@ struct Node {
     at: Option<i64>,
     /// The model of the reply the record is part of.
     model: Option<String>,
+    /// What the reply the record is part of used, on the first record of the reply.
+    tokens: Tokens,
     contents: Vec<Content>,
 }
 
@@ -279,7 +298,6 @@ struct Reading<'a> {
     calls: HashMap<String, Place>,
     answers: Vec<Answer>,
     unplaced: Vec<Unrecognised>,
-    tokens: Tokens,
     /// The replies whose usage is counted, by `message.id`.
     counted: HashSet<String>,
     /// The compaction boundary still waiting for its summary.
@@ -289,6 +307,10 @@ struct Reading<'a> {
     cwd: Option<String>,
     branch: Option<String>,
     entrypoint: Option<String>,
+    /// Whether the transcript is a session's own, in which the records marked as a
+    /// subagent's are set apart, in `inline`.
+    main: bool,
+    inline: Option<Box<Reading<'a>>>,
 }
 
 /// A transcript as a conversation, and what else it says.
@@ -296,6 +318,9 @@ struct Read {
     conversation: Conversation,
     /// The subagent transcripts its calls started, by key.
     claimed: HashSet<String>,
+    /// The subagents whose records are in the transcript itself and that no call of it is
+    /// known to have started.
+    inline: Vec<Subagent>,
     title: Option<String>,
     cwd: Option<String>,
     branch: Option<String>,
@@ -303,18 +328,16 @@ struct Read {
 }
 
 impl<'a> Reading<'a> {
-    /// Reads the transcript `key`. What can't be read ends it there, and says so.
-    fn of(items: &dyn SessionItems, key: &str, saved: &'a Saved<'a>) -> Self {
-        let item: Arc<str> = Arc::from(key);
-        let mut reading = Self {
+    /// Nothing read yet of the transcript `item`.
+    fn new(item: Arc<str>, saved: &'a Saved<'a>, main: bool) -> Self {
+        Self {
             saved,
-            item: item.clone(),
+            item,
             nodes: Vec::new(),
             by_uuid: HashMap::new(),
             calls: HashMap::new(),
             answers: Vec::new(),
             unplaced: Vec::new(),
-            tokens: Tokens::default(),
             counted: HashSet::new(),
             compaction: None,
             ending: Ending::Whole,
@@ -322,7 +345,16 @@ impl<'a> Reading<'a> {
             cwd: None,
             branch: None,
             entrypoint: None,
-        };
+            main,
+            inline: None,
+        }
+    }
+
+    /// Reads the transcript `key`, a session's own (`main`) or a subagent's. What can't be
+    /// read ends it there, and says so.
+    fn of(items: &dyn SessionItems, key: &str, saved: &'a Saved<'a>, main: bool) -> Self {
+        let item: Arc<str> = Arc::from(key);
+        let mut reading = Self::new(item.clone(), saved, main);
         let mut bytes = match items.open(key, 0) {
             Ok(bytes) => BufReader::with_capacity(1 << 16, bytes),
             Err(error) => {
@@ -382,6 +414,14 @@ impl<'a> Reading<'a> {
                 return true;
             }
         };
+        /* A subagent's record in the session's own transcript says nothing of the session. */
+        if self.main && record.is_sidechain == Some(true) {
+            let (item, saved) = (self.item.clone(), self.saved);
+            self.inline
+                .get_or_insert_with(|| Box::new(Self::new(item, saved, false)))
+                .take(record, line);
+            return true;
+        }
         let text = |text: Option<Text>| text.map(|Text(text)| text);
         if self.cwd.is_none() {
             self.cwd = text(record.cwd.take());
@@ -392,6 +432,13 @@ impl<'a> Reading<'a> {
         if self.entrypoint.is_none() {
             self.entrypoint = record.entrypoint.take();
         }
+        self.take(record, line);
+        true
+    }
+
+    /// Takes in one record of the transcript's conversation, or of what goes beside it.
+    fn take(&mut self, mut record: Record, line: &Line) {
+        let text = |text: Option<Text>| text.map(|Text(text)| text);
         match record.kind.as_str() {
             /* The last one is the title. */
             TITLE => self.title = text(record.custom_title.take()).or(self.title.take()),
@@ -422,7 +469,6 @@ impl<'a> Reading<'a> {
             }
             _ => self.unplaced.push(unknown(record.kind, line.whole())),
         }
-        true
     }
 
     /// Starts the node of a record. What the record holds is pushed onto it next.
@@ -441,6 +487,7 @@ impl<'a> Reading<'a> {
                 .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
                 .map(|time| time.timestamp_millis()),
             model: None,
+            tokens: Tokens::default(),
             contents: Vec::new(),
         });
     }
@@ -480,18 +527,17 @@ impl<'a> Reading<'a> {
         let Some(message) = record.message.and_then(typed::<Message>) else {
             return self.misfit("assistant", "message", line.whole());
         };
+        let counted = message.id.is_none_or(|id| self.counted.insert(id));
         if let Some(node) = self.nodes.last_mut() {
             node.model = message.model.filter(|model| model != SYNTHETIC);
-        }
-        if message.id.is_none_or(|id| self.counted.insert(id))
-            && let Some(usage) = message.usage.and_then(typed::<Usage>)
-        {
-            self.tokens.add(Tokens {
-                input: usage.input_tokens.unwrap_or(0),
-                output: usage.output_tokens.unwrap_or(0),
-                cache_read: usage.cache_read_input_tokens.unwrap_or(0),
-                cache_write: usage.cache_creation_input_tokens.unwrap_or(0),
-            });
+            if counted && let Some(usage) = message.usage.and_then(typed::<Usage>) {
+                node.tokens = Tokens {
+                    input: usage.input_tokens.unwrap_or(0),
+                    output: usage.output_tokens.unwrap_or(0),
+                    cache_read: usage.cache_read_input_tokens.unwrap_or(0),
+                    cache_write: usage.cache_creation_input_tokens.unwrap_or(0),
+                };
+            }
         }
         match message.content.map(shape) {
             Some(Shape::Text(text)) => match string(text) {
@@ -666,15 +712,17 @@ impl<'a> Reading<'a> {
             Some((kind, workflow)) if kind != ToolKind::Subagent && !workflow => None,
             _ => record.tool_use_result.and_then(typed::<Launched>),
         };
+        let failed = block.is_error == Some(true);
         let result = ToolResult {
             at: self.nodes.last().and_then(|node| node.at),
-            status: if block.is_error == Some(true) {
+            status: if failed {
                 ToolStatus::Failed
             } else {
                 ToolStatus::Ok
             },
-            brief: call
-                .and_then(|(kind, _)| tools::brief(kind, first_text, record.tool_use_result)),
+            brief: call.and_then(|(kind, _)| {
+                tools::brief(kind, first_text, failed, record.tool_use_result)
+            }),
             output: match content {
                 None => Vec::new(),
                 Some(Shape::Text(text)) => vec![Output::Text(self.output_text(text, line))],
@@ -822,32 +870,141 @@ impl<'a> Reading<'a> {
     /// Pairs results with calls, names the subagents the calls started, and puts the records
     /// in the model's order.
     fn finish(mut self, items: &dyn SessionItems) -> Read {
-        /* The calls that started something, by the id their result gave it. */
+        let starters = self.pair();
+        let claimed = self.subagents(items, &starters);
+        let inline = match self.inline.take() {
+            Some(inline) => self.sidechains(*inline, items),
+            None => Vec::new(),
+        };
+        let (title, cwd, branch, entrypoint) = (
+            self.title.take(),
+            self.cwd.take(),
+            self.branch.take(),
+            self.entrypoint.take(),
+        );
+        let ending = self.ending.clone();
+        Read {
+            conversation: self
+                .conversations(false, &ending)
+                .pop()
+                .expect("records that are not set apart are one conversation"),
+            claimed,
+            inline,
+            title,
+            cwd,
+            branch,
+            entrypoint,
+        }
+    }
+
+    /// Gives each call its result, and returns the calls that started something, by the id
+    /// their result gave it. A result with no call, or of a call that has one, is kept as it
+    /// was recorded.
+    fn pair(&mut self) -> HashMap<String, Place> {
         let mut starters: HashMap<String, Place> = HashMap::new();
         for answer in std::mem::take(&mut self.answers) {
             let place = answer
                 .call
                 .as_ref()
                 .and_then(|id| self.calls.get(id).copied());
-            if let Some((node, at)) = place
-                && let Content::ToolCall(call) = &mut self.nodes[node].contents[at]
-            {
-                if call.result.is_none() {
+            let call = place.and_then(|(node, at)| match &mut self.nodes[node].contents[at] {
+                Content::ToolCall(call) => Some((call, (node, at))),
+                _ => None,
+            });
+            let misfit = match call {
+                Some((call, place)) if call.result.is_none() => {
                     call.result = Some(answer.result);
+                    starters.extend(answer.started.into_iter().map(|id| (id, place)));
+                    continue;
                 }
-                starters.extend(answer.started.into_iter().map(|id| (id, (node, at))));
-            } else {
-                self.nodes[answer.node]
+                Some(_) => "a second result",
+                None => "tool_use_id",
+            };
+            self.nodes[answer.node]
+                .contents
+                .push(Content::Unrecognised(Unrecognised {
+                    kind: "tool_result".to_string(),
+                    misfit: Some(misfit),
+                    raw: answer.record,
+                }));
+        }
+        starters
+    }
+
+    /**
+     * The subagents whose records `inline` holds, which are those of this transcript marked
+     * as a subagent's (the module docs): each tree of them is one. One goes under the call of
+     * this transcript that starts a subagent with the very prompt it opens with, when there
+     * is exactly one such call. The others are returned.
+     */
+    fn sidechains(&mut self, mut inline: Reading<'a>, items: &dyn SessionItems) -> Vec<Subagent> {
+        inline.pair();
+        self.unplaced.append(&mut inline.unplaced);
+        /* Each call that starts a subagent, with the prompt it gives it. */
+        let starts: Vec<(Place, String)> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .flat_map(|(node, record)| {
+                record
                     .contents
-                    .push(Content::Unrecognised(Unrecognised {
-                        kind: "tool_result".to_string(),
-                        misfit: Some("tool_use_id"),
-                        raw: answer.record,
-                    }));
+                    .iter()
+                    .enumerate()
+                    .map(move |(at, content)| ((node, at), content))
+            })
+            .filter_map(|(place, content)| match content {
+                Content::ToolCall(call) => match &call.input {
+                    ToolInput::Subagent { prompt, .. } => {
+                        Some((place, prompt.load_text(items).ok()?))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let mut unattached = Vec::new();
+        for conversation in inline.conversations(true, &self.ending) {
+            let opens = conversation.turns().first().and_then(|turn| {
+                match &conversation[turn.blocks[0]].content {
+                    Content::Prompt { text, .. } => Some(text.trim()),
+                    _ => None,
+                }
+            });
+            let mut started = starts
+                .iter()
+                .filter(|(_, prompt)| Some(prompt.trim()) == opens)
+                .map(|(place, _)| *place);
+            let call = match (started.next(), started.next()) {
+                (Some((node, at)), None) => match &mut self.nodes[node].contents[at] {
+                    Content::ToolCall(call) => Some(call),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let (kind, description) = match call.as_ref().map(|call| &call.input) {
+                Some(ToolInput::Subagent {
+                    kind, description, ..
+                }) => (kind.clone(), description.clone()),
+                _ => (None, None),
+            };
+            let subagent = Subagent::Read {
+                kind,
+                description,
+                conversation: Box::new(conversation),
+            };
+            match call {
+                Some(call) => call.subagents.push(subagent),
+                None => unattached.push(subagent),
             }
         }
-        let claimed = self.subagents(items, &starters);
+        unattached
+    }
 
+    /**
+     * The records as conversations, in the model's order: one of them all, or with `apart`,
+     * one of each tree of records, each ending as `ending` says the transcript did.
+     */
+    fn conversations(mut self, apart: bool, ending: &Ending) -> Vec<Conversation> {
         /* Each record after the one it follows, otherwise in the order they were written. A
         record that follows itself, around a loop, starts a tree instead. */
         let mut parent: Vec<Option<usize>> = self
@@ -873,15 +1030,32 @@ impl<'a> Reading<'a> {
         }
 
         let hidden = hidden(&self.nodes, &parent, &order);
-        let mut builder = Builder::new(self.item);
+        /* The conversation each record goes into: that of its tree's first record, or the
+        one there is. */
+        let mut builders: Vec<Builder> = Vec::new();
+        let mut of: Vec<usize> = vec![0; self.nodes.len()];
+        if !apart {
+            builders.push(Builder::new(self.item.clone()));
+        }
         let mut tail: Vec<Option<BlockId>> = vec![None; self.nodes.len()];
         for node in order {
+            of[node] = match parent[node] {
+                _ if !apart => 0,
+                Some(parent) => of[parent],
+                None => {
+                    builders.push(Builder::new(self.item.clone()));
+                    builders.len() - 1
+                }
+            };
+            let builder = &mut builders[of[node]];
             let Node {
                 at,
                 model,
+                tokens,
                 contents,
                 ..
             } = &mut self.nodes[node];
+            builder.used(*tokens);
             let mut last = parent[node].and_then(|parent| tail[parent]);
             for content in contents.drain(..) {
                 let model = match content {
@@ -898,26 +1072,23 @@ impl<'a> Reading<'a> {
             }
             tail[node] = last;
         }
-        for record in self.unplaced {
-            builder.unplaced(record);
+        if let Some(first) = builders.first_mut() {
+            for record in self.unplaced {
+                first.unplaced(record);
+            }
         }
-        builder.used(self.tokens);
-        Read {
-            conversation: builder.finish(self.ending),
-            claimed,
-            title: self.title,
-            cwd: self.cwd,
-            branch: self.branch,
-            entrypoint: self.entrypoint,
-        }
+        builders
+            .into_iter()
+            .map(|builder| builder.finish(ending.clone()))
+            .collect()
     }
 
     /**
      * Names, under each call, the subagents it started, and returns their transcripts' keys.
      * A subagent's file is named by the `agentId` the result of its call recorded, and a
-     * workflow's subagents are in a folder named by the run. Only when a call that starts
-     * subagents has none by those is each remaining transcript's `.meta.json` read, for the
-     * `tool_use` it names.
+     * workflow's subagents are in a folder named by the run. Only while a call that starts
+     * subagents has none by those are the remaining transcripts' `.meta.json` read, for the
+     * `tool_use` each names.
      */
     fn subagents(
         &mut self,
@@ -953,32 +1124,37 @@ impl<'a> Reading<'a> {
                 start(&mut claimed, *place, key);
             }
         }
-        let unresolved = self
+        let mut unresolved = self
             .nodes
             .iter()
             .flat_map(|node| &node.contents)
-            .any(|content| match content {
+            .filter(|content| match content {
                 Content::ToolCall(call) => {
                     (call.kind == ToolKind::Subagent || call.name == WORKFLOW)
                         && call.subagents.is_empty()
                 }
                 _ => false,
-            });
-        if unresolved {
-            for key in transcripts {
-                if claimed.contains(key) {
-                    continue;
-                }
-                let named = sidecar::<SubagentMeta>(items, &meta_key(key))
-                    .ok()
-                    .flatten()
-                    .and_then(|meta| self.calls.get(&meta.tool_use_id?).copied());
-                if let Some(place) = named
-                    && let Content::ToolCall(call) = &mut self.nodes[place.0].contents[place.1]
-                {
-                    call.subagents.push(Subagent::Unread { item: key.into() });
-                    claimed.insert(key.to_string());
-                }
+            })
+            .count();
+        /* One `.meta.json` is read for each transcript no call has, for as long as a call
+        that starts subagents has none. */
+        for key in transcripts {
+            if unresolved == 0 {
+                break;
+            }
+            if claimed.contains(key) {
+                continue;
+            }
+            let named = sidecar::<SubagentMeta>(items, &meta_key(key))
+                .ok()
+                .flatten()
+                .and_then(|meta| self.calls.get(&meta.tool_use_id?).copied());
+            if let Some(place) = named
+                && let Content::ToolCall(call) = &mut self.nodes[place.0].contents[place.1]
+            {
+                unresolved -= usize::from(call.subagents.is_empty());
+                call.subagents.push(Subagent::Unread { item: key.into() });
+                claimed.insert(key.to_string());
             }
         }
         claimed

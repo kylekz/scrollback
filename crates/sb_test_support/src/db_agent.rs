@@ -41,9 +41,11 @@ const DATABASE: &str = ".dbagent/sessions.db";
 const CHUNK: usize = 1024;
 
 /// One message as a line of a session's export. `call` is a tool call's row: the tool, its
-/// arguments, its output and whether it worked.
+/// arguments, its output and whether it worked. A row whose `call` is not JSON is exported
+/// with what it holds, as text: an export loses nothing, whatever the agent wrote.
 fn export_line(id: i64, role: &str, body: &str, call: Option<&str>) -> String {
-    let call: Option<Value> = call.map(|call| serde_json::from_str(call).unwrap());
+    let call: Option<Value> = call
+        .map(|call| serde_json::from_str(call).unwrap_or_else(|_| Value::String(call.to_string())));
     json!({ "id": id, "role": role, "body": body, "call": call }).to_string() + "\n"
 }
 
@@ -110,6 +112,11 @@ impl Provider for DbProvider {
 
     fn parser_version(&self) -> u32 {
         1
+    }
+
+    fn classify(&self, key: &str) -> (ItemKind, Option<String>) {
+        let session = key.strip_prefix("sessions/").map(str::to_string);
+        (ItemKind::Transcript, session)
     }
 
     fn parse(&self, items: &dyn SessionItems) -> Transcript {
@@ -471,6 +478,13 @@ impl DbAgent {
     pub fn call(&mut self, key: &str, tool: &str, args: Value, output: &str, ok: bool) {
         let call = json!({ "tool": tool, "args": args, "output": output, "ok": ok });
         self.row(key, "tool", "", Some(&call.to_string()));
+        self.bump(key);
+    }
+
+    /// One more message of the session: a tool's row whose `call` holds `call` as it is,
+    /// which need not be what the agent's own tools write there.
+    pub fn call_raw(&mut self, key: &str, call: &str) {
+        self.row(key, "tool", "", Some(call));
         self.bump(key);
     }
 

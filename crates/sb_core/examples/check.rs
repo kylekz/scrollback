@@ -317,7 +317,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut transcript = provider.parse(&items);
             transcript.read_subagents(provider.as_ref(), &items);
             totals.session(&transcript);
-            let Some(audit) = provider.audit(&items, &transcript) else {
+            let Some(audit) = provider::audit(provider.id(), &items, &transcript) else {
                 continue;
             };
             for (kind, (count, known)) in audit.records {

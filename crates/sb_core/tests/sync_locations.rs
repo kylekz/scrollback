@@ -10,7 +10,7 @@ use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::archive::Archive;
 use sb_core::location::LocationKind;
-use sb_core::provider::{Provider, ProviderError, ProviderId, SessionItems, Source};
+use sb_core::provider::{ItemKind, Provider, ProviderError, ProviderId, SessionItems, Source};
 use sb_core::sync::{Pass, SyncError, sync_location};
 use sb_core::transcript::{Facts, Transcript};
 use sb_core::transport::{Transport, TransportError};
@@ -37,6 +37,10 @@ impl Provider for Unreachable {
 
     fn parser_version(&self) -> u32 {
         1
+    }
+
+    fn classify(&self, _key: &str) -> (ItemKind, Option<String>) {
+        (ItemKind::Sidecar, None)
     }
 
     fn parse(&self, _items: &dyn SessionItems) -> Transcript {

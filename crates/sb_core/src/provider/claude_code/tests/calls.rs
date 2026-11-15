@@ -254,6 +254,26 @@ fn a_result_has_a_short_form_where_the_record_gives_one() {
     let call = t.call("Bash", json!({ "command": "exit" }));
     t.failure(&call, "Exit code unknown");
     expect(None);
+    /* A command that worked and printed those words exited with nothing worth saying. */
+    let call = t.call("Bash", json!({ "command": "echo 'Exit code 3 is odd'" }));
+    t.result(&call, json!("Exit code 3 is odd"));
+    expect(None);
+
+    /* A search for lines found the lines it says, not the files they are in; one for files
+    found files. */
+    let search = |t: &mut sb_test_support::Records, found| {
+        let call = t.call("Grep", json!({ "pattern": "fn main" }));
+        t.result_with(&call, json!("found"), false, found);
+    };
+    search(
+        t,
+        json!({ "mode": "content", "numFiles": 0, "numLines": 4 }),
+    );
+    expect(Some(Brief::Matches(4)));
+    search(t, json!({ "mode": "content", "numFiles": 0 }));
+    expect(None);
+    search(t, json!({ "mode": "files_with_matches", "numFiles": 2 }));
+    expect(Some(Brief::Matches(2)));
 
     /* A file read as a picture has no lines, and a failed edit no patch. */
     let call = t.call(

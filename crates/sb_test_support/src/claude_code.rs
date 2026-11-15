@@ -162,6 +162,13 @@ pub struct Session {
 }
 
 impl Session {
+    /// The provider's id for the session: its project's folder and its own id.
+    pub fn session_key(&self) -> &str {
+        self.dir
+            .strip_prefix("projects/")
+            .expect("a session's folder is under projects/")
+    }
+
     /// Appends `records` records to the transcript, as the agent does while the session runs.
     pub fn append(&mut self, records: usize) {
         self.transcript.filler(records, self.record_bytes);

@@ -1,14 +1,16 @@
 //! A temporary command-line trigger for the sync engine (PLAN §13), for use until the app has
 //! locations in its UI. It syncs this machine's agents into the archive in a folder, creating
 //! the archive if the folder has none, and indexes what the sync changed; or verifies that
-//! archive; or sets aside what verify found under its `files/` that the catalogue doesn't
-//! record; or empties the session index and builds it again from the archive, and says
-//! whether it came back the same. It prints totals only.
+//! archive, listing what is under its `files/` that the catalogue doesn't record; or sets
+//! that aside; or brings the session index up to date as a start does; or empties it and
+//! builds it again from the archive, and says whether it came back the same. It prints
+//! totals, and of the archive's own files their paths in it.
 //!
 //! ```text
 //! cargo run --release -p sb_core --example sync -- <archive folder>
 //! cargo run --release -p sb_core --example sync -- <archive folder> verify
 //! cargo run --release -p sb_core --example sync -- <archive folder> set-aside
+//! cargo run --release -p sb_core --example sync -- <archive folder> index
 //! cargo run --release -p sb_core --example sync -- <archive folder> reindex
 //! ```
 
@@ -45,13 +47,15 @@ fn print_index(catalogue: &Catalogue) -> Result<(), Box<dyn Error>> {
     println!(
         "the index holds {} sessions: {} with a title, {} with a project path, {} without a \
          transcript of their own, {} that end inside a record, {} that could not be read \
-         through, {} that could not be parsed, {} with a version held back",
+         through, {} with a part that could not be read, {} that could not be parsed, {} \
+         with a version held back",
         sessions.len(),
         count(&|session| session.title.is_some()),
         count(&|session| session.project.is_some()),
         count(&|session| session.main_item.is_none() && session.failure.is_none()),
         count(&|session| session.ending == Some(Ending::MidRecord)),
         count(&|session| matches!(session.ending, Some(Ending::Unreadable(_)))),
+        count(&|session| session.unread),
         count(&|session| session.failure.is_some()),
         count(&|session| session.held_back),
     );
@@ -62,8 +66,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (dir, action) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         [dir] => (dir, "sync"),
-        [dir, action @ ("verify" | "set-aside" | "reindex")] => (dir, action),
-        _ => return Err("usage: sync <archive folder> [verify | set-aside | reindex]".into()),
+        [dir, action @ ("verify" | "set-aside" | "index" | "reindex")] => (dir, action),
+        _ => {
+            return Err(
+                "usage: sync <archive folder> [verify | set-aside | index | reindex]".into(),
+            );
+        }
     };
     let archive = match Archive::open(Path::new(dir)) {
         Err(ArchiveError::NotAnArchive(_)) => Archive::create(Path::new(dir))?,
@@ -100,16 +108,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 unread.version, unread.error
             );
         }
-        if !(report.damaged.is_empty()
-            && report.unread.is_empty()
-            && report.uncatalogued.is_empty())
-        {
+        /* What the catalogue doesn't record is no damage: every archived byte is as it was. */
+        for unrecorded in &report.uncatalogued {
+            println!("not recorded by the catalogue: {}", unrecorded.display());
+        }
+        if !(report.damaged.is_empty() && report.unread.is_empty()) {
             return Err(format!(
-                "{} versions are damaged, {} could not be read, and the catalogue doesn't \
-                 record {} files or folders under files/",
+                "{} versions are damaged and {} could not be read",
                 report.damaged.len(),
-                report.unread.len(),
-                report.uncatalogued.len()
+                report.unread.len()
             )
             .into());
         }
@@ -117,9 +124,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let catalogue = archive.catalogue();
-    if action == "reindex" {
+    if action == "index" || action == "reindex" {
         let before = catalogue.sessions(Shelf::All)?;
-        catalogue.drop_index()?;
+        if action == "reindex" {
+            catalogue.drop_index()?;
+        }
         let report = index(
             &archive,
             None,
@@ -144,7 +153,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             after.len()
         );
         print_index(catalogue)?;
-        return if before == after {
+        return if action == "index" || before == after {
             Ok(())
         } else {
             Err("the index did not come back as it was".into())
@@ -182,6 +191,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     )?;
     for pass in passes {
+        match &pass.index {
+            Ok(index) => println!("{}: {}", pass.provider, indexed(index)),
+            Err(error) => println!("{}: the index failed: {error}", pass.provider),
+        }
         let report = match pass.outcome {
             Ok(report) => report,
             Err(error) => {
@@ -209,7 +222,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             report.bytes_fetched,
             report.bytes_stored
         );
-        println!("{}: {}", pass.provider, indexed(&report.index));
         let mut reasons: Vec<_> = report
             .failed
             .iter()

@@ -9,6 +9,7 @@ use toolbox_store::rusqlite::{self, params_from_iter};
 use super::session::{BY_ACTIVITY, SESSION, session_from};
 use super::{Catalogue, Result, Session};
 use crate::filing::{FolderId, NormalPath};
+use crate::location::LocationId;
 
 /// The sessions one page of the library lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,11 +32,17 @@ pub struct LibraryCounts {
     pub folders: HashMap<FolderId, usize>,
 }
 
-/// The Unsorted sessions that started in one project path.
+/// The Unsorted sessions that started in one place: a project path at a location. The same
+/// path at two locations is two places, unless it is a drive's, which is one place from every
+/// location that sees the drive (a WSL distro and the Windows it runs on).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathGroup {
     /// The path, as filing compares paths; `None` for the sessions that recorded none.
     pub project: Option<NormalPath>,
+    /// The locations its sessions are from: one, unless the path is a drive's.
+    pub locations: Vec<LocationId>,
+    /// The path as its sessions recorded it, each spelling once.
+    pub spellings: Vec<String>,
     pub sessions: Vec<Session>,
 }
 
@@ -104,21 +111,37 @@ impl Catalogue {
         })
     }
 
-    /// Unsorted, grouped by project path (PLAN §8): the group with the session that did
-    /// something last first, and so the sessions in each.
+    /// Unsorted, grouped by where the sessions started (PLAN §8): the group with the session
+    /// that did something last first, and so the sessions in each.
     pub fn unsorted(&self) -> Result<Vec<PathGroup>> {
         let mut groups: Vec<PathGroup> = Vec::new();
+        /* Where each place's group is: a place is a path, and its location unless the path is
+        a drive's. */
+        let mut places: HashMap<(Option<NormalPath>, Option<LocationId>), usize> = HashMap::new();
         for session in self.sessions(Shelf::Unsorted)? {
-            match groups
-                .iter_mut()
-                .find(|group| group.project == session.project)
-            {
-                Some(group) => group.sessions.push(session),
-                None => groups.push(PathGroup {
-                    project: session.project.clone(),
-                    sessions: vec![session],
-                }),
+            let on_drive = session.project.as_ref().is_some_and(NormalPath::is_drive);
+            let location = (!on_drive).then(|| session.id.location.clone());
+            let at = *places
+                .entry((session.project.clone(), location))
+                .or_insert_with(|| {
+                    groups.push(PathGroup {
+                        project: session.project.clone(),
+                        locations: Vec::new(),
+                        spellings: Vec::new(),
+                        sessions: Vec::new(),
+                    });
+                    groups.len() - 1
+                });
+            let group = &mut groups[at];
+            if !group.locations.contains(&session.id.location) {
+                group.locations.push(session.id.location.clone());
             }
+            if let Some(spelling) = &session.project_path
+                && !group.spellings.contains(spelling)
+            {
+                group.spellings.push(spelling.clone());
+            }
+            group.sessions.push(session);
         }
         Ok(groups)
     }

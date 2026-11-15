@@ -81,8 +81,10 @@ impl Transcript {
 
 /**
  * Reads the subagents the calls of `conversation` started, and theirs. `placed` gains every
- * item that is under a call; an item already there stays unread under a second call that
- * claims it, as does one of `above`, the subagents this conversation is itself under.
+ * item that is read under a call; an item already there stays unread under a second call that
+ * claims it, as does one of `above`, the subagents this conversation is itself under. A
+ * subagent its provider's parse read with the session (one whose records are in the
+ * session's own transcript) is where the parse put it.
  */
 fn read_under(
     conversation: &mut Conversation,
@@ -97,10 +99,10 @@ fn read_under(
         };
         for subagent in &mut call.subagents {
             let item = subagent.item().clone();
-            if above.contains(&item) || !placed.insert(item.clone()) {
-                continue;
-            }
             if matches!(subagent, Subagent::Unread { .. }) {
+                if above.contains(&item) || !placed.insert(item.clone()) {
+                    continue;
+                }
                 *subagent = provider.subagent(items, &item);
             }
             if let Subagent::Read { conversation, .. } = subagent {
@@ -419,10 +421,12 @@ pub enum ToolStatus {
     Failed,
 }
 
-/// The short form of a result that a collapsed row shows (DESIGN §4.2.3).
+/// The short form of a result that a collapsed row shows (DESIGN §4.2.3). A result without one
+/// is not thereby a success: a command that timed out or was refused has failed and says no
+/// more, so a row shows the result's status whether or not there is a brief.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Brief {
-    /// The status a command exited with.
+    /// The status a command that failed exited with.
     Exit(i32),
     /// How many lines were read.
     Lines(u64),

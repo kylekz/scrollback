@@ -3,7 +3,9 @@
 
 use std::collections::BTreeMap;
 
-use super::{BlockId, Content, Conversation, Subagent, Tokens, ToolInput, ToolKind, Transcript};
+use super::{
+    BlockId, Content, Conversation, Ending, Subagent, Tokens, ToolInput, ToolKind, Transcript,
+};
 
 /// The version of what the index holds of a session: of [`index`], and of how the catalogue
 /// derives and keeps a session's row from it. Rows made by another version are made again
@@ -12,13 +14,16 @@ pub const INDEX_VERSION: u32 = 1;
 
 /// How much of the first prompt stands in for a title the agent didn't store.
 const TITLE_CHARS: usize = 80;
+/// How much of a title the agent stored is kept.
+const STORED_TITLE_CHARS: usize = 300;
 /// How much of the first prompt a session's card and row show.
 const PROMPT_CHARS: usize = 240;
 
 /// A session's derived fields and search text.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionIndex {
-    /// The title the agent stored, else the start of the first prompt.
+    /// The start of the title the agent stored, if it stored one that says anything; else the
+    /// start of the first prompt.
     pub title: Option<String>,
     /// The start of the first prompt.
     pub first_prompt: Option<String>,
@@ -27,6 +32,9 @@ pub struct SessionIndex {
     pub entrypoint: Option<String>,
     /// The session's items hold no main transcript: what is here is of its subagents alone.
     pub transcript_missing: bool,
+    /// Some part of the session could not be read: one of its conversations to its end, or
+    /// something that goes with one.
+    pub unread: bool,
     /// From the first block recorded to the last block or result, in Unix milliseconds: of the
     /// session's own conversation, or without one, of its subagents'.
     pub started: Option<i64>,
@@ -95,13 +103,16 @@ pub fn index(transcript: &Transcript) -> SessionIndex {
         title: transcript
             .facts
             .title
-            .clone()
+            .as_deref()
+            .map(|title| start(title, STORED_TITLE_CHARS))
+            .filter(|title| !title.is_empty())
             .or_else(|| first_prompt.map(|text| start(text, TITLE_CHARS))),
         first_prompt: first_prompt.map(|text| start(text, PROMPT_CHARS)),
         project_path: transcript.facts.project_path.clone(),
         branch: transcript.facts.branch.clone(),
         entrypoint: transcript.facts.entrypoint.clone(),
         transcript_missing: own.is_none(),
+        unread: false,
         started: None,
         ended: None,
         models: own.map_or_else(Vec::new, |own| own.models.clone()),
@@ -146,6 +157,8 @@ fn count(conversation: &Conversation, totals: &mut Totals) {
  */
 fn collect(conversation: &Conversation, within: Option<At>, index: &mut SessionIndex) {
     count(conversation, &mut index.all);
+    index.unread |=
+        matches!(conversation.ending, Ending::Unreadable(_)) || !conversation.unreadable.is_empty();
     for (turn, blocks) in conversation.turns().iter().enumerate() {
         for block in &blocks.blocks {
             let at = within.unwrap_or(At::Block {

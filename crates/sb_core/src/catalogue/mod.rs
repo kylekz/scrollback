@@ -31,7 +31,7 @@ use crate::provider::{ItemKind, ScannedItem};
 
 pub use folder::{Folder, FolderPath};
 pub use library::{LibraryCounts, PathGroup, Shelf};
-pub(crate) use session::{Derived, Reading, fingerprint};
+pub(crate) use session::{Derived, Indexed, Reading, fingerprint};
 pub use session::{Filed, Session, SessionId, Usage};
 
 #[derive(Debug, Error)]
@@ -54,9 +54,22 @@ pub enum CatalogueError {
     },
     #[error("a folder is not moved into itself or into a folder inside it")]
     FolderInItself,
-    #[error("version {0} is not a version of one of the session's items")]
+    #[error("there is no folder {}", .0.0)]
+    NoFolder(FolderId),
+    /// A folder's name is some text, of at most [`FOLDER_NAME_CHARS`] characters.
+    #[error("a folder's name is not empty and not longer than {FOLDER_NAME_CHARS} characters")]
+    FolderName,
+    /// Nothing is archived of a session of this identity.
+    #[error("nothing is archived of a session {} of {} at location {}", .0.key, .0.provider, .0.location)]
+    NoSession(SessionId),
+    #[error("item {0} is not one of the session's items")]
     NotOfSession(i64),
+    #[error("version {version} is not a version of item {item}")]
+    NotOfItem { version: i64, item: i64 },
 }
+
+/// The most characters a folder's name has.
+pub const FOLDER_NAME_CHARS: usize = 200;
 
 impl From<rusqlite::Error> for CatalogueError {
     fn from(error: rusqlite::Error) -> Self {
@@ -174,15 +187,23 @@ pub struct Version {
     /// The length and SHA-256 of the content so far.
     pub length: u64,
     pub hash: Hash,
-    /// The version is a loss beside the copy being read (it is shorter, or `held_by_parse`),
-    /// so it is not the reading copy unless the owner chooses it.
-    pub held_back: bool,
-    /// Its transcript no longer parses where the copy being read does (PLAN §4.2). It stays
-    /// held back however long it grows, until an index finds it parses again.
-    pub held_by_parse: bool,
+    /// Why the version is not the reading copy unless the owner chooses it, when it is a loss
+    /// beside the copy being read (PLAN §4.2). Only a transcript's version is held back.
+    pub held_back: Option<Held>,
     /// Verify, or a sync extending it, found its stored bytes missing or changed.
     pub damaged: bool,
     pub export_version: Option<u32>,
+}
+
+/// Why a version is held back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    /// It is shorter than the copy being read. It stops being held back once it has grown to
+    /// that copy's length.
+    Shorter,
+    /// Its transcript no longer parses where the copy being read does. It stays held back
+    /// however long it grows, until an index finds it parses as well again.
+    ParsesWorse,
 }
 
 /// One stored byte range of a version (PLAN §4.1).
@@ -527,10 +548,12 @@ impl Catalogue {
     /**
      * Records stored ranges, each with its segments and the source state it brings its item up
      * to, all in one transaction.
-     * Returns for each whether a version it starts is held back (PLAN §4.2): it is shorter
-     * than the copy being read, which is the newest version not itself held back. A held-back
-     * version that grows to that copy's length is no longer a loss and stops being held back,
-     * unless it is held back for how it parses ([`Catalogue::hold_for_parse`]).
+     * Returns for each whether a version it starts is held back (PLAN §4.2): it is a
+     * transcript's and is shorter than the copy being read, which is the newest version not
+     * itself held back. A held-back version that grows to that copy's length is no longer a
+     * loss and stops being held back, unless it is held back for how it parses
+     * ([`Catalogue::hold_for_parse`]). A version that starts also ends the owner's choice of
+     * an earlier one to read ([`Catalogue::set_reading_version`]).
      */
     pub(crate) fn commit(&self, commits: &[Recorded<'_>]) -> Result<Vec<bool>> {
         let now = now_ms();
@@ -589,7 +612,8 @@ impl Catalogue {
                             [item],
                             |row| row.get(0),
                         )?;
-                        let held = commit.length < reading;
+                        let held = scanned.kind.is_transcript() && commit.length < reading;
+                        tx.execute("DELETE FROM reading_choice WHERE item_id = ?1", [item])?;
                         (start(item, commit.number, reason, held)?, held)
                     }
                     Target::Append { item, version } => {
@@ -794,8 +818,11 @@ fn version_from(row: &Row<'_>, at: usize) -> rusqlite::Result<Version> {
         started_at: row.get(at + 3)?,
         length: row.get(at + 4)?,
         hash: row.get(at + 5)?,
-        held_back: row.get(at + 6)?,
-        held_by_parse: row.get(at + 7)?,
+        held_back: match (row.get(at + 6)?, row.get(at + 7)?) {
+            (false, _) => None,
+            (true, false) => Some(Held::Shorter),
+            (true, true) => Some(Held::ParsesWorse),
+        },
         damaged: row.get(at + 8)?,
         export_version: row.get(at + 9)?,
     })

@@ -9,8 +9,13 @@ use toolbox_store::rusqlite::{self, ToSql};
 use crate::location::LocationId;
 
 /// Where a WSL distro mounts the Windows drives unless its `/etc/wsl.conf` says otherwise
-/// (PLAN §6.3).
+/// (PLAN §6.3). A path under it is read as a drive's wherever it was recorded, so that the
+/// same project files the same from a distro and from Windows.
 pub const WSL_DRIVE_MOUNT: &str = "/mnt/";
+
+/// What Windows puts before a path to have it taken as it is, and before a share's then.
+const VERBATIM: &str = r"\\?\";
+const VERBATIM_SHARE: &str = r"UNC\";
 
 /// The hosts under which Windows shows a WSL distro's own files, as `\\<host>\<distro>\…`.
 const WSL_HOSTS: [&str; 2] = ["wsl.localhost", "wsl$"];
@@ -23,6 +28,7 @@ const WSL_HOSTS: [&str; 2] = ["wsl.localhost", "wsl$"];
  *   compares names without regard to case: `d:/projects/app`;
  * - a path under a WSL distro's drive mount (`/mnt/d/Projects/app`) as the drive's path, which
  *   is the same directory: `d:/projects/app`;
+ * - a path Windows wrote to be taken as it is (`\\?\D:\Projects\app`) as the path it names;
  * - a path on a Windows share (`\\Server\Share\app`, `//server/share/app`) in lower case behind
  *   `\\`: `\\server/share/app`. A WSL distro's files seen from Windows are such a path
  *   (`\\wsl.localhost\<distro>\home\user`), but their names are the distro's and keep their
@@ -37,14 +43,25 @@ pub struct NormalPath(String);
 impl NormalPath {
     /**
      * Normalises `path`. `drive_mount` is where the location the path is from mounts the
-     * Windows drives, when it is a WSL distro; for any other location it is `None`, and a path
-     * like `/mnt/d/…` is only itself.
+     * Windows drives, when the location says (a WSL distro whose `/etc/wsl.conf` sets one);
+     * `None` is [`WSL_DRIVE_MOUNT`], for every location.
      *
      * `None` for a path that names nothing (an empty one, `.`, `/`): attached to a folder it
      * would claim every session.
      */
     pub fn new(path: &str, drive_mount: Option<&str>) -> Option<Self> {
         let named = |component: &&str| !component.is_empty() && *component != ".";
+        let share;
+        let path = match path.strip_prefix(VERBATIM) {
+            Some(taken) => match taken.strip_prefix(VERBATIM_SHARE) {
+                Some(rest) => {
+                    share = format!(r"\\{rest}");
+                    &share
+                }
+                None => taken,
+            },
+            None => path,
+        };
         let bytes = path.as_bytes();
         if bytes.len() >= 2
             && bytes[0].is_ascii_alphabetic()
@@ -67,15 +84,20 @@ impl NormalPath {
         }
         let components: Vec<&str> = path.split('/').filter(named).collect();
         /* Under the drive mount, the next component is the drive's letter. */
-        let drive = drive_mount.and_then(|mount| {
-            let mount: Vec<&str> = mount.split('/').filter(named).collect();
-            let (letter, rest) = components.strip_prefix(&mount[..])?.split_first()?;
-            (letter.len() == 1 && letter.as_bytes()[0].is_ascii_alphabetic()).then(|| {
+        let mount: Vec<&str> = drive_mount
+            .unwrap_or(WSL_DRIVE_MOUNT)
+            .split('/')
+            .filter(named)
+            .collect();
+        let drive = components
+            .strip_prefix(&mount[..])
+            .and_then(<[&str]>::split_first)
+            .filter(|(letter, _)| letter.len() == 1 && letter.as_bytes()[0].is_ascii_alphabetic())
+            .map(|(letter, rest)| {
                 format!("{letter}:/{}", rest.join("/"))
                     .trim_end_matches('/')
                     .to_lowercase()
-            })
-        });
+            });
         match drive {
             Some(drive) => Some(Self(drive)),
             None if components.is_empty() => None,
@@ -86,6 +108,21 @@ impl NormalPath {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether the path is on a Windows drive: the one form that is the same place from every
+    /// location that can see the drive.
+    pub fn is_drive(&self) -> bool {
+        let bytes = self.0.as_bytes();
+        bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes.get(2).is_none_or(|byte| *byte == b'/')
+    }
+
+    /// Whether the path says where it is from the top: on a drive, on a share, or from `/`.
+    pub fn is_absolute(&self) -> bool {
+        self.is_drive() || self.0.starts_with('/') || self.0.starts_with(r"\\")
     }
 
     /// Whether `other` is this path or one under it. `/home/user/code/app` contains
@@ -212,8 +249,12 @@ mod tests {
             ("/d/Projects/App", Some("/"), "d:/projects/app"),
             ("/windows/d/Projects", Some("/windows/"), "d:/projects"),
             ("/mnt/d/Projects", Some("/windows/"), "/mnt/d/Projects"),
-            /* Anywhere but in a WSL distro, the mount is only a directory. */
-            ("/mnt/d/Projects/App", None, "/mnt/d/Projects/App"),
+            /* Without one, the default mount is the drives' at every location. */
+            ("/mnt/d/Projects/App", None, "d:/projects/app"),
+            ("/mnt/data/app", None, "/mnt/data/app"),
+            /* A path Windows wrote to be taken as it is, is the path it names. */
+            (r"\\?\D:\Projects\App", None, "d:/projects/app"),
+            (r"\\?\UNC\Server\Share\App", None, r"\\server/share/app"),
         ] {
             assert_eq!(
                 NormalPath::new(path, mount).unwrap().as_str(),
@@ -321,7 +362,12 @@ mod tests {
             /* Windows and WSL views of one directory, whatever the case. */
             (plain(r"d:\projects\APP\crates"), &pc, Some(6)),
             (wsl("/mnt/d/Projects/app"), &pc, Some(6)),
-            (plain("/mnt/d/Projects/app"), &laptop, None),
+            (plain("/mnt/d/Projects/app"), &laptop, Some(6)),
+            (
+                NormalPath::new("/mnt/d/Projects/app", Some("/windows/")).unwrap(),
+                &laptop,
+                None,
+            ),
             (plain(r"D:\Projects\apple"), &pc, None),
         ] {
             assert_eq!(

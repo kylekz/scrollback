@@ -85,6 +85,15 @@ pub enum ItemKind {
     Sidecar,
 }
 
+impl ItemKind {
+    /// Whether the item is a conversation: a session's own transcript or a subagent's. Those
+    /// are what a parser reads as conversations, what makes a group of items a session, and
+    /// the only items of which a version can be held back (PLAN §4.2).
+    pub fn is_transcript(self) -> bool {
+        matches!(self, Self::Transcript | Self::Subagent)
+    }
+}
+
 /// One item the agent has at a location, as a scan finds it (PLAN §5).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScannedItem {
@@ -195,11 +204,27 @@ pub trait Provider: Send + Sync {
         Subagent::Unread { item: item.into() }
     }
 
-    /// Checks `transcript`, parsed from `items` with every subagent read, against the records
-    /// read another way. `None` from a provider that has no such check.
-    fn audit(&self, _items: &dyn SessionItems, _transcript: &Transcript) -> Option<Audit> {
-        None
-    }
+    /**
+     * What the item `key` is: its kind, and the provider's id of the session it belongs to,
+     * if it belongs to one. It is what the provider's scan says of an item at a location, said
+     * of an archived one. The engine asks it again of everything archived when the parser's
+     * version changes, so that a better answer reaches the items that are gone from their
+     * location too.
+     */
+    fn classify(&self, key: &str) -> (ItemKind, Option<String>);
+}
+
+/**
+ * For development (the `check` example): checks `transcript`, which `provider` parsed from
+ * `items` with every subagent read, against the session's records read another way. `None`
+ * for a provider that has no such check.
+ */
+pub fn audit(
+    provider: ProviderId,
+    items: &dyn SessionItems,
+    transcript: &Transcript,
+) -> Option<Audit> {
+    (provider == claude_code::ID).then(|| claude_code::audit(items, transcript))
 }
 
 /**

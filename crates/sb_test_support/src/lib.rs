@@ -24,6 +24,7 @@ use sb_core::transport::{
     Transport, TransportError,
 };
 use toolbox_store::rusqlite::Connection;
+use toolbox_store::rusqlite::types::ValueRef;
 
 pub use claude_code::{Call, FileAgent, ProjectsTree, Records, Session, image_block};
 pub use db_agent::{DbAgent, DbProvider};
@@ -206,6 +207,24 @@ impl RangeSink for Fetched {
         result.unwrap();
         Ok(())
     }
+}
+
+/// What `sql` reads from the catalogue of the archive in `dir`, behind the archive's back: the
+/// first column of each row, as text. For what the catalogue keeps and has no call to say.
+pub fn read_catalogue(dir: &Path, sql: &str) -> Vec<String> {
+    let connection = Connection::open(dir.join("scrollback.db")).unwrap();
+    let mut select = connection.prepare(sql).unwrap();
+    select
+        .query_map([], |row| {
+            row.get_ref(0).map(|value| match value {
+                ValueRef::Integer(number) => number.to_string(),
+                ValueRef::Text(text) => String::from_utf8_lossy(text).into_owned(),
+                other => format!("{other:?}"),
+            })
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
 }
 
 const FAIL_COMMITS: &str = "fail_segment_commits";
