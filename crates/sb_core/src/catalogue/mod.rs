@@ -507,6 +507,11 @@ impl Catalogue {
             let mut held_back = Vec::new();
             for Recorded { commit, segments } in commits {
                 let scanned = commit.scanned;
+                /* It is archived: whatever a pass later leaves it waiting for starts anew. */
+                tx.execute(
+                    "DELETE FROM waiting WHERE location_id = ?1 AND provider = ?2 AND key = ?3",
+                    params![commit.location, commit.provider, scanned.key],
+                )?;
                 let start = |item: i64, number: u32, reason: Reason, held_back: bool| {
                     tx.execute(
                         "INSERT INTO version (item_id, number, reason, started_at, length, hash,
@@ -612,7 +617,9 @@ impl Catalogue {
     }
 
     /// Replaces what is recorded as waiting to be archived from `provider` at `location` with
-    /// `waiting`, each a key and why. An item that was waiting already keeps since when.
+    /// `waiting`, each a key and why. An item that was waiting already keeps since when. One
+    /// that is stored stops waiting with its commit ([`Catalogue::commit`]), whatever becomes
+    /// of the pass.
     pub(crate) fn record_waiting(
         &self,
         location: &LocationId,
@@ -636,7 +643,8 @@ impl Catalogue {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             for (key, reason) in waiting {
-                let since = since.remove(*key).unwrap_or(now);
+                /* Not from later than now: the clock may have been ahead when it was kept. */
+                let since = since.remove(*key).map_or(now, |since| since.min(now));
                 insert.execute(params![location, provider, key, since, reason])?;
             }
             Ok(())

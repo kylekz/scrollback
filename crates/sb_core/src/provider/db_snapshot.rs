@@ -27,6 +27,13 @@
 //! No journal may have grown. A log that only gained commits looks harmless, but a checkpoint
 //! may have moved them into the file that was hashed, and they are not in the copied log.
 //!
+//! What this cannot see:
+//! - A database that keeps no journal on disk (`journal_mode` `MEMORY` or `OFF`). A commit
+//!   that stalls part-way through the file for as long as the copy and the hash take gives a
+//!   copy of a half-written file that matches.
+//! - A transaction across several attached databases. Its journal names a super-journal that
+//!   is not copied, so SQLite does not roll the copy back, and the copy may hold part of it.
+//!
 //! The provider reads the copy and defines its items as exports of the rows. Only those are
 //! archived; the copy is deleted when the snapshot is dropped.
 

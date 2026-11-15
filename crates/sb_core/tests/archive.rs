@@ -464,12 +464,13 @@ fn a_read_that_stops_inside_a_segment_has_been_handed_no_bytes_that_were_not_arc
 }
 
 #[test]
-fn a_segment_that_decompresses_to_far_more_than_was_archived_is_refused() {
+fn a_segment_is_not_decompressed_past_what_was_archived() {
     let (bench, key) = synced();
     let version = bench.versions(&key).remove(0);
-    /* A small file that decompresses to far more than any segment holds. */
-    let huge = zstd::encode_all(io::repeat(0).take(1 << 28), 3).unwrap();
-    fs::write(bench.segment_files().remove(0), huge).unwrap();
+    /* A small file that would decompress to far more than any segment holds, and breaks off
+    half-way: a reader that went on past what was archived would run into that. */
+    let huge = zstd::encode_all(io::repeat(0).take(1 << 26), 3).unwrap();
+    fs::write(bench.segment_files().remove(0), &huge[..huge.len() / 2]).unwrap();
 
     let mut content = Vec::new();
     let error = bench

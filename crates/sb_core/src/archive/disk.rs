@@ -40,11 +40,19 @@ pub(super) fn push_dir(_dir: &Path) -> io::Result<()> {
 }
 
 /// Makes everything pushed so far durable, by a full flush through the folder `dir` on the
-/// same volume. A volume that has no full flush has had all it can do in [`push`].
+/// same volume. A volume that has no full flush has had all it can do in [`push`]; a full
+/// flush that fails for any other reason is a failure.
 #[cfg(target_vendor = "apple")]
 pub(super) fn settle(dir: &Path) -> io::Result<()> {
+    use rustix::io::Errno;
+
     let dir = File::open(dir)?;
-    dir.sync_all().or_else(|_| push(&dir))
+    dir.sync_all().or_else(
+        |error| match error.raw_os_error().map(Errno::from_raw_os_error) {
+            Some(Errno::NOTSUP | Errno::OPNOTSUPP | Errno::NOTTY | Errno::INVAL) => push(&dir),
+            _ => Err(error),
+        },
+    )
 }
 
 /// What was pushed is durable already.
@@ -70,12 +78,18 @@ pub(super) fn write_new(tmp: &Path, to: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
-/// Whether the files at `one` and `other` hold the same bytes.
-pub(super) fn same_bytes(one: &Path, other: &Path) -> io::Result<bool> {
-    Ok(
-        fs::metadata(one)?.len() == fs::metadata(other)?.len()
-            && fs::read(one)? == fs::read(other)?,
-    )
+/// Whether what is at `there` is a regular file holding the bytes of the file at `new`. A
+/// link, a folder, or a file that can't be read is not.
+pub(super) fn same_file(new: &Path, there: &Path) -> io::Result<bool> {
+    let bytes = fs::read(new)?;
+    Ok(fs::symlink_metadata(there)
+        .is_ok_and(|found| found.is_file() && found.len() == bytes.len() as u64)
+        && fs::read(there).is_ok_and(|found| found == bytes))
+}
+
+/// [`push`] for the file at `path`. It is opened to write, which is what Windows flushes.
+pub(super) fn push_at(path: &Path) -> io::Result<()> {
+    push(&File::options().write(true).open(path)?)
 }
 
 /**
