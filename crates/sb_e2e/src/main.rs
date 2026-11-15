@@ -19,6 +19,8 @@
 //! - `"boards"`: an archive already in the data dir, holding the library the design boards
 //!   draw ([`boards`]), so that the pages can be captured as the boards show them
 //!   (docs/DESIGN.md §6).
+//! - `"boards-held-back"`: the same, with one of the subfolder player's sessions held back
+//!   and filed by hand ([`boards::build`]).
 //! - `"archive-remains"`: what is left of an archive in the data dir, its files without its
 //!   `archive.json`: the app must say it can't open it, and make no new one in its place
 //!   (docs/PLAN.md §4.4).
@@ -45,6 +47,7 @@ enum Library {
     Agent,
     AgentLarge,
     Boards,
+    BoardsHeldBack,
     ArchiveRemains,
 }
 
@@ -123,11 +126,15 @@ impl RunnerApp for Scrollback {
             Library::Agent => fixture::agent(&mut tree),
             Library::AgentLarge => boards::agent(&mut tree),
             Library::NoAgent => std::fs::remove_dir_all(&home)?,
-            Library::Boards => {
+            Library::Boards | Library::BoardsHeldBack => {
                 // Its locations' trees are synced into the archive here, and gone by the
                 // time the app starts: the app finds no agent, and syncs nothing away.
                 std::fs::remove_dir_all(&home)?;
-                boards::build(&cx.data_dir.join("archive"), &cx.out_dir.join("locations"))?;
+                boards::build(
+                    &cx.data_dir.join("archive"),
+                    &cx.out_dir.join("locations"),
+                    matches!(header.fixture, Library::BoardsHeldBack),
+                )?;
             }
             Library::ArchiveRemains => {
                 std::fs::remove_dir_all(&home)?;

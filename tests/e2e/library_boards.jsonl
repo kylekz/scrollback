@@ -14,6 +14,9 @@
 {"cmd": "query", "prefix": "sidebar/location/", "expect_result": {"pointer": "", "len": 3}}
 {"cmd": "bounds", "target": "sidebar/location/This PC", "expect_result": [{"pointer": "/x", "equals": 8}, {"pointer": "/w", "equals": 231}, {"pointer": "/h", "equals": 40}]}
 {"cmd": "bounds", "target": "sidebar/location/user@macbook", "expect_result": [{"pointer": "/h", "equals": 40}, {"pointer": "/y", "gte": 850}, {"pointer": "/y", "lte": 852}]}
+// At 1440 every card has room for its tool calls (DESIGN §4.4): the glyph and the count after the day.
+{"cmd": "bounds", "target": "card/0/calls", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "card/3/calls", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "screenshot", "name": "all-sessions-dark"}
 
 // fc's page, as E-Folder draws it: 488 sessions with its subfolder's, three path chips, and the cards four to a row under each month's overline.

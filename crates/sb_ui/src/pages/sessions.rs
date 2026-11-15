@@ -703,12 +703,13 @@ impl SessionsView {
                     .text_spec(&theme.text.small)
                     .whitespace_nowrap()
                     .child(agents::mark(&session.id.provider, theme.sizes.icon_xs, cx))
-                    // The model's name takes the room the rest leave it, and gives way first.
+                    // The model's name takes the room the rest leave it, and gives way first,
+                    // down to its least: then the tags give way.
                     .child(
                         div()
                             .flex_1()
                             .flex_basis(px(0.))
-                            .min_w_0()
+                            .min_w(MODEL_MIN)
                             .overflow_hidden()
                             .text_ellipsis()
                             .child(model),
