@@ -5,10 +5,11 @@
 
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 
-use crate::transcript::{Encoding, Stored};
+use crate::transcript::{Encoding, Stored, json_string};
 
 /// One record while it is read: its bytes, without the newline, and where they are.
 pub(super) struct Line<'a> {
@@ -47,12 +48,26 @@ impl Line<'_> {
 
 /// The text `raw` is, when it is a JSON string.
 pub(super) fn string(raw: &RawValue) -> Option<String> {
-    serde_json::from_str(raw.get()).ok()
+    json_string(raw.get())
 }
 
 /// What `raw` holds, when it is in the shape `T` reads.
 pub(super) fn typed<'a, T: Deserialize<'a>>(raw: &'a RawValue) -> Option<T> {
     serde_json::from_str(raw.get()).ok()
+}
+
+/**
+ * Text that someone wrote or that was cut to fit: a JSON string read as [`json_string`] reads
+ * one, so that half a surrogate pair left by a cut doesn't make its record unreadable.
+ */
+pub(super) struct Text(pub String);
+
+impl<'de> Deserialize<'de> for Text {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        string(<&RawValue>::deserialize(deserializer)?)
+            .map(Self)
+            .ok_or_else(|| D::Error::custom("not a string"))
+    }
 }
 
 /// A record's type alone, for one whose other fields aren't as [`Record`] reads them.
@@ -72,11 +87,11 @@ pub(super) struct Record<'a> {
     /// On a compaction boundary, whose `parentUuid` is null: the record it follows.
     pub logical_parent_uuid: Option<String>,
     pub timestamp: Option<String>,
-    pub cwd: Option<String>,
-    pub git_branch: Option<String>,
+    pub cwd: Option<Text>,
+    pub git_branch: Option<Text>,
     pub entrypoint: Option<String>,
     pub subtype: Option<String>,
-    pub custom_title: Option<String>,
+    pub custom_title: Option<Text>,
     /// The record was put into the conversation by Claude Code, not typed by the user.
     pub is_meta: Option<bool>,
     pub is_compact_summary: Option<bool>,
@@ -140,7 +155,7 @@ pub(super) struct Block<'a> {
     pub kind: String,
     #[serde(borrow)]
     pub text: Option<&'a RawValue>,
-    pub thinking: Option<String>,
+    pub thinking: Option<Text>,
     pub id: Option<String>,
     pub name: Option<String>,
     #[serde(borrow)]
@@ -176,10 +191,14 @@ pub(super) struct Attachment<'a> {
     pub origin: Option<&'a RawValue>,
 }
 
-/// Who sent a prompt: `human`, or what stood in for one (another session, a finished task).
+/// Who sent a prompt: `human`, or what stood in for one. A message from another session
+/// (`peer`) carries the sender's name and, apart from the markup around it, what it said.
 #[derive(Deserialize)]
 pub(super) struct Origin {
     pub kind: String,
+    pub name: Option<Text>,
+    pub from: Option<Text>,
+    pub body: Option<Text>,
 }
 
 #[derive(Deserialize)]
@@ -198,12 +217,68 @@ pub(super) struct ApiError<'a> {
     pub message: Option<&'a RawValue>,
 }
 
-/// What a tool result's `toolUseResult` says the call started: a subagent, or a workflow run.
+/*
+ * A tool result's `toolUseResult` is Claude Code's structured copy of the result. Its fields
+ * depend on the tool, and a subagent's transcript has none. The shapes below are what a short
+ * result and a subagent's place are read from.
+ */
+
+/// The `toolUseResult` of an `Agent` or `Workflow` call.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Launched {
+    /// The subagent an `Agent` call started.
     pub agent_id: Option<String>,
+    /// The run a `Workflow` call's subagents are filed under.
     pub run_id: Option<String>,
+    /// Of a subagent that ran to its end before the result was written.
+    pub resolved_model: Option<String>,
+    pub total_tool_use_count: Option<u64>,
+    pub total_duration_ms: Option<u64>,
+}
+
+/// The `toolUseResult` of a `Read`.
+#[derive(Deserialize)]
+pub(super) struct ReadResult {
+    pub file: ReadFile,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ReadFile {
+    pub num_lines: u64,
+}
+
+/// The `toolUseResult` of an `Edit`: the hunks of the change.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct EditResult<'a> {
+    #[serde(borrow)]
+    pub structured_patch: Vec<Hunk<'a>>,
+}
+
+/// The `toolUseResult` of a `Write`: `create` or `update`, and what was written.
+#[derive(Deserialize)]
+pub(super) struct WriteResult<'a> {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(borrow)]
+    pub content: &'a RawValue,
+}
+
+/// The `toolUseResult` of a `Grep` or a `Glob`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SearchResult {
+    pub num_matches: Option<u64>,
+    pub num_files: Option<u64>,
+}
+
+/// A hunk of a `structuredPatch`: its lines, each starting with ` `, `+` or `-`.
+#[derive(Deserialize)]
+pub(super) struct Hunk<'a> {
+    #[serde(borrow)]
+    pub lines: Vec<&'a RawValue>,
 }
 
 /// A subagent's `.meta.json`.

@@ -16,11 +16,14 @@
 //! `<project>` is the starting directory with its punctuation replaced by `-`, so it can't be
 //! turned back into a path and is not read here. Every `.jsonl` file is appended to line by line.
 //!
-//! [`parse`] turns a session's archived files into the transcript model, and [`tools`] maps
-//! Claude Code's tools onto the common kinds.
+//! [`parse`] turns a session's archived files into the transcript model, [`tools`] maps
+//! Claude Code's tools onto the common kinds, and [`audit`] counts a session's records another
+//! way to check the parse against.
 
+mod audit;
 mod parse;
 mod record;
+mod said;
 #[cfg(test)]
 mod tests;
 mod tools;
@@ -28,11 +31,11 @@ mod tools;
 use serde_json::Value;
 
 use super::{
-    FileClass, FileTree, ItemKind, ItemPrefix, ItemRange, ParseError, Provider, ProviderError,
+    Audit, FileClass, FileTree, ItemKind, ItemPrefix, ItemRange, Provider, ProviderError,
     ScannedItem, SessionItems, Source,
 };
 use crate::hash::Hash;
-use crate::transcript::{ToolKind, Transcript};
+use crate::transcript::{Subagent, Transcript};
 use crate::transport::{RangeSink, Transport};
 
 /// The provider's identity (PLAN §2.1).
@@ -72,12 +75,16 @@ impl Provider for Agent {
         }))
     }
 
-    fn parse(&self, items: &dyn SessionItems) -> Result<Transcript, ParseError> {
+    fn parse(&self, items: &dyn SessionItems) -> Transcript {
         parse::parse(items)
     }
 
-    fn tool_kind(&self, name: &str) -> ToolKind {
-        tools::kind(name)
+    fn subagent(&self, items: &dyn SessionItems, item: &str) -> Subagent {
+        parse::subagent(items, item)
+    }
+
+    fn audit(&self, items: &dyn SessionItems, transcript: &Transcript) -> Option<Audit> {
+        Some(audit::audit(items, transcript))
     }
 }
 

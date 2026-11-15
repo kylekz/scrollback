@@ -9,14 +9,21 @@ use crate::location::LocationId;
 /// (PLAN §6.3).
 pub const WSL_DRIVE_MOUNT: &str = "/mnt/";
 
+/// The hosts under which Windows shows a WSL distro's own files, as `\\<host>\<distro>\…`.
+const WSL_HOSTS: [&str; 2] = ["wsl.localhost", "wsl$"];
+
 /**
  * A path in the form paths are compared in (PLAN §8): its components joined by `/`, with no
- * trailing separator, and
+ * trailing separator and nothing that names nothing (`//`, `/./`), and
  *
- * - a Windows path (`D:\Projects\app`, `D:/Projects/app`, `\\server\share\app`) in lower case,
- *   as Windows compares names without regard to case: `d:/projects/app`, `\\server/share/app`;
+ * - a path on a Windows drive (`D:\Projects\app`, `D:/Projects/app`) in lower case, as Windows
+ *   compares names without regard to case: `d:/projects/app`;
  * - a path under a WSL distro's drive mount (`/mnt/d/Projects/app`) as the drive's path, which
  *   is the same directory: `d:/projects/app`;
+ * - a path on a Windows share (`\\Server\Share\app`, `//server/share/app`) in lower case behind
+ *   `\\`: `\\server/share/app`. A WSL distro's files seen from Windows are such a path
+ *   (`\\wsl.localhost\<distro>\home\user`), but their names are the distro's and keep their
+ *   case;
  * - any other path as it is, case kept: `/home/user/code/app`.
  *
  * The path as it was typed or recorded is kept beside it, for display.
@@ -29,36 +36,48 @@ impl NormalPath {
      * Normalises `path`. `drive_mount` is where the location the path is from mounts the
      * Windows drives, when it is a WSL distro; for any other location it is `None`, and a path
      * like `/mnt/d/…` is only itself.
+     *
+     * `None` for a path that names nothing (an empty one, `.`, `/`): attached to a folder it
+     * would claim every session.
      */
-    pub fn new(path: &str, drive_mount: Option<&str>) -> Self {
+    pub fn new(path: &str, drive_mount: Option<&str>) -> Option<Self> {
+        let named = |component: &&str| !component.is_empty() && *component != ".";
         let bytes = path.as_bytes();
-        let has_drive = bytes.len() >= 2
+        if bytes.len() >= 2
             && bytes[0].is_ascii_alphabetic()
             && bytes[1] == b':'
-            && bytes.get(2).is_none_or(|byte| matches!(byte, b'\\' | b'/'));
-        if has_drive || path.starts_with(r"\\") {
-            let root = if has_drive { "" } else { r"\\" };
-            return Self(format!(
-                "{root}{}",
-                join(path.split(['\\', '/'])).to_lowercase()
-            ));
+            && bytes.get(2).is_none_or(|byte| matches!(byte, b'\\' | b'/'))
+        {
+            let components: Vec<&str> = path.split(['\\', '/']).filter(named).collect();
+            return Some(Self(components.join("/").to_lowercase()));
         }
-        /* Under the drive mount, the first component is the drive's letter. */
-        let drive = drive_mount
-            .and_then(|mount| {
-                path.strip_prefix(mount.trim_end_matches('/'))?
-                    .strip_prefix('/')
+        if path.starts_with(r"\\") || (path.starts_with("//") && !path.starts_with("///")) {
+            let mut components = path.split(['\\', '/']).filter(named);
+            let host = components.next()?.to_lowercase();
+            let rest = components.collect::<Vec<_>>().join("/");
+            let share = if WSL_HOSTS.contains(&host.as_str()) {
+                format!(r"\\{}/{rest}", WSL_HOSTS[0])
+            } else {
+                format!(r"\\{host}/{}", rest.to_lowercase())
+            };
+            return Some(Self(share.trim_end_matches('/').to_string()));
+        }
+        let components: Vec<&str> = path.split('/').filter(named).collect();
+        /* Under the drive mount, the next component is the drive's letter. */
+        let drive = drive_mount.and_then(|mount| {
+            let mount: Vec<&str> = mount.split('/').filter(named).collect();
+            let (letter, rest) = components.strip_prefix(&mount[..])?.split_first()?;
+            (letter.len() == 1 && letter.as_bytes()[0].is_ascii_alphabetic()).then(|| {
+                format!("{letter}:/{}", rest.join("/"))
+                    .trim_end_matches('/')
+                    .to_lowercase()
             })
-            .and_then(|rest| {
-                let mut components = rest.split('/');
-                let letter = components.next()?;
-                (letter.len() == 1 && letter.as_bytes()[0].is_ascii_alphabetic())
-                    .then(|| format!("{letter}:/{}", join(components)).to_lowercase())
-            });
+        });
         match drive {
-            Some(drive) => Self(drive.trim_end_matches('/').to_string()),
-            None if path.starts_with('/') => Self(format!("/{}", join(path.split('/')))),
-            None => Self(join(path.split('/'))),
+            Some(drive) => Some(Self(drive)),
+            None if components.is_empty() => None,
+            None if path.starts_with('/') => Some(Self(format!("/{}", components.join("/")))),
+            None => Some(Self(components.join("/"))),
         }
     }
 
@@ -71,17 +90,9 @@ impl NormalPath {
     pub fn contains(&self, other: &NormalPath) -> bool {
         other
             .0
-            .strip_prefix(self.0.trim_end_matches('/'))
+            .strip_prefix(&self.0)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
     }
-}
-
-/// The components that name something, joined by `/`.
-fn join<'a>(components: impl Iterator<Item = &'a str>) -> String {
-    components
-        .filter(|component| !component.is_empty() && *component != ".")
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 /// A folder's identity in the catalogue (PLAN §2.1).
@@ -127,11 +138,11 @@ mod tests {
     use super::*;
 
     fn wsl(path: &str) -> NormalPath {
-        NormalPath::new(path, Some(WSL_DRIVE_MOUNT))
+        NormalPath::new(path, Some(WSL_DRIVE_MOUNT)).unwrap()
     }
 
     fn plain(path: &str) -> NormalPath {
-        NormalPath::new(path, None)
+        NormalPath::new(path, None).unwrap()
     }
 
     #[test]
@@ -141,9 +152,8 @@ mod tests {
             ("/home/user/code/app", None, "/home/user/code/app"),
             ("/home/user/code/app/", None, "/home/user/code/app"),
             ("/home/user//code/./app///", None, "/home/user/code/app"),
+            ("///home/user", None, "/home/user"),
             ("/Users/user/Code/App", None, "/Users/user/Code/App"),
-            ("/", None, "/"),
-            ("", None, ""),
             ("code/app/", None, "code/app"),
             (r"/home/user/odd\name", None, r"/home/user/odd\name"),
             /* Windows paths fold case and take either separator. */
@@ -155,12 +165,27 @@ mod tests {
             (r"D:\", None, "d:"),
             ("D:", None, "d:"),
             (r"\\Server\Share\App\", None, r"\\server/share/app"),
+            (r"\\Server", None, r"\\server"),
+            ("//Server/Share/App", None, r"\\server/share/app"),
+            /* A WSL distro's files seen from Windows keep the case of their names. */
+            (
+                r"\\wsl.localhost\Ubuntu-24.04\home\user\Code",
+                None,
+                r"\\wsl.localhost/Ubuntu-24.04/home/user/Code",
+            ),
+            (
+                r"\\WSL$\Ubuntu-24.04\home\user\Code\",
+                None,
+                r"\\wsl.localhost/Ubuntu-24.04/home/user/Code",
+            ),
             /* A name that only starts like a drive is not one. */
             ("D:ata/app", None, "D:ata/app"),
             ("/D:/app", None, "/D:/app"),
             /* Under a WSL distro's drive mount, a path is the drive's. */
             ("/mnt/d/Projects/App", Some("/mnt/"), "d:/projects/app"),
             ("/mnt/D/Projects/App/", Some("/mnt/"), "d:/projects/app"),
+            ("/mnt//d/Projects/App", Some("/mnt/"), "d:/projects/app"),
+            ("/mnt/./d/Projects/App", Some("/mnt/"), "d:/projects/app"),
             ("/mnt/c", Some("/mnt/"), "c:"),
             ("/mnt/c/", Some("/mnt"), "c:"),
             ("/mnt/data/app", Some("/mnt/"), "/mnt/data/app"),
@@ -175,7 +200,7 @@ mod tests {
             ("/mnt/d/Projects/App", None, "/mnt/d/Projects/App"),
         ] {
             assert_eq!(
-                NormalPath::new(path, mount).as_str(),
+                NormalPath::new(path, mount).unwrap().as_str(),
                 normal,
                 "{path:?} with the drive mount {mount:?}"
             );
@@ -183,10 +208,30 @@ mod tests {
     }
 
     #[test]
+    fn a_path_that_names_nothing_is_refused() {
+        for path in ["", ".", "./", "/", "//", "/./", r"\\"] {
+            assert_eq!(NormalPath::new(path, None), None, "{path:?}");
+            assert_eq!(
+                NormalPath::new(path, Some(WSL_DRIVE_MOUNT)),
+                None,
+                "{path:?}"
+            );
+        }
+        assert_eq!(
+            NormalPath::new("/mnt/", Some(WSL_DRIVE_MOUNT)),
+            Some(plain("/mnt"))
+        );
+    }
+
+    #[test]
     fn the_same_directory_seen_from_windows_and_from_wsl_is_one_path() {
         assert_eq!(wsl("/mnt/d/Projects/app"), plain(r"D:\Projects\app"));
         assert_eq!(wsl("/mnt/d/Projects/app"), plain("d:/projects/APP/"));
         assert_ne!(wsl("/home/user/app"), plain("/home/user/App"));
+        assert_ne!(
+            plain(r"\\wsl.localhost\Ubuntu-24.04\home\user\app"),
+            plain(r"\\wsl.localhost\Ubuntu-24.04\home\user\App")
+        );
     }
 
     #[test]
@@ -201,11 +246,11 @@ mod tests {
             ("/home/user/code/app", "/home/user/code/app2", false),
             ("/home/user/code/app", "/home/user/code", false),
             ("/home/user/code/app", "/home/user/code/App", false),
-            ("/", "/home/user", true),
-            ("/", "/", true),
-            ("/", r"D:\Projects", false),
-            ("/", r"\\server\share", false),
+            ("/home", "/home/user", true),
+            ("/home", r"D:\home", false),
+            ("home", "/home/user", false),
             (r"\\Server\share", r"\\server\Share\app", true),
+            (r"\\Server\share", "/server/share/app", false),
             (r"D:\Projects\app", r"d:\projects\APP\crates", true),
             (r"D:\Projects\app", r"D:\Projects\application", false),
             (r"D:\", r"D:\Projects", true),
@@ -250,6 +295,7 @@ mod tests {
             (plain("/home/user/code/application/x"), &pc, Some(7)),
             (plain("/home/user/codes"), &pc, None),
             (plain("/home/user"), &pc, None),
+            (plain("/srv/x"), &pc, None),
             /* A path limited to a location files only that location's sessions, and there it
             wins over the same path attached for all. */
             (plain("/home/user/code/app"), &laptop, Some(4)),

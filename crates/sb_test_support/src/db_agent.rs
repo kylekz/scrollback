@@ -14,12 +14,12 @@ use std::sync::Arc;
 
 use sb_core::hash::Hash;
 use sb_core::provider::{
-    DbSnapshot, ItemKind, ItemPrefix, ItemRange, ParseError, Provider, ProviderError, ScannedItem,
+    DbSnapshot, ItemKind, ItemPrefix, ItemRange, Provider, ProviderError, ScannedItem,
     SessionItems, Source,
 };
 use sb_core::transcript::{
-    Block, BlockId, Content, Conversation, Encoding, Facts, Output, Stored, Tokens, ToolCall,
-    ToolInput, ToolKind, ToolResult, ToolStatus, Transcript, Turn, Unrecognised,
+    Builder, Content, Conversation, Encoding, Ending, Facts, Output, Stored, ToolCall, ToolInput,
+    ToolKind, ToolResult, ToolStatus, Transcript, Unrecognised,
 };
 use sb_core::transport::{
     Halt, LocalTransport, RangeFailure, RangeSink, Transport, TransportError,
@@ -104,25 +104,44 @@ impl Provider for DbProvider {
         }))
     }
 
-    fn parse(&self, items: &dyn SessionItems) -> Result<Transcript, ParseError> {
-        let item = items
+    fn parse(&self, items: &dyn SessionItems) -> Transcript {
+        let mut facts = Facts {
+            agent: ID,
+            title: None,
+            project_path: None,
+            branch: None,
+            entrypoint: None,
+        };
+        let export = items
             .list()
             .iter()
-            .find(|item| item.kind == ItemKind::Transcript)
-            .ok_or(ParseError::NoTranscript)?;
-        let failed = |source| ParseError::Read {
-            key: item.key.clone(),
-            source,
+            .find(|item| item.kind == ItemKind::Transcript);
+        Transcript {
+            conversation: export.map(|item| self.conversation(items, &item.key, &mut facts)),
+            facts,
+            unattached: Vec::new(),
+        }
+    }
+}
+
+impl DbProvider {
+    /// The conversation in the export `key`. Its rows have no links: each follows the last.
+    fn conversation(&self, items: &dyn SessionItems, key: &str, facts: &mut Facts) -> Conversation {
+        let mut builder = Builder::new(Arc::from(key));
+        let item = builder.item().clone();
+        let rows = match items.open(key, 0) {
+            Ok(export) => BufReader::new(export).split(b'\n'),
+            Err(error) => return builder.finish(Ending::Unreadable(error.to_string())),
         };
-        let key: Arc<str> = Arc::from(item.key.as_str());
-        let mut blocks: Vec<Block> = Vec::new();
-        let mut turns: Vec<Turn> = Vec::new();
-        let mut project_path = None;
+        let mut last = None;
         let mut offset = 0;
-        for line in BufReader::new(items.open(&item.key, 0).map_err(failed)?).split(b'\n') {
-            let line = line.map_err(failed)?;
+        for line in rows {
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => return builder.finish(Ending::Unreadable(error.to_string())),
+            };
             let whole = Stored {
-                item: key.clone(),
+                item: item.clone(),
                 offset,
                 length: line.len() as u64,
                 encoding: Encoding::Plain,
@@ -130,7 +149,7 @@ impl Provider for DbProvider {
             let content = match serde_json::from_slice::<Row>(&line) {
                 Ok(Row { role, body, call }) => match (role.as_str(), call) {
                     ("start", _) => {
-                        project_path = Some(body);
+                        facts.project_path = Some(body);
                         None
                     }
                     ("user", _) => Some(Content::Prompt {
@@ -139,20 +158,18 @@ impl Provider for DbProvider {
                         from: None,
                     }),
                     ("assistant", _) => Some(Content::Reply { text: body }),
-                    ("tool", Some(call)) => {
-                        Some(match serde_json::from_str::<CallRow>(call.get()) {
-                            Ok(call) => {
-                                Content::ToolCall(Box::new(self.call(call, |raw, encoding| {
-                                    Stored::part(&key, offset, &line, raw.get(), encoding)
-                                })))
-                            }
-                            Err(_) => Content::Unrecognised(Unrecognised {
-                                kind: role,
-                                misfit: Some("call"),
-                                raw: whole,
-                            }),
-                        })
-                    }
+                    ("tool", Some(call)) => Some(match serde_json::from_str(call.get()) {
+                        Ok(call) => {
+                            Content::ToolCall(Box::new(self.call(call, |raw, encoding| {
+                                Stored::part(&item, offset, &line, raw.get(), encoding)
+                            })))
+                        }
+                        Err(_) => Content::Unrecognised(Unrecognised {
+                            kind: role,
+                            misfit: Some("call"),
+                            raw: whole,
+                        }),
+                    }),
                     _ => Some(Content::Unrecognised(Unrecognised {
                         kind: role,
                         misfit: None,
@@ -166,61 +183,23 @@ impl Provider for DbProvider {
                 })),
             };
             if let Some(content) = content {
-                let id = BlockId(blocks.len());
-                match turns.last_mut() {
-                    Some(turn) if !matches!(content, Content::Prompt { .. }) => {
-                        turn.blocks.push(id);
-                    }
-                    _ => turns.push(Turn { blocks: vec![id] }),
-                }
-                blocks.push(Block {
-                    parent: id.0.checked_sub(1).map(BlockId),
-                    at: None,
-                    offset,
-                    model: None,
-                    content,
-                });
+                last = Some(builder.show(last, None, None, content));
             }
             offset += line.len() as u64 + 1;
         }
-        Ok(Transcript {
-            facts: Facts {
-                agent: ID,
-                title: None,
-                project_path,
-                branch: None,
-                entrypoint: None,
-            },
-            conversation: Conversation {
-                item: key,
-                blocks,
-                turns,
-                unplaced: Vec::new(),
-                models: Vec::new(),
-                tokens: Tokens::default(),
-                cut_short: false,
-            },
-            unattached: Vec::new(),
-        })
+        builder.finish(Ending::Whole)
     }
 
-    fn tool_kind(&self, name: &str) -> ToolKind {
-        match name {
+    /// A `tool` row as a call with its result. `part` says where a piece of the row is archived.
+    fn call(&self, call: CallRow, part: impl Fn(&RawValue, Encoding) -> Stored) -> ToolCall {
+        let kind = match call.tool.as_str() {
             "exec" => ToolKind::Shell,
             "open" => ToolKind::Read,
             _ => ToolKind::Other,
-        }
-    }
-}
-
-impl DbProvider {
-    /// A `tool` row as a call with its result. `part` says where a piece of the row is archived.
-    fn call(&self, call: CallRow, part: impl Fn(&RawValue, Encoding) -> Stored) -> ToolCall {
+        };
         ToolCall {
-            input: match (
-                self.tool_kind(&call.tool),
-                serde_json::from_str(call.args.get()),
-            ) {
+            kind,
+            input: match (kind, serde_json::from_str(call.args.get())) {
                 (
                     ToolKind::Shell,
                     Ok(Args {
@@ -252,6 +231,7 @@ impl DbProvider {
                     ToolStatus::Failed
                 },
                 output: vec![Output::Text(part(call.output, Encoding::JsonString))],
+                brief: None,
             }),
             subagents: Vec::new(),
         }

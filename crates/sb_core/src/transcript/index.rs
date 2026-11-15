@@ -1,9 +1,9 @@
-//! What the session index and search hold about a session (PLAN §4.3, §7.5, §10), derived from
-//! its transcript. It is the same for every agent, and nothing here touches the catalogue.
+//! What the session index and search hold about a session (PLAN §4.3, §10), derived from its
+//! transcript. It is the same for every agent, and nothing here touches the catalogue.
 
 use std::collections::BTreeMap;
 
-use super::{Content, Conversation, Tokens, ToolInput, ToolKind, Transcript};
+use super::{BlockId, Content, Conversation, Subagent, Tokens, ToolInput, ToolKind, Transcript};
 
 /// How much of the first prompt stands in for a title the agent didn't store.
 const TITLE_CHARS: usize = 80;
@@ -20,29 +20,47 @@ pub struct SessionIndex {
     pub project_path: Option<String>,
     pub branch: Option<String>,
     pub entrypoint: Option<String>,
-    /// When its first and last blocks were recorded, in Unix milliseconds.
+    /// The session's items hold no main transcript: what is here is of its subagents alone.
+    pub transcript_missing: bool,
+    /// From the first block recorded to the last block or result, in Unix milliseconds: of the
+    /// session's own conversation, or without one, of its subagents'.
     pub started: Option<i64>,
     pub ended: Option<i64>,
+    /// The models of the session's own conversation.
     pub models: Vec<String>,
-    pub tokens: Tokens,
-    /// Where each turn of the shown branch starts in the session's transcript item, so the
-    /// reader can open at a turn (PLAN §7.5).
-    pub turns: Vec<u64>,
-    /// The session's own tool calls on the shown branch, by kind. Its subagents' are not
-    /// counted.
-    pub calls: BTreeMap<ToolKind, u32>,
-    /// The text search indexes (PLAN §10), subagents' included.
+    /// The session's own conversation alone.
+    pub own: Totals,
+    /// The session's own conversation and every subagent's that was read, unattached ones
+    /// included.
+    pub all: Totals,
+    /// The text search indexes (PLAN §10), of the same conversations as `all`.
     pub spans: Vec<Span>,
+}
+
+/// What conversations used and did, on their shown branches.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Totals {
+    pub tokens: Tokens,
+    /// Tool calls by the kind of tool.
+    pub calls: BTreeMap<ToolKind, u32>,
 }
 
 /// One piece of text search can match.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
-    /// The turn it is in, as an index into [`SessionIndex::turns`]. Text of a subagent is in
-    /// the turn of the call that started it, which is where a match opens the session.
-    pub turn: usize,
+    pub at: At,
     pub kind: SpanKind,
     pub text: String,
+}
+
+/// Where a match opens the session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum At {
+    /// A block of the session's own conversation, in its turn `turn` (counted from 0): the
+    /// block the text is in, or for a subagent's text, the call under which it ran.
+    Block { turn: usize, block: BlockId },
+    /// The subagent at this place in [`Transcript::unattached`], or one under it.
+    Unattached(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,24 +72,21 @@ pub enum SpanKind {
     ToolCall,
 }
 
+/**
+ * The index of `transcript`, from what of it is read: a subagent whose conversation isn't adds
+ * nothing, so the indexer reads them all first ([`Transcript::read_subagents`]).
+ */
 pub fn index(transcript: &Transcript) -> SessionIndex {
-    let conversation = &transcript.conversation;
-    let first_prompt = conversation
-        .turns
-        .iter()
-        .filter_map(|turn| match &conversation[*turn.blocks.first()?].content {
+    let own = transcript.conversation.as_ref();
+    let first_prompt = own
+        .into_iter()
+        .flat_map(Conversation::turns)
+        .filter_map(|turn| match &own?[*turn.blocks.first()?].content {
             Content::Prompt { text, .. } => Some(text),
             _ => None,
         })
         .find(|text| !text.trim().is_empty());
-    let mut calls = BTreeMap::new();
-    for call in conversation.calls() {
-        *calls.entry(call.input.kind()).or_default() += 1;
-    }
-    let mut spans = Vec::new();
-    collect(conversation, None, &mut spans);
-    let span = conversation.span();
-    SessionIndex {
+    let mut index = SessionIndex {
         title: transcript
             .facts
             .title
@@ -81,37 +96,67 @@ pub fn index(transcript: &Transcript) -> SessionIndex {
         project_path: transcript.facts.project_path.clone(),
         branch: transcript.facts.branch.clone(),
         entrypoint: transcript.facts.entrypoint.clone(),
-        started: span.map(|(started, _)| started),
-        ended: span.map(|(_, ended)| ended),
-        models: conversation.models.clone(),
-        tokens: conversation.tokens,
-        turns: conversation
-            .turns
-            .iter()
-            .filter_map(|turn| Some(conversation[*turn.blocks.first()?].offset))
-            .collect(),
-        calls,
-        spans,
+        transcript_missing: own.is_none(),
+        started: None,
+        ended: None,
+        models: own.map_or_else(Vec::new, |own| own.models.clone()),
+        own: Totals::default(),
+        all: Totals::default(),
+        spans: Vec::new(),
+    };
+    let mut span = own.and_then(Conversation::span);
+    if let Some(own) = own {
+        count(own, &mut index.own);
+        collect(own, None, &mut index);
+    }
+    for (place, subagent) in transcript.unattached.iter().enumerate() {
+        if let Subagent::Read { conversation, .. } = subagent {
+            collect(conversation, Some(At::Unattached(place)), &mut index);
+            if own.is_none() {
+                span = match (span, conversation.span()) {
+                    (Some((start, end)), Some((first, last))) => {
+                        Some((start.min(first), end.max(last)))
+                    }
+                    (one, other) => one.or(other),
+                };
+            }
+        }
+    }
+    (index.started, index.ended) = span.unzip();
+    index
+}
+
+/// Adds what `conversation` used and the calls on its shown branch to `totals`.
+fn count(conversation: &Conversation, totals: &mut Totals) {
+    totals.tokens.add(conversation.tokens);
+    for (_, call) in conversation.calls() {
+        *totals.calls.entry(call.kind).or_default() += 1;
     }
 }
 
-/// The search text of `conversation`'s shown branch. `within` is the session's turn that a
-/// subagent's conversation belongs to; the session's own turns are their own.
-fn collect(conversation: &Conversation, within: Option<usize>, spans: &mut Vec<Span>) {
-    for (index, turn) in conversation.turns.iter().enumerate() {
-        let turn_index = within.unwrap_or(index);
-        let mut span = |kind, text: &str| {
-            if !text.trim().is_empty() {
-                spans.push(Span {
-                    turn: turn_index,
-                    kind,
-                    text: text.to_string(),
-                });
-            }
-        };
-        let mut subagents = Vec::new();
-        for id in &turn.blocks {
-            match &conversation[*id].content {
+/**
+ * Adds `conversation` to the totals of all, and its shown branch's text to the spans, with
+ * those of the subagents under its calls. `within` is where a subagent's conversation opens
+ * the session; the session's own conversation opens at each block.
+ */
+fn collect(conversation: &Conversation, within: Option<At>, index: &mut SessionIndex) {
+    count(conversation, &mut index.all);
+    for (turn, blocks) in conversation.turns().iter().enumerate() {
+        for block in &blocks.blocks {
+            let at = within.unwrap_or(At::Block {
+                turn,
+                block: *block,
+            });
+            let mut span = |kind, text: &str| {
+                if !text.trim().is_empty() {
+                    index.spans.push(Span {
+                        at,
+                        kind,
+                        text: text.to_string(),
+                    });
+                }
+            };
+            match &conversation[*block].content {
                 Content::Prompt { text, .. } => span(SpanKind::Prompt, text),
                 Content::Reply { text } => span(SpanKind::Reply, text),
                 Content::ToolCall(call) => {
@@ -135,16 +180,17 @@ fn collect(conversation: &Conversation, within: Option<usize>, spans: &mut Vec<S
                         ToolInput::WebFetch { url, .. } => span(SpanKind::ToolCall, url),
                         ToolInput::Todos(_) | ToolInput::Mcp { .. } | ToolInput::Other => {}
                     }
-                    subagents.extend(&call.subagents);
+                    for subagent in &call.subagents {
+                        if let Subagent::Read { conversation, .. } = subagent {
+                            collect(conversation, Some(at), index);
+                        }
+                    }
                 }
                 Content::Thinking { .. }
                 | Content::Compaction { .. }
                 | Content::Note { .. }
                 | Content::Unrecognised(_) => {}
             }
-        }
-        for subagent in subagents {
-            collect(&subagent.conversation, Some(turn_index), spans);
         }
     }
 }

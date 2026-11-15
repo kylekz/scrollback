@@ -106,6 +106,12 @@ impl Items {
             .collect();
         Self { list, bytes }
     }
+
+    /// Takes the item `key` away, as if it had not been archived.
+    pub fn remove(&mut self, key: &str) {
+        self.list.retain(|item| item.key != key);
+        self.bytes.remove(key);
+    }
 }
 
 impl SessionItems for Items {

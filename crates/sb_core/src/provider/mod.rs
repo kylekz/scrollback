@@ -6,9 +6,10 @@
 //! Where it is, it hands back a [`Source`]: the agent's data at that location for one sync pass,
 //! through which the engine scans, hashes and fetches without knowing what an item is.
 //!
-//! Parsing and the tool map (PLAN §7.1) are on [`Provider`] itself: they read a session's
-//! archived items ([`SessionItems`]), never a location. What the index holds is derived from the
-//! parsed transcript, the same way for every agent ([`crate::transcript::index`]).
+//! Parsing (PLAN §7.1) is on [`Provider`] itself: it reads a session's archived items
+//! ([`SessionItems`]), never a location, and maps the agent's tools onto the common kinds as it
+//! goes. What the index holds is derived from the parsed transcript, the same way for every
+//! agent ([`crate::transcript::index`]).
 
 pub mod claude_code;
 mod db_snapshot;
@@ -19,12 +20,12 @@ use thiserror::Error;
 use toolbox_store::rusqlite;
 
 use crate::hash::Hash;
-use crate::transcript::{ToolKind, Transcript};
+use crate::transcript::{Subagent, Transcript};
 use crate::transport::{RangeSink, Transport, TransportError};
 
 pub use db_snapshot::DbSnapshot;
 pub use file_tree::{FileClass, FileTree};
-pub use session::{ParseError, SessionItem, SessionItems};
+pub use session::{Audit, SessionItem, SessionItems};
 
 /// The providers scrollback ships. Every location is asked by each of them (PLAN §7.1).
 pub fn builtin() -> Vec<Box<dyn Provider>> {
@@ -112,12 +113,25 @@ pub trait Provider: Send + Sync {
         transport: &'a dyn Transport,
     ) -> Result<Option<Box<dyn Source + 'a>>, ProviderError>;
 
-    /// The transcript of the session whose archived items are `items` (PLAN §7.4). Records
-    /// the provider doesn't know are kept in it, not failed on (PLAN D5).
-    fn parse(&self, items: &dyn SessionItems) -> Result<Transcript, ParseError>;
+    /**
+     * The transcript of the session whose archived items are `items` (PLAN §7.4), with its own
+     * conversation read and the subagents its calls started named, not read. Nothing fails a
+     * parse: records the provider doesn't know are kept (PLAN D5), and what can't be read is
+     * said in the transcript.
+     */
+    fn parse(&self, items: &dyn SessionItems) -> Transcript;
 
-    /// Which common kind of tool the agent's tool `name` is (PLAN §7.4).
-    fn tool_kind(&self, name: &str) -> ToolKind;
+    /// The subagent whose conversation is the item `item`, read, with the subagents its own
+    /// calls started named. An agent without subagents has none to read.
+    fn subagent(&self, _items: &dyn SessionItems, item: &str) -> Subagent {
+        Subagent::Unread { item: item.into() }
+    }
+
+    /// Checks `transcript`, parsed from `items` with every subagent read, against the records
+    /// read another way. `None` from a provider that has no such check.
+    fn audit(&self, _items: &dyn SessionItems, _transcript: &Transcript) -> Option<Audit> {
+        None
+    }
 }
 
 /**

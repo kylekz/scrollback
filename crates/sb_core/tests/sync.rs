@@ -7,11 +7,10 @@ use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::catalogue::Reason;
 use sb_core::provider::{
-    ItemKind, ItemPrefix, ItemRange, ParseError, Provider, ProviderError, ScannedItem,
-    SessionItems, Source,
+    ItemKind, ItemPrefix, ItemRange, Provider, ProviderError, ScannedItem, SessionItems, Source,
 };
 use sb_core::sync::{PassReport, Progress, SyncError};
-use sb_core::transcript::{ToolKind, Transcript};
+use sb_core::transcript::Transcript;
 use sb_core::transport::{Halt, RangeFailure, RangeSink, Transport};
 use sb_test_support::{Agent, DbAgent, FileAgent, break_segment_commits, mend_segment_commits};
 
@@ -330,12 +329,8 @@ impl Provider for CancelsMidRange {
         }))
     }
 
-    fn parse(&self, items: &dyn SessionItems) -> Result<Transcript, ParseError> {
+    fn parse(&self, items: &dyn SessionItems) -> Transcript {
         self.inner.parse(items)
-    }
-
-    fn tool_kind(&self, name: &str) -> ToolKind {
-        self.inner.tool_kind(name)
     }
 }
 
