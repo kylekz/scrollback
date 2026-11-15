@@ -25,6 +25,10 @@ use crate::provider::{ItemKind, ScannedItem};
 pub enum CatalogueError {
     #[error(transparent)]
     Database(#[from] toolbox_store::Error),
+    /// A range was to be recorded as the continuation of a version that is not as long as the
+    /// pass that fetched the range found it. Nothing was recorded.
+    #[error("version {version} is no longer {length} bytes long, so nothing is appended to it")]
+    VersionMoved { version: i64, length: u64 },
 }
 
 impl From<rusqlite::Error> for CatalogueError {
@@ -203,7 +207,8 @@ pub(crate) struct Commit<'a> {
     pub target: Target,
     /// The number of the version the commit writes to.
     pub number: u32,
-    /// The version's length and hash with the range included.
+    /// The version's length before the range, and its length and hash with it.
+    pub from: u64,
     pub length: u64,
     pub hash: Hash,
 }
@@ -249,17 +254,6 @@ impl Catalogue {
             .daily_backup(chrono::Local::now().date_naive());
         Ok(Self {
             db: Database::open(&dir.join(DATABASE), &options)?,
-        })
-    }
-
-    /// How many segments are recorded, and when the newest of them was stored.
-    pub(crate) fn segments_recorded(&self) -> Result<(u64, Option<i64>)> {
-        self.db.read(|c| {
-            Ok(
-                c.query_row("SELECT count(*), max(stored_at) FROM segment", [], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })?,
-            )
         })
     }
 
@@ -564,7 +558,7 @@ impl Catalogue {
                     }
                     Target::Append { item, version } => {
                         seen(tx, item, scanned)?;
-                        tx.execute(
+                        let extended = tx.execute(
                             "UPDATE version SET length = ?2, hash = ?3,
                                  held_back = COALESCE(held_back AND ?2 < (
                                      SELECT length FROM version reading
@@ -573,9 +567,15 @@ impl Catalogue {
                                        AND reading.number < version.number
                                      ORDER BY reading.number DESC LIMIT 1
                                  ), 0)
-                             WHERE id = ?1",
-                            params![version, commit.length, commit.hash],
+                             WHERE id = ?1 AND length = ?4",
+                            params![version, commit.length, commit.hash, commit.from],
                         )?;
+                        if extended == 0 {
+                            return Err(CatalogueError::VersionMoved {
+                                version,
+                                length: commit.from,
+                            });
+                        }
                         (version, false)
                     }
                 };

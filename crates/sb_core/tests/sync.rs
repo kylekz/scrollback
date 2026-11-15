@@ -3,6 +3,8 @@
 
 mod common;
 
+use std::fs;
+
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::archive::ArchiveError;
@@ -49,7 +51,8 @@ for_both_agents!(
     a_pass_stopped_between_batches_keeps_the_batches_it_stored,
     a_pass_cancelled_inside_a_range_stores_none_of_it,
     a_crash_between_rename_and_commit_loses_nothing,
-    a_failed_commit_is_retried_without_a_restart,
+    a_commit_that_keeps_failing_sets_nothing_aside,
+    a_file_left_where_another_segment_goes_is_set_aside,
     a_location_runs_one_sync_at_a_time,
     a_provider_that_sends_less_than_was_asked_stores_nothing,
     a_provider_that_breaks_the_order_of_ranges_stops_the_pass,
@@ -398,49 +401,77 @@ fn a_crash_between_rename_and_commit_loses_nothing<A: Agent + Default>() {
             "{crashed:?}"
         );
         /* The segments reached their places and the catalogue never heard of them. */
-        assert_eq!(bench.segment_files().len(), recorded + placed);
+        let left = bench.segment_files();
+        let stored: Vec<_> = left.iter().map(|file| fs::read(file).unwrap()).collect();
+        assert_eq!(left.len(), recorded + placed);
         assert_eq!(bench.catalogued_segments(), recorded);
         assert!(bench.location().last_error.is_some());
         mend_segment_commits(bench.dir());
 
-        /* A start sets them aside, unless the catalogue is still empty: then nothing under
-        files/ is touched, and each is set aside when the next segment takes its place.
-        Nothing is deleted either way. */
+        /* A start leaves them where they are. */
         bench.reopen();
-        assert_eq!(
-            bench.segment_files().len(),
-            if grown { recorded } else { recorded + placed }
-        );
+        assert_eq!(bench.segment_files(), left);
 
-        /* And the next sync fetches the range again. */
+        /* The next sync fetches the range again, finds its segments in place already, and
+        records them: nothing is moved, and nothing set aside. */
         let report = bench.sync();
         assert_eq!(
             (report.new_items, report.appended),
             if grown { (0, 1) } else { (3, 0) }
         );
-        let set_aside = bench
-            .orphans()
-            .iter()
-            .filter(|file| file.extension().is_some_and(|extension| extension == "zst"))
-            .count();
-        assert_eq!(set_aside, placed);
+        assert_eq!(bench.segment_files(), left);
+        for (file, stored) in left.iter().zip(&stored) {
+            assert!(&fs::read(file).unwrap() == stored);
+        }
+        assert!(bench.orphans().is_empty());
+        assert!(files_under(&bench.dir().join("tmp")).is_empty());
         bench.assert_mirrors(&keys);
         assert_eq!(bench.segment_files().len(), bench.catalogued_segments());
         assert_eq!(bench.location().last_error, None);
     }
 }
 
-fn a_failed_commit_is_retried_without_a_restart<A: Agent + Default>() {
+fn a_commit_that_keeps_failing_sets_nothing_aside<A: Agent + Default>() {
+    let (mut bench, keys) = bench::<A>();
+    bench.sync();
+    bench.agent.append(&keys[0], 4);
+    break_segment_commits(bench.dir());
+    for _ in 0..3 {
+        bench.pass_with(bench.agent.provider()).unwrap_err();
+        assert!(bench.orphans().is_empty());
+    }
+    mend_segment_commits(bench.dir());
+
+    /* Without a restart: the file the failed passes left is the segment, and is recorded. */
+    assert_eq!(bench.sync().appended, 1);
+    assert!(bench.orphans().is_empty());
+    bench.assert_mirrors(&keys);
+    assert_eq!(bench.segment_files().len(), bench.catalogued_segments());
+}
+
+fn a_file_left_where_another_segment_goes_is_set_aside<A: Agent + Default>() {
     let (mut bench, keys) = bench::<A>();
     bench.sync();
     bench.agent.append(&keys[0], 4);
     break_segment_commits(bench.dir());
     bench.pass_with(bench.agent.provider()).unwrap_err();
     mend_segment_commits(bench.dir());
+    let before = bench.segment_files();
+    let left: Vec<_> = before
+        .iter()
+        .filter(|file| !file.ends_with("0000000000000000.zst"))
+        .collect();
+    assert_eq!(left.len(), 1);
+    let stored = fs::read(left[0]).unwrap();
 
-    /* The file the failed pass left where the segment goes is set aside, not replaced. */
+    /* The source grows again, so the range the next pass stores from the same offset is not
+    the one whose file is there. That file is set aside with its bytes, never replaced. */
+    bench.agent.append(&keys[0], 2);
     assert_eq!(bench.sync().appended, 1);
-    assert_eq!(bench.orphans().len(), 1);
+    let orphans = bench.orphans();
+    assert_eq!(orphans.len(), 1);
+    assert!(fs::read(&orphans[0]).unwrap() == stored);
+    assert_eq!(bench.segment_files(), before);
     bench.assert_mirrors(&keys);
     assert_eq!(bench.segment_files().len(), bench.catalogued_segments());
 }

@@ -9,11 +9,13 @@
 mod plan;
 mod store;
 
+use std::collections::HashSet;
+
 use thiserror::Error;
 use toolbox_process::CancelToken;
 
 use crate::archive::{Archive, ArchiveError};
-use crate::catalogue::CatalogueError;
+use crate::catalogue::{self, CatalogueError};
 use crate::location::LocationId;
 use crate::provider::{Provider, ProviderError, ProviderId, Source, Unlisted};
 use crate::transport::Transport;
@@ -34,6 +36,11 @@ pub enum SyncError {
     #[error(transparent)]
     Catalogue(#[from] CatalogueError),
 }
+
+/// How long an item may keep changing under every pass that reads it before a pass counts it
+/// among what it could not archive. Until then the next pass is expected to get it; after, a
+/// sync that keeps leaving it out must not go on looking like one that archived everything.
+pub const WAITING_HOURS: i64 = 24;
 
 /// How far a pass is, as it reports it (PLAN §5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,7 +85,8 @@ pub struct PassReport {
     /// Items that changed while the pass read them, so that nothing of them was stored: the
     /// next pass tries again. The catalogue keeps since when each has been waiting.
     pub deferred: Vec<Failure>,
-    /// Items that could not be read or stored.
+    /// Items that could not be read or stored, and those that have changed under every pass
+    /// for more than [`WAITING_HOURS`].
     pub failed: Vec<Failure>,
     /// What the agent has at the location that could not even be scanned.
     pub unlisted: Vec<Unlisted>,
@@ -93,7 +101,7 @@ pub struct PassReport {
 impl PassReport {
     /// Why the pass did not archive everything the agent has, if it did not: how many items it
     /// could not read and the first reason. Items that only changed under the pass are not a
-    /// reason: the next pass has them.
+    /// reason, the next pass has them, until they have waited too long and are among `failed`.
     fn shortfall(&self) -> Option<String> {
         let first = self
             .failed
@@ -238,5 +246,26 @@ fn pass(
         .map(|failure| (failure.key.as_str(), failure.reason.as_str()))
         .collect();
     catalogue.record_waiting(location, provider.as_str(), &waiting)?;
+    /* Left for the next pass, but only for so long. */
+    let too_long = catalogue::now_ms() - WAITING_HOURS * 60 * 60 * 1000;
+    let overdue: HashSet<String> = catalogue
+        .waiting(location, provider.as_str())?
+        .into_iter()
+        .filter(|waiting| waiting.since < too_long)
+        .map(|waiting| waiting.key)
+        .collect();
+    let (late, deferred) = std::mem::take(&mut report.deferred)
+        .into_iter()
+        .partition(|deferred| overdue.contains(&deferred.key));
+    report.deferred = deferred;
+    report
+        .failed
+        .extend(late.into_iter().map(|late: Failure| Failure {
+            reason: format!(
+                "{}, as on every pass for more than {WAITING_HOURS} hours",
+                late.reason
+            ),
+            ..late
+        }));
     Ok(report)
 }

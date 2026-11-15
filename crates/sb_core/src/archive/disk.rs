@@ -8,10 +8,9 @@
 //! `fsync` (and on Windows `FlushFileBuffers`) does both, in `push`, and `settle` has nothing
 //! left to do.
 
-use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tempfile::{NamedTempFile, TempPath};
 
@@ -41,10 +40,11 @@ pub(super) fn push_dir(_dir: &Path) -> io::Result<()> {
 }
 
 /// Makes everything pushed so far durable, by a full flush through the folder `dir` on the
-/// same volume.
+/// same volume. A volume that has no full flush has had all it can do in [`push`].
 #[cfg(target_vendor = "apple")]
 pub(super) fn settle(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
+    let dir = File::open(dir)?;
+    dir.sync_all().or_else(|_| push(&dir))
 }
 
 /// What was pushed is durable already.
@@ -53,49 +53,29 @@ pub(super) fn settle(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Writes `bytes` to the new file `to` through a file in `tmp`, so `to` is either absent or
-/// whole, and pushes it. A `to` that already exists is left as it is.
-pub(super) fn write_new(tmp: &Path, to: &Path, bytes: &[u8]) -> io::Result<()> {
+/// A file in `tmp` holding `bytes`, whole and pushed. Dropped, it is removed.
+pub(super) fn new_file(tmp: &Path, bytes: &[u8]) -> io::Result<TempPath> {
     let mut file = NamedTempFile::new_in(tmp)?;
     file.write_all(bytes)?;
     push(file.as_file())?;
-    match place(file.into_temp_path(), to) {
+    Ok(file.into_temp_path())
+}
+
+/// Writes `bytes` to the new file `to` through a file in `tmp`, so `to` is either absent or
+/// whole, and pushes it. A `to` that already exists is left as it is.
+pub(super) fn write_new(tmp: &Path, to: &Path, bytes: &[u8]) -> io::Result<()> {
+    match place(new_file(tmp, bytes)?, to) {
         Err((error, _)) if error.kind() != io::ErrorKind::AlreadyExists => Err(error),
         _ => Ok(()),
     }
 }
 
-/// Writes `bytes` to `to`, in place of what is there, through a file in `tmp`, and makes it
-/// durable: `to` holds either what it held or `bytes`, whole.
-pub(super) fn write_over(tmp: &Path, to: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = NamedTempFile::new_in(tmp)?;
-    file.write_all(bytes)?;
-    push(file.as_file())?;
-    file.persist(to).map_err(|error| error.error)?;
-    match to.parent() {
-        Some(dir) => push_dir(dir).and_then(|()| settle(dir)),
-        None => Ok(()),
-    }
-}
-
-/// Creates `dir` and whichever of its parents are missing, and adds to `changed` each folder
-/// that gained one of them.
-pub(super) fn create_dirs(dir: &Path, changed: &mut BTreeSet<PathBuf>) -> io::Result<()> {
-    if dir.is_dir() {
-        return Ok(());
-    }
-    let Some(parent) = dir.parent() else {
-        return fs::create_dir(dir);
-    };
-    create_dirs(parent, changed)?;
-    match fs::create_dir(dir) {
-        Ok(()) => {
-            changed.insert(parent.to_path_buf());
-            Ok(())
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(error),
-    }
+/// Whether the files at `one` and `other` hold the same bytes.
+pub(super) fn same_bytes(one: &Path, other: &Path) -> io::Result<bool> {
+    Ok(
+        fs::metadata(one)?.len() == fs::metadata(other)?.len()
+            && fs::read(one)? == fs::read(other)?,
+    )
 }
 
 /**

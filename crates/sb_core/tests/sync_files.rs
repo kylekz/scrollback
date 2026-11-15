@@ -9,9 +9,11 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use pretty_assertions::assert_eq;
+use sb_core::CancelToken;
 use sb_core::archive::{Problem, SEGMENT_BYTES};
 use sb_core::catalogue::Reason;
 use sb_core::provider::ItemKind;
+use sb_core::sync::Progress;
 use sb_test_support::{Agent, FileAgent, ProjectsTree, edit_catalogue};
 
 use common::Bench;
@@ -674,4 +676,33 @@ mod unreadable {
         assert_eq!(report.skipped[0].path, link.to_str().unwrap());
         assert_eq!(bench.location().last_error, None);
     }
+}
+
+#[test]
+fn a_batch_is_bounded_by_what_its_proofs_hash() {
+    let mut agent = FileAgent::new();
+    let keys: Vec<_> = (0..3).map(|_| agent.add_session(1)).collect();
+    let line = "{\"type\":\"user\",\"text\":\"filler\"}\n";
+    let lines = line.repeat(24 * 1024 * 1024 / line.len());
+    for key in &keys {
+        agent.append_raw(key, &lines);
+    }
+    let mut bench = Bench::new(agent);
+    bench.sync();
+    for key in &keys {
+        bench.agent.append(key, 1);
+    }
+
+    /* Little is fetched, but each range's proof hashes its file from the start, and the three
+    files together are more than a batch may have hashed. */
+    let mut stored = Vec::new();
+    bench
+        .try_sync(&CancelToken::new(), &mut |progress| {
+            if let Progress::Stored { items } = progress {
+                stored.push(*items);
+            }
+        })
+        .unwrap();
+    assert_eq!(stored, [2, 3]);
+    bench.assert_mirrors(&keys);
 }

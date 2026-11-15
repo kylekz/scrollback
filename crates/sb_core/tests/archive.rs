@@ -1,17 +1,19 @@
 //! The archive on disk (PLAN §4, §12): opening and the lock, reading versions back, verify, and
-//! what a start does with files it doesn't know.
+//! what becomes of files the catalogue doesn't record.
 
 mod common;
 
 use std::fs;
-use std::io::Read as _;
+use std::io::{self, Read as _};
 use std::path::PathBuf;
 
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::archive::{Archive, ArchiveError, Problem};
 use sb_core::catalogue::Reason;
-use sb_test_support::{Agent, DbAgent, FileAgent, edit_catalogue};
+use sb_test_support::{
+    Agent, DbAgent, FileAgent, break_segment_commits, edit_catalogue, mend_segment_commits,
+};
 
 use common::{Bench, files_under};
 
@@ -188,35 +190,21 @@ fn a_create_that_was_cut_short_can_be_done_again() {
 }
 
 #[test]
-fn an_archive_whose_state_cannot_be_written_still_opens() {
-    let (mut bench, key) = synced();
-    bench.close();
-    /* As after a sync that died storing; and nothing can take the file's place, as when the
-    disk is full. */
-    let state = bench.dir().join("state.json");
-    fs::remove_file(&state).unwrap();
-    fs::create_dir(&state).unwrap();
-    fs::write(state.join("in the way"), "").unwrap();
-
-    bench.reopen();
-    let version = bench.versions(&key).remove(0);
-    assert!(bench.read(&version) == bench.agent.content(&key));
-    bench.assert_verifies();
-}
-
-#[test]
 fn a_catalogue_that_records_nothing_does_not_get_the_files_set_aside() {
     let (mut bench, _) = synced();
     let files = files_under(&bench.dir().join("files"));
     bench.close();
-    /* This archive's catalogue as it was before its first sync, as an early backup has it,
-    and a start that looks. */
+    /* This archive's catalogue as it was before its first sync, as an early backup has it. */
     edit_catalogue(
         bench.dir(),
         "DELETE FROM segment; DELETE FROM version; DELETE FROM item;",
     );
 
     bench.reopen();
+    assert!(matches!(
+        bench.archive().set_aside_uncatalogued(),
+        Err(ArchiveError::NothingRecorded(_))
+    ));
     assert_eq!(files_under(&bench.dir().join("files")), files);
     assert!(bench.orphans().is_empty());
 }
@@ -270,70 +258,92 @@ fn strays(bench: &Bench<FileAgent>) -> Vec<(PathBuf, PathBuf, &'static str)> {
     strays
 }
 
-/// Asserts the bench's strays were set aside with their bytes, under the paths they had.
-fn assert_set_aside(bench: &Bench<FileAgent>, strays: &[(PathBuf, PathBuf, &'static str)]) {
-    for (reported, inside, bytes) in strays {
-        assert!(!bench.dir().join(reported).exists(), "{reported:?}");
-        let mut moved = bench.dir().join("orphans").join(reported);
-        moved.extend(inside);
-        assert_eq!(fs::read_to_string(moved).unwrap(), *bytes, "{reported:?}");
-    }
-    assert_eq!(bench.orphans().len(), strays.len());
-}
-
 #[test]
-fn a_start_after_a_sync_that_did_not_end_sets_aside_what_the_catalogue_does_not_record() {
+fn what_the_catalogue_does_not_record_stays_until_the_owner_has_it_set_aside() {
     let (mut bench, key) = synced();
     let strays = strays(&bench);
-    /* As a sync that was storing when the app died leaves it. */
-    let state = bench.dir().join("state.json");
-    let syncing = fs::read_to_string(&state)
-        .unwrap()
-        .replace("\"syncing\":false", "\"syncing\":true");
-    fs::write(&state, syncing).unwrap();
+    let mut expected: Vec<_> = strays.iter().map(|(path, ..)| path.clone()).collect();
+    expected.sort();
 
+    /* Neither a start nor a sync looks for it. Verify reports it, and moves nothing. */
     bench.reopen();
-    assert_set_aside(&bench, &strays);
-    bench.assert_mirrors(&[key]);
-}
-
-#[test]
-fn a_start_with_no_word_of_the_last_one_sets_aside_what_the_catalogue_does_not_record() {
-    let (mut bench, key) = synced();
-    let strays = strays(&bench);
-    fs::remove_file(bench.dir().join("state.json")).unwrap();
-
-    bench.reopen();
-    assert_set_aside(&bench, &strays);
-    bench.assert_mirrors(&[key]);
-}
-
-#[test]
-fn a_start_after_a_sync_that_ended_well_does_not_look_and_verify_reports_instead() {
-    let (mut bench, key) = synced();
-    let strays = strays(&bench);
-
-    bench.reopen();
-    assert!(
-        strays
-            .iter()
-            .all(|(path, ..)| bench.dir().join(path).exists())
-    );
-    assert!(bench.orphans().is_empty());
+    bench.agent.append(&key, 3);
+    bench.sync();
     let mut uncatalogued = bench
         .archive()
         .verify(&CancelToken::new())
         .unwrap()
         .uncatalogued;
     uncatalogued.sort();
-    let mut expected: Vec<_> = strays.iter().map(|(path, ..)| path.clone()).collect();
-    expected.sort();
     assert_eq!(uncatalogued, expected);
+    assert!(
+        strays
+            .iter()
+            .all(|(path, ..)| bench.dir().join(path).exists())
+    );
+    assert!(bench.orphans().is_empty());
 
-    /* What verify found is a reason for the next start to look. */
-    bench.reopen();
-    assert_set_aside(&bench, &strays);
+    /* Asked to, the archive sets it aside, with its bytes, under the paths it had. */
+    let mut moved = bench.archive().set_aside_uncatalogued().unwrap();
+    moved.sort();
+    assert_eq!(moved, expected);
+    for (reported, inside, bytes) in &strays {
+        assert!(!bench.dir().join(reported).exists(), "{reported:?}");
+        let mut orphan = bench.dir().join("orphans").join(reported);
+        orphan.extend(inside);
+        assert_eq!(fs::read_to_string(orphan).unwrap(), *bytes, "{reported:?}");
+    }
+    assert_eq!(bench.orphans().len(), strays.len());
     bench.assert_mirrors(&[key]);
+    assert!(bench.archive().set_aside_uncatalogued().unwrap().is_empty());
+
+    /* What is set aside later from the same path does not take the place of what was. */
+    let again = &strays[5].0;
+    fs::write(bench.dir().join(again), "later").unwrap();
+    assert_eq!(
+        bench.archive().set_aside_uncatalogued().unwrap(),
+        std::slice::from_ref(again)
+    );
+    let orphan = bench.dir().join("orphans").join(again);
+    assert_eq!(fs::read_to_string(&orphan).unwrap(), strays[5].2);
+    assert_eq!(
+        fs::read_to_string(orphan.with_extension("txt.1")).unwrap(),
+        "later"
+    );
+}
+
+#[test]
+fn an_item_left_by_a_sync_that_died_and_gone_from_its_source_waits_for_the_owner() {
+    let mut agent = FileAgent::new();
+    let keys = [agent.add_session(8), agent.add_session(3)];
+    let mut bench = Bench::new(agent);
+    break_segment_commits(bench.dir());
+    bench.pass_with(bench.agent.provider()).unwrap_err();
+    mend_segment_commits(bench.dir());
+    assert_eq!(bench.segment_files().len(), 2);
+
+    /* The agent deletes one session before the next sync: no pass ever places its files
+    again, so nothing takes up the ones that are there. */
+    bench.reopen();
+    bench.agent.delete(&keys[0]);
+    assert_eq!(bench.sync().new_items, 1);
+    assert_eq!(
+        (bench.segment_files().len(), bench.catalogued_segments()),
+        (2, 1)
+    );
+    assert!(bench.orphans().is_empty());
+    let report = bench.archive().verify(&CancelToken::new()).unwrap();
+    assert_eq!((report.uncatalogued.len(), report.damaged.len()), (1, 0));
+
+    assert_eq!(
+        bench.archive().set_aside_uncatalogued().unwrap(),
+        report.uncatalogued
+    );
+    assert_eq!(
+        (bench.segment_files().len(), bench.catalogued_segments()),
+        (1, 1)
+    );
+    bench.assert_mirrors(&keys[1..]);
 }
 
 #[test]
@@ -352,17 +362,21 @@ fn a_catalogue_restored_from_before_the_last_sync_costs_no_segment() {
     let stored: Vec<_> = newer.iter().map(|file| fs::read(file).unwrap()).collect();
     assert_eq!(newer.len(), 2);
 
-    /* The catalogue goes back to its backup, which knows one segment. */
+    /* The catalogue goes back to its backup, which knows one segment. The other stays. */
     bench.close();
     fs::write(&database, backup).unwrap();
     bench.reopen();
-    assert_eq!(bench.segment_files().len(), 1);
-    let orphans = bench.orphans();
-    assert_eq!(orphans.len(), 1);
-    assert!(stored.contains(&fs::read(&orphans[0]).unwrap()));
+    assert_eq!(bench.segment_files(), newer);
+    assert_eq!(bench.catalogued_segments(), 1);
 
-    /* And the source still has what that segment held. */
+    /* The source still has what that segment held, so the next sync finds the segment where
+    it means to put it and records it. */
     assert_eq!(bench.sync().appended, 1);
+    assert_eq!(bench.segment_files(), newer);
+    for (file, stored) in newer.iter().zip(&stored) {
+        assert!(&fs::read(file).unwrap() == stored);
+    }
+    assert!(bench.orphans().is_empty());
     bench.assert_mirrors(&[key]);
 }
 
@@ -419,6 +433,56 @@ fn reading_a_version_fails_on_bytes_that_were_not_archived() {
         Problem::of(&error),
         Some(&Problem::SegmentChanged { offset: 0 })
     );
+}
+
+#[test]
+fn a_read_that_stops_inside_a_segment_has_been_handed_no_bytes_that_were_not_archived() {
+    let (bench, key) = synced();
+    let version = bench.versions(&key).remove(0);
+    let archived = bench.read(&version);
+    let read_some = || {
+        let mut some = [0; 64];
+        bench
+            .archive()
+            .read_version_from(version.id, 10)
+            .unwrap()
+            .read(&mut some)
+            .map(|read| some[..read].to_vec())
+    };
+    assert!(read_some().unwrap() == archived[10..74]);
+
+    /* A well-formed segment of other bytes, as many as were archived. */
+    fs::write(
+        bench.segment_files().remove(0),
+        zstd::encode_all(&vec![b'x'; archived.len()][..], 3).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        Problem::of(&read_some().unwrap_err()),
+        Some(&Problem::SegmentChanged { offset: 0 })
+    );
+}
+
+#[test]
+fn a_segment_that_decompresses_to_far_more_than_was_archived_is_refused() {
+    let (bench, key) = synced();
+    let version = bench.versions(&key).remove(0);
+    /* A small file that decompresses to far more than any segment holds. */
+    let huge = zstd::encode_all(io::repeat(0).take(1 << 28), 3).unwrap();
+    fs::write(bench.segment_files().remove(0), huge).unwrap();
+
+    let mut content = Vec::new();
+    let error = bench
+        .archive()
+        .read_version(version.id)
+        .unwrap()
+        .read_to_end(&mut content)
+        .unwrap_err();
+    assert_eq!(
+        Problem::of(&error),
+        Some(&Problem::SegmentChanged { offset: 0 })
+    );
+    assert!(content.is_empty());
 }
 
 #[test]

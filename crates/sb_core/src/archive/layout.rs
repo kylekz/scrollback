@@ -6,9 +6,8 @@
 //!   scrollback.db                   the catalogue
 //!   backups/                        checked backups of the catalogue
 //!   lock                            held while the archive is open
-//!   state.json                      whether files/ can hold what the catalogue doesn't record
 //!   tmp/                            in-flight writes; emptied on start
-//!   orphans/                        files the catalogue doesn't know, set aside on start
+//!   orphans/                        files the catalogue doesn't record, set aside
 //!   files/<location-id>/<provider>/<ab>/<item-id>/
 //!       source.json                 provider, location, the item's key
 //!       v0001/0000000000000000.zst  bytes [0, a) of version 1
@@ -27,7 +26,6 @@ use crate::location::LocationId;
 
 pub(super) const MANIFEST: &str = "archive.json";
 pub(super) const LOCK: &str = "lock";
-pub(super) const STATE: &str = "state.json";
 pub(super) const TMP: &str = "tmp";
 pub(super) const FILES: &str = "files";
 pub(super) const ORPHANS: &str = "orphans";

@@ -6,9 +6,8 @@
 //! A read the file system failed (a file in use, a disk error) says nothing about the stored
 //! bytes. Such a version is reported as unread and is not marked.
 //!
-//! It also reports what `files/` holds that the catalogue doesn't record, which a start only
-//! looks for when it has a reason to (the archive's module docs). Finding any is such a reason:
-//! the next start sets it aside.
+//! It also reports what `files/` holds that the catalogue doesn't record. Nothing else looks
+//! for that, and nothing moves it but [`Archive::set_aside_uncatalogued`], when the owner asks.
 
 use std::fs;
 use std::io::{self, Read as _};
@@ -69,9 +68,6 @@ impl Archive {
         if !uncatalogued.is_empty() {
             let accounted = accounted(&stored);
             uncatalogued.retain(|path| !accounted.contains(path));
-        }
-        if !uncatalogued.is_empty() {
-            self.note_unrecorded();
         }
         let mut report = VerifyReport {
             uncatalogued,

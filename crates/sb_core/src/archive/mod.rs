@@ -7,21 +7,15 @@
 //! - a segment is a new file, written whole before the catalogue records it, and it is moved
 //!   into place with a move that fails if a file is already there ([`Archive::store`]), so the
 //!   file system itself refuses to replace one;
-//! - nothing here deletes a file under `files/`. A file there that the catalogue doesn't know (a
-//!   store that was interrupted between the move and the commit, or a catalogue restored from
-//!   an older backup) is moved to `orphans/` when the archive is opened, so the tree holds only
-//!   what the catalogue records and no bytes are lost;
+//! - nothing here deletes a file under `files/`, and none is ever moved without being looked
+//!   at. A file the catalogue doesn't record (a store that was interrupted between the move
+//!   and the commit, or a catalogue restored from an older backup) stays where it is until a
+//!   segment is to be placed there. If it holds the very bytes being placed, it is kept and
+//!   recorded; if not, it is set aside in `orphans/`. [`Archive::verify`] reports all there
+//!   are, and [`Archive::set_aside_uncatalogued`] sets them aside when the owner asks;
 //! - a catalogue is only ever used with the archive it was made for: the archive's id is in
 //!   `archive.json` and in the catalogue, an archive whose catalogue is missing or another's
 //!   is not opened, and one is not created over a folder that holds a catalogue or files.
-//!
-//! Looking for files the catalogue doesn't record means walking all of `files/`, so a start
-//! only does it when there can be any. `state.json` says so: it is written, and flushed, when
-//! a sync first stores something (`syncing`) and again when the last sync under way has ended
-//! with everything it stored recorded, then with how many segments the catalogue records and
-//! when the newest was stored. A start that finds it saying `syncing`, or saying something
-//! else than the catalogue does (a catalogue from a backup, or one that lost its last commits
-//! to a power cut), or doesn't find it, looks.
 
 mod disk;
 mod layout;
@@ -32,7 +26,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Mutex, PoisonError, RwLock};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -111,6 +105,14 @@ pub enum ArchiveError {
     /// A segment was about to be stored where the catalogue already records one.
     #[error("{} is already archived and is never overwritten", .0.display())]
     SegmentExists(PathBuf),
+    /// The catalogue records nothing while `files/` holds files: it is this archive's from
+    /// before its first sync, back from a backup. Setting aside what it doesn't record would
+    /// empty the archive.
+    #[error(
+        "the catalogue of {} records nothing, so nothing under its files/ is set aside",
+        .0.display()
+    )]
+    NothingRecorded(PathBuf),
     #[error("version {0} is not in the catalogue")]
     UnknownVersion(i64),
     #[error("verify was cancelled")]
@@ -147,28 +149,6 @@ struct SourceManifest<'a> {
     key: &'a str,
 }
 
-/// `state.json` (the module docs).
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-struct State {
-    /// A sync is storing, or `files/` is known to hold something the catalogue doesn't record.
-    syncing: bool,
-    /// How many segments the catalogue recorded when this was written, and when the newest of
-    /// them was stored.
-    segments: u64,
-    newest: Option<i64>,
-}
-
-/// The syncs under way.
-#[derive(Debug, Default)]
-struct Syncing {
-    locations: HashSet<LocationId>,
-    /// `state.json` says `syncing`.
-    storing: bool,
-    /// `files/` may hold a file the catalogue doesn't record: a store did not end well after
-    /// it had put one in place, or verify found one.
-    unrecorded: bool,
-}
-
 /// An open archive. Only one can be open on a folder at a time (PLAN §4.4): the lock is held
 /// until this is dropped.
 #[derive(Debug)]
@@ -176,7 +156,8 @@ pub struct Archive {
     dir: PathBuf,
     id: String,
     catalogue: Catalogue,
-    syncing: Mutex<Syncing>,
+    /// The locations a sync is running on.
+    syncing: Mutex<HashSet<LocationId>>,
     /// Held shared from a segment's move into place until its commit, and exclusively by
     /// whoever has to tell the files the catalogue doesn't record from those it is about to.
     placing: RwLock<()>,
@@ -225,7 +206,7 @@ impl Archive {
             .and_then(|()| disk::push_dir(dir))
             .and_then(|()| disk::settle(dir))
             .map_err(io_error("write", &manifest_path))?;
-        Ok(Self::start(dir, lock, id, catalogue))
+        Ok(Self::opened(dir, lock, id, catalogue))
     }
 
     /// Opens the archive in `dir`. A folder without one is [`ArchiveError::NotAnArchive`]; an
@@ -264,11 +245,11 @@ impl Archive {
                 catalogue: owner,
             });
         }
-        Ok(Self::start(dir, lock, manifest.id, catalogue))
+        Ok(Self::opened(dir, lock, manifest.id, catalogue))
     }
 
-    /// What every start does first, once the lock is held: makes sure the archive's folders
-    /// are there, empties `tmp/` and opens the catalogue. Returns the catalogue and `tmp/`.
+    /// What every start does, once the lock is held: makes sure the archive's folders are
+    /// there, empties `tmp/` and opens the catalogue. Returns the catalogue and `tmp/`.
     fn prepare(dir: &Path) -> Result<(Catalogue, PathBuf)> {
         let tmp = dir.join(layout::TMP);
         for sub in [&tmp, &dir.join(layout::FILES)] {
@@ -289,33 +270,15 @@ impl Archive {
         Ok((Catalogue::open(dir)?, tmp))
     }
 
-    /**
-     * The open archive. When `files/` may hold what the catalogue doesn't record (the module
-     * docs), that is set aside first. Nothing here keeps the archive from opening: when the
-     * look or the note of it fails (a full disk), the next start looks again.
-     */
-    fn start(dir: &Path, lock: File, id: String, catalogue: Catalogue) -> Self {
-        let archive = Self {
+    fn opened(dir: &Path, lock: File, id: String, catalogue: Catalogue) -> Self {
+        Self {
             dir: dir.to_path_buf(),
             id,
             catalogue,
             syncing: Mutex::default(),
             placing: RwLock::default(),
             _lock: lock,
-        };
-        let tidied = archive.recorded_state().and_then(|recorded| {
-            let state = fs::read(dir.join(layout::STATE))
-                .ok()
-                .and_then(|json| serde_json::from_slice::<State>(&json).ok());
-            if state.as_ref() != Some(&recorded) && archive.set_aside_uncatalogued()? {
-                archive.write_state(&recorded)?;
-            }
-            Ok(())
-        });
-        if let Err(error) = tidied {
-            log::warn!("{error}");
         }
-        archive
     }
 
     pub fn dir(&self) -> &Path {
@@ -368,15 +331,12 @@ impl Archive {
         )
     }
 
-    fn syncing(&self) -> MutexGuard<'_, Syncing> {
-        self.syncing.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     /// Marks `location` as being synced until the guard is dropped; `None` while it already is
     /// (PLAN §5: one location runs one pass at a time).
     pub(crate) fn begin_sync(&self, location: &LocationId) -> Option<SyncGuard<'_>> {
-        self.syncing()
-            .locations
+        self.syncing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(location.clone())
             .then(|| SyncGuard {
                 archive: self,
@@ -390,81 +350,72 @@ impl Archive {
     }
 
     /**
-     * Stores a batch (PLAN §4.1): for each commit, makes its item durable on disk, with its
-     * folder, its `source.json` and the range's segments in their places, and then commits all
-     * of them to the catalogue in one transaction. Returns, for each, whether a version it
-     * starts is held back.
+     * Stores a batch (PLAN §4.1): for each commit, puts its item on disk, with its folder, its
+     * `source.json` and the range's segments in their places; makes all of it durable; and only
+     * then commits all of them to the catalogue in one transaction. Returns, for each, whether
+     * a version it starts is held back.
      *
-     * A file already where a segment goes is one the catalogue never recorded (it is what an
-     * interrupted store leaves) and is set aside. One the catalogue does record is never
-     * replaced: [`ArchiveError::SegmentExists`].
+     * A file already where one goes is one the catalogue never recorded: it is what a store
+     * that was interrupted before its commit leaves. When it holds the very bytes that are
+     * being placed, it stays and is recorded now, so a pass that takes up where another was
+     * killed moves nothing. When it holds anything else, it is set aside. A segment the
+     * catalogue does record is never touched: [`ArchiveError::SegmentExists`]. An item's
+     * `source.json` says only what the catalogue says too, so one that is not what it should
+     * be is set aside and written again.
      */
     pub(crate) fn store(&self, batch: Vec<(Commit<'_>, Vec<Sealed>)>) -> Result<Vec<bool>> {
         if batch.is_empty() {
             return Ok(Vec::new());
         }
-        {
-            let mut syncing = self.syncing();
-            if !syncing.storing {
-                self.write_state(&State {
-                    syncing: true,
-                    ..self.recorded_state()?
-                })?;
-                syncing.storing = true;
-            }
-        }
         let _placing = self.placing.read().unwrap_or_else(PoisonError::into_inner);
-        /* Until the commit, whatever goes wrong may leave files the catalogue doesn't record. */
-        let mut unrecorded = Unrecorded {
-            archive: self,
-            recorded: false,
-        };
-        /* The folders that gain an entry here. Each is pushed once, at the end. */
-        let mut changed = BTreeSet::new();
+        /* The folders whose entries this batch relies on, each pushed once, at the end: an
+        item's folder and the ones it is in, whether this store made them or an earlier one
+        that never got as far as its flush. */
+        let mut folders = BTreeSet::new();
         let mut commits = Vec::new();
         for (commit, segments) in batch {
             let folder = item_folder(&commit.scanned.key);
             let item = layout::item_dir(commit.location, commit.provider, &folder);
             let item_dir = self.dir.join(&item);
-            disk::create_dirs(&item_dir, &mut changed).map_err(io_error("create", &item_dir))?;
-            let source = item_dir.join(layout::SOURCE);
-            if !source.exists() {
-                let json = serde_json::to_vec_pretty(&SourceManifest {
-                    provider: commit.provider,
-                    location: commit.location.as_str(),
-                    key: &commit.scanned.key,
-                })
-                .expect("a struct of text always serializes");
-                disk::write_new(&self.tmp(), &source, &json).map_err(io_error("write", &source))?;
-                changed.insert(item_dir.clone());
+            fs::create_dir_all(&item_dir).map_err(io_error("create", &item_dir))?;
+            folders.extend(
+                item.ancestors()
+                    .take_while(|folder| !folder.as_os_str().is_empty())
+                    .map(|folder| self.dir.join(folder)),
+            );
+            let json = serde_json::to_vec_pretty(&SourceManifest {
+                provider: commit.provider,
+                location: commit.location.as_str(),
+                key: &commit.scanned.key,
+            })
+            .expect("a struct of text always serializes");
+            let source = item.join(layout::SOURCE);
+            /* One that is there and is not this (a write cut short) is set aside by `place`. */
+            if !fs::read(self.dir.join(&source)).is_ok_and(|existing| existing == json) {
+                let file =
+                    disk::new_file(&self.tmp(), &json).map_err(io_error("write", &item_dir))?;
+                self.place(file, &source, || Ok(false))?;
             }
+
             let version = item.join(layout::version_dir(commit.number));
-            let version_dir = self.dir.join(&version);
             let mut placed = Vec::new();
             for sealed in segments {
-                disk::create_dirs(&version_dir, &mut changed)
-                    .map_err(io_error("create", &version_dir))?;
-                let relative = version.join(layout::segment_file(sealed.offset));
-                let to = self.dir.join(&relative);
-                let mut file = sealed.file;
-                /* The move refuses to replace a file, so nothing here can overwrite one. */
-                while let Err((error, unplaced)) = disk::place(file, &to) {
-                    if error.kind() != io::ErrorKind::AlreadyExists {
-                        return Err(io_error("store", &to)(error));
-                    }
-                    if self.catalogue.has_segment(
-                        commit.location,
-                        commit.provider,
-                        &folder,
-                        commit.number,
-                        sealed.offset,
-                    )? {
-                        return Err(ArchiveError::SegmentExists(to));
-                    }
-                    self.set_aside(&relative)?;
-                    file = unplaced;
-                }
-                changed.insert(version_dir.clone());
+                let version_dir = self.dir.join(&version);
+                fs::create_dir_all(&version_dir).map_err(io_error("create", &version_dir))?;
+                folders.insert(version_dir);
+                self.place(
+                    sealed.file,
+                    &version.join(layout::segment_file(sealed.offset)),
+                    || {
+                        Ok(self.catalogue.has_segment(
+                            commit.location,
+                            commit.provider,
+                            &folder,
+                            commit.number,
+                            sealed.offset,
+                        )?)
+                    },
+                )?;
                 placed.push((sealed.offset, sealed.length, sealed.hash));
             }
             commits.push(Recorded {
@@ -473,50 +424,39 @@ impl Archive {
             });
         }
         let files = self.dir.join(layout::FILES);
-        changed
+        folders
             .iter()
-            .try_for_each(|dir| disk::push_dir(dir))
+            .try_for_each(|folder| disk::push_dir(folder))
             .and_then(|()| disk::settle(&files))
             .map_err(io_error("flush", &files))?;
-        let held_back = self.catalogue.commit(&commits)?;
-        unrecorded.recorded = true;
-        Ok(held_back)
+        Ok(self.catalogue.commit(&commits)?)
     }
 
-    /// What `state.json` says when nothing is being stored: what the catalogue records.
-    fn recorded_state(&self) -> Result<State> {
-        let (segments, newest) = self.catalogue.segments_recorded()?;
-        Ok(State {
-            syncing: false,
-            segments,
-            newest,
-        })
-    }
-
-    /// Writes `state.json`, flushed to disk.
-    fn write_state(&self, state: &State) -> Result<()> {
-        let path = self.dir.join(layout::STATE);
-        let json =
-            serde_json::to_vec(state).expect("a struct of numbers and a flag always serializes");
-        disk::write_over(&self.tmp(), &path, &json).map_err(io_error("write", &path))
-    }
-
-    /// Notes that `files/` holds something the catalogue doesn't record, so that the next
-    /// start looks (the module docs).
-    fn note_unrecorded(&self) {
-        let mut syncing = self.syncing();
-        syncing.unrecorded = true;
-        if !syncing.storing {
-            let written = self.recorded_state().and_then(|recorded| {
-                self.write_state(&State {
-                    syncing: true,
-                    ..recorded
-                })
-            });
-            if let Err(error) = written {
-                log::warn!("{error}");
+    /// Moves the whole, pushed `file` from `tmp/` to `relative` (to the archive, under
+    /// `files/`), which nothing is ever replaced at ([`Archive::store`]). `recorded` says
+    /// whether the catalogue records a file there.
+    fn place(
+        &self,
+        mut file: tempfile::TempPath,
+        relative: &Path,
+        recorded: impl Fn() -> Result<bool>,
+    ) -> Result<()> {
+        let to = self.dir.join(relative);
+        /* The move refuses to replace a file, so nothing here can overwrite one. */
+        while let Err((error, unplaced)) = disk::place(file, &to) {
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(io_error("store", &to)(error));
             }
+            if recorded()? {
+                return Err(ArchiveError::SegmentExists(to));
+            }
+            if disk::same_bytes(&unplaced, &to).map_err(io_error("read", &to))? {
+                return Ok(());
+            }
+            self.set_aside(relative)?;
+            file = unplaced;
         }
+        Ok(())
     }
 
     /// Moves the file or folder at `relative` (to the archive, under `files/`) to the same path
@@ -539,46 +479,26 @@ impl Archive {
     }
 
     /**
-     * Sets aside everything under `files/` that the catalogue doesn't record (the module docs).
-     * Returns whether `files/` now holds nothing but what the catalogue records. It doesn't
-     * when something could not be moved (a file another program holds), which stays where it
-     * is, to be set aside when it is in the way or at a later start.
+     * Sets aside, in `orphans/`, everything under `files/` that the catalogue doesn't account
+     * for: what [`Archive::verify`] reports as uncatalogued. Nothing does this unasked. Returns
+     * the paths that were moved, relative to the archive. One that can't be moved (a file
+     * another program holds) stays where it is.
      */
-    fn set_aside_uncatalogued(&self) -> Result<bool> {
-        /* A catalogue that records nothing beside files that are there is this archive's from
-        before its first sync, back from a backup: setting everything aside would empty the
-        archive. */
-        if !self.catalogue.has_items()? {
-            let empty = self.entries(Path::new(layout::FILES))?.is_empty();
-            if !empty {
-                log::warn!(
-                    "the catalogue of {} records nothing, but its files/ is not empty; \
-                     everything there is left where it is",
-                    self.dir.display()
-                );
-            }
-            return Ok(empty);
-        }
+    pub fn set_aside_uncatalogued(&self) -> Result<Vec<PathBuf>> {
+        /* No segment is between its place and its commit while this looks and moves. */
+        let _quiet = self.placing.write().unwrap_or_else(PoisonError::into_inner);
         let uncatalogued = self.uncatalogued(&accounted(&self.catalogue.stored()?))?;
-        let mut left = 0;
-        for relative in &uncatalogued {
-            if let Err(error) = self.set_aside(relative) {
-                log::warn!("{error}");
-                left += 1;
-            }
-            /* A folder left empty goes; one with anything in it stays. */
-            if let Some(dir) = relative.parent() {
-                let _ = fs::remove_dir(self.dir.join(dir));
+        if !uncatalogued.is_empty() && !self.catalogue.has_items()? {
+            return Err(ArchiveError::NothingRecorded(self.dir.clone()));
+        }
+        let mut moved = Vec::new();
+        for relative in uncatalogued {
+            match self.set_aside(&relative) {
+                Ok(()) => moved.push(relative),
+                Err(error) => log::warn!("{error}"),
             }
         }
-        if !uncatalogued.is_empty() {
-            log::warn!(
-                "set aside {} files or folders the catalogue doesn't record, in {}",
-                uncatalogued.len() - left,
-                self.dir.join(layout::ORPHANS).display()
-            );
-        }
-        Ok(left == 0)
+        Ok(moved)
     }
 
     /// Every path under `files/`, relative to the archive, that is not among `accounted`
@@ -587,29 +507,18 @@ impl Archive {
         let mut uncatalogued = Vec::new();
         let mut folders = vec![PathBuf::from(layout::FILES)];
         while let Some(folder) = folders.pop() {
-            for (name, is_dir) in self.entries(&folder)? {
-                let path = folder.join(name);
+            let dir = self.dir.join(&folder);
+            for entry in fs::read_dir(&dir).map_err(io_error("list", &dir))? {
+                let entry = entry.map_err(io_error("list", &dir))?;
+                let path = folder.join(entry.file_name());
                 if !accounted.contains(&path) {
                     uncatalogued.push(path);
-                } else if is_dir {
+                } else if entry.file_type().map_err(io_error("list", &dir))?.is_dir() {
                     folders.push(path);
                 }
             }
         }
         Ok(uncatalogued)
-    }
-
-    /// What is in the folder `relative`: each entry's name, and whether it is a folder.
-    fn entries(&self, relative: &Path) -> Result<Vec<(std::ffi::OsString, bool)>> {
-        let dir = self.dir.join(relative);
-        fs::read_dir(&dir)
-            .map_err(io_error("list", &dir))?
-            .map(|entry| {
-                let entry = entry?;
-                Ok((entry.file_name(), entry.file_type()?.is_dir()))
-            })
-            .collect::<io::Result<_>>()
-            .map_err(io_error("list", &dir))
     }
 }
 
@@ -661,21 +570,6 @@ fn lock(dir: &Path) -> Result<File> {
     }
 }
 
-/// A store under way. Dropped before its commit, by an error or a panic, it may have left
-/// files in place that the catalogue doesn't record.
-struct Unrecorded<'a> {
-    archive: &'a Archive,
-    recorded: bool,
-}
-
-impl Drop for Unrecorded<'_> {
-    fn drop(&mut self) {
-        if !self.recorded {
-            self.archive.syncing().unrecorded = true;
-        }
-    }
-}
-
 /// A location's sync in progress.
 pub(crate) struct SyncGuard<'a> {
     archive: &'a Archive,
@@ -683,25 +577,12 @@ pub(crate) struct SyncGuard<'a> {
 }
 
 impl Drop for SyncGuard<'_> {
-    /// The sync is over. When it was the last one under way and everything that was stored is
-    /// recorded, `state.json` says so again. If it isn't, or that can't be written, the file
-    /// goes on saying `syncing` and the next start looks through `files/`, which costs time
-    /// and nothing else.
     fn drop(&mut self) {
-        let mut syncing = self.archive.syncing();
-        syncing.locations.remove(&self.location);
-        if syncing.locations.is_empty() && syncing.storing {
-            syncing.storing = false;
-            if !syncing.unrecorded {
-                let written = self
-                    .archive
-                    .recorded_state()
-                    .and_then(|state| self.archive.write_state(&state));
-                if let Err(error) = written {
-                    log::warn!("{error}");
-                }
-            }
-        }
+        self.archive
+            .syncing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.location);
     }
 }
 
@@ -709,6 +590,7 @@ impl Drop for SyncGuard<'_> {
 mod tests {
     use super::*;
     use crate::catalogue::Target;
+    use crate::hash::Hash;
     use crate::location::LocationKind;
     use crate::provider::{ItemKind, ScannedItem};
 
@@ -739,8 +621,9 @@ mod tests {
             scanned,
             target: Target::NewItem,
             number: 1,
+            from: 0,
             length: bytes.len() as u64,
-            hash: crate::hash::Hash::of(bytes),
+            hash: Hash::of(bytes),
         };
         (commit, writer.finish().unwrap())
     }
@@ -756,102 +639,189 @@ mod tests {
         (dir, archive, location)
     }
 
-    fn state(archive: &Archive) -> State {
-        serde_json::from_slice(&fs::read(archive.dir().join(layout::STATE)).unwrap()).unwrap()
+    /// Where version 1's first segment of the item `scanned` goes, relative to the archive.
+    fn first_segment(location: &LocationId, scanned: &ScannedItem) -> PathBuf {
+        layout::item_dir(location, "fixture", &item_folder(&scanned.key))
+            .join("v0001/0000000000000000.zst")
+    }
+
+    fn orphans(archive: &Archive) -> usize {
+        fn count(dir: &Path) -> usize {
+            fs::read_dir(dir).map_or(0, |entries| {
+                entries
+                    .map(|entry| entry.unwrap().path())
+                    .map(|path| if path.is_dir() { count(&path) } else { 1 })
+                    .sum()
+            })
+        }
+        count(&archive.dir().join(layout::ORPHANS))
     }
 
     #[test]
-    fn a_segment_is_set_aside_or_refused_but_never_replaced() {
+    fn a_file_in_the_way_is_kept_if_it_is_the_segment_and_set_aside_if_not() {
+        let (_dir, archive, location) = archive();
+        let (same, other) = (scanned("items/same"), scanned("items/other"));
+        /* What a store that never reached its commit left for the first item: its segment, as
+        this store would write it. For the second: files of other bytes where its segment and
+        its source.json go, the segment's as many as this store would write. */
+        let place = archive.dir().join(first_segment(&location, &same));
+        fs::create_dir_all(place.parent().unwrap()).unwrap();
+        fs::copy(
+            &first(&archive, &location, &same, b"first").1[0].file,
+            &place,
+        )
+        .unwrap();
+        let different = archive.dir().join(first_segment(&location, &other));
+        let source = different.parent().unwrap().with_file_name(layout::SOURCE);
+        fs::create_dir_all(different.parent().unwrap()).unwrap();
+        let mut left = fs::read(&first(&archive, &location, &other, b"other").1[0].file).unwrap();
+        *left.last_mut().unwrap() ^= 1;
+        fs::write(&different, &left).unwrap();
+        fs::write(&source, "{").unwrap();
+
+        archive
+            .store(vec![
+                first(&archive, &location, &same, b"first"),
+                first(&archive, &location, &other, b"other"),
+            ])
+            .unwrap();
+        /* The first was adopted where it was, the second's files set aside with their bytes. */
+        assert_eq!(orphans(&archive), 2);
+        assert!(fs::read_to_string(source).unwrap().contains("items/other"));
+        let orphan = archive
+            .dir()
+            .join(layout::ORPHANS)
+            .join(first_segment(&location, &other));
+        assert!(fs::read(orphan).unwrap() == left);
+        assert_eq!(fs::read_dir(archive.tmp()).unwrap().count(), 0);
+        let report = archive
+            .verify(&toolbox_process::CancelToken::new())
+            .unwrap();
+        assert_eq!((report.versions, report.damaged.len()), (2, 0));
+        assert!(report.uncatalogued.is_empty());
+    }
+
+    #[test]
+    fn a_segment_the_catalogue_records_is_never_replaced_or_moved() {
         let (_dir, archive, location) = archive();
         let scanned = scanned("items/one");
-        let relative = layout::item_dir(&location, "fixture", &item_folder(&scanned.key))
-            .join("v0001/0000000000000000.zst");
-        let place = archive.dir().join(&relative);
-        let orphan = archive.dir().join(layout::ORPHANS).join(&relative);
-
-        /* A file the catalogue doesn't record is where the segment goes: it is set aside. */
-        fs::create_dir_all(place.parent().unwrap()).unwrap();
-        fs::write(&place, "left by an interrupted store").unwrap();
+        let place = archive.dir().join(first_segment(&location, &scanned));
         archive
             .store(vec![first(&archive, &location, &scanned, b"first")])
             .unwrap();
         let recorded = fs::read(&place).unwrap();
-        assert_eq!(fs::read(&orphan).unwrap(), b"left by an interrupted store");
 
-        /* Now the catalogue records the segment there: storing another is refused. */
-        let refused = archive.store(vec![first(&archive, &location, &scanned, b"other")]);
+        /* Other bytes, and the very same ones: neither is put where a recorded segment is. */
+        for bytes in [&b"other"[..], b"first"] {
+            let refused = archive.store(vec![first(&archive, &location, &scanned, bytes)]);
+            assert!(
+                matches!(refused, Err(ArchiveError::SegmentExists(_))),
+                "{refused:?}"
+            );
+            assert!(fs::read(&place).unwrap() == recorded);
+            assert_eq!(fs::read_dir(archive.tmp()).unwrap().count(), 0);
+            assert_eq!(orphans(&archive), 0);
+        }
+    }
+
+    #[test]
+    fn a_range_planned_for_a_version_of_another_length_is_not_recorded() {
+        let (_dir, archive, location) = archive();
+        let scanned = scanned("items/one");
+        archive
+            .store(vec![first(&archive, &location, &scanned, b"first")])
+            .unwrap();
+        let item = archive
+            .catalogue()
+            .item(&location, "fixture", &scanned.key)
+            .unwrap()
+            .unwrap();
+        let version = archive.catalogue().versions(item.id).unwrap().remove(0);
+        /* A plan made when the version was 7 bytes long; it is 5. */
+        let mut writer = archive.range_writer(7);
+        writer.write(b" more").unwrap();
+        let stale = Commit {
+            location: &location,
+            provider: "fixture",
+            scanned: &scanned,
+            target: Target::Append {
+                item: item.id,
+                version: version.id,
+            },
+            number: 1,
+            from: 7,
+            length: 12,
+            hash: Hash::of(b"first??more"),
+        };
+        let refused = archive.store(vec![(stale, writer.finish().unwrap())]);
         assert!(
-            matches!(refused, Err(ArchiveError::SegmentExists(_))),
+            matches!(
+                refused,
+                Err(ArchiveError::Catalogue(CatalogueError::VersionMoved {
+                    length: 7,
+                    ..
+                }))
+            ),
             "{refused:?}"
         );
-        assert!(fs::read(&place).unwrap() == recorded);
-        assert_eq!(fs::read_dir(archive.tmp()).unwrap().count(), 0);
-        assert_eq!(fs::read_dir(orphan.parent().unwrap()).unwrap().count(), 1);
+        let after = archive.catalogue().versions(item.id).unwrap().remove(0);
+        assert_eq!((after.length, after.hash), (5, version.hash));
+        assert_eq!(archive.catalogue().segments(version.id).unwrap().len(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn a_store_that_fails_after_placing_a_file_keeps_the_state_saying_so() {
+    fn nothing_is_committed_before_it_is_flushed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let (_dir, archive, location) = archive();
-        let (one, two) = (scanned("items/one"), scanned("items/two"));
-        let syncing = archive.begin_sync(&location).unwrap();
-        /* The second item of the batch can't be given a folder: a file is in the way. The
-        first item's segment is in place by then, and never committed. */
-        let folder = item_folder(&two.key);
-        let blocked = archive
-            .dir()
-            .join(layout::item_dir(&location, "fixture", &folder));
+        let scanned = scanned("items/one");
         archive
-            .store(vec![first(
-                &archive,
-                &location,
-                &scanned("items/zero"),
-                b"zero",
-            )])
+            .store(vec![first(&archive, &location, &scanned, b"first")])
             .unwrap();
-        fs::create_dir_all(blocked.parent().unwrap()).unwrap();
-        fs::write(&blocked, "not a folder").unwrap();
-        let failed = archive.store(vec![
-            first(&archive, &location, &one, b"first"),
-            first(&archive, &location, &two, b"second"),
-        ]);
-        assert!(matches!(failed, Err(ArchiveError::Io { .. })), "{failed:?}");
-        assert!(
-            archive
-                .catalogue()
-                .item(&location, "fixture", &one.key)
-                .unwrap()
-                .is_none()
-        );
-
-        /* The sync ends: the state still says to look, though no commit failed. */
-        drop(syncing);
-        assert!(state(&archive).syncing);
-    }
-
-    #[test]
-    fn the_state_says_syncing_until_the_last_sync_under_way_ends() {
-        let (_dir, archive, first_location) = archive();
-        let second_location = archive
+        let item = archive
             .catalogue()
-            .add_location(LocationKind::Local, "another")
+            .item(&location, "fixture", &scanned.key)
             .unwrap()
-            .id;
-        assert_eq!(state(&archive), archive.recorded_state().unwrap());
+            .unwrap();
+        let version = archive.catalogue().versions(item.id).unwrap().remove(0);
+        /* The version's folder can be written into and not opened, so the segment is placed
+        and its folder can't be flushed. */
+        let folder = archive.dir().join(first_segment(&location, &scanned));
+        let folder = folder.parent().unwrap();
+        fs::set_permissions(folder, fs::Permissions::from_mode(0o300)).unwrap();
+        let mut writer = archive.range_writer(5);
+        writer.write(b" more").unwrap();
+        let append = Commit {
+            location: &location,
+            provider: "fixture",
+            scanned: &scanned,
+            target: Target::Append {
+                item: item.id,
+                version: version.id,
+            },
+            number: 1,
+            from: 5,
+            length: 10,
+            hash: Hash::of(b"first more"),
+        };
+        let failed = archive.store(vec![(append, writer.finish().unwrap())]);
+        fs::set_permissions(folder, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let (one, two) = (scanned("items/one"), scanned("items/two"));
-        let first_sync = archive.begin_sync(&first_location).unwrap();
-        let second_sync = archive.begin_sync(&second_location).unwrap();
-        archive
-            .store(vec![first(&archive, &first_location, &one, b"first")])
-            .unwrap();
-        assert!(state(&archive).syncing);
-        drop(first_sync);
-        assert!(state(&archive).syncing);
-        archive
-            .store(vec![first(&archive, &second_location, &two, b"second")])
-            .unwrap();
-        drop(second_sync);
-        let ended = state(&archive);
-        assert_eq!((ended.syncing, ended.segments), (false, 2));
+        assert!(
+            matches!(
+                failed,
+                Err(ArchiveError::Io {
+                    action: "flush",
+                    ..
+                })
+            ),
+            "{failed:?}"
+        );
+        assert!(folder.join("0000000000000005.zst").exists());
+        /* The catalogue records nothing of what could not be made durable. */
+        let version = archive.catalogue().versions(item.id).unwrap().remove(0);
+        assert_eq!(version.length, 5);
+        assert_eq!(archive.catalogue().segments(version.id).unwrap().len(), 1);
     }
 }

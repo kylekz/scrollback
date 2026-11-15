@@ -1,10 +1,12 @@
 //! A temporary command-line trigger for the sync engine (PLAN §13), for use until the app has
 //! locations in its UI. It syncs this machine's agents into the archive in a folder, creating
-//! the archive if the folder has none, or verifies that archive. It prints totals only.
+//! the archive if the folder has none, or verifies that archive, or sets aside what verify
+//! found under its `files/` that the catalogue doesn't record. It prints totals only.
 //!
 //! ```text
 //! cargo run --release -p sb_core --example sync -- <archive folder>
 //! cargo run --release -p sb_core --example sync -- <archive folder> verify
+//! cargo run --release -p sb_core --example sync -- <archive folder> set-aside
 //! ```
 
 use std::error::Error;
@@ -20,17 +22,24 @@ use sb_core::transport::LocalTransport;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (dir, verify) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        [dir] => (dir, false),
-        [dir, "verify"] => (dir, true),
-        _ => return Err("usage: sync <archive folder> [verify]".into()),
+    let (dir, action) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [dir] => (dir, "sync"),
+        [dir, action @ ("verify" | "set-aside")] => (dir, action),
+        _ => return Err("usage: sync <archive folder> [verify | set-aside]".into()),
     };
     let archive = match Archive::open(Path::new(dir)) {
         Err(ArchiveError::NotAnArchive(_)) => Archive::create(Path::new(dir))?,
         opened => opened?,
     };
     let started = Instant::now();
-    if verify {
+    if action == "set-aside" {
+        println!(
+            "set aside {} files or folders the catalogue doesn't record, in orphans/",
+            archive.set_aside_uncatalogued()?.len()
+        );
+        return Ok(());
+    }
+    if action == "verify" {
         let report = archive.verify(&CancelToken::new())?;
         println!(
             "verified {} versions in {} segments: {} bytes, stored in {} ({:.1}x), in {:.1?}",

@@ -5,11 +5,12 @@
 //! catalogue records it (PLAN §2.3, invariant 2).
 //!
 //! Reading goes through [`VersionReader`], the one place stored bytes are decompressed. It
-//! checks each segment, and the version as a whole, against what the catalogue recorded, so no
-//! reader is handed bytes other than the ones that were archived.
+//! checks each segment against what the catalogue recorded before handing out any of it, and
+//! the version as a whole at its end, so no reader is handed bytes other than the ones that
+//! were archived.
 
 use std::fs::File;
-use std::io::{self, BufReader, Read, Write as _};
+use std::io::{self, Read, Write as _};
 use std::path::PathBuf;
 
 use tempfile::{NamedTempFile, TempPath};
@@ -27,8 +28,8 @@ const LEVEL: i32 = 3;
 /**
  * The most a segment holds, uncompressed. A longer range is stored as several segments.
  *
- * Reading from an offset starts at the head of the segment that holds it, so this bounds what
- * is decompressed to reach any byte: a few milliseconds' worth. It is four times the window
+ * A segment is read whole, so this bounds what is decompressed to reach any byte (a few
+ * milliseconds' worth) and what a reader holds in memory. It is four times the window
  * zstd compresses with at this level, so cutting a range here costs next to nothing in size,
  * and small enough that a transcript of a hundred megabytes is a dozen files, not hundreds.
  */
@@ -158,9 +159,10 @@ impl From<Problem> for io::Error {
 }
 
 /**
- * A version's content from some offset on: its segments decompressed one after another, each
- * checked against the length and hash the catalogue recorded for it, and, when read from the
- * start, all of them together against the version's.
+ * A version's content from some offset on. Each segment is decompressed whole and checked
+ * against the length and hash the catalogue recorded for it before any byte of it is handed
+ * out, so a reader that stops early has still only seen archived bytes. Read from the start to
+ * the end, the segments together are checked against the version's hash as well.
  *
  * A check that fails is a read error holding the [`Problem`] ([`Problem::of`]). After it the
  * reader stands at the next segment, so reading on finds every problem a version has; what was
@@ -171,24 +173,18 @@ pub struct VersionReader {
     segments: std::vec::IntoIter<Segment>,
     /// Problems known before anything is read.
     gaps: std::vec::IntoIter<Problem>,
-    open: Option<Reading>,
-    /// How many bytes of the segment opened next come before the offset reading starts at.
+    /// The checked bytes of the segment being handed out, and how many of them have been.
+    segment: Vec<u8>,
+    served: usize,
+    /// How many bytes of the segment read next come before the offset reading starts at.
     skip: u64,
-    /// The hash of everything read.
+    /// The hash of everything handed out.
     content: Hasher,
     /// The version's recorded hash.
     recorded: Hash,
-    /// Whether every byte of the version so far was read and passed its checks.
-    whole: bool,
+    /// Whether every byte of the version so far was handed out and passed its checks.
+    intact: bool,
     ended: bool,
-}
-
-/// The segment being read.
-struct Reading {
-    decoder: Decoder<'static, BufReader<File>>,
-    recorded: Segment,
-    hasher: Hasher,
-    length: u64,
 }
 
 impl VersionReader {
@@ -227,9 +223,10 @@ impl VersionReader {
         Self {
             dir,
             segments,
-            whole: gaps.is_empty() && start == 0,
+            intact: gaps.is_empty() && start == 0,
             gaps: gaps.into_iter(),
-            open: None,
+            segment: Vec::new(),
+            served: 0,
             skip,
             content: Hasher::new(),
             recorded: hash,
@@ -244,28 +241,36 @@ impl VersionReader {
         self.content
     }
 
-    /// Opens the next segment; `None` when there is none.
-    fn open_next(&mut self) -> io::Result<Option<Reading>> {
-        let Some(recorded) = self.segments.next() else {
-            return Ok(None);
-        };
-        let file = self.dir.join(super::layout::segment_file(recorded.offset));
+    /// The bytes of the segment recorded as `recorded`, if its file holds exactly them.
+    fn checked(&self, recorded: &Segment) -> io::Result<Vec<u8>> {
+        let offset = recorded.offset;
+        let file = self.dir.join(super::layout::segment_file(offset));
         let file = File::open(file).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
-                Problem::SegmentMissing {
-                    offset: recorded.offset,
-                }
-                .into()
+                Problem::SegmentMissing { offset }.into()
             } else {
                 error
             }
         })?;
-        Ok(Some(Reading {
-            decoder: Decoder::new(file)?,
-            recorded,
-            hasher: Hasher::new(),
-            length: 0,
-        }))
+        /* No more is decompressed than the segment may hold, whatever the file claims. */
+        let mut bytes = Vec::new();
+        Decoder::new(file)?
+            .take(recorded.length + 1)
+            .read_to_end(&mut bytes)
+            /* An error with no code from the operating system is the decoder's: the file is
+            not the frame that was written. */
+            .map_err(|error| match error.raw_os_error() {
+                Some(_) => error,
+                None => Problem::SegmentUnreadable {
+                    offset,
+                    detail: error.to_string(),
+                }
+                .into(),
+            })?;
+        if Hash::of(&bytes) != recorded.hash {
+            return Err(Problem::SegmentChanged { offset }.into());
+        }
+        Ok(bytes)
     }
 }
 
@@ -278,66 +283,36 @@ impl Read for VersionReader {
             return Ok(0);
         }
         loop {
-            let open = match &mut self.open {
-                Some(open) => open,
-                None => match self.open_next() {
-                    Ok(Some(open)) => self.open.insert(open),
-                    /* The end: each segment was what was recorded; are they the version? */
-                    Ok(None) => {
-                        let ended = std::mem::replace(&mut self.ended, true);
-                        if !ended && self.whole && self.content.clone().finish() != self.recorded {
-                            return Err(Problem::VersionChanged.into());
-                        }
-                        return Ok(0);
-                    }
-                    Err(error) => {
-                        self.whole = false;
-                        self.skip = 0;
-                        return Err(error);
-                    }
-                },
+            let left = &self.segment[self.served..];
+            if !left.is_empty() {
+                let read = left.len().min(buffer.len());
+                buffer[..read].copy_from_slice(&left[..read]);
+                self.content.update(&left[..read]);
+                self.served += read;
+                return Ok(read);
+            }
+            let Some(recorded) = self.segments.next() else {
+                /* The end: each segment was what was recorded; are they the version? */
+                let ended = std::mem::replace(&mut self.ended, true);
+                if !ended && self.intact && self.content.clone().finish() != self.recorded {
+                    return Err(Problem::VersionChanged.into());
+                }
+                return Ok(0);
             };
-            let offset = open.recorded.offset;
-            match open.decoder.read(buffer) {
-                Ok(0) => {
-                    let matches = open.length == open.recorded.length
-                        && open.hasher.clone().finish() == open.recorded.hash;
-                    self.open = None;
-                    self.skip = 0;
-                    if !matches {
-                        self.whole = false;
-                        return Err(Problem::SegmentChanged { offset }.into());
-                    }
+            /* What comes before the offset reading starts at is checked like the rest and not
+            handed out. */
+            let skip = std::mem::take(&mut self.skip);
+            self.segment.clear();
+            self.served = 0;
+            match self.checked(&recorded) {
+                Ok(bytes) => {
+                    self.served =
+                        usize::try_from(skip).map_or(bytes.len(), |skip| skip.min(bytes.len()));
+                    self.segment = bytes;
                 }
-                Ok(read) => {
-                    open.hasher.update(&buffer[..read]);
-                    open.length += read as u64;
-                    /* What comes before the offset reading starts at is checked like the rest
-                    and not handed out. */
-                    let skipped = usize::try_from(self.skip).map_or(read, |skip| skip.min(read));
-                    self.skip -= skipped as u64;
-                    if skipped < read {
-                        buffer.copy_within(skipped..read, 0);
-                        self.content.update(&buffer[..read - skipped]);
-                        return Ok(read - skipped);
-                    }
-                }
-                /* The caller reads again. */
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
                 Err(error) => {
-                    self.open = None;
-                    self.whole = false;
-                    self.skip = 0;
-                    /* An error with no code from the operating system is the decoder's: the
-                    file is not the frame that was written. */
-                    return Err(match error.raw_os_error() {
-                        Some(_) => error,
-                        None => Problem::SegmentUnreadable {
-                            offset,
-                            detail: error.to_string(),
-                        }
-                        .into(),
-                    });
+                    self.intact = false;
+                    return Err(error);
                 }
             }
         }

@@ -38,11 +38,10 @@ pub(super) struct Planned<'a> {
     /// How many bytes to fetch: the rest of the source. 0 when there is nothing to fetch and
     /// only the source's start to compare with what is archived.
     pub length: u64,
-    /// Whether to store only up to the last newline of the range.
+    /// Whether to store only up to the last newline of the range: so for lines that may still
+    /// be being written. A range that is not cut is kept only if the source ends where it
+    /// does, since the version is then meant to be all of the source.
     pub cut: bool,
-    /// Whether the source must end where the stored bytes do for them to be kept: so for an
-    /// item that is not lines, and for lines taken with their unfinished end.
-    pub whole: bool,
     /// What to fetch the source whole as, when its start turns out not to be what is archived.
     pub otherwise: Option<Target>,
 }
@@ -58,7 +57,6 @@ impl<'a> Planned<'a> {
             base: Hash::of(b""),
             length: scanned.length,
             cut: scanned.lines,
-            whole: !scanned.lines,
             otherwise: None,
         }
     }
@@ -76,11 +74,11 @@ pub(super) struct Plan<'a> {
     pub unchanged: usize,
 }
 
-/// Decides about each of `scanned`. `whole` says the scan saw everything the agent has: only
-/// then is an archived item that is not in it missing at the source.
+/// Decides about each of `scanned`. `complete` says the scan saw everything the agent has:
+/// only then is an archived item that is not in it missing at the source.
 pub(super) fn plan<'a>(
     scanned: &'a [ScannedItem],
-    whole: bool,
+    complete: bool,
     archived: Vec<Archived>,
 ) -> Plan<'a> {
     let mut archived: HashMap<String, Archived> = archived
@@ -143,12 +141,11 @@ pub(super) fn plan<'a>(
                 length: scanned.length - current.length,
                 /* As last seen: nothing is writing it, so its unfinished last line is taken. */
                 cut: scanned.lines && !as_seen,
-                whole: !scanned.lines || as_seen,
                 otherwise: Some(next(changed).target),
             });
         }
     }
-    if whole {
+    if complete {
         plan.gone = archived
             .into_values()
             .filter(|archived| archived.item.gone_since.is_none())

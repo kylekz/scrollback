@@ -12,8 +12,8 @@ use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::catalogue::Reason;
 use sb_core::provider::ProviderError;
-use sb_core::sync::SyncError;
-use sb_test_support::{Agent, FileAgent};
+use sb_core::sync::{SyncError, WAITING_HOURS};
+use sb_test_support::{Agent, FileAgent, edit_catalogue};
 
 use common::{Bench, Meddle, When, files_under};
 
@@ -78,6 +78,37 @@ fn a_file_rewritten_before_its_new_bytes_are_fetched_is_not_extended() {
         assert!(files_under(&bench.dir().join("tmp")).is_empty());
         bench.assert_verifies();
     }
+}
+
+#[test]
+fn new_bytes_that_changed_under_the_pass_are_not_taken_for_a_rewrite() {
+    let (mut bench, key) = synced();
+    let archived = bench.agent.content(&key);
+    bench.agent.append(&key, 5);
+    /* Between the fetch and the proof one of the new bytes changes. What is archived is still
+    how the source starts. */
+    let mut later = bench.agent.content(&key);
+    let changed = later.len() - 10;
+    later[changed] ^= 1;
+
+    let report = bench
+        .pass_with(bench.meddling(Meddle::at(When::BeforeProof, || {
+            bench.agent.overwrite(&key, &later);
+        })))
+        .unwrap();
+    assert_eq!(
+        (report.appended, report.new_versions, report.deferred.len()),
+        (0, 0, 1)
+    );
+    assert!(report.failed.is_empty());
+    let versions = bench.versions(&key);
+    assert_eq!(versions.len(), 1);
+    assert!(bench.read(&versions[0]) == archived);
+    assert!(files_under(&bench.dir().join("tmp")).is_empty());
+
+    assert_eq!(bench.sync().appended, 1);
+    assert_eq!(bench.versions(&key).len(), 1);
+    bench.assert_mirrors(&[key]);
 }
 
 #[test]
@@ -170,6 +201,53 @@ fn an_item_that_keeps_changing_has_been_waiting_since_the_first_pass_that_missed
         assert_eq!(report.deferred.len(), 1);
         assert_eq!(*first.get_or_insert(since(&bench)), since(&bench));
     }
+}
+
+#[test]
+fn an_item_that_has_waited_too_long_counts_against_the_sync() {
+    let mut agent = FileAgent::new();
+    let session = agent.add_session(2);
+    let mut bench = Bench::new(agent);
+    bench.sync();
+    let key = bench.agent.session(&session).tool_result(700_000);
+    /* A pass that the file changes under, and the same pass that many hours later. */
+    let missed = |round: u8| {
+        bench
+            .pass_with(bench.meddling(Meddle::at(When::InsideARange, || {
+                bench.agent.overwrite(&key, &vec![b'a' + round; 700_000]);
+            })))
+            .unwrap()
+    };
+    let hours_pass = |hours: i64| {
+        edit_catalogue(
+            bench.dir(),
+            &format!(
+                "UPDATE waiting SET since = since - {}",
+                hours * 60 * 60 * 1000
+            ),
+        );
+    };
+    let report = missed(0);
+    assert_eq!((report.deferred.len(), report.failed.len()), (1, 0));
+    assert_eq!(bench.location().last_error, None);
+
+    /* Short of the bound it is still only left for the next pass. */
+    hours_pass(WAITING_HOURS - 1);
+    let report = missed(1);
+    assert_eq!((report.deferred.len(), report.failed.len()), (1, 0));
+    assert_eq!(bench.location().last_error, None);
+
+    /* Past it, the sync has not archived everything. */
+    hours_pass(2);
+    let report = missed(2);
+    assert_eq!((report.deferred.len(), report.failed.len()), (0, 1));
+    assert_eq!(report.failed[0].key, key);
+    assert!(bench.location().last_error.is_some());
+
+    /* Until it does. */
+    assert_eq!(bench.sync().new_items, 1);
+    assert_eq!(bench.location().last_error, None);
+    assert!(waiting(&bench).is_empty());
 }
 
 #[test]

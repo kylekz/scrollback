@@ -148,8 +148,8 @@ pub trait Transport: Send + Sync {
     /// are reported in the listing and do not fail it.
     fn list(&self, root: &str) -> Result<Listing, TransportError>;
 
-    /// The SHA-256 of each requested prefix. A file that is missing, unreadable or shorter than
-    /// its prefix fails that request only.
+    /// The SHA-256 of each requested prefix, hashed one after another in the order asked. A
+    /// file that is missing, unreadable or shorter than its prefix fails that request only.
     fn hash_prefixes(
         &self,
         requests: &[PrefixRequest],

@@ -13,8 +13,9 @@
 //!    committed to the catalogue in one transaction (PLAN §4.1).
 //!
 //! A range that fails its proof where the plan took the source for a continuation of the
-//! archived version is fetched again whole, as the next version, in a later batch. Any other
-//! is left for the next pass. A pass that stops loses the batch it was in, and nothing else.
+//! archived version is fetched again whole, as the next version, in a later batch, if the
+//! source no longer starts with what is archived. Any other is left for the next pass. A pass
+//! that stops loses the batch it was in, and nothing else.
 
 use std::collections::VecDeque;
 use std::io::{self, Read as _};
@@ -27,12 +28,13 @@ use crate::archive::{Archive, ArchiveError, Problem, RangeWriter, Sealed};
 use crate::catalogue::{Commit, Target};
 use crate::hash::{Hash, Hasher};
 use crate::location::LocationId;
-use crate::provider::{ItemPrefix, ItemRange, ProviderError, Source};
+use crate::provider::{Hashed, ItemPrefix, ItemRange, ProviderError, Source};
 use crate::transport::{Halt, RangeFailure, RangeSink};
 
-/// The most ranges fetched, proven and committed together, and the most bytes they ask for
-/// (one range may ask for more on its own). A batch is what a stopped pass loses, what waits
-/// in `tmp/`, and what is made durable with one flush.
+/// The most ranges fetched, proven and committed together, and the most bytes their proofs
+/// have the source hash: each range's version from its start to the range's end (one range may
+/// need more on its own). A batch is what a stopped pass loses, what waits in `tmp/`, and what
+/// is made durable with one flush.
 const BATCH_ITEMS: usize = 256;
 const BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -48,18 +50,40 @@ pub(super) struct Storing<'a> {
     pub done: usize,
 }
 
-/// What became of one range of a batch once it was fetched.
-enum Arrived {
-    /// It arrived whole and is in `tmp/` as these segments, which hold `stored` bytes; with
-    /// them the version hashes to `content`.
-    Whole {
+/// What a batch does with one of its ranges.
+enum Outcome {
+    /// It is in `tmp/` as these segments, which hold `stored` bytes; with them the version
+    /// hashes to `content`. It is stored once it is proven.
+    Fetched {
         segments: Vec<Sealed>,
         stored: u64,
         content: Hash,
     },
-    /// The source no longer had it. The next pass sees what it has then.
-    Deferred(String),
-    Failed(String),
+    /// The source's start with the range is not the version with it. Whether the start alone
+    /// is still what is archived decides what that means.
+    Doubted(Target),
+    /// The source's start is not what is archived: it is fetched whole, as this.
+    Rewritten(Target),
+    /// Nothing of it is stored. It could not be read (`failed`), or it changed under the pass
+    /// and the next pass sees what it is then.
+    Left { failed: bool, reason: String },
+}
+
+impl Outcome {
+    /// What an item is left as when the source could not give a range of it, or its proof.
+    fn unread(failure: &RangeFailure) -> Self {
+        Self::Left {
+            failed: matches!(failure, RangeFailure::Unreadable(_)),
+            reason: failure.to_string(),
+        }
+    }
+
+    fn changed(when: &str) -> Self {
+        Self::Left {
+            failed: false,
+            reason: format!("it changed {when} it was read"),
+        }
+    }
 }
 
 impl Storing<'_> {
@@ -75,9 +99,9 @@ impl Storing<'_> {
             let mut bytes = 0;
             while let Some(next) = queue.front()
                 && batch.len() < BATCH_ITEMS
-                && (batch.is_empty() || bytes + next.length <= BATCH_BYTES)
+                && (batch.is_empty() || bytes + next.offset + next.length <= BATCH_BYTES)
             {
-                bytes += next.length;
+                bytes += next.offset + next.length;
                 batch.extend(queue.pop_front());
             }
             self.batch(&batch, source, &mut queue)?;
@@ -91,6 +115,22 @@ impl Storing<'_> {
         } else {
             Ok(())
         }
+    }
+
+    /// The source's hash of each of `prefixes`, in order. It is asked for them only when there
+    /// are any, and when the pass has not been cancelled.
+    fn hashes(
+        &self,
+        source: &mut dyn Source,
+        prefixes: &[ItemPrefix],
+    ) -> Result<std::vec::IntoIter<Result<Hashed, RangeFailure>>, SyncError> {
+        Ok(if prefixes.is_empty() {
+            Vec::new()
+        } else {
+            self.stop_if_cancelled()?;
+            source.hash_prefixes(prefixes)?
+        }
+        .into_iter())
     }
 
     /// One batch (the module docs). Ranges to fetch again whole are added to `queue`.
@@ -125,90 +165,94 @@ impl Storing<'_> {
             fetched = sink.finish(ended)?;
         }
         let mut fetched = fetched.into_iter();
-        let arrived: Vec<Arrived> = batch
+        let mut outcomes: Vec<Outcome> = batch
             .iter()
             .map(|planned| {
                 if planned.length == 0 {
-                    Arrived::Whole {
+                    Outcome::Fetched {
                         segments: Vec::new(),
                         stored: 0,
                         content: planned.base,
                     }
                 } else {
-                    fetched
-                        .next()
-                        .unwrap_or_else(|| Arrived::Failed("the provider did not send it".into()))
+                    fetched.next().unwrap_or_else(|| Outcome::Left {
+                        failed: true,
+                        reason: "the provider did not send it".to_string(),
+                    })
                 }
             })
             .collect();
 
-        /* Prove. */
-        self.stop_if_cancelled()?;
+        /* Prove: the source's start, as far as each version would reach with its range. */
+        let prefix = |planned: &Planned<'_>, length| ItemPrefix {
+            key: planned.scanned.key.clone(),
+            length,
+        };
         let proofs: Vec<_> = batch
             .iter()
-            .zip(&arrived)
-            .filter_map(|(planned, arrived)| match arrived {
-                Arrived::Whole { stored, .. } => Some(ItemPrefix {
-                    key: planned.scanned.key.clone(),
-                    length: planned.offset + stored,
-                }),
+            .zip(&outcomes)
+            .filter_map(|(planned, outcome)| match outcome {
+                Outcome::Fetched { stored, .. } => Some(prefix(planned, planned.offset + stored)),
                 _ => None,
             })
             .collect();
-        let mut hashes = if proofs.is_empty() {
-            Vec::new()
-        } else {
-            source.hash_prefixes(&proofs)?
+        /* A provider that answers fewer proofs than it was asked has not proven the rest. */
+        let mut proven = self.hashes(source, &proofs)?;
+        for (planned, outcome) in batch.iter().zip(&mut outcomes) {
+            let Outcome::Fetched {
+                stored, content, ..
+            } = outcome
+            else {
+                continue;
+            };
+            let end = planned.offset + *stored;
+            match proven.next().unwrap_or(Err(RangeFailure::Missing)) {
+                Ok(hashed) if hashed.hash != *content => {
+                    *outcome = match planned.otherwise {
+                        Some(target) if *stored > 0 => Outcome::Doubted(target),
+                        Some(target) => Outcome::Rewritten(target),
+                        None => Outcome::changed("while"),
+                    }
+                }
+                /* A version that must be all of its source: the source must end there. */
+                Ok(hashed) if !planned.cut && hashed.size != end => {
+                    *outcome = Outcome::changed("after");
+                }
+                Ok(_) => {}
+                Err(failure) => *outcome = Outcome::unread(&failure),
+            }
         }
-        .into_iter();
+        /* An append that failed its proof: when the source still starts with what is archived,
+        it was the new bytes that changed under the pass, and the item is left for the next
+        one. Only a source whose start changed was rewritten. */
+        let doubts: Vec<_> = batch
+            .iter()
+            .zip(&outcomes)
+            .filter(|(_, outcome)| matches!(outcome, Outcome::Doubted(_)))
+            .map(|(planned, _)| prefix(planned, planned.offset))
+            .collect();
+        let mut starts = self.hashes(source, &doubts)?;
+        for (planned, outcome) in batch.iter().zip(&mut outcomes) {
+            if let Outcome::Doubted(target) = *outcome {
+                *outcome = match starts.next().unwrap_or(Err(RangeFailure::Missing)) {
+                    Ok(hashed) if hashed.hash == planned.base => Outcome::changed("while"),
+                    Ok(_) => Outcome::Rewritten(target),
+                    Err(failure) => Outcome::unread(&failure),
+                };
+            }
+        }
 
         /* Store what was proven. */
         let mut commits = Vec::new();
         let mut counts = Vec::new();
         let mut again = 0;
-        for (planned, arrived) in batch.iter().zip(arrived) {
-            let key = &planned.scanned.key;
-            let left = |reason: String| Failure {
-                key: key.clone(),
-                reason,
-            };
-            let (segments, stored, content) = match arrived {
-                Arrived::Whole {
+        for (planned, outcome) in batch.iter().zip(outcomes) {
+            match outcome {
+                Outcome::Fetched {
                     segments,
                     stored,
                     content,
-                } => (segments, stored, content),
-                Arrived::Deferred(reason) => {
-                    self.report.deferred.push(left(reason));
-                    continue;
-                }
-                Arrived::Failed(reason) => {
-                    self.report.failed.push(left(reason));
-                    continue;
-                }
-            };
-            let end = planned.offset + stored;
-            /* A provider that answers fewer proofs than it was asked has not proven this. */
-            match hashes.next().unwrap_or(Err(RangeFailure::Missing)) {
-                Ok(hashed) if hashed.hash != content => match planned.otherwise {
-                    Some(target) => {
-                        queue.push_back(Planned::whole(
-                            planned.scanned,
-                            target,
-                            planned.number + 1,
-                        ));
-                        again += 1;
-                    }
-                    None => self
-                        .report
-                        .deferred
-                        .push(left("it changed while it was read".to_string())),
-                },
-                Ok(hashed) if planned.whole && hashed.size != end => self
-                    .report
-                    .deferred
-                    .push(left("it changed after it was read".to_string())),
-                Ok(_) => {
+                } => {
                     counts.push((planned.target, stored));
                     commits.push((
                         Commit {
@@ -217,17 +261,27 @@ impl Storing<'_> {
                             scanned: planned.scanned,
                             target: planned.target,
                             number: planned.number,
-                            length: end,
+                            from: planned.offset,
+                            length: planned.offset + stored,
                             hash: content,
                         },
                         segments,
                     ));
                 }
-                Err(failure @ (RangeFailure::Missing | RangeFailure::Short { .. })) => {
-                    self.report.deferred.push(left(failure.to_string()));
+                Outcome::Rewritten(target) | Outcome::Doubted(target) => {
+                    queue.push_back(Planned::whole(planned.scanned, target, planned.number + 1));
+                    again += 1;
                 }
-                Err(failure @ RangeFailure::Unreadable(_)) => {
-                    self.report.failed.push(left(failure.to_string()));
+                Outcome::Left { failed, reason } => {
+                    let left = Failure {
+                        key: planned.scanned.key.clone(),
+                        reason,
+                    };
+                    if failed {
+                        self.report.failed.push(left);
+                    } else {
+                        self.report.deferred.push(left);
+                    }
                 }
             }
         }
@@ -259,7 +313,7 @@ struct Sink<'a, 'b, 'p> {
     open: Option<Open>,
     /// What became of the ranges that have ended. They end in request order, so the next one's
     /// index is how many there are.
-    arrived: Vec<Arrived>,
+    arrived: Vec<Outcome>,
     /// Why the sink stopped the stream, once it has.
     stopped: Option<SyncError>,
 }
@@ -309,7 +363,7 @@ impl Open {
 impl Sink<'_, '_, '_> {
     /// After the provider's fetch returned with `ended`: what became of each range, or why the
     /// pass stops.
-    fn finish(mut self, ended: Result<(), ProviderError>) -> Result<Vec<Arrived>, SyncError> {
+    fn finish(mut self, ended: Result<(), ProviderError>) -> Result<Vec<Outcome>, SyncError> {
         if let Some(stopped) = self.stopped.take() {
             return Err(stopped);
         }
@@ -412,19 +466,20 @@ impl RangeSink for Sink<'_, '_, '_> {
         let length = self.current(request)?.length;
         let open = self.open.take();
         self.storing.report.bytes_fetched += open.as_ref().map_or(0, |open| open.received);
+        let failed = |reason| Outcome::Left {
+            failed: true,
+            reason,
+        };
         let arrived = match (result, open) {
-            (Err(failure @ (RangeFailure::Missing | RangeFailure::Short { .. })), _) => {
-                Arrived::Deferred(failure.to_string())
-            }
-            (Err(failure @ RangeFailure::Unreadable(_)), _) => Arrived::Failed(failure.to_string()),
+            (Err(failure), _) => Outcome::unread(&failure),
             (
                 Ok(()),
                 Some(Open {
                     refused: Some(reason),
                     ..
                 }),
-            ) => Arrived::Failed(reason),
-            (Ok(()), Some(open)) if open.received == length => Arrived::Whole {
+            ) => failed(reason),
+            (Ok(()), Some(open)) if open.received == length => Outcome::Fetched {
                 segments: open.writer.finish().map_err(|source| {
                     let error = self.tmp_error(source);
                     self.stop(error)
@@ -432,7 +487,7 @@ impl RangeSink for Sink<'_, '_, '_> {
                 stored: open.stored,
                 content: open.content.finish(),
             },
-            (Ok(()), open) => Arrived::Failed(format!(
+            (Ok(()), open) => failed(format!(
                 "the provider sent {} of {length} bytes",
                 open.map_or(0, |open| open.received)
             )),
