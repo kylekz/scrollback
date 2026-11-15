@@ -492,3 +492,10 @@ fn a_sync_leaves_the_source_as_it_was() {
     assert!(source(&bench) == before);
     assert_eq!(before.len(), 4);
 }
+
+/// Every test here once more, over the shell transport.
+#[cfg(unix)]
+#[test]
+fn the_same_with_the_locations_read_through_a_shell() {
+    common::again_through_a_shell();
+}

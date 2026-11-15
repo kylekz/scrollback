@@ -7,6 +7,8 @@
 //!   database, with the test-only provider for it. It exists so the provider seam is tested
 //!   with a second shape of source before a second real agent arrives (PLAN D8, §12).
 //! - [`Agent`]: what the sync tests do to a source, so each test runs against both.
+//! - [`HomeTransport`]: a fixture as a location, read with `std::fs` or through the shell
+//!   transport by a local shell ([`loopback`]), so each test runs over both too.
 //!
 //! gpui: **never** (`script/check` step 3).
 
@@ -17,13 +19,58 @@ use std::path::Path;
 
 use sb_core::provider::{Hashed, Provider, RangeFailure};
 use sb_core::transport::{
-    Env, FileStat, Listing, LocalTransport, PrefixRequest, RangeRequest, RangeSink, Transport,
-    TransportError,
+    Env, FileStat, Launcher, Listing, LocalTransport, PrefixRequest, RangeRequest, RangeSink,
+    ShellTransport, Transport, TransportError,
 };
 use toolbox_store::rusqlite::Connection;
 
 pub use claude_code::{FileAgent, ProjectsTree, Session};
 pub use db_agent::{DbAgent, DbProvider};
+
+/// The environment variable that names a shell (`sh`, `dash`) to read every fixture location
+/// through, with the shell transport, instead of with `std::fs`. The sync tests run again
+/// with it set to `sh` (PLAN §12).
+pub const SHELL: &str = "SB_TEST_SHELL";
+
+/// The environment variable that holds a command, as words, to run [`SHELL`]'s shell through:
+/// one that starts a container whose userland the scripts are to be tried in, with the temp
+/// dir mounted where it is on this machine.
+pub const SHELL_VIA: &str = "SB_TEST_SHELL_VIA";
+
+/// The shells to run the shell transport's scripts in: the one [`SHELL`] names, or else those
+/// of `sh`, `bash`, `dash`, `zsh` and `ksh` that this machine has.
+pub fn shells() -> Vec<String> {
+    if let Ok(shell) = std::env::var(SHELL) {
+        return vec![shell];
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    ["sh", "bash", "dash", "zsh", "ksh"]
+        .into_iter()
+        .filter(|shell| std::env::split_paths(&path).any(|dir| dir.join(shell).is_file()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A launcher that runs `shell` on this machine with `home` as its home folder and `vars`,
+/// and nothing else of this process's environment but its `PATH`.
+pub fn loopback(shell: &str, home: &Path, vars: &[(String, String)]) -> Launcher {
+    let via = std::env::var(SHELL_VIA).unwrap_or_default();
+    let mut words = via
+        .split_whitespace()
+        .map(str::to_string)
+        .chain([
+            "env".to_string(),
+            "-i".to_string(),
+            format!("PATH={}", std::env::var("PATH").unwrap()),
+            format!("HOME={}", home.to_str().unwrap()),
+        ])
+        .chain(vars.iter().map(|(name, value)| format!("{name}={value}")))
+        .chain([shell.to_string(), "-s".to_string()]);
+    Launcher::Command {
+        program: words.next().unwrap().into(),
+        args: words.collect(),
+    }
+}
 
 /// A location in a temp dir: this machine's files, with a home folder and an environment of
 /// the test's choosing in place of the real ones.
@@ -31,19 +78,46 @@ pub use db_agent::{DbAgent, DbProvider};
 pub struct HomeTransport {
     home: String,
     vars: Vec<(String, String)>,
+    /// The same location through a shell, when it is read that way.
+    shell: Option<ShellTransport>,
 }
 
 impl HomeTransport {
+    /// The location, read with `std::fs`, or through the shell [`SHELL`] names.
     pub fn new(home: &Path, vars: Vec<(String, String)>) -> Self {
+        match std::env::var(SHELL) {
+            Ok(shell) => Self::through(&shell, home, vars),
+            Err(_) => Self {
+                home: home.to_str().unwrap().to_string(),
+                vars,
+                shell: None,
+            },
+        }
+    }
+
+    /// The location, read through the shell transport by `shell`.
+    pub fn through(shell: &str, home: &Path, vars: Vec<(String, String)>) -> Self {
         Self {
             home: home.to_str().unwrap().to_string(),
+            shell: Some(ShellTransport::new(loopback(shell, home, &vars))),
             vars,
+        }
+    }
+
+    /// The transport every operation but `env` goes to.
+    fn inner(&self) -> &dyn Transport {
+        match &self.shell {
+            Some(shell) => shell,
+            None => &LocalTransport,
         }
     }
 }
 
 impl Transport for HomeTransport {
     fn env(&self, names: &[&str]) -> Result<Env, TransportError> {
+        if let Some(shell) = &self.shell {
+            return shell.env(names);
+        }
         Ok(Env {
             home: self.home.clone(),
             vars: self
@@ -56,18 +130,18 @@ impl Transport for HomeTransport {
     }
 
     fn stat(&self, paths: &[&str]) -> Result<Vec<Option<FileStat>>, TransportError> {
-        LocalTransport.stat(paths)
+        self.inner().stat(paths)
     }
 
     fn list(&self, root: &str) -> Result<Listing, TransportError> {
-        LocalTransport.list(root)
+        self.inner().list(root)
     }
 
     fn hash_prefixes(
         &self,
         requests: &[PrefixRequest],
     ) -> Result<Vec<Result<Hashed, RangeFailure>>, TransportError> {
-        LocalTransport.hash_prefixes(requests)
+        self.inner().hash_prefixes(requests)
     }
 
     fn read_ranges(
@@ -75,11 +149,11 @@ impl Transport for HomeTransport {
         requests: &[RangeRequest],
         sink: &mut dyn RangeSink,
     ) -> Result<(), TransportError> {
-        LocalTransport.read_ranges(requests, sink)
+        self.inner().read_ranges(requests, sink)
     }
 
     fn read_small(&self, path: &str) -> Result<Option<Vec<u8>>, TransportError> {
-        LocalTransport.read_small(path)
+        self.inner().read_small(path)
     }
 }
 

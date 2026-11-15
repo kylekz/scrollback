@@ -12,9 +12,10 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use sb_core::CancelToken;
-use sb_core::archive::Archive;
+use sb_core::archive::{Archive, ArchiveError};
 use sb_core::catalogue::{Item, Segment, Version};
 use sb_core::location::{Location, LocationId, LocationKind};
 use sb_core::provider::{
@@ -66,7 +67,19 @@ impl<A: Agent> Bench<A> {
     /// Closes the archive and opens it again, as a restart of the app does.
     pub fn reopen(&mut self) {
         self.close();
-        self.archive = Some(Archive::open(self.dir.path()).unwrap());
+        /* A process that another test is starting at this moment has this archive's lock
+        among its open files until its program runs, which is when the lock goes: only in a
+        test do an archive's closing and another's sync share a process. */
+        let mut tries = 0;
+        self.archive = Some(loop {
+            match Archive::open(self.dir.path()) {
+                Err(ArchiveError::Locked(_)) if tries < 1000 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                opened => break opened.unwrap(),
+            }
+        });
     }
 
     /// A sync of the fixture's location with the fixture's provider.
@@ -216,6 +229,25 @@ impl<A: Agent> Bench<A> {
             .map(|version| self.segments(&version).len())
             .sum()
     }
+}
+
+/// Runs this test binary's tests once more with every fixture location read through the
+/// shell transport, by this machine's `sh` (PLAN §12). The run it starts has the shell named
+/// in its environment and starts none itself; naming another there (`SB_TEST_SHELL=dash
+/// cargo test`) runs the tests through that one.
+pub fn again_through_a_shell() {
+    if std::env::var_os(sb_test_support::SHELL).is_some() {
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .env(sb_test_support::SHELL, "sh")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "with the locations read through sh:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 /// Every file under `dir`, however deep; none when `dir` is missing.

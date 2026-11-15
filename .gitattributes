@@ -6,3 +6,5 @@
 *.json text eol=lf
 # Shell scripts run under bash, which rejects CRLF line endings (core.autocrlf checkouts).
 script/* text eol=lf
+# The shell transport's script is sent as it is to a POSIX shell, which rejects them too.
+*.sh text eol=lf

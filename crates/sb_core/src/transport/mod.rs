@@ -10,10 +10,13 @@
 //! read: [`Transport::hash_prefixes`] has the location hash the file's own start, and gives
 //! the file's size with the hash ([`Hashed`]).
 //!
-//! [`LocalTransport`] reads this machine with `std::fs`. The shell transport for WSL and SSH
-//! comes with phase 5 (PLAN §13).
+//! [`LocalTransport`] reads this machine with `std::fs`. [`ShellTransport`] reads a WSL distro
+//! or a host over SSH by running POSIX `sh` scripts there (PLAN §6.2); [`wsl`] lists the
+//! distros there are.
 
 mod local;
+mod shell;
+pub mod wsl;
 
 use std::collections::HashMap;
 use std::io;
@@ -23,6 +26,13 @@ use thiserror::Error;
 use crate::hash::Hash;
 
 pub use local::LocalTransport;
+pub use shell::{Launcher, Probe, ShellTransport};
+
+/// Why a listing leaves something out on purpose ([`Listing::skipped`]), and why a name can't
+/// be listed: the same words from every transport.
+const SYMBOLIC_LINK: &str = "it is a symbolic link";
+const NOT_A_FILE: &str = "it is neither a file nor a folder";
+const NOT_UNICODE: &str = "its name is not Unicode";
 
 /// A location's home directory and the environment variables that were asked for and are set.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +143,38 @@ pub enum TransportError {
     /// A [`RangeSink`] stopped the stream. The sink knows why.
     #[error("the stream was stopped by its reader")]
     Halted,
+    /// The transport's cancel token was cancelled; what it was running is stopped.
+    #[error("the transport was cancelled")]
+    Cancelled,
+    /// The program that reaches the location (`wsl.exe`, `ssh`) could not be started. With a
+    /// source of kind `NotFound`, it is not installed on this machine.
+    #[error("could not start {program}: {source}")]
+    Launch {
+        program: String,
+        #[source]
+        source: io::Error,
+    },
+    /// The location could not be connected to: a machine that is asleep or off the network.
+    /// A normal state and not an error (PLAN §5). The launcher's own words.
+    #[error("it could not be reached: {0}")]
+    Unreachable(String),
+    /// The host turned the sign-in down: `ssh` had no key it accepts and may not ask for a
+    /// password. `ssh`'s own words.
+    #[error("the host refused the sign-in: {0}")]
+    Refused(String),
+    /// The host's key is not the one `ssh` has on record for it, or `ssh` has none. Nothing
+    /// here ever accepts a key in the owner's place. `ssh`'s own words.
+    #[error("the host's key was not accepted, and is never accepted on your behalf: {0}")]
+    HostKey(String),
+    /// The launcher or the shell at the location failed some other way, in its own words.
+    #[error("{0}")]
+    Failed(String),
+    /// The location lacks tools the shell transport needs (PLAN §6.2).
+    #[error("the location has no {}", .0.join(", no "))]
+    MissingTools(Vec<String>),
+    /// The shell at the location answered something the transport can't read.
+    #[error("the location's shell gave an answer that can't be read: {0}")]
+    Protocol(String),
 }
 
 /// A read-only view of a location's file system (the module docs).

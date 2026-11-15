@@ -618,8 +618,10 @@ mod unreadable {
 
             let report = bench.pass_with(bench.agent.provider()).unwrap();
             set_mode(folder, 0o755);
-            /* The folder as one, or its two files each. */
-            assert_eq!(report.unlisted.len(), if mode == 0o000 { 1 } else { 2 });
+            /* The folder as one; or, read with `std::fs`, which can still list the names
+            in a folder it may not search, its two files each. */
+            let as_one = mode == 0o000 || std::env::var_os(sb_test_support::SHELL).is_some();
+            assert_eq!(report.unlisted.len(), if as_one { 1 } else { 2 });
             assert_eq!((report.scanned, report.gone), (1, 0));
             assert_eq!(bench.item(&subagent).gone_since, None);
             let error = bench.location().last_error.unwrap();
@@ -705,4 +707,11 @@ fn a_batch_is_bounded_by_what_its_proofs_hash() {
         .unwrap();
     assert_eq!(stored, [2, 3]);
     bench.assert_mirrors(&keys);
+}
+
+/// Every test here once more, over the shell transport.
+#[cfg(unix)]
+#[test]
+fn the_same_with_the_locations_read_through_a_shell() {
+    common::again_through_a_shell();
 }
