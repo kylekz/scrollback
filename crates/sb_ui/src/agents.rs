@@ -52,6 +52,11 @@ pub fn model(id: &str, models: &[String], cx: &App) -> Option<String> {
     Some(provider(id, cx).map_or_else(|| model.clone(), |provider| provider.model_name(model)))
 }
 
+/// The model `model`, recorded by the agent of the provider `id`, as its provider writes it.
+pub fn model_name(id: &str, model: &str, cx: &App) -> String {
+    provider(id, cx).map_or_else(|| model.to_string(), |provider| provider.model_name(model))
+}
+
 /// The agent's mark at `size` in its own colour, or the generic `bot` glyph in `fg3` for an
 /// agent that brings none (DESIGN §1.5).
 pub fn mark(id: &str, size: Pixels, cx: &App) -> AnyElement {

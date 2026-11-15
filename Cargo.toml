@@ -14,7 +14,48 @@ publish = false
 # sibling apps. Pinned exactly; bump all of these together, starting in toolbox-rs.
 gpui = { package = "gpui-pre", version = "=0.3.11" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11" }
-gpui-component = "=0.9.0"
+# gpui-component's base: the rich text view (`TextView`, its style, range highlights and the
+# window-wide text selection) that `sb_ui::markdown` renders prompts and replies with (PLAN D11).
+gpui-base = "=0.9.0"
+# The tree-sitter grammars `sb_ui::syntax` highlights fenced code with (PLAN §9): every one of
+# gpui-component's `tree-sitter-languages`, as dv enables them.
+gpui-component = { version = "=0.9.0", features = [
+    "tree-sitter-astro",
+    "tree-sitter-bash",
+    "tree-sitter-c",
+    "tree-sitter-cmake",
+    "tree-sitter-cpp",
+    "tree-sitter-csharp",
+    "tree-sitter-css",
+    "tree-sitter-diff",
+    "tree-sitter-ejs",
+    "tree-sitter-elixir",
+    "tree-sitter-erb",
+    "tree-sitter-go",
+    "tree-sitter-graphql",
+    "tree-sitter-html",
+    "tree-sitter-java",
+    "tree-sitter-javascript",
+    "tree-sitter-jsdoc",
+    "tree-sitter-kotlin",
+    "tree-sitter-lua",
+    "tree-sitter-make",
+    "tree-sitter-markdown",
+    "tree-sitter-php",
+    "tree-sitter-proto",
+    "tree-sitter-python",
+    "tree-sitter-ruby",
+    "tree-sitter-rust",
+    "tree-sitter-scala",
+    "tree-sitter-sql",
+    "tree-sitter-svelte",
+    "tree-sitter-swift",
+    "tree-sitter-toml",
+    "tree-sitter-tsx",
+    "tree-sitter-typescript",
+    "tree-sitter-yaml",
+    "tree-sitter-zig",
+] }
 
 # ---- internal crates (docs/PLAN.md §3)
 sb_core = { path = "crates/sb_core" }
@@ -45,7 +86,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 clap = { version = "4.5", features = ["derive", "env"] }
 dirs = "6"
 env_logger = "0.11"
+# The size of an image in a transcript, read from its header before gpui decodes it
+# (`sb_ui::services::reader`); gpui's own pin, the formats a transcript holds.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 log = "0.4"
+# The Markdown parser gpui-base's `TextView` uses: `sb_ui::markdown` sanitises a body at the
+# spans it reports before `TextView` sees it. Already in the tree through gpui-base.
+markdown = "1.0.0"
 pretty_assertions = "1.4"
 # Apple systems only: `fsync` without the full flush std's `sync_all` does there
 # (`sb_core::archive`).

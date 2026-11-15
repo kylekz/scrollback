@@ -14,6 +14,7 @@
 pub mod first_run;
 mod first_sync;
 mod header;
+pub mod reader;
 pub mod sessions;
 mod states;
 #[cfg(test)]
@@ -37,6 +38,7 @@ use crate::keymap;
 use crate::services::{ActiveServices as _, ArchiveState, LibraryService, LocationStatus};
 use crate::theme::{ActiveTheme as _, SbTheme};
 use first_run::FirstRun;
+use reader::ReaderView;
 use sessions::SessionsView;
 use unsorted::UnsortedView;
 
@@ -98,7 +100,8 @@ impl Showing {
             Self::Sessions => keymap::SESSIONS,
             Self::Unsorted => keymap::UNSORTED,
             Self::FirstRun => keymap::FIRST_RUN,
-            Self::Starting | Self::ArchiveFailed | Self::LocationsFailed | Self::Session => "Main",
+            Self::Session => keymap::READER,
+            Self::Starting | Self::ArchiveFailed | Self::LocationsFailed => "Main",
         }
     }
 
@@ -123,6 +126,7 @@ pub struct MainArea {
     focus_handle: FocusHandle,
     sessions: Entity<SessionsView>,
     unsorted: Entity<UnsortedView>,
+    reader: Entity<ReaderView>,
     first_run: Entity<FirstRun>,
     _observers: [Subscription; 3],
 }
@@ -145,6 +149,7 @@ impl MainArea {
         Self {
             sessions: cx.new(|cx| SessionsView::new(focus_handle.clone(), cx)),
             unsorted: cx.new(|cx| UnsortedView::new(focus_handle.clone(), cx)),
+            reader: cx.new(|cx| ReaderView::new(focus_handle.clone(), cx)),
             focus_handle,
             first_run: cx.new(FirstRun::new),
             _observers: [
@@ -153,6 +158,11 @@ impl MainArea {
                 cx.observe(&library, |_, _, cx| cx.notify()),
             ],
         }
+    }
+
+    /// What the reader shows, for automation.
+    pub fn reader(&self, cx: &App) -> reader::ReaderSnapshot {
+        self.reader.read(cx).snapshot()
     }
 
     /// Moves a page's selection: `by` along the reading order, or `lines` up or down.
@@ -311,20 +321,7 @@ impl Render for MainArea {
                 .failure()
                 .map(|why| states::locations_failed(why, &theme, cx)),
             Showing::FirstRun => Some(self.first_run.clone().into_any_element()),
-            Showing::Session => {
-                let library = services.library.read(cx);
-                let from: SharedString = match library.shelf() {
-                    Shelf::All => "All sessions".into(),
-                    Shelf::Starred => "Starred".into(),
-                    Shelf::Unsorted => "Unsorted".into(),
-                    Shelf::Folder(folder) => library
-                        .folder(folder)
-                        .map_or_else(SharedString::default, |it| it.name.clone().into()),
-                };
-                library
-                    .open_session()
-                    .map(|session| states::session(session, from, &theme, cx))
-            }
+            Showing::Session => Some(self.reader.clone().into_any_element()),
             Showing::Unsorted => Some(self.unsorted.clone().into_any_element()),
             Showing::Sessions => Some(self.sessions.clone().into_any_element()),
         };
@@ -344,6 +341,9 @@ impl Render for MainArea {
                     .update(cx, |sessions, cx| sessions.star_selected(cx));
             }))
             .on_action(cx.listener(Self::add))
+            .when(showing == Showing::Session, |this| {
+                reader::bind_keys(this, &self.reader)
+            })
             .size_full()
             .flex()
             .flex_col()

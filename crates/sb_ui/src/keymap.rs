@@ -10,7 +10,7 @@
 
 use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, SharedString};
 
-use crate::actions::{app, first_run, library, sessions, shell, sidebar};
+use crate::actions::{app, first_run, library, reader, sessions, shell, sidebar};
 
 /// Key context of the shell's root element: everything in the main window.
 pub const SHELL: &str = "Shell";
@@ -24,6 +24,8 @@ pub const SESSIONS: &str = "Sessions";
 pub const UNSORTED: &str = "Unsorted";
 /// Key context of the main area while it shows the first run.
 pub const FIRST_RUN: &str = "FirstRun";
+/// Key context of the main area while it shows a session.
+pub const READER: &str = "Reader";
 
 /// One row of the keymap.
 #[derive(Clone, Copy)]
@@ -84,6 +86,11 @@ pub const SYNC_ALL: Shortcut = shortcut!("f5", SHELL, library::SyncAll);
 pub const BACK: Shortcut = shortcut!("alt-left", SHELL, library::Back);
 /// `S`. Named, because a card's star button says it.
 pub const STAR: Shortcut = shortcut!("s", SESSIONS, sessions::Star);
+/// The reader's keys its header's buttons say (DESIGN §4.2.1).
+pub const READER_STAR: Shortcut = shortcut!("s", READER, reader::Star);
+pub const NEXT_SESSION: Shortcut = shortcut!("j", READER, reader::NextSession);
+pub const PREVIOUS_SESSION: Shortcut = shortcut!("k", READER, reader::PreviousSession);
+pub const SWITCH_CALLS: Shortcut = shortcut!("e", READER, reader::SwitchCalls);
 
 /// Every binding scrollback defines.
 pub const SHORTCUTS: &[Shortcut] = &[
@@ -111,6 +118,22 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut!("down", UNSORTED, sessions::Down),
     shortcut!("enter", UNSORTED, sessions::Open),
     shortcut!("enter", FIRST_RUN, first_run::Add),
+    READER_STAR,
+    NEXT_SESSION,
+    PREVIOUS_SESSION,
+    SWITCH_CALLS,
+    shortcut!("]", READER, reader::NextTurn),
+    shortcut!("[", READER, reader::PreviousTurn),
+    shortcut!("up", READER, reader::Up),
+    shortcut!("down", READER, reader::Down),
+    shortcut!("enter", READER, reader::Toggle),
+    shortcut!("right", READER, reader::Expand),
+    shortcut!("left", READER, reader::Collapse),
+    shortcut!("secondary-c", READER, reader::Copy),
+    shortcut!("pageup", READER, reader::PageUp),
+    shortcut!("pagedown", READER, reader::PageDown),
+    shortcut!("home", READER, reader::Top),
+    shortcut!("end", READER, reader::Bottom),
 ];
 
 /// `Ctrl K`, the palette's key (module docs).

@@ -6,6 +6,8 @@
 //! - [`SyncService`] (`Sync`): the locations, the passes that sync them and their progress.
 //! - [`LibraryService`] (`Library`): the page shown, what is selected on it, and what the
 //!   sidebar and the pages read from the catalogue.
+//! - [`ReaderService`] (the reader, PLAN §9): the session open in the main area, parsed, and
+//!   what of it has been loaded.
 //!
 //! Nothing here blocks the UI thread: the archive is opened, synced and read in
 //! `background_spawn` jobs (in tests, gpui's deterministic scheduler), and a service's state
@@ -15,6 +17,9 @@ pub mod archive;
 pub mod library;
 #[cfg(test)]
 mod location_tests;
+pub mod reader;
+#[cfg(test)]
+mod reader_tests;
 #[cfg(test)]
 mod scale;
 pub mod sync;
@@ -34,6 +39,7 @@ pub use archive::{ArchiveService, ArchiveState};
 pub use library::{
     LibraryService, Month, Page, PathChip, SessionsPage, Stats, can_attach, group_key, group_path,
 };
+pub use reader::{ReaderService, ReaderState};
 #[cfg(any(test, feature = "automation"))]
 pub use sync::Held;
 pub use sync::{LocationStatus, PassProgress, SyncEvent, SyncService};
@@ -61,17 +67,19 @@ pub struct Services {
     pub archive: Entity<ArchiveService>,
     pub sync: Entity<SyncService>,
     pub library: Entity<LibraryService>,
+    pub reader: Entity<ReaderService>,
     pub providers: Providers,
 }
 
 impl Global for Services {}
 
 impl Services {
-    /// Nothing is opening, syncing, indexing or loading: automation's `settled`.
+    /// Nothing is opening, syncing, indexing, loading or being read: automation's `settled`.
     pub fn is_settled(&self, cx: &App) -> bool {
         !matches!(self.archive.read(cx).state(), ArchiveState::Opening)
             && self.sync.read(cx).is_settled()
             && self.library.read(cx).is_settled()
+            && self.reader.read(cx).is_settled()
     }
 }
 
@@ -82,10 +90,13 @@ pub fn init(config: ServicesConfig, cx: &mut App) {
     let sync =
         cx.new(|cx| SyncService::new(archive.clone(), providers.clone(), config.connect, cx));
     let library = cx.new(|cx| LibraryService::new(archive.clone(), sync.clone(), cx));
+    let reader =
+        cx.new(|cx| ReaderService::new(archive.clone(), library.clone(), providers.clone(), cx));
     cx.set_global(Services {
         archive,
         sync,
         library,
+        reader,
         providers,
     });
 }

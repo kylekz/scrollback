@@ -111,6 +111,49 @@ pub mod sessions {
     );
 }
 
+/// The reader's actions, while the main area shows a session and has the keyboard.
+pub mod reader {
+    use gpui::actions;
+
+    actions!(
+        reader,
+        [
+            /// Open the next session of the page the session was opened from (`J`).
+            NextSession,
+            /// Open the previous session of that page (`K`).
+            PreviousSession,
+            /// Go to the next turn (`]`).
+            NextTurn,
+            /// Go to the previous turn (`[`).
+            PreviousTurn,
+            /// Switch between Activity and Full calls (`E`).
+            SwitchCalls,
+            /// Star or unstar the session (`S`).
+            Star,
+            /// Move to the row above (`↑`).
+            Up,
+            /// Move to the row below (`↓`).
+            Down,
+            /// Open or close the row the keyboard is on (`Enter`).
+            Toggle,
+            /// Open it (`→`).
+            Expand,
+            /// Close it, or go to the row it is under (`←`).
+            Collapse,
+            /// Copy the message the keyboard is on, or a call's command or path (`Ctrl C`).
+            Copy,
+            /// Scroll a screen up (`Page Up`).
+            PageUp,
+            /// Scroll a screen down (`Page Down`).
+            PageDown,
+            /// Go to the first row (`Home`).
+            Top,
+            /// Go to the last row (`End`).
+            Bottom,
+        ]
+    );
+}
+
 /// The first run's actions.
 pub mod first_run {
     use gpui::actions;

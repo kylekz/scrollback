@@ -1,21 +1,16 @@
-//! What the main area shows in place of a library page: why the archive didn't open, why the
-//! locations couldn't be read, and the page a session opens on until the reader is built
-//! (PLAN §13, phase 4).
+//! What the main area shows in place of a library page: why the archive didn't open, and why
+//! the locations couldn't be read.
 
 use gpui::{
     AnyElement, Context, Hsla, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, StyledText, TextRun, div, font,
     prelude::FluentBuilder as _,
 };
-use sb_core::catalogue::Session;
 
 use super::MainArea;
-use crate::agents;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{ButtonKind, button, icon, icon_button};
-use crate::format;
+use crate::components::{ButtonKind, button, icon};
 use crate::icons::SbIcon;
-use crate::keymap;
 use crate::services::archive::Failure;
 use crate::services::{ActiveServices as _, SyncService};
 use crate::theme::{SbTheme, StyledText as _};
@@ -155,111 +150,4 @@ pub fn locations_failed(why: &str, theme: &SbTheme, cx: &Context<MainArea>) -> A
                 .automation_target("locations/failed"),
         )
         .into_any_element()
-}
-
-/// The page an opened session shows until the reader is built: a header with Back and where
-/// the session was opened from, and what the library knows of the session.
-pub fn session(
-    session: &Session,
-    from: SharedString,
-    theme: &SbTheme,
-    cx: &Context<MainArea>,
-) -> AnyElement {
-    let c = &theme.colors;
-    let title: SharedString = session
-        .title
-        .clone()
-        .unwrap_or_else(|| "Untitled session".to_string())
-        .into();
-    let agent = agents::name(&session.id.provider, cx);
-    let model = agents::model(&session.id.provider, &session.models, cx);
-    let when = session
-        .ended
-        .or(session.started)
-        .map(|ended| format!("{} · ", format::day(ended, format::now())))
-        .unwrap_or_default();
-    div()
-        .size_full()
-        .flex()
-        .flex_col()
-        .child(
-            div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(theme.spacing.md)
-                .h(theme.sizes.reader_header_height)
-                .px(theme.spacing.lg)
-                .border_b_1()
-                .border_color(c.line_subtle)
-                .whitespace_nowrap()
-                .child(
-                    icon_button("session-back", theme.sizes.control_height, theme)
-                        .aria_label(format!("Back to {from} ({})", keymap::BACK.label()))
-                        .on_click(cx.listener(|_, _, _, cx| {
-                            let library = cx.services().library.clone();
-                            library.update(cx, |library, cx| library.close(cx));
-                        }))
-                        .child(icon(SbIcon::ArrowLeft, theme.sizes.icon, c.fg2))
-                        .automation_target("session/back"),
-                )
-                .child(div().flex_none().text_color(c.fg3).child(from))
-                .child(icon(SbIcon::ChevronRight, theme.sizes.icon_xs, c.fg3))
-                .child(
-                    div()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .text_spec(&theme.text.title)
-                        .child(title.clone())
-                        .automation_target("session/title"),
-                ),
-        )
-        .child(
-            div()
-                .flex_1()
-                .flex()
-                .justify_center()
-                .pt(theme.sizes.first_run_top)
-                .child(
-                    state(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(theme.spacing.md)
-                            .text_color(c.fg2)
-                            .child(agents::mark(&session.id.provider, theme.sizes.icon, cx))
-                            .child(
-                                std::iter::once(agent)
-                                    .chain(model)
-                                    .collect::<Vec<_>>()
-                                    .join(" · "),
-                            )
-                            .into_any_element(),
-                        title,
-                        theme,
-                    )
-                    .children(session.project_path.clone().map(|path| {
-                        div()
-                            .text_color(c.fg2)
-                            .text_spec(&theme.text.path)
-                            .child(path)
-                    }))
-                    .child(
-                        div()
-                            .text_color(c.fg3)
-                            .text_spec(&theme.text.number)
-                            .child(format!(
-                                "{when}{}",
-                                format::plural(session.all.calls as usize, "call")
-                            )),
-                    )
-                    .child(
-                        div().text_color(c.fg2).child(
-                            "This session is archived. Reading it here comes with the reader.",
-                        ),
-                    ),
-                ),
-        )
-        .automation_target("session")
 }

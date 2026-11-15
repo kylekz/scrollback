@@ -245,6 +245,29 @@ pub struct TypeScale {
     pub empty_title: TextSpec,
     /// 14/21 the paragraph under a state's title (`E-First-Run`).
     pub lead: TextSpec,
+    /// 15/24 transcript prose: prompts and replies (DESIGN §1.3 "Reading").
+    pub reading: TextSpec,
+    /// 13/20 prose inside a nested panel or a tool's result.
+    pub reading_nested: TextSpec,
+    /// Markdown headings: 20/28 for the first level, which DESIGN leaves out, then DESIGN's
+    /// 17/24 `h2` and 14/20 `h3`, all at 600.
+    pub heading1: TextSpec,
+    pub heading2: TextSpec,
+    pub heading3: TextSpec,
+    /// 12.5 JetBrains Mono inline code, on its line's height.
+    pub inline_code: TextSpec,
+    /// 12/20 JetBrains Mono a fenced code block.
+    pub code_block: TextSpec,
+    /// 12/19 JetBrains Mono a call body's text (`callbody pre`).
+    pub code: TextSpec,
+    /// 12/16 at 600 who wrote a message, over it ("You", the model).
+    pub author: TextSpec,
+    /// 12/16 JetBrains Mono an activity row's target, and at 500 its tool's name.
+    pub activity: TextSpec,
+    pub activity_name: TextSpec,
+    /// 12.5/20 a collapsed thought, and 13/20 an open one, both drawn italic.
+    pub thought: TextSpec,
+    pub thought_open: TextSpec,
 }
 
 impl TypeScale {
@@ -272,6 +295,19 @@ impl TypeScale {
             state_title: TextSpec::new(&fonts.ui, 22., 28., semibold),
             empty_title: TextSpec::new(&fonts.ui, 15., 20., semibold),
             lead: TextSpec::new(&fonts.ui, 14., 21., regular),
+            reading: TextSpec::new(&fonts.ui, 15., 24., regular),
+            reading_nested: TextSpec::new(&fonts.ui, 13., 20., regular),
+            heading1: TextSpec::new(&fonts.ui, 20., 28., semibold),
+            heading2: TextSpec::new(&fonts.ui, 17., 24., semibold),
+            heading3: TextSpec::new(&fonts.ui, 14., 20., semibold),
+            inline_code: TextSpec::new(&fonts.mono, 12.5, 18., regular),
+            code_block: TextSpec::new(&fonts.mono, 12., 20., regular),
+            code: TextSpec::new(&fonts.mono, 12., 19., regular),
+            author: TextSpec::new(&fonts.ui, 12., 16., semibold),
+            activity: TextSpec::new(&fonts.mono, 12., 16., regular),
+            activity_name: TextSpec::new(&fonts.mono, 12., 16., medium),
+            thought: TextSpec::new(&fonts.ui, 12.5, 20., regular),
+            thought_open: TextSpec::new(&fonts.ui, 13., 20., regular),
         }
     }
 }
@@ -363,6 +399,35 @@ pub struct Sizes {
     pub window_min_height: Pixels,
     /// Below this window width the sidebar collapses (DESIGN §2, "Narrow windows").
     pub sidebar_collapse_width: Pixels,
+    /// The reader (DESIGN §4.2): its column at most 720 wide with 32 at its sides, 28 above its
+    /// first block and 16 between blocks.
+    pub reading_width: Pixels,
+    pub reading_side: Pixels,
+    pub reading_top: Pixels,
+    pub block_gap: Pixels,
+    /// A small square button beside a message or in a call's header (Copy).
+    pub small_button: Pixels,
+    /// The header's star button.
+    pub star_button: Pixels,
+    /// An activity row: 26, 24 inside a subagent's panel; its tool's name 44 wide; and how far
+    /// in a call's body hangs, past the row's icon.
+    pub activity_row: Pixels,
+    pub activity_row_nested: Pixels,
+    pub activity_name_width: Pixels,
+    pub call_indent: Pixels,
+    /// A call body's header and footer.
+    pub call_header: Pixels,
+    pub call_footer: Pixels,
+    /// A collapsed thought's row.
+    pub thought_row: Pixels,
+    /// A prompt's image as a thumbnail (`shot`), and its caption.
+    pub shot_width: Pixels,
+    pub shot_height: Pixels,
+    pub shot_caption: Pixels,
+    /// The highest an image a tool returned is drawn (DESIGN §4.2.4).
+    pub tool_image_max_height: Pixels,
+    /// A segment of a segmented control.
+    pub segment_height: Pixels,
 }
 
 impl Default for Sizes {
@@ -412,6 +477,24 @@ impl Default for Sizes {
             window_min_width: px(960.),
             window_min_height: px(600.),
             sidebar_collapse_width: px(1040.),
+            reading_width: px(720.),
+            reading_side: px(32.),
+            reading_top: px(28.),
+            block_gap: px(16.),
+            small_button: px(22.),
+            star_button: px(24.),
+            activity_row: px(26.),
+            activity_row_nested: px(24.),
+            activity_name_width: px(44.),
+            call_indent: px(30.),
+            call_header: px(26.),
+            call_footer: px(24.),
+            thought_row: px(22.),
+            shot_width: px(200.),
+            shot_height: px(116.),
+            shot_caption: px(24.),
+            tool_image_max_height: px(320.),
+            segment_height: px(22.),
         }
     }
 }

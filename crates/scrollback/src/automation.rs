@@ -62,7 +62,7 @@ use sb_core::transport::{
     RangeSink, Transport, TransportError,
 };
 use sb_ui::Shell;
-use sb_ui::services::{ActiveServices as _, ArchiveState, Held, LocationStatus, Page};
+use sb_ui::services::{ActiveServices as _, ArchiveState, Held, LocationStatus, Page, ReaderState};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -94,6 +94,7 @@ impl AutomationHost for ScrollbackAutomation {
             "archive": archive(cx),
             "sync": sync(cx),
             "library": library(cx),
+            "reader": reader(shell, cx),
         })
     }
 
@@ -248,6 +249,37 @@ fn library(cx: &App) -> Value {
         "selected": library.selected().and_then(title_of),
         "open": library.open_session().and_then(|session| session.title.clone()),
         "error": library.failure(),
+    })
+}
+
+/// `state.reader`.
+fn reader(shell: &Shell, cx: &App) -> Value {
+    let reader = cx.services().reader.read(cx);
+    let view = shell.reader(cx);
+    let open = reader.open_session();
+    json!({
+        "state": reader.state().key(),
+        "error": match reader.state() {
+            ReaderState::Failed { why, .. } => Some(why),
+            _ => None,
+        },
+        "full_calls": reader.full_calls(),
+        "place": cx.services().library.read(cx).open_place().map(|(at, of)| json!([at + 1, of])),
+        "rows": view.rows,
+        "top": view.top,
+        "focused": view.focused.map(|(at, kind)| json!({ "row": at, "kind": kind })),
+        "open_calls": view.open_calls,
+        "markdown_states": view.states,
+        "alone": view.alone,
+        "loads": open.map(|open| {
+            open.loads()
+                .into_iter()
+                .map(|(name, loading, loaded)| {
+                    (name.to_string(), json!({ "loading": loading, "loaded": loaded }))
+                })
+                .collect::<serde_json::Map<_, _>>()
+        }),
+        "fault": open.and_then(|open| open.fault()),
     })
 }
 

@@ -24,10 +24,13 @@ pub mod components;
 pub mod format;
 pub mod icons;
 pub mod keymap;
+pub mod markdown;
 pub mod pages;
 pub mod services;
 pub mod shell;
 pub mod sidebar;
+pub mod syntax;
+pub mod system;
 #[cfg(test)]
 mod test_support;
 pub mod theme;

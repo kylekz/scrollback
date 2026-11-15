@@ -600,6 +600,67 @@ impl LibraryService {
         }
     }
 
+    /// The sessions of the shown page in its order: a page of sessions', or Unsorted's group
+    /// after group.
+    fn listed(&self) -> Vec<&Session> {
+        match self.page() {
+            Some(Page::Sessions(page)) => page.sessions.iter().collect(),
+            Some(Page::Unsorted(groups)) => {
+                groups.iter().flat_map(|group| &group.sessions).collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Where the open session is among the sessions of the page it was opened from, from 0,
+    /// and how many that page lists (DESIGN §4.2.1: "4 of 488").
+    pub fn open_place(&self) -> Option<(usize, usize)> {
+        let id = &self.open.as_ref()?.id;
+        let listed = self.listed();
+        let at = listed.iter().position(|session| session.id == *id)?;
+        Some((at, listed.len()))
+    }
+
+    /// Opens the session `by` places after the open one (before, for a negative `by`) on the
+    /// page it was opened from, and selects it there. Nothing happens past either end.
+    pub fn open_step(&mut self, by: isize, cx: &mut Context<Self>) {
+        let Some((at, _)) = self.open_place() else {
+            return;
+        };
+        let Some(session) = at
+            .checked_add_signed(by)
+            .and_then(|next| self.listed().get(next).map(|session| (*session).clone()))
+        else {
+            return;
+        };
+        let index =
+            matches!(self.page(), Some(Page::Sessions(_))).then_some(at.wrapping_add_signed(by));
+        self.selected = Some((session.id.clone(), index));
+        self.open = Some(session);
+        cx.notify();
+    }
+
+    /// Stars the open session, or takes its star away.
+    pub fn toggle_open_star(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = &mut self.open else {
+            return;
+        };
+        open.starred = !open.starred;
+        let (id, starred) = (open.id.clone(), open.starred);
+        if let Some((_, Page::Sessions(page))) = &mut self.page
+            && let Some(listed) = page.sessions.iter_mut().find(|session| session.id == id)
+        {
+            listed.starred = starred;
+        }
+        if starred {
+            self.counts.starred += 1;
+        } else {
+            self.counts.starred = self.counts.starred.saturating_sub(1);
+        }
+        self.write(Change::Star { id, starred }, cx);
+        cx.notify();
+    }
+
     /// Goes back from the reader to the page it was opened from.
     pub fn close(&mut self, cx: &mut Context<Self>) {
         if self.open.take().is_some() {
