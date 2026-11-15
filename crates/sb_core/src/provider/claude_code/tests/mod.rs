@@ -50,10 +50,17 @@ impl Files {
         let mut list: Vec<SessionItem> = files
             .iter()
             .filter_map(|file| {
-                let key = file.strip_prefix(&root).unwrap().to_str().unwrap();
-                let class = classify(key);
+                /* A key is written with `/`, whatever the system's paths are written with. */
+                let key = file
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .iter()
+                    .map(|part| part.to_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let class = classify(&key);
                 (class.session.as_deref() == Some(&session.id)).then(|| SessionItem {
-                    key: key.to_string(),
+                    key,
                     kind: class.kind,
                     length: file.metadata().unwrap().len(),
                 })
