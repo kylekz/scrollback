@@ -8,36 +8,39 @@ scrollback is a native desktop app (Rust + GPUI) that backs up, archives and rea
 
 1. **scrollback never shows a transcript from an agent's own directory.** It syncs transcripts into its archive and reads only the archive.
 2. **A sync only adds.** It never overwrites or deletes anything already archived. Bytes appended at the source extend the current version; any other change starts a new version; a file that disappears at the source stays in the archive. Only the owner removes something from the archive, on purpose.
-3. **The archive holds the source's bytes exactly.** Parsing happens when a transcript is read or indexed, so a better parser or a new tool renderer applies to everything already archived. The index is derived and can be rebuilt from the archive.
+3. **The archive holds exactly what the source held:** a file's bytes, or for an agent that keeps a database, a lossless export of its records. Parsing happens when a transcript is read or indexed, so a better parser or a new tool renderer applies to everything already archived. The index is derived and can be rebuilt from the archive.
 4. **Sources are read-only.** scrollback never writes to an agent's directories and installs nothing on the machines it reads from. Deleting a session from the archive never deletes it at its location.
 5. **Locations, not a server.** One app owns the archive on the machine it runs on and pulls from the locations the owner defines: this machine, a WSL distro, a host over SSH.
 6. **External tools are shelled out to, not bundled:** `wsl.exe` and the system `ssh`, which brings the owner's SSH config, keys and agent with it.
+7. **Agent-agnostic.** Everything specific to a coding agent lives in that agent's provider: where its transcripts are, how they are fetched, how they are parsed. Sync, the archive, filing, search and the reader work the same for any agent, whether it keeps flat files as Claude Code does or a database. Only Claude Code is built now; adding another agent is adding a provider and nothing else.
 
 ## Data model
 
 - **Location:** a place transcripts are pulled from. Local (this machine's user), WSL (one distro) or SSH (one host). Has a name, a kind, and a sync state.
-- **Source file:** one file under an agent's transcript root at a location. Every file is archived, not only the transcripts: subagent transcripts, saved tool results, images, titles.
-- **Version:** one continuous history of a source file's bytes. Appends extend it. A rewrite, a truncation or a replacement starts the next version.
-- **Session:** what the owner reads: one conversation, made of a main transcript file and the files that belong to it. Has a title, a project path, a time span, the models used, a git branch, token and tool-call counts.
+- **Agent:** a coding agent whose transcripts are archived, through its provider. Claude Code is the first. A location can hold more than one.
+- **Item:** one unit archived from an agent at a location. For Claude Code an item is a file, and every file is archived, not only the transcripts: subagent transcripts, saved tool results, images, titles. For an agent that keeps a database, an item is an export of one session's records.
+- **Version:** one continuous history of an item's bytes. Appends extend it. A rewrite, a truncation or a replacement starts the next version.
+- **Session:** what the owner reads: one conversation, made of a main transcript and the items that belong to it. Has a title, an agent, a project path, a time span, the models used, a git branch, token and tool-call counts.
 - **Project path:** the working directory a session started in, for example `/home/user/code/fc` or `D:\Projects\fc`.
 - **Folder:** the owner's own grouping of sessions. Folders nest. A session is in one folder or in none (Unsorted).
 - **Attached path:** a project path attached to a folder, optionally limited to one location. Sessions started under an attached path file themselves into that folder.
 
 ## Locations
 
-- **Local:** this machine's Claude Code directory (`~/.claude`, or `CLAUDE_CONFIG_DIR` when set).
-- **WSL** (Windows only): installed distros are found automatically and offered by name (`Ubuntu-24.04`); nothing is typed by hand. A stopped distro is listed without being started; syncing it starts it.
-- **SSH:** a host as `ssh` knows it (a `~/.ssh/config` alias or `user@host`). Adding one runs a connection test and shows what it found. The remote needs a POSIX shell: Linux and macOS hosts.
+- **A location is a machine or environment, not an agent's folder.** Every supported agent found at a location is synced; the location shows which agents it has.
+- **Local:** this machine's user. For Claude Code that means `~/.claude`, or `CLAUDE_CONFIG_DIR` when set.
+- **WSL** (Windows only): installed distros are found automatically and offered by name (`Ubuntu-24.04`); nothing is typed by hand. A stopped distro is listed without being started, and can be added without starting it; syncing it starts it.
+- **SSH:** a host as `ssh` knows it (a `~/.ssh/config` alias or `user@host`). Adding one runs a connection test and shows what it found: the agents present and how many sessions. A host that fails the test can still be added, so a machine that is asleep can be set up now. The remote needs a POSIX shell: Linux and macOS hosts.
 - **Add, rename, remove.** Removing a location stops syncing it and keeps everything already archived from it.
 - **State per location:** synced (when), syncing (progress in files and bytes), unreachable (since when, last successful sync), failed (the reason, in the tool's own words).
 - **An unreachable location is a normal state**, not an error: a laptop that is asleep, a distro that is stopped. The app shows how stale it is.
-- **Staleness warning:** a location that hasn't synced for a set number of days is flagged, because the agent's own cleanup may delete transcripts before the next sync.
+- **Staleness warning:** a location that hasn't synced for a set number of days is flagged, because the agent's own cleanup may delete transcripts before the next sync. It says how close that cleanup is, from the retention period last read at the location.
 - **First run:** "Add your first location", with this machine and any WSL distros offered at once. The archive is created in the app's data directory without asking; it works the same on any machine the app is opened on, each with its own archive.
 
 ## Sync
 
 - **When:** on launch, on demand (one location or all), and on an interval while the app is open. Any of them starts a stopped WSL distro to sync it.
-- **What:** every file under the agent's transcript root. For Claude Code that is `projects/`: session transcripts, subagent transcripts and their metadata, saved tool results, images, custom titles.
+- **What:** everything each agent's provider finds at the location. For Claude Code that is every file under `projects/`: session transcripts, subagent transcripts and their metadata, saved tool results, images, custom titles.
 - **Incremental:** unchanged files are skipped by size and modification time. A file that grew is checked against what the archive holds, and only the new bytes are fetched.
 - **Versions:** a file whose earlier bytes changed, or that shrank, becomes a new version. The earlier version stays readable.
 - **Held back:** when a new version is a loss (the source shrank, or no longer parses), the earlier version stays the reading copy until the owner chooses otherwise.
@@ -51,7 +54,7 @@ scrollback is a native desktop app (Rust + GPUI) that backs up, archives and rea
 - A new session is filed by its project path: the folder with the longest attached path that contains it wins. A subfolder's more specific path claims a session before its parent's.
 - **Paths are compared as paths, not text:** separators and Windows case are normalised, and a WSL view of a Windows drive matches the drive (`/mnt/d/Projects/fc` is `D:\Projects\fc`).
 - **Under a path counts:** a session started in `…/fc/crates/fc_ui` files into the folder that has `…/fc`.
-- **Manual filing sticks.** A session the owner dragged into a folder is never moved by a rule.
+- **Manual filing sticks.** A session the owner dragged into a folder is never moved by a rule. **File automatically** hands such a session back to the rules.
 - **Changing a folder's paths re-files** the sessions in Unsorted and the ones a rule filed, never the ones filed by hand.
 - **Unsorted** holds sessions that match no folder, grouped by project path, with "Create folder from this path" and dragging a path onto a folder to attach it.
 
@@ -61,12 +64,12 @@ The layout is concept E on the design canvas (`design/project/E-Reader.dc.html`,
 
 - **Sidebar:** All sessions, Starred, Unsorted (with a count), Trash, the folder tree, and the locations with their sync state at the foot.
 - **Folders:** create, rename, delete (its sessions go to Unsorted), nest, reorder. Drag sessions onto a folder; drag a folder into another.
-- **Folder page:** the folder's name and totals (sessions, tool calls, time span, locations), its attached paths as chips edited in place, and its sessions as cards grouped by month.
-- **Session card:** title, the start of the first prompt, model, location, date, number of tool calls.
-- **Filters and sort** on a folder page: text filter, model, branch, location, starred; newest or oldest first; cards or a list.
+- **Folder page:** the folder's name and totals (sessions, tool calls, time span, locations), its attached paths as chips edited in place, and its sessions as cards grouped by month. A folder's page and count include its subfolders' sessions.
+- **Session card:** title, the start of the first prompt, agent and model, location, date, number of tool calls.
+- **Filters and sort** on a folder page: text filter, agent, model, branch, location, date, starred; newest or oldest first; cards or a list.
 - **Session title:** the custom title when the agent stored one, otherwise the start of the first prompt.
 - **Star** a session.
-- **Delete** a session from the archive. It moves to Trash, where it can be restored or deleted for good. A session deleted for good is not archived again by later syncs, even while it still exists at its location. Nothing is ever deleted at a location.
+- **Delete** a session from the archive. It moves to Trash, where it can be restored or deleted for good. A restored session returns to its folder, or to Unsorted and the filing rules if that folder is gone. A session deleted for good is not archived again by later syncs, even while it still exists at its location. Nothing is ever deleted at a location.
 
 ## Reader
 
@@ -79,6 +82,7 @@ The layout is concept E on the design canvas (`design/project/E-Reader.dc.html`,
   - **Todo and task lists:** the list with its states.
   - **Subagents:** the subagent's own transcript nested under the call that started it, with its model, call count and duration.
   - **Web fetch and search, MCP tools, anything unknown:** the tool's name with its input and output, formatted.
+  - These are kinds of tool, not Claude Code's tools: each agent's tool names are mapped onto the same kinds, so one renderer serves every agent.
 - **Thinking blocks**, collapsed to one line with their duration.
 - **Images** the user attached or a tool returned.
 - **Context compaction** shown as a boundary in the transcript.
@@ -92,18 +96,20 @@ The layout is concept E on the design canvas (`design/project/E-Reader.dc.html`,
 ## Search
 
 - **Across the archive** (`Ctrl K`): session titles, prompts, replies, and the commands and file paths of tool calls.
-- **Narrowed by** folder, location, model, branch and date.
+- **Subagent transcripts are searched too.** A match in one opens the parent session at the call that started the subagent.
+- **Narrowed by** folder, location, agent, model, branch and date.
 - A result opens the session at the match.
 
 ## Versions
 
 - A session's **history:** each version with its date, size and why it started (first sync, source rewritten, source shrank).
 - **Choose the reading copy** when a version is held back, or to look at an earlier one.
+- The history shown is the main transcript's. A session's subagent transcripts and saved tool results keep versions of their own.
 
 ## Settings
 
 - Settings open inside the main window, not a separate window.
-- **Archive:** where it is, pointing the app at a different folder, its size, Verify.
+- **Archive:** where it is and its size. **Use a different folder** opens the archive there or creates one; it moves nothing. **Verify**, and for anything it finds damaged, fetching it again from its location when it still exists there. The sessions deleted for good, each with a way to let it be archived again.
 - **Sync:** the interval, the staleness warning's threshold.
 - **Appearance:** System, Light or Dark, and the window material, as the sibling apps do.
 - **Shortcuts:** a read-only table in v1.
@@ -117,7 +123,7 @@ The layout is concept E on the design canvas (`design/project/E-Reader.dc.html`,
 
 ## Later
 
-- **Other agents** (Codex CLI and others), each as a provider beside Claude Code.
+- **Other agents** (opencode, pi, Codex CLI and others), each as a provider beside Claude Code. The seam they plug into is part of the first version and is tested with a stand-in agent that keeps a database ([PLAN §7](PLAN.md#7-providers-and-the-transcript-model)).
 - **Headless sync** (`scrollback sync`) for a scheduled backup without the window, and a tray or background mode.
 - **Merging archives:** an export and import bundle, so an archive on the Mac and one on the PC can be combined.
 - **Usage over time:** tokens, models and sessions per folder.
@@ -145,3 +151,4 @@ The layout is concept E on the design canvas (`design/project/E-Reader.dc.html`,
 - **Licence: MIT** ([PLAN D15](PLAN.md#1-decisions)).
 - **Any sync starts a stopped WSL distro,** scheduled ones included.
 - **Sessions can be deleted from the archive,** never from their location ([PLAN D14](PLAN.md#1-decisions)).
+- **Fetching is agent-agnostic.** Only Claude Code is built, but nothing outside its provider knows it, and agents that keep a database instead of files fit the same seam ([PLAN D8](PLAN.md#1-decisions)).
