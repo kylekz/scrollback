@@ -5,12 +5,14 @@
 {"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
 {"cmd": "settle"}
 
-// One of the sessions is held back and filed by hand, so every page that lists it budgets a card's line for the chip and the hand (DESIGN §4.4).
+// One of the sessions is held back and filed by hand. The page decides on counts by what an ordinary card carries, so that one session takes nobody else's count; its own card drops its count when its line is short of room (DESIGN §4.4).
+{"cmd": "bounds", "target": "card/0/calls", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "screenshot", "name": "all-sessions-1440-dark"}
 
-// fc's page holds a subfolder's sessions, one of them held back and filed by hand: its cards' lines budget for every piece.
+// fc's page holds a subfolder's sessions, one of them held back and filed by hand: the ordinary cards keep their counts.
 {"cmd": "click", "target": "sidebar/folder/fc"}
 {"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 488}}
+{"cmd": "bounds", "target": "card/1/calls", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "screenshot", "name": "folder-1440-dark"}
 {"cmd": "scroll", "target": "page/cards", "dy": -600}
 {"cmd": "screenshot", "name": "folder-held-back-1440-dark"}

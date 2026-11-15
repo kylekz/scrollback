@@ -215,23 +215,27 @@ pub fn warn_chip(label: impl Into<SharedString>, theme: &SbTheme) -> Div {
         .child(label.into())
 }
 
-/// The ring around what has the keyboard (`.inp.focus`: an `accent` edge and 3px of
-/// `accent-soft` around it). An element with a border takes the edge as its border colour and
-/// the ring alone (`edge` false); one without is given the edge inside it.
+/**
+ * The ring around what has the keyboard (`.inp.focus`: an `accent` edge and 3px of
+ * `accent-soft`), drawn inside the element's own bounds: a row or a card sits against the
+ * edge of what holds it, which would cut a ring drawn outside. An element with a border
+ * takes the edge as its border colour and the soft ring alone (`edge` false); one without
+ * is given the edge too.
+ */
 pub fn focus_ring(edge: bool, theme: &SbTheme) -> Vec<BoxShadow> {
-    let ring = |color, spread: f32, inset| BoxShadow {
+    let ring = |color, spread: f32| BoxShadow {
         color,
         offset: point(px(0.), px(0.)),
         blur_radius: px(0.),
         spread_radius: px(spread),
-        inset,
+        inset: true,
     };
     let c = &theme.colors;
-    let mut rings = vec![ring(c.accent_soft, 3., false)];
     if edge {
-        rings.push(ring(c.accent, 1., true));
+        vec![ring(c.accent_soft, 4.), ring(c.accent, 1.)]
+    } else {
+        vec![ring(c.accent_soft, 3.)]
     }
-    rings
 }
 
 /// `text` in `color` and `spec`'s face, with every number in it (a run of digits, with the
