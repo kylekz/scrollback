@@ -1,0 +1,23 @@
+{"scenario": {"window_size": "1440x900", "platforms": ["macos"], "description": "The empty shell's materials on macOS (DESIGN §3): None by default, Vibrancy as a choice (gpui_appearance's own NSVisualEffectView behind the window's content, as AppKit reports it: shell.window_native); Mica and Acrylic resolve to None. Needs Reduce transparency off; its first assertion says so when it is on. A background window is inactive, so vibrancy shows flat"}}
+{"cmd": "wait_ready", "timeout_ms": 20000}
+{"cmd": "settle", "expect": [{"pointer": "/appearance/available", "equals": ["vibrancy", "opaque"]}, {"pointer": "/appearance/material", "equals": "opaque"}, {"pointer": "/shell/window_material", "equals": "opaque"}, {"pointer": "/shell/window_native/opaque", "equals": true}, {"pointer": "/shell/window_native/vibrancy_view", "equals": false}, {"pointer": "/shell/window_native/forced", "equals": null}]}
+
+// A Windows material is kept but shows None.
+{"cmd": "set_appearance", "material": "mica", "expect_result": [{"pointer": "/material", "equals": "mica"}, {"pointer": "/resolved/material", "equals": "opaque"}]}
+{"cmd": "settle", "expect": [{"pointer": "/shell/window_material", "equals": "opaque"}, {"pointer": "/shell/window_native/vibrancy_view", "equals": false}]}
+
+// Vibrancy: the effect view goes in behind gpui's content, the window no longer opaque. The title bar and the sidebar let it through; the main area stays solid.
+{"cmd": "set_appearance", "material": "vibrancy", "mode": "dark", "expect_result": [{"pointer": "/resolved/material", "equals": "vibrancy"}, {"pointer": "/resolved/appearance", "equals": "dark"}]}
+{"cmd": "settle", "expect": [{"pointer": "/shell/window_material", "equals": "vibrancy"}, {"pointer": "/shell/window_native/opaque", "equals": false}, {"pointer": "/shell/window_native/vibrancy_view", "equals": true}, {"pointer": "/shell/window_native/forced", "equals": "dark"}]}
+{"cmd": "screenshot", "name": "shell-vibrancy-dark"}
+{"cmd": "set_appearance", "mode": "light", "expect_result": {"pointer": "/resolved/appearance", "equals": "light"}}
+{"cmd": "settle", "expect": [{"pointer": "/shell/window_native/forced", "equals": "light"}, {"pointer": "/shell/window_native/vibrancy_view", "equals": true}]}
+{"cmd": "screenshot", "name": "shell-vibrancy-light"}
+
+// System mode lets the window follow macOS's own setting: no appearance of its own.
+{"cmd": "set_appearance", "mode": "system", "expect_result": {"pointer": "/mode", "equals": "system"}}
+{"cmd": "settle", "expect": {"pointer": "/shell/window_native/forced", "equals": null}}
+
+// Back to None: the effect view is taken out.
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "settle", "expect": [{"pointer": "/shell/window_material", "equals": "opaque"}, {"pointer": "/shell/window_native/opaque", "equals": true}, {"pointer": "/shell/window_native/vibrancy_view", "equals": false}]}

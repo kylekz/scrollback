@@ -1,0 +1,16 @@
+[package]
+name = "sb_core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "scrollback's headless domain logic: the archive, sync, providers and search (docs/PLAN.md §3)"
+
+# gpui: never, not even transitively (`script/check` step 3).
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+toolbox_process.workspace = true
+toolbox_store.workspace = true

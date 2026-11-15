@@ -1,0 +1,44 @@
+[package]
+name = "scrollback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "scrollback: backs up, archives and reads coding-agent transcripts (docs/PLAN.md)"
+
+[[bin]]
+name = "scrollback"
+path = "src/main.rs"
+
+# Two shapes, both linted by `script/check` step 2:
+# - default (`automation`): development, tests and the e2e runner;
+# - `--no-default-features`: the app as it ships.
+[features]
+default = ["automation"]
+# `--automation`: the JSONL driver used by the e2e scenarios (docs/PLAN.md §12). Shipped builds
+# are built without it.
+automation = ["dep:gpui_automation", "gpui_automation/enabled", "dep:serde_json", "sb_ui/automation"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+env_logger.workspace = true
+gpui.workspace = true
+# What the platform can show, probed at startup, and automation's `state` of it.
+gpui_appearance.workspace = true
+gpui_automation = { workspace = true, optional = true }
+gpui_platform.workspace = true
+log.workspace = true
+sb_ui.workspace = true
+serde_json = { workspace = true, optional = true }
+
+# macOS: text through Core Text needs gpui's `font-kit` (without it nothing draws), and
+# `runtime_shaders` compiles the Metal shaders when the window opens, so building needs no
+# Metal toolchain (Xcode's is a separate download).
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_platform = { workspace = true, features = ["font-kit", "runtime_shaders"] }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+pretty_assertions.workspace = true

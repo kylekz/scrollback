@@ -1,0 +1,8 @@
+* text=auto
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+# Shell scripts run under bash, which rejects CRLF line endings (core.autocrlf checkouts).
+script/* text eol=lf

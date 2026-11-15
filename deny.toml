@@ -1,0 +1,49 @@
+# cargo-deny: every crate comes from crates.io or the owner's toolbox-rs, carries a license on
+# the list below, and has no open security advisory. A change to Cargo.lock that brings in a
+# crate from anywhere else, or a crate RustSec flags, fails `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+# Yanked crates and every vulnerability fail; one that doesn't apply goes in `ignore` with why.
+# Unmaintained crates fail only when the workspace depends on one directly: the rest come through
+# gpui and its platform crates, which scrollback doesn't choose.
+yanked = "deny"
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[licenses.private]
+# The workspace's own crates (publish = false) are this repository's MIT.
+ignore = true
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# toolbox-rs, the owner's shared crates (docs/PLAN.md §3), pinned by tag in Cargo.toml: the one
+# source besides crates.io. A change to it goes to toolbox-rs first, then a new tag here.
+allow-git = ["https://github.com/kylekz/toolbox-rs"]

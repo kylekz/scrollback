@@ -1,0 +1,21 @@
+{"scenario": {"window_size": "1440x900", "platforms": ["windows"], "description": "The empty shell's materials on Windows (DESIGN §3): Mica by default, Acrylic and None as choices, dark and light, in a background run. Needs Windows 11 22H2+ with Transparency effects on; its first assertion says so otherwise. Window-source screenshots show Mica as the inactive window's fill and Acrylic's translucent surfaces over black"}}
+{"cmd": "wait_ready", "timeout_ms": 20000}
+{"cmd": "settle", "expect": [{"pointer": "/appearance/available", "equals": ["mica", "acrylic", "opaque"]}, {"pointer": "/appearance/material", "equals": "mica"}, {"pointer": "/shell/window_material", "equals": "mica"}]}
+
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "shell-mica-dark"}
+{"cmd": "pin_appearance", "appearance": "light", "expect_result": {"pointer": "/resolved/appearance", "equals": "light"}}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "shell-mica-light"}
+
+{"cmd": "set_appearance", "material": "acrylic", "expect_result": {"pointer": "/resolved/material", "equals": "acrylic"}}
+{"cmd": "settle", "expect": {"pointer": "/shell/window_material", "equals": "acrylic"}}
+{"cmd": "screenshot", "name": "shell-acrylic-light"}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "shell-acrylic-dark"}
+
+// macOS's material is kept but shows None.
+{"cmd": "set_appearance", "material": "vibrancy", "expect_result": [{"pointer": "/material", "equals": "vibrancy"}, {"pointer": "/resolved/material", "equals": "opaque"}]}
+{"cmd": "settle", "expect": {"pointer": "/shell/window_material", "equals": "opaque"}}

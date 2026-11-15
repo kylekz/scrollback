@@ -1,0 +1,29 @@
+[package]
+name = "sb_ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "scrollback's views, services and theme (docs/PLAN.md §11)"
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[features]
+# The automation seam re-exports toolbox-rs's `gpui_automation` (docs/PLAN.md §11), whose driver
+# this turns on; without it the seam is the crate's no-op stand-ins. The scrollback binary
+# enables it through its own `automation` feature.
+automation = ["gpui_automation/enabled"]
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+gpui-component.workspace = true
+gpui_appearance.workspace = true
+gpui_automation.workspace = true
+sb_core.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+pretty_assertions.workspace = true
