@@ -24,6 +24,10 @@
 //! ([`SyncService::indexing`]). A location's index and its pass never run together: a sync
 //! asked for while its location is indexed starts when the index is over.
 //!
+//! **The owner's locations** ([`locations`]): adding, renaming and removing one are the
+//! service's writes, each on a background job, as are the connection test and the listing of
+//! WSL's distros, which views observe.
+//!
 //! Views observe the service for the locations' rows, and the library hears
 //! [`SyncEvent::Archived`] when what it shows may have changed. When the app quits, every pass
 //! and index is told to stop.
@@ -36,11 +40,20 @@ use std::time::Duration;
 
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 use sb_core::CancelToken;
+use sb_core::archive::Archive;
 use sb_core::location::{Location, LocationId, LocationKind};
 use sb_core::sync::{Found, IndexReport, Progress, SyncError, index, survey, sync_location};
+use sb_core::transport::Transport;
 
-use super::{ArchiveService, Connect, Providers};
+use super::{ArchiveService, Connect, ListDistros, Providers, Tester};
 use crate::format;
+
+mod locations;
+
+pub use locations::{
+    ConnectionTest, Details, Distros, Expiring, STALE_AFTER_DAYS, Stale, TestFailure, TestState,
+    host_problem, refusal, stale,
+};
 
 /// How often every location is synced while the app is open (DESIGN §4.13 offers 5, 15, 30 and
 /// 60 minutes; Settings arrive in a later phase).
@@ -151,8 +164,32 @@ pub enum LocationStatus {
     NeverSynced,
 }
 
-/// What an agent's provider found on this machine, or why it could not look.
+/// What each agent's provider found at a place, or why it could not look.
 pub type Survey = Vec<Result<Found, String>>;
+
+/// How each kind of location is reached and tested, and how WSL's distros are listed.
+pub struct Reach {
+    pub connect: Connect,
+    pub tester: Tester,
+    pub distros: ListDistros,
+}
+
+/// What each of `providers` finds at the place `transport` reads, an agent that could not
+/// look named as its provider names it, never by its id.
+fn surveyed(archive: &Archive, transport: &dyn Transport, providers: &Providers) -> Survey {
+    survey(archive, transport, providers)
+        .into_iter()
+        .map(|found| {
+            found.map_err(|(id, error)| {
+                let name = providers
+                    .iter()
+                    .find(|provider| provider.id() == id)
+                    .map_or(id.as_str(), |provider| provider.display().name);
+                format!("{name}: {error}")
+            })
+        })
+        .collect()
+}
 
 pub enum SyncEvent {
     /// The archive may hold sessions it didn't, or other facts about them.
@@ -252,8 +289,14 @@ pub struct SyncService {
     archive: Entity<ArchiveService>,
     providers: Providers,
     connect: Connect,
-    /// `None` until they are read from the catalogue.
+    tester: Tester,
+    lister: ListDistros,
+    /// The owner's locations; `None` until they are read from the catalogue.
     locations: Option<Vec<Location>>,
+    /// The locations the owner removed, whose sessions are still in the archive.
+    removed: Vec<Location>,
+    /// What the archive holds from each location, and what was found at each.
+    details: Details,
     /// Why the locations could not be read.
     failure: Option<String>,
     /// What is on this machine, looked for while there is no location (DESIGN §4.10).
@@ -265,8 +308,20 @@ pub struct SyncService {
     waiting: HashSet<LocationId>,
     /// Why a location's last pass stopped, where the catalogue could not record it.
     errors: HashMap<LocationId, String>,
-    /// This machine is being added as a location.
-    adding: bool,
+    /// The places being added as locations.
+    adding: Vec<LocationKind>,
+    /// The locations to remove once their pass has stopped.
+    removing: HashSet<LocationId>,
+    /// Why the last of the owner's changes to the locations could not be made.
+    refused: Option<String>,
+    /// The connection test running or last run.
+    test: Option<ConnectionTest>,
+    /// WSL's distros, once they have been listed, and what each running one has.
+    distros: Option<Distros>,
+    /// WSL's distros are being listed.
+    listing: bool,
+    /// When every location is synced next ([`SYNC_INTERVAL`]), in Unix milliseconds.
+    next_round: Option<i64>,
     /// Background jobs other than passes and indexes: reading and adding locations, looking
     /// at this machine.
     jobs: usize,
@@ -283,7 +338,7 @@ impl SyncService {
     pub fn new(
         archive: Entity<ArchiveService>,
         providers: Providers,
-        connect: Connect,
+        reach: Reach,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
@@ -296,15 +351,25 @@ impl SyncService {
             ],
             archive,
             providers,
-            connect,
+            connect: reach.connect,
+            tester: reach.tester,
+            lister: reach.distros,
             locations: None,
+            removed: Vec::new(),
+            details: Details::default(),
             failure: None,
             found: None,
             passes: HashMap::new(),
             indexes: HashMap::new(),
             waiting: HashSet::new(),
             errors: HashMap::new(),
-            adding: false,
+            adding: Vec::new(),
+            removing: HashSet::new(),
+            refused: None,
+            test: None,
+            distros: None,
+            listing: false,
+            next_round: None,
             jobs: 0,
             stop_index: CancelToken::new(),
             #[cfg(any(test, feature = "automation"))]
@@ -313,13 +378,23 @@ impl SyncService {
         }
     }
 
-    /// The locations, oldest first; `None` until they are read.
+    /// The owner's locations, oldest first; `None` until they are read.
     pub fn locations(&self) -> Option<&[Location]> {
         self.locations.as_deref()
     }
 
+    /// A location, one the owner removed too: its sessions still name it.
     pub fn location(&self, id: &LocationId) -> Option<&Location> {
-        self.locations.as_ref()?.iter().find(|it| it.id == *id)
+        self.locations
+            .iter()
+            .flatten()
+            .chain(&self.removed)
+            .find(|it| it.id == *id)
+    }
+
+    /// Whether the archive has never had a location: the first run (DESIGN §4.10).
+    pub fn is_first_run(&self) -> bool {
+        self.locations.as_ref().is_some_and(Vec::is_empty) && self.removed.is_empty()
     }
 
     /// Why the locations could not be read, when they could not.
@@ -385,10 +460,15 @@ impl SyncService {
         if self.archive.read(cx).archive().is_none() || self._interval.is_some() {
             return;
         }
+        self.next_round = Some(format::now() + SYNC_INTERVAL.as_millis() as i64);
         self._interval = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(SYNC_INTERVAL).await;
-                if this.update(cx, |this, cx| this.sync_all(cx)).is_err() {
+                let synced = this.update(cx, |this, cx| {
+                    this.next_round = Some(format::now() + SYNC_INTERVAL.as_millis() as i64);
+                    this.sync_all(cx);
+                });
+                if synced.is_err() {
                     break;
                 }
             }
@@ -404,13 +484,19 @@ impl SyncService {
         };
         self.run(
             cx,
-            move || archive.catalogue().locations(),
-            |this, locations, cx| match locations {
-                Ok(locations) => {
-                    let none = locations.is_empty();
+            move || {
+                let locations = archive.catalogue().locations()?;
+                Ok::<_, sb_core::catalogue::CatalogueError>((locations, Details::read(&archive)?))
+            },
+            |this, read, cx| match read {
+                Ok((locations, details)) => {
+                    let (removed, locations) =
+                        locations.into_iter().partition(|it| it.removed.is_some());
                     this.failure = None;
                     this.locations = Some(locations);
-                    if none {
+                    this.removed = removed;
+                    this.details = details;
+                    if this.is_first_run() {
                         this.look_here(cx);
                     } else {
                         this.sync_all(cx);
@@ -431,7 +517,8 @@ impl SyncService {
         }
     }
 
-    /// Asks each provider what this machine has (DESIGN §4.10).
+    /// Asks each provider what this machine has, and lists WSL's distros, surveying those
+    /// that run (DESIGN §4.10).
     fn look_here(&mut self, cx: &mut Context<Self>) {
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return;
@@ -441,56 +528,17 @@ impl SyncService {
             cx,
             move || {
                 let here = connect(&LocationKind::Local, &CancelToken::new());
-                survey(&archive, here.as_ref(), &providers)
-                    .into_iter()
-                    .map(|found| {
-                        found.map_err(|(id, error)| {
-                            // An agent is named as its provider names it, never by its id.
-                            let name = providers
-                                .iter()
-                                .find(|provider| provider.id() == id)
-                                .map_or(id.as_str(), |provider| provider.display().name);
-                            format!("{name}: {error}")
-                        })
-                    })
-                    .collect()
+                surveyed(&archive, here.as_ref(), &providers)
             },
             |this, found, _| this.found = Some(found),
         );
+        self.list_distros(cx);
     }
 
     /// Adds this machine as a location and starts its first sync (DESIGN §4.10). It is one
     /// location: nothing happens while it is being added, or once it is one.
     pub fn add_local(&mut self, cx: &mut Context<Self>) {
-        let Some(archive) = self.archive.read(cx).archive().cloned() else {
-            return;
-        };
-        let is_local = |location: &Location| matches!(location.kind, LocationKind::Local);
-        if self.adding || self.locations.iter().flatten().any(is_local) {
-            return;
-        }
-        self.adding = true;
-        self.run(
-            cx,
-            move || {
-                archive
-                    .catalogue()
-                    .add_location(LocationKind::Local, local_name())
-            },
-            |this, added, cx| {
-                this.adding = false;
-                match added {
-                    Ok(location) => {
-                        let id = location.id.clone();
-                        this.locations.get_or_insert_default().push(location);
-                        this.sync(&id, cx);
-                    }
-                    Err(error) => {
-                        log::error!("this machine could not be added as a location: {error}");
-                    }
-                }
-            },
-        );
+        self.add(LocationKind::Local, local_name().to_string(), true, cx);
     }
 
     /// Syncs every location that isn't syncing already.
@@ -512,10 +560,10 @@ impl SyncService {
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return;
         };
-        let Some(location) = self.location(id) else {
+        let Some(location) = self.locations.iter().flatten().find(|it| it.id == *id) else {
             return;
         };
-        if self.passes.contains_key(id) {
+        if self.passes.contains_key(id) || self.removing.contains(id) {
             return;
         }
         if self.indexes.contains_key(&Some(id.clone())) {
@@ -605,7 +653,13 @@ impl SyncService {
                     }
                     if !whole {
                         // What it stored before it ended is indexed, so that it shows.
-                        this.index(Some(id), cx);
+                        this.index(Some(id.clone()), cx);
+                    }
+                    // A location the owner removed while it synced goes once its pass is over.
+                    if this.removing.contains(&id) {
+                        this.write_removal(id, cx);
+                    } else {
+                        this.read_details(cx);
                     }
                     if changed || !whole {
                         cx.emit(SyncEvent::Archived);
@@ -748,10 +802,21 @@ impl SyncService {
         self.hold.release();
     }
 
-    /// Stops every pass and every index: the app is quitting.
+    /// Stops a location's pass at its next step. What it committed stays (PLAN §5).
+    pub fn stop(&mut self, id: &LocationId) {
+        if let Some(running) = self.passes.get(id) {
+            running.cancel.cancel();
+            #[cfg(any(test, feature = "automation"))]
+            self.hold.release();
+        }
+        self.waiting.remove(id);
+    }
+
+    /// Stops every pass and every index, and the connection test: the app is quitting.
     fn stop_everything(&mut self) {
         self.stop_all();
         self.stop_index.cancel();
+        self.cancel_test();
     }
 
     /// Makes the next pass act on a hold once it has stored `after` items (see [`Held`]).

@@ -469,6 +469,15 @@ fn the_type_scale_matches_design() {
             semibold,
         ),
         ("lead", &scale.lead, &fonts.ui, 14., 21., regular),
+        (
+            "sheet_title",
+            &scale.sheet_title,
+            &fonts.ui,
+            15.,
+            20.,
+            semibold,
+        ),
+        ("said", &scale.said, &fonts.mono, 11., 16., regular),
     ] {
         assert_eq!(
             (&spec.family, spec.size, spec.line_height, spec.weight),
@@ -510,6 +519,24 @@ fn sizes_radii_and_spacing_match_design() {
         (px(660.), px(56.))
     );
     assert_eq!(sizes.state_width, px(600.));
+    // §4.11: the locations sheet is 1200 × 790 with a 540 list, its kind tiles 32 square;
+    // §4.12: dialogs 440 wide and up to 760 high; §1.4: a segment is 22 high.
+    assert_eq!(
+        (
+            sizes.sheet_width,
+            sizes.sheet_height,
+            sizes.sheet_list_width
+        ),
+        (px(1200.), px(790.), px(540.))
+    );
+    assert_eq!(sizes.location_tile, px(32.));
+    assert_eq!(
+        (sizes.dialog_width, sizes.dialog_max_height),
+        (px(440.), px(760.))
+    );
+    assert_eq!(sizes.segment_height, px(22.));
+    // sb.css: a radio is 14 square and a key/value row's label 128 wide.
+    assert_eq!((sizes.radio, sizes.kv_label_width), (px(14.), px(128.)));
 
     // Radii: 4 tags, 6 buttons, 7 inputs, 8 rows, 10 cards, 12 sheets, 14 the page tile,
     // 999 chips.

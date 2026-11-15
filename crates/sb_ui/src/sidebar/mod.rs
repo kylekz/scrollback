@@ -164,12 +164,10 @@ impl Sidebar {
         }
     }
 
-    /// Whether there is a location, and so a library to show (DESIGN §4.10).
+    /// Whether there is a location, or was, and so a library to show (DESIGN §4.10).
     fn has_library(&self, cx: &App) -> bool {
-        self.sync
-            .read(cx)
-            .locations()
-            .is_some_and(|locations| !locations.is_empty())
+        let sync = self.sync.read(cx);
+        sync.locations().is_some() && !sync.is_first_run()
     }
 
     fn rebuild(&mut self, cx: &App) {
@@ -669,7 +667,7 @@ impl Render for Sidebar {
         let theme = cx.sb_theme().clone();
         let c = &theme.colors;
         let has_library = self.has_library(cx);
-        let first_run = self.sync.read(cx).locations().is_some_and(<[_]>::is_empty);
+        let first_run = self.sync.read(cx).is_first_run();
         let syncing = self.sync.read(cx).is_syncing();
         div()
             .id("sidebar-rows")

@@ -18,7 +18,7 @@ use sb_core::transport::Transport;
 use sb_test_support::{Outline, ProjectsTree};
 use tempfile::TempDir;
 
-use crate::services::{self, ActiveServices as _, ServicesConfig};
+use crate::services::{self, ActiveServices as _, Reach, ServicesConfig};
 use crate::shell::Shell;
 
 /// The scratch folders of a test's services, kept for as long as its app.
@@ -86,7 +86,8 @@ pub fn init_in(archive: TempDir, machine: ProjectsTree, cx: &mut TestAppContext)
 /**
  * [`init_in`], with the locations of the other kinds than this machine reached through
  * `elsewhere`: never the real distro or host a kind names, but a home of the test's own, read
- * through a local shell or a stand-in transport.
+ * through a local shell or a stand-in transport. No connection test runs, and this machine
+ * has no WSL.
  */
 pub fn init_with(
     archive: TempDir,
@@ -94,18 +95,43 @@ pub fn init_with(
     elsewhere: impl Fn(&LocationKind, &CancelToken) -> Box<dyn Transport> + Send + Sync + 'static,
     cx: &mut TestAppContext,
 ) {
+    init_reaching(
+        archive,
+        machine,
+        Reach {
+            connect: Arc::new(elsewhere),
+            tester: Arc::new(|launcher, _| panic!("this test tests no {launcher:?}")),
+            distros: Arc::new(|_| Ok(None)),
+        },
+        cx,
+    );
+}
+
+/// [`init_with`], with the connection test and WSL's distros the test's stand-ins too:
+/// `elsewhere` reaches every place but this machine.
+pub fn init_reaching(
+    archive: TempDir,
+    machine: ProjectsTree,
+    elsewhere: Reach,
+    cx: &mut TestAppContext,
+) {
     cx.update(|cx| {
         crate::init(cx).expect("sb_ui initialises");
         crate::appearance::init(MaterialSupport::ALL, Mode::System, cx);
         let here = machine.transport();
+        let connect = elsewhere.connect;
         services::init(
             ServicesConfig {
                 archive_dir: archive.path().join("archive"),
                 providers: sb_core::provider::builtin(),
-                connect: Arc::new(move |kind, cancel| match kind {
-                    LocationKind::Local => Box::new(here.clone()),
-                    other => elsewhere(other, cancel),
-                }),
+                reach: Reach {
+                    connect: Arc::new(move |kind, cancel| match kind {
+                        LocationKind::Local => Box::new(here.clone()),
+                        other => connect(other, cancel),
+                    }),
+                    tester: elsewhere.tester,
+                    distros: elsewhere.distros,
+                },
             },
             cx,
         );

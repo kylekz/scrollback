@@ -275,6 +275,8 @@ pub enum ButtonKind {
     Plain,
     /// `.btn.primary`: `accent` with `accent-ink` text.
     Primary,
+    /// `.btn.danger`: as plain, with `red` text.
+    Danger,
 }
 
 /// A button (`.btn`: 28 high, radius 6, 500), or the small one (`.btn.sm`: 24 high, 12px).
@@ -290,6 +292,7 @@ pub fn button(
     let c = &theme.colors;
     let (fill, hover, text, border) = match kind {
         ButtonKind::Plain => (c.s2, c.s3, c.fg, c.line),
+        ButtonKind::Danger => (c.s2, c.s3, c.red, c.line),
         ButtonKind::Primary => (
             c.accent,
             c.accent.opacity(0.9),
@@ -390,4 +393,140 @@ pub fn page_tile(glyph: SbIcon, accent: bool, theme: &SbTheme) -> impl IntoEleme
         .rounded(theme.radii.tile)
         .bg(fill)
         .child(icon(glyph, theme.sizes.tile_glyph, color))
+}
+
+/// A card (`.card`: `s1`, a `line-subtle` border, radius 10).
+pub fn card(theme: &SbTheme) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .rounded(theme.radii.card)
+        .border_1()
+        .border_color(theme.colors.line_subtle)
+        .bg(theme.colors.s1)
+}
+
+/// A key and its value (`.kv`: 12/18, the key in a 128 column in `fg3`, the value `fg2`).
+pub fn kv(key: impl Into<SharedString>, value: impl IntoElement, theme: &SbTheme) -> Div {
+    div()
+        .flex()
+        .items_start()
+        .gap(theme.spacing.lg)
+        .text_spec(&theme.text.secondary)
+        .line_height(px(18.))
+        .child(
+            div()
+                .flex_none()
+                .w(theme.sizes.kv_label_width)
+                .text_color(theme.colors.fg3)
+                .child(key.into()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_color(theme.colors.fg2)
+                .child(value),
+        )
+}
+
+/// A tool's own words, line for line, in a `code` box (DESIGN §4.11, §4.12).
+pub fn said(text: impl Into<SharedString>, theme: &SbTheme) -> Div {
+    div()
+        .px(theme.spacing.md)
+        .py(theme.spacing.sm)
+        .rounded(theme.radii.control)
+        .bg(theme.colors.code)
+        .text_color(theme.colors.fg2)
+        .text_spec(&theme.text.said)
+        .child(text.into())
+}
+
+/// A banner that warns (`.banner.warn`: `yellow-soft`, an alert glyph in `yellow`).
+pub fn warn_banner(theme: &SbTheme) -> Div {
+    let c = &theme.colors;
+    div()
+        .flex()
+        .items_start()
+        .gap(BANNER_GAP)
+        .py(theme.spacing.md)
+        .px(theme.spacing.lg)
+        .rounded(theme.radii.row)
+        .bg(c.yellow_soft)
+        .text_spec(&theme.text.secondary)
+        .child(icon(SbIcon::TriangleAlert, theme.sizes.icon, c.yellow))
+}
+
+/// A banner that tells (`.banner.info`: `s1` with a `line-subtle` border, its glyph `fg3`).
+pub fn info_banner(theme: &SbTheme) -> Div {
+    let c = &theme.colors;
+    div()
+        .flex()
+        .items_start()
+        .gap(BANNER_GAP)
+        .py(theme.spacing.md)
+        .px(theme.spacing.lg)
+        .rounded(theme.radii.row)
+        .border_1()
+        .border_color(c.line_subtle)
+        .bg(c.s1)
+        .text_color(c.fg2)
+        .text_spec(&theme.text.secondary)
+        .child(icon(SbIcon::Info, theme.sizes.icon, c.fg3))
+}
+
+/// A status dot (`.dot`): filled with `fill`, or an outline in `fg3` (`.dot.off`).
+pub fn dot(fill: Option<Hsla>, theme: &SbTheme) -> Div {
+    div()
+        .flex_none()
+        .size(theme.sizes.dot)
+        .rounded_full()
+        .map(|this| match fill {
+            Some(fill) => this.bg(fill),
+            None => this.border(px(1.5)).border_color(theme.colors.fg3),
+        })
+}
+
+/// A radio button (`.radio`: 14 round; chosen, a thick `accent` ring).
+pub fn radio(on: bool, theme: &SbTheme) -> impl IntoElement {
+    let c = &theme.colors;
+    div()
+        .flex_none()
+        .size(theme.sizes.radio)
+        .rounded_full()
+        .map(|this| {
+            if on {
+                this.border(px(4.)).border_color(c.accent)
+            } else {
+                this.border(px(1.5)).border_color(c.fg3)
+            }
+        })
+}
+
+/// A field's label (`.lbl`: 12/16 at 500 in `fg2`).
+pub fn label(text: impl Into<SharedString>, theme: &SbTheme) -> impl IntoElement {
+    div()
+        .text_color(theme.colors.fg2)
+        .text_spec(&theme.text.control_small)
+        .child(text.into())
+}
+
+/// The kind tile of a location (DESIGN §4.11: 32 square; `accent-soft` this machine,
+/// `blue-soft` a distro, `s1` a host), its glyph `size`.
+pub fn kind_tile(kind: &LocationKind, theme: &SbTheme) -> impl IntoElement {
+    let c = &theme.colors;
+    let (fill, color) = match kind {
+        LocationKind::Local => (c.accent_soft, c.accent_text),
+        LocationKind::Wsl { .. } => (c.blue_soft, c.blue),
+        LocationKind::Ssh { .. } => (c.s1, c.fg2),
+    };
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(theme.sizes.location_tile)
+        .rounded(theme.radii.input)
+        .bg(fill)
+        .child(icon(kind_icon(kind), theme.sizes.icon, color))
 }

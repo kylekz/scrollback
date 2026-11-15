@@ -282,12 +282,12 @@ impl SessionsView {
             });
         }
         // The locations may arrive, or be renamed, after the sessions.
-        let tag = self
-            .sync
-            .read(cx)
+        let sync = self.sync.read(cx);
+        let tag = sync
             .locations()
             .unwrap_or_default()
             .iter()
+            .chain(sync.removed())
             .map(|location| tag_width(&location.name, theme, window))
             .fold(px(0.), Pixels::max);
         self.shows_calls = calls_fit(

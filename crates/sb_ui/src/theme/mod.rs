@@ -245,6 +245,10 @@ pub struct TypeScale {
     pub empty_title: TextSpec,
     /// 14/21 the paragraph under a state's title (`E-First-Run`).
     pub lead: TextSpec,
+    /// 15/20 a sheet's or a dialog's title.
+    pub sheet_title: TextSpec,
+    /// 11/16 JetBrains Mono: a tool's own words in a box of their own (DESIGN §4.11).
+    pub said: TextSpec,
 }
 
 impl TypeScale {
@@ -272,6 +276,8 @@ impl TypeScale {
             state_title: TextSpec::new(&fonts.ui, 22., 28., semibold),
             empty_title: TextSpec::new(&fonts.ui, 15., 20., semibold),
             lead: TextSpec::new(&fonts.ui, 14., 21., regular),
+            sheet_title: TextSpec::new(&fonts.ui, 15., 20., semibold),
+            said: TextSpec::new(&fonts.mono, 11., 16., regular),
         }
     }
 }
@@ -359,6 +365,23 @@ pub struct Sizes {
     pub window_min_height: Pixels,
     /// Below this window width the sidebar collapses (DESIGN §2, "Narrow windows").
     pub sidebar_collapse_width: Pixels,
+    /// The locations sheet, and its list (DESIGN §1.4).
+    pub sheet_width: Pixels,
+    pub sheet_height: Pixels,
+    pub sheet_list_width: Pixels,
+    /// How far a sheet or a dialog keeps from the window's edges and the title bar.
+    pub overlay_margin: Pixels,
+    /// A dialog's width and greatest height (DESIGN §4.12: 440 × up to 760).
+    pub dialog_width: Pixels,
+    pub dialog_max_height: Pixels,
+    /// A segment of a segmented control (DESIGN §1.4).
+    pub segment_height: Pixels,
+    /// A radio button (`.radio`).
+    pub radio: Pixels,
+    /// A location's kind tile in the locations sheet (DESIGN §4.11).
+    pub location_tile: Pixels,
+    /// The label column of a key/value row (`.kv`).
+    pub kv_label_width: Pixels,
 }
 
 impl Default for Sizes {
@@ -406,6 +429,16 @@ impl Default for Sizes {
             window_min_width: px(960.),
             window_min_height: px(600.),
             sidebar_collapse_width: px(1040.),
+            sheet_width: px(1200.),
+            sheet_height: px(790.),
+            sheet_list_width: px(540.),
+            overlay_margin: px(24.),
+            dialog_width: px(440.),
+            dialog_max_height: px(760.),
+            segment_height: px(22.),
+            radio: px(14.),
+            location_tile: px(32.),
+            kv_label_width: px(128.),
         }
     }
 }

@@ -8,9 +8,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use gpui::{App, QuitMode, px, size};
 use sb_core::location::LocationKind;
+use sb_core::transport::wsl;
 use sb_ui::ActiveTheme as _;
 use sb_ui::appearance::MaterialSupport;
-use sb_ui::services::{Connect, ServicesConfig};
+use sb_ui::services::{Reach, ServicesConfig};
 
 use crate::cli::Cli;
 
@@ -58,20 +59,23 @@ fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
     }
     // Light or dark and the material, before the first frame.
     sb_ui::appearance::init(MaterialSupport::probe(), cli.theme.unwrap_or_default(), cx);
+    let reach = Reach {
+        connect: Arc::new(LocationKind::transport),
+        tester: Arc::new(sb_ui::services::probe),
+        distros: Arc::new(wsl::distros),
+    };
     // A scripted run reaches only what its scenario put there.
     #[cfg(feature = "automation")]
-    let connect: Connect = if cli.automation_enabled() {
-        Arc::new(crate::automation::connect)
+    let reach = if cli.automation_enabled() {
+        crate::automation::stand_ins()
     } else {
-        Arc::new(LocationKind::transport)
+        reach
     };
-    #[cfg(not(feature = "automation"))]
-    let connect: Connect = Arc::new(LocationKind::transport);
     sb_ui::services::init(
         ServicesConfig {
             archive_dir: data_dir.join(ARCHIVE),
             providers: sb_core::provider::builtin(),
-            connect,
+            reach,
         },
         cx,
     );
