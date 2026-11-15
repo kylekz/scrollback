@@ -65,10 +65,14 @@ sb_icons! {
     Monitor => "monitor",
     PanelLeft => "panel-left",
     Plus => "plus",
+    // A tool call of no kind in particular (DESIGN §1.5 "puzzle", as the boards draw it).
+    Puzzle => "puzzle",
     RefreshCw => "refresh-cw",
     Search => "search",
     Settings => "settings",
     Star => "star",
+    // The star of a starred session: filled (DESIGN §4.2.1).
+    StarFilled => "star-filled",
     Trash => "trash-2",
     TriangleAlert => "triangle-alert",
     X => "x",

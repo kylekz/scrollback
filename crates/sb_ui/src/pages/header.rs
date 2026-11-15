@@ -7,7 +7,7 @@ use gpui::{
 };
 
 use crate::automation::AutomationTargetExt as _;
-use crate::components::page_tile;
+use crate::components::{page_tile, with_numbers};
 use crate::format;
 use crate::icons::SbIcon;
 use crate::services::Stats;
@@ -64,7 +64,7 @@ pub fn header(
                             div()
                                 .flex()
                                 .flex_col()
-                                .child(div().text_spec(&theme.text.stat).child(value))
+                                .child(stat_value(value, theme))
                                 .child(
                                     div()
                                         .text_color(c.fg3)
@@ -75,12 +75,30 @@ pub fn header(
                         .into_any_element(),
                     Under::Line(line) => div()
                         .max_w(px(760.))
-                        .text_color(c.fg2)
-                        .child(line)
+                        .child(with_numbers(line, c.fg2, &theme.text.body, theme))
                         .into_any_element(),
                 }),
         )
         .automation_target("page/header")
+}
+
+/// A stat's value in the face for numbers. Geist Mono's en dash is as narrow as its hyphen, so
+/// a span's dash ("Nov 2025 – Nov 2026", DESIGN §4.4) is drawn in the UI face.
+fn stat_value(value: String, theme: &SbTheme) -> AnyElement {
+    let Some((from, to)) = value.split_once(" – ") else {
+        return div()
+            .text_spec(&theme.text.stat)
+            .child(value)
+            .into_any_element();
+    };
+    div()
+        .flex()
+        .gap(theme.spacing.sm)
+        .text_spec(&theme.text.stat)
+        .child(from.to_string())
+        .child(div().font_family(theme.fonts.ui.clone()).child("–"))
+        .child(to.to_string())
+        .into_any_element()
 }
 
 /// The four stats as their values and labels, one of a thing in the singular. A page with no

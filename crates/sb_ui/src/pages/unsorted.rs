@@ -19,8 +19,8 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Pixels, Render, Role, ScrollStrategy, SharedString, Size,
+    AnyElement, ClickEvent, Context, Div, Entity, FocusHandle, InteractiveElement as _,
+    IntoElement, ParentElement as _, Pixels, Render, Role, ScrollStrategy, SharedString, Size,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
     prelude::FluentBuilder as _, px, size,
 };
@@ -31,7 +31,7 @@ use sb_core::catalogue::{PathGroup, Session, SessionId};
 use super::header::{Under, header};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{ButtonKind, button, icon, icon_button, location_tag};
+use crate::components::{ButtonKind, button, focus_ring, icon, icon_button, location_tag};
 use crate::format;
 use crate::icons::SbIcon;
 use crate::services::{
@@ -111,11 +111,14 @@ pub struct UnsortedView {
     sizes: Rc<Vec<Size<Pixels>>>,
     /// The items are of what the library held before it last changed.
     stale: bool,
+    /// Where the keyboard rests in the main area: while it is there, the selected row has
+    /// the keyboard's ring.
+    focus: FocusHandle,
     _observers: [Subscription; 2],
 }
 
 impl UnsortedView {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(focus: FocusHandle, cx: &mut Context<Self>) -> Self {
         let services = cx.services();
         let (library, sync) = (services.library.clone(), services.sync.clone());
         Self {
@@ -134,6 +137,7 @@ impl UnsortedView {
             items: Vec::new(),
             sizes: Rc::default(),
             stale: true,
+            focus,
         }
     }
 
@@ -277,15 +281,18 @@ impl UnsortedView {
         }
     }
 
+    /// The list's items in `range`. Each keeps the page's side padding at its right, so that
+    /// the list, and its scrollbar, reach the main area's edge.
     fn render_items(
         &mut self,
         range: Range<usize>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let theme = cx.sb_theme().clone();
         let c = &theme.colors;
         let now = format::now();
+        let keyboard = self.focus.is_focused(window) && window.last_input_was_keyboard();
         let groups = self.library.read(cx).groups();
         range
             .filter_map(|at| {
@@ -314,7 +321,7 @@ impl UnsortedView {
                         at,
                         (of, row),
                         group.sessions.get(row)?,
-                        now,
+                        (now, keyboard),
                         &theme,
                         cx,
                     ),
@@ -323,6 +330,7 @@ impl UnsortedView {
                 Some(
                     div()
                         .w_full()
+                        .pr(theme.sizes.page_side)
                         .when(last, |this| this.pb(theme.spacing.lg))
                         .child(part)
                         .into_any_element(),
@@ -480,7 +488,8 @@ impl UnsortedView {
     }
 
     /// A session's row (DESIGN §4.6): its title and the start of its prompt, its agent's mark
-    /// and model, when it ended, and its tool calls.
+    /// and model, when it ended, and its tool calls. `keyboard` says the keyboard is on the
+    /// page, and so on the selected row.
     #[expect(clippy::too_many_arguments)]
     fn row(
         &self,
@@ -488,7 +497,7 @@ impl UnsortedView {
         at: usize,
         (group, row): (usize, usize),
         session: &Session,
-        now: i64,
+        (now, keyboard): (i64, bool),
         theme: &SbTheme,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -515,6 +524,7 @@ impl UnsortedView {
             .map(|this| {
                 if selected {
                     this.bg(c.s3)
+                        .when(keyboard, |this| this.shadow(focus_ring(true, theme)))
                 } else {
                     this.hover(|style| style.bg(c.s1))
                 }
@@ -700,22 +710,21 @@ impl Render for UnsortedView {
                         .automation_target("unsorted/summary"),
                 )
                 .child(
-                    // The scrollbar is in the page's side padding, clear of the rows.
+                    // The list reaches the main area's edge, and its scrollbar sits in the
+                    // page's side padding, clear of the rows ([`Self::render_items`]).
                     div()
                         .relative()
                         .flex_1()
                         .min_h_0()
                         .mr(-theme.sizes.page_side)
                         .child(
-                            div().size_full().pr(theme.sizes.page_side).child(
-                                v_virtual_list(
-                                    cx.entity(),
-                                    "groups",
-                                    self.sizes.clone(),
-                                    Self::render_items,
-                                )
-                                .track_scroll(&self.scroll),
-                            ),
+                            v_virtual_list(
+                                cx.entity(),
+                                "groups",
+                                self.sizes.clone(),
+                                Self::render_items,
+                            )
+                            .track_scroll(&self.scroll),
                         )
                         .child(Scrollbar::vertical(&self.scroll)),
                 )

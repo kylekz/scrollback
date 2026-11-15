@@ -11,25 +11,29 @@
 //!
 //! Filters, sort, the list view and the hover bar's other actions come with later tasks.
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Pixels, Render, Role, ScrollStrategy, SharedString, Size,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, point,
-    prelude::FluentBuilder as _, px, size,
+    AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, FocusHandle,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, Role, ScrollStrategy,
+    SharedString, Size, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
+    point, prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::scroll::Scrollbar;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use sb_core::catalogue::{Filed, Session, SessionId, Shelf};
+use sb_core::filing::FolderId;
+use sb_core::location::LocationId;
 
 use super::first_sync;
 use super::header::{Under, header};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
-    Tone, icon, location_tag, overline, tag, tag_width, text_width, warn_chip,
+    Tone, focus_ring, icon, location_tag, overline, tag, tag_width, text_width, warn_chip,
 };
 use crate::format;
 use crate::icons::SbIcon;
@@ -56,33 +60,119 @@ const HELD_BACK: &str = "held back";
 
 /// The least of a model's name a card's last line keeps room for when it decides whether the
 /// tool calls fit.
-const MODEL_MIN: Pixels = px(40.);
+const MODEL_MIN: Pixels = px(20.);
+
+/**
+ * The widest of each piece the last line of a page's cards can hold (DESIGN §4.4), but for
+ * the agent's mark and the model's name: the mark is always there, and the model takes what
+ * the rest leave it.
+ */
+#[derive(Clone, Debug, Default, PartialEq)]
+struct LinePieces {
+    /// The tag of each location the page's sessions are from, as wide as it is uncapped.
+    locations: Vec<Pixels>,
+    /// The tag of each subfolder the page's sessions are filed in, likewise.
+    subfolders: Vec<Pixels>,
+    /// The "held back" chip, when one of the page's sessions has it.
+    held: Option<Pixels>,
+    /// One of the page's sessions is filed by hand: its line ends in the hand glyph.
+    by_hand: bool,
+    /// The widest day.
+    day: Pixels,
+    /// The widest call count, without its glyph.
+    calls: Pixels,
+}
 
 /**
  * Whether the cards of a page show their tool calls (DESIGN §4.4), decided for the page and
  * not card by card, so that neighbours read alike: whether a card `inner` wide inside its
- * padding and border fits the agent's mark, [`MODEL_MIN`] of a model's name, the widest
- * location's tag (`tag`), and a day with a call count as wide as the page's widest
- * (`day_and_calls`), with the gaps between them. Whatever the answer, the location's tag and
- * the day show whole and the model's name takes the rest of its card.
+ * padding and border fits a line holding every piece the page's lines can hold, each as wide
+ * as the widest (`line`), the tags at their caps, [`MODEL_MIN`] of a model's name and the
+ * gaps between them. Whatever the answer the day shows whole: the model's name gives way
+ * first, then the tags.
  */
-fn calls_fit(inner: Pixels, tag: Pixels, day_and_calls: Pixels, theme: &SbTheme) -> bool {
-    theme.sizes.icon_xs + MODEL_MIN + tag + day_and_calls + theme.spacing.sm * 3. <= inner
+fn calls_fit(inner: Pixels, line: &LinePieces, theme: &SbTheme) -> bool {
+    let sizes = &theme.sizes;
+    let widest = |tags: &[Pixels], cap: Pixels| {
+        tags.iter()
+            .copied()
+            .reduce(Pixels::max)
+            .map(|widest| widest.min(cap))
+    };
+    let pieces: Vec<Pixels> = [
+        Some(sizes.icon_xs),
+        Some(MODEL_MIN),
+        widest(&line.locations, sizes.location_tag_max_width),
+        widest(&line.subfolders, sizes.tag_max_width),
+        line.held,
+        Some(line.day),
+        Some(sizes.icon_xs + theme.spacing.xs + line.calls),
+        line.by_hand.then_some(sizes.icon_xs),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    pieces.iter().copied().sum::<Pixels>() + theme.spacing.sm * (pieces.len() - 1) as f32 <= inner
 }
 
-/// A day and a call count as wide as the widest a page of `stats` and `most_calls` shows:
-/// the day of its oldest session, with a two-digit day, and the most calls a session made.
-fn widest_day_and_calls(stats: &Stats, most_calls: u32, now: i64) -> String {
+/// What the last lines of a page's cards hold, from its sessions: what [`LinePieces`] measures.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct PageLine {
+    locations: Vec<LocationId>,
+    subfolders: Vec<FolderId>,
+    held: bool,
+    by_hand: bool,
+    /// A day as wide as the widest the page shows ([`widest_day`]).
+    day: String,
+    most_calls: u32,
+}
+
+impl PageLine {
+    fn of(page: &SessionsPage, shelf: Shelf, now: i64) -> Self {
+        let mut line = Self {
+            day: widest_day(&page.stats, now),
+            ..Self::default()
+        };
+        for session in &page.sessions {
+            if !line.locations.contains(&session.id.location) {
+                line.locations.push(session.id.location.clone());
+            }
+            if let Some(folder) = subfolder_of(session, shelf)
+                && !line.subfolders.contains(&folder)
+            {
+                line.subfolders.push(folder);
+            }
+            line.held |= session.held_back;
+            line.by_hand |= matches!(session.filed, Filed::ByHand(_));
+            line.most_calls = line.most_calls.max(session.all.calls);
+        }
+        line
+    }
+}
+
+/// The folder inside the one whose page `shelf` is that `session` is filed in, whose tag its
+/// card carries (DESIGN §4.4).
+fn subfolder_of(session: &Session, shelf: Shelf) -> Option<FolderId> {
+    match (session.filed, shelf) {
+        (Filed::ByRule(folder) | Filed::ByHand(folder), Shelf::Folder(shown))
+            if folder != shown =>
+        {
+            Some(folder)
+        }
+        _ => None,
+    }
+}
+
+/// A day as wide as the widest a page of `stats` shows: the day of its oldest session, which
+/// carries its year if any does, with a two-digit day.
+fn widest_day(stats: &Stats, now: i64) -> String {
     let day = stats
         .span
         .map(|(oldest, _)| format::day(oldest, now))
         .unwrap_or_default();
     // Geist Mono's digits are all as wide: the month and the year are what differ.
     let month = day.find(' ').map_or("", |at| &day[at..]);
-    format!(
-        "28{month} · {}",
-        format::plural(most_calls as usize, "call")
-    )
+    format!("28{month}")
 }
 
 /// One item of the list of cards.
@@ -109,16 +199,21 @@ pub fn rows(months: &[Month], columns: usize) -> Vec<Row> {
     rows
 }
 
-/// How many cards fit a row `width` wide (DESIGN §2): four, then three, then two, each at
-/// least the card's minimum width.
+/**
+ * How many cards a row `width` wide holds (DESIGN §1.4, §2): the fewest that keep a card no
+ * wider than its maximum, which is four at 1440 and more as the window grows, and never fewer
+ * than two. A card stays at least its minimum width, which the narrowest window allows.
+ */
 pub fn columns(width: Pixels, theme: &SbTheme) -> usize {
-    (2..=4)
-        .rev()
-        .find(|columns| {
-            let gaps = theme.spacing.lg * (*columns as f32 - 1.);
-            (width - gaps) / *columns as f32 >= theme.sizes.card_min_width
-        })
-        .unwrap_or(2)
+    let card = |columns: usize| (width - theme.spacing.lg * (columns as f32 - 1.)) / columns as f32;
+    let mut columns = 2;
+    while card(columns) > theme.sizes.card_max_width {
+        columns += 1;
+    }
+    while columns > 2 && card(columns) < theme.sizes.card_min_width {
+        columns -= 1;
+    }
+    columns
 }
 
 /// A card's height: its padding, the title's line, the prompt's two, the last line and the
@@ -215,19 +310,25 @@ pub struct SessionsView {
     columns: usize,
     /// How wide a card is, as far as the window's width says.
     card_width: Pixels,
-    /// The widest day and call count the page shows ([`widest_day_and_calls`]).
-    day_and_calls: String,
+    /// What the last lines of the page's cards hold.
+    line: PageLine,
     /// Whether the cards show their tool calls ([`calls_fit`]).
     shows_calls: bool,
+    /// The names of the locations and folders whose tags on a card end in an ellipsis, which
+    /// say their name in full on hover.
+    cut_tags: HashSet<String>,
     /// The card under the pointer.
     hovered: Option<SessionId>,
     /// The rows are of what the library held before it last changed.
     stale: bool,
+    /// Where the keyboard rests in the main area: while it is there, the selected card has
+    /// the keyboard's ring.
+    focus: FocusHandle,
     _observers: [Subscription; 2],
 }
 
 impl SessionsView {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(focus: FocusHandle, cx: &mut Context<Self>) -> Self {
         let services = cx.services();
         let (library, sync) = (services.library.clone(), services.sync.clone());
         Self {
@@ -246,10 +347,12 @@ impl SessionsView {
             sizes: Rc::default(),
             columns: 0,
             card_width: px(0.),
-            day_and_calls: String::new(),
+            line: PageLine::default(),
             shows_calls: false,
+            cut_tags: HashSet::new(),
             hovered: None,
             stale: true,
+            focus,
         }
     }
 
@@ -276,26 +379,44 @@ impl SessionsView {
             let page = self.library.read(cx).sessions();
             self.rows = page.map_or_else(Vec::new, |page| rows(&page.months, columns));
             self.sizes = Rc::new(row_sizes(&self.rows, theme));
-            self.day_and_calls = page.map_or_else(String::new, |page| {
-                let most = page.sessions.iter().map(|it| it.all.calls).max();
-                widest_day_and_calls(&page.stats, most.unwrap_or(0), format::now())
+            self.line = page.map_or_else(PageLine::default, |page| {
+                PageLine::of(page, shelf, format::now())
             });
         }
-        // The locations may arrive, or be renamed, after the sessions.
-        let tag = self
-            .sync
-            .read(cx)
-            .locations()
-            .unwrap_or_default()
-            .iter()
-            .map(|location| tag_width(&location.name, theme, window))
-            .fold(px(0.), Pixels::max);
-        self.shows_calls = calls_fit(
-            self.card_width - CARD_PADDING * 2. - px(2.),
-            tag,
-            text_width(&self.day_and_calls, &theme.text.count, window),
-            theme,
-        );
+        // The locations may arrive, or be renamed, after the sessions; and so may the folders.
+        let (sync, library) = (self.sync.read(cx), self.library.read(cx));
+        self.cut_tags.clear();
+        let mut measure = |name: &str, cap: Pixels| {
+            let width = tag_width(name, theme, window);
+            if width > cap {
+                self.cut_tags.insert(name.to_string());
+            }
+            width
+        };
+        let locations = (self.line.locations.iter())
+            .filter_map(|id| sync.location(id))
+            .map(|location| measure(&location.name, theme.sizes.location_tag_max_width))
+            .collect();
+        let subfolders = (self.line.subfolders.iter())
+            .filter_map(|id| library.folder(*id))
+            .map(|folder| measure(&folder.name, theme.sizes.tag_max_width))
+            .collect();
+        let pieces = LinePieces {
+            locations,
+            subfolders,
+            held: self
+                .line
+                .held
+                .then(|| text_width(HELD_BACK, &theme.text.small, window) + theme.spacing.sm * 2.),
+            by_hand: self.line.by_hand,
+            day: text_width(&self.line.day, &theme.text.count, window),
+            calls: text_width(
+                &format::count(u64::from(self.line.most_calls)),
+                &theme.text.count,
+                window,
+            ),
+        };
+        self.shows_calls = calls_fit(self.card_width - CARD_PADDING * 2. - px(2.), &pieces, theme);
     }
 
     /// Moves the selection (see [`moved`]); with nothing selected, selects the first session.
@@ -337,10 +458,12 @@ impl SessionsView {
         }
     }
 
+    /// The list's rows in `range`. Each keeps the page's side padding at its right, so that the
+    /// list, and its scrollbar, reach the main area's edge.
     fn render_rows(
         &mut self,
         range: Range<usize>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let theme = cx.sb_theme().clone();
@@ -349,21 +472,22 @@ impl SessionsView {
             return Vec::new();
         };
         let now = format::now();
+        let keyboard = self.focus.is_focused(window) && window.last_input_was_keyboard();
         range
             .filter_map(|at| self.rows.get(at))
             .map(|row| match row {
                 Row::Month(month) => div()
+                    .pr(theme.sizes.page_side)
                     .child(overline(&month_name(&page.months[*month]), &theme))
                     .into_any_element(),
                 Row::Cards(sessions) => div()
                     .w_full()
                     .flex()
                     .gap(theme.spacing.lg)
-                    .children(
-                        sessions
-                            .clone()
-                            .map(|index| self.card(index, &page.sessions[index], now, &theme, cx)),
-                    )
+                    .pr(theme.sizes.page_side)
+                    .children(sessions.clone().map(|index| {
+                        self.card(index, &page.sessions[index], now, keyboard, &theme, cx)
+                    }))
                     // A short row's cards stay as wide as a full one's: what fills the row
                     // takes a card's padding and border too.
                     .children((sessions.len()..self.columns).map(|_| {
@@ -379,20 +503,38 @@ impl SessionsView {
             .collect()
     }
 
+    /// A tag on a card's last line, no wider than `cap`; one that has to end in an ellipsis
+    /// says its name in full on hover.
+    fn line_tag(&self, id: ElementId, tag: Div, name: &str, cap: Pixels) -> AnyElement {
+        let tag = tag.flex_shrink(1.).min_w_0().max_w(cap);
+        if !self.cut_tags.contains(name) {
+            return tag.into_any_element();
+        }
+        let name = SharedString::from(name.to_string());
+        tag.id(id)
+            .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx))
+            .into_any_element()
+    }
+
     /// A session's card (DESIGN §4.4): its title, the start of its first prompt on two lines,
-    /// then its agent's mark and model, where it is from, and when it ended and how many
-    /// tool calls it made.
+    /// then its agent's mark and model, where it is from, when it ended and how many tool
+    /// calls it made. `keyboard` says the keyboard is on the page, and so on the selected
+    /// card.
     fn card(
         &self,
         index: usize,
         session: &Session,
         now: i64,
+        keyboard: bool,
         theme: &SbTheme,
         cx: &Context<Self>,
     ) -> AnyElement {
         let c = &theme.colors;
         let library = self.library.read(cx);
         let selected = library.selected_index() == Some(index);
+        // With nothing selected, the keyboard on the page is on its first card, where the arrows
+        // start.
+        let ringed = keyboard && library.selected_index().unwrap_or(0) == index;
         // The hover bar shows on the selected card and on the one under the pointer.
         let barred = selected || self.hovered.as_ref() == Some(&session.id);
         let title: SharedString = session
@@ -410,28 +552,17 @@ impl SessionsView {
             .collect::<Vec<_>>()
             .join(" · ");
         // On a folder's page a tag names the folder of a session from one inside it.
-        let subfolder = match (session.filed, library.shelf()) {
-            (Filed::ByRule(folder) | Filed::ByHand(folder), Shelf::Folder(shown))
-                if folder != shown =>
-            {
-                library.folder(folder)
-            }
-            _ => None,
-        };
+        let subfolder = subfolder_of(session, library.shelf()).and_then(|it| library.folder(it));
         let location = self.sync.read(cx).location(&session.id.location);
         let by_hand = matches!(session.filed, Filed::ByHand(_));
         // The day always shows, and the calls on a page whose cards have room for them, but
         // none where there were none.
         let calls = (self.shows_calls && session.all.calls > 0)
-            .then(|| format::plural(session.all.calls as usize, "call"));
-        let when = session
+            .then(|| format::count(u64::from(session.all.calls)));
+        let day = session
             .ended
             .or(session.started)
-            .map(|ended| format::day(ended, now))
-            .into_iter()
-            .chain(calls)
-            .collect::<Vec<_>>()
-            .join(" · ");
+            .map(|ended| format::day(ended, now));
 
         let id = session.id.clone();
         let star = div()
@@ -457,11 +588,11 @@ impl SessionsView {
                         .update(cx, |library, cx| library.toggle_star(&id, index, cx));
                 }
             }))
-            .child(icon(
-                SbIcon::Star,
-                theme.sizes.icon_sm,
-                if session.starred { c.yellow } else { c.fg2 },
-            ))
+            .child(if session.starred {
+                icon(SbIcon::StarFilled, theme.sizes.icon_sm, c.yellow)
+            } else {
+                icon(SbIcon::Star, theme.sizes.icon_sm, c.fg2)
+            })
             .automation_target_with(move || format!("card/{index}/star").into());
         div()
             .id(("card", index))
@@ -482,7 +613,9 @@ impl SessionsView {
             .bg(c.s1)
             .border_1()
             .map(|this| {
-                if selected {
+                if ringed {
+                    this.border_color(c.accent).shadow(focus_ring(false, theme))
+                } else if selected {
                     this.border_color(c.line_strong)
                         .shadow(theme.shadows.card.clone())
                 } else {
@@ -547,7 +680,7 @@ impl SessionsView {
                     )
                     // The bar's own star says so while it shows.
                     .when(session.starred && !barred, |this| {
-                        this.child(icon(SbIcon::Star, theme.sizes.icon_xs, c.yellow))
+                        this.child(icon(SbIcon::StarFilled, theme.sizes.icon_xs, c.yellow))
                     }),
             )
             .child(
@@ -570,33 +703,58 @@ impl SessionsView {
                     .text_spec(&theme.text.small)
                     .whitespace_nowrap()
                     .child(agents::mark(&session.id.provider, theme.sizes.icon_xs, cx))
-                    // Only the model's name gives way, to the room the rest leaves it.
+                    // The model's name takes the room the rest leave it, and gives way first.
                     .child(
                         div()
+                            .flex_1()
+                            .flex_basis(px(0.))
                             .min_w_0()
                             .overflow_hidden()
                             .text_ellipsis()
                             .child(model),
                     )
                     .children(location.map(|location| {
-                        location_tag(location.name.clone(), &location.kind, true, theme)
+                        self.line_tag(
+                            ("card-location", index).into(),
+                            location_tag(location.name.clone(), &location.kind, true, theme),
+                            &location.name,
+                            theme.sizes.location_tag_max_width,
+                        )
                     }))
                     .children(subfolder.map(|folder| {
-                        tag(folder.name.clone(), Tone::Neutral, true, theme)
-                            .max_w(theme.sizes.tag_max_width)
+                        self.line_tag(
+                            ("card-subfolder", index).into(),
+                            tag(folder.name.clone(), Tone::Neutral, true, theme),
+                            &folder.name,
+                            theme.sizes.tag_max_width,
+                        )
                     }))
                     .when(session.held_back, |this| {
                         this.child(warn_chip(HELD_BACK, theme))
                     })
-                    .child(
+                    .children(
+                        day.map(|day| div().flex_none().text_spec(&theme.text.count).child(day)),
+                    )
+                    .children(calls.map(|calls| {
                         div()
                             .flex_none()
-                            .ml_auto()
-                            .text_spec(&theme.text.count)
-                            .child(when),
-                    )
+                            .flex()
+                            .items_center()
+                            .gap(theme.spacing.xs)
+                            .child(icon(SbIcon::Puzzle, theme.sizes.icon_xs, c.fg3))
+                            .child(div().text_spec(&theme.text.count).child(calls))
+                            .automation_target_with(move || format!("card/{index}/calls").into())
+                    }))
                     .when(by_hand, |this| {
-                        this.child(icon(SbIcon::Hand, theme.sizes.icon_xs, c.fg3))
+                        this.child(
+                            div()
+                                .id(("card-by-hand", index))
+                                .flex_none()
+                                .tooltip(|window, cx| {
+                                    Tooltip::new("Filed by hand").build(window, cx)
+                                })
+                                .child(icon(SbIcon::Hand, theme.sizes.icon_xs, c.fg3)),
+                        )
                     }),
             )
             .child(
@@ -624,18 +782,20 @@ impl SessionsView {
 }
 
 /// A folder's attached paths as read-only chips (DESIGN §4.4), or what the line says while
-/// it has none.
+/// it has none. It is one line: where the chips don't fit, each gives way in its path.
 fn paths_line(paths: &[PathChip], folder: &str, sync: &SyncService, theme: &SbTheme) -> AnyElement {
     let c = &theme.colors;
     div()
         .flex_none()
         .flex()
-        .flex_wrap()
         .items_center()
         .gap(theme.spacing.md)
+        .h(theme.sizes.path_chip_height)
+        .overflow_hidden()
         .child(icon(SbIcon::Link, theme.sizes.icon_sm, c.fg3))
         .child(
             div()
+                .flex_none()
                 .mr(theme.spacing.xs)
                 .text_color(c.fg2)
                 .text_spec(&theme.text.control_small)
@@ -644,6 +804,10 @@ fn paths_line(paths: &[PathChip], folder: &str, sync: &SyncService, theme: &SbTh
         .when(paths.is_empty(), |this| {
             this.child(
                 div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
                     .text_color(c.fg3)
                     .text_spec(&theme.text.secondary)
                     .child(format!(
@@ -660,7 +824,7 @@ fn paths_line(paths: &[PathChip], folder: &str, sync: &SyncService, theme: &SbTh
             // A long path gives way in its middle; its location and its count stay whole.
             div()
                 .min_w_0()
-                .max_w_full()
+                .flex_shrink(1.)
                 .flex()
                 .items_center()
                 .gap(theme.spacing.sm)
@@ -828,22 +992,21 @@ impl Render for SessionsView {
                     this.child(empty(shelf, &title, sync.is_indexing(), &theme))
                 }
                 Some(_) => this.child(
-                    // The scrollbar is in the page's side padding, clear of the cards.
+                    // The list reaches the main area's edge, and its scrollbar sits in the
+                    // page's side padding, clear of the cards ([`Self::render_rows`]).
                     div()
                         .relative()
                         .flex_1()
                         .min_h_0()
                         .mr(-theme.sizes.page_side)
                         .child(
-                            div().size_full().pr(theme.sizes.page_side).child(
-                                v_virtual_list(
-                                    cx.entity(),
-                                    "cards",
-                                    self.sizes.clone(),
-                                    Self::render_rows,
-                                )
-                                .track_scroll(&self.scroll),
-                            ),
+                            v_virtual_list(
+                                cx.entity(),
+                                "cards",
+                                self.sizes.clone(),
+                                Self::render_rows,
+                            )
+                            .track_scroll(&self.scroll),
                         )
                         // The overline of the month at the top, over the list: the cards
                         // under it take no clicks through it.
@@ -890,27 +1053,51 @@ mod tests {
     }
 
     #[test]
-    fn cards_drop_from_four_columns_to_three_then_two() {
+    fn a_row_has_as_many_cards_as_keep_each_between_its_least_and_most_width() {
         let theme = SbTheme::new(Appearance::Dark, Material::Opaque);
-        // DESIGN §2: 1440 wide with the sidebar docked leaves 1144 for the cards.
+        // DESIGN §2: 1440 wide with the sidebar docked leaves 1144 for the cards: four of 277.
         assert_eq!(columns(px(1144.), &theme), 4);
-        // Four cards of 200 and three gaps of 12.
-        assert_eq!(columns(px(836.), &theme), 4);
-        assert_eq!(columns(px(835.), &theme), 3);
-        assert_eq!(columns(px(624.), &theme), 3);
-        assert_eq!(columns(px(623.), &theme), 2);
+        // Three cards of 320 and two gaps of 12; any wider and a fourth fits.
+        assert_eq!(columns(px(984.), &theme), 3);
+        assert_eq!(columns(px(985.), &theme), 4);
+        // 1040 with the sidebar docked, and 960 with it collapsed: three.
+        assert_eq!(columns(px(744.), &theme), 3);
+        assert_eq!(columns(px(912.), &theme), 3);
+        assert_eq!(columns(px(652.), &theme), 2);
+        // A very wide window: seven of 313, not four of 563.
+        assert_eq!(columns(px(2264.), &theme), 7);
         assert_eq!(columns(px(300.), &theme), 2);
     }
 
     #[test]
     fn the_calls_show_on_every_card_of_a_page_or_on_none() {
         let theme = SbTheme::new(Appearance::Dark, Material::Opaque);
-        // The mark (12), 40 of a model's name, a 70 tag, a 100 day and calls, three gaps of 6.
-        assert!(calls_fit(px(241.), px(70.), px(100.), &theme));
-        assert!(calls_fit(px(240.), px(70.), px(100.), &theme));
-        assert!(!calls_fit(px(239.), px(70.), px(100.), &theme));
-        // The widest location decides for every card, whichever location a card is from.
-        assert!(!calls_fit(px(240.), px(71.), px(100.), &theme));
+        let line = |locations: &[f32]| LinePieces {
+            locations: locations.iter().copied().map(px).collect(),
+            day: px(40.),
+            calls: px(20.),
+            ..LinePieces::default()
+        };
+        // The mark (12), 20 of a model's name, a 70 tag, a 40 day, the glyph (12), 4 and a
+        // 20 count, and four gaps of 6.
+        assert!(calls_fit(px(202.), &line(&[70.]), &theme));
+        assert!(!calls_fit(px(201.), &line(&[70.]), &theme));
+        // The widest location decides for every card, whichever location a card is from...
+        assert!(!calls_fit(px(201.), &line(&[40., 70.]), &theme));
+        assert!(!calls_fit(px(201.), &line(&[70., 40.]), &theme));
+        // ...at its cap of 80.
+        assert!(calls_fit(px(212.), &line(&[200., 70.]), &theme));
+        assert!(!calls_fit(px(211.), &line(&[200., 70.]), &theme));
+        // Every piece a line can hold is counted: a subfolder's tag at its cap of 96, the
+        // held-back chip, and the hand glyph, each with its gap.
+        let full = LinePieces {
+            subfolders: vec![px(50.), px(120.)],
+            held: Some(px(55.)),
+            by_hand: true,
+            ..line(&[70., 200.])
+        };
+        assert!(calls_fit(px(393.), &full, &theme));
+        assert!(!calls_fit(px(392.), &full, &theme));
     }
 
     #[test]
@@ -928,18 +1115,9 @@ mod tests {
             span: Some((oldest, now)),
             locations: 1,
         };
-        assert_eq!(
-            widest_day_and_calls(&stats(at(2026, 11, 2)), 1, now),
-            "28 Nov · 1 call"
-        );
-        assert_eq!(
-            widest_day_and_calls(&stats(at(2025, 12, 3)), 1234, now),
-            "28 Dec 2025 · 1,234 calls"
-        );
-        assert_eq!(
-            widest_day_and_calls(&Stats::default(), 0, now),
-            "28 · 0 calls"
-        );
+        assert_eq!(widest_day(&stats(at(2026, 11, 2)), now), "28 Nov");
+        assert_eq!(widest_day(&stats(at(2025, 12, 3)), now), "28 Dec 2025");
+        assert_eq!(widest_day(&Stats::default(), now), "28");
     }
 
     #[test]

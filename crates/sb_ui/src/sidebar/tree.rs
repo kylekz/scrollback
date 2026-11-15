@@ -15,12 +15,6 @@ pub struct TreeRow {
     pub depth: usize,
     pub has_children: bool,
     pub open: bool,
-    /**
-     * Whether the row keeps room for a chevron before its icon: every top-level row does, and
-     * a nested one does when a folder beside it has children, so that the names of the
-     * folders in one folder line up (`E-Folder` draws a nested row without the room).
-     */
-    pub chevron_room: bool,
 }
 
 /// The rows that show of `folders`, which are in the catalogue's order (those with one parent
@@ -32,19 +26,14 @@ pub fn rows(folders: &[Folder], open: &HashSet<FolderId>) -> Vec<TreeRow> {
     }
     let mut rows = Vec::with_capacity(folders.len());
     // Depth first: the folders still to show, the next one last.
-    let mut pending: Vec<(usize, usize, bool)> = Vec::new();
-    let push = |pending: &mut Vec<(usize, usize, bool)>, parent, depth: usize| {
-        let Some(inside) = children.get(&parent) else {
-            return;
-        };
-        let room = depth == 0
-            || inside
-                .iter()
-                .any(|at| children.contains_key(&Some(folders[*at].id)));
-        pending.extend(inside.iter().rev().map(|at| (*at, depth, room)));
+    let mut pending: Vec<(usize, usize)> = Vec::new();
+    let push = |pending: &mut Vec<(usize, usize)>, parent, depth: usize| {
+        if let Some(inside) = children.get(&parent) {
+            pending.extend(inside.iter().rev().map(|at| (*at, depth)));
+        }
     };
     push(&mut pending, None, 0);
-    while let Some((at, depth, chevron_room)) = pending.pop() {
+    while let Some((at, depth)) = pending.pop() {
         let id = folders[at].id;
         let has_children = children.contains_key(&Some(id));
         let is_open = has_children && open.contains(&id);
@@ -53,7 +42,6 @@ pub fn rows(folders: &[Folder], open: &HashSet<FolderId>) -> Vec<TreeRow> {
             depth,
             has_children,
             open: is_open,
-            chevron_room,
         });
         if is_open {
             push(&mut pending, Some(id), depth + 1);
@@ -100,7 +88,7 @@ mod tests {
         ]
     }
 
-    fn shown(folders: &[Folder], open: &[i64]) -> Vec<(String, usize, bool, bool, bool)> {
+    fn shown(folders: &[Folder], open: &[i64]) -> Vec<(String, usize, bool, bool)> {
         rows(folders, &open.iter().copied().map(FolderId).collect())
             .into_iter()
             .map(|row| {
@@ -109,7 +97,6 @@ mod tests {
                     row.depth,
                     row.has_children,
                     row.open,
-                    row.chevron_room,
                 )
             })
             .collect()
@@ -121,9 +108,9 @@ mod tests {
         assert_eq!(
             shown(&folders, &[]),
             [
-                ("dv".to_string(), 0, true, false, true),
-                ("fc".to_string(), 0, true, false, true),
-                ("folio".to_string(), 0, false, false, true),
+                ("dv".to_string(), 0, true, false),
+                ("fc".to_string(), 0, true, false),
+                ("folio".to_string(), 0, false, false),
             ]
         );
     }
@@ -134,25 +121,23 @@ mod tests {
         assert_eq!(
             shown(&folders, &[2]),
             [
-                ("dv".to_string(), 0, true, false, true),
-                ("fc".to_string(), 0, true, true, true),
-                // `player` has a folder in it, so both rows keep room for a chevron.
-                ("player".to_string(), 1, true, false, true),
-                ("import".to_string(), 1, false, false, true),
-                ("folio".to_string(), 0, false, false, true),
+                ("dv".to_string(), 0, true, false),
+                ("fc".to_string(), 0, true, true),
+                ("player".to_string(), 1, true, false),
+                ("import".to_string(), 1, false, false),
+                ("folio".to_string(), 0, false, false),
             ]
         );
         assert_eq!(
             shown(&folders, &[1, 2, 5]),
             [
-                ("dv".to_string(), 0, true, true, true),
-                // None of `dv`'s folders has one in it: no room for a chevron.
-                ("dv-wsl-backend".to_string(), 1, false, false, false),
-                ("fc".to_string(), 0, true, true, true),
-                ("player".to_string(), 1, true, true, true),
-                ("hwdec".to_string(), 2, false, false, false),
-                ("import".to_string(), 1, false, false, true),
-                ("folio".to_string(), 0, false, false, true),
+                ("dv".to_string(), 0, true, true),
+                ("dv-wsl-backend".to_string(), 1, false, false),
+                ("fc".to_string(), 0, true, true),
+                ("player".to_string(), 1, true, true),
+                ("hwdec".to_string(), 2, false, false),
+                ("import".to_string(), 1, false, false),
+                ("folio".to_string(), 0, false, false),
             ]
         );
     }

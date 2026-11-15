@@ -100,17 +100,18 @@
 {"cmd": "settle", "expect": {"pointer": "/library/groups", "equals": 6}}
 {"cmd": "screenshot", "name": "unsorted-light"}
 
-// The minimum window size (DESIGN §2): the sidebar collapses and the cards keep four columns of at least 200.
+// The minimum window size (DESIGN §2): the sidebar collapses, and the cards take three columns, the fewest that keep a card no wider than 320.
 {"cmd": "pin_appearance", "appearance": "dark"}
 {"cmd": "resize", "w": 960, "h": 600, "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
 {"cmd": "screenshot", "name": "unsorted-960x600"}
 {"cmd": "key", "keystroke": "secondary-b", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
 {"cmd": "click", "target": "sidebar/folder/fc", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
 {"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 488}}
-{"cmd": "bounds", "target": "card/0", "expect_result": [{"pointer": "/x", "equals": 24}, {"pointer": "/w", "equals": 219}, {"pointer": "/h", "equals": 112}]}
-{"cmd": "bounds", "target": "card/3", "expect_result": [{"pointer": "/x", "equals": 717}, {"pointer": "/w", "equals": 219}]}
+{"cmd": "bounds", "target": "card/0", "expect_result": [{"pointer": "/x", "equals": 24}, {"pointer": "/w", "equals": 296}, {"pointer": "/h", "equals": 112}]}
+{"cmd": "bounds", "target": "card/2", "expect_result": [{"pointer": "/x", "equals": 640}, {"pointer": "/w", "equals": 296}]}
+{"cmd": "bounds", "target": "card/3", "expect_result": {"pointer": "/x", "equals": 24}}
 {"cmd": "screenshot", "name": "folder-960x600"}
-// Between 836 and 624 of card room there are three columns: at 1040 the sidebar docks and leaves 744.
+// At 1040 the sidebar docks and leaves 744: three columns of 240.
 {"cmd": "resize", "w": 1040, "h": 700, "expect": {"pointer": "/shell/sidebar", "equals": "docked"}}
 {"cmd": "bounds", "target": "card/2", "expect_result": [{"pointer": "/x", "equals": 776}, {"pointer": "/w", "equals": 240}]}
 {"cmd": "bounds", "target": "card/3", "expect_result": {"pointer": "/x", "equals": 272}}

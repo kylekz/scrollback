@@ -10,7 +10,9 @@ use sb_core::catalogue::Shelf;
 
 use super::sessions::SessionsView;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{BANNER_GAP, ButtonKind, button, icon, kind_icon, progress_bar};
+use crate::components::{
+    BANNER_GAP, ButtonKind, button, icon, kind_icon, progress_bar, with_numbers,
+};
 use crate::format;
 use crate::icons::SbIcon;
 use crate::services::{LocationStatus, PassProgress, SyncService};
@@ -119,15 +121,15 @@ pub fn card(first_sync: &FirstSync, theme: &SbTheme, cx: &Context<SessionsView>)
                 .items_center()
                 .gap(theme.spacing.md)
                 .child(div().text_spec(&theme.text.title).child("First sync"))
-                .child(
-                    div()
-                        .text_color(c.fg3)
-                        .text_spec(&theme.text.secondary)
-                        .child(match time_left(first_sync, format::now()) {
-                            Some(left) => format!("{started} · {left}"),
-                            None => started,
-                        }),
-                )
+                .child(div().text_spec(&theme.text.secondary).child(with_numbers(
+                    match time_left(first_sync, format::now()) {
+                        Some(left) => format!("{started} · {left}"),
+                        None => started,
+                    },
+                    c.fg3,
+                    &theme.text.secondary,
+                    theme,
+                )))
                 .child(
                     button("first-sync-stop", ButtonKind::Plain, true, true, theme)
                         .ml_auto()

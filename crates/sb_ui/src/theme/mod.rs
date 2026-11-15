@@ -311,6 +311,8 @@ pub struct Sizes {
     pub tag_small_height: Pixels,
     /// The widest a subfolder's tag is on a card before its name ends in an ellipsis.
     pub tag_max_width: Pixels,
+    /// The widest a location's tag is on a card, likewise.
+    pub location_tag_max_width: Pixels,
     /// Icons (DESIGN §1.5): 12, 14, 16 and 18.
     pub icon_xs: Pixels,
     pub icon_sm: Pixels,
@@ -333,8 +335,10 @@ pub struct Sizes {
     pub page_side: Pixels,
     /// The icon tile of a page's header.
     pub page_tile: Pixels,
-    /// A session card is a quarter of its row less the gap, and never narrower than this.
+    /// A session card is a quarter of its row less the gap at 1440, and never narrower than
+    /// the first; a wider window has more columns, so a card is never wider than the second.
     pub card_min_width: Pixels,
+    pub card_max_width: Pixels,
     /// The two lines of a card's prompt (`design/project/sb.css`: a 36px box of 12/16 text).
     pub card_prompt_height: Pixels,
     pub list_row_height: Pixels,
@@ -378,6 +382,7 @@ impl Default for Sizes {
             tag_height: px(18.),
             tag_small_height: px(16.),
             tag_max_width: px(96.),
+            location_tag_max_width: px(80.),
             icon_xs: px(12.),
             icon_sm: px(14.),
             icon: px(16.),
@@ -392,6 +397,7 @@ impl Default for Sizes {
             page_side: px(24.),
             page_tile: px(56.),
             card_min_width: px(200.),
+            card_max_width: px(320.),
             card_prompt_height: px(36.),
             list_row_height: px(34.),
             group_head_height: px(44.),
