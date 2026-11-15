@@ -15,7 +15,8 @@
 //!   (what was applied to the window) and `window_native` (macOS: what AppKit reports, `forced`
 //!   light or dark or `null`, `opaque` and `vibrancy_view`; `null` elsewhere).
 //!
-//! Commands, each replying with `state.appearance` after the change:
+//! Commands, each replying with `state.appearance` after the change. An argument a command
+//! doesn't have is an error, so a misspelt one never passes for a change:
 //! - `pin_appearance {appearance}` pins `light` or `dark` whatever the mode and the OS say, so
 //!   a scenario looks the same on every machine; `null` lifts the pin.
 //! - `set_appearance {mode?, material?}` changes what scrollback asks for, as Settings ›
@@ -23,11 +24,12 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Context, Entity, Window};
 use gpui_appearance::{Appearance, Material, Mode};
 use gpui_automation::AutomationHost;
 use sb_ui::Shell;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 /// The entity `gpui_automation` drives: the shell it describes.
@@ -72,11 +74,23 @@ impl AutomationHost for ScrollbackAutomation {
         cx: &mut Context<Self>,
     ) -> Option<Result<Value>> {
         let result = match cmd {
-            "pin_appearance" => pin_appearance(&args, cx),
-            "set_appearance" => set_appearance(&args, cx),
+            "pin_appearance" => serde_json::from_value(args)
+                .map(|PinAppearance { appearance }| gpui_appearance::pin(appearance, cx)),
+            "set_appearance" => {
+                serde_json::from_value(args).map(|SetAppearance { mode, material }| {
+                    let mut preferences = gpui_appearance::state(cx).preferences();
+                    preferences.mode = mode.unwrap_or(preferences.mode);
+                    preferences.material = material.unwrap_or(preferences.material);
+                    gpui_appearance::set_preferences(preferences, cx);
+                })
+            }
             _ => return None,
         };
-        Some(result.map(|()| appearance(cx)))
+        Some(
+            result
+                .map(|()| appearance(cx))
+                .with_context(|| format!("{cmd}'s arguments")),
+        )
     }
 }
 
@@ -104,42 +118,21 @@ fn appearance(cx: &App) -> Value {
 }
 
 /// `pin_appearance {"appearance": "light" | "dark" | null}`.
-fn pin_appearance(args: &Value, cx: &mut App) -> Result<()> {
-    let appearance = match args.get("appearance") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(key)) => Some(
-            Appearance::from_key(key)
-                .ok_or_else(|| anyhow!("appearance must be light, dark or null, not {key:?}"))?,
-        ),
-        Some(other) => bail!("appearance must be light, dark or null, not {other}"),
-    };
-    gpui_appearance::pin(appearance, cx);
-    Ok(())
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinAppearance {
+    /// `null` lifts the pin. `deserialize_with` makes the key required, where serde would read
+    /// a missing `Option` as `None`: a command without it must not lift the pin.
+    #[serde(deserialize_with = "Option::deserialize")]
+    appearance: Option<Appearance>,
 }
 
 /// `set_appearance {mode?, material?}`: what is given replaces the current value.
-fn set_appearance(args: &Value, cx: &mut App) -> Result<()> {
-    let string = |name: &str| -> Result<Option<&str>> {
-        match args.get(name) {
-            None | Some(Value::Null) => Ok(None),
-            Some(value) => value
-                .as_str()
-                .map(Some)
-                .with_context(|| format!("set_appearance's {name:?} must be a string")),
-        }
-    };
-    let mut preferences = gpui_appearance::state(cx).preferences();
-    if let Some(mode) = string("mode")? {
-        preferences.mode = Mode::from_key(mode)
-            .ok_or_else(|| anyhow!("mode must be system, light or dark, not {mode:?}"))?;
-    }
-    if let Some(material) = string("material")? {
-        preferences.material = Material::from_key(material).ok_or_else(|| {
-            anyhow!("material must be mica, acrylic, vibrancy or opaque, not {material:?}")
-        })?;
-    }
-    gpui_appearance::set_preferences(preferences, cx);
-    Ok(())
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetAppearance {
+    mode: Option<Mode>,
+    material: Option<Material>,
 }
 
 /// Starts automation on the main window.
@@ -156,4 +149,40 @@ pub fn start(
         ..Default::default()
     };
     gpui_automation::start(window, host, cx, options)
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn pin_appearance_takes_one_required_argument() {
+        let parse = |args: Value| serde_json::from_value::<PinAppearance>(args);
+        assert_eq!(
+            parse(json!({"appearance": "dark"})).unwrap().appearance,
+            Some(Appearance::Dark)
+        );
+        assert_eq!(parse(json!({"appearance": null})).unwrap().appearance, None);
+        // A misspelt or missing argument must not lift the pin.
+        let misspelt = parse(json!({"apperance": "dark"})).unwrap_err().to_string();
+        assert!(misspelt.contains("unknown field `apperance`"), "{misspelt}");
+        assert!(parse(json!({})).is_err());
+        assert!(parse(json!({"appearance": "sepia"})).is_err());
+    }
+
+    #[test]
+    fn set_appearance_takes_only_a_mode_and_a_material() {
+        let parse = |args: Value| serde_json::from_value::<SetAppearance>(args);
+        let both = parse(json!({"mode": "light", "material": "mica"})).unwrap();
+        assert_eq!(
+            (both.mode, both.material),
+            (Some(Mode::Light), Some(Material::Mica))
+        );
+        let neither = parse(json!({})).unwrap();
+        assert_eq!((neither.mode, neither.material), (None, None));
+        assert!(parse(json!({"materail": "mica"})).is_err());
+        assert!(parse(json!({"mode": "sepia"})).is_err());
+    }
 }

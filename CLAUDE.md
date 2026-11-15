@@ -4,7 +4,7 @@ Native desktop app (Rust + GPUI) that backs up, archives and reads coding-agent 
 
 - Spec: `docs/FEATURES.md` (what it does) and `docs/PLAN.md` (decisions D1–D15, the archive, sync, transports, phases; cited as `PLAN §N` / `D<n>`). Read the relevant sections before changing anything; when code and spec disagree, fix one of them in the same change.
 - Design: `docs/DESIGN.md` (tokens, layout, materials, screens, keyboard map; cited as `DESIGN §N`), written from concept E on the design canvas. The boards' sources are in `design/project/` (the `E-*.dc.html` files; A–D are the concepts E was chosen from). Where a board and DESIGN.md disagree, DESIGN.md wins.
-- Status: phase 0 of PLAN §13. The workspace builds and the app opens the empty concept E shell; nothing is archived, synced or read yet.
+- Status: phase 1 of PLAN §13. `sb_core` has the archive, the catalogue, the local transport, the provider seam with the first provider's scan and fetch, and the sync engine, driven by a dev example; the app still opens the empty concept E shell and uses none of it yet.
 - Agent-agnostic (PLAN D8, §7): everything specific to a coding agent lives in its provider. Sync, the archive, filing, search and the reader never name an agent. Adding an agent must not need a change outside its provider; if it does, fix the seam first.
 - Sibling apps on the same stack, all the owner's: dv (`kylekz/diff`), fc, slide, folio, and the shared crates in `kylekz/toolbox-rs`. Lift from them per PLAN D15.
 - Machine-specific notes live in the git-ignored `CLAUDE.local.md` beside this file, never in the repository:
@@ -27,7 +27,7 @@ Before committing, search the staged changes for the local username, home direct
 Rust 1.98.1 (pinned in `rust-toolchain.toml`). Run `script/check` with bash; on Windows that is Git Bash.
 
 ```bash
-script/check                 # every gate: fmt, clippy x2, gpui boundary, agent names, tests, e2e
+script/check                 # the gates: fmt, clippy x2, gpui boundary, agent names, tests, e2e
 script/check --fast          # the same without the e2e scenarios
 script/check --e2e-only      # the e2e scenarios alone
 cargo deny check             # licences, advisories and sources (deny.toml); needs cargo-deny
@@ -36,6 +36,8 @@ cargo build                  # the scrollback binary (default member)
 cargo run -- --data-dir target/tmp/data --window-size 1440x900 --theme dark
                              # the app, one process, in the foreground; --theme is system, light or dark
 cargo test --workspace
+cargo run --release -p sb_core --example sync -- <archive folder> [verify | set-aside]
+                             # a dev trigger for the sync engine: syncs this machine into an archive, or checks one
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p scrollback --no-default-features --all-targets -- -D warnings   # the shipped app
 

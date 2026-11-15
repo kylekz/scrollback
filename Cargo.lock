@@ -2773,6 +2773,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "raw-window-handle",
+ "serde",
  "windows-sys 0.61.2",
 ]
 
@@ -5920,6 +5921,7 @@ dependencies = [
  "chrono",
  "log",
  "pretty_assertions",
+ "rustix",
  "sb_test_support",
  "serde",
  "serde_json",
@@ -5929,6 +5931,7 @@ dependencies = [
  "toolbox_process",
  "toolbox_store",
  "uuid",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
@@ -6043,6 +6046,7 @@ dependencies = [
  "log",
  "pretty_assertions",
  "sb_ui",
+ "serde",
  "serde_json",
 ]
 

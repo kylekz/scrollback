@@ -2,29 +2,44 @@
 
 use std::{fmt, path::PathBuf, str::FromStr};
 
-use clap::{ArgGroup, Parser};
+use clap::Parser;
+use clap::builder::{OsStringValueParser, TypedValueParser as _};
 use sb_ui::appearance::Mode;
 
 /// Back up, archive and read coding-agent transcripts.
 // A repeated option takes its last value: a scenario's own `app_args` follow the runner's.
 #[derive(Parser, Debug, Clone, PartialEq)]
 #[command(name = "scrollback", version, args_override_self = true)]
-#[command(group(ArgGroup::new("automation_mode").args(["automation", "automation_pipe"]).multiple(true)))]
+#[cfg_attr(
+    feature = "automation",
+    command(group(clap::ArgGroup::new("automation_mode").args(["automation", "automation_pipe"]).multiple(true)))
+)]
 pub struct Cli {
-    /// Where scrollback keeps its files [default: the platform's local data folder plus
-    /// `scrollback`; under automation a temporary folder].
-    #[arg(long, env = "SCROLLBACK_DATA_DIR", value_name = "PATH")]
+    /// Where scrollback keeps its files; an empty value counts as not given [default: the
+    /// platform's local data folder plus `scrollback`].
+    // clap's own path parser refuses an empty value, which `SCROLLBACK_DATA_DIR=` is.
+    #[arg(
+        long,
+        env = "SCROLLBACK_DATA_DIR",
+        value_name = "PATH",
+        value_parser = OsStringValueParser::new().map(PathBuf::from)
+    )]
     pub data_dir: Option<PathBuf>,
 
+    // The automation options exist only in a build with the driver (`automation`); the shipped
+    // app's `--help` doesn't offer what it can't do.
+    #[cfg(feature = "automation")]
     /// Accept automation commands as JSON lines on stdin (PLAN §12).
     #[arg(long)]
     pub automation: bool,
 
+    #[cfg(feature = "automation")]
     /// Serve automation on the Windows named pipe `\\.\pipe\<NAME>` instead of stdio, so a
     /// driver can attach to a running app. Implies `--automation`.
     #[arg(long, value_name = "NAME")]
     pub automation_pipe: Option<String>,
 
+    #[cfg(feature = "automation")]
     /// Under automation, open every window unfocused, behind all other windows and out of the
     /// taskbar, so scripted runs never disturb the person using the machine. The e2e runner
     /// passes it unless given `--foreground`. Needs `--automation` or `--automation-pipe`.
@@ -41,6 +56,7 @@ pub struct Cli {
     pub theme: Option<Mode>,
 }
 
+#[cfg(feature = "automation")]
 impl Cli {
     /// Whether the automation driver runs, over stdio or a named pipe.
     pub fn automation_enabled(&self) -> bool {
@@ -97,6 +113,7 @@ mod tests {
         Cli::try_parse_from(std::iter::once("scrollback").chain(args.iter().copied()))
     }
 
+    #[cfg(feature = "automation")]
     #[test]
     fn automation_pipe_implies_automation() {
         assert!(!parse(&[]).unwrap().automation_enabled());
@@ -108,6 +125,7 @@ mod tests {
         assert!(parse(&["--automation"]).unwrap().automation_enabled());
     }
 
+    #[cfg(feature = "automation")]
     #[test]
     fn the_runners_command_line_parses() {
         let cli = parse(&[
@@ -132,11 +150,31 @@ mod tests {
         assert_eq!(cli.theme, None);
     }
 
+    #[cfg(feature = "automation")]
     #[test]
     fn background_needs_automation() {
         assert!(parse(&["--automation-background"]).is_err());
         assert!(parse(&["--automation", "--automation-background"]).is_ok());
         assert!(parse(&["--automation-pipe", "p", "--automation-background"]).is_ok());
+    }
+
+    #[cfg(not(feature = "automation"))]
+    #[test]
+    fn a_build_without_the_driver_has_no_automation_options() {
+        for flag in ["--automation", "--automation-background"] {
+            assert!(parse(&[flag]).is_err(), "{flag}");
+        }
+        assert!(parse(&["--automation-pipe", "p"]).is_err());
+    }
+
+    #[test]
+    fn an_empty_data_dir_parses_as_given_but_empty() {
+        // `SCROLLBACK_DATA_DIR=` reaches the parser the same way; `data_dir` reads it as unset.
+        assert_eq!(
+            parse(&["--data-dir", ""]).unwrap().data_dir,
+            Some(PathBuf::new())
+        );
+        assert_eq!(parse(&[]).unwrap().data_dir, None);
     }
 
     #[test]

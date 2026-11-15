@@ -2,10 +2,22 @@
 //! under one directory of the agent's root, keys are their paths relative to the root, and the
 //! stamp is the modification time. A provider for such an agent supplies where the root is and
 //! how a path maps to a session.
+//!
+//! A file's size and modification time stand for its content only once the modification time
+//! is safely in the past: a file written again within the same tick of the file system's clock
+//! keeps its time. So the stamp of a file modified as recently as the scan, or later by its
+//! clock, says so (git's rule for the same race). When the file is found on a later pass with
+//! a time that is in the past by then, the two stamps differ, and that pass compares its bytes
+//! with what is archived.
 
-use super::{ItemKind, ItemPrefix, ItemRange, ProviderError, ScannedItem, Source};
-use crate::hash::Hash;
+use super::{
+    Hashed, ItemKind, ItemPrefix, ItemRange, ProviderError, RangeFailure, Scan, ScannedItem, Source,
+};
 use crate::transport::{PrefixRequest, RangeRequest, RangeSink, Transport};
+
+/// How long before the scan a file must have been modified last for its modification time to
+/// be trusted. The coarsest timestamps in use tick every two seconds.
+const FRESH_NS: i64 = 2_000_000_000;
 
 /// What a file is, from its key alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,31 +59,41 @@ impl<'a> FileTree<'a> {
 }
 
 impl Source for FileTree<'_> {
-    fn scan(&mut self) -> Result<Vec<ScannedItem>, ProviderError> {
-        Ok(self
-            .transport
-            .list(&self.path(self.subtree))?
+    fn scan(&mut self) -> Result<Scan, ProviderError> {
+        let listing = self.transport.list(&self.path(self.subtree))?;
+        let items = listing
+            .files
             .into_iter()
             .map(|file| {
                 let key = format!("{}/{}", self.subtree, file.path);
                 let class = (self.classify)(&key);
+                let mtime = file.stat.mtime_ns;
                 ScannedItem {
                     key,
                     kind: class.kind,
                     session: class.session,
                     length: file.stat.size,
-                    stamp: file.stat.mtime_ns.to_string(),
+                    stamp: if mtime < listing.clock_ns - FRESH_NS {
+                        mtime.to_string()
+                    } else {
+                        format!("{mtime} fresh")
+                    },
                     lines: class.lines,
                     export_version: None,
                 }
             })
-            .collect())
+            .collect();
+        Ok(Scan {
+            items,
+            unlisted: listing.unlisted,
+            skipped: listing.skipped,
+        })
     }
 
     fn hash_prefixes(
         &mut self,
         requests: &[ItemPrefix],
-    ) -> Result<Vec<Option<Hash>>, ProviderError> {
+    ) -> Result<Vec<Result<Hashed, RangeFailure>>, ProviderError> {
         let requests: Vec<_> = requests
             .iter()
             .map(|request| PrefixRequest {

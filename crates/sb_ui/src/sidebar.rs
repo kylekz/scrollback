@@ -18,13 +18,17 @@ use crate::theme::{SbTheme, StyledText as _};
 /// How the library rows are drawn while they can't be opened (DESIGN §4.10).
 const DISABLED_ROWS_OPACITY: f32 = 0.55;
 
-/// The library rows, top to bottom: icon, name and automation target.
+/// The library rows, top to bottom (DESIGN §4.1): icon, name and automation target.
 const LIBRARY_ROWS: [(SbIcon, &str, &str); 4] = [
     (SbIcon::Layers, "All sessions", "sidebar/all-sessions"),
     (SbIcon::Star, "Starred", "sidebar/starred"),
     (SbIcon::Inbox, "Unsorted", "sidebar/unsorted"),
     (SbIcon::Trash, "Trash", "sidebar/trash"),
 ];
+
+/// What the Folders and Locations sections say while they have no rows (DESIGN §4.10).
+const NO_FOLDERS: &str = "Folders come after the first sync.";
+const NO_LOCATIONS: &str = "None yet";
 
 /// The sidebar on `background`: `bg-side` docked, its solid value as an overlay (DESIGN §2).
 pub fn sidebar(background: gpui::Hsla, theme: &SbTheme) -> AnyElement {
@@ -69,7 +73,7 @@ pub fn sidebar(background: gpui::Hsla, theme: &SbTheme) -> AnyElement {
                     theme,
                 )),
         )
-        .child(note("Folders come after the first sync.", theme))
+        .child(note(NO_FOLDERS, theme))
         .child(div().flex_1())
         .child(
             div()
@@ -94,7 +98,7 @@ pub fn sidebar(background: gpui::Hsla, theme: &SbTheme) -> AnyElement {
             div()
                 .pt(theme.spacing.xs)
                 .pb(theme.spacing.md)
-                .child(note("None yet", theme)),
+                .child(note(NO_LOCATIONS, theme)),
         )
         .automation_target("shell/sidebar")
 }
@@ -158,4 +162,28 @@ fn note(text: &'static str, theme: &SbTheme) -> impl IntoElement {
         .text_color(theme.colors.fg3)
         .text_spec(&theme.text.secondary)
         .child(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn the_rows_and_the_notes_read_as_design_writes_them() {
+        // DESIGN §4.1: the library rows top to bottom, each with its icon (§1.5).
+        assert_eq!(
+            LIBRARY_ROWS,
+            [
+                (SbIcon::Layers, "All sessions", "sidebar/all-sessions"),
+                (SbIcon::Star, "Starred", "sidebar/starred"),
+                (SbIcon::Inbox, "Unsorted", "sidebar/unsorted"),
+                (SbIcon::Trash, "Trash", "sidebar/trash"),
+            ]
+        );
+        // DESIGN §4.10.
+        assert_eq!(NO_FOLDERS, "Folders come after the first sync.");
+        assert_eq!(NO_LOCATIONS, "None yet");
+    }
 }

@@ -47,6 +47,9 @@ dirs = "6"
 env_logger = "0.11"
 log = "0.4"
 pretty_assertions = "1.4"
+# Apple systems only: `fsync` without the full flush std's `sync_all` does there
+# (`sb_core::archive`).
+rustix = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Segment and version hashes (PLAN §4.1).
@@ -55,6 +58,8 @@ tempfile = "3"
 thiserror = "2"
 # Archive and location ids.
 uuid = { version = "1", features = ["v4"] }
+# Windows only: the rename that puts a segment in place (`sb_core::archive`). toolbox-rs's pin.
+windows-sys = "0.61"
 # Segments are zstd frames (PLAN §4.1).
 zstd = "0.13"
 

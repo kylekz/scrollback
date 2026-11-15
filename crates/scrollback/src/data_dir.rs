@@ -1,4 +1,5 @@
-//! Where scrollback keeps its files (PLAN D3): `--data-dir` / `SCROLLBACK_DATA_DIR` when given;
+//! Where scrollback keeps its files (PLAN D3): `--data-dir` / `SCROLLBACK_DATA_DIR` when given
+//! and not empty (`SCROLLBACK_DATA_DIR=` is how a shell unsets it for one command);
 //! under automation without one, a temporary folder, so a scripted run never reaches the real
 //! one; otherwise the platform's local data folder plus `scrollback` (DESIGN §4.10:
 //! `C:\Users\user\AppData\Local\scrollback`, `/Users/user/Library/Application
@@ -100,6 +101,7 @@ mod tests {
 
     #[test]
     fn automation_never_uses_the_real_dir() {
+        // Not given, and given but empty (`SCROLLBACK_DATA_DIR=`, `--data-dir ""`).
         for explicit in [None, Some(PathBuf::new())] {
             let place = choose(
                 explicit,
@@ -119,19 +121,21 @@ mod tests {
 
     #[test]
     fn otherwise_the_local_data_folder() {
-        let place = choose(
-            None,
-            false,
-            1,
-            Path::new("C:/Temp"),
-            Some(PathBuf::from("C:/Users/user/AppData/Local")),
-        )
-        .unwrap();
-        assert_eq!(
-            place.dir,
-            Path::new("C:/Users/user/AppData/Local").join("scrollback")
-        );
-        assert_eq!(place.source, Source::Platform);
+        for explicit in [None, Some(PathBuf::new())] {
+            let place = choose(
+                explicit,
+                false,
+                1,
+                Path::new("C:/Temp"),
+                Some(PathBuf::from("C:/Users/user/AppData/Local")),
+            )
+            .unwrap();
+            assert_eq!(
+                place.dir,
+                Path::new("C:/Users/user/AppData/Local").join("scrollback")
+            );
+            assert_eq!(place.source, Source::Platform);
+        }
         assert!(choose(None, false, 1, Path::new("C:/Temp"), None).is_err());
     }
 }

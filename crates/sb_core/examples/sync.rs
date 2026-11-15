@@ -1,10 +1,12 @@
 //! A temporary command-line trigger for the sync engine (PLAN §13), for use until the app has
 //! locations in its UI. It syncs this machine's agents into the archive in a folder, creating
-//! the archive if the folder has none, or verifies that archive. It prints totals only.
+//! the archive if the folder has none, or verifies that archive, or sets aside what verify
+//! found under its `files/` that the catalogue doesn't record. It prints totals only.
 //!
 //! ```text
 //! cargo run --release -p sb_core --example sync -- <archive folder>
 //! cargo run --release -p sb_core --example sync -- <archive folder> verify
+//! cargo run --release -p sb_core --example sync -- <archive folder> set-aside
 //! ```
 
 use std::error::Error;
@@ -20,17 +22,24 @@ use sb_core::transport::LocalTransport;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (dir, verify) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        [dir] => (dir, false),
-        [dir, "verify"] => (dir, true),
-        _ => return Err("usage: sync <archive folder> [verify]".into()),
+    let (dir, action) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [dir] => (dir, "sync"),
+        [dir, action @ ("verify" | "set-aside")] => (dir, action),
+        _ => return Err("usage: sync <archive folder> [verify | set-aside]".into()),
     };
     let archive = match Archive::open(Path::new(dir)) {
         Err(ArchiveError::NotAnArchive(_)) => Archive::create(Path::new(dir))?,
         opened => opened?,
     };
     let started = Instant::now();
-    if verify {
+    if action == "set-aside" {
+        println!(
+            "set aside {} files or folders the catalogue doesn't record, in orphans/",
+            archive.set_aside_uncatalogued()?.len()
+        );
+        return Ok(());
+    }
+    if action == "verify" {
         let report = archive.verify(&CancelToken::new())?;
         println!(
             "verified {} versions in {} segments: {} bytes, stored in {} ({:.1}x), in {:.1?}",
@@ -47,8 +56,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                 damage.version, damage.problems
             );
         }
-        if !report.damaged.is_empty() {
-            return Err(format!("{} versions are damaged", report.damaged.len()).into());
+        for unread in &report.unread {
+            println!(
+                "not read: version {} of an item: {}",
+                unread.version, unread.error
+            );
+        }
+        if !(report.damaged.is_empty()
+            && report.unread.is_empty()
+            && report.uncatalogued.is_empty())
+        {
+            return Err(format!(
+                "{} versions are damaged, {} could not be read, and the catalogue doesn't \
+                 record {} files or folders under files/",
+                report.damaged.len(),
+                report.unread.len(),
+                report.uncatalogued.len()
+            )
+            .into());
         }
         return Ok(());
     }
@@ -59,10 +84,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => catalogue.add_location(LocationKind::Local, "This machine")?,
     };
     let mut planned = (0, 0);
+    let mut fetched = 0;
     let passes = sync_location(
         &archive,
         &location.id,
-        &LocalTransport::new(),
+        &LocalTransport,
         &provider::builtin(),
         &CancelToken::new(),
         &mut |progress| match *progress {
@@ -71,38 +97,52 @@ fn main() -> Result<(), Box<dyn Error>> {
                 planned = (items, bytes);
                 println!("planned {items} items, {bytes} bytes");
             }
-            Progress::Fetched { items, bytes } if items % 100 == 0 || items == planned.0 => {
-                println!(
-                    "fetched {items} of {} items, {bytes} of {} bytes",
-                    planned.0, planned.1
-                );
-            }
-            Progress::Fetched { .. } => {}
+            Progress::Fetched { bytes } => fetched = bytes,
+            Progress::Stored { items } => println!(
+                "fetched {items} of {} items, {fetched} of {} bytes",
+                planned.0, planned.1
+            ),
         },
     )?;
     for pass in passes {
+        let report = match pass.outcome {
+            Ok(report) => report,
+            Err(error) => {
+                println!("{}: failed: {error}", pass.provider);
+                continue;
+            }
+        };
         println!(
             "{}: {} items: {} unchanged, {} new, {} appended, {} touched, {} new versions \
-             ({} held back), {} gone, {} deferred, {} failed; {} bytes fetched, {} stored",
+             ({} held back), {} gone, {} deferred, {} failed, {} unlisted, {} skipped; {} bytes \
+             fetched, {} stored",
             pass.provider,
-            pass.scanned,
-            pass.unchanged,
-            pass.new_items,
-            pass.appended,
-            pass.touched,
-            pass.new_versions,
-            pass.held_back,
-            pass.gone,
-            pass.deferred,
-            pass.failed.len(),
-            pass.bytes_fetched,
-            pass.bytes_stored
+            report.scanned,
+            report.unchanged,
+            report.new_items,
+            report.appended,
+            report.touched,
+            report.new_versions,
+            report.held_back,
+            report.gone,
+            report.deferred.len(),
+            report.failed.len(),
+            report.unlisted.len(),
+            report.skipped.len(),
+            report.bytes_fetched,
+            report.bytes_stored
         );
-        let mut reasons: Vec<_> = pass.failed.iter().map(|failure| &failure.reason).collect();
+        let mut reasons: Vec<_> = report
+            .failed
+            .iter()
+            .chain(&report.deferred)
+            .map(|failure| &failure.reason)
+            .chain(report.unlisted.iter().map(|unlisted| &unlisted.reason))
+            .collect();
         reasons.sort();
         reasons.dedup();
         for reason in reasons {
-            println!("  failed: {reason}");
+            println!("  not archived: {reason}");
         }
     }
     println!("synced in {:.1?}", started.elapsed());

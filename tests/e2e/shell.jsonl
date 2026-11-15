@@ -8,29 +8,33 @@
 {"cmd": "bounds", "target": "shell/sidebar", "expect_result": [{"pointer": "/x", "equals": 0}, {"pointer": "/y", "equals": 40}, {"pointer": "/w", "equals": 248}, {"pointer": "/h", "equals": 860}]}
 {"cmd": "bounds", "target": "shell/main", "expect_result": [{"pointer": "/x", "equals": 248}, {"pointer": "/y", "equals": 40}, {"pointer": "/w", "equals": 1192}, {"pointer": "/h", "equals": 860}]}
 
-// The title bar's pieces: the search field is 460 wide, centred on the window (DESIGN §2).
-{"cmd": "bounds", "target": "titlebar/search", "expect_result": [{"pointer": "/x", "equals": 490}, {"pointer": "/w", "equals": 460}, {"pointer": "/h", "equals": 30}, {"pointer": "/visible", "not_equals": null}]}
+// The title bar's pieces: the search field is 460 wide, centred on the window (DESIGN §2). A fractional display scale (125%, 175%) rounds edges to whole device pixels, which can take a pixel off a size or move an edge by one.
+{"cmd": "bounds", "target": "titlebar/search", "expect_result": [{"pointer": "/x", "equals": 490}, {"pointer": "/w", "equals": 460}, {"pointer": "/h", "gte": 29}, {"pointer": "/h", "lte": 30}, {"pointer": "/visible", "not_equals": null}]}
 {"cmd": "bounds", "target": "titlebar/mark", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "bounds", "target": "titlebar/sync-all", "expect_result": [{"pointer": "/h", "equals": 24}, {"pointer": "/visible", "not_equals": null}]}
 {"cmd": "bounds", "target": "titlebar/settings", "expect_result": [{"pointer": "/w", "equals": 28}, {"pointer": "/h", "equals": 28}, {"pointer": "/visible", "not_equals": null}]}
 // The sidebar's button shows only while the window is too narrow to dock the sidebar.
 {"cmd": "bounds", "target": "titlebar/sidebar", "expect_error": "no target"}
-// Windows' caption buttons: 46 wide, the title bar's height inside its bottom hairline (one device pixel), flush right; macOS draws traffic lights instead.
-{"cmd": "bounds", "target": "titlebar/close", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "equals": 1394}, {"pointer": "/y", "equals": 0}, {"pointer": "/w", "equals": 46}, {"pointer": "/h", "gte": 39}, {"pointer": "/h", "lte": 40}]}
-{"cmd": "bounds", "target": "titlebar/max", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "equals": 1348}, {"pointer": "/w", "equals": 46}]}
-{"cmd": "bounds", "target": "titlebar/min", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "equals": 1302}, {"pointer": "/w", "equals": 46}]}
+// Windows' caption buttons: 46 wide and the title bar's height, flush right; macOS draws traffic lights instead. Each is a 40px box centred in the 39px the bar's bottom hairline leaves, so it reports half a pixel over at each end, which the display scale rounds to 39, 40 or 41 high from 0 or -1; the hairline and the window's edge are drawn over the overflow.
+{"cmd": "bounds", "target": "titlebar/close", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "equals": 1394}, {"pointer": "/y", "gte": -1}, {"pointer": "/y", "lte": 0}, {"pointer": "/w", "equals": 46}, {"pointer": "/h", "gte": 39}, {"pointer": "/h", "lte": 41}]}
+{"cmd": "bounds", "target": "titlebar/max", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "gte": 1348}, {"pointer": "/x", "lte": 1349}, {"pointer": "/w", "gte": 45}, {"pointer": "/w", "lte": 46}]}
+{"cmd": "bounds", "target": "titlebar/min", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "gte": 1302}, {"pointer": "/x", "lte": 1303}, {"pointer": "/w", "equals": 46}]}
 {"cmd": "bounds", "target": "titlebar/close", "platforms": ["macos"], "expect_error": "no target"}
 
 // The sidebar's empty state (DESIGN §4.1, §4.10): four library rows 32 high inside its 8px padding and 1px right border, then the section buttons.
 {"cmd": "query", "prefix": "sidebar/", "expect_result": {"pointer": "", "len": 6}}
 {"cmd": "bounds", "target": "sidebar/all-sessions", "expect_result": [{"pointer": "/x", "equals": 8}, {"pointer": "/y", "equals": 50}, {"pointer": "/w", "equals": 231}, {"pointer": "/h", "equals": 32}]}
-{"cmd": "bounds", "target": "sidebar/trash", "expect_result": [{"pointer": "/y", "equals": 149}, {"pointer": "/h", "equals": 32}]}
-{"cmd": "bounds", "target": "sidebar/new-folder", "expect_result": [{"pointer": "/w", "equals": 22}, {"pointer": "/h", "equals": 22}]}
-{"cmd": "bounds", "target": "sidebar/sync-all", "expect_result": [{"pointer": "/w", "equals": 22}, {"pointer": "/h", "equals": 22}]}
+// Three rows and three 1px gaps down: 149, or 148 where a fractional display scale (125%, 150%) rounds the gaps to whole device pixels.
+{"cmd": "bounds", "target": "sidebar/trash", "expect_result": [{"pointer": "/y", "gte": 148}, {"pointer": "/y", "lte": 149}, {"pointer": "/h", "equals": 32}]}
+// The section buttons are 22 square, or 21 wide where a fractional display scale (125%) rounds their edges to whole device pixels.
+{"cmd": "bounds", "target": "sidebar/new-folder", "expect_result": [{"pointer": "/w", "gte": 21}, {"pointer": "/w", "lte": 22}, {"pointer": "/h", "equals": 22}]}
+{"cmd": "bounds", "target": "sidebar/sync-all", "expect_result": [{"pointer": "/w", "gte": 21}, {"pointer": "/w", "lte": 22}, {"pointer": "/h", "equals": 22}]}
 
 // Dark and light, pinned so the captures don't depend on the machine's own setting, on the Opaque surfaces the boards draw.
 {"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
 {"cmd": "pin_appearance", "appearance": "dark", "expect_result": [{"pointer": "/pinned", "equals": "dark"}, {"pointer": "/resolved/appearance", "equals": "dark"}]}
+// A misspelt argument is refused, not read as "lift the pin".
+{"cmd": "pin_appearance", "apperance": "light", "expect_error": "unknown field", "expect": {"pointer": "/appearance/pinned", "equals": "dark"}}
 {"cmd": "settle", "expect": {"pointer": "/shell/window_material", "equals": "opaque"}}
 {"cmd": "screenshot", "name": "shell-dark"}
 {"cmd": "pin_appearance", "appearance": "light", "expect_result": [{"pointer": "/pinned", "equals": "light"}, {"pointer": "/resolved/appearance", "equals": "light"}]}
@@ -46,7 +50,7 @@
 // The caption buttons need more than half of what the field leaves, so the field moves left of centre.
 {"cmd": "bounds", "target": "titlebar/search", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "lte": 250}, {"pointer": "/x", "gte": 160}, {"pointer": "/w", "equals": 460}]}
 {"cmd": "screenshot", "name": "shell-960x600"}
-// The button and Ctrl B show it over the main area; Esc and a click outside close it.
+// The button and Ctrl B show it over the main area; Esc and a press of any button outside it, on the main area or on the title bar, close it.
 {"cmd": "click", "target": "titlebar/sidebar", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
 {"cmd": "bounds", "target": "shell/sidebar", "expect_result": [{"pointer": "/x", "equals": 0}, {"pointer": "/y", "equals": 40}, {"pointer": "/w", "equals": 248}, {"pointer": "/h", "equals": 560}]}
 {"cmd": "bounds", "target": "shell/main", "expect_result": {"pointer": "/w", "equals": 960}}
@@ -54,11 +58,19 @@
 {"cmd": "key", "keystroke": "escape", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
 {"cmd": "key", "keystroke": "secondary-b", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
 {"cmd": "click", "x": 600, "y": 300, "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+{"cmd": "key", "keystroke": "secondary-b", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
+{"cmd": "click", "x": 600, "y": 300, "button": "right", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+{"cmd": "key", "keystroke": "secondary-b", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
+{"cmd": "click", "target": "titlebar/search", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+// A press on the overlay leaves it open, and its own button toggles it.
 {"cmd": "click", "target": "titlebar/sidebar", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
+{"cmd": "click", "target": "sidebar/all-sessions", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
 {"cmd": "click", "target": "titlebar/sidebar", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
 
 // A smaller --window-size is raised to the minimum (DESIGN §2: 960x600).
 {"restart": {"app_args": ["--window-size", "800x500"]}, "expect": [{"pointer": "/window/w", "equals": 960}, {"pointer": "/window/h", "equals": 600}, {"pointer": "/appearance/pinned", "equals": null}]}
+// The window opens at exactly the size asked, whichever way centring it on the display rounds: 1440x900 above and 1441x901 here differ in parity, so one of them centres on a half pixel. A fractional display scale can't show an odd size exactly and lands within a pixel of it.
+{"restart": {"app_args": ["--window-size", "1441x901"]}, "expect": [{"pointer": "/window/w", "gte": 1440.3}, {"pointer": "/window/w", "lte": 1441.7}, {"pointer": "/window/h", "gte": 900.3}, {"pointer": "/window/h", "lte": 901.7}]}
 // --theme forces light or dark for the run without a pin.
 {"restart": {"app_args": ["--theme", "light"]}, "expect": [{"pointer": "/window/w", "equals": 1440}, {"pointer": "/appearance/mode", "equals": "light"}, {"pointer": "/appearance/pinned", "equals": null}, {"pointer": "/appearance/resolved/appearance", "equals": "light"}]}
 {"restart": {"app_args": ["--theme", "dark"]}, "expect": [{"pointer": "/appearance/mode", "equals": "dark"}, {"pointer": "/appearance/resolved/appearance", "equals": "dark"}]}

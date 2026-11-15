@@ -4,6 +4,12 @@
 //! No operation writes, and none runs an agent's own tools (PLAN §2.3, invariant 5). Paths are
 //! the location's own, absolute, as text; a relative path a transport returns uses `/`.
 //!
+//! A location is read while its agent writes to it, and nothing is locked, so what a read
+//! returns may be a mixture of two states of a file. A file's size and modification time
+//! can't rule that out (a writer can leave both as they were), so the caller proves what it
+//! read: [`Transport::hash_prefixes`] has the location hash the file's own start, and gives
+//! the file's size with the hash ([`Hashed`]).
+//!
 //! [`LocalTransport`] reads this machine with `std::fs`. The shell transport for WSL and SSH
 //! comes with phase 5 (PLAN §13).
 
@@ -39,11 +45,41 @@ pub struct FileEntry {
     pub stat: FileStat,
 }
 
+/// Something under a listed directory that is not among the listing's files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unlisted {
+    /// The location's path of it, as far as it can be shown.
+    pub path: String,
+    pub reason: String,
+}
+
+/// What [`Transport::list`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Listing {
+    pub files: Vec<FileEntry>,
+    /// What could not be listed: a folder or a file that could not be read, or was gone when
+    /// it was looked at. While there is any, the files are not all there is.
+    pub unlisted: Vec<Unlisted>,
+    /// What was left out on purpose: symbolic links, and whatever is neither a file nor a
+    /// folder.
+    pub skipped: Vec<Unlisted>,
+    /// The location's clock when the listing began, in nanoseconds since the Unix epoch: what
+    /// the files' modification times are measured against.
+    pub clock_ns: i64,
+}
+
 /// The first `length` bytes of the file at `path`, to be hashed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrefixRequest {
     pub path: String,
     pub length: u64,
+}
+
+/// A hashed prefix, and the whole size of the file it was read from once it was read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hashed {
+    pub hash: Hash,
+    pub size: u64,
 }
 
 /// The bytes `[offset, offset + length)` of the file at `path`.
@@ -59,9 +95,11 @@ pub struct RangeRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Halt;
 
-/// Why one requested range could not be read. It fails that range only; the stream goes on.
+/// Why one requested range or prefix could not be read. It fails that request only.
 #[derive(Debug, Error)]
 pub enum RangeFailure {
+    #[error("it is no longer there")]
+    Missing,
     #[error("the source ended after {got} of {expected} bytes")]
     Short { expected: u64, got: u64 },
     #[error("{0}")]
@@ -105,15 +143,17 @@ pub trait Transport: Send + Sync {
     /// Each path's size and modification time, or `None` where nothing is there.
     fn stat(&self, paths: &[&str]) -> Result<Vec<Option<FileStat>>, TransportError>;
 
-    /// Every regular file under the directory `root`, however deep; none when `root` is missing.
-    /// Symbolic links are neither listed nor followed.
-    fn list(&self, root: &str) -> Result<Vec<FileEntry>, TransportError>;
+    /// Every regular file under the directory `root`, however deep. Symbolic links are not
+    /// followed. What can't be listed, `root` itself when it is missing, and what is left out
+    /// are reported in the listing and do not fail it.
+    fn list(&self, root: &str) -> Result<Listing, TransportError>;
 
-    /// The SHA-256 of each requested prefix, or `None` where the file is missing or shorter.
+    /// The SHA-256 of each requested prefix, hashed one after another in the order asked. A
+    /// file that is missing, unreadable or shorter than its prefix fails that request only.
     fn hash_prefixes(
         &self,
         requests: &[PrefixRequest],
-    ) -> Result<Vec<Option<Hash>>, TransportError>;
+    ) -> Result<Vec<Result<Hashed, RangeFailure>>, TransportError>;
 
     /// Streams each requested range into `sink`. A file that is missing, unreadable or shorter
     /// than its range fails that range only.

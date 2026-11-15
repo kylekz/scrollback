@@ -16,12 +16,14 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::io::{self, Cursor, Read};
+use std::path::Path;
 
 use sb_core::provider::{self, ItemKind, ItemRange, SessionItem, SessionItems, Source};
 use sb_core::transcript::{
     BlockId, Content, Conversation, Ending, Subagent, ToolInput, ToolKind, Transcript,
 };
-use sb_core::transport::{Halt, LocalTransport, RangeFailure, RangeSink};
+use sb_core::transport::{Halt, LocalTransport, RangeFailure, RangeSink, Transport};
+use sb_test_support::HomeTransport;
 
 /// One session's items, fetched from the location as they are asked for.
 struct Session<'a, 'b> {
@@ -121,6 +123,7 @@ impl Totals {
             "sessions in which nothing was asked",
             "sessions that open with something other than a prompt",
             "subagents no call is known to have started",
+            "files that could not be listed",
         ] {
             totals.sessions.add(what, 0);
         }
@@ -270,18 +273,25 @@ impl Totals {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let transport = match std::env::args().nth(1) {
-        Some(home) => LocalTransport::with_env(home, []),
-        None => LocalTransport::new(),
+    let transport: Box<dyn Transport> = match std::env::args().nth(1) {
+        Some(home) => Box::new(HomeTransport::new(Path::new(&home), Vec::new())),
+        None => Box::new(LocalTransport),
     };
+    /* No provider that ships keeps anything for a pass, but the seam asks for a place. */
+    let scratch = tempfile::tempdir()?;
     let mut totals = Totals::new();
     for provider in provider::builtin() {
-        let Some(source) = provider.detect(&transport)? else {
+        let Some(source) = provider.detect(transport.as_ref(), scratch.path())? else {
             continue;
         };
         let source = RefCell::new(source);
         let mut sessions: BTreeMap<String, Vec<SessionItem>> = BTreeMap::new();
-        for item in source.borrow_mut().scan()? {
+        let scanned = source.borrow_mut().scan()?;
+        totals.sessions.add(
+            "files that could not be listed",
+            scanned.unlisted.len() as u64,
+        );
+        for item in scanned.items {
             let Some(session) = item.session else {
                 continue;
             };

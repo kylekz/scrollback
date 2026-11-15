@@ -235,6 +235,32 @@ turn 2
 }
 
 #[test]
+fn a_generated_sessions_filler_subagents_are_under_calls_too() {
+    let mut tree = ProjectsTree::new();
+    let mut session = tree.session(PROJECT, 6);
+    session.subagent(3);
+    session.append(3);
+    session.subagent(5);
+
+    let (transcript, _) = parse(&tree, &session);
+    assert_eq!(transcript.unattached, []);
+    let started: Vec<usize> = own(&transcript)
+        .calls()
+        .filter(|(_, call)| call.kind == ToolKind::Subagent)
+        .map(|(_, call)| read(&call.subagents[0]).blocks().len())
+        .collect();
+    assert_eq!(started.len(), 2);
+    assert!(started.iter().all(|blocks| *blocks > 0));
+    assert_eq!(
+        own(&transcript)
+            .calls()
+            .filter(|(_, call)| call.result.is_none())
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn a_session_says_where_it_started_and_what_it_is_called() {
     let mut tree = ProjectsTree::new();
     let mut session = session(&mut tree);
@@ -258,7 +284,7 @@ fn a_session_says_where_it_started_and_what_it_is_called() {
     assert_eq!(
         transcript.facts,
         Facts {
-            agent: "claude-code",
+            agent: Agent.id(),
             title: Some("Second title".to_string()),
             project_path: Some(PROJECT.to_string()),
             branch: Some("main".to_string()),

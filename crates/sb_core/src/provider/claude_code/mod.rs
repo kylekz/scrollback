@@ -2,7 +2,8 @@
 //!
 //! Its data is a file tree (PLAN §7.2). The root is `$CLAUDE_CONFIG_DIR` when set, else
 //! `~/.claude`, and every file under `projects/` is an item, keyed by its path relative to the
-//! root. Under `projects/<project>/`:
+//! root, whether or not it is one of these. Under `projects/<project>/`, with `<session>` a
+//! session id, which is a UUID:
 //!
 //! | Path | Item |
 //! |---|---|
@@ -11,10 +12,13 @@
 //! | `<session>/subagents/…/agent-<id>.jsonl` | a subagent's transcript |
 //! | `<session>/tool-results/…` | tool output saved outside the transcript |
 //! | `<session>/…` | a sidecar of the session: titles, subagent metadata, workflows |
-//! | `memory/…` | the project's memory files: sidecars of no session |
+//! | anything else (`memory/…`, an index file) | a sidecar of no session |
 //!
-//! `<project>` is the starting directory with its punctuation replaced by `-`, so it can't be
-//! turned back into a path and is not read here. Every `.jsonl` file is appended to line by line.
+//! A file or folder belongs to a session when its name is the id or starts with it and a `.`.
+//! A session's folder can be there without its transcript, and the transcript without the
+//! folder. `<project>` is the starting directory with its punctuation replaced by `-`, so it
+//! can't be turned back into a path and is not read here. Every `.jsonl` file is appended to
+//! line by line.
 //!
 //! [`parse`] turns a session's archived files into the transcript model, [`tools`] maps
 //! Claude Code's tools onto the common kinds, and [`audit`] counts a session's records another
@@ -28,18 +32,18 @@ mod said;
 mod tests;
 mod tools;
 
+use std::path::Path;
+
 use serde_json::Value;
 
 use super::{
-    Audit, FileClass, FileTree, ItemKind, ItemPrefix, ItemRange, Provider, ProviderError,
-    ScannedItem, SessionItems, Source,
+    Audit, FileClass, FileTree, Hashed, ItemKind, ItemPrefix, ItemRange, Provider, ProviderError,
+    ProviderId, RangeFailure, Scan, SessionItems, Source,
 };
-use crate::hash::Hash;
 use crate::transcript::{Subagent, Transcript};
-use crate::transport::{RangeSink, Transport};
+use crate::transport::{Env, RangeSink, Transport};
 
-/// The provider's identity (PLAN §2.1).
-const ID: &str = "claude-code";
+const ID: ProviderId = ProviderId::new("claude-code");
 
 /// Where the items are, under the root.
 const SUBTREE: &str = "projects";
@@ -52,19 +56,16 @@ const DEFAULT_RETENTION_DAYS: u32 = 30;
 pub struct Agent;
 
 impl Provider for Agent {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> ProviderId {
         ID
     }
 
     fn detect<'a>(
-        &self,
+        &'a self,
         transport: &'a dyn Transport,
+        _scratch: &'a Path,
     ) -> Result<Option<Box<dyn Source + 'a>>, ProviderError> {
-        let mut env = transport.env(&["CLAUDE_CONFIG_DIR"])?;
-        let root = match env.vars.remove("CLAUDE_CONFIG_DIR") {
-            Some(dir) if !dir.is_empty() => dir,
-            _ => format!("{}/.claude", env.home),
-        };
+        let root = root(transport.env(&["CLAUDE_CONFIG_DIR"])?);
         let present = transport.stat(&[&format!("{root}/{SUBTREE}")])?[0].is_some();
         Ok(present.then(|| {
             Box::new(Data {
@@ -88,6 +89,14 @@ impl Provider for Agent {
     }
 }
 
+/// Where Claude Code keeps its data at a location with the environment `env`.
+fn root(mut env: Env) -> String {
+    match env.vars.remove("CLAUDE_CONFIG_DIR") {
+        Some(dir) if !dir.is_empty() => dir,
+        _ => format!("{}/.claude", env.home),
+    }
+}
+
 /// Claude Code's data at one location.
 struct Data<'a> {
     tree: FileTree<'a>,
@@ -96,14 +105,14 @@ struct Data<'a> {
 }
 
 impl Source for Data<'_> {
-    fn scan(&mut self) -> Result<Vec<ScannedItem>, ProviderError> {
+    fn scan(&mut self) -> Result<Scan, ProviderError> {
         self.tree.scan()
     }
 
     fn hash_prefixes(
         &mut self,
         requests: &[ItemPrefix],
-    ) -> Result<Vec<Option<Hash>>, ProviderError> {
+    ) -> Result<Vec<Result<Hashed, RangeFailure>>, ProviderError> {
         self.tree.hash_prefixes(requests)
     }
 
@@ -115,30 +124,35 @@ impl Source for Data<'_> {
         self.tree.fetch(requests, sink)
     }
 
-    /**
-     * `cleanupPeriodDays` in the root's `settings.json`: Claude Code deletes transcripts older
-     * than that many days, 30 unless set, at least 1. A settings file it would reject (not
-     * JSON, or a period that isn't a whole number of days from 1 up) gives no answer, as Claude
-     * Code itself then stops deleting. Settings from other scopes (a project's, a managed
-     * policy) can override the value and are not read.
-     */
     fn retention_days(&mut self) -> Result<Option<u32>, ProviderError> {
-        let Some(settings) = self
-            .transport
-            .read_small(&format!("{}/settings.json", self.root))?
-        else {
-            return Ok(Some(DEFAULT_RETENTION_DAYS));
-        };
-        Ok(match serde_json::from_slice(&settings) {
-            Ok(Value::Object(settings)) => match settings.get("cleanupPeriodDays") {
-                None => Some(DEFAULT_RETENTION_DAYS),
-                Some(days) => days
-                    .as_u64()
-                    .filter(|days| *days >= 1)
-                    .map(|days| u32::try_from(days).unwrap_or(u32::MAX)),
-            },
-            _ => None,
-        })
+        Ok(retention_days(
+            self.transport
+                .read_small(&format!("{}/settings.json", self.root))?
+                .as_deref(),
+        ))
+    }
+}
+
+/**
+ * `cleanupPeriodDays` in the root's `settings.json`, given the file if there is one: Claude Code
+ * deletes transcripts older than that many days, 30 unless set, at least 1. A settings file it
+ * would reject (not JSON, or a period that isn't a whole number of days from 1 up) gives no
+ * answer, as Claude Code itself then stops deleting. Settings from other scopes (a project's, a
+ * managed policy) can override the value and are not read.
+ */
+fn retention_days(settings: Option<&[u8]>) -> Option<u32> {
+    let Some(settings) = settings else {
+        return Some(DEFAULT_RETENTION_DAYS);
+    };
+    match serde_json::from_slice(settings) {
+        Ok(Value::Object(settings)) => match settings.get("cleanupPeriodDays") {
+            None => Some(DEFAULT_RETENTION_DAYS),
+            Some(days) => days
+                .as_u64()
+                .filter(|days| *days >= 1)
+                .map(|days| u32::try_from(days).unwrap_or(u32::MAX)),
+        },
+        _ => None,
     }
 }
 
@@ -146,25 +160,16 @@ impl Source for Data<'_> {
 fn classify(key: &str) -> FileClass {
     /* `projects/<project>/` and then the path inside the project. */
     let inside: Vec<&str> = key.split('/').skip(2).collect();
-    let (kind, session) = match inside[..] {
-        [] => (ItemKind::Sidecar, None),
-        [file] => {
-            let session = file.split('.').next().unwrap_or(file);
-            let kind = if file.strip_prefix(session) == Some(".jsonl") {
-                ItemKind::Transcript
-            } else {
-                ItemKind::Sidecar
-            };
-            (kind, Some(session))
-        }
-        ["memory", ..] => (ItemKind::Sidecar, None),
-        [session, "subagents", .., file]
+    let session = inside.first().and_then(|name| session_of(name));
+    let kind = match (session, &inside[..]) {
+        (Some(session), [file]) if &file[session.len()..] == ".jsonl" => ItemKind::Transcript,
+        (Some(_), [_, "subagents", .., file])
             if file.starts_with("agent-") && file.ends_with(".jsonl") =>
         {
-            (ItemKind::Subagent, Some(session))
+            ItemKind::Subagent
         }
-        [session, "tool-results", ..] => (ItemKind::ToolResult, Some(session)),
-        [session, ..] => (ItemKind::Sidecar, Some(session)),
+        (Some(_), [_, "tool-results", _, ..]) => ItemKind::ToolResult,
+        _ => ItemKind::Sidecar,
     };
     FileClass {
         kind,
@@ -173,12 +178,23 @@ fn classify(key: &str) -> FileClass {
     }
 }
 
+/// The session id that leads `name`, the name of a file or folder in a project: a UUID, alone
+/// or followed by `.` and more, as in `01234567-89ab-cdef-0123-456789abcdef.jsonl`. Other
+/// names there are not a session's.
+fn session_of(name: &str) -> Option<&str> {
+    let id = name.get(..36)?;
+    let shaped = id.bytes().enumerate().all(|(at, byte)| match at {
+        8 | 13 | 18 | 23 => byte == b'-',
+        _ => byte.is_ascii_hexdigit(),
+    });
+    (shaped && matches!(name.as_bytes().get(36), None | Some(b'.'))).then_some(id)
+}
+
 #[cfg(test)]
 mod source_tests {
-    use std::fs;
+    use std::collections::HashMap;
 
     use super::*;
-    use crate::transport::LocalTransport;
 
     fn class(kind: ItemKind, session: Option<&str>, lines: bool) -> FileClass {
         FileClass {
@@ -191,40 +207,83 @@ mod source_tests {
     #[test]
     fn files_are_classified_by_where_they_are() {
         use ItemKind::{Sidecar, Subagent, ToolResult, Transcript};
-        for (inside, expected) in [
-            ("s1.jsonl", class(Transcript, Some("s1"), true)),
-            ("s1.released.json", class(Sidecar, Some("s1"), false)),
+        const ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+        let in_session = |path: &str| format!("{ID}{path}");
+        for (inside, kind, session, lines) in [
+            (in_session(".jsonl"), Transcript, true, true),
+            (in_session(".released.json"), Sidecar, true, false),
             (
-                "s1/subagents/agent-a1.jsonl",
-                class(Subagent, Some("s1"), true),
+                in_session("/subagents/agent-a1.jsonl"),
+                Subagent,
+                true,
+                true,
             ),
             (
-                "s1/subagents/agent-a1.meta.json",
-                class(Sidecar, Some("s1"), false),
+                in_session("/subagents/agent-a1.meta.json"),
+                Sidecar,
+                true,
+                false,
             ),
             (
-                "s1/subagents/workflows/w1/agent-a2.jsonl",
-                class(Subagent, Some("s1"), true),
+                in_session("/subagents/agent-a1.prefix.json"),
+                Sidecar,
+                true,
+                false,
             ),
             (
-                "s1/subagents/workflows/w1/journal.jsonl",
-                class(Sidecar, Some("s1"), true),
+                in_session("/subagents/workflows/w1/agent-a2.jsonl"),
+                Subagent,
+                true,
+                true,
             ),
             (
-                "s1/tool-results/r1.txt",
-                class(ToolResult, Some("s1"), false),
+                in_session("/subagents/workflows/w1/journal.jsonl"),
+                Sidecar,
+                true,
+                true,
+            ),
+            (in_session("/tool-results/r1.txt"), ToolResult, true, false),
+            (in_session("/tool-results/r2.png"), ToolResult, true, false),
+            (in_session("/tool-results/r3.html"), ToolResult, true, false),
+            (in_session("/custom-title.json"), Sidecar, true, false),
+            (in_session("/notes.txt"), Sidecar, true, false),
+            (in_session("/workflows/w1.json"), Sidecar, true, false),
+            (in_session("/workflows/w1/main.js"), Sidecar, true, false),
+            /* Not a session's: no session id leads the name. */
+            ("memory/notes.md".to_string(), Sidecar, false, false),
+            ("sessions-index.json".to_string(), Sidecar, false, false),
+            ("notes.jsonl".to_string(), Sidecar, false, true),
+            (
+                "other/tool-results/r1.txt".to_string(),
+                Sidecar,
+                false,
+                false,
+            ),
+            /* A folder is a session's by the same rule as a file. */
+            (in_session(".d/notes.txt"), Sidecar, true, false),
+            (
+                in_session(".d/tool-results/r1.txt"),
+                ToolResult,
+                true,
+                false,
+            ),
+            (format!("{ID}x.jsonl"), Sidecar, false, true),
+            (
+                format!("{ID}x/subagents/agent-a1.jsonl"),
+                Sidecar,
+                false,
+                true,
             ),
             (
-                "s1/tool-results/r2.png",
-                class(ToolResult, Some("s1"), false),
+                "01234567-89ab-cdef-0123-456789abcdeg.jsonl".to_string(),
+                Sidecar,
+                false,
+                true,
             ),
-            ("s1/custom-title.json", class(Sidecar, Some("s1"), false)),
-            ("s1/workflows/w1/main.js", class(Sidecar, Some("s1"), false)),
-            ("memory/notes.md", class(Sidecar, None, false)),
         ] {
             assert_eq!(
                 classify(&format!("projects/-home-user-code-app/{inside}")),
-                expected,
+                class(kind, session.then_some(ID), lines),
                 "{inside}"
             );
         }
@@ -232,61 +291,27 @@ mod source_tests {
     }
 
     #[test]
-    fn the_root_is_the_config_dir_when_set_else_the_home_folder() {
-        let home = tempfile::tempdir().unwrap();
-        let home_text = home.path().to_str().unwrap().to_string();
-        let transport = LocalTransport::with_env(home_text.clone(), []);
-        assert!(Agent.detect(&transport).unwrap().is_none());
-
-        let project = home.path().join(".claude/projects/-home-user-code-app");
-        fs::create_dir_all(&project).unwrap();
-        fs::write(project.join("s1.jsonl"), "{}\n").unwrap();
-        let mut found = Agent.detect(&transport).unwrap().unwrap();
-        let keys: Vec<_> = found.scan().unwrap().into_iter().map(|i| i.key).collect();
-        assert_eq!(keys, ["projects/-home-user-code-app/s1.jsonl"]);
-
-        let elsewhere = home.path().join("config");
-        fs::create_dir_all(elsewhere.join("projects/-home-user-code-other")).unwrap();
-        fs::write(
-            elsewhere.join("projects/-home-user-code-other/s2.jsonl"),
-            "{}\n",
-        )
-        .unwrap();
-        let transport = LocalTransport::with_env(
-            home_text,
-            [(
-                "CLAUDE_CONFIG_DIR".to_string(),
-                elsewhere.to_str().unwrap().to_string(),
-            )],
-        );
-        let mut found = Agent.detect(&transport).unwrap().unwrap();
-        let keys: Vec<_> = found.scan().unwrap().into_iter().map(|i| i.key).collect();
-        assert_eq!(keys, ["projects/-home-user-code-other/s2.jsonl"]);
+    fn the_root_is_the_config_dir_when_set_else_under_the_home_folder() {
+        let env = |config_dir: Option<&str>| Env {
+            home: "/home/user".to_string(),
+            vars: config_dir
+                .map(|dir| ("CLAUDE_CONFIG_DIR".to_string(), dir.to_string()))
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        };
+        assert_eq!(root(env(None)), "/home/user/.claude");
+        assert_eq!(root(env(Some(""))), "/home/user/.claude");
+        assert_eq!(root(env(Some("/srv/agent"))), "/srv/agent");
     }
 
     #[test]
     fn retention_is_read_from_settings_with_the_documented_default() {
-        let home = tempfile::tempdir().unwrap();
-        let root = home.path().join(".claude");
-        fs::create_dir_all(root.join("projects")).unwrap();
-        let transport = LocalTransport::with_env(home.path().to_str().unwrap().to_string(), []);
-        let retention = |settings: Option<&str>| {
-            match settings {
-                Some(settings) => fs::write(root.join("settings.json"), settings).unwrap(),
-                None => drop(fs::remove_file(root.join("settings.json"))),
-            }
-            Agent
-                .detect(&transport)
-                .unwrap()
-                .unwrap()
-                .retention_days()
-                .unwrap()
-        };
-        assert_eq!(retention(None), Some(30));
-        assert_eq!(retention(Some(r#"{"theme": "dark"}"#)), Some(30));
-        assert_eq!(retention(Some(r#"{"cleanupPeriodDays": 365}"#)), Some(365));
-        assert_eq!(retention(Some(r#"{"cleanupPeriodDays": 0}"#)), None);
-        assert_eq!(retention(Some(r#"{"cleanupPeriodDays": "90"}"#)), None);
-        assert_eq!(retention(Some("{ not json")), None);
+        let retention = |settings: &str| retention_days(Some(settings.as_bytes()));
+        assert_eq!(retention_days(None), Some(30));
+        assert_eq!(retention(r#"{"theme": "dark"}"#), Some(30));
+        assert_eq!(retention(r#"{"cleanupPeriodDays": 365}"#), Some(365));
+        assert_eq!(retention(r#"{"cleanupPeriodDays": 0}"#), None);
+        assert_eq!(retention(r#"{"cleanupPeriodDays": "90"}"#), None);
+        assert_eq!(retention("{ not json"), None);
     }
 }

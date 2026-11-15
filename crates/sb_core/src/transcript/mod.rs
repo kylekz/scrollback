@@ -33,7 +33,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use thiserror::Error;
 
-use crate::provider::{Provider, SessionItems};
+use crate::provider::{Provider, ProviderId, SessionItems};
 
 pub use build::Builder;
 pub use index::{At, SessionIndex, Span, SpanKind, Totals, index};
@@ -122,8 +122,8 @@ fn read_under(
 /// What a session says about itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Facts {
-    /// The id of the provider that parsed the session, which is its agent.
-    pub agent: &'static str,
+    /// The provider that parsed the session, which is its agent.
+    pub agent: ProviderId,
     /// The title the agent stored, if it stored one.
     pub title: Option<String>,
     /// The first working directory, as the agent wrote it (PLAN D9).

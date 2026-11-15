@@ -17,7 +17,15 @@ path = "src/main.rs"
 default = ["automation"]
 # `--automation`: the JSONL driver used by the e2e scenarios (docs/PLAN.md §12). Shipped builds
 # are built without it.
-automation = ["dep:gpui_automation", "gpui_automation/enabled", "dep:serde_json", "sb_ui/automation"]
+automation = [
+    "dep:gpui_automation",
+    "gpui_automation/enabled",
+    # Its commands' arguments name a mode, a material and an appearance by their keys.
+    "gpui_appearance/serde",
+    "dep:serde",
+    "dep:serde_json",
+    "sb_ui/automation",
+]
 
 [dependencies]
 anyhow.workspace = true
@@ -31,6 +39,7 @@ gpui_automation = { workspace = true, optional = true }
 gpui_platform.workspace = true
 log.workspace = true
 sb_ui.workspace = true
+serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
 # macOS: text through Core Text needs gpui's `font-kit` (without it nothing draws), and
@@ -40,5 +49,4 @@ serde_json = { workspace = true, optional = true }
 gpui_platform = { workspace = true, features = ["font-kit", "runtime_shaders"] }
 
 [dev-dependencies]
-gpui = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true

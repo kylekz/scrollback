@@ -2,25 +2,33 @@
 //! sizes with subagents, saved tool results and bookkeeping files, and transcripts written
 //! record by record with whatever a test needs in them. Everything in it is made up here;
 //! nothing comes from a real transcript.
+//!
+//! Every file is given a modification time well in the past, a second later at each write, as
+//! if the agent had written it a while ago: sync does not trust a file modified in the last
+//! moments before it is scanned, which a file a test has just written would be.
+//! [`ProjectsTree::modified_ago`] makes a file one of those.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use sb_core::provider::{self, Provider};
-use sb_core::transport::LocalTransport;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use crate::Agent;
+use crate::{Agent, HomeTransport};
 
-/// A home folder holding `.claude/projects/`.
+/// A home folder holding the agent's root with its `projects/`.
 pub struct ProjectsTree {
     home: TempDir,
+    root: PathBuf,
+    /// The location's environment: the variable that says where the root is, when it is not
+    /// where the agent puts it by default.
+    vars: Vec<(String, String)>,
     sessions: usize,
     record_bytes: usize,
 }
@@ -32,11 +40,31 @@ impl Default for ProjectsTree {
 }
 
 impl ProjectsTree {
+    /// A tree in the agent's default place, `.claude` under the home folder.
     pub fn new() -> Self {
         let home = tempfile::tempdir().unwrap();
-        fs::create_dir_all(home.path().join(".claude/projects")).unwrap();
+        let root = home.path().join(".claude");
+        Self::at(home, root, Vec::new())
+    }
+
+    /// A tree somewhere else under the home folder, which the location's environment points
+    /// the agent at.
+    pub fn in_config_dir() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("elsewhere/agent");
+        let vars = vec![(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            root.to_str().unwrap().to_string(),
+        )];
+        Self::at(home, root, vars)
+    }
+
+    fn at(home: TempDir, root: PathBuf, vars: Vec<(String, String)>) -> Self {
+        fs::create_dir_all(root.join("projects")).unwrap();
         Self {
             home,
+            root,
+            vars,
             sessions: 0,
             record_bytes: 160,
         }
@@ -54,18 +82,18 @@ impl ProjectsTree {
     }
 
     /// This tree as a location.
-    pub fn transport(&self) -> LocalTransport {
-        LocalTransport::with_env(self.home().to_str().unwrap(), [])
+    pub fn transport(&self) -> HomeTransport {
+        HomeTransport::new(self.home(), self.vars.clone())
     }
 
     /// The file an item's key names.
     pub fn path(&self, key: &str) -> PathBuf {
-        self.home.path().join(".claude").join(key)
+        self.root.join(key)
     }
 
     /// Writes the agent's `settings.json`.
     pub fn write_settings(&self, json: &str) {
-        fs::write(self.path("settings.json"), json).unwrap();
+        write(&self.path("settings.json"), json.as_bytes());
     }
 
     /// A new session started in `project` (a path such as `/home/user/code/app`), with a
@@ -78,7 +106,7 @@ impl ProjectsTree {
 
     fn session_with_id(&self, project: &str, id: String, records: usize) -> Session {
         let folder = project_folder(project);
-        let root = self.home.path().join(".claude");
+        let root = self.root.clone();
         let key = format!("projects/{folder}/{id}.jsonl");
         let mut session = Session {
             dir: format!("projects/{folder}/{id}"),
@@ -96,9 +124,26 @@ impl ProjectsTree {
 
     /// A memory file of the project at `project`. Returns its key.
     pub fn memory(&self, project: &str, name: &str, text: &str) -> String {
-        let key = format!("projects/{}/memory/{name}.md", project_folder(project));
-        write(&self.path(&key), text.as_bytes());
+        self.project_file(project, &format!("memory/{name}.md"), text.as_bytes())
+    }
+
+    /// The file `path` in the folder of the project at `project`, holding `bytes`: any file
+    /// the agent keeps there, whatever it is. Returns its key.
+    pub fn project_file(&self, project: &str, path: &str, bytes: &[u8]) -> String {
+        let key = format!("projects/{}/{path}", project_folder(project));
+        write(&self.path(&key), bytes);
         key
+    }
+
+    /// Gives the file at `key` the modification time `modified`.
+    pub fn set_modified(&self, key: &str, modified: SystemTime) {
+        set_modified(&self.path(key), modified);
+    }
+
+    /// Gives the file at `key` a modification time `ago` before now: for a short `ago`, the
+    /// time of a file the agent has just written.
+    pub fn modified_ago(&self, key: &str, ago: Duration) {
+        self.set_modified(key, SystemTime::now() - ago);
     }
 }
 
@@ -122,19 +167,40 @@ impl Session {
         self.transcript.filler(records, self.record_bytes);
     }
 
-    /// A subagent's transcript of `records` records, with its metadata file. Returns the
-    /// transcript's key.
+    /**
+     * A subagent's transcript of `records` records, with its metadata file, and in the
+     * session's transcript the call that started it and the call's result, as a real session
+     * has them. Returns the subagent transcript's key.
+     */
     pub fn subagent(&mut self, records: usize) -> String {
-        let call = format!("toolu_{:024x}", self.extras + 1);
+        let call = self.transcript.call(
+            "Agent",
+            json!({
+                "subagent_type": "general-purpose",
+                "description": "Look something up",
+                "prompt": "Look it up.",
+            }),
+        );
         let (key, mut transcript) = self.subagent_transcript(
             "",
             Some(json!({
                 "agentType": "general-purpose",
                 "description": "Look something up",
-                "toolUseId": call,
+                "toolUseId": call.id,
             })),
         );
         transcript.filler(records, self.record_bytes);
+        let started = json!({ "agentId": transcript.agent, "status": "completed" });
+        self.transcript
+            .result_with(&call, json!("Looked up."), false, started);
+        key
+    }
+
+    /// The file `path` in the session's own folder, holding `bytes`: any file the agent keeps
+    /// there, whatever it is. Returns its key.
+    pub fn file(&self, path: &str, bytes: &[u8]) -> String {
+        let key = format!("{}/{path}", self.dir);
+        write(&self.root.join(&key), bytes);
         key
     }
 
@@ -256,6 +322,8 @@ pub struct Records {
     prefix: usize,
     /// How many records were written. Ids and times count from it.
     written: usize,
+    /// How many of them were filler.
+    filled: usize,
     /// The uuid of the conversation record the next one follows.
     parent: Option<String>,
     /// The filler's call that its next record answers.
@@ -278,6 +346,7 @@ impl Records {
             agent,
             prefix,
             written: 0,
+            filled: 0,
             parent: None,
             unanswered: None,
         }
@@ -292,8 +361,7 @@ impl Records {
 
     /// Appends `line` and a newline as they are.
     pub fn raw(&mut self, line: &str) {
-        let mut file = File::options().append(true).open(&self.path).unwrap();
-        writeln!(file, "{line}").unwrap();
+        append(&self.path, format!("{line}\n").as_bytes());
         self.written += 1;
     }
 
@@ -491,7 +559,8 @@ impl Records {
     /// that calls a tool, the tool's result, and a bookkeeping record, over and over.
     fn filler(&mut self, records: usize, bytes: usize) {
         for _ in 0..records {
-            let index = self.written;
+            let index = self.filled;
+            self.filled += 1;
             let text = filler(index, bytes);
             match index % 4 {
                 0 => {
@@ -505,7 +574,7 @@ impl Records {
                           "input": { "command": "ls" } },
                     ]);
                     self.unanswered = Some(Call {
-                        uuid: self.assistant(index, MODEL, blocks, json!({})),
+                        uuid: self.assistant(self.written, MODEL, blocks, json!({})),
                         id,
                     });
                 }
@@ -534,9 +603,44 @@ fn project_folder(project: &str) -> String {
         .collect()
 }
 
+/// Replaces the file at `path` with `bytes`, as written a second after it was last written.
 fn write(path: &Path, bytes: &[u8]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let modified = next_modified(path);
     fs::write(path, bytes).unwrap();
+    set_modified(path, modified);
+}
+
+/// Adds `bytes` to the end of the file at `path`, as written a second after it was last
+/// written.
+fn append(path: &Path, bytes: &[u8]) {
+    let modified = next_modified(path);
+    File::options()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(bytes)
+        .unwrap();
+    set_modified(path, modified);
+}
+
+/// The time the next write to `path` is given: a second after its last, or an hour ago for a
+/// new file.
+fn next_modified(path: &Path) -> SystemTime {
+    match fs::metadata(path) {
+        Ok(metadata) => metadata.modified().unwrap() + Duration::from_secs(1),
+        Err(_) => SystemTime::now() - Duration::from_secs(3600),
+    }
+}
+
+fn set_modified(path: &Path, modified: SystemTime) {
+    File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
 }
 
 /// `bytes` bytes of words, different for each `seed`.
@@ -572,13 +676,22 @@ impl Default for FileAgent {
 
 impl FileAgent {
     pub fn new() -> Self {
+        Self::on(ProjectsTree::new())
+    }
+
+    /// The agent whose data is `tree`.
+    pub fn on(tree: ProjectsTree) -> Self {
         Self {
-            tree: ProjectsTree::new(),
+            tree,
             sessions: HashMap::new(),
         }
     }
 
-    pub fn tree(&mut self) -> &mut ProjectsTree {
+    pub fn tree(&self) -> &ProjectsTree {
+        &self.tree
+    }
+
+    pub fn tree_mut(&mut self) -> &mut ProjectsTree {
         &mut self.tree
     }
 
@@ -587,15 +700,24 @@ impl FileAgent {
         self.sessions.get_mut(key).unwrap()
     }
 
-    /// Writes `text` at the end of the transcript `key` as it is: with no newline, the start
-    /// of a record the agent has not finished writing.
+    /// Writes `text` at the end of the file `key` as it is: without a newline, the start of a
+    /// record the agent has not finished writing.
     pub fn append_raw(&self, key: &str, text: &str) {
-        File::options()
-            .append(true)
-            .open(self.tree.path(key))
-            .unwrap()
-            .write_all(text.as_bytes())
-            .unwrap();
+        append(&self.tree.path(key), text.as_bytes());
+    }
+
+    /// Replaces what the file `key` holds with `bytes`, as the agent rewriting it would.
+    pub fn overwrite(&self, key: &str, bytes: &[u8]) {
+        write(&self.tree.path(key), bytes);
+    }
+
+    /// Replaces what the file `key` holds with `bytes` and leaves its modification time as it
+    /// was: a change a scan can only see in the bytes.
+    pub fn overwrite_unseen(&self, key: &str, bytes: &[u8]) {
+        let path = self.tree.path(key);
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, bytes).unwrap();
+        set_modified(&path, modified);
     }
 
     fn lines(&self, key: &str) -> Vec<String> {
@@ -611,11 +733,11 @@ impl Agent for FileAgent {
     fn provider(&self) -> Box<dyn Provider> {
         provider::builtin()
             .into_iter()
-            .find(|provider| provider.id() == "claude-code")
+            .find(|provider| provider.id().as_str() == "claude-code")
             .unwrap()
     }
 
-    fn transport(&self) -> LocalTransport {
+    fn transport(&self) -> HomeTransport {
         self.tree.transport()
     }
 
@@ -635,23 +757,26 @@ impl Agent for FileAgent {
         let mut first: Value = serde_json::from_str(&lines[0]).unwrap();
         first["message"]["content"] = json!(filler(1, 64));
         lines[0] = first.to_string() + "\n";
-        fs::write(self.tree.path(key), lines.concat()).unwrap();
+        self.overwrite(key, lines.concat().as_bytes());
         self.session(key).append(1);
+    }
+
+    fn rewrite_same_size(&mut self, key: &str) {
+        let mut bytes = self.content(key);
+        /* Inside the first record's text, where any letter will do. */
+        let at = bytes.iter().position(|byte| *byte == b' ').unwrap() - 1;
+        bytes[at] = if bytes[at] == b'x' { b'y' } else { b'x' };
+        self.overwrite(key, &bytes);
     }
 
     fn truncate(&mut self, key: &str, records: usize) {
         let lines = self.lines(key);
-        fs::write(self.tree.path(key), lines[..lines.len() - records].concat()).unwrap();
+        self.overwrite(key, lines[..lines.len() - records].concat().as_bytes());
     }
 
     fn touch(&mut self, key: &str) {
-        let file = File::options()
-            .write(true)
-            .open(self.tree.path(key))
-            .unwrap();
-        let modified = file.metadata().unwrap().modified().unwrap();
-        file.set_modified(modified + Duration::from_secs(1))
-            .unwrap();
+        let path = self.tree.path(key);
+        set_modified(&path, next_modified(&path));
     }
 
     fn delete(&mut self, key: &str) {
