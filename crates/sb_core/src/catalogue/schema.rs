@@ -162,8 +162,8 @@ CREATE TABLE reading_choice (
 -- one of its transcripts is held back. failure is why the last index of the session did not
 -- parse it; the other derived columns are then what the index before it found.
 -- parser_version, index_version and indexed_from say what the row was made by and from: a
--- session is indexed again when any of them is no longer so. indexed_from is NULL when the
--- row is of no state of the items, so that the next index tries again.
+-- session is indexed again when any of them is no longer so. retry: the archive could not be
+-- read when the row was made, and an index of a start tries again.
 CREATE TABLE session (
     id INTEGER PRIMARY KEY,
     location_id TEXT NOT NULL REFERENCES location (id),
@@ -196,9 +196,10 @@ CREATE TABLE session (
     unread INTEGER NOT NULL,
     held_back INTEGER NOT NULL,
     failure TEXT,
+    retry INTEGER NOT NULL,
     parser_version INTEGER NOT NULL,
     index_version INTEGER NOT NULL,
-    indexed_from TEXT,
+    indexed_from TEXT NOT NULL,
     UNIQUE (location_id, provider, session)
 ) STRICT;
 ";

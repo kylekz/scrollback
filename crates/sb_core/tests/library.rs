@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::catalogue::{Catalogue, CatalogueError, Filed, Folder, SessionId, Shelf};
-use sb_core::filing::{FolderId, NormalPath};
+use sb_core::filing::{AttachedPath, FolderId, NormalPath};
 use sb_core::location::{LocationId, LocationKind};
 use sb_core::sync::sync_location;
 use sb_test_support::{Agent, DbAgent, FileAgent, read_catalogue};
@@ -409,7 +409,10 @@ fn a_deleted_folders_sessions_go_to_unsorted_and_are_filed_again() {
         [Filed::ByRule(code), Filed::Unsorted, Filed::ByHand(deep)]
     );
     assert_eq!(outline(&catalogue.folders().unwrap(), None), "code(deep)");
-    assert!(catalogue.folder_paths(app).unwrap().is_empty());
+    assert!(matches!(
+        catalogue.folder_paths(app),
+        Err(CatalogueError::NoFolder(_))
+    ));
     let counts = catalogue.library_counts().unwrap();
     assert_eq!(counts.unsorted, 1);
     assert_eq!(counts.folders, HashMap::from([(code, 2), (deep, 1)]));
@@ -552,9 +555,10 @@ fn a_path_is_the_same_however_the_drive_is_written() {
     let first = catalogue.create_folder("first", None).unwrap();
     let second = catalogue.create_folder("second", None).unwrap();
 
-    /* Typed with white space around it, which is not part of the path. */
+    /* Typed with white space around it, and in the quotes a path copied from a file
+    manager comes in: neither is part of the path. */
     catalogue
-        .attach_path(first, "  D:\\Projects\\app \n", None)
+        .attach_path(first, "  \"D:\\Projects\\app\" \n", None)
         .unwrap();
     let paths = catalogue.folder_paths(first).unwrap();
     assert_eq!(
@@ -639,13 +643,39 @@ fn what_is_not_there_is_said_not_passed_over() {
     );
 
     /* The folders a move leaves close up: the places among them have no gaps. */
+    let top = "SELECT position FROM folder WHERE parent_id IS NULL ORDER BY position";
+    let b = catalogue.folders().unwrap()[1].id;
+    catalogue.move_folder(b, Some(folder), 0).unwrap();
+    assert_eq!(
+        outline(&catalogue.folders().unwrap(), None),
+        "work(b work) c"
+    );
+    assert_eq!(read_catalogue(bench.dir(), top), ["0", "1"]);
+    catalogue.move_folder(b, None, 1).unwrap();
     catalogue.move_folder(twin, None, 1).unwrap();
+    assert_eq!(read_catalogue(bench.dir(), top), ["0", "1", "2", "3"]);
     catalogue.delete_folder(folder).unwrap();
     assert_eq!(outline(&catalogue.folders().unwrap(), None), "work b c");
-    assert_eq!(
-        read_catalogue(bench.dir(), "SELECT position FROM folder ORDER BY position"),
-        ["0", "1", "2"]
-    );
+    assert_eq!(read_catalogue(bench.dir(), top), ["0", "1", "2"]);
+
+    /* Paths of a folder that is not there, and a path that is not attached. */
+    assert!(matches!(
+        catalogue.folder_paths(missing),
+        Err(CatalogueError::NoFolder(_))
+    ));
+    catalogue
+        .attach_path(twin, "/home/user/code/app", None)
+        .unwrap();
+    let attached = catalogue.folder_paths(twin).unwrap().remove(0).attached;
+    catalogue.detach_path(&attached).unwrap();
+    assert!(matches!(
+        catalogue.detach_path(&attached),
+        Err(CatalogueError::NotAttached(path)) if path == "/home/user/code/app"
+    ));
+    assert!(no_folder(catalogue.detach_path(&AttachedPath {
+        folder: missing,
+        ..attached
+    })));
 
     /* Nothing is decided about a session of which nothing is archived, and nothing is kept
     of the attempt: the session that arrives under that identity starts as any other. */

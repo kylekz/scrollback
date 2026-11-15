@@ -66,6 +66,12 @@ pub enum CatalogueError {
     NotOfSession(i64),
     #[error("version {version} is not a version of item {item}")]
     NotOfItem { version: i64, item: i64 },
+    /// A version whose stored bytes are damaged is not chosen to be read.
+    #[error("version {0} is damaged")]
+    Damaged(i64),
+    /// The path is not attached to the folder for those locations.
+    #[error("{0} is not attached to the folder")]
+    NotAttached(String),
 }
 
 /// The most characters a folder's name has.
@@ -198,8 +204,8 @@ pub struct Version {
 /// Why a version is held back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Held {
-    /// It is shorter than the copy being read. It stops being held back once it has grown to
-    /// that copy's length.
+    /// It was shorter than the copy being read when it started. It stops being held back once
+    /// an index finds it as long as that copy and parsing no worse.
     Shorter,
     /// Its transcript no longer parses where the copy being read does. It stays held back
     /// however long it grows, until an index finds it parses as well again.
@@ -550,10 +556,9 @@ impl Catalogue {
      * to, all in one transaction.
      * Returns for each whether a version it starts is held back (PLAN §4.2): it is a
      * transcript's and is shorter than the copy being read, which is the newest version not
-     * itself held back. A held-back version that grows to that copy's length is no longer a
-     * loss and stops being held back, unless it is held back for how it parses
-     * ([`Catalogue::hold_for_parse`]). A version that starts also ends the owner's choice of
-     * an earlier one to read ([`Catalogue::set_reading_version`]).
+     * itself held back. It stays held back while it grows: the index, which parses it, says
+     * when it is no loss any more ([`Catalogue::set_hold`]). A version that starts also ends
+     * the owner's choice of an earlier one to read ([`Catalogue::set_reading_version`]).
      */
     pub(crate) fn commit(&self, commits: &[Recorded<'_>]) -> Result<Vec<bool>> {
         let now = now_ms();
@@ -607,8 +612,7 @@ impl Catalogue {
                     Target::NewVersion { item, reason } => {
                         seen(tx, item, scanned)?;
                         let reading: u64 = tx.query_row(
-                            "SELECT length FROM version WHERE item_id = ?1 AND held_back = 0
-                             ORDER BY number DESC LIMIT 1",
+                            &format!("SELECT {}", session::copy("length", "?1", None)),
                             [item],
                             |row| row.get(0),
                         )?;
@@ -618,15 +622,10 @@ impl Catalogue {
                     }
                     Target::Append { item, version } => {
                         seen(tx, item, scanned)?;
+                        /* A version that is held back stays so however it grows: whether it
+                        is still a loss is for the index to say, which parses it. */
                         let extended = tx.execute(
-                            "UPDATE version SET length = ?2, hash = ?3,
-                                 held_back = held_by_parse OR COALESCE(held_back AND ?2 < (
-                                     SELECT length FROM version reading
-                                     WHERE reading.item_id = version.item_id
-                                       AND reading.held_back = 0
-                                       AND reading.number < version.number
-                                     ORDER BY reading.number DESC LIMIT 1
-                                 ), 0)
+                            "UPDATE version SET length = ?2, hash = ?3
                              WHERE id = ?1 AND length = ?4",
                             params![version, commit.length, commit.hash, commit.from],
                         )?;
@@ -747,11 +746,17 @@ impl Catalogue {
         })
     }
 
+    /// Marks `versions` as damaged, or as damaged no more. A damaged version is not read by
+    /// the owner's choice: a choice of one ends here.
     pub(crate) fn set_damaged(&self, versions: &[i64], damaged: bool) -> Result<()> {
         self.db.write(|tx| {
             let mut update = tx.prepare("UPDATE version SET damaged = ?2 WHERE id = ?1")?;
+            let mut unchoose = tx.prepare("DELETE FROM reading_choice WHERE version_id = ?1")?;
             for version in versions {
                 update.execute(params![version, damaged])?;
+                if damaged {
+                    unchoose.execute([version])?;
+                }
             }
             Ok(())
         })
@@ -761,17 +766,10 @@ impl Catalogue {
 /// Records that `item` was found at its source as `scanned`: what it is, and its length and
 /// stamp. An item that was gone is back.
 fn seen(connection: &Connection, item: i64, scanned: &ScannedItem) -> rusqlite::Result<usize> {
+    session::classify(connection, item, scanned.kind, scanned.session.as_deref())?;
     connection.execute(
-        "UPDATE item SET kind = ?2, session = ?3, seen_length = ?4, seen_stamp = ?5,
-                         gone_since = NULL
-         WHERE id = ?1",
-        params![
-            item,
-            scanned.kind,
-            scanned.session,
-            scanned.length,
-            scanned.stamp
-        ],
+        "UPDATE item SET seen_length = ?2, seen_stamp = ?3, gone_since = NULL WHERE id = ?1",
+        params![item, scanned.length, scanned.stamp],
     )
 }
 

@@ -381,8 +381,11 @@ impl Archive {
         let mut commits = Vec::new();
         let mut unplaced = Vec::new();
         for (commit, segments) in batch {
-            match self.put(&commit, segments, &mut folders) {
+            /* The folders of an item that is not placed are not this batch's to flush. */
+            let mut its_folders = BTreeSet::new();
+            match self.put(&commit, segments, &mut its_folders) {
                 Ok(segments) => {
+                    folders.append(&mut its_folders);
                     commits.push(Recorded { commit, segments });
                     unplaced.push(None);
                 }

@@ -13,8 +13,9 @@ use crate::location::LocationId;
 /// same project files the same from a distro and from Windows.
 pub const WSL_DRIVE_MOUNT: &str = "/mnt/";
 
-/// What Windows puts before a path to have it taken as it is, and before a share's then.
-const VERBATIM: &str = r"\\?\";
+/// What Windows puts before a path to have it taken as it is, or as a device's, and before a
+/// share's then.
+const VERBATIM: [&str; 2] = [r"\\?\", r"\\.\"];
 const VERBATIM_SHARE: &str = r"UNC\";
 
 /// The hosts under which Windows shows a WSL distro's own files, as `\\<host>\<distro>\…`.
@@ -28,7 +29,8 @@ const WSL_HOSTS: [&str; 2] = ["wsl.localhost", "wsl$"];
  *   compares names without regard to case: `d:/projects/app`;
  * - a path under a WSL distro's drive mount (`/mnt/d/Projects/app`) as the drive's path, which
  *   is the same directory: `d:/projects/app`;
- * - a path Windows wrote to be taken as it is (`\\?\D:\Projects\app`) as the path it names;
+ * - a path Windows wrote to be taken as it is (`\\?\D:\Projects\app`, `\\.\D:\Projects\app`)
+ *   as the path it names;
  * - a path on a Windows share (`\\Server\Share\app`, `//server/share/app`) in lower case behind
  *   `\\`: `\\server/share/app`. A WSL distro's files seen from Windows are such a path
  *   (`\\wsl.localhost\<distro>\home\user`), but their names are the distro's and keep their
@@ -52,7 +54,7 @@ impl NormalPath {
     pub fn new(path: &str, drive_mount: Option<&str>) -> Option<Self> {
         let named = |component: &&str| !component.is_empty() && *component != ".";
         let share;
-        let path = match path.strip_prefix(VERBATIM) {
+        let path = match VERBATIM.iter().find_map(|prefix| path.strip_prefix(prefix)) {
             Some(taken) => match taken.strip_prefix(VERBATIM_SHARE) {
                 Some(rest) => {
                     share = format!(r"\\{rest}");
@@ -255,6 +257,7 @@ mod tests {
             /* A path Windows wrote to be taken as it is, is the path it names. */
             (r"\\?\D:\Projects\App", None, "d:/projects/app"),
             (r"\\?\UNC\Server\Share\App", None, r"\\server/share/app"),
+            (r"\\.\D:\Projects\App", None, "d:/projects/app"),
         ] {
             assert_eq!(
                 NormalPath::new(path, mount).unwrap().as_str(),

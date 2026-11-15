@@ -33,7 +33,7 @@ use toolbox_process::CancelToken;
 
 use super::{Progress, SyncError};
 use crate::archive::{Archive, ArchivedSession};
-use crate::catalogue::{Derived, Held, Indexed, Reading, SessionId, Version, fingerprint};
+use crate::catalogue::{Derived, Held, Indexed, Reading, SessionId, fingerprint};
 use crate::location::LocationId;
 use crate::provider::{ItemKind, Provider};
 use crate::transcript::{self, Content, Conversation, Ending, Subagent, Transcript};
@@ -103,6 +103,12 @@ pub fn index_session(
     provider: &dyn Provider,
     id: &SessionId,
 ) -> Result<IndexReport, SyncError> {
+    if provider.id().as_str() != id.provider {
+        return Err(SyncError::NotItsProvider {
+            session: id.provider.clone(),
+            provider: provider.id(),
+        });
+    }
     let mut report = IndexReport::default();
     session(archive, provider, id, &mut report)?;
     Ok(report)
@@ -126,7 +132,7 @@ fn run(
     for provider in providers {
         let (id, parser) = (provider.id(), provider.parser_version());
         if backlog {
-            catalogue.reclassify(id.as_str(), parser, &|key| provider.classify(key))?;
+            catalogue.reclassify(location, id.as_str(), parser, &|key| provider.classify(key))?;
         }
         let (sessions, gone) = catalogue.stale(location, id.as_str(), parser, backlog)?;
         catalogue.forget_sessions(&gone)?;
@@ -230,6 +236,11 @@ fn session(
     Ok(())
 }
 
+/// Whether reading a conversation's item failed part of the way.
+fn unreadable(conversation: &Conversation) -> bool {
+    matches!(conversation.ending, Ending::Unreadable(_))
+}
+
 /// What a panic said.
 fn said(fault: &(dyn Any + Send)) -> &str {
     fault
@@ -240,15 +251,18 @@ fn said(fault: &(dyn Any + Send)) -> &str {
 }
 
 /**
- * Decides, for each of the session's transcripts whose newest version may be a loss for how
- * it parses, whether that version is held back (PLAN §4.2). `transcript` is the session as
- * `readings` give it, with no subagent read.
+ * Decides, for each of the session's transcripts that has more than one version, whether its
+ * newest is held back (PLAN §4.2). `transcript` is the session as `readings` give it, with no
+ * subagent read.
  *
- * The newest version is parsed beside the copy that is read without it, which is the newest
- * version before it that is not held back. A version held back only for being shorter is a
- * loss already, one the owner accepted is none, and neither is parsed for this. Nothing is
- * decided from a read the operating system failed. Returns how many versions are newly held
- * back, when any hold is not as it was.
+ * The newest version is measured beside the copy that is read without it, which is the newest
+ * version before it that is not held back. It is held back when it is shorter than that copy;
+ * and when it is not, when it parses worse ([`parses_worse`]), for which both are parsed. A
+ * version the owner accepted is never held back. Nothing is decided from a read the
+ * operating system failed, nor from stored bytes that are damaged: what can't be read of the
+ * archive says nothing of what the source held, and is for verify to find and the next sync
+ * to fetch again (PLAN §4.4). Returns how many versions are newly held back for how they
+ * parse, when any hold is not as it was.
  */
 fn hold(
     archive: &Archive,
@@ -260,28 +274,20 @@ fn hold(
     let own = transcript.conversation.as_ref();
     let mut newly_held = None;
     for reading in readings {
-        if !reading.kind.is_transcript()
-            || reading.newest_number == 1
-            || reading.newest_accepted
-            || reading.newest_held == Some(Held::Shorter)
-        {
+        if !reading.kind.is_transcript() || reading.newest_number == 1 || reading.newest_accepted {
             continue;
         }
-        let versions = catalogue.versions(reading.item)?;
-        let Some((newest, copy)) = versions.split_last().and_then(|(newest, older)| {
-            let copy = older.iter().rev().find(|older| older.held_back.is_none())?;
-            Some((newest, copy))
-        }) else {
+        let Some(copy) = catalogue.copy_before(reading.item, reading.newest_number)? else {
             continue;
         };
-        /* The item's conversation as it is in `version`; `None` when the provider reads none
+        /* The item's conversation as it is in a version; `None` when the provider reads none
         from it, or a read failed for a reason that is not the stored bytes. */
-        let conversation = |version: &Version| {
+        let conversation = |version: i64, length: u64| {
             let own = own.filter(|own| *own.item == *reading.key);
-            if let Some(own) = own.filter(|_| reading.version == version.id) {
+            if let Some(own) = own.filter(|_| reading.version == version) {
                 return Some(Cow::Borrowed(own));
             }
-            let items = ArchivedSession::of(archive, readings).at(&reading.key, version);
+            let items = ArchivedSession::of(archive, readings).at(&reading.key, version, length);
             let read = match (own, reading.kind) {
                 (Some(_), _) => provider.parse(&items).conversation,
                 (None, ItemKind::Subagent) => match provider.subagent(&items, &reading.key) {
@@ -292,12 +298,19 @@ fn hold(
             };
             read.filter(|_| items.fault().is_none()).map(Cow::Owned)
         };
-        let Some((newer, copy)) = conversation(newest).zip(conversation(copy)) else {
-            continue;
+        let held = if reading.newest_length < copy.length {
+            Some(Held::Shorter)
+        } else {
+            let Some((newer, copy)) = conversation(reading.newest, reading.newest_length)
+                .zip(conversation(copy.id, copy.length))
+                .filter(|(newer, copy)| !unreadable(newer) && !unreadable(copy))
+            else {
+                continue;
+            };
+            parses_worse(&newer, &copy).then_some(Held::ParsesWorse)
         };
-        let worse = parses_worse(&newer, &copy);
-        if catalogue.hold_for_parse(newest.id, newest.length, worse)? {
-            *newly_held.get_or_insert(0) += usize::from(worse);
+        if catalogue.set_hold(reading.newest, reading.newest_length, held)? {
+            *newly_held.get_or_insert(0) += usize::from(held == Some(Held::ParsesWorse));
         }
     }
     Ok(newly_held)
@@ -305,15 +318,13 @@ fn hold(
 
 /**
  * Whether a transcript "no longer parses" in its version `newer` where it did in `reading`,
- * the copy being read (PLAN §4.2): it can't be read to its end where the reading copy can, or
- * it holds fewer blocks the provider recognised, over every branch. What an agent appends
- * only ever adds blocks, whichever branch they are on, so an append is never held back; a
- * source that was emptied, cut short or replaced by something that is not a transcript holds
- * fewer, however long it is and however many records it has that the provider doesn't know.
+ * the copy being read (PLAN §4.2): it holds fewer blocks the provider recognised, over every
+ * branch. What an agent appends only ever adds blocks, whichever branch they are on, so an
+ * append is never held back for this; a source that was emptied, cut short or replaced by
+ * something that is not a transcript holds fewer, however long it is and however many records
+ * it has that the provider doesn't know. How either ends is not part of it.
  */
 fn parses_worse(newer: &Conversation, reading: &Conversation) -> bool {
-    let unreadable =
-        |conversation: &Conversation| matches!(conversation.ending, Ending::Unreadable(_));
     let recognised = |conversation: &Conversation| {
         conversation
             .blocks()
@@ -321,7 +332,7 @@ fn parses_worse(newer: &Conversation, reading: &Conversation) -> bool {
             .filter(|block| !matches!(block.content, Content::Unrecognised(_)))
             .count()
     };
-    (unreadable(newer) && !unreadable(reading)) || recognised(newer) < recognised(reading)
+    recognised(newer) < recognised(reading)
 }
 
 #[cfg(test)]
@@ -387,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn a_version_parses_worse_when_it_alone_cannot_be_read_through() {
+    fn how_a_version_ends_is_not_how_it_parses() {
         let unreadable = |blocks| {
             conversation(
                 vec![reply(); blocks],
@@ -395,8 +406,9 @@ mod tests {
                 Ending::Unreadable("damaged".to_string()),
             )
         };
-        assert!(parses_worse(&unreadable(5), &of(3)));
-        assert!(!parses_worse(&unreadable(5), &unreadable(3)));
+        assert!(!parses_worse(&unreadable(5), &of(3)));
+        assert!(!parses_worse(&unreadable(3), &of(3)));
+        assert!(parses_worse(&unreadable(2), &of(3)));
         assert!(!parses_worse(&of(3), &unreadable(3)));
         /* A version that ends inside a record is one still being written. */
         let unfinished = conversation(vec![reply(); 3], Vec::new(), Ending::MidRecord);

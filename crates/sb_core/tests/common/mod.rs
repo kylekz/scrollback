@@ -392,8 +392,10 @@ pub enum Meddle<'a> {
     /// Its parser stops, with a panic, on the session that has the item of this key.
     FaultyParser(String),
     /// Says its parser is of the next version, and of each item what this makes of its key and
-    /// of what the provider says of it.
+    /// of what the provider says of it, in its scan as in its classifier.
     Classifier(Classifier),
+    /// The same, with the parser's version as it was.
+    SameParser(Classifier),
     /// Fails when it is asked for its second lot of proofs, as a connection that drops after
     /// a batch was stored: `asked` counts the lots.
     SecondProofsFail(AtomicUsize),
@@ -487,7 +489,9 @@ impl Provider for Meddling<'_> {
 
     fn classify(&self, key: &str) -> (ItemKind, Option<String>) {
         match &self.meddle {
-            Meddle::Classifier(classify) => classify(key, self.inner.classify(key)),
+            Meddle::Classifier(classify) | Meddle::SameParser(classify) => {
+                classify(key, self.inner.classify(key))
+            }
             _ => self.inner.classify(key),
         }
     }
@@ -496,7 +500,15 @@ impl Provider for Meddling<'_> {
 impl Source for MeddlingSource<'_, '_> {
     fn scan(&mut self) -> Result<Scan, ProviderError> {
         self.meddle.reached(When::BeforeScan);
-        let scan = self.inner.scan();
+        let mut scan = self.inner.scan();
+        /* A provider's scan and its classifier say the same of an item. */
+        if let (Ok(scan), Meddle::Classifier(classify) | Meddle::SameParser(classify)) =
+            (&mut scan, self.meddle)
+        {
+            for item in &mut scan.items {
+                (item.kind, item.session) = classify(&item.key, (item.kind, item.session.take()));
+            }
+        }
         self.meddle.reached(When::AfterScan);
         scan
     }

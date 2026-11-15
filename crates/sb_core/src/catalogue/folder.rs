@@ -147,6 +147,7 @@ impl Catalogue {
     /// The paths attached to a folder, in the order they were attached.
     pub fn folder_paths(&self, folder: FolderId) -> Result<Vec<FolderPath>> {
         self.db.read(|c| {
+            parent_of(c, folder)?;
             Ok(c.prepare(
                 "SELECT path, location_id, typed FROM folder_path WHERE folder_id = ?1
                  ORDER BY rowid",
@@ -169,8 +170,9 @@ impl Catalogue {
      * Attaches the project path `typed` to a folder, for the sessions of `location` or of
      * every location, and files by it: the sessions in Unsorted and those a rule filed go
      * where the rules now put them (PLAN §8). The white space around the path is not part of
-     * it. A path that names no directory, or does not say where it is from the top (`~/code`,
-     * `code/app`), is [`CatalogueError::NoPath`].
+     * it, nor is a pair of double quotes around it, which a path copied from a file manager
+     * comes in. A path that names no directory, or does not say where it is from the top
+     * (`~/code`, `code/app`), is [`CatalogueError::NoPath`].
      *
      * A path is attached once for a scope. A second attach, to any folder, is refused with
      * [`CatalogueError::PathAttached`], which names the folder that has it.
@@ -182,6 +184,10 @@ impl Catalogue {
         location: Option<&LocationId>,
     ) -> Result<()> {
         let typed = typed.trim();
+        let typed = typed
+            .strip_prefix('"')
+            .and_then(|typed| typed.strip_suffix('"'))
+            .map_or(typed, str::trim);
         /* The drive mount is the default one for every location until a location can say its
         own (PLAN §6.3). */
         let path = NormalPath::new(typed, None)
@@ -218,11 +224,17 @@ impl Catalogue {
     /// put them: to a folder with a shorter path that contains theirs, or to Unsorted.
     pub fn detach_path(&self, attached: &AttachedPath) -> Result<()> {
         self.db.write(|tx| {
-            tx.execute(
+            parent_of(tx, attached.folder)?;
+            let detached = tx.execute(
                 "DELETE FROM folder_path
                  WHERE folder_id = ?1 AND path = ?2 AND location_id IS ?3",
                 params![attached.folder.0, attached.path, attached.location],
             )?;
+            if detached == 0 {
+                return Err(CatalogueError::NotAttached(
+                    attached.path.as_str().to_string(),
+                ));
+            }
             Ok(refile(tx)?)
         })
     }

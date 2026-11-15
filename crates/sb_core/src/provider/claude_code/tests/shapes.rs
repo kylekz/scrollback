@@ -276,3 +276,81 @@ fn a_file_beside_a_transcript_that_is_not_what_it_should_be_is_said() {
     assert_eq!(description.as_deref(), Some("Look \u{fffd}"));
     assert!(!index(&transcript).unread);
 }
+
+#[test]
+fn a_transcript_of_nothing_but_a_subagents_records_still_says_where_it_started() {
+    let mut tree = ProjectsTree::new();
+    let mut session = session(&mut tree);
+    let t = &mut session.transcript;
+    let side = || json!({ "isSidechain": true });
+    t.record(
+        "user",
+        json!({ "isSidechain": true, "parentUuid": null,
+                "message": { "role": "user", "content": "Warm up." } }),
+    );
+    t.assistant(
+        90,
+        "model-2",
+        json!([{ "type": "text", "text": "Ready." }]),
+        side(),
+    );
+    /* A tree of one record that holds no conversation is no subagent. */
+    t.record(
+        "attachment",
+        json!({ "isSidechain": true, "parentUuid": null, "attachment": { "type": "date" } }),
+    );
+
+    let (transcript, _) = parse(&tree, &session);
+    assert_eq!(
+        (
+            transcript.facts.project_path.as_deref(),
+            transcript.facts.branch.as_deref(),
+            transcript.facts.entrypoint.as_deref(),
+        ),
+        (Some(super::PROJECT), Some("main"), Some("cli"))
+    );
+    assert!(own(&transcript).blocks().is_empty());
+    let [Subagent::Read { conversation, .. }] = &transcript.unattached[..] else {
+        panic!("{:?}", transcript.unattached);
+    };
+    assert_eq!(prompts(conversation), ["Warm up."]);
+    assert_eq!(
+        index(&transcript).project_path.as_deref(),
+        Some(super::PROJECT)
+    );
+}
+
+#[test]
+fn two_subagents_that_open_alike_are_under_no_call() {
+    let mut tree = ProjectsTree::new();
+    let mut session = session(&mut tree);
+    let t = &mut session.transcript;
+    t.prompt("Go.");
+    let call = t.call(
+        "Task",
+        json!({ "description": "Count", "prompt": "Count the tests." }),
+    );
+    for (message, reply) in [(90, "Forty."), (91, "Forty-one.")] {
+        t.record(
+            "user",
+            json!({ "isSidechain": true, "parentUuid": null,
+                    "message": { "role": "user", "content": "Count the tests." } }),
+        );
+        t.assistant(
+            message,
+            "model-2",
+            json!([{ "type": "text", "text": reply }]),
+            json!({ "isSidechain": true }),
+        );
+    }
+    t.follow(&call.uuid);
+    t.result(&call, json!("Forty."));
+
+    /* One call gives the prompt and two subagents open with it: which it started can't be
+    told, so neither is put under it. */
+    let (transcript, _) = parse(&tree, &session);
+    let calls: Vec<_> = own(&transcript).calls().collect();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].1.subagents.is_empty());
+    assert_eq!(transcript.unattached.len(), 2);
+}

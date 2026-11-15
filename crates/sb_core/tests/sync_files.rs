@@ -598,6 +598,30 @@ mod unreadable {
     }
 
     #[test]
+    fn an_items_folder_that_cannot_be_entered_fails_its_item_alone() {
+        let mut agent = FileAgent::new();
+        let (closed, open) = (agent.add_session(4), agent.add_session(4));
+        let mut bench = Bench::new(agent);
+        bench.sync();
+        bench.agent.append(&closed, 2);
+        bench.agent.append(&open, 2);
+        /* The folder of one item in the archive can't be entered: nothing can be placed in
+        it, nor can it be flushed. */
+        let segment = bench.segment_files_of(&closed).remove(0);
+        let folder = segment.parent().unwrap().parent().unwrap();
+        set_mode(folder, 0o000);
+
+        let report = bench.pass_with(bench.agent.provider());
+        set_mode(folder, 0o755);
+        /* The other item of the batch is stored all the same. */
+        let report = report.unwrap();
+        assert_eq!((report.appended, report.failed.len()), (1, 1));
+        assert_eq!(report.failed[0].key, closed);
+        assert_eq!(bench.sync().appended, 1);
+        bench.assert_mirrors(&[closed, open]);
+    }
+
+    #[test]
     fn an_archived_file_that_grew_and_cannot_be_read_fails_alone() {
         let mut agent = FileAgent::new();
         let (locked, open) = (agent.add_session(4), agent.add_session(4));

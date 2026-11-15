@@ -12,10 +12,12 @@ use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::catalogue::{Filed, Session, Usage};
 use sb_core::filing::NormalPath;
-use sb_core::provider::{ItemKind, Provider};
-use sb_core::sync::{IndexReport, Progress, SyncError, index};
+use sb_core::provider::{ItemKind, Provider, SessionItems as _};
+use sb_core::sync::{IndexReport, Progress, SyncError, index, index_session};
 use sb_core::transcript::{self, Ending, INDEX_VERSION, SessionIndex, Totals};
-use sb_test_support::{Agent, DbAgent, FileAgent, Items, ProjectsTree, edit_catalogue};
+use sb_test_support::{
+    Agent, DbAgent, DbProvider, FileAgent, Items, ProjectsTree, edit_catalogue, read_catalogue,
+};
 use serde_json::json;
 
 use common::{Bench, Meddle, for_both_agents};
@@ -32,6 +34,8 @@ for_both_agents!(
     a_sync_is_on_record_before_it_indexes,
     two_indexes_at_once_leave_the_index_as_one_does,
     a_classifier_that_changes_reaches_what_is_gone_from_its_source,
+    a_pass_before_the_index_of_a_start_moves_what_the_owner_decided,
+    what_the_owner_decided_goes_with_a_session_that_is_split_merged_or_gone,
 );
 
 /// A bench whose agent has three sessions of different sizes.
@@ -495,6 +499,113 @@ fn a_classifier_that_changes_reaches_what_is_gone_from_its_source<A: Agent + Def
     assert!(bench.session(&keys[0]).starred);
 }
 
+fn a_pass_before_the_index_of_a_start_moves_what_the_owner_decided<A: Agent + Default>() {
+    let (bench, keys) = bench::<A>();
+    bench.sync();
+    let catalogue = bench.archive().catalogue();
+    let folder = catalogue.create_folder("kept", None).unwrap();
+    let old = bench.session_id(&keys[0]);
+    catalogue.set_starred(&old, true).unwrap();
+    catalogue.file_by_hand(&old, folder).unwrap();
+
+    /* The app is upgraded to a parser that gives every session another id, and a sync of
+    the location runs before the index of the start does: its scan says of each item what
+    the classifier would. */
+    let newer = |bench: &Bench<A>| {
+        bench.meddling(Meddle::Classifier(|_, (kind, session)| {
+            (kind, session.map(|session| format!("moved/{session}")))
+        }))
+    };
+    assert_eq!(bench.synced_with(newer(&bench)).index.sessions, 3);
+    assert_eq!(bench.index_with(newer(&bench)).sessions, 0);
+    let sessions = bench.sessions();
+    assert_eq!(sessions.len(), 3);
+    for session in &sessions {
+        let its = session.id.key == format!("moved/{}", old.key);
+        assert_eq!(
+            (session.starred, session.filed),
+            (
+                its,
+                if its {
+                    Filed::ByHand(folder)
+                } else {
+                    Filed::Unsorted
+                }
+            ),
+            "{}",
+            session.id.key
+        );
+    }
+    /* Nothing is left under the id no session has any more. */
+    assert_eq!(
+        read_catalogue(bench.dir(), "SELECT session FROM session_state"),
+        [format!("moved/{}", old.key)]
+    );
+}
+
+fn what_the_owner_decided_goes_with_a_session_that_is_split_merged_or_gone<A: Agent + Default>() {
+    let (bench, mut keys) = bench::<A>();
+    keys.sort();
+    /* An earlier parser took every transcript for one session's. */
+    let one = |bench: &Bench<A>| {
+        bench.meddling(Meddle::Classifier(|_, (kind, _)| {
+            (kind, Some("one".to_string()))
+        }))
+    };
+    bench.synced_with(one(&bench));
+    let [merged] = &bench.sessions()[..] else {
+        panic!("{:?}", bench.sessions());
+    };
+    let catalogue = bench.archive().catalogue();
+    let folder = catalogue.create_folder("kept", None).unwrap();
+    catalogue.set_starred(&merged.id, true).unwrap();
+    catalogue.file_by_hand(&merged.id, folder).unwrap();
+
+    /* The parser that tells them apart: one session becomes three, each with a transcript
+    of its own. What was decided goes with the first of them, and nothing is left behind. */
+    assert_eq!(bench.index().sessions, 3);
+    let starred = |bench: &Bench<A>| -> Vec<_> {
+        keys.iter()
+            .map(|key| {
+                let session = bench.session(key);
+                (session.starred, session.filed)
+            })
+            .collect()
+    };
+    assert_eq!(
+        starred(&bench),
+        [
+            (true, Filed::ByHand(folder)),
+            (false, Filed::Unsorted),
+            (false, Filed::Unsorted)
+        ]
+    );
+    let decided =
+        |bench: &Bench<A>| read_catalogue(bench.dir(), "SELECT session FROM session_state");
+    assert_eq!(decided(&bench), [bench.session_id(&keys[0]).key]);
+
+    /* Three become one again: the one keeps what was decided about the first to arrive,
+    and what was decided about the others is dropped with them. */
+    catalogue
+        .set_starred(&bench.session_id(&keys[2]), true)
+        .unwrap();
+    assert_eq!(bench.index_with(one(&bench)).sessions, 1);
+    let [merged] = &bench.sessions()[..] else {
+        panic!("{:?}", bench.sessions());
+    };
+    assert_eq!(
+        (merged.starred, merged.filed),
+        (true, Filed::ByHand(folder))
+    );
+    assert_eq!(decided(&bench), ["one"]);
+
+    /* Its transcripts are no session's at all: nothing is decided about nothing. */
+    let none = bench.meddling(Meddle::SameParser(|_, (kind, _)| (kind, None)));
+    bench.synced_with(none);
+    assert!(bench.sessions().is_empty());
+    assert_eq!(decided(&bench), Vec::<String>::new());
+}
+
 /// A bench on a file tree with nothing in it yet.
 fn files() -> Bench<FileAgent> {
     Bench::new(FileAgent::on(ProjectsTree::new()))
@@ -812,10 +923,87 @@ fn a_read_the_system_fails_is_tried_again_and_changes_nothing() {
         },
         before
     );
-    /* It is tried again by every index until it can be read. */
+    /* It is tried again by the index of every start until it can be read, and not by every
+    pass meanwhile. */
     assert_eq!(bench.index().failed.len(), 1);
-    assert_eq!(bench.sync().index.failed.len(), 1);
+    assert_eq!(bench.sync().index.sessions, 0);
+    assert_eq!(bench.index().failed.len(), 1);
     fs::set_permissions(locked, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(bench.sync().index.sessions, 0);
     assert_eq!(bench.index().sessions, 1);
     assert_eq!(bench.session(&key), before);
+    assert_eq!(bench.index().sessions, 0);
+}
+
+#[test]
+fn what_an_item_is_alone_is_part_of_what_a_row_is_made_from() {
+    let mut bench = files();
+    let mut session = bench.agent.tree_mut().session("/home/user/code/app", 4);
+    let title = session.title("A title");
+    session.transcript.prompt("Go on.");
+    bench.sync();
+    let id = bench.session_id(&session.key);
+    bench.archive().catalogue().set_starred(&id, true).unwrap();
+    assert_eq!(bench.sync().index.sessions, 0);
+
+    /* The provider says of the title file that it is something else: nothing of it or of
+    any other item changed, and the session is indexed again. */
+    let report = bench.synced_with(bench.meddling(Meddle::SameParser(
+        |_, (kind, session)| match kind {
+            ItemKind::Sidecar => (ItemKind::ToolResult, session),
+            _ => (kind, session),
+        },
+    )));
+    assert_eq!((report.unchanged, report.index.sessions), (2, 1));
+    assert_eq!(bench.item(&title).kind, ItemKind::ToolResult);
+
+    /* It says the file is another session's: that takes nothing of what the owner decided
+    about this one, whose own transcript stays. */
+    let report = bench.synced_with(bench.meddling(Meddle::SameParser(
+        |_, (kind, session)| match kind {
+            ItemKind::Sidecar => (kind, Some("another".to_string())),
+            _ => (kind, session),
+        },
+    )));
+    assert_eq!(report.index.sessions, 1);
+    assert_eq!(bench.item(&title).session.as_deref(), Some("another"));
+    assert!(bench.session(&session.key).starred);
+    assert_eq!(bench.sessions().len(), 1);
+    assert_eq!(
+        read_catalogue(bench.dir(), "SELECT session FROM session_state"),
+        std::slice::from_ref(&id.key)
+    );
+
+    /* A session is indexed by its own agent's provider. */
+    assert!(matches!(
+        index_session(bench.archive(), &DbProvider::default(), &id),
+        Err(SyncError::NotItsProvider { .. })
+    ));
+}
+
+#[test]
+fn a_transcript_that_is_one_no_more_is_read_at_its_newest_version() {
+    let mut agent = FileAgent::new();
+    let key = agent.add_session(12);
+    let mut bench = Bench::new(agent);
+    bench.sync();
+    let id = bench.session_id(&key);
+    bench.agent.truncate(&key, 6);
+    assert_eq!(bench.sync().held_back, 1);
+    let versions = bench.versions(&key);
+    let read = |bench: &Bench<FileAgent>| {
+        let items = bench.archive().session(&id).unwrap();
+        items.list()[0].length
+    };
+    assert_eq!(read(&bench), versions[0].length);
+
+    /* The provider no longer takes the file for a transcript. A version of anything else is
+    never a loss: what is read of it is the newest, held back or not when it was one. */
+    bench.synced_with(bench.meddling(Meddle::SameParser(|_, (_, session)| {
+        (ItemKind::Sidecar, session)
+    })));
+    assert_eq!(bench.item(&key).kind, ItemKind::Sidecar);
+    assert_eq!(read(&bench), versions[1].length);
+    /* And a session with no transcript is none. */
+    assert!(bench.sessions().is_empty());
 }

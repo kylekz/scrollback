@@ -34,6 +34,12 @@ pub enum SyncError {
     /// The provider's fetch did not keep to the order ranges are streamed in.
     #[error("the provider broke the fetch protocol: {0}")]
     Protocol(String),
+    /// A session was to be indexed by another agent's provider than its own.
+    #[error("the session is {session}'s, and {provider} does not parse it")]
+    NotItsProvider {
+        session: String,
+        provider: ProviderId,
+    },
     #[error(transparent)]
     Archive(#[from] ArchiveError),
     #[error(transparent)]

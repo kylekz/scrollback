@@ -13,7 +13,7 @@ use std::cell::RefCell;
 use std::io::{self, Read};
 
 use super::{Archive, Problem, Result, VersionReader};
-use crate::catalogue::{Reading, SessionId, Version};
+use crate::catalogue::{Reading, SessionId};
 use crate::provider::{SessionItem, SessionItems};
 
 /// The archived items of one session, by key, and the version each is read at.
@@ -53,11 +53,11 @@ impl<'a> ArchivedSession<'a> {
         }
     }
 
-    /// The same items, with the item `key` read at `version`.
-    pub(crate) fn at(mut self, key: &str, version: &Version) -> Self {
+    /// The same items, with the item `key` read at its version `version`, of `length` bytes.
+    pub(crate) fn at(mut self, key: &str, version: i64, length: u64) -> Self {
         if let Ok(at) = self.find(key) {
-            self.list[at].length = version.length;
-            self.versions[at] = version.id;
+            self.list[at].length = length;
+            self.versions[at] = version;
         }
         self
     }

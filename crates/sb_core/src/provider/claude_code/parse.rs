@@ -414,25 +414,26 @@ impl<'a> Reading<'a> {
                 return true;
             }
         };
-        /* A subagent's record in the session's own transcript says nothing of the session. */
-        if self.main && record.is_sidechain == Some(true) {
-            let (item, saved) = (self.item.clone(), self.saved);
+        /* A subagent's record in the session's own transcript is set apart with the others
+        of its kind, and says where they ran, not where the session started. */
+        let (item, saved) = (self.item.clone(), self.saved);
+        let reading = if self.main && record.is_sidechain == Some(true) {
             self.inline
                 .get_or_insert_with(|| Box::new(Self::new(item, saved, false)))
-                .take(record, line);
-            return true;
-        }
+        } else {
+            self
+        };
         let text = |text: Option<Text>| text.map(|Text(text)| text);
-        if self.cwd.is_none() {
-            self.cwd = text(record.cwd.take());
+        if reading.cwd.is_none() {
+            reading.cwd = text(record.cwd.take());
         }
-        if self.branch.is_none() {
-            self.branch = text(record.git_branch.take()).filter(|branch| !branch.is_empty());
+        if reading.branch.is_none() {
+            reading.branch = text(record.git_branch.take()).filter(|branch| !branch.is_empty());
         }
-        if self.entrypoint.is_none() {
-            self.entrypoint = record.entrypoint.take();
+        if reading.entrypoint.is_none() {
+            reading.entrypoint = record.entrypoint.take();
         }
-        self.take(record, line);
+        reading.take(record, line);
         true
     }
 
@@ -872,16 +873,20 @@ impl<'a> Reading<'a> {
     fn finish(mut self, items: &dyn SessionItems) -> Read {
         let starters = self.pair();
         let claimed = self.subagents(items, &starters);
+        /* A session whose own transcript holds nothing but its subagents' records started
+        where they ran. */
+        let (mut cwd, mut branch, mut entrypoint) =
+            (self.cwd.take(), self.branch.take(), self.entrypoint.take());
         let inline = match self.inline.take() {
-            Some(inline) => self.sidechains(*inline, items),
+            Some(mut inline) => {
+                cwd = cwd.or(inline.cwd.take());
+                branch = branch.or(inline.branch.take());
+                entrypoint = entrypoint.or(inline.entrypoint.take());
+                self.sidechains(*inline, items)
+            }
             None => Vec::new(),
         };
-        let (title, cwd, branch, entrypoint) = (
-            self.title.take(),
-            self.cwd.take(),
-            self.branch.take(),
-            self.entrypoint.take(),
-        );
+        let title = self.title.take();
         let ending = self.ending.clone();
         Read {
             conversation: self
@@ -933,9 +938,10 @@ impl<'a> Reading<'a> {
 
     /**
      * The subagents whose records `inline` holds, which are those of this transcript marked
-     * as a subagent's (the module docs): each tree of them is one. One goes under the call of
-     * this transcript that starts a subagent with the very prompt it opens with, when there
-     * is exactly one such call. The others are returned.
+     * as a subagent's (the module docs): each tree of them that holds anything is one. One
+     * goes under the call of this transcript that starts a subagent with the very prompt it
+     * opens with, when there is exactly one such call and no other tree opens with that
+     * prompt. The others are returned.
      */
     fn sidechains(&mut self, mut inline: Reading<'a>, items: &dyn SessionItems) -> Vec<Subagent> {
         inline.pair();
@@ -962,17 +968,27 @@ impl<'a> Reading<'a> {
                 _ => None,
             })
             .collect();
-        let mut unattached = Vec::new();
-        for conversation in inline.conversations(true, &self.ending) {
-            let opens = conversation.turns().first().and_then(|turn| {
-                match &conversation[turn.blocks[0]].content {
-                    Content::Prompt { text, .. } => Some(text.trim()),
+        let trees: Vec<Conversation> = inline
+            .conversations(true, &self.ending)
+            .into_iter()
+            .filter(|conversation| !conversation.blocks().is_empty())
+            .collect();
+        /* The prompt each tree opens with. */
+        let openings: Vec<Option<String>> = trees
+            .iter()
+            .map(|conversation| {
+                match &conversation[*conversation.turns().first()?.blocks.first()?].content {
+                    Content::Prompt { text, .. } => Some(text.trim().to_string()),
                     _ => None,
                 }
-            });
+            })
+            .collect();
+        let mut unattached = Vec::new();
+        for (conversation, opens) in trees.into_iter().zip(&openings) {
+            let alone = openings.iter().filter(|other| *other == opens).count() == 1;
             let mut started = starts
                 .iter()
-                .filter(|(_, prompt)| Some(prompt.trim()) == opens)
+                .filter(|(_, prompt)| alone && Some(prompt.trim()) == opens.as_deref())
                 .map(|(place, _)| *place);
             let call = match (started.next(), started.next()) {
                 (Some((node, at)), None) => match &mut self.nodes[node].contents[at] {

@@ -10,7 +10,9 @@ use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::catalogue::{CatalogueError, Held, Session};
 use sb_core::provider::{ItemKind, SessionItems};
-use sb_test_support::{Agent, DbAgent, FileAgent};
+use sb_core::sync::{Progress, SyncError};
+use sb_core::transcript::Ending;
+use sb_test_support::{Agent, DbAgent, FileAgent, read_catalogue};
 use serde_json::json;
 
 use common::{Bench, for_both_agents};
@@ -123,6 +125,8 @@ fn the_owner_chooses_an_older_version_until_a_newer_one_arrives<A: Agent + Defau
     let report = bench.archive().verify(&CancelToken::new()).unwrap();
     assert_eq!(report.damaged.len(), 1);
     assert!(read(&bench, &key, &key) == third);
+    /* The choice is over, not waiting for the version to be mended. */
+    assert!(read_catalogue(bench.dir(), "SELECT version_id FROM reading_choice").is_empty());
 }
 
 #[test]
@@ -523,4 +527,171 @@ fn nothing_is_held_back_for_a_read_the_system_failed() {
     assert_eq!(bench.versions(&key)[1].held_back, None);
     fs::set_permissions(first, fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(bench.session(&key), before);
+}
+
+#[test]
+fn a_version_that_grows_stays_held_back_until_an_index_has_parsed_it() {
+    let mut agent = FileAgent::new();
+    let key = agent.add_session(12);
+    let bench = Bench::new(agent);
+    bench.sync();
+    let whole = bench.agent.content(&key);
+    bench.agent.overwrite(&key, b"this is not a transcript\n");
+    assert_eq!(bench.sync().held_back, 1);
+    assert_eq!(bench.versions(&key)[1].held_back, Some(Held::Shorter));
+
+    /* It grows past the copy that is read, with nothing that is a conversation, and the
+    sync stops once that is stored, before its index. */
+    bench.agent.append_raw(&key, &garbage(&whole));
+    let cancel = CancelToken::new();
+    let stopped = bench.try_sync(&cancel, &mut |progress| {
+        if matches!(progress, Progress::Stored { .. }) {
+            cancel.cancel();
+        }
+    });
+    assert!(matches!(stopped, Err(SyncError::Cancelled)), "{stopped:?}");
+    let newest = bench.versions(&key).remove(1);
+    assert!(newest.length > whole.len() as u64);
+    /* It is no shorter any more, and still held back: a reader is not given it. */
+    assert_eq!(newest.held_back, Some(Held::Shorter));
+    assert!(read(&bench, &key, &key) == whole);
+
+    /* The index, which parses it, says what it is. */
+    assert_eq!(bench.sync().index.held_back, 1);
+    assert_eq!(bench.versions(&key)[1].held_back, Some(Held::ParsesWorse));
+    assert!(read(&bench, &key, &key) == whole);
+}
+
+#[test]
+fn a_version_is_measured_again_when_the_copy_before_it_is_another() {
+    let mut agent = FileAgent::new();
+    let key = agent.add_session(12);
+    let bench = Bench::new(agent);
+    bench.sync();
+    let whole = bench.agent.content(&key);
+    let lines: Vec<&[u8]> = whole.split_inclusive(|byte| *byte == b'\n').collect();
+    /* The second version is short; the third and the fourth are between it and the first. */
+    for kept in [&lines[..4], &lines[1..9], &lines[2..12]] {
+        bench.agent.overwrite(&key, &kept.concat());
+        assert_eq!(bench.sync().held_back, 1);
+    }
+    let held = |bench: &Bench<FileAgent>| -> Vec<_> {
+        bench
+            .versions(&key)
+            .iter()
+            .map(|version| version.held_back)
+            .collect()
+    };
+    let shorter = Some(Held::Shorter);
+    assert_eq!(held(&bench), [None, shorter, shorter, shorter]);
+    assert_eq!(versions_of(&bench.session(&key)), (Some(1), Some(4)));
+
+    /* The owner accepts the second. The later ones were held back beside the first, and
+    are no loss beside the second: the third is measured at once, the newest by the index
+    of the session, which also parses it. */
+    let (id, item) = (bench.session_id(&key), bench.item(&key).id);
+    let second = bench.versions(&key).remove(1);
+    bench
+        .archive()
+        .catalogue()
+        .set_reading_version(&id, item, Some(second.id))
+        .unwrap();
+    assert_eq!(held(&bench), [None, None, None, shorter]);
+    assert_eq!(bench.index_session(&key).held_back, 0);
+    assert_eq!(held(&bench), [None, None, None, None]);
+    /* The second is what the owner chose to read, and the rule would now read the newest:
+    it is read as a choice, which a newer version or the owner ends. */
+    let row = bench.session(&key);
+    assert_eq!(versions_of(&row), (Some(2), Some(4)));
+    assert!(!row.held_back);
+    assert_eq!(bench.index().sessions, 0);
+    bench
+        .archive()
+        .catalogue()
+        .set_reading_version(&id, item, None)
+        .unwrap();
+    bench.index_session(&key);
+    assert_eq!(versions_of(&bench.session(&key)), (Some(4), Some(4)));
+}
+
+#[test]
+fn damage_is_not_a_matter_of_parsing_and_shows_on_the_row() {
+    let mut agent = FileAgent::new();
+    let key = agent.add_session(12);
+    let mut bench = Bench::new(agent);
+    bench.sync();
+    bench.agent.rewrite(&key);
+    bench.sync();
+    let before = bench.session(&key);
+    assert_eq!(bench.index().sessions, 0);
+
+    /* The newest version's stored bytes are not what was archived. Verify finds it, and the
+    row is made again from the copy as it is: unreadable, and still the copy that is read. */
+    let segments = bench.segment_files_of(&key);
+    let newest = segments.last().unwrap();
+    let stored = fs::read(newest).unwrap();
+    fs::write(newest, "not what was stored").unwrap();
+    assert_eq!(bench.index().sessions, 0);
+    let report = bench.archive().verify(&CancelToken::new()).unwrap();
+    assert_eq!(report.damaged.len(), 1);
+    let indexed = bench.index();
+    assert_eq!((indexed.sessions, indexed.held_back), (1, 0));
+    assert_eq!(bench.versions(&key)[1].held_back, None);
+    let row = bench.session(&key);
+    assert!(
+        matches!(row.ending, Some(Ending::Unreadable(_))),
+        "{:?}",
+        row.ending
+    );
+    assert!(row.unread && !row.held_back);
+    assert_eq!(versions_of(&row), (Some(2), Some(2)));
+
+    /* A damaged version is not one the owner chooses to read. */
+    let damaged = bench.versions(&key).remove(1);
+    assert!(damaged.damaged);
+    assert!(matches!(
+        bench.archive().catalogue().set_reading_version(
+            &bench.session_id(&key),
+            bench.item(&key).id,
+            Some(damaged.id)
+        ),
+        Err(CatalogueError::Damaged(version)) if version == damaged.id
+    ));
+
+    /* The bytes are back, verify says so, and the row is as it was. */
+    fs::write(newest, stored).unwrap();
+    let report = bench.archive().verify(&CancelToken::new()).unwrap();
+    assert_eq!(report.damaged.len(), 0);
+    assert_eq!(bench.index().sessions, 1);
+    assert_eq!(bench.session(&key), before);
+}
+
+#[test]
+fn a_choice_of_an_older_version_holds_while_the_newest_grows() {
+    let mut agent = FileAgent::new();
+    let key = agent.add_session(8);
+    let mut bench = Bench::new(agent);
+    bench.sync();
+    let first = bench.agent.content(&key);
+    bench.agent.rewrite(&key);
+    bench.sync();
+    let (id, item) = (bench.session_id(&key), bench.item(&key).id);
+    let older = bench.versions(&key).remove(0);
+    bench
+        .archive()
+        .catalogue()
+        .set_reading_version(&id, item, Some(older.id))
+        .unwrap();
+    bench.index_session(&key);
+
+    /* An append is no version that was not there to choose from. */
+    bench.agent.append(&key, 3);
+    let report = bench.sync();
+    assert_eq!((report.appended, report.new_versions), (1, 0));
+    assert!(read(&bench, &key, &key) == first);
+    assert_eq!(versions_of(&bench.session(&key)), (Some(1), Some(2)));
+    assert_eq!(
+        read_catalogue(bench.dir(), "SELECT version_id FROM reading_choice"),
+        [older.id.to_string()]
+    );
 }
