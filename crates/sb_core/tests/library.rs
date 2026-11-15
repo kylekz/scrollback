@@ -5,14 +5,20 @@
 mod common;
 
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::catalogue::{Catalogue, CatalogueError, Filed, Folder, SessionId, Shelf};
 use sb_core::filing::{AttachedPath, FolderId, NormalPath};
 use sb_core::location::{LocationId, LocationKind};
+use sb_core::provider::{Hashed, RangeFailure};
 use sb_core::sync::sync_location;
-use sb_test_support::{Agent, DbAgent, FileAgent, read_catalogue};
+use sb_core::transport::{
+    Env, FileStat, Listing, PrefixRequest, RangeRequest, RangeSink, Transport, TransportError,
+};
+use sb_test_support::{Agent, DbAgent, FileAgent, HomeTransport, read_catalogue};
 
 use common::{Bench, Meddle};
 
@@ -32,22 +38,31 @@ struct Elsewhere {
 
 impl Elsewhere {
     fn new(bench: &Bench<DbAgent>) -> Self {
+        Self::of(bench, LocationKind::Local)
+    }
+
+    /// A second location of the kind `kind`.
+    fn of(bench: &Bench<DbAgent>, kind: LocationKind) -> Self {
         Self {
             agent: DbAgent::new(),
             location: bench
                 .archive()
                 .catalogue()
-                .add_location(LocationKind::Local, "elsewhere")
+                .add_location(kind, "elsewhere")
                 .unwrap()
                 .id,
         }
     }
 
     fn sync(&self, bench: &Bench<DbAgent>) {
+        self.sync_through(bench, &self.agent.transport());
+    }
+
+    fn sync_through(&self, bench: &Bench<DbAgent>, transport: &dyn Transport) {
         sync_location(
             bench.archive(),
             &self.location,
-            &self.agent.transport(),
+            transport,
             &[self.agent.provider()],
             &CancelToken::new(),
             &mut |_| {},
@@ -583,6 +598,163 @@ fn a_location_that_mounts_its_drives_elsewhere_is_filed_by_its_own_mount() {
             .as_str(),
         "e:/work"
     );
+}
+
+/// A WSL distro's side of a location: the fixture's files, and an `/etc/wsl.conf` of the
+/// test's choosing.
+struct Distro {
+    files: HomeTransport,
+    /// The file's text, `None` where there is no such file, or what goes wrong reading it.
+    conf: Mutex<Result<Option<String>, String>>,
+    /// How many times the file was read.
+    read: AtomicUsize,
+}
+
+impl Transport for Distro {
+    fn env(&self, names: &[&str]) -> Result<Env, TransportError> {
+        self.files.env(names)
+    }
+
+    fn stat(&self, paths: &[&str]) -> Result<Vec<Option<FileStat>>, TransportError> {
+        self.files.stat(paths)
+    }
+
+    fn list(&self, root: &str) -> Result<Listing, TransportError> {
+        self.files.list(root)
+    }
+
+    fn hash_prefixes(
+        &self,
+        requests: &[PrefixRequest],
+    ) -> Result<Vec<Result<Hashed, RangeFailure>>, TransportError> {
+        self.files.hash_prefixes(requests)
+    }
+
+    fn read_ranges(
+        &self,
+        requests: &[RangeRequest],
+        sink: &mut dyn RangeSink,
+    ) -> Result<(), TransportError> {
+        self.files.read_ranges(requests, sink)
+    }
+
+    fn read_small(&self, path: &str) -> Result<Option<Vec<u8>>, TransportError> {
+        if path != "/etc/wsl.conf" {
+            return self.files.read_small(path);
+        }
+        self.read.fetch_add(1, Ordering::Relaxed);
+        match &*self.conf.lock().unwrap() {
+            Ok(conf) => Ok(conf.clone().map(String::into_bytes)),
+            Err(why) => Err(TransportError::Failed(why.clone())),
+        }
+    }
+}
+
+#[test]
+fn a_distro_that_moves_its_drives_has_its_paths_read_again() {
+    let bench = Bench::new(DbAgent::new());
+    let catalogue = bench.archive().catalogue().clone();
+    let mut distro = Elsewhere::of(
+        &bench,
+        LocationKind::Wsl {
+            distro: "Ubuntu-24.04".to_string(),
+        },
+    );
+    let sessions = [
+        "/mnt/d/Projects/app/src",
+        "/windows/d/Projects/app/src",
+        "/d/Projects/app/src",
+    ]
+    .map(|project| started(&mut distro.agent, project));
+    let app = catalogue.create_folder("app", None).unwrap();
+    catalogue
+        .attach_path(app, r"D:\Projects\app", None)
+        .unwrap();
+    /* Two paths for the distro alone: one under a folder that may come to be the drive
+    mount, and the drive itself. */
+    let [work, drive] = ["work", "drive"].map(|name| catalogue.create_folder(name, None).unwrap());
+    for (folder, typed) in [(work, "/windows/e/Work"), (drive, r"E:\Work")] {
+        catalogue
+            .attach_path(folder, typed, Some(&distro.location))
+            .unwrap();
+    }
+
+    let transport = Distro {
+        files: distro.agent.transport(),
+        conf: Mutex::new(Ok(None)),
+        read: AtomicUsize::new(0),
+    };
+    /* After a sync that finds the file to be `conf`: the mount on record, which of the
+    sessions the folder's path claims, and the paths attached for the distro. */
+    let synced = |conf: Result<Option<&str>, &str>| {
+        *transport.conf.lock().unwrap() = conf
+            .map(|conf| conf.map(str::to_string))
+            .map_err(str::to_string);
+        distro.sync_through(&bench, &transport);
+        let claimed = sessions
+            .each_ref()
+            .map(|key| filed(&catalogue, &distro.session_id(key)) == Filed::ByRule(app));
+        let attached = [work, drive].map(|folder| {
+            let paths = catalogue.folder_paths(folder).unwrap();
+            paths
+                .iter()
+                .map(|path| path.attached.path.as_str().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        let location = catalogue.location(&distro.location).unwrap().unwrap();
+        (location.drive_mount, claimed, attached)
+    };
+    let mount = |mount: &str| Some(mount.to_string());
+    let paths = |paths: [&str; 2]| paths.map(str::to_string);
+
+    /* No file: the drives are under /mnt/. */
+    assert_eq!(
+        synced(Ok(None)),
+        (
+            None,
+            [true, false, false],
+            paths(["/windows/e/Work", "e:/work"])
+        )
+    );
+    /* The owner moves them. No session changed, and each is read by the new mount at once;
+    the path that is now the drive's is attached once, where it was first. */
+    assert_eq!(
+        synced(Ok(Some("[automount] # moved\nroot = /windows # here\n"))),
+        (
+            mount("/windows/"),
+            [false, true, false],
+            paths(["e:/work", ""])
+        )
+    );
+    /* The drives at /c, /d. */
+    assert_eq!(
+        synced(Ok(Some("[automount]\nroot = /\n"))),
+        (
+            mount("/"),
+            [false, false, true],
+            paths(["/windows/e/Work", ""])
+        )
+    );
+    /* A file that can't be read just now changes nothing. */
+    assert_eq!(
+        synced(Err("no answer for 600 seconds")),
+        (
+            mount("/"),
+            [false, false, true],
+            paths(["/windows/e/Work", ""])
+        )
+    );
+    assert_eq!(
+        synced(Ok(Some("[boot]\nsystemd = true\n"))),
+        (None, [true, false, false], paths(["/windows/e/Work", ""]))
+    );
+    assert_eq!(transport.read.load(Ordering::Relaxed), 5);
+
+    /* Only a distro has the file read: anywhere else it would say nothing of drives. */
+    let host = Elsewhere::new(&bench);
+    host.sync_through(&bench, &transport);
+    assert_eq!(transport.read.load(Ordering::Relaxed), 5);
 }
 
 #[test]

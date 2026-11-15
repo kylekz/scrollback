@@ -16,7 +16,7 @@ use sb_core::provider::ItemKind;
 use sb_core::sync::Progress;
 use sb_test_support::{Agent, FileAgent, ProjectsTree, edit_catalogue};
 
-use common::Bench;
+use common::{Bench, Meddle, When};
 
 fn file_bench() -> (Bench<FileAgent>, String) {
     let mut agent = FileAgent::new();
@@ -179,6 +179,95 @@ fn a_long_append_is_stored_whole_up_to_its_last_newline() {
     let version = bench.versions(&key).remove(0);
     assert!(bench.read(&version) == whole_lines);
     bench.assert_verifies();
+}
+
+/// A record of one line that is longer than the engine holds in memory while it waits for
+/// a line's end, without the newline.
+fn a_line_too_long_to_hold() -> String {
+    format!(
+        r#"{{"type":"user","message":"{}"}}"#,
+        "long ".repeat(8 * 1024 * 1024)
+    )
+}
+
+#[test]
+fn a_line_too_long_to_hold_is_stored_with_the_file_whole() {
+    let (mut bench, key) = file_bench();
+    /* After it, lines as ever, and a record the agent has not finished. */
+    bench
+        .agent
+        .append_raw(&key, &format!("{}\n", a_line_too_long_to_hold()));
+    bench.agent.append(&key, 3);
+    bench.agent.append_raw(&key, r#"{"type":"user","mess"#);
+    let length = bench.agent.content(&key).len() as u64;
+
+    /* Not cut at its last newline, as a file of lines is: all of it, which is what the
+    source was when it was read. */
+    let report = bench.sync();
+    assert_eq!(
+        (report.new_items, report.bytes_fetched, report.bytes_stored),
+        (1, length, length)
+    );
+    assert!(bench.read(&bench.versions(&key)[0]) == bench.agent.content(&key));
+    bench.assert_mirrors(std::slice::from_ref(&key));
+
+    /* What follows is appended, up to its last newline again. */
+    bench
+        .agent
+        .append_raw(&key, "age\"}\n{\"type\":\"assistant\"}\n{\"type\":\"us");
+    let report = bench.sync();
+    assert_eq!((report.appended, report.new_versions), (1, 0));
+    assert_eq!(bench.versions(&key)[0].length, length + 27);
+    bench.assert_verifies();
+}
+
+#[test]
+fn a_line_too_long_to_hold_that_is_appended_is_stored_as_far_as_it_goes() {
+    let (mut bench, key) = file_bench();
+    bench.sync();
+    let before = bench.agent.content(&key).len() as u64;
+    /* A line and the start of a long one, which the agent is still writing. */
+    bench.agent.append(&key, 2);
+    let long = a_line_too_long_to_hold();
+    let (start, rest) = long.split_at(long.len() - 5);
+    bench.agent.append_raw(&key, start);
+    let length = bench.agent.content(&key).len() as u64;
+
+    let report = bench.sync();
+    assert_eq!((report.appended, report.new_versions), (1, 0));
+    assert_eq!(report.bytes_stored, length - before);
+    assert!(bench.read(&bench.versions(&key)[0]) == bench.agent.content(&key));
+
+    /* The line's end and what follows it go on from there. */
+    bench.agent.append_raw(&key, &format!("{rest}\n"));
+    bench.agent.append(&key, 2);
+    let report = bench.sync();
+    assert_eq!((report.appended, report.new_versions), (1, 0));
+    assert_eq!(bench.versions(&key).len(), 1);
+    bench.assert_mirrors(&[key]);
+}
+
+#[test]
+fn a_line_too_long_to_hold_is_not_stored_while_its_file_grows() {
+    let (bench, key) = file_bench();
+    bench.sync();
+    let before = bench.agent.content(&key).len() as u64;
+    bench.agent.append_raw(&key, &a_line_too_long_to_hold());
+
+    /* The agent goes on writing: what the pass read is neither the file's start up to the
+    end of a line nor the file whole. */
+    let report = bench
+        .pass_with(bench.meddling(Meddle::at(When::AfterScan, || {
+            bench.agent.append_raw(&key, "\n{\"type\":\"us");
+        })))
+        .unwrap();
+    assert_eq!((report.appended, report.deferred.len()), (0, 1));
+    assert_eq!(bench.versions(&key)[0].length, before);
+    bench.assert_verifies();
+
+    /* The next pass finds the file at rest, and takes it as far as it goes. */
+    assert_eq!(bench.sync().appended, 1);
+    bench.assert_mirrors(&[key]);
 }
 
 #[test]
@@ -357,21 +446,37 @@ fn the_agent_is_found_where_the_environment_says_its_data_is() {
     );
 }
 
-/// How long before now the tests that follow give a file its modification time, and how long
-/// they then wait: a time the scan can't trust yet, and one it can.
-const JUST_NOW: Duration = Duration::from_millis(900);
-const A_WHILE: Duration = Duration::from_millis(1600);
+/**
+ * How far ahead of now the tests that follow give a file its modification time: a time the
+ * scan can't trust yet, whenever in the two seconds after it the scan gets to the file. A
+ * location read through a container takes seconds to answer each call, and is given longer.
+ */
+fn soon() -> Duration {
+    let slow = std::env::var_os(sb_test_support::SHELL_VIA).is_some();
+    Duration::from_secs(if slow { 20 } else { 1 })
+}
+
+/// How long those tests then wait: until that time is one the scan trusts.
+fn a_while() -> Duration {
+    soon() + Duration::from_millis(2200)
+}
+
+/// Gives the file at `key` the time of one the agent writes as the scan runs.
+fn modified_as_the_scan_runs(bench: &Bench<FileAgent>, key: &str) {
+    let soon = SystemTime::now() + soon();
+    bench.agent.tree().set_modified(key, soon);
+}
 
 #[test]
 fn a_file_modified_as_the_scan_ran_is_stored_and_checked_again() {
     let (bench, key) = file_bench();
-    bench.agent.tree().modified_ago(&key, JUST_NOW);
+    modified_as_the_scan_runs(&bench, &key);
 
     /* Its modification time can't vouch for it. A pass that finds it with that time, once
     the time is safely in the past, compares its bytes with what is archived. */
     assert_eq!(bench.sync().new_items, 1);
     bench.assert_mirrors(std::slice::from_ref(&key));
-    thread::sleep(A_WHILE);
+    thread::sleep(a_while());
     let later = bench.sync();
     assert_eq!((later.touched, later.unchanged), (1, 0));
     let settled = bench.sync();
@@ -381,7 +486,7 @@ fn a_file_modified_as_the_scan_ran_is_stored_and_checked_again() {
 #[test]
 fn a_rewrite_in_the_same_tick_as_the_scan_is_not_missed() {
     let (bench, key) = file_bench();
-    bench.agent.tree().modified_ago(&key, JUST_NOW);
+    modified_as_the_scan_runs(&bench, &key);
     bench.sync();
     let before = bench.agent.content(&key);
 
@@ -391,7 +496,7 @@ fn a_rewrite_in_the_same_tick_as_the_scan_is_not_missed() {
     bytes[12] ^= 1;
     bench.agent.overwrite_unseen(&key, &bytes);
 
-    thread::sleep(A_WHILE);
+    thread::sleep(a_while());
     assert_eq!(bench.sync().new_versions, 1);
     let versions = bench.versions(&key);
     assert_eq!(versions[1].reason, Reason::Rewritten);
@@ -401,27 +506,25 @@ fn a_rewrite_in_the_same_tick_as_the_scan_is_not_missed() {
 
 #[test]
 fn an_unfinished_last_line_is_taken_on_the_second_pass_whatever_the_files_time() {
-    /* Modified long ago, just now, and at a time ahead of the clock. */
-    for modified in [
-        None,
-        Some(SystemTime::now()),
-        Some(SystemTime::now() + A_WHILE * 1000),
-    ] {
+    /* Modified long ago, as the passes run, and at a time far ahead of the clock. */
+    for ahead in [None, Some(soon()), Some(Duration::from_secs(3600))] {
         let (bench, key) = file_bench();
         bench.agent.append_raw(&key, r#"{"type":"user","mess"#);
-        if let Some(modified) = modified {
+        /* The time is set as the first pass starts: both passes are to find it as young. */
+        if let Some(ahead) = ahead {
+            let modified = SystemTime::now() + ahead;
             bench.agent.tree().set_modified(&key, modified);
         }
         bench.sync();
         assert!(bench.versions(&key)[0].length < bench.agent.content(&key).len() as u64);
 
         let second = bench.sync();
-        assert_eq!((second.appended, second.unchanged), (1, 0), "{modified:?}");
+        assert_eq!((second.appended, second.unchanged), (1, 0), "{ahead:?}");
         bench.assert_mirrors(std::slice::from_ref(&key));
         /* And it is not compared again on every pass after that. */
-        if modified.is_none_or(|modified| modified > SystemTime::now()) {
+        if ahead != Some(soon()) {
             let third = bench.sync();
-            assert_eq!((third.touched, third.unchanged), (0, 1), "{modified:?}");
+            assert_eq!((third.touched, third.unchanged), (0, 1), "{ahead:?}");
         }
     }
 }

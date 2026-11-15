@@ -3,7 +3,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
-use std::time::Duration;
 
 use toolbox_process::Command;
 
@@ -64,9 +63,10 @@ impl Launcher {
              * the ports the owner's own session forwards. `--`: a host is never read as an
              * option.
              *
-             * With `ControlMaster auto` in the owner's config, a call that finds no master
-             * becomes it, and a cancel that kills the call takes the shared connection down
-             * with it: the calls after it connect again.
+             * `ControlMaster=no`: with `auto` in the owner's config, a call that found no
+             * master would become it, and every call's `ssh` is killed once its answer is
+             * read, which would take down whatever else had come to share the connection.
+             * A master that is already there is still used.
              */
             Self::Ssh { host } => words(&[
                 "ssh",
@@ -81,6 +81,8 @@ impl Launcher {
                 &format!("ServerAliveCountMax={ALIVE_COUNT}"),
                 "-o",
                 "ClearAllForwardings=yes",
+                "-o",
+                "ControlMaster=no",
                 "-o",
                 "LogLevel=INFO",
                 "--",
@@ -180,16 +182,6 @@ impl Launcher {
             _ => TransportError::Failed(said),
         }
     }
-
-    /// The launcher's process has said nothing at all for `idle`: it is given up on. For a
-    /// host that is the connection gone quiet; anything else has hung.
-    pub(super) fn silent(&self, idle: Duration) -> TransportError {
-        let said = format!("no answer for {} seconds", idle.as_secs());
-        match self {
-            Self::Ssh { .. } => TransportError::Unreachable(said),
-            _ => TransportError::Failed(said),
-        }
-    }
 }
 
 /// The lines of `text` that say something, without the space around them.
@@ -240,7 +232,9 @@ fn ssh_failure(said: String) -> TransportError {
     } else if says(&UNREACHABLE) {
         TransportError::Unreachable(said)
     } else if said.is_empty() {
-        TransportError::Failed("ssh failed without saying why".to_string())
+        /* A connection that stalls or drops where ssh has no word for it. Its own
+        mistakes (a bad option, a bad config) it always names. */
+        TransportError::Unreachable("ssh gave up without saying why".to_string())
     } else {
         TransportError::Failed(said)
     }
@@ -323,6 +317,8 @@ mod tests {
                 "-o",
                 "ClearAllForwardings=yes",
                 "-o",
+                "ControlMaster=no",
+                "-o",
                 "LogLevel=INFO",
                 "--",
                 "-oProxyCommand=touch /tmp/x",
@@ -377,11 +373,17 @@ mod tests {
             ),
             other => panic!("{other}"),
         }
-        /* A call that hears nothing for too long: the connection, to a host. */
-        assert!(matches!(
-            ssh.silent(Duration::from_secs(600)),
-            TransportError::Unreachable(_)
-        ));
+        /* With nothing said, its own exit status still tells of a connection that failed. */
+        for nothing in [&b""[..], b" \r\n"] {
+            assert!(matches!(
+                ssh.failure(exit(255), nothing, b"not an answer"),
+                TransportError::Unreachable(said) if said == "ssh gave up without saying why"
+            ));
+        }
+        assert_eq!(
+            said(ssh.failure(exit(1), b"", b"")),
+            format!("it ended before it answered ({})", exit(1).unwrap())
+        );
 
         /* wsl.exe speaks in UTF-16, and in UTF-8 with WSL_UTF8 set, on either stream: what
         it says of a distro that is not installed, with its lines ended as it ends them. The
@@ -401,10 +403,6 @@ mod tests {
             assert_eq!(said(wsl.failure(exit(255), b"", words)), in_lines);
             assert_eq!(said(wsl.failure(exit(255), words, b"")), in_lines);
         }
-        assert!(matches!(
-            wsl.silent(Duration::from_secs(600)),
-            TransportError::Failed(said) if said == "no answer for 600 seconds"
-        ));
 
         let silent = Launcher::Command {
             program: "sh".into(),
@@ -431,13 +429,30 @@ mod tests {
             TransportError::Failed(_) => "failed",
             other => panic!("{other}"),
         };
+        /* What ssh says only at its level INFO, and not at ERROR: of a host that stopped
+        answering, and on Windows of a connection that was refused. They are heard because
+        the launcher asks for that level. */
+        let ssh = Launcher::Ssh {
+            host: "user@macbook".to_string(),
+        };
+        assert!(ssh.words().contains(&"LogLevel=INFO".to_string()));
+        for at_info in [
+            "Timeout, server macbook.local not responding.",
+            "banner exchange: Connection to UNKNOWN port -1: Connection refused",
+        ] {
+            assert!(
+                matches!(
+                    ssh.failure(exit(255), at_info.as_bytes(), b""),
+                    TransportError::Unreachable(_)
+                ),
+                "{at_info}"
+            );
+        }
         for unreachable in [
             "ssh: Could not resolve hostname macbook.local: nodename nor servname provided, or not known",
             "ssh: Could not resolve hostname macbook: Name or service not known",
-            /* OpenSSH for Windows. A refused connection is all it says of one, and only
-            at the level INFO or below. */
+            /* OpenSSH for Windows. */
             "ssh: Could not resolve hostname macbook.local: No such host is known. ",
-            "banner exchange: Connection to UNKNOWN port -1: Connection refused",
             "ssh: connect to host macbook.local port 22: Operation timed out",
             "ssh: connect to host 192.0.2.7 port 22: Connection timed out",
             "ssh: connect to host macbook.local port 22: Connection refused",
@@ -450,9 +465,10 @@ mod tests {
             "Connection timed out during banner exchange\r\nConnection to 192.0.2.7 port 22 timed out",
             "kex_exchange_identification: read: Connection reset by peer\r\nConnection reset by 192.0.2.7 port 22",
             "kex_exchange_identification: Connection closed by remote host\r\nConnection closed by 192.0.2.7 port 22",
-            "Timeout, server macbook.local not responding.",
             "client_loop: send disconnect: Broken pipe",
             "Connection to macbook.local closed by remote host.",
+            /* Nothing at all. */
+            "",
         ] {
             assert_eq!(kind(unreachable), "unreachable", "{unreachable}");
         }
@@ -479,7 +495,6 @@ mod tests {
             "/home/user/.ssh/config: line 7: Bad configuration option: hostnam\n\
              /home/user/.ssh/config: terminating, 1 bad configuration options",
             "Bad owner or permissions on /home/user/.ssh/config",
-            "",
         ] {
             assert_eq!(kind(failed), "failed", "{failed}");
         }

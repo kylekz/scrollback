@@ -146,28 +146,51 @@ var() {
     [ -z "$sb_set" ] || printf 'V %s\n%s\0' "$1" "$sb_value"
 }
 
-# as_login <script> <done> <seconds>: runs <script> with `sh -c` from inside the user's login
-# shell, so that it sees what their profile exports: a command run by `wsl.exe --exec` or
-# `ssh host command` gets none of that. Whatever the profile prints comes out too; the script
-# marks its own output. A login shell that takes longer than <seconds> is killed. Last, on a
-# line of its own, "<done>".
+# as_login <script> <done> <late> <seconds>: runs <script> with `sh -c` from inside the user's
+# login shell, so that it sees what their profile exports: a command run by `wsl.exe --exec`
+# or `ssh host command` gets none of that. Whatever the profile prints comes out too; the
+# script marks its own output. A login shell that is still running after <seconds> is killed
+# with everything it started, where the shell can tell those apart from itself, and "<late>"
+# says so on a line of its own. Last, on a line of its own, "<done>".
 as_login() {
     # The script travels in the environment, so the login shell, whichever it is, has only
-    # a plain command to run.
-    SB_LOGIN=$1 "${SHELL:-sh}" -lc 'exec sh -c "$SB_LOGIN"' </dev/null 2>/dev/null &
-    sb_login=$!
-    # Kills it once the time is up. It holds none of the reply's pipes, and when it is told
-    # to stop, takes its sleep with it.
+    # a plain command to run. It runs in a process group of its own, so that what a profile
+    # left waiting can be killed with it: as setsid makes one, or else the shell's job control
+    # (bash and ksh have it without a terminal; dash and zsh don't, and there only the login
+    # shell itself can be killed).
+    sb_group=''
+    if command -v setsid >/dev/null 2>&1; then
+        SB_LOGIN=$1 setsid "${SHELL:-sh}" -lc 'exec sh -c "$SB_LOGIN"' </dev/null 2>/dev/null &
+        sb_login=$! sb_group=1
+    else
+        # Tried in a subshell first: a shell that can't turn job control on may end there.
+        if (set -m) 2>/dev/null; then set -m 2>/dev/null; fi
+        case $- in *m*) sb_group=1 ;; esac
+        SB_LOGIN=$1 "${SHELL:-sh}" -lc 'exec sh -c "$SB_LOGIN"' </dev/null 2>/dev/null &
+        sb_login=$!
+        set +m 2>/dev/null
+    fi
+    # Kills it once the time is up, and exits 7 to say so. It holds none of the reply's
+    # pipes, and when it is told to stop before that, takes its sleep with it.
     (
         trap 'kill "$sb_sleep" 2>/dev/null; exit 0' TERM
-        sleep "$3" &
+        sleep "$4" &
         sb_sleep=$!
-        wait "$sb_sleep" && kill "$sb_login" 2>/dev/null
+        wait "$sb_sleep"
+        trap '' TERM
+        # A profile that hangs may not heed anything gentler. A negative number is a group.
+        if [ -n "$sb_group" ]; then
+            kill -s KILL -- "-$sb_login"
+        else
+            kill -s KILL "$sb_login"
+        fi
+        exit 7
     ) </dev/null >/dev/null 2>&1 &
     sb_watch=$!
     wait "$sb_login" 2>/dev/null
     kill "$sb_watch" 2>/dev/null
     wait "$sb_watch" 2>/dev/null
+    [ "$?" -ne 7 ] || printf '\n%s\n' "$3"
     printf '\n%s\n' "$2"
 }
 
@@ -256,10 +279,13 @@ prefix() {
     else
         sb_sum=''
     fi
-    if sb_size=$(stat -L "$stat_flag" "$size_format" -- "$2" 2>&1); then
-        printf 'P %s\n%s\0' "$sb_size" "$sb_sum"
-    else
+    if ! sb_size=$(stat -L "$stat_flag" "$size_format" -- "$2" 2>&1); then
         printf 'P -\n%s\n%s\0' "$sb_sum" "$sb_size"
+    elif [ ! -e "$2" ]; then
+        # BSD stat -L describes the link itself where its target is missing.
+        printf 'P -\n%s\nNo such file or directory\0' "$sb_sum"
+    else
+        printf 'P %s\n%s\0' "$sb_size" "$sb_sum"
     fi
 }
 
@@ -326,6 +352,9 @@ range() {
     sb_out='' sb_block=0
     if ! sb_size=$(stat -L "$stat_flag" "$size_format" -- "$3" 2>&1); then
         sb_out=$sb_size
+    elif [ ! -e "$3" ]; then
+        # BSD stat -L describes the link itself where its target is missing.
+        sb_out='No such file or directory'
     elif [ ! -r "$3" ]; then
         sb_out='Permission denied'
     elif [ "$sb_size" -le "$1" ]; then

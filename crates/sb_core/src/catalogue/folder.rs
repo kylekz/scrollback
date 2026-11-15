@@ -353,6 +353,46 @@ fn refile(connection: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/**
+ * Reads again, under the drive mount `location` now has, what was read under the one it had:
+ * the project path of each of its sessions and each path attached for it, from how they were
+ * recorded. Then files by the rules.
+ */
+pub(super) fn remount(
+    connection: &Connection,
+    location: &LocationId,
+    mount: Option<&str>,
+) -> rusqlite::Result<()> {
+    let sessions: Vec<(i64, String)> = connection
+        .prepare(
+            "SELECT id, project_path FROM session
+             WHERE location_id = ?1 AND project_path IS NOT NULL",
+        )?
+        .query_map([location], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut read = connection.prepare("UPDATE session SET project = ?2 WHERE id = ?1")?;
+    for (id, path) in sessions {
+        read.execute(params![id, NormalPath::new(&path, mount)])?;
+    }
+    let attached: Vec<(i64, String)> = connection
+        .prepare("SELECT folder_id, typed FROM folder_path WHERE location_id = ?1 ORDER BY rowid")?
+        .query_map([location], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    /* Taken off and attached again in the order they were: a path may now be what another
+    was a moment ago. One that now names what an earlier one does is not attached twice. */
+    connection.execute("DELETE FROM folder_path WHERE location_id = ?1", [location])?;
+    let mut attach = connection.prepare(
+        "INSERT OR IGNORE INTO folder_path (folder_id, path, typed, location_id)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (folder, typed) in attached {
+        if let Some(path) = NormalPath::new(&typed, mount).filter(NormalPath::is_absolute) {
+            attach.execute(params![folder, path, typed, location])?;
+        }
+    }
+    refile(connection)
+}
+
 /// The folder whose attached path claims a session started in `project` at `location`.
 fn claimed(
     project: Option<&NormalPath>,

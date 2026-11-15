@@ -14,6 +14,8 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pretty_assertions::assert_eq;
@@ -325,6 +327,7 @@ fn a_small_file_is_read_whole_whatever_it_holds() {
     }
     fs::write(dir.path().join("locked"), "secret").unwrap();
     set_mode(&dir.path().join("locked"), 0o000);
+    symlink("nowhere", dir.path().join("link to nothing")).unwrap();
     let may_read_anything = fs::read(dir.path().join("locked")).is_ok();
     for shell in shells() {
         let transport = through(&shell, dir.path());
@@ -334,6 +337,7 @@ fn a_small_file_is_read_whole_whatever_it_holds() {
         }
         let read = |name| transport.read_small(&text(&dir.path().join(name)));
         assert_eq!(read("missing").unwrap(), None, "{shell}");
+        assert_eq!(read("link to nothing").unwrap(), None, "{shell}");
         if !may_read_anything {
             let refused = read("locked").unwrap_err();
             assert!(
@@ -361,6 +365,8 @@ fn readable() -> (TempDir, Vec<(PathBuf, u64, u64)>) {
     let locked = file("locked", b"secret".to_vec());
     set_mode(&locked, 0o000);
     let missing = dir.path().join("missing");
+    let dangling = dir.path().join("link to nothing");
+    symlink("nowhere", &dangling).unwrap();
     let requests = vec![
         (small.clone(), 0, 10),
         (small.clone(), 2, 5),
@@ -383,6 +389,8 @@ fn readable() -> (TempDir, Vec<(PathBuf, u64, u64)>) {
         (large, 2_999_999, 2),
         (missing.clone(), 0, 4),
         (missing, 0, 0),
+        (dangling.clone(), 0, 4),
+        (dangling, 0, 0),
         (locked.clone(), 0, 6),
         (locked, 0, 0),
         (small, 0, 10),
@@ -928,6 +936,273 @@ fn many_small_files_are_read_and_hashed_as_they_would_be_one_by_one() {
     }
 }
 
+/// A stand-in's body for a hashing tool: its lines for several files in the reverse of their
+/// order, by the shell alone (no other tool is on the stand-in's `PATH`).
+const BACKWARDS: &str = "if [ \"$#\" -gt 4 ]; then\n\
+    lines=$(\"$real\" \"$@\")\nset -f\nIFS='\n'\nback=''\n\
+    for line in $lines; do back=\"$line\n$back\"; done\n\
+    printf '%s' \"$back\"\n\
+    else exec \"$real\" \"$@\"; fi";
+
+/// Puts in the place of `name` among `tools` a script that runs the real tool, after it has
+/// added a line to `log`: how many files it was given, which is how many of its arguments
+/// are absolute paths.
+fn counted(tools: &Path, name: &str, log: &Path) {
+    stand_in(
+        tools,
+        name,
+        &format!(
+            "files=0\nfor word do case $word in /*) files=$((files + 1)) ;; esac; done\n\
+             printf '%s\\n' \"$files\" >> '{}'\nexec \"$real\" \"$@\"",
+            text(log)
+        ),
+    );
+}
+
+/// What [`counted`] wrote to `log`: the number of files each run of the tool was given.
+fn runs(log: &Path) -> Vec<usize> {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|files| files.parse().unwrap())
+        .collect()
+}
+
+/// The tool that hashes on this machine, as the scripts choose it.
+fn hasher() -> &'static str {
+    if tool("sha256sum").is_some() {
+        "sha256sum"
+    } else {
+        "shasum"
+    }
+}
+
+#[test]
+fn small_files_are_read_and_hashed_many_to_a_process_where_they_may_be() {
+    let dir = tempfile::tempdir().unwrap();
+    let files: Vec<(String, Vec<u8>)> = (0..600)
+        .map(|n| {
+            let path = dir.path().join(format!("file {n}"));
+            let content = noise(50 + n % 200);
+            fs::write(&path, &content).unwrap();
+            (text(&path), content)
+        })
+        .collect();
+    let tools = tools(&[]);
+    let (cats, sums) = (dir.path().join("cats.log"), dir.path().join("sums.log"));
+    counted(tools.path(), "cat", &cats);
+    counted(tools.path(), hasher(), &sums);
+    let transport = with_tools(tools.path());
+
+    let ranges: Vec<_> = files
+        .iter()
+        .map(|(path, content)| RangeRequest {
+            path: path.clone(),
+            offset: 0,
+            length: content.len() as u64,
+        })
+        .collect();
+    let mut there = Collect::default();
+    transport.read_ranges(&ranges, &mut there).unwrap();
+    assert!(there.ends.iter().all(Result::is_ok));
+    for (bytes, (path, content)) in there.bytes.iter().zip(&files) {
+        assert!(bytes == content, "{path}");
+    }
+    /* A handful of processes read them all, not one for each. */
+    let read = runs(&cats);
+    assert_eq!(
+        (read.len(), read.iter().sum::<usize>()),
+        (3, 600),
+        "{read:?}"
+    );
+
+    /* Files hashed whole are one run of the tool. */
+    let prefixes = |shorter: u64| -> Vec<PrefixRequest> {
+        files[..5]
+            .iter()
+            .map(|(path, content)| PrefixRequest {
+                path: path.clone(),
+                length: content.len() as u64 - shorter,
+            })
+            .collect()
+    };
+    let hashed = |requests: &[PrefixRequest]| -> Vec<Hash> {
+        let _ = fs::remove_file(&sums);
+        transport
+            .hash_prefixes(requests)
+            .unwrap()
+            .into_iter()
+            .map(|hashed| hashed.unwrap().hash)
+            .collect()
+    };
+    let of = |shorter: usize| -> Vec<Hash> {
+        files[..5]
+            .iter()
+            .map(|(_, content)| Hash::of(&content[..content.len() - shorter]))
+            .collect()
+    };
+    assert_eq!(hashed(&prefixes(0)), of(0));
+    assert_eq!(runs(&sums), [5]);
+    /* A file that is longer than its prefix is hashed by itself, from its start. */
+    assert_eq!(hashed(&prefixes(1)), of(1));
+    assert_eq!(runs(&sums), [0; 5]);
+    /* So is one whose name the tool would print in another way than it is. */
+    let mut mixed = prefixes(0);
+    let mut hashes = of(0);
+    for (name, content) in [("back\\slash", "a name"), ("new\nline", "another")] {
+        fs::write(dir.path().join(name), content).unwrap();
+        mixed.insert(
+            2,
+            PrefixRequest {
+                path: text(&dir.path().join(name)),
+                length: content.len() as u64,
+            },
+        );
+        hashes.insert(2, Hash::of(content.as_bytes()));
+    }
+    assert_eq!(hashed(&mixed), hashes);
+    assert_eq!(runs(&sums), [2, 0, 0, 3]);
+}
+
+#[test]
+fn files_that_change_under_a_group_whose_bytes_still_add_up_are_asked_for_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = ["a", "b", "c"].map(|name| text(&dir.path().join(name)));
+    for (path, byte) in paths.iter().zip(*b"ABC") {
+        fs::write(path, [byte; 10]).unwrap();
+    }
+    /* As they are about to be read, the first loses five bytes and the second gains five:
+    the group is as long as it was, with no file in it where its size had put it. */
+    let tools = tools(&[]);
+    stand_in(
+        tools.path(),
+        "cat",
+        &format!(
+            "printf AAAAA > '{}'\nprintf bbbbb >> '{}'\nexec \"$real\" \"$@\"",
+            paths[0], paths[1]
+        ),
+    );
+    let ranges = paths.map(|path| RangeRequest {
+        path,
+        offset: 0,
+        length: 10,
+    });
+    let (mut there, mut here) = (Collect::default(), Collect::default());
+    with_tools(tools.path())
+        .read_ranges(&ranges, &mut there)
+        .unwrap();
+    LocalTransport.read_ranges(&ranges, &mut here).unwrap();
+    assert_eq!(there, here);
+    assert_eq!(here.bytes, [&b"AAAAA"[..], b"BBBBBBBBBB", b"CCCCCCCCCC"]);
+    assert!(here.ends[0].is_err() && here.ends[1..] == [Ok(()), Ok(())]);
+}
+
+#[test]
+fn a_group_is_read_as_one_only_within_its_limit_of_bytes() {
+    /* Three files asked for by their starts, one of which has grown by megabytes. */
+    let dir = tempfile::tempdir().unwrap();
+    let paths = ["a", "grown", "c"].map(|name| text(&dir.path().join(name)));
+    for path in &paths {
+        fs::write(path, noise(10)).unwrap();
+    }
+    fs::write(&paths[1], megabytes(2)).unwrap();
+    let tools = tools(&[]);
+    let log = dir.path().join("cats.log");
+    counted(tools.path(), "cat", &log);
+    let ranges = paths.map(|path| RangeRequest {
+        path,
+        offset: 0,
+        length: 10,
+    });
+    let (mut there, mut here) = (Collect::default(), Collect::default());
+    with_tools(tools.path())
+        .read_ranges(&ranges, &mut there)
+        .unwrap();
+    LocalTransport.read_ranges(&ranges, &mut here).unwrap();
+    assert_eq!(there, here);
+    assert_eq!(there.ends, [Ok(()), Ok(()), Ok(())]);
+    /* Each by itself: megabytes were not sent to have ten bytes taken of them. */
+    assert_eq!(runs(&log), Vec::<usize>::new());
+}
+
+#[test]
+fn what_is_no_regular_file_is_not_read_in_a_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = ["a", "pipe", "c"].map(|name| text(&dir.path().join(name)));
+    for path in [&paths[0], &paths[2]] {
+        fs::write(path, "01234").unwrap();
+    }
+    assert!(
+        Command::new("mkfifo")
+            .arg(&paths[1])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let ranges = paths.map(|path| RangeRequest {
+        path,
+        offset: 0,
+        length: 5,
+    });
+    for shell in shells() {
+        /* Read with the others, a pipe would have the reader wait for someone to write to
+        it, for as long as a call may be silent: the wait is cut short here. */
+        let cancel = CancelToken::new();
+        let transport = through(&shell, dir.path()).cancelled_by(&cancel);
+        let done = AtomicBool::new(false);
+        let mut ends = Ends::default();
+        let read = thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..200 {
+                    if done.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                cancel.cancel();
+            });
+            let read = transport.read_ranges(&ranges, &mut ends);
+            done.store(true, Ordering::Relaxed);
+            read
+        });
+        assert!(read.is_ok(), "{shell}: {read:?}");
+        assert_eq!(
+            (ends.0[0].as_str(), ends.0[2].as_str()),
+            ("ok", "ok"),
+            "{shell}"
+        );
+        assert_ne!(ends.0[1], "ok", "{shell}");
+    }
+}
+
+#[test]
+fn a_hash_is_taken_only_from_the_line_that_names_its_file_in_full() {
+    /* Files of one name, in a folder each. */
+    let dir = tempfile::tempdir().unwrap();
+    let files: Vec<(String, Vec<u8>)> = (0..5)
+        .map(|n| {
+            let folder = dir.path().join(format!("folder {n}"));
+            fs::create_dir(&folder).unwrap();
+            let content = noise(100 + n);
+            fs::write(folder.join("same"), &content).unwrap();
+            (text(&folder.join("same")), content)
+        })
+        .collect();
+    let prefixes: Vec<_> = files
+        .iter()
+        .map(|(path, content)| PrefixRequest {
+            path: path.clone(),
+            length: content.len() as u64,
+        })
+        .collect();
+    let tools = tools(&[]);
+    stand_in(tools.path(), hasher(), BACKWARDS);
+    let hashes = with_tools(tools.path()).hash_prefixes(&prefixes).unwrap();
+    for (hashed, (path, content)) in hashes.iter().zip(&files) {
+        assert_eq!(hashed.as_ref().unwrap().hash, Hash::of(content), "{path}");
+    }
+}
+
 #[test]
 fn a_group_that_does_not_hold_together_is_asked_for_again_file_by_file() {
     let (_dir, requests) = many_small_files();
@@ -963,11 +1238,7 @@ fn a_group_that_does_not_hold_together_is_asked_for_again_file_by_file() {
         } else {
             &[]
         });
-        stand_in(
-            tools_sum.path(),
-            name,
-            "if [ \"$#\" -gt 4 ]; then \"$real\" \"$@\" | sort; else exec \"$real\" \"$@\"; fi",
-        );
+        stand_in(tools_sum.path(), name, BACKWARDS);
         assert_as_here(
             &with_tools(tools_sum.path()),
             &requests,

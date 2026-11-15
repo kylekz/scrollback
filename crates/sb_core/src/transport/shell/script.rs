@@ -81,9 +81,10 @@ impl Script {
         }
         inner.push_str(&format!("; printf '%s\\n' '{}'", login.end));
         self.line(&format!(
-            "as_login {} {} {LOGIN_SECONDS}",
+            "as_login {} {} {} {LOGIN_SECONDS}",
             quoted(&inner),
-            quoted(&login.done)
+            quoted(&login.done),
+            quoted(&login.late)
         ))
     }
 
@@ -109,8 +110,22 @@ pub(super) struct Login {
     /// Before and after the command's own output.
     begin: String,
     end: String,
+    /// Before `done`, when the login shell was killed for taking too long.
+    late: String,
     /// After the login shell has ended, however it ended.
     done: String,
+}
+
+/// What the user's login shell had to say for itself.
+pub(super) enum Asked {
+    /// The variables it has set, of those asked about.
+    Answered(HashMap<String, String>),
+    /// Nothing, and it would say as much another time: there is none, it takes no `-lc`
+    /// (csh and tcsh don't), or its profile fails.
+    Silent,
+    /// It was still running when its time was up, and was killed: its profile waits for
+    /// something, or the location is busy just now.
+    Late,
 }
 
 impl Login {
@@ -118,36 +133,40 @@ impl Login {
         Self {
             begin: unique("begin"),
             end: unique("end"),
+            late: unique("late"),
             done: unique("done"),
         }
     }
 
-    /**
-     * Reads what the request added by [`Script::login`] answered: the variables the login
-     * shell has set, of those asked about, or `None` when it did not answer (there is none,
-     * its profile failed, or it took too long).
-     */
-    pub(super) fn read(
-        &self,
-        reply: &mut Reply<'_>,
-    ) -> Result<Option<HashMap<String, String>>, TransportError> {
-        let (begin, done) = (format!("{}\n", self.begin), format!("{}\n", self.done));
-        if reply.skip_to(&[&begin, &done])? == 1 {
-            return Ok(None);
-        }
+    /// Reads what the request added by [`Script::login`] answered.
+    pub(super) fn read(&self, reply: &mut Reply<'_>) -> Result<Asked, TransportError> {
+        let line = |line: &str| format!("{line}\n");
+        let (begin, late, done) = (line(&self.begin), line(&self.late), line(&self.done));
         let mut vars = HashMap::new();
-        let whole = loop {
-            let line = reply.line()?;
-            let Some(name) = line.strip_prefix("V ") else {
-                break line == self.end;
+        let mut whole = false;
+        let mut found = reply.skip_to(&[&begin, &late, &done])?;
+        if found == 0 {
+            whole = loop {
+                let line = reply.line()?;
+                let Some(name) = line.strip_prefix("V ") else {
+                    break line == self.end;
+                };
+                /* As on this machine, a value that is not Unicode counts as not set. */
+                if let Ok(value) = String::from_utf8(reply.text()?) {
+                    vars.insert(name.to_string(), value);
+                }
             };
-            /* As on this machine, a value that is not Unicode counts as not set. */
-            if let Ok(value) = String::from_utf8(reply.text()?) {
-                vars.insert(name.to_string(), value);
-            }
-        };
-        reply.skip_to(&[&done])?;
-        Ok(whole.then_some(vars))
+            found = 1 + reply.skip_to(&[&late, &done])?;
+        }
+        if found == 1 {
+            reply.skip_to(&[&done])?;
+        }
+        /* An answer that is whole stands, whatever kept the shell from ending after it. */
+        Ok(match (whole, found) {
+            (true, _) => Asked::Answered(vars),
+            (false, 1) => Asked::Late,
+            (false, _) => Asked::Silent,
+        })
     }
 }
 

@@ -18,7 +18,9 @@ use sb_core::transport::{
 use sb_test_support::{loopback, shells};
 use tempfile::TempDir;
 
-use common::shell::{Collect, Ends, launched, noise, text, through, tool, tools, with_tools};
+use common::shell::{
+    Collect, Ends, launched, noise, stand_in, text, through, tool, tools, with_tools,
+};
 
 #[test]
 fn a_missing_tool_is_named_and_what_does_not_need_it_still_works() {
@@ -83,8 +85,35 @@ fn the_connection_test_says_what_is_there_and_how_long_it_took() {
             (clock.as_nanos() as i64 - probe.clock_ns).abs() < 60_000_000_000,
             "{shell}"
         );
+        assert!(probe.clock_ahead_ns.abs() < 60_000_000_000, "{shell}");
         assert!(probe.took > Duration::ZERO && probe.took < Duration::from_secs(60));
     }
+}
+
+#[test]
+fn how_far_a_clock_is_ahead_does_not_count_the_rest_of_the_test() {
+    /* The same clock, read through a location whose login shell takes its time. */
+    let home = home_with_profiles("sleep 3");
+    let slow = ShellTransport::new(loopback("sh", home.path(), &[pair("SHELL", "sh")]));
+    let probe = slow.probe().unwrap();
+    assert!(probe.took >= Duration::from_secs(3), "{:?}", probe.took);
+    /* A clock in whole seconds reads up to one behind. */
+    assert!(
+        probe.clock_ahead_ns.abs() < 2_000_000_000,
+        "{}",
+        probe.clock_ahead_ns
+    );
+
+    /* A location whose clock is an hour ahead: its date knows no nanoseconds, and adds an
+    hour to the seconds. */
+    let tools = tools(&[]);
+    stand_in(
+        tools.path(),
+        "date",
+        "printf '%s\\n' \"$(($(\"$real\" +%s) + 3600))\"",
+    );
+    let ahead = with_tools(tools.path()).probe().unwrap().clock_ahead_ns;
+    assert!((ahead - 3_600_000_000_000).abs() < 5_000_000_000, "{ahead}");
 }
 
 #[test]
@@ -239,12 +268,9 @@ fn what_a_login_shells_profile_sets_is_seen_and_what_it_prints_is_not() {
 #[test]
 fn a_login_shell_that_does_not_answer_leaves_the_bare_environment() {
     let bare = [pair("SB_BARE", "bare"), pair("SB_BOTH", "command")];
-    /* A profile that fails, one that never ends, and a login shell that is not there. */
-    for (last_line, login) in [
-        ("exit 3", "sh"),
-        ("sleep 60", "sh"),
-        ("", "/nonexistent/shell"),
-    ] {
+    /* A profile that fails, and a login shell that is not there: neither would answer
+    another time. */
+    for (last_line, login) in [("exit 3", "sh"), ("", "/nonexistent/shell")] {
         let home = home_with_profiles(last_line);
         let vars = [
             pair("SHELL", login),
@@ -256,6 +282,89 @@ fn a_login_shell_that_does_not_answer_leaves_the_bare_environment() {
         assert_eq!(variables(&transport), bare, "{last_line} {login}");
         assert_eq!(transport.probe().unwrap().login_shell, None, "{last_line}");
         assert!(started.elapsed() < Duration::from_secs(30), "{last_line}");
+    }
+}
+
+/// The lines of `file`, in a home folder whose profile adds one each time it is read.
+fn times_read(file: &std::path::Path) -> usize {
+    fs::read_to_string(file).unwrap_or_default().lines().count()
+}
+
+#[test]
+fn the_login_shell_is_asked_once_in_the_life_of_a_transport() {
+    for (last_line, both) in [("", "profile"), ("exit 3", "command")] {
+        let home = home_with_profiles(&format!("echo read >>\"$HOME/read\"\n{last_line}"));
+        let vars = [pair("SHELL", "sh"), pair("SB_BOTH", "command")];
+        let transport = ShellTransport::new(loopback("sh", home.path(), &vars));
+        let read = home.path().join("read");
+        for _ in 0..3 {
+            assert_eq!(
+                transport.env(&["SB_BOTH"]).unwrap().vars["SB_BOTH"],
+                both,
+                "{last_line}"
+            );
+        }
+        /* A copy of it knows what it knows. */
+        let copy = transport.clone();
+        assert_eq!(copy.env(&["SB_BOTH", "7"]).unwrap().vars.len(), 1);
+        assert_eq!(copy.env(&[]).unwrap().home, text(home.path()));
+        assert_eq!(times_read(&read), 1, "{last_line}");
+        /* A name it has not asked about is asked of a login shell that answers, and not of
+        one that had no answer. */
+        let more = transport.env(&["SB_FROM_PROFILE", "SB_BOTH"]).unwrap().vars;
+        let (times, known) = if last_line.is_empty() { (2, 2) } else { (1, 1) };
+        assert_eq!((times_read(&read), more.len()), (times, known), "{more:?}");
+        /* Another transport starts over. */
+        let other = ShellTransport::new(loopback("sh", home.path(), &vars));
+        assert_eq!(other.env(&["SB_BOTH"]).unwrap().vars["SB_BOTH"], both);
+        assert_eq!(times_read(&read), times + 1, "{last_line}");
+    }
+}
+
+#[test]
+fn a_login_shell_that_hangs_fails_the_call_and_is_killed_with_what_it_started() {
+    for shell in shells() {
+        /* A profile that leaves something waiting, and waits for it. */
+        let home = home_with_profiles("sleep 61 &\necho $! >\"$HOME/waiting\"\nwait");
+        let vars = [pair("SHELL", "sh"), pair("SB_BOTH", "command")];
+        let transport = ShellTransport::new(loopback(&shell, home.path(), &vars));
+        let started = Instant::now();
+        /* Not the bare environment, which may name another place than the profile would. */
+        match transport.env(&["SB_BOTH"]) {
+            Err(TransportError::Failed(said)) => assert!(said.contains("login shell"), "{said}"),
+            other => panic!("{shell}: {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(30), "{shell}");
+        /* Through a container, what runs there can't be seen from here. */
+        if std::env::var_os(sb_test_support::SHELL_VIA).is_none() {
+            let waiting = fs::read_to_string(home.path().join("waiting")).unwrap();
+            let waiting = waiting.trim();
+            /* By the shell's own kill: not every system has the program. A process that
+            has ended and that nothing collects, as in a container without an init, still
+            takes a signal: Linux says in /proc that it is one. */
+            let alive = || {
+                let ended = fs::read_to_string(format!("/proc/{waiting}/stat"))
+                    .is_ok_and(|stat| stat.rsplit(')').next().unwrap().starts_with(" Z"));
+                !ended
+                    && std::process::Command::new("sh")
+                        .args(["-c", "kill -0 \"$1\"", "sh", waiting])
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .unwrap()
+                        .success()
+            };
+            /* Killed, and a moment later no longer a process at all. */
+            let gone = (0..40).any(|_| {
+                std::thread::sleep(Duration::from_millis(50));
+                !alive()
+            });
+            assert!(gone, "{shell}: {waiting} is still running");
+        }
+        /* It is asked again by the next call, and what does not need it works. */
+        if shell == "sh" {
+            assert!(matches!(transport.probe(), Err(TransportError::Failed(_))));
+            assert_eq!(transport.env(&[]).unwrap().home, text(home.path()));
+        }
     }
 }
 
@@ -301,6 +410,30 @@ fn a_cancel_is_seen_while_the_launcher_has_not_read_the_script() {
 }
 
 #[test]
+fn a_call_that_is_cancelled_already_starts_nothing() {
+    /* A launcher that can't be started says so, to a call that tries. */
+    let nowhere = || {
+        ShellTransport::new(Launcher::Command {
+            program: "/nonexistent/launcher".into(),
+            args: Vec::new(),
+        })
+    };
+    assert!(matches!(
+        nowhere().env(&[]),
+        Err(TransportError::Launch { .. })
+    ));
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let cancelled = nowhere().cancelled_by(&cancel);
+    assert!(matches!(cancelled.env(&[]), Err(TransportError::Cancelled)));
+    assert!(matches!(cancelled.probe(), Err(TransportError::Cancelled)));
+    assert!(matches!(
+        cancelled.stat(&["/"]),
+        Err(TransportError::Cancelled)
+    ));
+}
+
+#[test]
 fn a_launcher_with_a_lot_to_say_first_holds_nothing_up() {
     /* As ssh at a debug log level: more than a pipe holds, on stderr, before its shell
     reads a script that is itself more than a pipe holds. */
@@ -336,6 +469,45 @@ fn answering(records: &str) -> ShellTransport {
         "marker=$(sed -n \"s/^printf '%s\\\\\\\\n' '\\(scrollback answer [0-9a-f]*\\)'$/\\1/p\"); \
          printf '%s\\nK\\n' \"$marker\"; printf '{records}'"
     ))
+}
+
+#[test]
+fn a_group_that_is_not_the_one_asked_for_is_not_taken() {
+    let requests = ["/a", "/b"].map(|path| RangeRequest {
+        path: path.to_string(),
+        offset: 0,
+        length: 2,
+    });
+    let read = |records: &str| {
+        let mut sink = Collect::default();
+        let read = answering(records).read_ranges(&requests, &mut sink);
+        (read, sink)
+    };
+    /* stat's line for a file of so many bytes. */
+    let stat = |size: u64| format!("81a4 {size} 1700000000\\n");
+    let group =
+        |total: u64, size: u64| format!("G 2 {total}\\n{0}{0}abcdx{0}{0}.\\nZ\\n", stat(size));
+    /* As it should be. */
+    let (taken, sink) = read(&group(4, 2));
+    taken.unwrap();
+    assert_eq!(sink.bytes, [b"ab", b"cd"]);
+    assert_eq!(sink.ends, [Ok(()), Ok(())]);
+    /* More bytes than were asked for and files may have grown by, and a group of another
+    number of files: neither is an answer to what was asked. */
+    for records in ["G 2 99999999\\n", "G 3 4\\n"] {
+        match read(records) {
+            (Err(TransportError::Protocol(said)), _) => assert!(said.contains("G "), "{said}"),
+            (other, _) => panic!("{records}: {other:?}"),
+        }
+    }
+    /* Sizes that are not what the block holds: nothing of it is passed on, and the files
+    are asked for again by themselves, which this far side has no answer to. */
+    let (asked_again, sink) = read(&group(4, 1));
+    assert!(
+        matches!(&asked_again, Err(TransportError::Protocol(said)) if said.contains("R record")),
+        "{asked_again:?}"
+    );
+    assert_eq!((sink.bytes.len(), sink.ends.len()), (0, 0));
 }
 
 #[test]

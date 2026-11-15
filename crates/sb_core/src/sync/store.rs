@@ -8,7 +8,9 @@
 //!    kept only if that is the hash of the version's bytes with the range (and, where the
 //!    version must be all of the source, the source ends there). Every state of a stored
 //!    version is therefore bytes the source held at one instant: for an item made of lines,
-//!    its start up to the end of a line.
+//!    its start up to the end of a line. A line too long to hold in memory until its end
+//!    arrives ([`HELD_MAX`]) ends that for its range, which is then stored as far as it goes
+//!    and proven like an item that is not made of lines: the source must end there.
 //! 3. **Store.** The kept ranges' segments are moved into place, made durable together, and
 //!    committed to the catalogue in one transaction (PLAN §4.1).
 //!
@@ -38,6 +40,10 @@ use crate::transport::{Halt, RangeFailure, RangeSink};
 const BATCH_ITEMS: usize = 256;
 const BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The most of an unfinished line that is held in memory waiting for its end. Records are
+/// far shorter; a file that is one line of gigabytes must not be held whole.
+const HELD_MAX: usize = 32 * 1024 * 1024;
+
 /// What a pass fetches and stores with.
 pub(super) struct Storing<'a> {
     pub archive: &'a Archive,
@@ -53,11 +59,13 @@ pub(super) struct Storing<'a> {
 /// What a batch does with one of its ranges.
 enum Outcome {
     /// It is in `tmp/` as these segments, which hold `stored` bytes; with them the version
-    /// hashes to `content`. It is stored once it is proven.
+    /// hashes to `content`. It is stored once it is proven. `cut`: it ends at the range's
+    /// last newline, and the source may go on after it.
     Fetched {
         segments: Vec<Sealed>,
         stored: u64,
         content: Hash,
+        cut: bool,
     },
     /// The source's start with the range is not the version with it. Whether the start alone
     /// is still what is archived decides what that means.
@@ -173,6 +181,7 @@ impl Storing<'_> {
                         segments: Vec::new(),
                         stored: 0,
                         content: planned.base,
+                        cut: planned.cut,
                     }
                 } else {
                     fetched.next().unwrap_or_else(|| Outcome::Left {
@@ -200,12 +209,15 @@ impl Storing<'_> {
         let mut proven = self.hashes(source, &proofs)?;
         for (planned, outcome) in batch.iter().zip(&mut outcomes) {
             let Outcome::Fetched {
-                stored, content, ..
+                stored,
+                content,
+                cut,
+                ..
             } = outcome
             else {
                 continue;
             };
-            let end = planned.offset + *stored;
+            let (end, cut) = (planned.offset + *stored, *cut);
             match proven.next().unwrap_or(Err(RangeFailure::Missing)) {
                 Ok(hashed) if hashed.hash != *content => {
                     *outcome = match planned.otherwise {
@@ -215,7 +227,7 @@ impl Storing<'_> {
                     }
                 }
                 /* A version that must be all of its source: the source must end there. */
-                Ok(hashed) if !planned.cut && hashed.size != end => {
+                Ok(hashed) if !cut && hashed.size != end => {
                     *outcome = Outcome::changed("after");
                 }
                 Ok(_) => {}
@@ -252,6 +264,7 @@ impl Storing<'_> {
                     segments,
                     stored,
                     content,
+                    ..
                 } => {
                     counts.push((planned, stored));
                     commits.push((
@@ -333,6 +346,9 @@ struct Open {
     writer: RangeWriter,
     /// The version's hash so far, with what was written of the range.
     content: Hasher,
+    /// Whether the range is cut at its last newline: so for an item made of lines, until a
+    /// line of it is longer than [`HELD_MAX`].
+    cut: bool,
     /// The bytes since the last newline, when the range is cut there.
     held: Vec<u8>,
     received: u64,
@@ -342,9 +358,9 @@ struct Open {
 }
 
 impl Open {
-    /// Takes the next bytes of the range. When it is `cut`, what follows the last newline so
+    /// Takes the next bytes of the range. When it is cut, what follows the last newline so
     /// far is held until another newline arrives, and never stored if none does.
-    fn write(&mut self, bytes: &[u8], cut: bool) -> io::Result<()> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.received += bytes.len() as u64;
         if self.refused.is_some() {
             return Ok(());
@@ -354,7 +370,7 @@ impl Open {
             self.stored += bytes.len() as u64;
             self.writer.write(bytes)
         };
-        if !cut {
+        if !self.cut {
             return write(bytes);
         }
         match bytes.iter().rposition(|byte| *byte == b'\n') {
@@ -365,6 +381,12 @@ impl Open {
                 self.held.extend_from_slice(&bytes[newline + 1..]);
             }
             None => self.held.extend_from_slice(bytes),
+        }
+        /* A line too long to wait for the end of: from here on the range is stored as it
+        comes, and holds only if the source ends where it does. */
+        if self.held.len() > HELD_MAX {
+            self.cut = false;
+            write(&std::mem::take(&mut self.held))?;
         }
         Ok(())
     }
@@ -439,6 +461,7 @@ impl Sink<'_, '_, '_> {
         Ok(Open {
             writer: archive.range_writer(planned.offset),
             content,
+            cut: planned.cut,
             held: Vec::new(),
             received: 0,
             stored: 0,
@@ -457,14 +480,14 @@ impl Sink<'_, '_, '_> {
 
 impl RangeSink for Sink<'_, '_, '_> {
     fn data(&mut self, request: usize, bytes: &[u8]) -> Result<(), Halt> {
-        let cut = self.current(request)?.cut;
+        self.current(request)?;
         let mut open = match self.open.take() {
             Some(open) => open,
             None => self
                 .begin(self.fetching[request])
                 .map_err(|error| self.stop(error))?,
         };
-        let written = open.write(bytes, cut);
+        let written = open.write(bytes);
         self.open = Some(open);
         written.map_err(|source| {
             let error = self.tmp_error(source);
@@ -496,6 +519,7 @@ impl RangeSink for Sink<'_, '_, '_> {
                 })?,
                 stored: open.stored,
                 content: open.content.finish(),
+                cut: open.cut,
             },
             (Ok(()), open) => failed(format!(
                 "the provider sent {} of {length} bytes",

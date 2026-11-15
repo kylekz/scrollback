@@ -434,6 +434,50 @@ fn a_location_whose_launcher_fails_is_tried_once_and_fails_as_one() {
 }
 
 #[test]
+fn what_a_provider_fell_short_of_is_said_with_the_locations_own_failure() {
+    let (bench, _, _) = two_agents();
+    let providers: [Box<dyn Provider + '_>; 2] = [Box::new(Unreachable), bench.agent.provider()];
+    let sync = |transport: &dyn Transport| {
+        let passes = sync_location(
+            bench.archive(),
+            &bench.location,
+            transport,
+            &providers,
+            &CancelToken::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(passes.len(), 2);
+        bench.location()
+    };
+    /* The first provider fails by itself, and then the launcher does. */
+    let refused = sync(&Refusing {
+        calls: AtomicUsize::new(0),
+    });
+    let error = refused.last_error.unwrap();
+    assert!(
+        error.starts_with("unreachable: ")
+            && error.ends_with(
+                "; the host refused the sign-in: user@macbook: Permission denied (publickey)."
+            ),
+        "{error}"
+    );
+    /* A location that can't be reached is no error: what the provider before it fell
+    short of is all the sync has to say, beside that it could not be reached. */
+    let asleep = sync(&Sleepy {
+        inner: bench.agent.transport(),
+        asleep: AtomicBool::new(true),
+        after_proofs: false,
+    });
+    let error = asleep.last_error.unwrap();
+    assert!(
+        error.starts_with("unreachable: ") && !error.contains("refused"),
+        "{error}"
+    );
+    assert_eq!(asleep.unreachable.unwrap().reason, ASLEEP);
+}
+
+#[test]
 fn what_the_providers_before_did_is_kept_when_the_location_goes() {
     let (bench, database, _) = two_agents();
     /* Awake for the first provider's pass, and asleep from its proofs on. */

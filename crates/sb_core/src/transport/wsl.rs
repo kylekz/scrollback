@@ -18,6 +18,9 @@ pub(super) const WSL_EXE: &str = "wsl.exe";
 /// older one does not know it, so what it writes is decoded either way ([`decode`]).
 pub(super) const UTF8: &str = "WSL_UTF8";
 
+/// The file in which a distro says how it wants WSL set up.
+pub(crate) const CONF: &str = "/etc/wsl.conf";
+
 /// How long the listing may take. It answers at once unless WSL itself is starting.
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -116,24 +119,70 @@ fn parse(listing: &[u8]) -> Vec<Distro> {
         .collect()
 }
 
-/// Text `wsl.exe` printed: UTF-8 when it is that, as it is from a Linux program and from a
-/// `wsl.exe` that knows [`UTF8`]; otherwise UTF-16, which its own messages are without it.
-/// (UTF-16 has a NUL in every ASCII letter and line end, which UTF-8 text never holds.)
+/// Text `wsl.exe` printed: UTF-16 when it starts with that encoding's mark or holds a NUL,
+/// as its own messages do without [`UTF8`] (every ASCII letter and line end has one, and
+/// UTF-8 text never does); otherwise UTF-8, as it is from a Linux program and from a
+/// `wsl.exe` that knows the variable, whatever was cut off in the middle of a character.
 pub(super) fn decode(bytes: &[u8]) -> String {
-    match std::str::from_utf8(bytes) {
-        Ok(text) if !text.contains('\0') => text.to_string(),
-        _ => {
-            let units: Vec<u16> = bytes
-                .strip_prefix(&[0xFF, 0xFE])
-                .unwrap_or(bytes)
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| u16::from_le_bytes(*pair))
-                .collect();
-            String::from_utf16_lossy(&units)
-        }
+    const MARK: [u8; 2] = [0xFF, 0xFE];
+    if !bytes.starts_with(&MARK) && !bytes.contains(&0) {
+        return String::from_utf8_lossy(bytes).into_owned();
     }
+    let units: Vec<u16> = bytes
+        .strip_prefix(&MARK)
+        .unwrap_or(bytes)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/**
+ * Where a WSL distro mounts the Windows drives, from its `/etc/wsl.conf`: the `root` of its
+ * `[automount]` section, with a slash at each end, as the default `/mnt/` has (`/` alone
+ * for a distro that has its drives at `/c`). `None` when the file sets none, or sets the
+ * default. As WSL reads the file, a `#` ends a section's header and a value that is not in
+ * quotes.
+ */
+pub(crate) fn automount_root(conf: &str) -> Option<String> {
+    let mut section = "";
+    let root = conf.lines().map(str::trim).find_map(|line| {
+        if let Some(header) = line.strip_prefix('[') {
+            section = header
+                .split_once(']')
+                .map_or(header, |(name, _)| name)
+                .trim();
+            return None;
+        }
+        let (key, value) = line.split_once('=')?;
+        let value = value.trim_start();
+        let in_quotes = ['"', '\''].into_iter().find_map(|quote| {
+            let quoted = value.strip_prefix(quote)?;
+            Some(
+                quoted
+                    .split_once(quote)
+                    .map_or(quoted, |(inside, _)| inside),
+            )
+        });
+        (section.eq_ignore_ascii_case("automount") && key.trim().eq_ignore_ascii_case("root")).then(
+            || {
+                in_quotes.unwrap_or_else(|| {
+                    value
+                        .split_once('#')
+                        .map_or(value, |(set, _)| set)
+                        .trim_end()
+                })
+            },
+        )
+    })?;
+    let root = match root.trim_matches('/') {
+        "" if root.is_empty() => return None,
+        "" => "/".to_string(),
+        named => format!("/{named}/"),
+    };
+    (root != crate::filing::WSL_DRIVE_MOUNT).then_some(root)
 }
 
 #[cfg(test)]
@@ -227,5 +276,53 @@ mod tests {
             assert_eq!(decode(said.as_bytes()), said);
         }
         assert_eq!(decode(b""), "");
+        /* The end of what a Linux program said, kept from the middle of a character on:
+        still UTF-8, with the half character lost. */
+        let cut = &"é: Permission denied\n".as_bytes()[1..];
+        assert_eq!(decode(cut), "\u{FFFD}: Permission denied\n");
+        /* The mark alone says UTF-16, where no letter has a NUL. */
+        let marked: Vec<u8> = "\u{FEFF}名前"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(decode(&marked), "名前");
+    }
+
+    #[test]
+    fn a_distros_drive_mount_is_read_from_its_wsl_conf() {
+        let conf = "# where the drives go\n[boot]\nsystemd=true\nroot = /not-this\n\n\
+                    [automount]\nenabled = true\nroot = /windows\noptions = \"metadata\"\n\
+                    [network]\nroot=/nor-this/\n";
+        assert_eq!(automount_root(conf), Some("/windows/".to_string()));
+        for (conf, root) in [
+            ("[Automount]\r\nRoot=\"/c drives/\"\r\n", "/c drives/"),
+            /* The drives at `/c`, `/d`. */
+            ("[automount]\nroot = /\n", "/"),
+            /* A `#` ends a header, and a value outside quotes. */
+            (
+                "[automount] # the drives\nroot = /windows # here\n",
+                "/windows/",
+            ),
+            ("[automount]#x\nroot=/windows/#here\n", "/windows/"),
+            ("[automount]\nroot = \"/win #1\" # here\n", "/win #1/"),
+            ("[automount]\nroot = '/win'\n", "/win/"),
+        ] {
+            assert_eq!(automount_root(conf).as_deref(), Some(root), "{conf:?}");
+        }
+        /* None set, the usual one set, one commented out, and a file of something else. */
+        for conf in [
+            "",
+            "[automount]\nenabled = true\n",
+            "[automount]\nroot = /mnt/\n",
+            "[automount]\nroot = /mnt # as ever\n",
+            "[automount]\nroot =\n",
+            "[automount]\nroot = # /windows\n",
+            "[automount]\n# root = /windows\n",
+            "# [automount]\nroot = /windows\n",
+            "root = /windows/\n",
+            "\0\u{1}binary",
+        ] {
+            assert_eq!(automount_root(conf), None, "{conf:?}");
+        }
     }
 }

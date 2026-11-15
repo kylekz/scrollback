@@ -38,12 +38,18 @@ pub(super) enum Trouble {
 
 impl Trouble {
     pub(super) fn of(said: &str) -> Self {
-        let ends = |error: &str| said.lines().any(|line| line.trim_end().ends_with(error));
-        if said.trim().is_empty() {
+        /* A tool's verdict is the last thing it says: what came before it may be of another
+        file, or of the same one a moment earlier. */
+        let last = said
+            .lines()
+            .map(str::trim_end)
+            .rfind(|line| !line.is_empty())
+            .unwrap_or_default();
+        if last.is_empty() {
             Self::Nothing
-        } else if ends("No such file or directory") {
+        } else if last.ends_with("No such file or directory") {
             Self::Gone
-        } else if ends("Permission denied") {
+        } else if last.ends_with("Permission denied") {
             Self::Denied
         } else {
             Self::Other(said.trim().to_string())
@@ -297,26 +303,6 @@ fn nanoseconds(time: &str) -> Option<i64> {
         .checked_add(fraction)
 }
 
-/**
- * Where a WSL distro mounts the Windows drives, from its `/etc/wsl.conf`: the `root` of its
- * `[automount]` section, with a slash at each end, as the default `/mnt/` has. `None` when
- * the file sets none, or sets the default.
- */
-pub(super) fn automount_root(conf: &str) -> Option<String> {
-    let mut section = "";
-    let root = conf.lines().map(str::trim).find_map(|line| {
-        if let Some(name) = line.strip_prefix('[') {
-            section = name.trim_end_matches(']').trim();
-            return None;
-        }
-        let (key, value) = line.split_once('=')?;
-        (section.eq_ignore_ascii_case("automount") && key.trim().eq_ignore_ascii_case("root"))
-            .then(|| value.trim().trim_matches(['"', '\'']))
-    })?;
-    let root = format!("/{}/", root.trim_matches('/'));
-    (root.len() > 2 && root != crate::filing::WSL_DRIVE_MOUNT).then_some(root)
-}
-
 /// What a clock record read.
 pub(super) fn clock(time: &str) -> Result<i64, TransportError> {
     nanoseconds(time).ok_or_else(|| TransportError::Protocol(format!("the clock read {time:?}")))
@@ -451,31 +437,21 @@ mod tests {
             assert_eq!(unread(other).to_string(), other);
         }
         assert_eq!(Trouble::of(" \n"), Trouble::Nothing);
-    }
-
-    #[test]
-    fn a_distros_drive_mount_is_read_from_its_wsl_conf() {
-        let conf = "# where the drives go\n[boot]\nsystemd=true\nroot = /not-this\n\n\
-                    [automount]\nenabled = true\nroot = /windows\noptions = \"metadata\"\n\
-                    [network]\nroot=/nor-this/\n";
-        assert_eq!(automount_root(conf), Some("/windows/".to_string()));
+        /* Of several lines, the last is the verdict. */
         assert_eq!(
-            automount_root("[Automount]\r\nRoot=\"/c drives/\"\r\n"),
-            Some("/c drives/".to_string())
+            Trouble::of(
+                "head: /home/user/x: No such file or directory\nstat: x: Permission denied\n\n"
+            ),
+            Trouble::Denied
         );
-        /* None set, the usual one set, the root of everything, and a file of something
-        else. */
-        for conf in [
-            "",
-            "[automount]\nenabled = true\n",
-            "[automount]\nroot = /mnt/\n",
-            "[automount]\nroot = /mnt\n",
-            "[automount]\nroot = /\n",
-            "root = /windows/\n",
-            "\0\u{1}binary",
-        ] {
-            assert_eq!(automount_root(conf), None, "{conf:?}");
-        }
+        assert_eq!(
+            Trouble::of(
+                "find: /home/user/x: Permission denied\nfind: y: No such file or directory"
+            ),
+            Trouble::Gone
+        );
+        let two = "find: /home/user/x: No such file or directory\nfind: y: Input/output error";
+        assert_eq!(Trouble::of(two), Trouble::Other(two.to_string()));
     }
 
     fn request(path: &str, length: u64) -> PrefixRequest {
@@ -565,5 +541,11 @@ mod tests {
         assert_eq!(wholes(&requests, &sums(whole), "3\n0"), None);
         let escaped = sums(whole).replacen(&hashes[0].to_hex(), "\\", 1);
         assert_eq!(wholes(&requests, &escaped, "3\n0\n5"), None);
+        /* A name counts whole, not by its last part. */
+        let twins = [request("/a/same", 3), request("/b/same", 3)];
+        let line = |name: &str| format!("{} {name}\n", hashes[0].to_hex());
+        let (first, second) = (line(" /a/same"), line(" /b/same"));
+        assert!(wholes(&twins, &format!("{first}{second}"), "3\n3").is_some());
+        assert_eq!(wholes(&twins, &format!("{second}{first}"), "3\n3"), None);
     }
 }

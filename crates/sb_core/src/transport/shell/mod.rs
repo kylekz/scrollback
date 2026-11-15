@@ -6,8 +6,8 @@
 //! a script: `shell.sh`, which defines a function per operation and documents the answer's
 //! records, then the requests as calls of those ([`script`]). A pass over a location where
 //! nothing changed is four processes (the environment, whether the agent is there, its
-//! settings, the listing); each batch it fetches adds one for the stream and one for the
-//! proofs.
+//! settings, the listing), and a fifth for a WSL distro's `/etc/wsl.conf`; each batch it
+//! fetches adds one for the stream and one for the proofs.
 //!
 //! **Requests are shell words.** A path is written between single quotes, where a POSIX shell
 //! reads every character as itself, a quote in it as `'\''`. So a name with spaces, newlines,
@@ -41,12 +41,20 @@
 //! **The environment** a command run by `wsl.exe --exec` or `ssh host command` gets is bare:
 //! no profile is read. So the variables a provider asks about are asked of the user's login
 //! shell (`$SHELL -lc`), which reads the profile, and of the bare environment only when the
-//! login shell does not answer in a few seconds. What only an interactive shell's startup
-//! file sets is still not seen.
+//! login shell has no answer: there is none, it takes no `-lc` (csh and tcsh), or its profile
+//! fails. One that is still running after a few seconds is killed and the call fails: the
+//! bare environment could name another place than the profile would have. What only an
+//! interactive shell's startup file sets is still not seen. The answer is kept for the life
+//! of the [`ShellTransport`], which is one pass: the login shell is asked once in it.
 //!
 //! **A call that hears nothing** from its launcher for [`IDLE`] is given up on: a `find` on a
 //! network mount that hangs, a `wsl.exe` that stalls. `ssh` itself notices a host that stops
 //! answering much sooner ([`Launcher`]).
+//!
+//! **What the transport can't see.** A group's mark is one byte of evidence that its files
+//! were as long as `stat` said. At a location whose `stat` and `read` disagree (a network
+//! mount with a stale attribute cache), a grouped read can hand over bytes cut at the wrong
+//! places; the engine's proof then rejects them, and nothing wrong is stored.
 
 mod launch;
 mod parse;
@@ -56,17 +64,19 @@ mod script;
 use std::collections::HashMap;
 use std::io;
 use std::ops::Range;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
 
 use toolbox_process::CancelToken;
 
+use super::local::ns_since_epoch;
 use super::{
     Env, FileStat, Halt, Hashed, Listing, MAY_NOT_BE_READ, PrefixRequest, RangeFailure,
-    RangeRequest, RangeSink, Transport, TransportError, Unlisted,
+    RangeRequest, RangeSink, Transport, TransportError, Unlisted, wsl,
 };
 use parse::{Trouble, clock, entry, not_unicode, number, parse_stat, range};
 use reply::{END, Reply, unexpected};
-use script::{Login, Script};
+use script::{Asked, Login, Script};
 
 pub use launch::Launcher;
 
@@ -105,6 +115,9 @@ pub struct Probe {
     pub home: String,
     /// The location's clock, in nanoseconds since the Unix epoch.
     pub clock_ns: i64,
+    /// How far that clock is ahead of this machine's, in nanoseconds: taken when its reading
+    /// arrived, so the rest of the test is not counted in it.
+    pub clock_ahead_ns: i64,
     /// The tools the transport needs that the location lacks. With any, it can't be synced.
     pub missing: Vec<String>,
     /// Whether files' modification times come in whole seconds only.
@@ -112,22 +125,43 @@ pub struct Probe {
     /// Where the `sh` that answered is found at the location (`/bin/sh`).
     pub shell: String,
     /// The user's login shell, when it answered: the variables its profile sets are seen.
-    /// `None` when it did not, and only the bare environment of a command is.
+    /// `None` when it did not, and only the bare environment of a command is: always so
+    /// for csh and tcsh, which take no `-lc`.
     pub login_shell: Option<String>,
     /// Where a WSL distro mounts the Windows drives, when its `/etc/wsl.conf` says it is not
-    /// `/mnt/` (PLAN §6.3), with a slash at each end: what the location is to be given
-    /// ([`crate::catalogue::Catalogue::set_drive_mount`]). `None` anywhere else.
+    /// `/mnt/` (PLAN §6.3), with a slash at each end. `None` anywhere else. A sync reads
+    /// the same file, and records what it says for the location.
     pub drive_mount: Option<String>,
     /// How long the test took, from starting the launcher to the end of the answer.
     pub took: Duration,
 }
 
-/// A location behind a [`Launcher`] (the module docs).
+/// A location behind a [`Launcher`] (the module docs). Made anew for each pass: what it
+/// learns of the location's environment it keeps.
 #[derive(Clone, Debug)]
 pub struct ShellTransport {
     launcher: Launcher,
     cancel: CancelToken,
     idle: Duration,
+    environment: Arc<Mutex<Environment>>,
+}
+
+/// What the location's environment was found to be so far.
+#[derive(Debug, Default)]
+struct Environment {
+    home: Option<String>,
+    /// The login shell had no answer: the bare environment is all there is to ask.
+    silent: bool,
+    /// The variables asked about, and what each is set to.
+    vars: HashMap<String, Option<String>>,
+}
+
+/// The login shell was killed before it answered.
+fn late() -> TransportError {
+    TransportError::Failed(format!(
+        "the login shell there was still starting after {LOGIN_SECONDS} seconds and was \
+         stopped: its profile may be waiting for something"
+    ))
 }
 
 impl ShellTransport {
@@ -136,6 +170,7 @@ impl ShellTransport {
             launcher,
             cancel: CancelToken::new(),
             idle: IDLE,
+            environment: Arc::default(),
         }
     }
 
@@ -154,7 +189,8 @@ impl ShellTransport {
     /**
      * The connection test: whether the launcher reaches a shell, and what the transport would
      * find there. A location that can't be reached, or whose launcher fails, is an error; one
-     * that lacks tools answers, and names them in [`Probe::missing`].
+     * that lacks tools answers, and names them in [`Probe::missing`]. A login shell that had
+     * to be stopped is an error, as it is to a pass.
      */
     pub fn probe(&self) -> Result<Probe, TransportError> {
         let started = Instant::now();
@@ -164,20 +200,27 @@ impl ShellTransport {
         reply.field("H")?;
         let home = reply.words()?;
         let clock_ns = clock(&reply.field("C")?)?;
+        let clock_ahead_ns = clock_ns.saturating_sub(ns_since_epoch(SystemTime::now()));
         let whole_seconds = reply.field("N")? == "0";
         reply.field("L")?;
         let shell = reply.words()?;
         let login_shell = reply.words()?;
         /* A file that is not there, or can't be read, sets nothing. */
-        let drive_mount = small(&mut reply, "/etc/wsl.conf")
+        let drive_mount = small(&mut reply, wsl::CONF)
             .ok()
             .flatten()
-            .and_then(|conf| parse::automount_root(&String::from_utf8_lossy(&conf)));
-        let answered = login.read(&mut reply)?.is_some();
+            .and_then(|conf| wsl::automount_root(&String::from_utf8_lossy(&conf)));
+        let answered = match login.read(&mut reply)? {
+            Asked::Answered(_) => true,
+            Asked::Silent => false,
+            Asked::Late => return Err(late()),
+        };
         reply.end()?;
+        self.environment().silent = !answered;
         Ok(Probe {
             home,
             clock_ns,
+            clock_ahead_ns,
             missing,
             whole_seconds,
             shell,
@@ -185,6 +228,12 @@ impl ShellTransport {
             drive_mount,
             took: started.elapsed(),
         })
+    }
+
+    fn environment(&self) -> MutexGuard<'_, Environment> {
+        self.environment
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Runs `script` at the location and reads its answer up to the first record.
@@ -206,6 +255,57 @@ impl ShellTransport {
         } else {
             Err(TransportError::MissingTools(missing))
         }
+    }
+
+    /// Asks the location for its home folder and the variables `names`, and adds them to
+    /// what is `known` of its environment.
+    fn learn(&self, known: &mut Environment, names: &[&str]) -> Result<(), TransportError> {
+        let login = Login::new();
+        let ask_login = !names.is_empty() && !known.silent;
+        let mut script = Script::new().line("home");
+        if ask_login {
+            script = script.login(&login, names);
+        }
+        for name in names {
+            script = script.line(&format!("var {name}"));
+        }
+        let mut reply = self.ask("", script)?;
+        reply.field("H")?;
+        let home = String::from_utf8(reply.text()?)
+            .ok()
+            .filter(|home| home.starts_with('/'))
+            .ok_or(TransportError::NoHome)?;
+        /* What the login shell has of them, when it answered; else what a command gets. */
+        let logged_in = if ask_login {
+            match login.read(&mut reply)? {
+                Asked::Answered(vars) => Some(vars),
+                Asked::Silent => None,
+                Asked::Late => return Err(late()),
+            }
+        } else {
+            None
+        };
+        let mut bare = HashMap::new();
+        loop {
+            let line = reply.line()?;
+            let Some(name) = line.strip_prefix("V ") else {
+                if line != END {
+                    return Err(unexpected("V", &line));
+                }
+                break;
+            };
+            /* As on this machine, a value that is not Unicode counts as not set. */
+            if let Ok(value) = String::from_utf8(reply.text()?) {
+                bare.insert(name.to_string(), value);
+            }
+        }
+        known.home = Some(home);
+        known.silent |= ask_login && logged_in.is_none();
+        let mut vars = logged_in.unwrap_or(bare);
+        for name in names {
+            known.vars.insert((*name).to_string(), vars.remove(*name));
+        }
+        Ok(())
     }
 
     /**
@@ -465,44 +565,23 @@ impl Transport for ShellTransport {
             .copied()
             .filter(|name| script::is_identifier(name))
             .collect();
-        let login = Login::new();
-        let mut script = Script::new().line("home");
-        if !names.is_empty() {
-            script = script.login(&login, &names);
+        /* Held across the call: whoever else asks meanwhile wants the same answer. */
+        let mut known = self.environment();
+        let new: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| !known.vars.contains_key(*name))
+            .collect();
+        if known.home.is_none() || !new.is_empty() {
+            self.learn(&mut known, &new)?;
         }
-        for name in &names {
-            script = script.line(&format!("var {name}"));
-        }
-        let mut reply = self.ask("", script)?;
-        reply.field("H")?;
-        let home = String::from_utf8(reply.text()?)
-            .ok()
-            .filter(|home| home.starts_with('/'))
-            .ok_or(TransportError::NoHome)?;
-        /* What the login shell has of them, when it answered; else what a command gets. */
-        let logged_in = if names.is_empty() {
-            None
-        } else {
-            login.read(&mut reply)?
-        };
-        let mut bare = HashMap::new();
-        loop {
-            let line = reply.line()?;
-            let Some(name) = line.strip_prefix("V ") else {
-                return if line == END {
-                    Ok(Env {
-                        home,
-                        vars: logged_in.unwrap_or(bare),
-                    })
-                } else {
-                    Err(unexpected("V", &line))
-                };
-            };
-            /* As on this machine, a value that is not Unicode counts as not set. */
-            if let Ok(value) = String::from_utf8(reply.text()?) {
-                bare.insert(name.to_string(), value);
-            }
-        }
+        Ok(Env {
+            home: known.home.clone().ok_or(TransportError::NoHome)?,
+            vars: names
+                .iter()
+                .filter_map(|name| Some(((*name).to_string(), known.vars.get(*name)?.clone()?)))
+                .collect(),
+        })
     }
 
     fn stat(&self, paths: &[&str]) -> Result<Vec<Option<FileStat>>, TransportError> {

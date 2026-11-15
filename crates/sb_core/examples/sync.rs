@@ -32,7 +32,7 @@
 
 use std::error::Error;
 use std::path::Path;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use sb_core::CancelToken;
 use sb_core::archive::{Archive, ArchiveError};
@@ -152,8 +152,7 @@ fn test(place: &Place) -> Result<(), Box<dyn Error>> {
     let probe = ShellTransport::new(launcher)
         .probe()
         .map_err(|error| error.to_string())?;
-    let ahead =
-        probe.clock_ns as f64 / 1e9 - SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
+    let ahead = probe.clock_ahead_ns as f64 / 1e9;
     println!(
         "connected in {:.2?}: {} answered, its home is {}, its clock is {ahead:+.1} s from \
          this machine's, modification times come in {}",
@@ -168,7 +167,9 @@ fn test(place: &Place) -> Result<(), Box<dyn Error>> {
     );
     match &probe.login_shell {
         Some(shell) => println!("variables: as the login shell {shell} has them"),
-        None => println!("variables: the login shell did not answer; a bare command's"),
+        None => println!(
+            "variables: the login shell did not answer (csh and tcsh never do); a bare command's"
+        ),
     }
     if let Some(mount) = &probe.drive_mount {
         println!("drives: mounted under {mount}");
@@ -347,14 +348,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => catalogue.add_location(place.kind.clone(), &place.name)?,
     };
     let cancel = CancelToken::new();
-    /* Where a distro mounts the drives is the connection test's to find, as the app has it
-    do when a location is added. */
-    if let (LocationKind::Wsl { .. }, Some(launcher)) = (&place.kind, place.launcher()) {
-        let probe = ShellTransport::new(launcher).cancelled_by(&cancel).probe();
-        if let Ok(probe) = probe {
-            catalogue.set_drive_mount(&location.id, probe.drive_mount.as_deref())?;
-        }
-    }
     let transport: Box<dyn Transport> = match place.launcher.clone() {
         Some(launcher) => Box::new(ShellTransport::new(launcher).cancelled_by(&cancel)),
         None => place.kind.transport(&cancel),

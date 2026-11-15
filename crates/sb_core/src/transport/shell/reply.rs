@@ -85,6 +85,10 @@ impl<'a> Reply<'a> {
         cancel: &'a CancelToken,
         idle: Duration,
     ) -> Result<(Self, Vec<String>), TransportError> {
+        /* Before anything is started: `wsl.exe` would start a distro that is stopped. */
+        if cancel.is_cancelled() {
+            return Err(TransportError::Cancelled);
+        }
         let (tx, events) = sync_channel(QUEUE);
         let process = spawn_streaming(&launcher.command(), move |event| {
             let _ = tx.send(event);
@@ -178,7 +182,12 @@ impl<'a> Reply<'a> {
                 }
                 Ok(Event::Exit(exit)) => self.exit = Some(exit),
                 Err(RecvTimeoutError::Timeout) if silent_since.elapsed() >= self.idle => {
-                    return Err(self.launcher.silent(self.idle));
+                    /* Not a host that can't be reached: `ssh` asks a silent host whether
+                    it is there, and ends by itself when it is not. Something hangs. */
+                    return Err(TransportError::Failed(format!(
+                        "no answer for {} seconds",
+                        self.idle.as_secs()
+                    )));
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => self.exit = Some(None),

@@ -348,17 +348,32 @@ impl Catalogue {
     }
 
     /**
-     * Records where `location` mounts the Windows drives, as the connection test found it
-     * ([`crate::transport::Probe::drive_mount`]); `None` for the usual place. The project
-     * paths of sessions indexed from then on are read by it, and so is a path attached for
-     * the location; sessions indexed before keep how they were read until they are indexed
-     * again.
+     * Records where `location` mounts the Windows drives, as a sync or the connection test
+     * found it ([`crate::transport::Probe::drive_mount`]); `None` for the usual place. The
+     * project paths of its sessions and the paths attached for it are read by it. When it
+     * is another place than was on record, those that were read under the old one are read
+     * again, from the paths as they were recorded, and the sessions are filed anew by the
+     * rules (PLAN §8).
      */
     pub fn set_drive_mount(&self, location: &LocationId, mount: Option<&str>) -> Result<()> {
-        self.execute(
-            "UPDATE location SET drive_mount = ?2 WHERE id = ?1",
-            params![location, mount],
-        )
+        self.db.write(|tx| {
+            let before: Option<String> = tx
+                .query_row(
+                    "SELECT drive_mount FROM location WHERE id = ?1",
+                    [location],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            if before.as_deref() != mount {
+                tx.execute(
+                    "UPDATE location SET drive_mount = ?2 WHERE id = ?1",
+                    params![location, mount],
+                )?;
+                folder::remount(tx, location, mount)?;
+            }
+            Ok(())
+        })
     }
 
     /// Where `location` mounts the Windows drives, when it is not the usual place.

@@ -252,7 +252,7 @@ fn stat_of(metadata: &Metadata) -> io::Result<FileStat> {
     })
 }
 
-fn ns_since_epoch(time: SystemTime) -> i64 {
+pub(super) fn ns_since_epoch(time: SystemTime) -> i64 {
     match time.duration_since(UNIX_EPOCH) {
         Ok(after) => i64::try_from(after.as_nanos()).unwrap_or(i64::MAX),
         Err(before) => i64::try_from(before.duration().as_nanos()).map_or(i64::MIN, |ns| -ns),
