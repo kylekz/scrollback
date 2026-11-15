@@ -42,6 +42,21 @@ fn a_folder_without_an_archive_is_not_opened_as_one() {
 }
 
 #[test]
+fn an_archive_named_by_a_relative_path_opens_again() {
+    /* A folder under the working directory, named from there. */
+    let here = std::env::current_dir().unwrap();
+    let dir = tempfile::tempdir_in(&here).unwrap();
+    let relative = dir.path().strip_prefix(&here).unwrap().join("archive");
+    assert!(relative.is_relative());
+
+    let created = Archive::create(&relative).unwrap();
+    assert!(created.dir().is_absolute());
+    let id = created.id().to_string();
+    drop(created);
+    assert_eq!(Archive::open(&relative).unwrap().id(), id);
+}
+
+#[test]
 fn a_second_opener_is_refused_by_the_lock() {
     let dir = tempfile::tempdir().unwrap();
     let first = Archive::create(dir.path()).unwrap();

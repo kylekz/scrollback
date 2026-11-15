@@ -116,6 +116,7 @@ pub struct Archive {
 impl Archive {
     /// Creates an archive in `dir`, which is made if missing and must not hold one already.
     pub fn create(dir: &Path) -> Result<Self> {
+        let dir = &absolute(dir)?;
         fs::create_dir_all(dir).map_err(io_error("create", dir))?;
         let lock = lock(dir)?;
         let manifest_path = dir.join(layout::MANIFEST);
@@ -138,6 +139,7 @@ impl Archive {
 
     /// Opens the archive in `dir`. A folder without one is [`ArchiveError::NotAnArchive`].
     pub fn open(dir: &Path) -> Result<Self> {
+        let dir = &absolute(dir)?;
         let manifest_path = dir.join(layout::MANIFEST);
         if !manifest_path.is_file() {
             return Err(ArchiveError::NotAnArchive(dir.to_path_buf()));
@@ -394,6 +396,13 @@ impl Archive {
         }
         Ok(names)
     }
+}
+
+/// `dir` as an absolute path: the archive stays the folder it was opened on wherever the
+/// process's working directory goes, and the catalogue's own reads of its database, which name
+/// it by a `file:` URI, need the whole path.
+fn absolute(dir: &Path) -> Result<PathBuf> {
+    std::path::absolute(dir).map_err(io_error("resolve", dir))
 }
 
 /// Takes the archive's lock, which lasts as long as the returned file is open.
