@@ -202,12 +202,23 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    /// A process's end with the exit code `code`.
+    fn exit(code: u8) -> Option<ExitStatus> {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt as _;
+            ExitStatus::from_raw(i32::from(code) << 8)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt as _;
+            ExitStatus::from_raw(u32::from(code))
+        };
+        Some(status)
+    }
+
     #[test]
     fn a_launchers_end_is_read_by_which_launcher_it_is() {
-        use std::os::unix::process::ExitStatusExt as _;
-
-        let exit = |code: i32| Some(ExitStatus::from_raw(code << 8));
         let said = |failure| match failure {
             TransportError::Failed(said) => said,
             other => panic!("{other}"),
@@ -223,26 +234,32 @@ mod tests {
         /* Any other exit is the remote command's, whatever it wrote: the host was reached. */
         assert_eq!(said(ssh.failure(exit(127), refused, b"")), refused.trim());
 
-        /* wsl.exe speaks on stdout, in UTF-16. */
+        /* wsl.exe speaks on stdout, in UTF-16, and in UTF-8 with WSL_UTF8 set: what it says
+        of a distro that is not installed, with its lines ended as it ends them. */
         let wsl = Launcher::Wsl {
             distro: "Ubuntu-24.04".to_string(),
         };
-        let no_distro: Vec<u8> = "There is no distribution with the supplied name.\r\n"
+        let no_distro = "There is no distribution with the supplied name.\r\n\
+                         Error code: Wsl/Service/WSL_E_DISTRO_NOT_FOUND\r\n";
+        let utf16: Vec<u8> = no_distro
             .encode_utf16()
             .flat_map(u16::to_le_bytes)
             .collect();
-        assert_eq!(
-            said(wsl.failure(exit(255), "", &no_distro)),
-            "There is no distribution with the supplied name."
-        );
+        for stdout in [&utf16[..], no_distro.as_bytes()] {
+            assert_eq!(
+                said(wsl.failure(exit(255), "", stdout)),
+                no_distro.trim_end()
+            );
+        }
 
         let silent = Launcher::Command {
             program: "sh".into(),
             args: Vec::new(),
         };
+        /* "exit status: 3", or "exit code: 3" on Windows. */
         assert_eq!(
             said(silent.failure(exit(3), " \n", b"not an answer")),
-            "it ended before it answered (exit status: 3)"
+            format!("it ended before it answered ({})", exit(3).unwrap())
         );
         assert_eq!(
             said(silent.failure(None, "", b"")),
@@ -263,6 +280,9 @@ mod tests {
         for unreachable in [
             "ssh: Could not resolve hostname macbook.local: nodename nor servname provided, or not known",
             "ssh: Could not resolve hostname macbook: Name or service not known",
+            /* OpenSSH for Windows. */
+            "ssh: Could not resolve hostname macbook.local: No such host is known. ",
+            "banner exchange: Connection to UNKNOWN port -1: Connection refused",
             "ssh: connect to host macbook.local port 22: Operation timed out",
             "ssh: connect to host 192.0.2.7 port 22: Connection timed out",
             "ssh: connect to host macbook.local port 22: Connection refused",
