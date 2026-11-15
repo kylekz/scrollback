@@ -33,20 +33,21 @@
 {"cmd": "bounds", "target": "titlebar/sync-all", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "query", "prefix": "sidebar/location/", "expect_result": {"pointer": "", "len": 1}}
 // DESIGN §2, §4.4: the page has 20px above its header and 24px at its sides; cards are a quarter of the row less the 12px gap, 112 high, under the month's overline.
-{"cmd": "bounds", "target": "page/header", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/y", "equals": 60}, {"pointer": "/w", "equals": 1144}, {"pointer": "/h", "equals": 72}]}
-{"cmd": "bounds", "target": "card/0", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/y", "equals": 178}, {"pointer": "/w", "equals": 277}, {"pointer": "/h", "equals": 112}]}
-{"cmd": "bounds", "target": "card/1", "expect_result": [{"pointer": "/x", "equals": 561}, {"pointer": "/y", "equals": 178}, {"pointer": "/w", "equals": 277}]}
+// Where a position or a size below is a range, its upper end is the design's number: a fractional display scale (125%, 150%, 175%) rounds each 1px hairline and gap above a thing to whole device pixels, which takes a pixel or two off where it sits and sometimes one off its height. The ranges are what Windows reports at 100%, 125%, 150% and 175%.
+{"cmd": "bounds", "target": "page/header", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/y", "equals": 60}, {"pointer": "/w", "equals": 1144}, {"pointer": "/h", "gte": 71}, {"pointer": "/h", "lte": 72}]}
+{"cmd": "bounds", "target": "card/0", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/y", "gte": 177}, {"pointer": "/y", "lte": 178}, {"pointer": "/w", "equals": 277}, {"pointer": "/h", "equals": 112}]}
+{"cmd": "bounds", "target": "card/1", "expect_result": [{"pointer": "/x", "equals": 561}, {"pointer": "/y", "gte": 177}, {"pointer": "/y", "lte": 178}, {"pointer": "/w", "equals": 277}]}
 // October's card is alone on its row and as wide as the others.
-{"cmd": "bounds", "target": "card/2", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/y", "equals": 336}, {"pointer": "/w", "equals": 277}]}
+{"cmd": "bounds", "target": "card/2", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/y", "gte": 335}, {"pointer": "/y", "lte": 336}, {"pointer": "/w", "equals": 277}]}
 {"cmd": "screenshot", "name": "all-sessions-dark"}
 
 // Unsorted groups them by where they started: the path with two sessions first.
 {"cmd": "click", "target": "sidebar/unsorted"}
 {"cmd": "settle", "expect": [{"pointer": "/page", "equals": "unsorted"}, {"pointer": "/library/shelf", "equals": "unsorted"}, {"pointer": "/library/groups", "equals": 2}]}
 // DESIGN §4.6: a group's head is 44 high under its section's border and its rows 34; the next group starts 12 under the last row.
-{"cmd": "bounds", "target": "unsorted/group/0", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/y", "equals": 178}, {"pointer": "/w", "equals": 1144}, {"pointer": "/h", "equals": 45}]}
-{"cmd": "bounds", "target": "unsorted/row/0/0", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/w", "equals": 1144}, {"pointer": "/h", "equals": 34}]}
-{"cmd": "bounds", "target": "unsorted/group/1", "expect_result": [{"pointer": "/y", "equals": 303}, {"pointer": "/h", "equals": 45}]}
+{"cmd": "bounds", "target": "unsorted/group/0", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/y", "gte": 176}, {"pointer": "/y", "lte": 178}, {"pointer": "/w", "equals": 1144}, {"pointer": "/h", "equals": 45}]}
+{"cmd": "bounds", "target": "unsorted/row/0/0", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/w", "equals": 1144}, {"pointer": "/h", "gte": 33}, {"pointer": "/h", "lte": 34}]}
+{"cmd": "bounds", "target": "unsorted/group/1", "expect_result": [{"pointer": "/y", "gte": 301}, {"pointer": "/y", "lte": 303}, {"pointer": "/h", "gte": 44}, {"pointer": "/h", "lte": 45}]}
 {"cmd": "screenshot", "name": "unsorted-dark"}
 {"cmd": "pin_appearance", "appearance": "light"}
 {"cmd": "settle"}
@@ -56,7 +57,7 @@
 {"cmd": "click", "target": "unsorted/group/0/toggle"}
 {"cmd": "bounds", "target": "unsorted/group/0", "expect_result": {"pointer": "/h", "equals": 45}}
 {"cmd": "bounds", "target": "unsorted/row/0/0", "expect_error": "no target"}
-{"cmd": "bounds", "target": "unsorted/group/1", "expect_result": {"pointer": "/y", "equals": 235}}
+{"cmd": "bounds", "target": "unsorted/group/1", "expect_result": [{"pointer": "/y", "gte": 233}, {"pointer": "/y", "lte": 235}]}
 {"cmd": "click", "target": "unsorted/group/0/toggle"}
 {"cmd": "bounds", "target": "unsorted/row/0/1", "expect_result": {"pointer": "/visible", "not_equals": null}}
 
