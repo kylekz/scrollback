@@ -3,7 +3,7 @@
 Native desktop app (Rust + GPUI) that backs up, archives and reads coding-agent transcripts. It pulls transcripts from locations (this machine, a WSL distro, a host over SSH) into an archive it owns and reads only from that archive. Claude Code is the first agent supported. Windows is the main platform, with first-class WSL; macOS is supported.
 
 - Spec: `docs/FEATURES.md` (what it does) and `docs/PLAN.md` (decisions D1–D15, the archive, sync, transports, phases; cited as `PLAN §N` / `D<n>`). Read the relevant sections before changing anything; when code and spec disagree, fix one of them in the same change.
-- Design: concept E on the design canvas. Its source boards are in `design/project/` (`E-Reader.dc.html`, `E-Folder.dc.html`; rows A–D are the concepts it was chosen from).
+- Design: `docs/DESIGN.md` (tokens, layout, materials, screens, keyboard map; cited as `DESIGN §N`), written from concept E on the design canvas. The boards' sources are in `design/project/` (the `E-*.dc.html` files; A–D are the concepts E was chosen from). Where a board and DESIGN.md disagree, DESIGN.md wins.
 - Status: planning. There is no code yet.
 - Agent-agnostic (PLAN D8, §7): everything specific to a coding agent lives in its provider. Sync, the archive, filing, search and the reader never name an agent. Adding an agent must not need a change outside its provider; if it does, fix the seam first.
 - Sibling apps on the same stack, all the owner's: dv (`kylekz/diff`), fc, slide, folio, and the shared crates in `kylekz/toolbox-rs`. Lift from them per PLAN D15.

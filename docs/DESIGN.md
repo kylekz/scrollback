@@ -1,0 +1,387 @@
+# scrollback: design spec
+
+The chosen direction is **concept E**: A's sidebar, always present, beside B's folder page and reader, without B's timeline gutter (PLAN D12).
+Pixel reference: the "Concept E" page of the design canvas (a private canvas), whose sources are the `E-*.dc.html` boards in `design/project/`. Each board has a `theme` tweak (dark / light). Tokens and shared components are in `design/project/sb.css`.
+Behaviour lives in [FEATURES.md](FEATURES.md) and [PLAN.md](PLAN.md); this file is tokens, layout and interaction. Where a board and this file disagree, this file wins (§6 lists the known differences). Cite it as `DESIGN §N`.
+
+---
+
+## 1. Tokens
+
+Colours are `sb.css`'s values. Views never hard-code a colour: every surface, text tier, status hue, diff fill and syntax colour is a token of the theme module (PLAN D13). The boards draw the Opaque surface values; §3 gives the translucent ones.
+
+### 1.1 Dark (default)
+
+| Token | Value | Use |
+|---|---|---|
+| `bg-app` | `#111214` | main area, reading column |
+| `bg-side` | `#0c0d0f` | sidebar |
+| `bg-panel` | `#0e0f11` | facts margin, nested subagent panel |
+| `chrome` | `#0c0d0f` | title bar |
+| `s1` | `#17191c` | cards, inputs, list headers, dialog footers |
+| `s2` | `#1d2024` | buttons, chips, popovers, sheets, menus, dialogs |
+| `s3` | `#24282d` | selected rows, current turn, tags |
+| `active` | `#2b3036` | chosen segment of a segmented control |
+| `code` | `#0d0e10` | code blocks, tool-call bodies, diffs |
+| `codehead` | `#15171a` | header row of a code block or call body |
+| `line-subtle` | `#1f2226` | hairlines, row separators |
+| `line` | `#2c3036` | control and card borders |
+| `line-strong` | `#3a3f46` | dashed drop areas, lifted card outline, toggle track |
+| `fg` | `#eceae6` | text |
+| `fg2` | `#b0aea8` | secondary text |
+| `fg3` | `#8a8882` | lowest text tier (labels, counts, timestamps); ≥4.5:1 on every surface |
+| `accent` | `#4fc4bd` | fills: primary button, progress, checkbox, current find match |
+| `accent-ink` | `#062120` | text on `accent` |
+| `accent-soft` | `rgba(79,196,189,.14)` | drop target, pending row, accent chip |
+| `accent-text` | `#8fe0d9` | accent as text: links, counts on a drop target |
+| `green` / `red` / `yellow` / `blue` | `#8fd694` / `#f08a7e` / `#f2c482` / `#8ab8f0` | status: ok / failed / warning and find / WSL tag |
+| `green-soft` / `red-soft` / `yellow-soft` / `blue-soft` | `rgba(143,214,148,.13)` / `rgba(240,138,126,.13)` / `rgba(242,196,130,.14)` / `rgba(138,184,240,.14)` | chip and banner fills |
+| `claude` / `claude-soft` | `#d97757` / `rgba(217,119,87,.16)` | the Claude model mark and its avatar fill |
+| `scrim` | `rgba(5,6,8,.58)` | under sheets, dialogs, the palette |
+| `shadow-card` | `0 6px 20px rgba(0,0,0,.28)` | hovered card, hover bar |
+| `shadow-pop` | `0 28px 70px rgba(0,0,0,.55), 0 2px 10px rgba(0,0,0,.35)` | popovers, menus, sheets, dialogs |
+
+Diff: `add-bg rgba(110,200,120,.10)`, `add-gut .18`, `add-word .30`; `del-bg rgba(240,100,90,.10)`, `del-gut .18`, `del-word .32`; `hunk rgba(138,184,240,.07)` with its text in `blue`. Added and removed rows differ in lightness as well as hue.
+
+Syntax: `k` (keyword) `#b9a3ff`, `f` (function) `#f2c482`, `s` (string) `#9fd3a3`, `n` (number) `#f2a97a`, `t` (type) `#8ec9f0`, `p` (property, TOML table) `#e7a6d6`, `c` (comment) `#8a8882` (= `fg3`). Highlighting produces token kinds, never colours (PLAN §9).
+
+Find and search: matches on `yellow-soft` with a 1px `yellow` underline (`hl`); the current find match on `accent` with `accent-ink` text (`hl.cur`).
+
+### 1.2 Light
+
+Same token names. `bg-app #fbfaf8`, `bg-side #f1f0ec`, `bg-panel #f5f4f1`, `chrome #efeee9`; `s1 #ffffff`, `s2 #ffffff`, `s3 #e7e5e0`, `active #ffffff`, `code #fdfdfc`, `codehead #f4f3f0`; `line-subtle #e6e4df`, `line #d8d5ce`, `line-strong #c0bcb3`; `fg #1c1b19`, `fg2 #4f4c46`, `fg3 #67645d`; `accent #0e7c78`, `accent-ink #ffffff`, `accent-soft rgba(14,124,120,.10)`, `accent-text #0a6461`; `green #17703f`, `red #b42a2a`, `yellow #845400`, `blue #1d5f9e`, soft fills at 9–10%; `claude #c6613f`; `scrim rgba(40,36,28,.30)`; `shadow-card 0 4px 14px rgba(40,30,10,.08)`; `shadow-pop 0 20px 56px rgba(40,30,10,.16), 0 2px 10px rgba(40,30,10,.10)`.
+Diff: `add-bg rgba(18,170,115,.10)`, `add-gut .18`, `add-word .26`; `del-bg rgba(225,45,70,.075)`, `del-gut .15`, `del-word .22`; `hunk rgba(29,95,158,.06)`.
+Syntax: `k #6236d6`, `f #8a4f00`, `s #0d7553`, `n #b4521b`, `t #0b6687`, `p #9a2694`, `c #67645d`.
+The light danger fill is `#b42a2a` (white text).
+
+### 1.3 Typography
+
+- **UI:** Geist (bundled, OFL), fallback Segoe UI Variable / system-ui. 13px/18px body; 12px/16px secondary; 11px/14px counts, tags, keycaps and overlines; 500 for controls and names, 600 for titles; only 400/500/600 are loaded.
+- **Overline** (`over`): 11px/14px, 500, letter-spacing .08em, uppercase, `fg3`. Section labels in the sidebar, facts margin and month groups.
+- **Reading:** transcript prose 15px/24px; markdown inside nested panels and tool results 13px/20px; `h2` 17px/24px 600; `h3` 14px/20px 600; inline code 12.5px on `s3`, radius 4.
+- **Code:** JetBrains Mono (bundled), 12px on 19–20px rows; line numbers `fg3`, tabular, right-aligned in a 30–36px gutter. Numbers in the UI (counts, dates, sizes) use Geist Mono with tabular figures.
+- **Headings:** page title (folder, Unsorted, Trash, All sessions) 24px/30px 600; first-run and edge-state titles 22px/28px 600; sheet and dialog titles 15–16px 600; settings section 17px/24px 600.
+
+### 1.4 Shape and space
+
+Spacing scale 4 / 6 / 8 / 12 / 16 / 24 / 32. Radii: 4 (tags, keycaps, inline code), 5–6 (buttons, menu items, activity rows, call bodies), 7 (inputs, segmented control), 8 (sidebar rows, menus, code blocks, banners, tables), 10 (cards, popovers, path groups), 12 (sheets, dialogs, empty drop area), 14 (page-header icon tile), 999 (chips).
+
+Heights: title bar 40; reader header 44; sidebar row 32 (location rows 40, a syncing one 48); control 28, small control 24, segment 22; input 30, filter field 26; activity row 26 (24 nested, 22 inside a subagent summary); list row 34; Trash row 52; menu item 28; path editor row 40; code rows 19–20.
+
+Widths: sidebar 248; facts margin 268; reading column max 720 (32 side padding); session card ¼ of the content row less the 12 gap, min 200; title-bar search field 460; locations sheet 1200 × 790 (list 540); dialogs 440–540; palette 840.
+
+### 1.5 Icons
+
+Inline stroke icons at 12/14/16/18px, stroke 1.6, round caps and joins, `currentColor`, Lucide geometry bundled as SVG paths. No emoji anywhere. The set used: folder, folder-plus, folder-input (move), inbox, star, layers (All sessions), trash, rotate-ccw (restore), search, chevrons, arrow-left (back), terminal (Bash), file-text (Read), file-plus (Write), file-x (gone, damaged), file-search (Glob), pen (Edit), list-todo, bot (agent), lightbulb (thinking), image, globe (web), plug (MCP), puzzle (unknown tool), fold-vertical (compaction), refresh (sync), history (versions), monitor (Local), box (WSL), laptop (SSH), plus, ellipsis, git-branch, link (paths), filter, grid, list, triangle-alert, circle-alert, check, circle-check, copy, play, pause, clock, sun, keyboard, archive, ban (deleted for good), message (search result), calendar, external-link, grip-vertical (drag handle), eye, shield-check (verify), hard-drive, settings (gear).
+
+**Tool kinds are told apart by icon and name, never by colour.** No view colour-codes tool kinds (the gutter and kind-mix bar of concept B are dropped for good).
+
+**Agent and model marks.** A session shows its agent's mark beside its model wherever the model appears (§4.2.10, §4.4, §4.5, §4.9). Claude Code's sessions show the Claude mark in `claude`; each later agent (opencode, pi) brings its own one-colour mark, falling back to `bot` in `fg3`. As an avatar the mark sits on its colour at 14–16%.
+
+---
+
+## 2. Layout
+
+```
+┌ title bar (chrome, 40) ───────────────────────────────────────────────────────────────────┐
+│ ▤ scrollback        [ Search titles, prompts, replies and commands   Ctrl K ]   ⟳ Sync all  ⚙  – □ × │
+├ sidebar 248 (bg-side) ┬ main area (bg-app) ─────────────────────────────────────────────────┤
+│ All sessions   2,318  │ folder page | Unsorted | Trash | Settings | reader                  │
+│ Starred           14  │                                                                     │
+│ Unsorted          37  │ reader:                                                             │
+│ Trash              3  │ ┌ header 44: ← fc › title ☆ ↑↓ 4 of 488   [Find  Ctrl F] Activity|Full calls ┐
+│ FOLDERS            +  │ │ reading column (max 720, centred)           │ facts margin 268   │
+│ ▸ dv             612  │ │                                             │ Session · Turns ·  │
+│ ▾ fc             488  │ │                                             │ Calls              │
+│   │ player        41  │ └─────────────────────────────────────────────┴────────────────────┘
+│ …                     │                                                                     │
+│ LOCATIONS          ⟳  │                                                                     │
+│ ▭ This PC        ●    │                                                                     │
+│ ▢ Ubuntu-24.04  ▬▬    │                                                                     │
+│ ▱ user@macbook   ○    │                                                                     │
+└───────────────────────┴─────────────────────────────────────────────────────────────────────┘
+```
+
+- **Two regions only:** the sidebar and the main area. No status bar: sync state is in the sidebar foot. No session-list column: lists are pages in the main area.
+- **Title bar:** the mark (an 18px `accent` tile with three `accent-ink` bars at 100/70/45%) and "scrollback" at 600; the search field centred on the window (a button that opens the palette, §4.9); Sync all (small button); Settings (gear, ghost icon button); the caption buttons, 46 wide and the bar's height, Close red on hover (Windows). On macOS the traffic lights sit at the left in a transparent titlebar and the mark moves right past them. A drag on the bar moves the window; a double-click maximizes or restores it.
+- **Main area pages** (folder page, All sessions, Starred, Unsorted, Trash, Settings) have 20px top and 24px side padding, a header, then a scroll area. The page header and filter row stay put; only the content under them scrolls.
+- **The reader** fills the main area: its 44px header, then the reading column (scrolls) and the facts margin (fixed; its Turns list scrolls on its own).
+- **Minimum window size** 960 × 600.
+- **Narrow windows:** below 1280px the facts margin collapses; a **Facts** toggle (panel-right icon) appears in the reader header and shows the margin as an overlay on the right edge, over the reading column, with `shadow-pop`, closed by `Esc` or a click outside. Below 1040px the sidebar collapses too: a sidebar button appears left of the mark and `Ctrl B` toggles it; it opens as an overlay over the main area, and picking a row closes it. Session cards drop from four columns to three, then two, keeping the 200 minimum. List-view columns drop in the order Branch, Location, Folder; Title never truncates below 240.
+- **Overlays:** sheets (locations), dialogs and the palette sit over `scrim`, which covers everything below the title bar, and are closed by `Esc` or a click on the scrim. Popovers (versions) and menus have no scrim and close on `Esc` or a click outside.
+
+---
+
+## 3. Materials
+
+Light and dark follow the siblings through `gpui_appearance` (PLAN D13): **System** follows the OS, **Light** and **Dark** force a mode. The window material follows the siblings too:
+
+| Platform | Choices | Default |
+|---|---|---|
+| Windows 11 | Mica, Acrylic, None | Mica |
+| Windows 10 | None | None |
+| macOS | Vibrancy, None | None |
+
+| Surface | Mica / Acrylic / Vibrancy | None (Opaque) |
+|---|---|---|
+| Window background | the OS material | `bg-app` solid |
+| Title bar | `chrome` at 82% (Mica) / 60% (Acrylic, Vibrancy) | solid |
+| Sidebar | `bg-side` at 76% / 50% | solid |
+| Main area, reading column, facts margin | solid: reading never sits on a material | solid |
+| Code, call bodies, cards, inputs | solid | solid |
+| Sheets, dialogs, palette | `s2` solid over `scrim`; no blur | same |
+| Popovers, menus | `s2` solid | same |
+
+GPUI blurs only what is behind the window, so in-app overlays never frost app content; there is no backdrop blur anywhere. **None** is chosen automatically where the OS offers no material, with system transparency off, or with Reduce transparency on, and must look finished in its own right. `fg3` on the translucent sidebar over a contrasting desktop is unverified (§6). The window's inactive appearance is the OS's; scrollback dims nothing itself.
+
+---
+
+## 4. Screens
+
+### 4.1 Shell: title bar and sidebar (every board)
+
+- **Search field** (title bar): `field` style, 460 wide, search glyph, "Search titles, prompts, replies and commands", `Ctrl K` keycap. A click or `Ctrl K` opens the palette (§4.9). On the first-run screen and while the archive is unavailable it is hidden.
+- **Sync all** syncs every location (PLAN §5); while any pass runs its glyph spins and it reads "Syncing…", a second click does nothing. **Settings** (gear) opens Settings in the main area (§4.13).
+- **Sidebar, top to bottom:** library rows **All sessions**, **Starred**, **Unsorted** (its count in `accent-text` while it is above zero), **Trash**, each with a count right-aligned in Geist Mono 11px `fg3`; the **Folders** overline with a New folder `+` (22 square); the folder tree; a spacer; a hairline; the **Locations** overline with a Sync all glyph; one row per location.
+- **Rows:** 32 high, radius 8, icon `fg3`, name `fg2`. Hover: `s2`. Selected (the page shown, or the folder of the session being read): `s3`, name `fg` at 500, icon `fg2`. Folder rows indent 18 per level with a 1px `line` guide, a 12px chevron for a folder with children (a click on the chevron opens or closes it without selecting).
+- **Folder tree drag and drop** (folio's tree is the precedent, PLAN §11): drag a folder onto another to nest it, between rows to reorder (a 2px `accent` insertion line, indented to the level it lands at). Hovering a closed folder for 500 ms opens it. A row that would take the drop is the **drop target**: `accent-soft` fill, 1px inset `accent` ring, icon and count in `accent-text`. A folder can't be dropped into itself or its descendants (no target shows). The ghost is a pre-rendered row (GPUI can't rotate a div): `s2`, `line` border, radius 8, `shadow` `0 14px 30px rgba(0,0,0,.30)`, grip glyph, the dragged item's name, "→", the result in `accent-text`, and a `fg3` note on what it does ("files by hand", "attach to scrollback · files 3 sessions").
+- **What drops on a folder row:** a session (card, list row, reader header title): files it there by hand. A path chip from Unsorted or a folder page: attaches the path. A folder: nests it. Trash takes sessions (moves them to Trash). Unsorted takes a session filed by hand only through **File automatically** (§4.4), never by drop.
+- **Folder row menu** (right-click or `⋯` on hover): Open, New subfolder, Rename (`F2`, in place), Edit paths… (opens its folder page with the path editor open, §4.7), Delete folder… (a dialog: "Delete *fc*? Its 447 sessions go to Unsorted and are filed again by the rules; its subfolders move up to its parent. Nothing is deleted from the archive.").
+- **Location rows** (foot): 40 high, kind icon (monitor Local, box WSL, laptop SSH), name at 500 `fg2` 12px, a second line 11px: "Local · synced 2 min ago" (`fg3`, `green` dot), "WSL · 41 of 96 MB" with a 4px `accent` bar and "38 / 212 files" in `accent-text` (48 high), "SSH · last sync 12 days ago" in `yellow` with an alert glyph and an outlined dot when unreachable and stale, "SSH · failed · host key changed" in `red` with an alert-circle glyph. Any location row, or the overline's area, opens the locations sheet with that location selected (§4.11). A location with more than one agent reads its sync state for all of them in one row.
+- **Focus order:** title bar (search, Sync all, Settings, caption buttons), sidebar top to bottom, then the main area. `Ctrl B` or `F6` moves focus between the sidebar and the main area.
+
+### 4.2 Reader (`E-Reader`, `E-Reader-Calls-1`, `E-Reader-Calls-2`, `E-Reader-Subagent`)
+
+#### 4.2.1 Header (44)
+Back (arrow, to the page the session was opened from, `Alt ←`); the breadcrumb: the folder (or Unsorted, Starred, All sessions, Trash) in `fg3`, a chevron, the title at 600 truncating at its end; Star (a toggle, `yellow` filled when on, `S`); previous / next session in the page it was opened from (`K` / `J`) and "4 of 488" in `fg3`; a spacer; the **Find** field (240, `Ctrl F`, §4.2.9); the **Activity | Full calls** segmented control (`E` toggles). The choice is remembered for the app, not per session. Below 1280 the Facts toggle joins the end (§2).
+
+#### 4.2.2 Reading column
+Max 720, centred, 28 top padding, 16 between blocks. Turns separated by a hairline. The column scrolls; the header and the facts margin don't. The list is virtualised (PLAN §9): collapsed activity rows have a fixed height, so a session with hundreds of calls has a known height. Opening a session shows the first turns from the index's offsets at once and fills in as parsing proceeds; while a later part is still parsing, its place holds skeleton rows (`s1` bars, 26 high) rather than a spinner.
+
+- **You:** "You" at 600 `fg`, the time in `fg3` tabular, a Copy message button (22 square, shown on hover of the message and while focused). The prompt is rendered markdown at 15/24. Attached images follow as thumbnails (`shot`, 200 × 116, caption with the file name), a click opens the image full size in an overlay.
+- **Assistant:** the agent mark, the model at 600, the time. Markdown fully rendered (FEATURES Reader): headings, lists, task lists, tables (`tbl`: `line` border, radius 8, header row on `s1` at 600 12px), block quotes, links in `accent-text` underlined at `accent-soft`, inline code, fenced code (`codeblk`: `code` fill, 28px `codehead` header with the language in mono 11px `fg3` and a Copy button at its right). Copy message on hover, as for You.
+- **Selection:** text selects across blocks; `Ctrl C` copies it as plain text.
+
+#### 4.2.3 Activity rows
+One per tool call, 26 high, radius 6, full width less 8 each side: kind icon (14, `fg3`), the tool's name as its agent calls it, in mono 500 `fg` (44 wide; for Claude Code: `bash`, `read`, `edit`, `write`, `grep`, `glob`, `todos`, `agent`, `search`, `fetch`, `mcp`; `unknown` for a tool its provider doesn't map). The icon and the renderer come from the tool's kind (PLAN §7.4), which is common to all agents; only the name is the agent's. the target in mono `fg2` truncating at its end, optional status chip (`exit 101` bad, `4 passed` ok), the short result in Geist Mono 11px `fg3` ("5 matches · 0.1s", "+12 −5" in `green` / `red`, "37 lines", "Haiku 4.5 · 9 calls · 41s"), and a chevron (right when closed, down when open). Consecutive calls sit 1px apart in a group. Hover: `s1`; open: `s1`. A click or `Enter` on a focused row expands it in place: its body hangs under it, indented 30 (past the icon), and the rows below move down. Output loads when a row is first expanded (PLAN §9); until it arrives the body shows a skeleton of three lines. **Full calls** expands every row; collapsing one by hand in Full calls collapses only that one until the switch is flipped again.
+
+A todos row shows the in-progress item and "1 of 4 done" in place of a target; an agent row shows the subagent's type and description.
+
+#### 4.2.4 Tool renderers
+Every body is a **call body** (`callbody`): `code` fill, `line-subtle` border, radius 6, optional **call header** (`callhd`, 26, `codehead`, 11px `fg3`, a Copy button at its right) and **call footer** (`callfoot`, 24, 11px `fg3`). Long bodies show their first 20 lines and "Show all" in the footer; a body never scrolls on its own inside the transcript.
+
+- **Bash:** header `$ <cd and command>` in mono with Copy command; output 12/19 mono `fg2`, ANSI colours mapped to `green` / `red` / `yellow` / `blue`; footer: exit status (`red` when not 0), duration, line count, Copy output.
+- **Read:** header: the absolute path and "lines 28–44 of 188"; content with line numbers, syntax-highlighted by the file's extension; footer "+n more lines · Show all". A Read of an image renders the image (below).
+- **Edit:** dv's diff rows (PLAN §9, D15): hunk header on `hunk` in `blue`, rows 20 high with a 36px line number gutter and a 16px `+`/`−` marker on the gutter fill, word-level `add-word` / `del-word` marks, syntax highlighting over the diff fills. Unified only; the reading column is too narrow for split.
+- **Write:** the same diff, every line added, "new file · 9 lines" as the short result; after 6 lines a `hunk` row "··· n more lines".
+- **Grep:** header: pattern, path, mode, separated by `·`; matches grouped by file (the file in `fg`, each line with its number), the matching text in `hl`.
+- **Glob:** the pattern as the target; body: one path per line.
+- **Todos:** on `s1`: one 24px row per item with a 14px checkbox: done (filled `accent`, check, text struck through in `fg3`), in progress (`accent` outline with a 6px `accent` square), open (`fg3` outline).
+- **Web search:** on `s1`: one entry per result, the title in `accent-text`, the domain and path in mono 11px `fg3`; "+5 more results".
+- **Web fetch:** header "prompt" with the prompt given; the result as rendered markdown at 13/20.
+- **MCP:** header: the full tool name in mono (`mcp__github__search_issues`) and "server github"; body: input and output side by side, each pretty-printed JSON with keys in `p`, strings `s`, numbers `n`, literals `k`, labelled "input" / "output" in `fg3`. Below 560px of column width they stack.
+- **Unknown tool:** header "Tool scrollback doesn't know yet, shown as sent and received"; input and output as one-line JSON each, wrapping (D5: nothing is dropped).
+- **Image a tool returned:** on `s1` with 10 padding: the image fitted to the column width, at most 320 high, and a caption (image glyph, name, "returned by Read", pixel size, file size, "Open full size").
+
+#### 4.2.5 Thinking
+Collapsed: one 22px row: lightbulb glyph, "Thought for 14s ·" and the start of the thought in italic 12.5 `fg2`, truncated. Expanded (a click; Full calls expands it too): "Thought for 22s" at 500 and a down chevron, the text below in italic 13/20 `fg2`, indented 22.
+
+#### 4.2.6 Compaction boundary
+A row across the column: `line` rules either side, fold glyph, "Context compacted at 15:02 · 171k → 24k tokens" in 12px `fg3`, and **Show summary** in `accent-text`, which expands the summary the agent was given as markdown below the row.
+
+#### 4.2.7 Subagents
+An `agent` activity row whose body is the **nested panel** (`nest`): `bg-panel`, `line-subtle` border, radius 8, 10/12 padding. Collapsed (Activity mode default), the panel shows up to three of the subagent's calls as 22px rows and its final reply at 12/19. Expanded (a click on the row, Full calls, or a search match inside it, §4.9): a meta line ("subagent" tag, start time, model, call count, duration, tokens; an **Open on its own** button that shows the subagent's transcript as the reader's whole column with a breadcrumb back to the parent call); the task it was given in a `userbox` titled "Task from Opus 5.5"; its calls as 24px activity rows that expand like the parent's; "Show 19 more calls" after the first five; its reply as markdown. Nesting inside a nested panel indents again, at most three levels drawn; deeper levels show only "Open on its own".
+
+#### 4.2.8 Facts margin
+268 wide, `bg-panel`, 18/16 padding, a left hairline. Three blocks separated by hairlines:
+- **Session** (`kv` rows, label column 128 in `fg3`): From (the location tag), Path (mono 11.5), Branch (git-branch glyph), Agent (mark and name; §6), Models, When (date and duration), Tokens (in · out), Version ("v3 of 3", or "v2 of 4 · older" in `yellow`, and **History**, §4.3), Source (only when gone, §4.14). Each value can be selected and copied.
+- **Turns** ("Turns · 38"): one row per prompt: the turn number (on long sessions), the time, the start of the prompt truncated. The current turn (the one at the top of the reading column) on `s3` in `fg`; the others `fg2`. A click scrolls the column to that turn. On a session whose turns don't fit, the list scrolls on its own and keeps the current turn in view; `[` / `]` move to the previous / next turn. While Find is active, each turn with matches shows a `warn` chip with its count, and the header says "14 matches in 5". This list is what replaces concept B's gutter; there is no other scrubber or minimap.
+- **Calls:** one row per kind with its icon and count (Bash, Read, Grep / Glob, Edit / Write, Agents, Todos, Web, MCP, Other); a click filters nothing (hiding by kind is later, FEATURES Later).
+
+#### 4.2.9 Find in session (`E-Reader-Subagent`)
+`Ctrl F` focuses the header's find field and selects its text; it gains the accent focus ring and widens to 300. Typing searches the parsed session (PLAN §9), subagents and collapsed bodies included: a match inside a collapsed row or panel expands it. The field shows "3 of 14"; `Enter` / `Shift Enter` and the up / down buttons step and wrap, scrolling the match into view; the current match is `hl.cur`, the others `hl`. `Esc` (or the close button) closes it and clears the highlights. With no match the count reads "No matches" in `fg3` and the field keeps its ring.
+
+#### 4.2.10 Agent
+Wherever a model shows (assistant header, facts, cards, list rows, search results), the agent's mark comes first. With one agent in the archive nothing else changes; with more than one, cards and list rows read "Claude Code · Opus 5.5" and the facts gain the Agent row.
+
+### 4.3 Versions (`E-Versions`)
+- **History popover:** from Version › History in the facts margin, anchored under it to the right edge (440 wide, `pop`, no scrim). Header "History", "main transcript · 4 versions", Close; a line on the rule ("A sync never overwrites. Appends extend a version; any other change to the source starts a new one."). One block per version, newest first: number at 500, state chip, date right-aligned, then why it started (first sync, source rewritten, source shrank, replaced), lines, size and "extended by n syncs", then its actions.
+  - **Held back** (`yellow-soft` block, alert glyph, `held back` warn chip): why ("Source shrank: 402 lines, down from 1,522 in v3"), **Read v4**, **Make v4 the reading copy**.
+  - **Reading copy** (check in `accent-text`, `reading copy` accent chip): **Read v3**.
+  - **Viewing** (the one shown, when not the reading copy; `s3` block, eye glyph, `viewing` chip): **Make v2 the reading copy**.
+  - Others: **Read vN**.
+  - Footer on `s1`: "Subagent transcripts and tool results have their own versions, listed with each call." The number in the header and facts is the main transcript's (decision 8); a call body whose file has more than one version shows "v2 of 2" in its footer with its own History.
+- **Reading an older version:** a `warn` banner across the top of the reading column (12/20 margin): history glyph, "Reading v2 of 4, synced 8 Nov at 23:10. This is an older version. The reading copy is v3.", **Back to the reading copy**, **Make v2 the reading copy**. The facts' Version reads "v2 of 4 · older" in `yellow`. The banner stays at the top while the column scrolls under it.
+- A held-back version also marks its session's card and list row with a `held back` warn chip, so it is found without opening the session.
+
+### 4.4 Folder page (`E-Folder`, `E-Edge-Empty-Folder`)
+- **Header:** a 56px icon tile (`accent-soft`, folder glyph 26 at 1.4 stroke), the name at 24/600 (double-click renames in place), stats in a row: sessions, tool calls, span ("Nov 2025 – Nov 2026"), locations, each a 18px Geist Mono value over a 12px `fg3` label; a folder actions button (`⋯`, bordered: Rename, New subfolder, Edit paths, Delete folder…). Counts include subfolders (decision 1).
+- **Paths line:** link glyph, "Project paths", one read-only chip per attached path (28 high: a location tag or "any location", the path in mono 12 `fg`, the count in `fg3`), **Edit paths** (ghost small button, opens §4.7), and at the right a `fg3` note when a subfolder claims a path under one of these first. A chip can be dragged onto another folder in the sidebar to move the path there (the editor's refusal rules apply, §4.7).
+- **Filter row** (stays put): filter field (220, "Filter in fc"; filters by title and first prompt as you type), the result count ("All 488", or "126 of 488" once filtered), filter chips **Agent**, **Model**, **Branch**, **Location**, **Date** (each a menu; once set, an `accent` chip "Model: Opus 5.5 ×" whose × clears it), **Starred** (a toggle chip), **Clear filters** (ghost, while any is set); then sort (**Newest first** / **Oldest first**) and the view switch (cards / list, icon segments). The filters and view are remembered per folder.
+- **Cards** grouped by month (overline "November 2026"), 12 gap, four per row at 1440. A card (`scard`: `s1`, `line-subtle` border, radius 10, 12/14 padding): title at 600 (the open target, a link), a `yellow` star when starred, the start of the first prompt in two lines of 12px `fg2`, then agent mark, model, location tag, and right-aligned "12 Nov · 68 calls". A session from a subfolder carries the subfolder's name as a `tag` after the location (decision 1). Cards carry no kind-mix bar.
+- **Hover** (`scard.hover`: `line-strong` border, `shadow-card`): the hover bar at the top-right corner (`s2`, radius 7, 26-square buttons): Star, Move to folder (the folder menu of §4.5), Move to Trash, More (the session menu, §4.5). The same actions come from right-click and, for the focused card, the keys.
+- **Drag a card:** after 4px of movement the card stays in place dashed and dimmed to 45% (`scard.lifted`) and the ghost follows the pointer (§4.1). Dropping on a folder files the session there by hand; dropping on Trash trashes it; anywhere else cancels and the card returns. Multi-select with `Ctrl` / `Shift`-click drags all selected; the ghost reads "3 sessions".
+- **Keyboard:** arrow keys move focus between cards in reading order, `Enter` opens, `S` stars, `Delete` moves to Trash, `M` opens Move to folder, `Ctrl A` selects all shown.
+- **What scrolls:** the cards area under the filter row; the month overline sticks at its top while its cards scroll.
+- **Empty folder** (`E-Edge-Empty-Folder`): stats "0", "—"; the path editor open by default (§4.7) with a **Suggested from Unsorted** row on `accent-soft` when an Unsorted path's last component matches the folder's name ("/Users/user/code/blog · 6 sessions · Attach", primary); below, a dashed `line-strong` drop area (radius 12) with the folder glyph, "Nothing in blog yet" at 15/600 and "Attach a project path above and its sessions file here now and after every sync. Or drag sessions here from any folder; sessions you place by hand stay put." The whole area is a drop target for sessions (it takes the drop-target style).
+- **Filtered to nothing:** in place of the cards, "No sessions match these filters" and **Clear filters**.
+- **File automatically** (decision 2): a session filed by hand shows a small hand glyph after its date (tooltip "Filed by hand") and its menus gain **File automatically**, which clears the mark and files it by the rules at once; it may move to another folder or to Unsorted, and a toast says where ("Filed in fc › player by its path · Undo").
+
+### 4.5 List view and All sessions (`E-All-Sessions`)
+- **The list view** is the folder page's other view; **All sessions** and **Starred** are pages of the same component with every folder's sessions and a **Folder** column. Their header has the layers / star tile and the archive's stats; they have no paths line.
+- **Columns:** star (16), Title (at 500 `fg`, followed by the first prompt's start in `fg3` on the same line, truncating), Folder (folder glyph and name, 120; the folder page itself shows it only for subfolder sessions), Agent · Model (96), Location tag (104), Branch (mono 11, 120), Date (64, the sorted column's header in `fg` with a chevron; a click on Date flips the order), Calls (44, right-aligned). Header row 30 on `s1`, 11px 500 `fg3`. Month group rows (30, overline "October 2026 · 52") as in cards.
+- **Rows** 34 high, `line-subtle` separators; hover `s1`; selected or focused `s3`. `↑` / `↓` move, `Enter` opens, `Shift` / `Ctrl`-click selects several; selected rows drag together (ghost "3 sessions").
+- **Session menu** (right-click, `⋯`, `Shift F10`), 230 wide: Open (`Enter`), Star (`S`), **Move to folder ›**, Copy project path, History…, File automatically (only when filed by hand), a separator, **Move to Trash** (`Delete`, `red`). The **Move to folder** submenu (220): a header saying how it is filed now ("Filed in fc by its path" / "Filed in fc by hand"), the folder tree as radio items (current one checked, subfolders indented 26), a separator, New folder… (creates it and moves the session into it).
+- **Filters applied** show as `accent` chips with ×; the count reads "126 of 2,318".
+- The list is virtualised; a few thousand rows scroll at the display's rate.
+
+### 4.6 Unsorted (`E-Unsorted`)
+A full page (E has no list column). Header: inbox tile, "Unsorted", and "37 sessions whose project path no folder claims, grouped by that path. Attach a path to a folder and these sessions, and every later one from the same path, file themselves there." Filter row: filter field, "6 paths · 37 sessions", Location and Agent filters, sort (**Most sessions first** / **Newest first** / **Path**).
+- **One group per project path and location:** a bordered section (radius 10). Its 44px head on `s1`: a disclosure button, the **path chip** (28, grip glyph, location tag, path in mono 12 `fg`, cursor grab), "14 sessions" in `fg3`, then **Create folder from this path** (folder-plus) and **Attach to folder ▾** (link; a menu of folders). Below, the group's sessions as list rows (title and prompt start, agent mark and model, date, calls). Groups with more than five sessions show five and "Show all 14".
+- **Paths that are the same project** (`/mnt/d/Projects/fc` from WSL and `D:\Projects\fc`) form one group, its chip showing the drive form and "also as /mnt/d/Projects/fc" in `fg3`.
+- **Create folder from this path** creates a top-level folder named after the path's last component (`advent-2025`), attaches the path limited to the group's location, files the group, and starts renaming the new folder in the sidebar.
+- **Drag a path chip** onto a sidebar folder: the chip stays dashed at 50%, the group's rows dim to 45%, the ghost reads "Ubuntu-24.04 /home/user/code/scrollback-spike → attach to scrollback · files 3 sessions". Dropping attaches the path to that folder limited to the chip's location; the group leaves Unsorted with a toast ("Attached to scrollback · 3 sessions filed · Undo"). A folder that already has a path for that location scope refuses (no drop target; the ghost says "already attached to fc").
+- **Drag a session row** onto a folder files it by hand, as on a folder page.
+- **Empty Unsorted:** "Everything is filed." in `fg2`, centred.
+
+### 4.7 Folder paths editor (`E-Folder-Paths`)
+Paths are edited **in place on the folder page**, never in a sidebar popover: the paths line (§4.4) becomes the editor card. **Edit paths**, the folder menu's Edit paths… and an empty folder open it.
+- **Card** (`s1`, `line` border, radius 10): "Project paths" at 600 and "Sessions that started under one of these file themselves into fc. The longest matching path wins, so subfolders claim first."
+- **Table** (bordered, radius 8): header (Location, Path, Sessions); one 40px row per path: grip (drag to reorder; order is cosmetic), the **location scope** button (a tag, "any location" or one location, with a chevron; a menu of "Any location" and each location by name), the path in mono, a note in `fg3` (an equivalence: "22 of them from Ubuntu-24.04 as /mnt/d/Projects/fc"), the count of sessions it matches, Remove (×).
+- **Pending changes** show before Save: an added path on `accent-soft` with its path in `accent-text`, "+3 from Unsorted" as its count and **Undo**; a removed path struck through with "−12 to Unsorted" and Undo.
+- **Add row** on `s1`: scope button, a path input (mono, with a + glyph) that completes from paths any location has seen (a dropdown under it, each with its location and session count), **Add** (disabled while empty or refused).
+- **Refused duplicate:** the input in its `bad` style, Add disabled, and under it in `red`: "Already attached to fc › player. A path belongs to one folder; remove it there first." The folder name is a link to that folder's editor. A path equal to one already on this folder (or its drive form) reads "Already here as D:\Projects\fc".
+- **Suggested from Unsorted:** up to five Unsorted paths whose last component starts with the folder's name or whose path is under one of its paths, each with **Add**, its location tag, path and count.
+- **Footer** on `s1`: what Save will do in one line ("Saving files 3 sessions from Unsorted into fc. Sessions you filed by hand stay where they are."), **Cancel**, **Save paths** (primary). `Ctrl Enter` saves, `Esc` cancels; leaving the page with pending changes asks "Save the path changes to fc?".
+- Below the card the page goes on (filters and cards), so the result of a change can be seen.
+
+### 4.8 Trash and deleting for good (`E-Trash`)
+- **Page:** trash tile, "Trash", "3 sessions · 9.8 MB. They are hidden everywhere else but still archived, and syncs keep adding to them. Restore puts a session back in its folder. Trash is never emptied on its own." A bordered table: header (Session, Was in, Location, Moved here, Size); rows 52 high: title at 500 over the prompt's start in `fg3`, the folder it was in, the location tag, the date, the size, **Restore** and **Delete for good…** (small, `red` text). Under the table a `fg3` note: "Deleting for good removes a session from this archive only. Nothing is ever deleted at a location."
+- **Restore** puts the session back where it was; when that folder no longer exists it goes to Unsorted and the rules file it (decision 10). A toast confirms with Undo.
+- **Confirmation** (`alertdialog`, 540, over `scrim`): a 32px `red-soft` tile with the trash glyph and the title "Delete “Try tree-sitter-bash for command parsing” for good?"; "This removes the session from the archive: its 3 files, 2 versions and 2.4 MB. It can't be restored."; "The session still exists on Ubuntu-24.04. **Nothing is deleted there.** Later syncs will skip it, so it won't come back; you can allow it again in Settings › Archive." (when the session is gone at its location, the second paragraph reads "It is no longer on Ubuntu-24.04 either, so this removes the last copy."); a `s1` box with the project path, model, date and calls. Footer: **Cancel** (focused first) and **Delete for good** (`danger-fill`, the app's only filled red). `Enter` does not confirm; the button must be clicked or reached with `Tab`.
+- **Empty Trash:** "Trash is empty." centred.
+
+### 4.9 Search palette (`E-Search`)
+- **Opens** with `Ctrl K` or a click on the title-bar field: an 840-wide panel 64 from the top, centred, over `scrim`, `pop` style, max 760 high.
+- **Query** (16px, 32 high, search glyph, `Esc` keycap). Under it, **filter tokens:** applied filters as `accent` chips with × (Folder, Location), offered ones as menus (Agent, Model, Branch, Date); the scope defaults to the page it was opened from (a folder page adds Folder: fc). Typing `in:`, `from:`, `model:`, `agent:`, `branch:`, `after:` / `before:` and a value turns into a chip; `Tab` adds the highlighted completion as a filter; `Backspace` on an empty query removes the last chip. At the right, "11 matches in 4 sessions".
+- **Results** grouped by session, best first: a 28px session row (message glyph, title at 500, folder, location tag, date, "5 matches"), then its matches, indented 34: a 76px kind column (glyph and "prompt", "reply", "command", "path", "title", "subagent"), the matching text with each hit in `hl` (mono for commands and paths), "turn 2" right-aligned. Up to four matches per session, then "+n more in this session".
+- **Commands** match too (PLAN §11): when the query matches an action's name ("sync", "trash", "settings"), a **Commands** group heads the results, each with its key.
+- **Keys:** `↑` / `↓` move over session rows and matches (wrapping); `Enter` opens the session at the highlighted match's turn with the match flashed (`hl.cur` for a second) and Find pre-filled with the query; on a session row, at its first match. A match inside a subagent opens the parent session at that call, expanded (decision 9). `Ctrl Enter` opens the session's folder page instead. `Esc` closes.
+- **Footer** on `s1`: keycaps for move, open at the match, add a filter; and "Searches titles, prompts, replies, and tool calls' commands and paths. Tool output isn't searched."
+- **States:** empty query: recent sessions opened, then recent searches. Searching: results stream in under a 2px `accent` bar at the top of the list. Nothing found: "No matches in fc. Search everywhere" (a button that drops the Folder chip). While the index is being rebuilt (PLAN §7.5): a `info` banner "Still indexing 412 sessions; results may be missing".
+
+### 4.10 First run (`E-First-Run`)
+- The shell with an empty sidebar: library rows disabled at 55% with counts 0, "Folders come after the first sync.", "None yet" under Locations. Title bar without search, Sync all or Settings.
+- **Column** (660, 56 from the top, centred): "Add your first location" at 22/600; the paragraph on what scrollback does; **Found on this PC:** a bordered list of checkbox rows (12/14 padding): This PC (Local, the transcript root in mono, "418 sessions"), each running WSL distro ("running · default", root, session count), each stopped distro (unchecked, name in `fg2`, "stopped", "Not started to look inside. If you add it, its first sync starts it.", "not counted"). Checked by default: This PC and running distros. With several agents found at one location, the row lists them ("Claude Code · 418 sessions, opencode · 12 sessions").
+- **Another machine:** a dashed row button "Add an SSH host…" that opens §4.12's SSH step as a dialog; an added host joins the list above, checked.
+- **Footer:** archive glyph and "The archive goes in scrollback's data folder, `C:\Users\user\AppData\Local\scrollback\archive`. Settings can point it somewhere else later." (the platform's data folder; `/Users/user/Library/Application Support/scrollback/archive` on macOS); the primary button counts what is checked ("Add 2 locations and sync"; disabled with none). There is no archive picker and no Skip.
+- After it: the first-sync state (§4.14).
+- **On macOS** there is no WSL section; Found on this Mac lists This Mac only.
+
+### 4.11 Locations sheet (`E-Locations`, `E-Locations-Failed`)
+- **Opens** from any sidebar location row or `Ctrl L`: 1200 × 790 over `scrim`, radius 12. Header: "Locations", "scrollback copies transcripts from these into its archive and reads only the copies. Nothing is ever written or deleted at a location.", **Sync all**, Close. Fixed copy never names an agent (PLAN §11); where an agent is named, as in the stale banner below, the name comes from its provider.
+- **List** (540, scrolls): a stale banner on top when any location is stale; one row per location (32px kind tile: Local `accent-soft`, WSL `blue-soft`, SSH `s1`; name at 600 and kind tag; the transcript root in mono 11 `fg3`; the state; an action at the right). The selected row is on `s3` and fills the detail pane. Then **Found on this PC, not added** (discovered WSL distros), then **Add location ▾** (This PC · WSL distro · SSH host).
+- **States**, each with its action:
+  - **Synced:** `green` dot, "Synced 2 min ago · 418 sessions". **Sync now**.
+  - **Syncing:** a 4px `accent` bar and "Syncing · 38 of 212 files · 41.2 of 96.0 MB" in `accent-text`. **Stop** (keeps everything committed, PLAN §5).
+  - **Unreachable** (normal, not an error): outlined dot, "Not reachable since 13 Nov · asleep or off the network", "Last good sync 3 Nov, 22:40 · 486 sessions archived". **Retry**.
+  - **Failed:** `red` alert-circle and "Failed ·" with the tool's last line ("Host key verification failed."). **Retry**.
+  - **Stale** (adds to any state): a `warn` chip "Stale · 12 days without a sync".
+  - **Never synced** (just added, stopped distro): "Not synced yet · starts Debian on first sync". **Sync now**.
+- **Stale banner** (`warn`): "user@macbook hasn't synced for 12 days. Claude Code there deletes transcripts after 30 days, so sessions written since the last sync start expiring around 3 Dec. Wake the Mac and sync it before then." The deadline is the last good sync plus the cleanup period last read from that location (decision 11).
+- **Found, not added:** a stopped `Debian` with "Listed without starting it. Adding it doesn't start it either; its first sync will." and **Add** (decision 6).
+- **Detail pane**, SSH: kind icon, name, tag; **Name** input (display name; renames on blur); **Host** input in mono with "As you'd type it after `ssh`: a `~/.ssh/config` alias or `user@host`. scrollback runs your `ssh` with your config, keys and agent, never prompts, and stores no credentials." There is no port, key, user or password field. A status card: unreachable ("Not reachable since 13 Nov, 22:41", ssh's message in a `code` box, Last good sync, Stale since, Next try) or failed (`red` border tint, "Failed at 09:40 today, and every try since 13 Nov", ssh's full message, "ssh's own message. scrollback never accepts a host key for you: check why the key changed, update `known_hosts` in a terminal, then Retry."). A card of what the last connection test found: transcript root, tools, what is archived from here, the agent's cleanup period. **Agents found here:** one line per agent with its root and session count (§6). Footer: **Remove location…** (`red` text), **Test connection**, **Sync now** (primary); "Removing stops syncing user@macbook. Its 486 archived sessions stay in the archive."
+- **Detail pane**, WSL: name, the distro (read-only), running or stopped, the root inside it, the mount root it maps to Windows drives (`/mnt`), the same status and agents cards; Remove, Sync now.
+- **Detail pane**, Local: the root (`C:\Users\user\.claude`, or `CLAUDE_CONFIG_DIR`'s value when set), status, agents; Sync now. This PC can be removed like any other location.
+- **Remove location…** asks: "Remove user@macbook? Syncing stops. Its 486 archived sessions stay in the archive and keep their folders." **Cancel** / **Remove**.
+- `↑` / `↓` move through the list; `Esc` closes the sheet.
+
+### 4.12 Add a location (`E-Add-Location`)
+A dialog (440 × up to 760) over `scrim`, from Add location in the sheet, the first run, or the palette. Its header carries a segmented kind switch: **This PC** (disabled with "Already added" when it is), **WSL distro** (Windows only), **SSH host**.
+- **WSL distro:** "Distros installed on this PC, from `wsl.exe --list`. Listing them never starts one." A radio list: added distros disabled ("Already a location"), the others with "running" or "stopped" and, for a running one, its session count. Choosing a stopped one shows an `info` banner: "Debian is stopped. Adding it doesn't start it. Its first sync will, and so will every sync after that, scheduled ones included." **Name** input. Footer: **Cancel**, **Add**, **Add and sync now** (primary). A running distro is tested as it is chosen, like an SSH host; a stopped one is added without a test (decision 6).
+- **SSH host:** **Host** input (mono) and **Test**; the help line as in §4.11. The test runs on Test, on `Enter`, and 600 ms after typing stops; while it runs, the result card shows "Connecting to user@macbook…" with an indeterminate `accent` bar, and the input stays editable (a new value cancels the old test).
+  - **Passed:** `green` "Connected in 1.4 s" and one checked line each: Shell, Tools, the agents found with their roots, Found ("486 sessions in 31 projects · 1.9 GB"), Cleanup ("Claude Code keeps 30 days here"). **Name** input, prefilled with the host. "The first sync copies 1.9 GB. A Mac that sleeps is fine: it shows as not reachable and syncs when it wakes." Footer: **Cancel**, **Add and sync now**.
+  - **Failed:** the input in `bad` style; a `red` card "Couldn't connect", ssh's own words in a `code` box, "scrollback ran:" and the exact command (`ssh -o BatchMode=yes -o ConnectTimeout=10 macbok sh -s`); **Things to check** (spelling against `~/.ssh/config`, with a known alias offered as a link that fills the input; whether `ssh <host>` works in a terminal without a password; "If the machine is only asleep, you can add it now; it syncs when it's back"). Footer: **Cancel**, **Add anyway** (decision 7; it is added unreachable), **Add and sync now** disabled.
+  - **No `ssh`** on `PATH` (Windows): a `bad` banner in place of the form, "ssh isn't installed. Add Windows' OpenSSH Client in Settings › Optional features, then try again."
+  - **Remote tools missing:** a failed check line names each missing tool (`sha256sum or shasum not found`); the host can't be added until it has them.
+- **This PC** (when removed earlier): the root found, agents and counts, **Add and sync now**.
+- After adding, the dialog closes, the new location is selected in the sheet and its first sync starts unless **Add** was chosen.
+
+### 4.13 Settings (`E-Settings-Archive`, `E-Settings`)
+- Settings open **in the main area**, replacing the page; the sidebar stays. A 44px header: Back (to the page Settings was opened from), "Settings", "Stored with this app on this PC". A 200px section list (Archive, Sync, Appearance, Shortcuts; `srow` style) and a scrolling content column (max 780, 24/32 padding). The list highlights the section at the top of the column; a click scrolls to it. `Ctrl ,` opens Settings, `Esc` goes back.
+- **Archive:** a card with the folder in mono (and a `default` tag when it is the data folder), **Show in Explorer** (Finder on macOS), **Use a different folder…**, and "An archive already in that folder opens; an empty folder gets a new one. This archive stays where it is. The setting lives with the app, not in the archive." (decision 4; choosing a folder asks to confirm and reopens the window on the other archive). Stats: on disk, sessions, items (the board says "source files"), versions. `kv` rows: Transcripts (compressed and original size), Catalogue and index, Backups.
+  - **Verify:** "Re-hashes every stored file against the catalogue and reports what doesn't match. It repairs nothing." **Verify now**; while running, a bar with "Verifying · 21,402 of 61,384 segments" and **Stop**. The last result in a card: header "No problems" (`green`) or "1 problem" (`yellow`) with when, how many segments, how long. One row per problem: the stored file in mono, what is wrong, the session (title, folder, location), and **Fetch again from its location** when the source file still exists there (it is stored as a new version, the damaged one kept and marked) or, when it doesn't, a `damaged` chip and "Its location no longer has it" (decision 5). **Open session** on every row.
+  - **Deleted for good · 2:** "Syncs skip these sessions even while their location still has them. Allowing one lets the next sync archive it again, if it is still there." One 44px row each: ban glyph, title, "deleted for good 4 Oct 2026", location tag, **Allow archiving again** (the row then reads "Allowed · archived again on the next sync of user@macbook" with Undo). None: "No sessions deleted for good."
+- **Sync:** **Sync every** (a menu: 5, 15, 30, 60 minutes, Only when I ask) with "While the app is open. Every launch syncs too, and Sync all runs whenever you ask."; **Stale after** (a number input, days, 1–90) with the cleanup periods read from the locations ("Claude Code deletes transcripts after 30 days on all three of your locations, so keep this well under that"; when they differ, the shortest with its location's name); an `info` banner "Any sync, scheduled or manual, starts a stopped WSL distro. Listing distros never does."
+- **Appearance:** **Theme** (System / Light / Dark segments, "System follows Windows."), **Window material** (§3's choices for the platform; disabled with the reason where the OS offers none).
+- **Shortcuts:** a read-only table (Action, Keys) of §5, keycaps in the platform's spelling. "Read-only for now."
+
+### 4.14 Edge, empty and loading states
+- **First sync running** (`E-Edge-First-Sync`): All sessions as the page, "214 archived so far. Each one appears as soon as it is copied, and you can open it right away." A **First sync** card: "started 09:02 · about 20 min left", **Stop**, one progress block per location (icon, name, "362 of 418 sessions · 1.1 of 1.4 GB" or "7,412 of 31,882 files · 0.9 of 3.8 GB", a 4px bar), "Stopping keeps everything copied so far; the next sync carries on from there." An `info` banner while no folders exist: "No folders yet, so everything lands in Unsorted, grouped by project path. Make folders from those paths there." with **Open Unsorted**. The list grows at its top as sessions arrive; a row being indexed shows "indexing…" in `fg3` and opens once it is done. Sidebar: counts tick up, "None yet. Unsorted groups sessions by project path; make folders from there." under Folders, location rows in their syncing state. The time left appears after a minute of progress; before that, "estimating…".
+- **Empty folder:** §4.4.
+- **Archive unavailable** (`E-Edge-Archive-Missing`): the main area centres a 600 column: a `red-soft` drive tile, "The archive can't be reached" at 22/600, the folder in mono (`E:\scrollback`), "The folder isn't there. If it is on a drive that's unplugged, plug it back in. If the drive's letter changed, locate the folder. scrollback won't make a new archive in its place, and syncing is paused until the archive is back. Nothing at your locations is affected.", **Try again** (primary), **Locate the archive…** (accepted only when the chosen folder's `archive.json` has this archive's id; otherwise "That folder holds a different archive. Open it instead?"), **Use a different folder…**; `kv` rows: Last opened, Held then, Archive id. The sidebar shows the folder tree from the last session dimmed to 50% with counts "—", location rows "paused"; Sync all, New folder and the search field are disabled. The app retries on its own when a drive is attached.
+- **Archive locked** by another scrollback (PLAN §4.4): the same layout, a lock glyph, "The archive is open in another scrollback window." and **Try again**.
+- **Source gone at its location** (`E-Edge-Source-Gone`): the reader is unchanged except for a neutral `info` banner across the column top (file-x glyph): "Gone at Ubuntu-24.04 since 11 Jan 2026. Claude Code removed it after 30 days. This archive holds the only copy, synced in full on 10 Jan." and a **Source** row in the facts ("gone since 11 Jan 2026"). Cards and list rows of such sessions show nothing extra; the Location filter gains "Gone at its location".
+- **Damaged** (Verify found a mismatch and the source is gone): a `bad` banner "Part of this session failed verification on 15 Nov. What follows turn 14 may be wrong." with **Details** (opens Settings › Archive at the problem).
+- **Loading a session:** the header and facts render at once from the index; the column shows the first turns and skeleton rows below while parsing continues (§4.2.2). No spinner covers the page.
+- **Empty pages:** Starred "Star a session to keep it here."; Unsorted "Everything is filed."; Trash "Trash is empty."; a folder or All sessions filtered to nothing "No sessions match these filters" with **Clear filters**.
+- **Toasts:** bottom-centre of the main area, `s2`, radius 8, `shadow-pop`, 5 s, one at a time, with Undo where the action can be undone (filing, moving to Trash, restoring, attaching a path). Never for sync progress, which lives in the sidebar.
+
+---
+
+## 5. Keyboard map
+
+**Proposed for the owner's review.** The first table is the set on the Settings board; the second adds what the screens above need. Every action is also a command in the palette (§4.9).
+
+| Key | Action |
+|---|---|
+| `Ctrl K` | search the archive (the palette; again, or `Esc`, closes it) |
+| `Ctrl F` | find in session (reader); again, the field focused with its text selected |
+| `Enter` / `Shift Enter` | in the find field: next / previous match, wrapping |
+| `Alt ←` | back to the page the session was opened from (also the mouse's back button) |
+| `J` / `K` | next / previous session in that page |
+| `]` / `[` | next / previous turn |
+| `E` | switch Activity / Full calls |
+| `S` | star or unstar the focused or open session |
+| `Delete` | move the focused or selected sessions to Trash |
+| `Ctrl Shift N` | new folder (inside the selected folder with `Shift` held on the `+`) |
+| `F5` | Sync all |
+| `Ctrl L` | the locations sheet |
+| `Ctrl ,` | Settings; `Esc` goes back |
+
+| Key | Action |
+|---|---|
+| `↑` / `↓`, `Enter` | move and open in the palette, menus, lists and the locations list |
+| `←` `→` `↑` `↓` | move between cards |
+| `Tab` | in the palette: add the highlighted completion as a filter |
+| `Ctrl Enter` | in the palette: open the session's folder page; in the path editor: save |
+| `M` | move the focused session to a folder (the Move to folder menu) |
+| `Shift F10` | the focused item's menu |
+| `F2` | rename the selected folder in place |
+| `Ctrl B` / `F6` | narrow windows: show the sidebar / move focus between the sidebar and the main area |
+| `Ctrl C` | copy the selected text; on a focused activity row, its command or path |
+| `Esc` | close the top overlay, else the open menu or popover, else close Find, else leave Settings |
+
+macOS uses `Cmd` for every `Ctrl` above, keycaps in its menu symbols (`⌘K`, `⌥←`, `⇧⌘N`). Single-letter keys are inactive while a text field has focus. Keycaps render with `kbd` style (Geist Mono 11px, `line` border, `s2` fill, radius 4) in the platform's spelling.
+
+---
+
+## 6. Known differences between the boards and this spec
+
+- **Agents.** The boards show one agent. This file adds: an agent mark beside every model, "Agent · model" on cards and list rows once there is more than one agent (§4.2.10), an **Agent** row in the facts, an **Agent** filter beside Model, Branch and Location on folder pages, All sessions, Unsorted and the palette, and the agents found at a location in the locations sheet's detail pane, the add-location test result and the first run (§4.10–§4.12). The sheet's header on `E-Locations` says "Claude Code transcripts"; fixed copy never names an agent, so it reads "transcripts" (§4.11).
+- **Subfolders on a folder page** (decision 1): `E-Folder` shows only fc's own cards; the page includes player's, each with a `player` tag (§4.4).
+- **File automatically** (decision 2) is not drawn: the session menu, the hover bar's More and a "Filed by hand" glyph on cards and rows (§4.4, §4.5).
+- **Date filter** (decision 3): `E-Folder` lacks the Date chip that `E-All-Sessions` has; every folder page has it.
+- **Verify** (decision 5): `E-Settings-Archive` offers only Open session on a problem; this file adds Fetch again from its location, or the `damaged` state (§4.13), and the damaged banner in the reader (§4.14).
+- **Search** (decision 9): matches inside subagents ("subagent" kind) and the Commands group (PLAN §11) are not drawn.
+- **Restore into a deleted folder** (decision 10) and every toast are not drawn.
+- **Stale deadline** (decision 11) uses the cleanup period last read from the location; the boards' banner copy already does.
+- **Narrow windows** (§2): the boards are all 1440 × 900; the Facts toggle, the collapsible sidebar and the reduced card and list columns are not drawn.
+- **Materials** (§3): the boards draw the Opaque values only. The translucent title bar and sidebar alphas are proposals; `fg3` on the Acrylic sidebar over a contrasting desktop is unverified. **Open:** measure on Windows and either raise the alpha or accept it for the opt-in material.
+- **Title bar:** the boards always show the search field, Sync all and Settings; the first run and the unavailable archive hide or disable them (§4.10, §4.14). `E-Edge-Archive-Missing` still shows them enabled. Build per this file.
+- **macOS:** the boards draw Windows (caption buttons, `C:\` paths, WSL). macOS has the traffic lights, no WSL section, and its own data folder (§2, §4.10).
+- **History popover footer:** `E-Versions` mentions subagent and tool-result versions in a footer only; each call body with more than one version also shows its own (§4.3).
+- **Versions on cards:** the `held back` chip on cards and list rows (§4.3) is not drawn.
+- **Settings' Back** is labelled "Back to fc" on both Settings boards, though they show no page under Settings; it names the page Settings was opened from.
+- **Unsorted's sort** and the "also as /mnt/d/…" grouping of equivalent paths (§4.6) are not drawn; `E-Unsorted` shows "6 paths" with five groups visible because the sixth is scrolled off.
+- **Board copy** (titles, prompts, counts, dates, "macbok") is illustrative fixture content in placeholder names; the GUI scenarios' fixtures (PLAN §12) reproduce it so screenshots compare 1:1.

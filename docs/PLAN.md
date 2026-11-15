@@ -3,7 +3,7 @@
 scrollback is a native desktop app (Rust + GPUI) that backs up, archives and reads coding-agent transcripts. It pulls transcripts from the locations the owner defines (this machine, a WSL distro, a host over SSH) into an archive it owns, and reads only from that archive. Claude Code is the first agent supported. Windows is the main platform, with first-class WSL; macOS is supported.
 
 - **Feature set:** [FEATURES.md](FEATURES.md). This plan covers how.
-- **Visual direction:** concept E on the design canvas; its boards are `design/project/E-Reader.dc.html` and `E-Folder.dc.html`, with the locations sheet, folder-path editing and versions carried over from concept A (`A-Ledger-Sync.dc.html`, `A-Ledger-Folders.dc.html`) and the first run from `First-Run.dc.html`. A `DESIGN.md` (tokens, layout, screens, keyboard map) is still to be written from them.
+- **Visual spec:** [DESIGN.md](DESIGN.md) (tokens, layout, materials, screens, keyboard map; cited as `DESIGN §N`), written from concept E on the design canvas. The boards' sources are the `E-*.dc.html` files in `design/project/`; where a board and DESIGN.md disagree, DESIGN.md wins.
 - **Status:** plan, written 2026-11-15. Nothing here is built. Decisions marked *(owner)* were made by the owner in the planning conversation; the rest are proposals the owner has seen and not objected to. §14 lists the risks and what is still to be checked. Sections are cited from code and commits as `PLAN §N` / `D<n>`.
 
 Comment and doc rule: code comments explain *what something is and why*, in the present tense, citing `PLAN §N` where a decision is involved. History belongs in commit messages, never in comments.
@@ -341,7 +341,7 @@ Provider-neutral, what the reader renders:
 - **Turn:** a user prompt and everything up to the next one.
 - **Block:** user text (with images), assistant markdown, thinking (text and duration), tool call, compaction boundary, system note.
 - **Tool call:** the agent's tool name, its kind, a typed input where the kind is known and raw JSON where it isn't, the paired result, status, duration, and for a subagent call, its transcript.
-- **Tool kinds are common to all agents:** shell, read, edit, write, search, todo list, subagent, web, other. Each provider maps its agent's tool names onto them (Claude Code: Bash, Read, Edit, Write, Grep and Glob, TodoWrite, Agent, WebFetch and WebSearch). The reader has one renderer per kind; a tool a provider doesn't map renders as `other`, with its name, input and output.
+- **Tool kinds are common to all agents:** shell, read, edit, write, content search, file search, todo list, subagent, web search, web fetch, MCP, other. Each provider maps its agent's tool names onto them (Claude Code: Bash, Read, Edit, Write, Grep, Glob, TodoWrite, Agent, WebSearch, WebFetch, and `mcp__…` tools). The reader has one renderer and one icon per kind (DESIGN §4.2.4) and shows the tool under the agent's own name; a tool a provider doesn't map renders as `other`, with its name, input and output.
 
 ### 7.5 Indexing and large files
 
