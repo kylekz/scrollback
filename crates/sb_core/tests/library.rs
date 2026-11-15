@@ -628,6 +628,35 @@ fn unsorted_is_grouped_by_where_its_sessions_started() {
     assert_eq!(spellings, ["/mnt/d/Projects/App", r"D:\Projects\App"]);
     assert_eq!(sessions.len(), 2);
     assert!(sessions.contains(&here[1]) && sessions.contains(&there[1]));
+    /* Its drive form is the one a session recorded; the paths that are no drive's have none. */
+    let drives: Vec<Option<&str>> = groups.iter().map(|group| group.drive.as_deref()).collect();
+    assert_eq!(drives.iter().filter(|drive| drive.is_none()).count(), 2);
+    assert!(drives.contains(&Some(r"D:\Projects\App")));
+}
+
+#[test]
+fn a_drives_group_recorded_only_under_a_distros_own_mount_has_its_drive_form() {
+    /* A WSL distro whose /etc/wsl.conf puts the Windows drives under /win/. */
+    let mut bench = Bench::new(DbAgent::new());
+    let catalogue = bench.archive().catalogue().clone();
+    catalogue
+        .set_drive_mount(&bench.location, Some("/win/"))
+        .unwrap();
+    let key = started(&mut bench.agent, "/win/d/Projects/fc");
+    bench.sync();
+    let groups = catalogue.unsorted().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].spellings, ["/win/d/Projects/fc"]);
+    assert_eq!(groups[0].drive.as_deref(), Some(r"D:\Projects\fc"));
+    /* Attached for that location, the drive form claims the group's session. */
+    let folder = catalogue
+        .create_folder_with_path("fc", None, r"D:\Projects\fc", Some(&bench.location))
+        .unwrap();
+    assert_eq!(
+        filed(&catalogue, &bench.session_id(&key)),
+        Filed::ByRule(folder)
+    );
+    assert_eq!(catalogue.unsorted().unwrap(), []);
 }
 
 #[test]

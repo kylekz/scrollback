@@ -155,25 +155,13 @@ pub fn group_key(group: &PathGroup) -> String {
 /**
  * How a group's path is written on its chip, and the other ways its sessions recorded it. A
  * drive's path is shown in its drive form (DESIGN §4.6: `D:\Projects\fc`, "also as
- * /mnt/d/Projects/fc"), which is made from a mount path when no session recorded it so.
- * `None` for the sessions that recorded no path.
+ * /mnt/d/Projects/fc"), which the catalogue read by its location's drive mount when no
+ * session recorded it so. `None` for the sessions that recorded no path.
  */
 pub fn group_path(group: &PathGroup) -> Option<(String, Vec<String>)> {
-    let on_drive = |path: &str| {
-        let bytes = path.as_bytes();
-        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
-    };
     let first = group.spellings.first()?;
-    if !group.project.as_ref().is_some_and(NormalPath::is_drive) {
+    let Some(shown) = group.drive.clone() else {
         return Some((first.clone(), group.spellings[1..].to_vec()));
-    }
-    let shown = match group.spellings.iter().find(|spelling| on_drive(spelling)) {
-        Some(drive) => drive.clone(),
-        None => {
-            let below = first.strip_prefix(filing::WSL_DRIVE_MOUNT).unwrap_or(first);
-            let (letter, rest) = below.split_at(below.len().min(1));
-            format!("{}:{}", letter.to_uppercase(), rest.replace('/', "\\"))
-        }
     };
     let others = group
         .spellings

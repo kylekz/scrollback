@@ -85,21 +85,11 @@ impl NormalPath {
             return Some(Self(share.trim_end_matches('/').to_string()));
         }
         let components: Vec<&str> = path.split('/').filter(named).collect();
-        /* Under the drive mount, the next component is the drive's letter. */
-        let mount: Vec<&str> = drive_mount
-            .unwrap_or(WSL_DRIVE_MOUNT)
-            .split('/')
-            .filter(named)
-            .collect();
-        let drive = components
-            .strip_prefix(&mount[..])
-            .and_then(<[&str]>::split_first)
-            .filter(|(letter, _)| letter.len() == 1 && letter.as_bytes()[0].is_ascii_alphabetic())
-            .map(|(letter, rest)| {
-                format!("{letter}:/{}", rest.join("/"))
-                    .trim_end_matches('/')
-                    .to_lowercase()
-            });
+        let drive = mounted(&components, drive_mount).map(|(letter, rest)| {
+            format!("{letter}:/{}", rest.join("/"))
+                .trim_end_matches('/')
+                .to_lowercase()
+        });
         match drive {
             Some(drive) => Some(Self(drive)),
             None if components.is_empty() => None,
@@ -135,6 +125,39 @@ impl NormalPath {
             .strip_prefix(&self.0)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
     }
+}
+
+/// The drive's letter and the components under it, when `components` are of a path under
+/// `drive_mount` ([`WSL_DRIVE_MOUNT`] when `None`).
+fn mounted<'a, 'p>(
+    components: &'a [&'p str],
+    drive_mount: Option<&str>,
+) -> Option<(&'p str, &'a [&'p str])> {
+    let mount: Vec<&str> = drive_mount
+        .unwrap_or(WSL_DRIVE_MOUNT)
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect();
+    components
+        .get(mount.len()..)
+        .filter(|_| components[..mount.len()] == mount[..])
+        .and_then(<[&str]>::split_first)
+        .filter(|(letter, _)| letter.len() == 1 && letter.as_bytes()[0].is_ascii_alphabetic())
+        .map(|(letter, rest)| (*letter, rest))
+}
+
+/**
+ * How Windows writes a path under a WSL distro's drive mount (`/mnt/d/Projects/app` with the
+ * mount `/mnt/`): `D:\Projects\app`, case kept but the drive's letter's. `drive_mount` is the
+ * location's, as for [`NormalPath::new`]. `None` for a path that is not under it.
+ */
+pub fn drive_form(path: &str, drive_mount: Option<&str>) -> Option<String> {
+    let components: Vec<&str> = path
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect();
+    let (letter, rest) = mounted(&components, drive_mount)?;
+    Some(format!("{}:\\{}", letter.to_uppercase(), rest.join("\\")))
 }
 
 impl ToSql for NormalPath {
@@ -262,6 +285,31 @@ mod tests {
             assert_eq!(
                 NormalPath::new(path, mount).unwrap().as_str(),
                 normal,
+                "{path:?} with the drive mount {mount:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_under_a_drive_mount_is_written_as_windows_writes_it() {
+        for (path, mount, drive) in [
+            ("/mnt/d/Projects/App", None, Some(r"D:\Projects\App")),
+            (
+                "/mnt/d/Projects/App/",
+                Some("/mnt/"),
+                Some(r"D:\Projects\App"),
+            ),
+            ("/mnt/c", None, Some(r"C:\")),
+            ("/win/e/Work/fc", Some("/win/"), Some(r"E:\Work\fc")),
+            ("/d/Projects", Some("/"), Some(r"D:\Projects")),
+            /* Elsewhere than the location's mount, it is no drive's. */
+            ("/mnt/d/Projects", Some("/win/"), None),
+            ("/mnt/data/app", None, None),
+            ("/home/user/code/app", None, None),
+        ] {
+            assert_eq!(
+                drive_form(path, mount).as_deref(),
+                drive,
                 "{path:?} with the drive mount {mount:?}"
             );
         }
