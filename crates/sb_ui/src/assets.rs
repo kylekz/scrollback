@@ -9,7 +9,8 @@ use std::borrow::Cow;
 use anyhow::{Result, bail};
 use gpui::{App, AssetSource, SharedString};
 
-/// The app's [`AssetSource`]: the icons in [`crate::icons`].
+/// The app's [`AssetSource`]: the icons in [`crate::icons`], and each agent's mark from its
+/// provider ([`crate::agents`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Assets;
 
@@ -17,6 +18,9 @@ impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         if path.is_empty() {
             return Ok(None);
+        }
+        if let Some(mark) = crate::agents::mark_asset(path) {
+            return Ok(Some(Cow::Borrowed(mark.as_bytes())));
         }
         match crate::icons::FILES.iter().find(|(name, _)| *name == path) {
             Some((_, bytes)) => Ok(Some(Cow::Borrowed(*bytes))),

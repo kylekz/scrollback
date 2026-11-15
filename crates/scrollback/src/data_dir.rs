@@ -5,7 +5,7 @@
 //! `C:\Users\user\AppData\Local\scrollback`, `/Users/user/Library/Application
 //! Support/scrollback`).
 //!
-//! Nothing is written there yet: the archive is created in it by phase 1 (PLAN §13).
+//! The archive is its `archive` folder, made on the first run (PLAN D3, §4.4).
 
 use std::path::{Path, PathBuf};
 

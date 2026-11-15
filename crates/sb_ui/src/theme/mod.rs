@@ -8,9 +8,9 @@
 //! including `Root`'s background, which is the window background of DESIGN §3: transparent over
 //! a material so the OS material shows, `bg-app` solid over Opaque.
 //!
-//! The colours are DESIGN §1.1 and §1.2 whole. The type scale, the sizes, the radii, the
-//! spacing scale and the shadows hold only what the shell draws; each later view adds its own
-//! steps of DESIGN §1.3 and §1.4 with the phase that builds it.
+//! The colours are DESIGN §1.1 and §1.2 whole. The type scale, the sizes, the radii and the
+//! shadows hold what the shell and the library draw; each later view adds its own steps of
+//! DESIGN §1.3 and §1.4 with the phase that builds it.
 
 pub mod tokens;
 
@@ -200,24 +200,51 @@ impl TextSpec {
     }
 }
 
-/// The shell's steps of the type scale (DESIGN §1.3): 13/18 body, 12/16 secondary, 11/14
-/// counts, keycaps and overlines; 600 for titles, 500 for controls, 400 for text.
+/// The steps of the type scale the shell and the library draw (DESIGN §1.3): 13/18 body, 12/16
+/// secondary, 11/14 counts, tags, keycaps and overlines; 600 for titles, 500 for controls and
+/// names, 400 for text.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypeScale {
     /// 13/18 body text.
     pub body: TextSpec,
-    /// 13/18 titles (the wordmark).
+    /// 13/18 titles (the wordmark, a card's title).
     pub title: TextSpec,
+    /// 13/18 controls and names.
+    pub control: TextSpec,
     /// 12/16 secondary text.
     pub secondary: TextSpec,
-    /// 12/16 small controls.
+    /// 12/16 small controls and small names.
     pub control_small: TextSpec,
+    /// 11/14 the smallest text: a location's state, a card's last line.
+    pub small: TextSpec,
+    /// 11/14 tags.
+    pub tag: TextSpec,
     /// 11/14 section labels, drawn uppercase in `fg3` (`components::overline`).
     pub overline: TextSpec,
     /// 11/14 Geist Mono counts.
     pub count: TextSpec,
+    /// 12/16 Geist Mono numbers in a line of secondary text.
+    pub number: TextSpec,
+    /// 18/18 Geist Mono: a page header's stats (`E-Folder` sets them on the body's 18px line).
+    pub stat: TextSpec,
     /// 11/14 Geist Mono keycaps.
     pub kbd: TextSpec,
+    /// 12/16 JetBrains Mono: a project path.
+    pub path: TextSpec,
+    /// 11/14 JetBrains Mono: a path in a line of small text.
+    pub path_small: TextSpec,
+    /// 12.5/18 a list row (`design/project/sb.css`, `.lrow`).
+    pub row: TextSpec,
+    /// 12.5/18 a list row's title.
+    pub row_title: TextSpec,
+    /// 24/30 a page's title.
+    pub page_title: TextSpec,
+    /// 22/28 the title of the first run and of an edge state.
+    pub state_title: TextSpec,
+    /// 15/20 the title of an empty area.
+    pub empty_title: TextSpec,
+    /// 14/21 the paragraph under a state's title (`E-First-Run`).
+    pub lead: TextSpec,
 }
 
 impl TypeScale {
@@ -227,11 +254,24 @@ impl TypeScale {
         Self {
             body: TextSpec::new(&fonts.ui, 13., 18., regular),
             title: TextSpec::new(&fonts.ui, 13., 18., semibold),
+            control: TextSpec::new(&fonts.ui, 13., 18., medium),
             secondary: TextSpec::new(&fonts.ui, 12., 16., regular),
             control_small: TextSpec::new(&fonts.ui, 12., 16., medium),
+            small: TextSpec::new(&fonts.ui, 11., 14., regular),
+            tag: TextSpec::new(&fonts.ui, 11., 14., medium),
             overline: TextSpec::new(&fonts.ui, 11., 14., medium),
             count: TextSpec::new(&fonts.numbers, 11., 14., regular),
+            number: TextSpec::new(&fonts.numbers, 12., 16., regular),
+            stat: TextSpec::new(&fonts.numbers, 18., 18., medium),
             kbd: TextSpec::new(&fonts.numbers, 11., 14., regular),
+            path: TextSpec::new(&fonts.mono, 12., 16., regular),
+            path_small: TextSpec::new(&fonts.mono, 11., 14., regular),
+            row: TextSpec::new(&fonts.ui, 12.5, 18., regular),
+            row_title: TextSpec::new(&fonts.ui, 12.5, 18., medium),
+            page_title: TextSpec::new(&fonts.ui, 24., 30., semibold),
+            state_title: TextSpec::new(&fonts.ui, 22., 28., semibold),
+            empty_title: TextSpec::new(&fonts.ui, 15., 20., semibold),
+            lead: TextSpec::new(&fonts.ui, 14., 21., regular),
         }
     }
 }
@@ -248,15 +288,51 @@ pub trait StyledText: Styled + Sized {
 
 impl<E: Styled> StyledText for E {}
 
-/// The shell's fixed sizes (DESIGN §1.4, §2).
+/// The fixed sizes of the shell and the library (DESIGN §1.4, §2).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sizes {
     pub title_bar_height: Pixels,
     pub sidebar_width: Pixels,
     pub sidebar_row_height: Pixels,
+    /// A location's row at the sidebar's foot, and one that is syncing.
+    pub location_row_height: Pixels,
+    pub location_row_syncing_height: Pixels,
+    /// How far a folder's row moves in per level.
+    pub folder_indent: Pixels,
+    /// A section's button beside its overline.
+    pub section_button: Pixels,
     pub control_height: Pixels,
     pub control_small_height: Pixels,
     pub input_height: Pixels,
+    /// A chip, and the taller one that holds a project path.
+    pub chip_height: Pixels,
+    pub path_chip_height: Pixels,
+    /// A tag, and the lower one on a card's last line.
+    pub tag_height: Pixels,
+    pub tag_small_height: Pixels,
+    /// A progress bar.
+    pub bar_height: Pixels,
+    /// A checkbox.
+    pub checkbox: Pixels,
+    /// A state's dot.
+    pub dot: Pixels,
+    /// A page's padding: above its header, and at its sides.
+    pub page_top: Pixels,
+    pub page_side: Pixels,
+    /// The icon tile of a page's header.
+    pub page_tile: Pixels,
+    /// A session card is a quarter of its row less the gap, and never narrower than this.
+    pub card_min_width: Pixels,
+    /// The two lines of a card's prompt (`design/project/sb.css`: a 36px box of 12/16 text).
+    pub card_prompt_height: Pixels,
+    pub list_row_height: Pixels,
+    /// The head of a group of Unsorted.
+    pub group_head_height: Pixels,
+    /// The first run's column, and how far below the title bar it starts.
+    pub first_run_width: Pixels,
+    pub first_run_top: Pixels,
+    /// The column of an edge state.
+    pub state_width: Pixels,
     /// The title bar's search field.
     pub search_field_width: Pixels,
     /// A Windows caption button: 46 wide, the title bar's height.
@@ -279,9 +355,30 @@ impl Default for Sizes {
             title_bar_height: px(40.),
             sidebar_width: px(248.),
             sidebar_row_height: px(32.),
+            location_row_height: px(40.),
+            location_row_syncing_height: px(48.),
+            folder_indent: px(18.),
+            section_button: px(22.),
             control_height: px(28.),
             control_small_height: px(24.),
             input_height: px(30.),
+            chip_height: px(22.),
+            path_chip_height: px(28.),
+            tag_height: px(18.),
+            tag_small_height: px(16.),
+            bar_height: px(4.),
+            checkbox: px(14.),
+            dot: px(7.),
+            page_top: px(20.),
+            page_side: px(24.),
+            page_tile: px(56.),
+            card_min_width: px(200.),
+            card_prompt_height: px(36.),
+            list_row_height: px(34.),
+            group_head_height: px(44.),
+            first_run_width: px(660.),
+            first_run_top: px(56.),
+            state_width: px(600.),
             search_field_width: px(460.),
             caption_button_width: px(46.),
             traffic_lights_inset: px(84.),
@@ -294,7 +391,7 @@ impl Default for Sizes {
     }
 }
 
-/// The shell's corner radii (DESIGN §1.4).
+/// The corner radii (DESIGN §1.4).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Radii {
     /// Tags, keycaps, inline code.
@@ -305,8 +402,14 @@ pub struct Radii {
     pub input: Pixels,
     /// Sidebar rows, menus, code blocks, banners, tables.
     pub row: Pixels,
+    /// Cards, popovers, path groups.
+    pub card: Pixels,
     /// Sheets, dialogs, the empty drop area.
     pub sheet: Pixels,
+    /// The icon tile of a page's header.
+    pub tile: Pixels,
+    /// Chips.
+    pub pill: Pixels,
 }
 
 impl Default for Radii {
@@ -316,12 +419,15 @@ impl Default for Radii {
             control: px(6.),
             input: px(7.),
             row: px(8.),
+            card: px(10.),
             sheet: px(12.),
+            tile: px(14.),
+            pill: px(999.),
         }
     }
 }
 
-/// The shell's steps of the spacing scale 4 / 6 / 8 / 12 / 16 / 24 / 32 (DESIGN §1.4).
+/// The spacing scale 4 / 6 / 8 / 12 / 16 / 24 / 32 (DESIGN §1.4).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Spacing {
     pub xs: Pixels,
@@ -329,6 +435,8 @@ pub struct Spacing {
     pub md: Pixels,
     pub lg: Pixels,
     pub xl: Pixels,
+    pub xxl: Pixels,
+    pub xxxl: Pixels,
 }
 
 impl Default for Spacing {
@@ -339,13 +447,18 @@ impl Default for Spacing {
             md: px(8.),
             lg: px(12.),
             xl: px(16.),
+            xxl: px(24.),
+            xxxl: px(32.),
         }
     }
 }
 
-/// Elevation (DESIGN §1.1 `shadow-pop`; §1.2 for light), written as CSS writes it.
+/// Elevation (DESIGN §1.1 `shadow-card` and `shadow-pop`; §1.2 for light), written as CSS
+/// writes it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Shadows {
+    /// A card under the pointer or the keyboard.
+    pub card: Vec<BoxShadow>,
     /// Popovers, menus, sheets, dialogs.
     pub pop: Vec<BoxShadow>,
 }
@@ -356,9 +469,11 @@ impl Shadows {
         let ink = |alpha| tokens::rgba(40, 30, 10, alpha);
         match appearance {
             Appearance::Dark => Self {
+                card: vec![shadow(black(0.28), 6., 20.)],
                 pop: vec![shadow(black(0.55), 28., 70.), shadow(black(0.35), 2., 10.)],
             },
             Appearance::Light => Self {
+                card: vec![shadow(ink(0.08), 4., 14.)],
                 pop: vec![shadow(ink(0.16), 20., 56.), shadow(ink(0.10), 2., 10.)],
             },
         }

@@ -391,6 +391,157 @@ fn shadows_match_design() {
     );
     assert_eq!(css(light[1].color), (0x281e0a, 100));
     assert_eq!((light[1].offset.y, light[1].blur_radius), (px(2.), px(5.)));
+
+    // `shadow-card`: 0 6px 20px rgba(0,0,0,.28) dark, 0 4px 14px rgba(40,30,10,.08) light.
+    let dark = Shadows::new(Appearance::Dark).card;
+    assert_eq!(dark.len(), 1);
+    assert_eq!(css(dark[0].color), (0x000000, 280));
+    assert_eq!((dark[0].offset.y, dark[0].blur_radius), (px(6.), px(10.)));
+    let light = Shadows::new(Appearance::Light).card;
+    assert_eq!(light.len(), 1);
+    assert_eq!(css(light[0].color), (0x281e0a, 80));
+    assert_eq!((light[0].offset.y, light[0].blur_radius), (px(4.), px(7.)));
+}
+
+#[test]
+fn the_type_scale_matches_design() {
+    // DESIGN §1.3: family, size / line height, weight.
+    let fonts = Fonts::default();
+    let scale = TypeScale::new(&fonts);
+    let (regular, medium, semibold) =
+        (FontWeight::NORMAL, FontWeight::MEDIUM, FontWeight::SEMIBOLD);
+    for (name, spec, family, size, line_height, weight) in [
+        ("body", &scale.body, &fonts.ui, 13., 18., regular),
+        ("title", &scale.title, &fonts.ui, 13., 18., semibold),
+        ("control", &scale.control, &fonts.ui, 13., 18., medium),
+        ("secondary", &scale.secondary, &fonts.ui, 12., 16., regular),
+        (
+            "control_small",
+            &scale.control_small,
+            &fonts.ui,
+            12.,
+            16.,
+            medium,
+        ),
+        ("small", &scale.small, &fonts.ui, 11., 14., regular),
+        ("tag", &scale.tag, &fonts.ui, 11., 14., medium),
+        ("overline", &scale.overline, &fonts.ui, 11., 14., medium),
+        // Numbers in the UI are Geist Mono.
+        ("count", &scale.count, &fonts.numbers, 11., 14., regular),
+        ("number", &scale.number, &fonts.numbers, 12., 16., regular),
+        ("stat", &scale.stat, &fonts.numbers, 18., 18., medium),
+        ("kbd", &scale.kbd, &fonts.numbers, 11., 14., regular),
+        // Paths are code: JetBrains Mono.
+        ("path", &scale.path, &fonts.mono, 12., 16., regular),
+        (
+            "path_small",
+            &scale.path_small,
+            &fonts.mono,
+            11.,
+            14.,
+            regular,
+        ),
+        ("row", &scale.row, &fonts.ui, 12.5, 18., regular),
+        ("row_title", &scale.row_title, &fonts.ui, 12.5, 18., medium),
+        // Page titles 24/30, first-run and edge-state titles 22/28, both at 600.
+        (
+            "page_title",
+            &scale.page_title,
+            &fonts.ui,
+            24.,
+            30.,
+            semibold,
+        ),
+        (
+            "state_title",
+            &scale.state_title,
+            &fonts.ui,
+            22.,
+            28.,
+            semibold,
+        ),
+        (
+            "empty_title",
+            &scale.empty_title,
+            &fonts.ui,
+            15.,
+            20.,
+            semibold,
+        ),
+        ("lead", &scale.lead, &fonts.ui, 14., 21., regular),
+    ] {
+        assert_eq!(
+            (&spec.family, spec.size, spec.line_height, spec.weight),
+            (family, px(size), px(line_height), weight),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn sizes_radii_and_spacing_match_design() {
+    // DESIGN §1.4: heights.
+    let sizes = Sizes::default();
+    assert_eq!(sizes.title_bar_height, px(40.));
+    assert_eq!(sizes.sidebar_row_height, px(32.));
+    assert_eq!(
+        (sizes.location_row_height, sizes.location_row_syncing_height),
+        (px(40.), px(48.))
+    );
+    assert_eq!(
+        (sizes.control_height, sizes.control_small_height),
+        (px(28.), px(24.))
+    );
+    assert_eq!(sizes.input_height, px(30.));
+    assert_eq!(sizes.list_row_height, px(34.));
+    // §4.1: folders indent 18 per level; §4.4: a 56px tile, 28px path chips.
+    assert_eq!(sizes.folder_indent, px(18.));
+    assert_eq!(sizes.page_tile, px(56.));
+    assert_eq!(sizes.path_chip_height, px(28.));
+    // §4.6: a group's head is 44 high.
+    assert_eq!(sizes.group_head_height, px(44.));
+    // Widths: sidebar 248, a card at least 200; §2: pages have 20px top and 24px side
+    // padding; §4.10: the first run's column is 660 wide, 56 from the top.
+    assert_eq!(sizes.sidebar_width, px(248.));
+    assert_eq!(sizes.card_min_width, px(200.));
+    assert_eq!((sizes.page_top, sizes.page_side), (px(20.), px(24.)));
+    assert_eq!(
+        (sizes.first_run_width, sizes.first_run_top),
+        (px(660.), px(56.))
+    );
+    assert_eq!(sizes.state_width, px(600.));
+
+    // Radii: 4 tags, 6 buttons, 7 inputs, 8 rows, 10 cards, 12 sheets, 14 the page tile,
+    // 999 chips.
+    let radii = Radii::default();
+    assert_eq!(
+        [
+            radii.small,
+            radii.control,
+            radii.input,
+            radii.row,
+            radii.card,
+            radii.sheet,
+            radii.tile,
+            radii.pill
+        ],
+        [4., 6., 7., 8., 10., 12., 14., 999.].map(px)
+    );
+
+    // The spacing scale 4 / 6 / 8 / 12 / 16 / 24 / 32.
+    let spacing = Spacing::default();
+    assert_eq!(
+        [
+            spacing.xs,
+            spacing.sm,
+            spacing.md,
+            spacing.lg,
+            spacing.xl,
+            spacing.xxl,
+            spacing.xxxl
+        ],
+        [4., 6., 8., 12., 16., 24., 32.].map(px)
+    );
 }
 
 #[gpui::test]

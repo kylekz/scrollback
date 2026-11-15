@@ -1,12 +1,16 @@
-//! Startup: the data dir, then gpui with scrollback's assets, fonts and theme, the main window
-//! and, with `--automation`, the automation driver.
+//! Startup: the data dir, then gpui with scrollback's assets, fonts and theme, the services
+//! over the archive in the data dir, the main window and, with `--automation`, the automation
+//! driver.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use gpui::{App, QuitMode, px, size};
+use sb_core::transport::LocalTransport;
 use sb_ui::ActiveTheme as _;
 use sb_ui::appearance::MaterialSupport;
+use sb_ui::services::ServicesConfig;
 
 use crate::cli::Cli;
 
@@ -39,13 +43,24 @@ pub fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// Opens the main window as `cli` asks. `data_dir` is where this run keeps its files; so far
-/// only automation's `state` reads it.
+/// The archive's folder in the data dir (PLAN §4.4, DESIGN §4.10).
+const ARCHIVE: &str = "archive";
+
+/// Opens the main window as `cli` asks. `data_dir` is where this run keeps its files: the
+/// archive is opened in it, and made there on the first run (PLAN D3).
 #[cfg_attr(not(feature = "automation"), expect(unused_variables))]
 fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
     sb_ui::init(cx)?;
     // Light or dark and the material, before the first frame.
     sb_ui::appearance::init(MaterialSupport::probe(), cli.theme.unwrap_or_default(), cx);
+    sb_ui::services::init(
+        ServicesConfig {
+            archive_dir: data_dir.join(ARCHIVE),
+            providers: sb_core::provider::builtin(),
+            local: Arc::new(LocalTransport),
+        },
+        cx,
+    );
 
     #[cfg(feature = "automation")]
     sb_ui::automation::set_background(cli.automation_background);

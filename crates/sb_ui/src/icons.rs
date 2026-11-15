@@ -47,8 +47,20 @@ sb_icons! {
     WindowRestore => "window-restore",
     WindowClose => "window-close",
     // Lucide.
+    Archive => "archive",
+    ArrowLeft => "arrow-left",
+    Bot => "bot",
+    Check => "check",
+    ChevronDown => "chevron-down",
+    ChevronRight => "chevron-right",
+    CircleAlert => "circle-alert",
+    Folder => "folder",
+    FolderPlus => "folder-plus",
+    Hand => "hand",
     Inbox => "inbox",
     Layers => "layers",
+    Link => "link",
+    Monitor => "monitor",
     PanelLeft => "panel-left",
     Plus => "plus",
     RefreshCw => "refresh-cw",
@@ -56,6 +68,8 @@ sb_icons! {
     Settings => "settings",
     Star => "star",
     Trash => "trash-2",
+    TriangleAlert => "triangle-alert",
+    X => "x",
 }
 
 #[cfg(test)]

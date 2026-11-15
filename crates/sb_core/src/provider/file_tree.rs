@@ -59,6 +59,10 @@ impl<'a> FileTree<'a> {
 }
 
 impl Source for FileTree<'_> {
+    fn root(&self) -> String {
+        self.path(self.subtree)
+    }
+
     fn scan(&mut self) -> Result<Scan, ProviderError> {
         let listing = self.transport.list(&self.path(self.subtree))?;
         let items = listing

@@ -13,9 +13,14 @@
 //! closes it: on the main area or on the title bar, except on the title bar's own buttons (the
 //! sidebar's, which toggles, and Windows' caption buttons, which are the OS's).
 //!
-//! **Keyboard.** It rests on the main area, inside the shell's key context, until a view there
-//! takes it, so the shell's keys work at once. The main area is the window's `Main` landmark,
+//! **Keyboard.** It rests on the main area ([`MainArea`]'s focus handle), inside the shell's key
+//! context, so the shell's keys and the shown page's work at once. `F6` moves it between the
+//! sidebar and the main area, and so does `Ctrl B` while the sidebar is docked (DESIGN §4.1);
+//! `Enter` in the sidebar hands it to the page. The main area is the window's `Main` landmark,
 //! which is what assistive technology announces while nothing in it has the keyboard.
+//!
+//! The library's own keys work wherever the keyboard is: `Ctrl Shift N` makes a folder, `F5`
+//! syncs every location, `Alt ←` goes back from an opened session (DESIGN §5).
 
 pub mod title_bar;
 
@@ -33,10 +38,13 @@ use gpui::{
 use gpui_appearance::Backing;
 use gpui_component::Root;
 
-use crate::actions::shell::{Dismiss, ToggleSidebar};
+use crate::actions::library::{Back, NewFolder, SyncAll};
+use crate::actions::shell::{Dismiss, FocusOther, ToggleSidebar};
 use crate::automation::AutomationTargetExt as _;
 use crate::keymap;
-use crate::sidebar::sidebar;
+use crate::pages::{MainArea, Showing};
+use crate::services::ActiveServices as _;
+use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::theme::{ActiveTheme as _, Material, SbTheme, StyledText as _};
 
 /// Where the sidebar is (module docs, "Narrow windows").
@@ -65,23 +73,47 @@ impl SidebarPlacement {
 pub struct Shell {
     /// Keeps the window's material and light/dark in step (module docs).
     appearance: gpui_appearance::WindowTracker,
-    /// The main area's, where the keyboard rests (module docs).
-    focus_handle: FocusHandle,
+    sidebar: Entity<Sidebar>,
+    /// Where the keyboard rests (module docs).
+    main: Entity<MainArea>,
     /// Whether a narrow window shows the sidebar over its main area.
     sidebar_open: bool,
-    _theme_changed: Subscription,
+    _observers: [Subscription; 5],
 }
 
 impl Shell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let focus_handle = cx.focus_handle();
-        focus_handle.focus(window, cx);
+        let main = cx.new(MainArea::new);
+        main.focus_handle(cx).focus(window, cx);
+        let sidebar = cx.new(|cx| Sidebar::new(window, cx));
+        let services = cx.services();
+        let (archive, sync, library) = (
+            services.archive.clone(),
+            services.sync.clone(),
+            services.library.clone(),
+        );
         Self {
             // gpui opened the window light or dark as the OS is; the theme may say otherwise.
             appearance: gpui_appearance::track_window(Backing::Solid, window, cx),
-            focus_handle,
             sidebar_open: false,
-            _theme_changed: cx.observe_global_in::<SbTheme>(window, |_, _, cx| cx.notify()),
+            _observers: [
+                cx.observe_global_in::<SbTheme>(window, |_, _, cx| cx.notify()),
+                // The title bar follows the archive, the locations and the passes.
+                cx.observe(&archive, |_, _, cx| cx.notify()),
+                cx.observe(&sync, |_, _, cx| cx.notify()),
+                cx.observe(&library, |_, _, cx| cx.notify()),
+                cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+                    // Picking a row closes a narrow window's overlay (DESIGN §2), and the
+                    // keyboard goes to the page with it.
+                    if std::mem::take(&mut this.sidebar_open) || matches!(event, SidebarEvent::Open)
+                    {
+                        this.main.focus_handle(cx).focus(window, cx);
+                    }
+                    cx.notify();
+                }),
+            ],
+            sidebar,
+            main,
         }
     }
 
@@ -101,19 +133,62 @@ impl Shell {
         }
     }
 
+    /// What the main area shows.
+    pub fn showing(&self, cx: &App) -> Showing {
+        Showing::now(cx)
+    }
+
+    /// Shows or hides a narrow window's sidebar, the keyboard going with it. A docked
+    /// sidebar always shows, so there the keyboard alone moves.
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, window: &mut Window, cx: &mut Context<Self>) {
-        // A docked sidebar always shows.
-        if self.sidebar_placement(window.viewport_size().width, cx) != SidebarPlacement::Docked {
-            self.sidebar_open = !self.sidebar_open;
+        if self.sidebar_placement(window.viewport_size().width, cx) == SidebarPlacement::Docked {
+            return self.focus_other(&FocusOther, window, cx);
+        }
+        self.sidebar_open = !self.sidebar_open;
+        if self.sidebar_open {
+            self.sidebar.focus_handle(cx).focus(window, cx);
+        } else {
+            self.main.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Moves the keyboard between the sidebar and the main area. A narrow window shows its
+    /// sidebar to give it the keyboard, and hides it again when the keyboard leaves.
+    fn focus_other(&mut self, _: &FocusOther, window: &mut Window, cx: &mut Context<Self>) {
+        let sidebar = self.sidebar.focus_handle(cx);
+        if sidebar.contains_focused(window, cx) {
+            self.sidebar_open = false;
+            self.main.focus_handle(cx).focus(window, cx);
+        } else {
+            self.sidebar_open = self.sidebar_placement(window.viewport_size().width, cx)
+                != SidebarPlacement::Docked;
+            sidebar.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar_open {
+            self.sidebar_open = false;
+            self.main.focus_handle(cx).focus(window, cx);
             cx.notify();
         }
     }
 
-    fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
-        if self.sidebar_open {
-            self.sidebar_open = false;
-            cx.notify();
-        }
+    fn new_folder(&mut self, _: &NewFolder, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.new_folder(false, cx));
+    }
+
+    pub(super) fn sync_all(&mut self, _: &SyncAll, _: &mut Window, cx: &mut Context<Self>) {
+        let sync = cx.services().sync.clone();
+        sync.update(cx, |sync, cx| sync.sync_all(cx));
+    }
+
+    fn back(&mut self, _: &Back, _: &mut Window, cx: &mut Context<Self>) {
+        let library = cx.services().library.clone();
+        library.update(cx, |library, cx| library.close(cx));
     }
 
     /// The main area (DESIGN §2): where the pages and the reader go. Always solid, since
@@ -122,13 +197,31 @@ impl Shell {
         div()
             .id("main")
             .role(Role::Main)
-            .track_focus(&self.focus_handle)
             .flex_1()
             .min_w_0()
             .h_full()
             .bg(theme.colors.bg_app)
             .debug_selector(|| "main".into())
+            .child(self.main.clone())
             .automation_target("shell/main")
+    }
+
+    /// The sidebar on `background`: `bg-side` docked, its solid value as an overlay
+    /// (DESIGN §2).
+    fn render_sidebar(&self, background: gpui::Hsla, theme: &SbTheme) -> AnyElement {
+        div()
+            .id("sidebar")
+            .role(Role::Navigation)
+            .aria_label("Library")
+            .flex_none()
+            .w(theme.sizes.sidebar_width)
+            .h_full()
+            .bg(background)
+            .border_r_1()
+            .border_color(theme.colors.line_subtle)
+            .debug_selector(|| "sidebar".into())
+            .child(self.sidebar.clone())
+            .automation_target("shell/sidebar")
     }
 
     /// The sidebar over the main area of a narrow window, and under it a layer that takes the
@@ -154,7 +247,7 @@ impl Shell {
                         .shadow(theme.shadows.pop.clone())
                         // A press on the sidebar itself is not a press outside it.
                         .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
-                        .child(sidebar(theme.colors.bg_side_overlay, theme)),
+                        .child(self.render_sidebar(theme.colors.bg_side_overlay, theme)),
                 ),
         )
         .into_any_element()
@@ -162,8 +255,8 @@ impl Shell {
 }
 
 impl Focusable for Shell {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.main.focus_handle(cx)
     }
 }
 
@@ -176,11 +269,21 @@ impl Render for Shell {
         if placement == SidebarPlacement::Docked {
             self.sidebar_open = false;
         }
+        // A sidebar that isn't shown can't keep the keyboard.
+        if placement == SidebarPlacement::Collapsed
+            && self.sidebar.focus_handle(cx).contains_focused(window, cx)
+        {
+            self.main.focus_handle(cx).focus(window, cx);
+        }
         div()
             .id("shell")
             .key_context(keymap::SHELL)
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::focus_other))
             .on_action(cx.listener(Self::dismiss))
+            .on_action(cx.listener(Self::new_folder))
+            .on_action(cx.listener(Self::sync_all))
+            .on_action(cx.listener(Self::back))
             .relative()
             .size_full()
             .flex()
@@ -199,7 +302,7 @@ impl Render for Shell {
                     .flex()
                     .flex_row()
                     .when(placement == SidebarPlacement::Docked, |this| {
-                        this.child(sidebar(c.bg_side, &theme))
+                        this.child(self.render_sidebar(c.bg_side, &theme))
                     })
                     .child(self.render_main(&theme)),
             )

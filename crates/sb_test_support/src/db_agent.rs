@@ -279,6 +279,10 @@ impl Exports<'_> {
 }
 
 impl Source for Exports<'_> {
+    fn root(&self) -> String {
+        self.database.clone()
+    }
+
     fn scan(&mut self) -> Result<Scan, ProviderError> {
         self.sessions.clear();
         let Some(snapshot) = DbSnapshot::take(self.transport, &self.database, self.scratch)? else {

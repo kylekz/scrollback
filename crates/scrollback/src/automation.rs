@@ -14,6 +14,16 @@
 //! - `shell`: `sidebar` (`docked`, `collapsed` or `overlay`, DESIGN §2), `window_material`
 //!   (what was applied to the window) and `window_native` (macOS: what AppKit reports, `forced`
 //!   light or dark or `null`, `opaque` and `vibrancy_view`; `null` elsewhere).
+//! - `page`: what the main area shows: `starting`, `archive-failed`, `first-run`, `sessions`
+//!   (All sessions, Starred or a folder), `unsorted` or `session` (an opened session).
+//! - `archive`: `dir`, and `state` (`opening`, `open` or `failed`, then with `error`).
+//! - `sync`: `syncing`, and `locations`, each with its `name`, `kind` and `state` (`syncing`,
+//!   `synced`, `failed` with `error`, or `never`).
+//! - `library`: `shelf` (`all`, `starred`, `unsorted`, or `{"folder": name}`), `counts` (`all`,
+//!   `starred`, `unsorted`), `folders` (each with its `name`, its `parent`'s name and its
+//!   `sessions`, in the catalogue's order), `sessions` and `groups` (how many the shown page
+//!   lists, `null` while it loads or is of the other kind), and the titles of the `selected`
+//!   and the `open` session.
 //!
 //! Commands, each replying with `state.appearance` after the change. An argument a command
 //! doesn't have is an error, so a misspelt one never passes for a change:
@@ -28,7 +38,10 @@ use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Context, Entity, Window};
 use gpui_appearance::{Appearance, Material, Mode};
 use gpui_automation::AutomationHost;
+use sb_core::catalogue::{SessionId, Shelf};
+use sb_core::location::LocationKind;
 use sb_ui::Shell;
+use sb_ui::services::{ActiveServices as _, ArchiveState, LocationStatus, Page};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -54,12 +67,16 @@ impl AutomationHost for ScrollbackAutomation {
                     "vibrancy_view": native.vibrancy_view,
                 })),
             },
+            "page": shell.showing(cx).key(),
+            "archive": archive(cx),
+            "sync": sync(cx),
+            "library": library(cx),
         })
     }
 
-    /// Nothing in the shell runs in the background yet.
-    fn settled(&self, _cx: &App) -> bool {
-        true
+    /// The archive is open or has failed to, and nothing is syncing, indexing or loading.
+    fn settled(&self, cx: &App) -> bool {
+        cx.services().is_settled(cx)
     }
 
     fn commands(&self) -> &'static [&'static str] {
@@ -92,6 +109,95 @@ impl AutomationHost for ScrollbackAutomation {
                 .with_context(|| format!("{cmd}'s arguments")),
         )
     }
+}
+
+/// `state.archive`.
+fn archive(cx: &App) -> Value {
+    let archive = cx.services().archive.read(cx);
+    let (state, error) = match archive.state() {
+        ArchiveState::Opening => ("opening", None),
+        ArchiveState::Open(_) => ("open", None),
+        ArchiveState::Failed(error) => ("failed", Some(error)),
+    };
+    json!({ "dir": archive.dir().display().to_string(), "state": state, "error": error })
+}
+
+/// `state.sync`.
+fn sync(cx: &App) -> Value {
+    let sync = cx.services().sync.read(cx);
+    let locations: Vec<Value> = sync
+        .locations()
+        .unwrap_or_default()
+        .iter()
+        .map(|location| {
+            let (state, error) = match sync.status(location) {
+                LocationStatus::Syncing { .. } => ("syncing", None),
+                LocationStatus::Synced(_) => ("synced", None),
+                LocationStatus::Failed(error) => ("failed", Some(error)),
+                LocationStatus::NeverSynced => ("never", None),
+            };
+            json!({
+                "name": location.name,
+                "kind": match location.kind {
+                    LocationKind::Local => "local",
+                },
+                "state": state,
+                "error": error,
+            })
+        })
+        .collect();
+    json!({ "syncing": sync.is_syncing(), "locations": locations })
+}
+
+/// `state.library`.
+fn library(cx: &App) -> Value {
+    let library = cx.services().library.read(cx);
+    let name = |folder| library.folder(folder).map(|folder| folder.name.clone());
+    let counts = library.counts();
+    let folders: Vec<Value> = library
+        .folders()
+        .iter()
+        .map(|folder| {
+            json!({
+                "name": folder.name,
+                "parent": folder.parent.and_then(name),
+                "sessions": counts.folders.get(&folder.id),
+            })
+        })
+        .collect();
+    let (sessions, groups) = match library.page() {
+        Some(Page::Sessions(page)) => (Some(page.sessions.len()), None),
+        Some(Page::Unsorted(groups)) => (None, Some(groups.len())),
+        None => (None, None),
+    };
+    // The selected session's title: on a page of sessions by its place, in Unsorted by its id.
+    let title_of = |id: &SessionId| match library.page()? {
+        Page::Sessions(page) => page.sessions.get(library.selected_index()?)?.title.clone(),
+        Page::Unsorted(groups) => groups
+            .iter()
+            .flat_map(|group| &group.sessions)
+            .find(|session| session.id == *id)?
+            .title
+            .clone(),
+    };
+    json!({
+        "shelf": match library.shelf() {
+            Shelf::All => json!("all"),
+            Shelf::Starred => json!("starred"),
+            Shelf::Unsorted => json!("unsorted"),
+            Shelf::Folder(folder) => json!({ "folder": name(folder) }),
+        },
+        "counts": {
+            "all": counts.all,
+            "starred": counts.starred,
+            "unsorted": counts.unsorted,
+        },
+        "folders": folders,
+        "sessions": sessions,
+        "groups": groups,
+        "selected": library.selected().and_then(title_of),
+        "open": library.open_session().and_then(|session| session.title.clone()),
+    })
 }
 
 /// `state.appearance`.

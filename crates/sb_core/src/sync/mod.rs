@@ -128,6 +128,55 @@ impl PassReport {
     }
 }
 
+/// What a provider's agent has at a location, before any of it is archived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Found {
+    pub provider: ProviderId,
+    /// Where the agent keeps it there ([`Source::root`]).
+    pub root: String,
+    /// How many sessions its items belong to.
+    pub sessions: usize,
+}
+
+/**
+ * What each of `providers` finds at the location behind `transport`, by a scan alone: what a
+ * location offers before it is added (PLAN §6.4; DESIGN §4.10). A provider whose agent is not
+ * there is left out; one that could not look is there with why. Nothing is archived or
+ * recorded.
+ */
+pub fn survey(
+    archive: &Archive,
+    transport: &dyn Transport,
+    providers: &[Box<dyn Provider + '_>],
+) -> Vec<Result<Found, (ProviderId, ProviderError)>> {
+    let scratch = archive.tmp();
+    providers
+        .iter()
+        .filter_map(|provider| {
+            let found = provider
+                .detect(transport, &scratch)
+                .and_then(|source| {
+                    let Some(mut source) = source else {
+                        return Ok(None);
+                    };
+                    let sessions: HashSet<_> = source
+                        .scan()?
+                        .items
+                        .into_iter()
+                        .filter_map(|item| item.session)
+                        .collect();
+                    Ok(Some(Found {
+                        provider: provider.id(),
+                        root: source.root(),
+                        sessions: sessions.len(),
+                    }))
+                })
+                .map_err(|error| (provider.id(), error));
+            found.transpose()
+        })
+        .collect()
+}
+
 /// One provider's pass over a location.
 #[derive(Debug)]
 pub struct Pass {

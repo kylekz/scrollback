@@ -24,7 +24,9 @@ use crate::{Agent, HomeTransport};
 
 /// A home folder holding the agent's root with its `projects/`.
 pub struct ProjectsTree {
-    home: TempDir,
+    home: PathBuf,
+    /// The temp dir the home folder is, when the tree made its own.
+    _temp: Option<TempDir>,
     root: PathBuf,
     /// The location's environment: the variable that says where the root is, when it is not
     /// where the agent puts it by default.
@@ -44,30 +46,51 @@ impl ProjectsTree {
     pub fn new() -> Self {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join(".claude");
-        Self::at(home, root, Vec::new())
+        Self::at(home.path().to_path_buf(), Some(home), root, Vec::new())
     }
 
     /// A tree somewhere else under the home folder, which the location's environment points
     /// the agent at.
     pub fn in_config_dir() -> Self {
         let home = tempfile::tempdir().unwrap();
-        let root = home.path().join("elsewhere/agent");
+        Self::configured(home.path().to_path_buf(), Some(home))
+    }
+
+    /// [`ProjectsTree::in_config_dir`] with `home` as the home folder, which stays when the
+    /// tree is dropped: for a process started with [`ProjectsTree::vars`] to find.
+    pub fn in_home(home: &Path) -> Self {
+        Self::configured(home.to_path_buf(), None)
+    }
+
+    fn configured(home: PathBuf, temp: Option<TempDir>) -> Self {
+        let root = home.join("elsewhere/agent");
         let vars = vec![(
             "CLAUDE_CONFIG_DIR".to_string(),
             root.to_str().unwrap().to_string(),
         )];
-        Self::at(home, root, vars)
+        Self::at(home, temp, root, vars)
     }
 
-    fn at(home: TempDir, root: PathBuf, vars: Vec<(String, String)>) -> Self {
+    fn at(
+        home: PathBuf,
+        temp: Option<TempDir>,
+        root: PathBuf,
+        vars: Vec<(String, String)>,
+    ) -> Self {
         fs::create_dir_all(root.join("projects")).unwrap();
         Self {
             home,
+            _temp: temp,
             root,
             vars,
             sessions: 0,
             record_bytes: 160,
         }
+    }
+
+    /// The location's environment: what points the agent, and its provider, at the tree.
+    pub fn vars(&self) -> &[(String, String)] {
+        &self.vars
     }
 
     /// Makes each record [`Session::append`] writes from now on carry about `bytes` bytes of
@@ -78,7 +101,7 @@ impl ProjectsTree {
 
     /// The location's home folder.
     pub fn home(&self) -> &Path {
-        self.home.path()
+        &self.home
     }
 
     /// This tree as a location.
@@ -145,6 +168,49 @@ impl ProjectsTree {
     pub fn modified_ago(&self, key: &str, ago: Duration) {
         self.set_modified(key, SystemTime::now() - ago);
     }
+
+    /// Writes the session `outline` describes: its prompt, one reply with its tool calls, and
+    /// its title. Returns the provider's id for the session.
+    pub fn outlined(&mut self, outline: &Outline) -> String {
+        let mut session = self.session(outline.project, 0);
+        let (year, month, day) = outline.day;
+        let at = |hour: u32| format!("{year:04}-{month:02}-{day:02}T{hour:02}:00:00.000Z");
+        session.transcript.user(
+            json!(outline.prompt),
+            json!({ "origin": { "kind": "human" }, "timestamp": at(11) }),
+        );
+        let blocks: Vec<Value> = std::iter::once(json!({ "type": "text", "text": "On it." }))
+            .chain((0..outline.calls).map(|call| {
+                json!({
+                    "type": "tool_use",
+                    "id": format!("toolu_{}_{call}", session.id),
+                    "name": "Bash",
+                    "input": { "command": "ls" },
+                })
+            }))
+            .collect();
+        session.transcript.assistant(
+            1,
+            outline.model,
+            json!(blocks),
+            json!({ "timestamp": at(12) }),
+        );
+        session.transcript.title(outline.title);
+        session.session_key().to_string()
+    }
+}
+
+/// A session as the library shows one: where it started, what it is called and asked, the
+/// model that answered, the day it ran, and how many tool calls its reply made.
+pub struct Outline<'a> {
+    pub project: &'a str,
+    pub title: &'a str,
+    pub prompt: &'a str,
+    pub model: &'a str,
+    /// Year, month and day. The session runs from 11:00 to 12:00 UTC, so the day is the same
+    /// in most of the world's time zones.
+    pub day: (i32, u32, u32),
+    pub calls: u32,
 }
 
 /// One session in a [`ProjectsTree`].

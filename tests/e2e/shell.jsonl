@@ -1,7 +1,10 @@
-{"scenario": {"window_size": "1440x900", "description": "The empty concept E shell (DESIGN §2, §4.1): its regions sit where DESIGN puts them, it is captured dark and light on the Opaque surfaces the boards draw, a narrow window collapses the sidebar, and --window-size and --theme do what they say"}}
+{"scenario": {"window_size": "1440x900", "fixture": "agent", "description": "The concept E shell (DESIGN §2, §4.1) around a small library: its regions sit where DESIGN puts them, it is captured dark and light on the Opaque surfaces the boards draw, a narrow window collapses the sidebar, and --window-size and --theme do what they say"}}
 {"cmd": "wait_ready", "timeout_ms": 20000}
 {"cmd": "settle"}
 {"cmd": "state", "expect": [{"pointer": "/app", "equals": "scrollback"}, {"pointer": "/data_dir", "equals": "${data_dir}"}, {"pointer": "/window/w", "equals": 1440}, {"pointer": "/window/h", "equals": 900}, {"pointer": "/shell/sidebar", "equals": "docked"}, {"pointer": "/appearance/mode", "equals": "system"}, {"pointer": "/appearance/pinned", "equals": null}]}
+// The first run (first_run.jsonl) adds this machine; from here on the shell has a library.
+{"cmd": "click", "target": "first-run/add"}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/sync/syncing", "equals": false}]}
 
 // DESIGN §1.4, §2: title bar 40, sidebar 248, the main area takes the rest.
 {"cmd": "bounds", "target": "titlebar", "expect_result": [{"pointer": "/x", "equals": 0}, {"pointer": "/y", "equals": 0}, {"pointer": "/w", "equals": 1440}, {"pointer": "/h", "equals": 40}, {"pointer": "/count", "equals": 1}]}
@@ -21,8 +24,9 @@
 {"cmd": "bounds", "target": "titlebar/min", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "gte": 1302}, {"pointer": "/x", "lte": 1303}, {"pointer": "/w", "equals": 46}]}
 {"cmd": "bounds", "target": "titlebar/close", "platforms": ["macos"], "expect_error": "no target"}
 
-// The sidebar's empty state (DESIGN §4.1, §4.10): four library rows 32 high inside its 8px padding and 1px right border, then the section buttons.
-{"cmd": "query", "prefix": "sidebar/", "expect_result": {"pointer": "", "len": 6}}
+// The sidebar (DESIGN §4.1): four library rows 32 high inside its 8px padding and 1px right border, the section buttons, and the location's row at its foot.
+{"cmd": "query", "prefix": "sidebar/", "expect_result": {"pointer": "", "len": 7}}
+{"cmd": "query", "prefix": "sidebar/location/", "expect_result": {"pointer": "", "len": 1}}
 {"cmd": "bounds", "target": "sidebar/all-sessions", "expect_result": [{"pointer": "/x", "equals": 8}, {"pointer": "/y", "equals": 50}, {"pointer": "/w", "equals": 231}, {"pointer": "/h", "equals": 32}]}
 // Three rows and three 1px gaps down: 149, or 148 where a fractional display scale (125%, 150%) rounds the gaps to whole device pixels.
 {"cmd": "bounds", "target": "sidebar/trash", "expect_result": [{"pointer": "/y", "gte": 148}, {"pointer": "/y", "lte": 149}, {"pointer": "/h", "equals": 32}]}
@@ -62,10 +66,15 @@
 {"cmd": "click", "x": 600, "y": 300, "button": "right", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
 {"cmd": "key", "keystroke": "secondary-b", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
 {"cmd": "click", "target": "titlebar/search", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
-// A press on the overlay leaves it open, and its own button toggles it.
+// A press on the overlay's empty space leaves it open, picking a row closes it (DESIGN §2), and its own button toggles it.
 {"cmd": "click", "target": "titlebar/sidebar", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
-{"cmd": "click", "target": "sidebar/all-sessions", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
+{"cmd": "click", "x": 100, "y": 420, "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
+{"cmd": "click", "target": "sidebar/starred", "expect": [{"pointer": "/shell/sidebar", "equals": "collapsed"}, {"pointer": "/library/shelf", "equals": "starred"}]}
+{"cmd": "click", "target": "titlebar/sidebar", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
 {"cmd": "click", "target": "titlebar/sidebar", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+// F6 shows it to give it the keyboard, and hides it when the keyboard goes back to the page.
+{"cmd": "key", "keystroke": "f6", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
+{"cmd": "key", "keystroke": "f6", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
 
 // A smaller --window-size is raised to the minimum (DESIGN §2: 960x600).
 {"restart": {"app_args": ["--window-size", "800x500"]}, "expect": [{"pointer": "/window/w", "equals": 960}, {"pointer": "/window/h", "equals": 600}, {"pointer": "/appearance/pinned", "equals": null}]}

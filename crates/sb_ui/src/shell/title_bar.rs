@@ -7,8 +7,12 @@
 //! group that needs more than its half keeps its own width and the field moves over by the
 //! difference. Each outer group's padding is on an inner box, so the two shares start equal.
 //!
-//! Search needs the index (PLAN §13 phase 6), Sync all a location (phase 3) and Settings its
-//! page (phase 7): until then each is drawn disabled and takes no clicks.
+//! **States** (DESIGN §4.1). The first run shows the mark alone: no search, Sync all or
+//! Settings (DESIGN §4.10). With a library, Sync all syncs every location, and while a pass
+//! runs its glyph turns, it reads "Syncing…" and a click does nothing. While the archive is
+//! opening or didn't open, it is drawn disabled (DESIGN §4.14). Search needs the index
+//! (PLAN §13 phase 6) and Settings its page (phase 7): until then each is drawn disabled and
+//! takes no clicks.
 //!
 //! **Caption buttons** (Windows). Each is a 46px-wide box, the bar's height, marked with gpui's
 //! `WindowControlArea` (`Min`, `Max`, `Close`), so Windows itself answers the hit test and
@@ -25,11 +29,14 @@ use gpui::{
 };
 
 use super::{Shell, SidebarPlacement};
+use crate::actions::library::SyncAll;
 use crate::actions::shell::{Dismiss, ToggleSidebar};
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{DISABLED_OPACITY, icon, kbd};
+use crate::components::{DISABLED_OPACITY, icon, kbd, sync_glyph};
 use crate::icons::SbIcon;
 use crate::keymap;
+use crate::pages::Showing;
+use crate::services::ActiveServices as _;
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
 /// The gap between the bar's items (`design/project/sb.css`, `.titlebar`).
@@ -45,6 +52,13 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &theme.colors;
+        let showing = Showing::now(cx);
+        let first_run = showing == Showing::FirstRun;
+        let has_library = matches!(
+            showing,
+            Showing::Sessions | Showing::Unsorted | Showing::Session
+        );
+        let syncing = cx.services().sync.read(cx).is_syncing();
         div()
             .id("titlebar")
             .flex_none()
@@ -83,15 +97,17 @@ impl Shell {
                         .child(mark(theme)),
                 ),
             )
-            .child(search_field(theme))
+            .when(!first_run, |this| this.child(search_field(theme)))
             .child(
                 div().flex_1().flex().justify_end().child(
                     div()
                         .flex()
                         .items_center()
                         .gap(GAP)
-                        .child(sync_all_button(theme))
-                        .child(settings_button(theme))
+                        .when(!first_run, |this| {
+                            this.child(sync_all_button(has_library, syncing, theme, cx))
+                                .child(settings_button(theme))
+                        })
                         // The caption buttons sit side by side, flush with the window's edge.
                         .map(|this| match CaptionButton::row(window) {
                             Some(buttons) => this.child(div().flex().children(buttons)),
@@ -223,12 +239,19 @@ fn search_field(theme: &SbTheme) -> AnyElement {
         .automation_target("titlebar/search")
 }
 
-/// Sync all (DESIGN §4.1): a small button that syncs every location. Disabled (module docs).
-fn sync_all_button(theme: &SbTheme) -> AnyElement {
+/// Sync all (DESIGN §4.1): a small button that syncs every location (`F5`). While a pass runs
+/// it says so and a click does nothing; without a library it is disabled (module docs).
+fn sync_all_button(
+    enabled: bool,
+    syncing: bool,
+    theme: &SbTheme,
+    cx: &mut Context<Shell>,
+) -> AnyElement {
     let c = &theme.colors;
     div()
         .id("titlebar-sync-all")
         .role(Role::Button)
+        .aria_label(format!("Sync all locations ({})", keymap::SYNC_ALL.label()))
         .flex_none()
         .flex()
         .items_center()
@@ -242,9 +265,27 @@ fn sync_all_button(theme: &SbTheme) -> AnyElement {
         .text_color(c.fg)
         .text_spec(&theme.text.control_small)
         .whitespace_nowrap()
-        .opacity(DISABLED_OPACITY)
-        .child(icon(SbIcon::RefreshCw, px(14.), c.fg))
-        .child("Sync all")
+        // A control inside the drag region.
+        .occlude()
+        .map(|this| {
+            if !enabled {
+                this.opacity(DISABLED_OPACITY)
+            } else if syncing {
+                this
+            } else {
+                this.cursor_pointer()
+                    .hover(|style| style.bg(c.s3))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.sync_all(&SyncAll, window, cx);
+                    }))
+            }
+        })
+        .child(sync_glyph(enabled && syncing, c.fg))
+        .child(if enabled && syncing {
+            "Syncing…"
+        } else {
+            "Sync all"
+        })
         .automation_target("titlebar/sync-all")
 }
 
