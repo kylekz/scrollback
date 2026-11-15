@@ -6,11 +6,13 @@ mod common;
 use std::fs;
 use std::io::{self, Read as _};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
-use sb_core::archive::{Archive, ArchiveError, Problem};
+use sb_core::archive::{Archive, ArchiveError, Problem, SegmentCache};
 use sb_core::catalogue::Reason;
+use sb_core::provider::SessionItems as _;
 use sb_test_support::{
     Agent, DbAgent, FileAgent, break_segment_commits, edit_catalogue, mend_segment_commits,
 };
@@ -481,6 +483,52 @@ fn a_read_that_stops_inside_a_segment_has_been_handed_no_bytes_that_were_not_arc
         Problem::of(&read_some().unwrap_err()),
         Some(&Problem::SegmentChanged { offset: 0 })
     );
+}
+
+#[test]
+fn a_session_read_again_through_its_cache_reads_the_bytes_it_was_parsed_from() {
+    let (mut bench, key) = two_segments();
+    let id = bench.session_id(&key);
+    let cache = Arc::new(SegmentCache::new(1));
+    let (pinned, first) = {
+        let session = bench
+            .archive()
+            .session(&id)
+            .unwrap()
+            .with_cache(cache.clone());
+        let mut first = Vec::new();
+        session
+            .open(&key, 0)
+            .unwrap()
+            .read_to_end(&mut first)
+            .unwrap();
+        (session.pinned().clone(), first)
+    };
+    let read_from = |archive: &Archive, offset: u64, length: usize| {
+        let session = archive.pinned_session(&pinned, cache.clone());
+        let mut bytes = vec![0; length];
+        session
+            .open(&key, offset)
+            .and_then(|mut reader| reader.read_exact(&mut bytes))
+            .map(|()| bytes)
+    };
+
+    /* The last segment read is kept: it is read again without its file. */
+    let last = bench.segment_files_of(&key).remove(1);
+    let last_bytes = fs::read(&last).unwrap();
+    fs::remove_file(&last).unwrap();
+    let at = first.len() as u64 - 10;
+    assert!(read_from(bench.archive(), at, 10).unwrap() == first[first.len() - 10..]);
+    /* Only one is kept: once another is read, a read that needs the last's file fails. */
+    assert!(read_from(bench.archive(), 0, 10).unwrap() == first[..10]);
+    assert!(read_from(bench.archive(), at, 10).is_err());
+    fs::write(&last, last_bytes).unwrap();
+
+    /* A sync that starts a new version leaves the pinned items where they were. */
+    bench.agent.rewrite(&key);
+    bench.sync();
+    assert_eq!(bench.versions(&key).len(), 2);
+    assert!(read_from(bench.archive(), 0, first.len()).unwrap() == first);
 }
 
 #[test]

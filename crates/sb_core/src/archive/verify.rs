@@ -105,7 +105,7 @@ impl Archive {
                 stored.provider.clone(),
                 stored.key.clone(),
             );
-            let mut reader = self.reader(stored, 0);
+            let mut reader = self.reader(stored, 0, None);
             let mut problems = Vec::new();
             let mut unread = None;
             loop {

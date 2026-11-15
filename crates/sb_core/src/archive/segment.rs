@@ -9,9 +9,11 @@
 //! the version as a whole at its end, so no reader is handed bytes other than the ones that
 //! were archived.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Read, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tempfile::{NamedTempFile, TempPath};
 use thiserror::Error;
@@ -159,6 +161,61 @@ impl From<Problem> for io::Error {
 }
 
 /**
+ * Segments readers decoded and checked, kept to be read again without decoding them anew: a
+ * reader that opens one body after another of a session (PLAN §9) reads the same few segments.
+ * It holds the `capacity` segments read last, each up to [`SEGMENT_BYTES`]. A stored segment
+ * never changes, so a kept one is always its file's bytes.
+ */
+pub struct SegmentCache {
+    capacity: usize,
+    /// The one read last at the back.
+    kept: Mutex<VecDeque<Kept>>,
+}
+
+/// A segment kept: its file, the hash the catalogue records for it, and its bytes.
+struct Kept {
+    file: PathBuf,
+    hash: Hash,
+    bytes: Arc<Vec<u8>>,
+}
+
+impl SegmentCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            kept: Mutex::new(VecDeque::with_capacity(capacity)),
+        }
+    }
+
+    fn get(&self, path: &Path, hash: Hash) -> Option<Arc<Vec<u8>>> {
+        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        let at = kept
+            .iter()
+            .position(|it| it.file == path && it.hash == hash)?;
+        let entry = kept.remove(at)?;
+        let bytes = entry.bytes.clone();
+        kept.push_back(entry);
+        Some(bytes)
+    }
+
+    fn put(&self, path: PathBuf, hash: Hash, bytes: Arc<Vec<u8>>) {
+        if self.capacity == 0 {
+            return;
+        }
+        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        kept.retain(|it| it.file != path);
+        if kept.len() == self.capacity {
+            kept.pop_front();
+        }
+        kept.push_back(Kept {
+            file: path,
+            hash,
+            bytes,
+        });
+    }
+}
+
+/**
  * A version's content from some offset on. Each segment is decompressed whole and checked
  * against the length and hash the catalogue recorded for it before any byte of it is handed
  * out, so a reader that stops early has still only seen archived bytes. Read from the start to
@@ -174,7 +231,7 @@ pub struct VersionReader {
     /// Problems known before anything is read.
     gaps: std::vec::IntoIter<Problem>,
     /// The checked bytes of the segment being handed out, and how many of them have been.
-    segment: Vec<u8>,
+    segment: Arc<Vec<u8>>,
     served: usize,
     /// How many bytes of the segment read next come before the offset reading starts at.
     skip: u64,
@@ -185,17 +242,20 @@ pub struct VersionReader {
     /// Whether every byte of the version so far was handed out and passed its checks.
     intact: bool,
     ended: bool,
+    /// Where segments decoded before are kept, and where this reader's go.
+    cache: Option<Arc<SegmentCache>>,
 }
 
 impl VersionReader {
     /// The version of `length` bytes hashing to `hash`, whose `segments` are in `dir`, from
-    /// its byte `start` on.
+    /// its byte `start` on, its segments kept in `cache` when there is one.
     pub(super) fn new(
         dir: PathBuf,
         segments: Vec<Segment>,
         length: u64,
         hash: Hash,
         start: u64,
+        cache: Option<Arc<SegmentCache>>,
     ) -> Self {
         let mut end = 0;
         let mut gaps = Vec::new();
@@ -225,12 +285,13 @@ impl VersionReader {
             segments,
             intact: gaps.is_empty() && start == 0,
             gaps: gaps.into_iter(),
-            segment: Vec::new(),
+            segment: Arc::default(),
             served: 0,
             skip,
             content: Hasher::new(),
             recorded: hash,
             ended: false,
+            cache,
         }
     }
 
@@ -241,40 +302,54 @@ impl VersionReader {
         self.content
     }
 
-    /// The bytes of the segment recorded as `recorded`, if its file holds exactly them.
-    fn checked(&self, recorded: &Segment) -> io::Result<Vec<u8>> {
-        let offset = recorded.offset;
-        let file = self.dir.join(super::layout::segment_file(offset));
-        let file = File::open(file).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                Problem::SegmentMissing { offset }.into()
-            } else {
-                error
-            }
-        })?;
-        /* No more is decompressed than the segment may hold, whatever the file claims. The
-        buffer is as large as the segment from the start: one that grows as it is filled
-        leaves the allocator holding every size it passed through, which over the segments
-        of a long session's items is hundreds of megabytes. */
-        let mut bytes = Vec::with_capacity(recorded.length.min(SEGMENT_BYTES) as usize + 1);
-        Decoder::new(file)?
-            .take(recorded.length + 1)
-            .read_to_end(&mut bytes)
-            /* An error with no code from the operating system is the decoder's: the file is
-            not the frame that was written. */
-            .map_err(|error| match error.raw_os_error() {
-                Some(_) => error,
-                None => Problem::SegmentUnreadable {
-                    offset,
-                    detail: error.to_string(),
-                }
-                .into(),
-            })?;
-        if Hash::of(&bytes) != recorded.hash {
-            return Err(Problem::SegmentChanged { offset }.into());
+    /// The bytes of the segment recorded as `recorded`, if its file holds exactly them: from
+    /// the cache when they were decoded and checked before.
+    fn checked(&self, recorded: &Segment) -> io::Result<Arc<Vec<u8>>> {
+        let path = self.dir.join(super::layout::segment_file(recorded.offset));
+        let cache = self.cache.as_ref();
+        if let Some(bytes) = cache.and_then(|cache| cache.get(&path, recorded.hash)) {
+            return Ok(bytes);
+        }
+        let bytes = Arc::new(decode(&path, recorded)?);
+        if let Some(cache) = cache {
+            cache.put(path, recorded.hash, bytes.clone());
         }
         Ok(bytes)
     }
+}
+
+/// The bytes of the segment file at `path`, decompressed, if they are what `recorded` says.
+fn decode(path: &Path, recorded: &Segment) -> io::Result<Vec<u8>> {
+    let offset = recorded.offset;
+    let file = File::open(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            Problem::SegmentMissing { offset }.into()
+        } else {
+            error
+        }
+    })?;
+    /* No more is decompressed than the segment may hold, whatever the file claims. The buffer
+    is as large as the segment from the start: one that grows as it is filled leaves the
+    allocator holding every size it passed through, which over the segments of a long
+    session's items is hundreds of megabytes. */
+    let mut bytes = Vec::with_capacity(recorded.length.min(SEGMENT_BYTES) as usize + 1);
+    Decoder::new(file)?
+        .take(recorded.length + 1)
+        .read_to_end(&mut bytes)
+        /* An error with no code from the operating system is the decoder's: the file is not
+        the frame that was written. */
+        .map_err(|error| match error.raw_os_error() {
+            Some(_) => error,
+            None => Problem::SegmentUnreadable {
+                offset,
+                detail: error.to_string(),
+            }
+            .into(),
+        })?;
+    if Hash::of(&bytes) != recorded.hash {
+        return Err(Problem::SegmentChanged { offset }.into());
+    }
+    Ok(bytes)
 }
 
 impl Read for VersionReader {
@@ -305,7 +380,7 @@ impl Read for VersionReader {
             /* What comes before the offset reading starts at is checked like the rest and not
             handed out. */
             let skip = std::mem::take(&mut self.skip);
-            self.segment.clear();
+            self.segment = Arc::default();
             self.served = 0;
             match self.checked(&recorded) {
                 Ok(bytes) => {
