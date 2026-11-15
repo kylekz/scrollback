@@ -102,6 +102,8 @@ pub fn init_with(
             connect: Arc::new(elsewhere),
             tester: Arc::new(|launcher, _| panic!("this test tests no {launcher:?}")),
             distros: Arc::new(|_| Ok(None)),
+            launcher: Arc::new(LocationKind::launcher),
+            development_home: None,
         },
         cx,
     );
@@ -131,6 +133,8 @@ pub fn init_reaching(
                     }),
                     tester: elsewhere.tester,
                     distros: elsewhere.distros,
+                    launcher: elsewhere.launcher,
+                    development_home: elsewhere.development_home,
                 },
             },
             cx,

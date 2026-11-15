@@ -94,7 +94,11 @@ pub struct Shell {
     /// Whether a narrow window shows the sidebar over its main area.
     sidebar_open: bool,
     /// The locations sheet while it is open, with where the keyboard was before it.
-    locations: Option<(Entity<LocationsSheet>, Option<FocusHandle>, Subscription)>,
+    locations: Option<(
+        Entity<LocationsSheet>,
+        Option<FocusHandle>,
+        [Subscription; 2],
+    )>,
     _observers: [Subscription; 6],
 }
 
@@ -235,10 +239,14 @@ impl Shell {
         }
         let back = window.focused(cx);
         let sheet = cx.new(|cx| LocationsSheet::new(selected, window, cx));
-        let closed = cx.subscribe_in(&sheet, window, |this, _, event, window, cx| match event {
-            LocationsSheetEvent::Close => this.close_locations(window, cx),
-        });
-        self.locations = Some((sheet, back, closed));
+        let heard = [
+            cx.subscribe_in(&sheet, window, |this, _, event, window, cx| match event {
+                LocationsSheetEvent::Close => this.close_locations(window, cx),
+            }),
+            // The shell draws the sheet's dialogs, so it redraws with the sheet.
+            cx.observe(&sheet, |_, _, cx| cx.notify()),
+        ];
+        self.locations = Some((sheet, back, heard));
         cx.notify();
     }
 
@@ -412,6 +420,13 @@ impl Render for Shell {
                     },
                 )
             }))
+            // A dialog over the sheet, on its own layer above it (DESIGN §3).
+            .children(
+                self.locations
+                    .as_ref()
+                    .map(|(sheet, ..)| sheet.clone())
+                    .and_then(|sheet| sheet.update(cx, |sheet, cx| sheet.dialog_layer(window, cx))),
+            )
     }
 }
 

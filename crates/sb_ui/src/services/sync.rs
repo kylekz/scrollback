@@ -49,7 +49,7 @@ use sb_core::location::{Location, LocationId, LocationKind};
 use sb_core::sync::{Found, IndexReport, Progress, SyncError, index, survey, sync_location};
 use sb_core::transport::Transport;
 
-use super::{ArchiveService, Connect, ListDistros, Providers, Tester};
+use super::{ArchiveService, Connect, Launch, ListDistros, Providers, Tester};
 use crate::format;
 
 mod locations;
@@ -176,6 +176,11 @@ pub struct Reach {
     pub connect: Connect,
     pub tester: Tester,
     pub distros: ListDistros,
+    /// What starts the shell of a WSL or SSH place: what its connection test runs and shows.
+    pub launcher: Launch,
+    /// The far side's home the development override reads every WSL and SSH location from,
+    /// while it is on: the sheet says so (`scrollback`'s `--dev-location-home`).
+    pub development_home: Option<String>,
 }
 
 /// What each of `providers` finds at the place `transport` reads, an agent that could not
@@ -299,6 +304,8 @@ pub struct SyncService {
     connect: Connect,
     tester: Tester,
     lister: ListDistros,
+    launch: Launch,
+    development_home: Option<String>,
     /// The owner's locations; `None` until they are read from the catalogue.
     locations: Option<Vec<Location>>,
     /// The locations the owner removed, whose sessions are still in the archive.
@@ -362,6 +369,8 @@ impl SyncService {
             connect: reach.connect,
             tester: reach.tester,
             lister: reach.distros,
+            launch: reach.launcher,
+            development_home: reach.development_home,
             locations: None,
             removed: Vec::new(),
             details: Details::default(),

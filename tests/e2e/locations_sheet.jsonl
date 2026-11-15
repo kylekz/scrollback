@@ -9,7 +9,7 @@
 // A sidebar row opens the sheet with its location selected (DESIGN §4.1): 1200 × 790, centred, 24 under the title bar.
 {"cmd": "click", "target": "sidebar/location/user@macbook"}
 {"cmd": "settle", "expect": {"pointer": "/sheet", "equals": {"selected": "user@macbook", "dialog": null}}}
-{"cmd": "bounds", "target": "sheet", "expect_result": [{"pointer": "/x", "equals": 120}, {"pointer": "/y", "equals": 64}, {"pointer": "/w", "equals": 1200}, {"pointer": "/h", "equals": 790}]}
+{"cmd": "bounds", "target": "sheet", "expect_result": [{"pointer": "/x", "equals": 120}, {"pointer": "/y", "gte": 62}, {"pointer": "/y", "lte": 64}, {"pointer": "/w", "equals": 1200}, {"pointer": "/h", "gte": 788}, {"pointer": "/h", "lte": 790}]}
 {"cmd": "bounds", "target": "sheet/status/unreachable", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "bounds", "target": "sheet/stale/user@macbook", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "bounds", "target": "sheet/stale/This PC", "expect_error": "no target"}

@@ -17,7 +17,7 @@ use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
     ButtonKind, button, card, dot, icon, kind_icon, kind_name, kv, label, location_tag,
-    progress_bar, said,
+    progress_bar, said, with_numbers,
 };
 use crate::format;
 use crate::icons::SbIcon;
@@ -216,9 +216,8 @@ impl LocationsSheet {
         };
         let last_good = kv(
             "Last good sync",
-            div()
-                .text_spec(&theme.text.number)
-                .child(match location.last_success {
+            with_numbers(
+                match location.last_success {
                     Some(at) => format!(
                         "{} {} · {}",
                         format::day(at, now),
@@ -226,7 +225,11 @@ impl LocationsSheet {
                         format::ago(at, now)
                     ),
                     None => "never".to_string(),
-                }),
+                },
+                c.fg2,
+                &theme.text.secondary,
+                theme,
+            ),
             theme,
         );
         let stale = stale(
@@ -488,7 +491,7 @@ fn found_card(
     }))
     .child(kv(
         "Archived from here",
-        div().text_spec(&theme.text.number).child(archived),
+        with_numbers(archived, c.fg2, &theme.text.secondary, theme),
         theme,
     ))
     .children(found.iter().filter_map(|found| {

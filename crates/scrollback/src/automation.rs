@@ -75,7 +75,7 @@ use sb_core::location::LocationKind;
 use sb_core::transport::wsl::Distro;
 use sb_core::transport::{
     Env, FileStat, Hashed, Launcher, Listing, LocalTransport, PrefixRequest, Probe, RangeFailure,
-    RangeRequest, RangeSink, Transport, TransportError,
+    RangeRequest, RangeSink, ShellTransport, Transport, TransportError,
 };
 use sb_ui::Shell;
 use sb_ui::services::sync::{TestFailure, TestState, stale};
@@ -575,6 +575,8 @@ pub fn stand_ins(cli: &Cli) -> Option<Reach> {
             }
         }),
         distros: Arc::new(|_| stage().distros.clone().map_err(TransportError::Failed)),
+        launcher: Arc::new(LocationKind::launcher),
+        development_home: None,
     })
 }
 
@@ -630,6 +632,32 @@ impl Transport for StandInHome {
 
     fn read_small(&self, path: &str) -> Result<Option<Vec<u8>>, TransportError> {
         LocalTransport.read_small(path)
+    }
+}
+
+/**
+ * The development override (`--dev-location-home`): every WSL and SSH location is reached
+ * through its own launcher, `wsl.exe` or `ssh`, with the far side's shell started with
+ * `home` for its home and nothing else of its environment ([`Launcher::reading_home`]), for
+ * its connection test, its survey and every pass. This machine is read as it is. Logged at
+ * the start, and said on the locations sheet, so that a build is never left in it unnoticed.
+ */
+pub fn development_override(home: &str) -> Reach {
+    log::warn!("development override: every WSL and SSH location is read with {home} for its home");
+    let launch = {
+        let home = home.to_string();
+        move |kind: &LocationKind| kind.launcher().map(|it| it.reading_home(&home))
+    };
+    let connect = launch.clone();
+    Reach {
+        connect: Arc::new(move |kind, cancel| match connect(kind) {
+            Some(launcher) => Box::new(ShellTransport::new(launcher).cancelled_by(cancel)),
+            None => Box::new(LocalTransport),
+        }),
+        tester: Arc::new(sb_ui::services::probe),
+        distros: Arc::new(sb_core::transport::wsl::distros),
+        launcher: Arc::new(launch),
+        development_home: Some(home.to_string()),
     }
 }
 
@@ -768,6 +796,36 @@ mod tests {
             (named.connect)(&host, &cancel).env(&[]),
             Err(TransportError::Unreachable(_))
         ));
+    }
+
+    #[test]
+    fn the_development_override_reads_distros_and_hosts_from_its_home_and_nothing_else() {
+        let reach = development_override("/home/user/fixture");
+        assert_eq!(
+            reach.development_home.as_deref(),
+            Some("/home/user/fixture")
+        );
+        let distro = LocationKind::Wsl {
+            distro: "Ubuntu-24.04".to_string(),
+        };
+        let wsl = (reach.launcher)(&distro).unwrap().command_line();
+        assert!(
+            wsl.starts_with("wsl.exe -d Ubuntu-24.04 --cd / --exec env -i PATH=")
+                && wsl.ends_with(" HOME=/home/user/fixture sh -s"),
+            "{wsl}"
+        );
+        let host = LocationKind::Ssh {
+            host: "user@macbook".to_string(),
+        };
+        let ssh = (reach.launcher)(&host).unwrap().command_line();
+        assert!(
+            ssh.starts_with("ssh -T -o BatchMode=yes")
+                && ssh.contains(" -- user@macbook env -i PATH=")
+                && ssh.ends_with(" HOME=/home/user/fixture sh -s"),
+            "{ssh}"
+        );
+        /* This machine has no launcher, and is read as it is. */
+        assert!((reach.launcher)(&LocationKind::Local).is_none());
     }
 
     #[test]

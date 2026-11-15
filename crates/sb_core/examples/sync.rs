@@ -76,17 +76,14 @@ impl Place {
             }
             ["--wsl", distro, "--home", home] => {
                 let distro = spelled(distro)?;
-                /* As the distro's shell is started, with `env` before the shell. */
-                let mut words = Launcher::Wsl {
+                let launcher = Launcher::Wsl {
                     distro: distro.clone(),
                 }
-                .words();
-                words.truncate(words.len() - 2);
-                words.extend(["env".to_string(), format!("HOME={home}")]);
+                .reading_home(home);
                 (
                     wsl_distro(&distro),
                     format!("{distro} {home}"),
-                    command(words),
+                    Some(launcher),
                 )
             }
             ["--ssh", host] => (

@@ -63,10 +63,17 @@ fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
         connect: Arc::new(LocationKind::transport),
         tester: Arc::new(sb_ui::services::probe),
         distros: Arc::new(wsl::distros),
+        launcher: Arc::new(LocationKind::launcher),
+        development_home: None,
     };
-    // A scripted run reaches only what its scenario put there.
+    // A scripted run reaches only what its scenario put there; a development run with the
+    // override reads its distros and hosts from a folder of generated data.
     #[cfg(feature = "automation")]
-    let reach = crate::automation::stand_ins(&cli).unwrap_or(reach);
+    let reach = match (crate::automation::stand_ins(&cli), &cli.dev_location_home) {
+        (Some(stand_ins), _) => stand_ins,
+        (None, Some(home)) => crate::automation::development_override(home),
+        (None, None) => reach,
+    };
     sb_ui::services::init(
         ServicesConfig {
             archive_dir: data_dir.join(ARCHIVE),

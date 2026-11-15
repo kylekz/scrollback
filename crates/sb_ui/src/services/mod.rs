@@ -49,6 +49,10 @@ pub type Providers = Arc<Vec<Box<dyn Provider>>>;
 /// machine's, a distro's and a host's.
 pub type Connect = Arc<dyn Fn(&LocationKind, &CancelToken) -> Box<dyn Transport> + Send + Sync>;
 
+/// What starts the shell of a place of a kind: [`LocationKind::launcher`], or under the
+/// development override the same reading another home.
+pub type Launch = Arc<dyn Fn(&LocationKind) -> Option<Launcher> + Send + Sync>;
+
 /// The connection test of the WSL distro or the SSH host a launcher starts a shell in, stopped
 /// by the token (DESIGN §4.12): what [`probe`] finds, or in tests a stand-in's answer.
 pub type Tester =

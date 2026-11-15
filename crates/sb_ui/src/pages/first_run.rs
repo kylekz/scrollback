@@ -470,7 +470,9 @@ impl Render for FirstRun {
                 },
             )
         });
-        div()
+        // The dialog's scrim covers the whole window: it is drawn beside the page, whose
+        // edges would clip it.
+        let page = div()
             .size_full()
             .flex()
             .justify_center()
@@ -583,8 +585,8 @@ impl Render for FirstRun {
                                     .automation_target("first-run/add"),
                             ),
                     ),
-            )
-            .children(dialog)
+            );
+        div().size_full().child(page).children(dialog)
     }
 }
 

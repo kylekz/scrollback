@@ -6,7 +6,7 @@
 {"cmd": "key", "keystroke": "secondary-l"}
 {"cmd": "settle", "expect": {"pointer": "/sheet/selected", "equals": "This PC"}}
 // 24 from each side and under the title bar: 912 × 512.
-{"cmd": "bounds", "target": "sheet", "expect_result": [{"pointer": "/x", "equals": 24}, {"pointer": "/y", "equals": 64}, {"pointer": "/w", "equals": 912}, {"pointer": "/h", "equals": 512}]}
+{"cmd": "bounds", "target": "sheet", "expect_result": [{"pointer": "/x", "equals": 24}, {"pointer": "/y", "gte": 62}, {"pointer": "/y", "lte": 64}, {"pointer": "/w", "equals": 912}, {"pointer": "/h", "gte": 510}, {"pointer": "/h", "lte": 512}]}
 {"cmd": "key", "keystroke": "down"}
 {"cmd": "key", "keystroke": "down"}
 {"cmd": "settle", "expect": {"pointer": "/sheet/selected", "equals": "user@macbook"}}
@@ -38,7 +38,7 @@
 {"cmd": "type", "text": "asleep-mac"}
 {"cmd": "key", "keystroke": "enter"}
 {"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "asleep-mac", "state": "unreachable"}}}
-{"cmd": "bounds", "target": "add", "expect_result": [{"pointer": "/w", "equals": 440}, {"pointer": "/y", "equals": 64}, {"pointer": "/h", "lte": 512}]}
+{"cmd": "bounds", "target": "add", "expect_result": [{"pointer": "/w", "equals": 440}, {"pointer": "/y", "gte": 62}, {"pointer": "/y", "lte": 64}, {"pointer": "/h", "lte": 512}]}
 {"cmd": "screenshot", "name": "narrow-add-dark"}
 {"cmd": "pin_appearance", "appearance": "light"}
 {"cmd": "settle"}

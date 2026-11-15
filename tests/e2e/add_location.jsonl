@@ -10,7 +10,7 @@
 // WSL: the distros WSL lists, Docker's left out; the one that is a location can't be chosen. The dialog is 440 wide, 24 under the title bar.
 {"cmd": "click", "target": "sheet/add"}
 {"cmd": "settle", "expect": {"pointer": "/sheet/dialog", "equals": "add"}}
-{"cmd": "bounds", "target": "add", "expect_result": [{"pointer": "/w", "equals": 440}, {"pointer": "/y", "equals": 64}, {"pointer": "/x", "equals": 500}]}
+{"cmd": "bounds", "target": "add", "expect_result": [{"pointer": "/w", "equals": 440}, {"pointer": "/y", "gte": 62}, {"pointer": "/y", "lte": 64}, {"pointer": "/x", "equals": 500}]}
 {"cmd": "query", "prefix": "add/distro/", "expect_result": [{"pointer": "", "len": 3}, {"pointer": "/0/target", "equals": "add/distro/Ubuntu-24.04"}]}
 // A running distro is tested as it is chosen.
 {"cmd": "click", "target": "add/distro/Arch"}

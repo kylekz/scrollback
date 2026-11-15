@@ -36,7 +36,7 @@ use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
     ButtonKind, DISABLED_OPACITY, bad_banner, button, card, icon, icon_button, info_banner, label,
-    radio, said, tab_stop,
+    radio, said, tab_stop, with_numbers,
 };
 use crate::format;
 use crate::icons::SbIcon;
@@ -1085,15 +1085,20 @@ pub(crate) fn test_card(
                     }))
                     .child(found_line(
                         "Found",
-                        if found.iter().flatten().next().is_some() {
-                            format!(
-                                "{} · {}",
-                                format::plural(sessions(found), "session"),
-                                format::size(total)
-                            )
-                        } else {
-                            "No transcripts found".to_string()
-                        },
+                        with_numbers(
+                            if found.iter().flatten().next().is_some() {
+                                format!(
+                                    "{} · {}",
+                                    format::plural(sessions(found), "session"),
+                                    format::size(total)
+                                )
+                            } else {
+                                "No transcripts found".to_string()
+                            },
+                            c.fg2,
+                            &theme.text.secondary,
+                            theme,
+                        ),
                         theme,
                     ))
                     .children(found.iter().flatten().filter_map(|found| {

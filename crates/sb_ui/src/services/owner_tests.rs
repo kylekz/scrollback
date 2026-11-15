@@ -92,6 +92,8 @@ fn init(
             connect: Arc::new(move |_, _| Box::new(other.transport())),
             tester: Arc::new(move |launcher, _| tester(launcher)),
             distros: Arc::new(|_| Ok(Some(distros()))),
+            launcher: Arc::new(LocationKind::launcher),
+            development_home: None,
         },
         cx,
     );
@@ -419,6 +421,8 @@ fn wsl_that_fails_to_list_says_so_in_its_words(cx: &mut TestAppContext) {
                     "The Windows Subsystem for Linux is not installed.".to_string(),
                 ))
             }),
+            launcher: Arc::new(LocationKind::launcher),
+            development_home: None,
         },
         cx,
     );
@@ -453,6 +457,8 @@ fn a_host_read_through_a_local_shell_passes_its_test_and_syncs(cx: &mut TestAppC
             // The real connection test, through a local shell in the host's place.
             tester: Arc::new(move |_, cancel| probe(&launcher, cancel)),
             distros: Arc::new(|_| Ok(None)),
+            launcher: Arc::new(LocationKind::launcher),
+            development_home: None,
         },
         cx,
     );
@@ -473,4 +479,36 @@ fn a_host_read_through_a_local_shell_passes_its_test_and_syncs(cx: &mut TestAppC
         assert_eq!(sync.details().sessions(&added[0].id), 1);
     });
     drop(host);
+}
+
+#[gpui::test]
+fn the_development_override_is_what_a_test_runs_and_shows(cx: &mut TestAppContext) {
+    let other = elsewhere();
+    init_reaching(
+        tempfile::tempdir().unwrap(),
+        machine(),
+        Reach {
+            connect: Arc::new(move |_, _| Box::new(other.transport())),
+            tester: Arc::new(|launcher, _| match launcher {
+                Launcher::Command { args, .. } if args.contains(&"HOME=/fixture".to_string()) => {
+                    Ok(answered())
+                }
+                other => panic!("the override's launcher, not {other:?}"),
+            }),
+            distros: Arc::new(|_| Ok(None)),
+            launcher: Arc::new(|kind| kind.launcher().map(|it| it.reading_home("/fixture"))),
+            development_home: Some("/fixture".to_string()),
+        },
+        cx,
+    );
+    let sync = cx.update(|cx| cx.services().sync.clone());
+    sync.update(cx, |sync, cx| sync.test_place(macbook(), cx));
+    cx.run_until_parked();
+    sync.read_with(cx, |sync, _| {
+        assert_eq!(sync.development_home(), Some("/fixture"));
+        let test = sync.test().unwrap();
+        assert!(matches!(test.state, TestState::Passed { .. }));
+        let command = test.command.as_deref().unwrap();
+        assert!(command.ends_with("HOME=/fixture sh -s"), "{command}");
+    });
 }

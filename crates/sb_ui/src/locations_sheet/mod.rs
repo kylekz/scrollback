@@ -33,8 +33,8 @@ use crate::add_location::{AddLocation, AddLocationEvent, Kind, Purpose};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
-    ButtonKind, bad_banner, button, dot, icon, icon_button, kind_name, kind_tile, location_tag,
-    overline, progress_bar, warn_banner, warn_chip,
+    ButtonKind, bad_banner, button, dot, focus_ring, icon, icon_button, info_banner, kind_name,
+    kind_tile, location_tag, overline, progress_bar, warn_banner, warn_chip, with_numbers,
 };
 use crate::format;
 use crate::icons::SbIcon;
@@ -371,7 +371,13 @@ impl LocationsSheet {
 
     /// A location's row (DESIGN §4.11): its kind's tile, its name and kind, where its agents
     /// keep their data, its state, and the action that suits it.
-    fn row(&self, location: &Location, theme: &SbTheme, cx: &mut Context<Self>) -> AnyElement {
+    fn row(
+        &self,
+        location: &Location,
+        keyboard: bool,
+        theme: &SbTheme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let c = &theme.colors;
         let sync = self.sync.read(cx);
         let now = format::now();
@@ -384,11 +390,14 @@ impl LocationsSheet {
             .iter()
             .filter_map(|found| found.root.as_deref().map(format::path))
             .collect();
+        // Numbers in the face for numbers (DESIGN §1.3).
         let line = |text: String, color| {
-            div()
-                .text_color(color)
-                .text_spec(&theme.text.secondary)
-                .child(text)
+            div().text_spec(&theme.text.secondary).child(with_numbers(
+                text,
+                color,
+                &theme.text.secondary,
+                theme,
+            ))
         };
         let archived = details.sessions(&location.id);
         let last_good = location.last_success.map(|at| {
@@ -487,6 +496,8 @@ impl LocationsSheet {
             .map(|this| {
                 if selected {
                     this.bg(c.s3)
+                        // The list has the keyboard, from the keyboard (DESIGN §5).
+                        .when(keyboard, |this| this.shadow(focus_ring(true, theme)))
                 } else {
                     this.hover(|style| style.bg(c.s1))
                 }
@@ -720,12 +731,20 @@ impl LocationsSheet {
 
     /// The list (DESIGN §4.11): refusals and stale banners, the locations, what was found and
     /// not added, and Add location at its foot.
-    fn list(&self, width: gpui::Pixels, theme: &SbTheme, cx: &mut Context<Self>) -> AnyElement {
+    fn list(
+        &self,
+        width: gpui::Pixels,
+        window: &Window,
+        theme: &SbTheme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let keyboard = self.list_focus.is_focused(window) && window.last_input_was_keyboard();
         let c = &theme.colors;
         let now = format::now();
         let locations = self.locations(cx).to_vec();
         let sync = self.sync.read(cx);
         let refused = sync.refused().map(str::to_string);
+        let development = sync.development_home().map(str::to_string);
         let kinds = add_kinds(sync);
         let stale: Vec<AnyElement> = locations
             .iter()
@@ -737,7 +756,7 @@ impl LocationsSheet {
             .collect();
         let rows: Vec<AnyElement> = locations
             .iter()
-            .map(|location| self.row(location, theme, cx))
+            .map(|location| self.row(location, keyboard, theme, cx))
             .collect();
         let found = self.found(theme, cx);
         div()
@@ -767,6 +786,16 @@ impl LocationsSheet {
                     .gap(px(2.))
                     .pt(px(10.))
                     .px(theme.spacing.md)
+                    // A build with the development override says so, plainly, at the top.
+                    .children(development.map(|home| {
+                        info_banner(theme)
+                            .mx(px(2.))
+                            .mb(theme.spacing.sm)
+                            .child(div().flex_1().child(format!(
+                                "Development override: locations are read from {home}"
+                            )))
+                            .automation_target("sheet/development")
+                    }))
                     .children(refused.map(|refused| {
                         bad_banner(theme)
                             .mx(px(2.))
@@ -857,30 +886,7 @@ impl Render for LocationsSheet {
                 .into_any_element(),
         };
         let header = self.header(&theme, cx);
-        let list = self.list(list, &theme, cx);
-        let weak = cx.entity().downgrade();
-        let dialog = self.add.clone().map(|dialog| {
-            let weak = weak.clone();
-            overlay::modal(dialog, Layer::Dialog, window, &theme, move |window, cx| {
-                weak.update(cx, |this, cx| this.close_dialog(window, cx))
-                    .ok();
-            })
-        });
-        let confirm = selected
-            .filter(|location| self.removing.as_ref() == Some(&location.id))
-            .map(|location| {
-                let confirm = self.confirm_removal(&location, window, &theme, cx);
-                overlay::modal(
-                    confirm,
-                    Layer::Confirm,
-                    window,
-                    &theme,
-                    move |window, cx| {
-                        weak.update(cx, |this, cx| this.close_dialog(window, cx))
-                            .ok();
-                    },
-                )
-            });
+        let list = self.list(list, window, &theme, cx);
         overlay::surface(&theme)
             .id("locations-sheet")
             .key_context(keymap::LOCATIONS_SHEET)
@@ -890,10 +896,50 @@ impl Render for LocationsSheet {
             .h(theme.sizes.sheet_height.min(room.height))
             .child(header)
             .child(div().flex_1().min_h_0().flex().child(list).child(detail))
-            .children(dialog)
-            .children(confirm)
             .focus_trap("locations-sheet-trap", &self.focus_handle)
             .automation_target("sheet")
+    }
+}
+
+impl LocationsSheet {
+    /**
+     * The dialog over the sheet, if one is open, on its own scrim: the add dialog, or the
+     * question before a removal. The shell draws it beside the sheet, each on a layer of its
+     * own, so that its scrim covers the sheet too and takes the presses on it.
+     */
+    pub fn dialog_layer(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let theme = cx.sb_theme().clone();
+        let weak = cx.entity().downgrade();
+        let dismiss = move |window: &mut Window, cx: &mut App| {
+            weak.update(cx, |this, cx| this.close_dialog(window, cx))
+                .ok();
+        };
+        if let Some(dialog) = self.add.clone() {
+            return Some(overlay::modal(
+                dialog,
+                Layer::Dialog,
+                window,
+                &theme,
+                dismiss,
+            ));
+        }
+        let location = self
+            .removing
+            .as_ref()
+            .and_then(|id| self.locations(cx).iter().find(|it| it.id == *id))
+            .cloned()?;
+        let confirm = self.confirm_removal(&location, window, &theme, cx);
+        Some(overlay::modal(
+            confirm,
+            Layer::Confirm,
+            window,
+            &theme,
+            dismiss,
+        ))
     }
 }
 

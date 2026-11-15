@@ -271,6 +271,12 @@ impl SyncService {
         self.distros.as_ref()
     }
 
+    /// The far side's home every WSL and SSH location is read from, while the development
+    /// override is on.
+    pub fn development_home(&self) -> Option<&str> {
+        self.development_home.as_deref()
+    }
+
     /// When every location is synced next, in Unix milliseconds.
     pub fn next_round(&self) -> Option<i64> {
         self.next_round
@@ -452,7 +458,7 @@ impl SyncService {
             return;
         };
         self.cancel_test();
-        let launcher = kind.launcher();
+        let launcher = (self.launch)(&kind);
         let cancel = CancelToken::new();
         self.test = Some(ConnectionTest {
             kind: kind.clone(),
