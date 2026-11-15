@@ -88,16 +88,24 @@ impl LocationKind {
         }
     }
 
+    /// What starts the shell of a WSL or SSH location: what its connection test runs, and
+    /// shows (DESIGN §4.12). `None` for this machine, which is read without one.
+    pub fn launcher(&self) -> Option<Launcher> {
+        match self {
+            Self::Local => None,
+            Self::Wsl { distro } => Some(Launcher::Wsl {
+                distro: distro.clone(),
+            }),
+            Self::Ssh { host } => Some(Launcher::Ssh { host: host.clone() }),
+        }
+    }
+
     /// The transport that reads a location of this kind. Cancelling `cancel` stops what a
     /// WSL or SSH location's transport is running.
     pub fn transport(&self, cancel: &CancelToken) -> Box<dyn Transport> {
-        let shell = |launcher| Box::new(ShellTransport::new(launcher).cancelled_by(cancel));
-        match self {
-            Self::Local => Box::new(LocalTransport),
-            Self::Wsl { distro } => shell(Launcher::Wsl {
-                distro: distro.clone(),
-            }),
-            Self::Ssh { host } => shell(Launcher::Ssh { host: host.clone() }),
+        match self.launcher() {
+            None => Box::new(LocalTransport),
+            Some(launcher) => Box::new(ShellTransport::new(launcher).cancelled_by(cancel)),
         }
     }
 }
@@ -132,6 +140,9 @@ pub struct Location {
     /// somewhere other than `/mnt/` (PLAN §6.3), as the last sync that reached it read
     /// there: its sessions' project paths under there are the drives' (PLAN §8).
     pub drive_mount: Option<String>,
+    /// When the owner removed it: it is synced no more, and what was archived from it stays
+    /// (FEATURES: Locations). `None` while it is one of the owner's locations.
+    pub removed: Option<i64>,
 }
 
 #[cfg(test)]

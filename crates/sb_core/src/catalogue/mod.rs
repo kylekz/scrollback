@@ -287,6 +287,31 @@ pub struct Waiting {
     pub reason: String,
 }
 
+/// A provider whose agent was found at a location (DESIGN §4.11), as its last pass there read
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderAt {
+    pub provider: String,
+    /// How long the agent keeps transcripts there, when it says.
+    pub retention_days: Option<u32>,
+    /// Where the agent keeps its data there ([`crate::provider::Source::root`]); `None` until
+    /// a pass records it.
+    pub root: Option<String>,
+}
+
+/// What the archive holds from one agent at one location.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Holding {
+    pub location: LocationId,
+    pub provider: String,
+    /// Its sessions in the index.
+    pub sessions: usize,
+    /// The length of every version of its items, as the source had them.
+    pub bytes: u64,
+    /// When the first of its versions was archived, in Unix milliseconds.
+    pub since: Option<i64>,
+}
+
 /// The catalogue's file in the archive's folder.
 pub(crate) const DATABASE: &str = "scrollback.db";
 
@@ -294,7 +319,7 @@ const ITEM: &str = "i.id, i.key, i.kind, i.session, i.seen_length, i.seen_stamp,
 const VERSION: &str = "v.id, v.number, v.reason, v.started_at, v.length, v.hash, v.held_back, \
                        v.held_by_parse, v.damaged, v.export_version";
 const LOCATION: &str = "id, kind, detail, name, last_attempt_at, last_success_at, last_error, \
-                        unreachable_since, unreachable_reason, drive_mount";
+                        unreachable_since, unreachable_reason, drive_mount, removed_at";
 
 /// The open catalogue: a cheap-to-clone handle. Every method blocks on disk I/O.
 #[derive(Clone, Debug)]
@@ -344,7 +369,38 @@ impl Catalogue {
             last_error: None,
             unreachable: None,
             drive_mount: None,
+            removed: None,
         })
+    }
+
+    /// Names a location `name`. Its id, and with it everything archived from it, stays.
+    pub fn rename_location(&self, location: &LocationId, name: &str) -> Result<()> {
+        self.execute(
+            "UPDATE location SET name = ?2 WHERE id = ?1",
+            params![location, name],
+        )
+    }
+
+    /**
+     * Removes a location (FEATURES: Locations): it is synced no more, and [`Self::locations`]
+     * gives it with when it was removed. Nothing archived from it is touched: its items,
+     * versions and sessions stay, filed as they were, and so does its row, which they name.
+     * Nothing reaches the location itself.
+     */
+    pub fn remove_location(&self, location: &LocationId) -> Result<()> {
+        self.execute(
+            "UPDATE location SET removed_at = COALESCE(removed_at, ?2) WHERE id = ?1",
+            params![location, now_ms()],
+        )
+    }
+
+    /// Makes a removed location one of the owner's again, named `name`: adding its place
+    /// again carries on from what was archived from it, rather than archiving it twice.
+    pub fn restore_location(&self, location: &LocationId, name: &str) -> Result<()> {
+        self.execute(
+            "UPDATE location SET removed_at = NULL, name = ?2 WHERE id = ?1",
+            params![location, name],
+        )
     }
 
     /**
@@ -389,7 +445,7 @@ impl Catalogue {
         })
     }
 
-    /// Every location, oldest first.
+    /// Every location, oldest first, those the owner removed among them.
     pub fn locations(&self) -> Result<Vec<Location>> {
         self.db.read(|c| {
             Ok(c.prepare(&format!(
@@ -459,18 +515,82 @@ impl Catalogue {
         )
     }
 
+    /// The providers whose agents were found at `location`, with where each keeps its data
+    /// there and for how long, as the last pass of each read them.
+    pub fn providers_at(&self, location: &LocationId) -> Result<Vec<ProviderAt>> {
+        self.db.read(|c| {
+            Ok(c.prepare(
+                "SELECT provider, retention_days, root FROM location_provider
+                 WHERE location_id = ?1 ORDER BY provider",
+            )?
+            .query_map([location], |row| {
+                Ok(ProviderAt {
+                    provider: row.get(0)?,
+                    retention_days: row.get(1)?,
+                    root: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// What the archive holds from each agent at each location it holds anything from
+    /// (DESIGN §4.11), by location and provider.
+    pub fn holdings(&self) -> Result<Vec<Holding>> {
+        self.db.read(|c| {
+            let mut holdings: Vec<Holding> = c
+                .prepare(
+                    "SELECT i.location_id, i.provider, SUM(v.length), MIN(v.started_at)
+                     FROM item i JOIN version v ON v.item_id = i.id
+                     GROUP BY i.location_id, i.provider
+                     ORDER BY i.location_id, i.provider",
+                )?
+                .query_map([], |row| {
+                    Ok(Holding {
+                        location: row.get(0)?,
+                        provider: row.get(1)?,
+                        sessions: 0,
+                        bytes: row.get(2)?,
+                        since: row.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut counts = c.prepare(
+                "SELECT location_id, provider, COUNT(*) FROM session
+                 GROUP BY location_id, provider",
+            )?;
+            for counted in counts.query_map([], |row| {
+                Ok((
+                    row.get::<_, LocationId>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, usize>(2)?,
+                ))
+            })? {
+                let (location, provider, sessions) = counted?;
+                if let Some(holding) = holdings
+                    .iter_mut()
+                    .find(|it| it.location == location && it.provider == provider)
+                {
+                    holding.sessions = sessions;
+                }
+            }
+            Ok(holdings)
+        })
+    }
+
     pub(crate) fn record_provider(
         &self,
         location: &LocationId,
         provider: &str,
         retention_days: Option<u32>,
+        root: &str,
     ) -> Result<()> {
         self.execute(
-            "INSERT INTO location_provider (location_id, provider, retention_days)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO location_provider (location_id, provider, retention_days, root)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (location_id, provider)
-             DO UPDATE SET retention_days = excluded.retention_days",
-            params![location, provider, retention_days],
+             DO UPDATE SET retention_days = excluded.retention_days, root = excluded.root",
+            params![location, provider, retention_days, root],
         )
     }
 
@@ -860,6 +980,7 @@ fn location_from(row: &Row<'_>) -> rusqlite::Result<Location> {
             _ => None,
         },
         drive_mount: row.get(9)?,
+        removed: row.get(10)?,
     })
 }
 

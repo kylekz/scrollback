@@ -142,6 +142,11 @@ pub struct Found {
     pub root: String,
     /// How many sessions its items belong to.
     pub sessions: usize,
+    /// How long its items are together: what a first sync copies.
+    pub bytes: u64,
+    /// How long the agent keeps transcripts there, when it says; `None` too when that could
+    /// not be read, which is no reason to doubt the rest.
+    pub retention_days: Option<u32>,
 }
 
 /**
@@ -165,16 +170,17 @@ pub fn survey(
                     let Some(mut source) = source else {
                         return Ok(None);
                     };
-                    let sessions: HashSet<_> = source
-                        .scan()?
-                        .items
-                        .into_iter()
-                        .filter_map(|item| item.session)
+                    let items = source.scan()?.items;
+                    let sessions: HashSet<_> = items
+                        .iter()
+                        .filter_map(|item| item.session.as_ref())
                         .collect();
                     Ok(Some(Found {
                         provider: provider.id(),
                         root: source.root(),
                         sessions: sessions.len(),
+                        bytes: items.iter().map(|item| item.length).sum(),
+                        retention_days: source.retention_days().ok().flatten(),
                     }))
                 })
                 .map_err(|error| (provider.id(), error));
@@ -354,7 +360,7 @@ fn pass(
         log::warn!("could not read how long {provider} keeps transcripts: {error}");
         None
     });
-    catalogue.record_provider(location, provider.as_str(), retention_days)?;
+    catalogue.record_provider(location, provider.as_str(), retention_days, &source.root())?;
 
     let scan = source.scan()?;
     progress(&Progress::Scanned {

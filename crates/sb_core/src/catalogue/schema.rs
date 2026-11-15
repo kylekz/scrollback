@@ -6,7 +6,7 @@ use toolbox_store::Schema;
 
 pub(super) const SCHEMA: Schema = Schema {
     domain: "scrollback",
-    steps: &[SYNC, LIBRARY, LOCATIONS],
+    steps: &[SYNC, LIBRARY, LOCATIONS, REMOVED],
 };
 
 /// What sync writes (PLAN §2.2): locations, items, versions and segments. Times are Unix
@@ -214,6 +214,16 @@ ALTER TABLE location ADD COLUMN unreachable_reason TEXT;
 -- Where a WSL distro mounts the Windows drives, when it is not the usual place: as its
 -- /etc/wsl.conf says, with a slash at each end. NULL for the usual place.
 ALTER TABLE location ADD COLUMN drive_mount TEXT;
+";
+
+/// Locations the owner removed (FEATURES: Locations), and where each agent keeps its data at a
+/// location (DESIGN §4.11).
+const REMOVED: &str = "
+-- When the owner removed the location: it is synced no more, and everything archived from it
+-- stays. NULL while it is one of the owner's locations.
+ALTER TABLE location ADD COLUMN removed_at INTEGER;
+-- Where the agent keeps its data there, as the provider names it, from the last pass.
+ALTER TABLE location_provider ADD COLUMN root TEXT;
 ";
 
 #[cfg(test)]
