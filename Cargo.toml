@@ -53,6 +53,8 @@ tempfile = "3"
 thiserror = "2"
 # Archive and location ids.
 uuid = { version = "1", features = ["v4"] }
+# Windows only: the rename that puts a segment in place (`sb_core::archive`). toolbox-rs's pin.
+windows-sys = "0.61"
 # Segments are zstd frames (PLAN §4.1).
 zstd = "0.13"
 
