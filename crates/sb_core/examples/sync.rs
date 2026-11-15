@@ -44,7 +44,7 @@ use sb_core::archive::{Archive, ArchiveError};
 use sb_core::catalogue::{Catalogue, Session, Shelf};
 use sb_core::location::LocationKind;
 use sb_core::provider;
-use sb_core::search::{self, Limit, Names};
+use sb_core::search::{self, Limit, Names, Searched};
 use sb_core::sync::{IndexReport, Progress, SyncError, index, sync_location};
 use sb_core::transcript::Ending;
 use sb_core::transport::{Launcher, ShellTransport, Transport, wsl};
@@ -225,7 +225,8 @@ fn print_index(catalogue: &Catalogue) -> Result<(), Box<dyn Error>> {
 }
 
 /// Searches the archive as the palette does, and prints what it found.
-fn find(catalogue: &Catalogue, input: &str) -> Result<(), Box<dyn Error>> {
+fn find(archive: &Archive, input: &str) -> Result<(), Box<dyn Error>> {
+    let catalogue = archive.catalogue();
     let started = Instant::now();
     let agents: Vec<_> = provider::builtin()
         .iter()
@@ -239,7 +240,13 @@ fn find(catalogue: &Catalogue, input: &str) -> Result<(), Box<dyn Error>> {
             agents: &agents,
         },
     );
-    let results = catalogue.search(&query, Limit::default(), &CancelToken::new())?;
+    let results = match archive.search(&query, Limit::default(), &CancelToken::new())? {
+        Searched::KeepTyping => {
+            println!("too short to look for: a letter or two of ASCII matches nearly everything");
+            return Ok(());
+        }
+        Searched::Results(results) => results,
+    };
     println!(
         "{} matches in {} sessions in {:.1?}",
         results.total_matches,
@@ -319,7 +326,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         [dir, "search", ref query @ ..] => {
             let archive = Archive::open(Path::new(dir))?;
-            return find(archive.catalogue(), &query.join(" "));
+            return find(&archive, &query.join(" "));
         }
         [dir, ref place @ ..] => (dir, "sync", Place::from(place)?),
         [] => return Err(USAGE.into()),

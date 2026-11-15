@@ -14,17 +14,27 @@
 //! catalogue records for them, by name, in each item's own folder, and nothing else. An item's
 //! folder is its alone (it is named by its key); the folders above it are shared, and are
 //! removed only when that leaves them empty ([`crate::archive::Archive::delete_for_good`]).
+//! What is freed in the catalogue's file is overwritten, so of the session the catalogue keeps
+//! only its tombstone: its title, its project path and its items' keys.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use toolbox_store::rusqlite::{self, OptionalExtension as _, params};
 
 use super::session::{archived, set_state};
 use super::{Catalogue, CatalogueError, Result, SessionId, now_ms};
+use crate::hash::Hash;
 use crate::location::LocationId;
 use crate::provider::ScannedItem;
 
-/// What deleting a session for good removes: what the confirmation names (DESIGN §4.8).
+/**
+ * What deleting a session for good removes: what the confirmation names (DESIGN §4.8), and
+ * what [`crate::archive::Archive::delete_for_good`] is given back, to delete only that.
+ *
+ * The session's title and project path stay in its tombstone, for Settings to name it; and the
+ * catalogue's backups made before the delete hold its row as it was (title, project path, the
+ * start of its first prompt) until they age out of `backups/`. Its text is in no backup.
+ */
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Deletion {
     pub session: SessionId,
@@ -55,68 +65,87 @@ pub struct Tombstone {
 pub(crate) struct Removal {
     pub location: LocationId,
     pub provider: String,
+    /// The item's folder: 32 hex digits, as the layout names it.
     pub folder: String,
-    pub files: Vec<ItemFile>,
+    /// Each file with its row in `removal`.
+    pub files: Vec<(i64, ItemFile)>,
 }
 
-/// A file in an item's folder (PLAN §4.1).
+/// A file in a deleted item's folder (PLAN §4.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ItemFile {
     /// Its `source.json`.
     Source,
+    /// A segment, which is removed only while it holds the `length` bytes of SHA-256 `hash`
+    /// that it held when it was deleted.
     Segment {
         version: u32,
         offset: u64,
+        length: u64,
+        hash: Hash,
     },
 }
 
 /// What a pass of one provider at one location skips (PLAN §5, step 2): the module docs.
 #[derive(Debug, Default)]
 pub(crate) struct Tombstoned {
-    keys: HashSet<String>,
+    /// The deleted items' keys, each with its tombstone's session.
+    keys: HashMap<String, String>,
     sessions: HashSet<String>,
 }
 
 impl Tombstoned {
-    /// Whether each of `scanned` is skipped, beside `archived`, the key and session of each
-    /// item the catalogue holds of the provider at the location.
+    /**
+     * Whether each of `scanned` is skipped, beside `archived`, the key and session of each item
+     * the catalogue holds of the provider at the location; and the tombstones (their sessions)
+     * of what is skipped, so the owner can be told that a session deleted for good goes on at
+     * its location unarchived.
+     */
     pub(crate) fn skips<'a>(
         &self,
         scanned: &[ScannedItem],
         archived: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
-    ) -> Vec<bool> {
+    ) -> (Vec<bool>, BTreeSet<String>) {
+        let mut met = BTreeSet::new();
         if self.keys.is_empty() && self.sessions.is_empty() {
-            return vec![false; scanned.len()];
+            return (vec![false; scanned.len()], met);
         }
         let now: HashMap<&str, Option<&str>> = scanned
             .iter()
             .map(|item| (item.key.as_str(), item.session.as_deref()))
             .collect();
-        let deleted: HashSet<&str> = self
+        /* Each session whose new items are skipped, with its tombstone. */
+        let mut deleted: HashMap<&str, &str> = self
             .sessions
             .iter()
-            .map(String::as_str)
-            .chain(
-                scanned
-                    .iter()
-                    .filter(|item| self.keys.contains(&item.key))
-                    .filter_map(|item| item.session.as_deref()),
-            )
+            .map(|session| (session.as_str(), session.as_str()))
             .collect();
+        for item in scanned {
+            if let (Some(tombstone), Some(session)) =
+                (self.keys.get(&item.key), item.session.as_deref())
+            {
+                deleted.entry(session).or_insert(tombstone);
+            }
+        }
         let live: HashSet<&str> = archived
             .into_iter()
             .filter_map(|(key, session)| now.get(key).copied().unwrap_or(session))
             .collect();
-        scanned
+        let skips = scanned
             .iter()
             .map(|item| {
-                self.keys.contains(&item.key)
-                    || item
-                        .session
-                        .as_deref()
-                        .is_some_and(|session| deleted.contains(session) && !live.contains(session))
+                let tombstone = self.keys.get(&item.key).map(String::as_str).or_else(|| {
+                    let session = item.session.as_deref()?;
+                    deleted
+                        .get(session)
+                        .filter(|_| !live.contains(session))
+                        .copied()
+                });
+                met.extend(tombstone.map(str::to_string));
+                tombstone.is_some()
             })
-            .collect()
+            .collect();
+        (skips, met)
     }
 }
 
@@ -155,15 +184,23 @@ impl Catalogue {
     }
 
     /**
-     * Deletes a session in Trash for good, in one transaction (PLAN §4.5): its items' rows and
-     * its own, with its search text and what the owner decided about it; a tombstone in their
+     * Deletes the session in Trash that `shown` is of for good, in one transaction (PLAN §4.5):
+     * its items' rows and its own, with what the owner decided about it; a tombstone in their
      * place; and, recorded as pending, the removal of every file the catalogue had for its
      * items, which the archive does once this is committed
-     * ([`crate::archive::Archive::delete_for_good`]).
+     * ([`crate::archive::Archive::delete_for_good`]). What is deleted is what was shown:
+     * if the session has another item, version or length now,
+     * [`CatalogueError::DeletionChanged`], and nothing is deleted.
      */
-    pub(crate) fn delete_for_good(&self, id: &SessionId) -> Result<Deletion> {
+    pub(crate) fn delete_for_good(&self, shown: &Deletion) -> Result<()> {
+        let id = &shown.session;
         self.db.write(|tx| {
-            let deletion = deletion(tx, id)?;
+            if deletion(tx, id)? != *shown {
+                return Err(CatalogueError::DeletionChanged(id.clone()));
+            }
+            /* What is freed in the file is overwritten: nothing of the session is left in it
+            but its tombstone. */
+            tx.pragma_update(None, "secure_delete", true)?;
             let identity = params![id.location, id.provider, id.key];
             let items: Vec<(i64, String, String)> = tx
                 .prepare(
@@ -197,21 +234,20 @@ impl Catalogue {
                     project_path
                 ],
             )?;
-            tx.execute(
+            for forget in [
                 "DELETE FROM session WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
-                identity,
-            )?;
-            tx.execute(
                 "DELETE FROM session_state
                  WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
-                identity,
-            )?;
+            ] {
+                tx.execute(forget, identity)?;
+            }
             for (item, key, folder) in &items {
                 tx.execute(
-                    "INSERT INTO removal (location_id, provider, folder, version, offset)
-                     SELECT ?1, ?2, ?3, NULL, NULL
+                    "INSERT INTO removal (location_id, provider, folder, version, offset, length,
+                                          hash)
+                     SELECT ?1, ?2, ?3, NULL, NULL, NULL, NULL
                      UNION ALL
-                     SELECT ?1, ?2, ?3, v.number, s.offset FROM version v
+                     SELECT ?1, ?2, ?3, v.number, s.offset, s.length, s.hash FROM version v
                      JOIN segment s ON s.version_id = v.id WHERE v.item_id = ?4",
                     params![id.location, id.provider, folder, item],
                 )?;
@@ -234,7 +270,7 @@ impl Catalogue {
                     params![id.location, id.provider, key],
                 )?;
             }
-            Ok(deletion)
+            Ok(())
         })
     }
 
@@ -289,34 +325,60 @@ impl Catalogue {
             let mut select = c.prepare(
                 "SELECT session, NULL FROM tombstone WHERE location_id = ?1 AND provider = ?2
                  UNION ALL
-                 SELECT NULL, key FROM tombstone_item WHERE location_id = ?1 AND provider = ?2",
+                 SELECT session, key FROM tombstone_item WHERE location_id = ?1 AND provider = ?2",
             )?;
             let mut rows = select.query(params![location, provider])?;
             while let Some(row) = rows.next()? {
-                match (row.get(0)?, row.get(1)?) {
-                    (Some(session), _) => tombstoned.sessions.insert(session),
-                    (_, Some(key)) => tombstoned.keys.insert(key),
-                    (None, None) => false,
-                };
+                let session: String = row.get(0)?;
+                match row.get(1)? {
+                    Some(key) => drop(tombstoned.keys.insert(key, session)),
+                    None => drop(tombstoned.sessions.insert(session)),
+                }
             }
             Ok(tombstoned)
         })
     }
 
-    /// The files of deleted items still to be removed, item by item.
+    /**
+     * The files of deleted items still to be removed, item by item. A row that does not name a
+     * place under `files/` as the layout makes them (an item's folder is 32 hex digits, a
+     * provider's id is lower-case letters, digits and `-`) is no file of this archive's: it is
+     * dropped, and said so in the log.
+     */
     pub(crate) fn removals(&self) -> Result<Vec<Removal>> {
-        self.db.read(|c| {
+        let mut unsound = Vec::new();
+        let removals = self.db.read(|c| {
             let mut removals: Vec<Removal> = Vec::new();
             let mut select = c.prepare(
-                "SELECT location_id, provider, folder, version, offset FROM removal
-                 ORDER BY location_id, provider, folder",
+                "SELECT rowid, location_id, provider, folder, version, offset, length, hash
+                 FROM removal ORDER BY location_id, provider, folder",
             )?;
             let mut rows = select.query([])?;
             while let Some(row) = rows.next()? {
-                let (location, provider, folder): (LocationId, String, String) =
-                    (row.get(0)?, row.get(1)?, row.get(2)?);
-                let file = match (row.get(3)?, row.get(4)?) {
-                    (Some(version), Some(offset)) => ItemFile::Segment { version, offset },
+                let (row_id, location, provider, folder): (i64, LocationId, String, String) =
+                    (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?);
+                let named = |text: &str, allowed: fn(u8) -> bool| {
+                    !text.is_empty() && text.bytes().all(allowed)
+                };
+                let sound = named(location.as_str(), |byte| byte.is_ascii_alphanumeric())
+                    && named(&provider, |byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+                    && folder.len() == 32
+                    && named(&folder, |byte| {
+                        byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                    });
+                if !sound {
+                    unsound.push(row_id);
+                    continue;
+                }
+                let file = match (row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?) {
+                    (Some(version), Some(offset), Some(length), Some(hash)) => ItemFile::Segment {
+                        version,
+                        offset,
+                        length,
+                        hash,
+                    },
                     _ => ItemFile::Source,
                 };
                 match removals.last_mut() {
@@ -324,18 +386,32 @@ impl Catalogue {
                         if (&last.location, &last.provider, &last.folder)
                             == (&location, &provider, &folder) =>
                     {
-                        last.files.push(file);
+                        last.files.push((row_id, file));
                     }
                     _ => removals.push(Removal {
                         location,
                         provider,
                         folder,
-                        files: vec![file],
+                        files: vec![(row_id, file)],
                     }),
                 }
             }
-            Ok(removals)
-        })
+            Ok::<_, CatalogueError>(removals)
+        })?;
+        if !unsound.is_empty() {
+            log::warn!(
+                "{} pending removals name no file of the archive",
+                unsound.len()
+            );
+            self.removed(&unsound)?;
+        }
+        Ok(removals)
+    }
+
+    /// How many files of deleted items are still to be removed.
+    pub(crate) fn pending_removals(&self) -> Result<usize> {
+        self.db
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM removal", [], |row| row.get(0))?))
     }
 
     /// Whether the catalogue records an item in the folder `folder` of `provider` at
@@ -357,12 +433,15 @@ impl Catalogue {
         })
     }
 
-    /// The removal of the item's files is done, or is not to be done.
-    pub(crate) fn removed(&self, removal: &Removal) -> Result<()> {
-        self.execute(
-            "DELETE FROM removal WHERE location_id = ?1 AND provider = ?2 AND folder = ?3",
-            params![removal.location, removal.provider, removal.folder],
-        )
+    /// The pending removals `rows` (of `removal`) are done, or are not to be done.
+    pub(crate) fn removed(&self, rows: &[i64]) -> Result<()> {
+        self.db.write(|tx| {
+            let mut done = tx.prepare("DELETE FROM removal WHERE rowid = ?1")?;
+            for row in rows {
+                done.execute([row])?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -379,28 +458,25 @@ fn trashed_at(connection: &rusqlite::Connection, id: &SessionId) -> Result<Optio
         .flatten())
 }
 
-/// What deleting the session in Trash `id` for good removes.
+/// What deleting the session in Trash `id` for good removes, from its items alone: its index
+/// row may be missing.
 fn deletion(connection: &rusqlite::Connection, id: &SessionId) -> Result<Deletion> {
     if trashed_at(connection, id)?.is_none() {
         return Err(CatalogueError::NotInTrash(id.clone()));
     }
-    let (files, bytes, at_location): (usize, u64, bool) = connection.query_row(
+    let (files, bytes, at_location, versions): (usize, u64, bool, usize) = connection.query_row(
         "SELECT count(*),
                 COALESCE(sum((SELECT sum(length) FROM version WHERE item_id = i.id)), 0),
-                COALESCE(max(i.gone_since IS NULL), 0)
+                COALESCE(max(i.gone_since IS NULL), 0),
+                COALESCE(sum(CASE WHEN i.kind = 'transcript'
+                             THEN (SELECT count(*) FROM version WHERE item_id = i.id) END), 0)
          FROM item i WHERE i.location_id = ?1 AND i.provider = ?2 AND i.session = ?3",
         params![id.location, id.provider, id.key],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
     if files == 0 {
         return Err(CatalogueError::NoSession(id.clone()));
     }
-    let versions = connection.query_row(
-        "SELECT count(*) FROM version v JOIN session s ON s.main_item = v.item_id
-         WHERE s.location_id = ?1 AND s.provider = ?2 AND s.session = ?3",
-        params![id.location, id.provider, id.key],
-        |row| row.get(0),
-    )?;
     Ok(Deletion {
         session: id.clone(),
         files,
@@ -428,26 +504,29 @@ mod tests {
     }
 
     /// Which of `scanned`, each a key and the session its provider says it is of, a pass
-    /// skips beside `archived`, after the session `a` with the item `a1` was deleted.
-    fn skipped(scanned: &[(&str, &str)], archived: &[(&str, &str)]) -> Vec<String> {
+    /// skips beside `archived`, after the session `a` with the item `a1` was deleted; and the
+    /// tombstones it met.
+    fn skipped(scanned: &[(&str, &str)], archived: &[(&str, &str)]) -> (Vec<String>, usize) {
         let tombstoned = Tombstoned {
-            keys: HashSet::from(["a1".to_string()]),
+            keys: HashMap::from([("a1".to_string(), "a".to_string())]),
             sessions: HashSet::from(["a".to_string()]),
         };
         let scanned: Vec<ScannedItem> = scanned
             .iter()
             .map(|(key, session)| self::scanned(key, session))
             .collect();
-        let skips = tombstoned.skips(
+        let (skips, met) = tombstoned.skips(
             &scanned,
             archived.iter().map(|(key, session)| (*key, Some(*session))),
         );
-        scanned
+        let skipped = scanned
             .into_iter()
             .zip(skips)
             .filter(|(_, skip)| *skip)
             .map(|(item, _)| item.key)
-            .collect()
+            .collect();
+        assert!(met.iter().all(|met| met == "a"));
+        (skipped, met.len())
     }
 
     #[test]
@@ -455,39 +534,44 @@ mod tests {
         /* Its item, and a new one of its session; never another session's. */
         assert_eq!(
             skipped(&[("a1", "a"), ("a2", "a"), ("b1", "b")], &[("b1", "b")]),
-            ["a1", "a2"]
+            (vec!["a1".to_string(), "a2".to_string()], 1)
+        );
+        /* Its transcript is gone at the source, and a new item of it appears. */
+        assert_eq!(
+            skipped(&[("a2", "a"), ("b1", "b")], &[("b1", "b")]),
+            (vec!["a2".to_string()], 1)
         );
         /* A classifier gave it another id: its item is found by its key, and the new one by
         the session that item is of now. */
         assert_eq!(
             skipped(&[("a1", "a'"), ("a2", "a'"), ("b1", "b")], &[("b1", "b")]),
-            ["a1", "a2"]
+            (vec!["a1".to_string(), "a2".to_string()], 1)
         );
         /* A classifier merged it with a session the archive holds: that session's backup goes
         on, and only the deleted item is skipped. */
         assert_eq!(
             skipped(&[("a1", "b"), ("b1", "b"), ("b2", "b")], &[("b1", "b")]),
-            ["a1"]
+            (vec!["a1".to_string()], 1)
         );
         /* A session the archive holds under the deleted id, as one merged into it is. */
         assert_eq!(
             skipped(&[("b1", "a"), ("b2", "a")], &[("b1", "a")]),
-            Vec::<String>::new()
+            (vec![], 0)
         );
         /* Nothing is skipped without a tombstone. */
         assert_eq!(
             Tombstoned::default().skips(&[scanned("a1", "a")], []),
-            [false]
+            (vec![false], BTreeSet::new())
         );
     }
 
     /**
-     * Deleting a session for good and searching read rows of tables that grow with the
-     * archive. Each looks them up by an index, a session's items by `item_session` and its
-     * spans by their range of ids, and none goes through a whole table of them.
+     * Deleting a session for good reads rows of tables that grow with the archive. Each looks
+     * them up by an index, a session's items by `item_session`, and none goes through a whole
+     * table of them.
      */
     #[test]
-    fn deleting_and_searching_find_their_rows_by_an_index() {
+    fn deleting_finds_its_rows_by_an_index() {
         let dir = tempfile::tempdir().unwrap();
         let archive = crate::archive::Archive::create(dir.path()).unwrap();
         let statements = [
@@ -495,11 +579,11 @@ mod tests {
              WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
             "SELECT count(*),
                     COALESCE(sum((SELECT sum(length) FROM version WHERE item_id = i.id)), 0),
-                    COALESCE(max(i.gone_since IS NULL), 0)
+                    COALESCE(max(i.gone_since IS NULL), 0),
+                    COALESCE(sum(CASE WHEN i.kind = 'transcript'
+                                 THEN (SELECT count(*) FROM version WHERE item_id = i.id) END), 0)
              FROM item i WHERE i.location_id = ?1 AND i.provider = ?2 AND i.session = ?3",
-            "SELECT count(*) FROM version v JOIN session s ON s.main_item = v.item_id
-             WHERE s.location_id = ?1 AND s.provider = ?2 AND s.session = ?3",
-            "SELECT v.number, s.offset FROM version v
+            "SELECT v.number, s.offset, s.length, s.hash FROM version v
              JOIN segment s ON s.version_id = v.id WHERE v.item_id = ?1",
             "DELETE FROM segment WHERE version_id IN (SELECT id FROM version WHERE item_id = ?1)",
             "DELETE FROM version WHERE item_id = ?1",
@@ -509,15 +593,10 @@ mod tests {
              )",
             "SELECT session, NULL FROM tombstone WHERE location_id = ?1 AND provider = ?2
              UNION ALL
-             SELECT NULL, key FROM tombstone_item WHERE location_id = ?1 AND provider = ?2",
+             SELECT session, key FROM tombstone_item WHERE location_id = ?1 AND provider = ?2",
             "DELETE FROM tombstone_item WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
-            "SELECT 'delete', id, text FROM span WHERE id BETWEEN ?1 AND ?2",
-            "DELETE FROM span WHERE id BETWEEN ?1 AND ?2",
-            "SELECT kind, subagent, turn, block, unattached, text FROM span WHERE id = ?1",
-            "SELECT rowid FROM session_text WHERE session_text MATCH ?1 ORDER BY rowid",
-            "SELECT id FROM span WHERE id BETWEEN ?1 AND ?2 AND text LIKE ?3 ORDER BY id",
             "SELECT id FROM session WHERE main_item = ?1",
-            "DELETE FROM removal WHERE location_id = ?1 AND provider = ?2 AND folder = ?3",
+            "DELETE FROM removal WHERE rowid = ?1",
         ];
         archive
             .catalogue()
@@ -532,9 +611,8 @@ mod tests {
                         .query_map([], |row| row.get(3))?
                         .collect::<rusqlite::Result<_>>()?;
                     assert!(
-                        plan.iter().all(|step| !step.starts_with("SCAN")
-                            || step.contains("VIRTUAL TABLE")
-                            || step == "SCAN CONSTANT ROW"),
+                        plan.iter()
+                            .all(|step| !step.starts_with("SCAN") || step == "SCAN CONSTANT ROW"),
                         "{sql}: {plan:#?}"
                     );
                     assert!(

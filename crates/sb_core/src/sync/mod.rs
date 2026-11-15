@@ -16,9 +16,10 @@ use thiserror::Error;
 use toolbox_process::CancelToken;
 
 use crate::archive::{Archive, ArchiveError};
-use crate::catalogue::{self, Catalogue, CatalogueError};
+use crate::catalogue::{self, Catalogue, CatalogueError, SessionId};
 use crate::location::{LocationId, LocationKind};
 use crate::provider::{Provider, ProviderError, ProviderId, ScannedItem, Source, Unlisted};
+use crate::search::SearchError;
 use crate::transport::{Transport, TransportError, wsl};
 
 pub use index::{IndexReport, index, index_session};
@@ -49,6 +50,8 @@ pub enum SyncError {
     Archive(#[from] ArchiveError),
     #[error(transparent)]
     Catalogue(#[from] CatalogueError),
+    #[error(transparent)]
+    Search(#[from] SearchError),
 }
 
 /// How long an item may keep changing under every pass that reads it before a pass counts it
@@ -113,6 +116,9 @@ pub struct PassReport {
     /// Of `scanned`, the items of sessions the owner deleted for good, which are not archived
     /// again (PLAN §4.5).
     pub deleted: usize,
+    /// The sessions deleted for good (their tombstones) that those items are of: sessions that
+    /// still exist at the location, and may be going on there, unarchived.
+    pub deleted_sessions: Vec<SessionId>,
     /// Bytes read from the location.
     pub bytes_fetched: u64,
     /// The bytes that went into segments.
@@ -316,7 +322,7 @@ fn pass(
 
     let archived = catalogue.archived(location, provider.as_str())?;
     /* What the owner deleted for good is not archived again (PLAN §4.5). */
-    let skips = catalogue.tombstoned(location, provider.as_str())?.skips(
+    let (skips, met) = catalogue.tombstoned(location, provider.as_str())?.skips(
         &scan.items,
         archived
             .iter()
@@ -341,6 +347,14 @@ fn pass(
     let mut report = PassReport {
         scanned,
         deleted: scanned - items.len(),
+        deleted_sessions: met
+            .into_iter()
+            .map(|key| SessionId {
+                location: location.clone(),
+                provider: provider.as_str().to_string(),
+                key,
+            })
+            .collect(),
         unchanged: plan.unchanged,
         touched: plan.back,
         gone: plan.gone.len(),

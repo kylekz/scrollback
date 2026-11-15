@@ -8,12 +8,11 @@
 //! The library is here too (PLAN §2.2): the owner's folders, attached paths and what they
 //! decided about a session ([`folder`]), Trash and the tombstones of sessions deleted for good
 //! ([`trash`]), and the derived index of each session ([`session`]), which is read through
-//! [`library`] and searched through [`search`].
+//! [`library`].
 
 mod folder;
 mod library;
 mod schema;
-mod search;
 mod session;
 mod trash;
 
@@ -36,8 +35,8 @@ pub use folder::{Folder, FolderPath};
 pub use library::{LibraryCounts, PathGroup, Shelf};
 pub(crate) use session::{Derived, Indexed, Reading, fingerprint};
 pub use session::{Filed, Session, SessionId, Usage};
-pub(crate) use trash::ItemFile;
 pub use trash::{Deletion, Tombstone};
+pub(crate) use trash::{ItemFile, Removal};
 
 #[derive(Debug, Error)]
 pub enum CatalogueError {
@@ -82,8 +81,10 @@ pub enum CatalogueError {
     NotInTrash(SessionId),
     #[error("no session {} of {} at location {} was deleted for good", .0.key, .0.provider, .0.location)]
     NoTombstone(SessionId),
-    #[error("the search was cancelled")]
-    Cancelled,
+    /// What deleting the session for good removes is not what was shown to the owner: an
+    /// item was added to it, or a version, since. Nothing was deleted.
+    #[error("the session {} of {} at location {} changed since it was shown", .0.key, .0.provider, .0.location)]
+    DeletionChanged(SessionId),
 }
 
 /// The most characters a folder's name has.
@@ -241,6 +242,7 @@ pub(crate) struct Archived {
 }
 
 /// A version and where its segments are, for verify and for reading it back.
+#[derive(Clone)]
 pub(crate) struct Stored {
     pub location: LocationId,
     pub provider: String,
@@ -315,16 +317,28 @@ pub struct Catalogue {
 }
 
 impl Catalogue {
-    /// Opens the catalogue in the archive folder `dir`, creating it if missing, with today's
-    /// backup and one before any migration.
+    /// Opens the catalogue in the archive folder `dir`, creating it if missing, with a backup
+    /// before any migration. Today's backup is [`Catalogue::daily_backup`]'s.
     pub(crate) fn open(dir: &Path) -> Result<Self> {
         let backups = backups(dir);
-        let options = OpenOptions::new(&schema::SCHEMA)
-            .backups(&backups)
-            .daily_backup(chrono::Local::now().date_naive());
+        let options = OpenOptions::new(&schema::SCHEMA).backups(&backups);
         Ok(Self {
             db: Database::open(&dir.join(DATABASE), &options)?,
         })
+    }
+
+    /// Makes today's backup of the catalogue, unless there is one. One that can't be made is
+    /// said in the log and is no reason not to go on.
+    pub(crate) fn daily_backup(&self) {
+        let made = backups(self.dir()).daily(self.db.path(), chrono::Local::now().date_naive());
+        if let Err(error) = made {
+            log::warn!("couldn't make today's backup of the catalogue: {error}");
+        }
+    }
+
+    /// The archive folder the catalogue is in.
+    fn dir(&self) -> &Path {
+        self.db.path().parent().unwrap_or(Path::new("."))
     }
 
     /// Whether anything is archived.
@@ -817,6 +831,40 @@ impl Catalogue {
                     row.get(0)
                 })?,
             )
+        })
+    }
+
+    /**
+     * Marks each of `versions` as damaged, or as damaged no more, if it is still the version
+     * that was read: its id is still of the version with that number of the item with that
+     * location, provider and key. One deleted since, whose id another version may have now,
+     * is left alone. Returns, for each, whether it was still there.
+     */
+    pub(crate) fn mark_as_read(&self, versions: &[(&Stored, bool)]) -> Result<Vec<bool>> {
+        self.db.write(|tx| {
+            let mut update = tx.prepare(
+                "UPDATE version SET damaged = ?2
+                 WHERE id = ?1 AND number = ?3 AND item_id = (
+                     SELECT id FROM item WHERE location_id = ?4 AND provider = ?5 AND key = ?6)",
+            )?;
+            let mut unchoose = tx.prepare("DELETE FROM reading_choice WHERE version_id = ?1")?;
+            let mut there = Vec::new();
+            for (stored, damaged) in versions {
+                let id = stored.version.id;
+                let marked = update.execute(params![
+                    id,
+                    damaged,
+                    stored.version.number,
+                    stored.location,
+                    stored.provider,
+                    stored.key
+                ])? > 0;
+                if marked && *damaged {
+                    unchoose.execute([id])?;
+                }
+                there.push(marked);
+            }
+            Ok(there)
         })
     }
 

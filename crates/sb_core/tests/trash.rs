@@ -29,6 +29,12 @@ for_both_agents!(
     a_session_deleted_for_good_stays_gone_until_its_tombstone_is_removed,
     a_tombstone_outlasts_a_rebuilt_index_and_a_classifier_that_renames_sessions,
     a_catalogue_restored_from_before_a_delete_has_the_rows_and_not_the_files,
+    deleting_for_good_leaves_no_text_of_the_session_in_any_file,
+    a_removal_that_fails_stays_pending_and_is_no_stray,
+    what_was_set_aside_of_a_deleted_item_goes_with_it,
+    a_session_that_changed_since_it_was_shown_is_not_deleted,
+    a_session_of_the_same_key_at_another_location_is_left_alone,
+    a_session_merged_with_one_in_trash_stays_in_trash,
 );
 
 /// Every file under `dir` with its bytes and modification time, by its path in `dir`; and
@@ -106,10 +112,6 @@ fn rows_of(dir: &Path, id: &SessionId) -> BTreeMap<&'static str, BTreeSet<String
         ),
         ("session", identity.clone()),
         ("session_state", identity.clone()),
-        (
-            "span",
-            format!("id >> 24 IN (SELECT id FROM session WHERE {identity})"),
-        ),
     ]
     .into_iter()
     .map(|(table, condition)| (table, rows(dir, table, &condition)))
@@ -309,7 +311,8 @@ fn deleting_for_good_removes_the_sessions_files_and_rows_and_nothing_else<A: Age
             .all(|table| tables_before.contains_key(*table))
     );
 
-    assert_eq!(bench.archive().delete_for_good(&id).unwrap(), deletion);
+    let deleted = bench.archive().delete_for_good(&deletion).unwrap();
+    assert_eq!((deleted.deletion, deleted.pending), (deletion.clone(), 0));
 
     /* Of files/, exactly the deleted items' folders are gone; the folder they shared with
     another session's is not. */
@@ -383,7 +386,7 @@ fn only_a_session_in_trash_is_deleted_for_good_and_not_while_its_location_syncs<
     let id = bench.session_id(&key);
     let files = snapshot(&bench.dir().join("files"));
     assert!(matches!(
-        bench.archive().delete_for_good(&id),
+        bench.delete_for_good(&id),
         Err(ArchiveError::Catalogue(CatalogueError::NotInTrash(_)))
     ));
     bench.archive().catalogue().trash(&id).unwrap();
@@ -391,10 +394,14 @@ fn only_a_session_in_trash_is_deleted_for_good_and_not_while_its_location_syncs<
     /* A pass of its location is under way. */
     let refused = AtomicBool::new(false);
     let archive = bench.archive();
+    let shown = archive.catalogue().deletion(&id).unwrap();
     bench
         .pass_with(bench.meddling(Meddle::at(When::AfterScan, || {
             refused.store(
-                matches!(archive.delete_for_good(&id), Err(ArchiveError::Syncing(_))),
+                matches!(
+                    archive.delete_for_good(&shown),
+                    Err(ArchiveError::Syncing(_))
+                ),
                 Ordering::Relaxed,
             );
         })))
@@ -407,8 +414,8 @@ fn only_a_session_in_trash_is_deleted_for_good_and_not_while_its_location_syncs<
         key: "no such session".to_string(),
         ..id.clone()
     };
-    assert!(bench.archive().delete_for_good(&nothing).is_err());
-    assert!(bench.archive().delete_for_good(&id).is_ok());
+    assert!(bench.delete_for_good(&nothing).is_err());
+    assert!(bench.delete_for_good(&id).is_ok());
 }
 
 fn a_session_deleted_for_good_stays_gone_until_its_tombstone_is_removed<A: Agent + Default>() {
@@ -418,11 +425,12 @@ fn a_session_deleted_for_good_stays_gone_until_its_tombstone_is_removed<A: Agent
     bench.sync();
     let id = trashed(&bench, &keys[0]);
     let content = bench.agent.content(&keys[0]);
-    bench.archive().delete_for_good(&id).unwrap();
+    bench.delete_for_good(&id).unwrap();
 
     /* The next sync skips it, and so does one after the agent went on with it. */
     let synced = bench.sync();
     assert_eq!((synced.deleted, synced.new_items), (1, 0));
+    assert_eq!(synced.deleted_sessions, std::slice::from_ref(&id));
     bench.agent.append(&keys[0], 2);
     let synced = bench.sync();
     assert_eq!(
@@ -462,7 +470,7 @@ fn a_session_deleted_for_good_stays_gone_until_its_tombstone_is_removed<A: Agent
 
     /* The deletion survives a restart. */
     let id = trashed(&bench, &keys[0]);
-    bench.archive().delete_for_good(&id).unwrap();
+    bench.delete_for_good(&id).unwrap();
     bench.reopen();
     assert_eq!(bench.sync().deleted, 1);
     assert_eq!(listed(&bench, Shelf::All).len(), 1);
@@ -476,7 +484,7 @@ fn a_tombstone_outlasts_a_rebuilt_index_and_a_classifier_that_renames_sessions<
     let bench = Bench::new(agent);
     bench.sync();
     let id = trashed(&bench, &keys[0]);
-    bench.archive().delete_for_good(&id).unwrap();
+    bench.delete_for_good(&id).unwrap();
     let catalogue = bench.archive().catalogue();
     catalogue.drop_index().unwrap();
     bench.index();
@@ -515,7 +523,7 @@ fn a_catalogue_restored_from_before_a_delete_has_the_rows_and_not_the_files<A: A
     bench.close();
     fs::copy(&catalogue, &backup).unwrap();
     bench.reopen();
-    bench.archive().delete_for_good(&id).unwrap();
+    bench.delete_for_good(&id).unwrap();
 
     /* The owner puts the older catalogue back: the session's rows are there, in Trash,
     and its files are not; verify says so, and the next sync, as the location still has the
@@ -579,7 +587,7 @@ fn deleting_for_good_takes_every_item_of_the_session_and_none_of_its_project() {
         .count();
     /* The subagent's transcript has its metadata beside it. */
     assert_eq!(items, keys.len() + 1);
-    let deletion = bench.archive().delete_for_good(&id).unwrap();
+    let deletion = bench.delete_for_good(&id).unwrap().deletion;
     assert_eq!(deletion.files, items);
 
     let left: Vec<String> = bench.items().into_iter().map(|item| item.key).collect();
@@ -615,10 +623,301 @@ fn what_turns_up_later_under_a_deleted_session_is_skipped() {
     let bench = Bench::new(FileAgent::on(tree));
     bench.sync();
     let id = trashed(&bench, &session.key);
-    bench.archive().delete_for_good(&id).unwrap();
+    bench.delete_for_good(&id).unwrap();
     /* Its transcript and the new subagent's, with its metadata. */
     session.subagent(3);
     let synced = bench.sync();
     assert_eq!((synced.deleted, synced.new_items), (3, 0));
     assert!(bench.items().is_empty());
+}
+
+/// Whether any file under `dir` holds `bytes`.
+fn held_anywhere(dir: &Path, bytes: &[u8]) -> Vec<PathBuf> {
+    common::files_under(dir)
+        .into_iter()
+        .filter(|file| {
+            fs::read(file)
+                .unwrap()
+                .windows(bytes.len())
+                .any(|run| run == bytes)
+        })
+        .collect()
+}
+
+/**
+ * A session is often deleted because it holds a secret. Once it is deleted for good, no file
+ * of the archive holds its text, nor a run of three characters of it the search index was made
+ * of: not the search index, not the catalogue, not either one's log. Only its tombstone keeps
+ * the start of its title.
+ */
+fn deleting_for_good_leaves_no_text_of_the_session_in_any_file<A: Agent + Default>() {
+    let mut agent = A::default();
+    let kept = agent.add_session(2);
+    let doomed = agent.add_session(0);
+    let title = "Rotate the keys of the staging cluster before the audit begins, carefully";
+    let secret = "qzxjvkwqzxjvkw";
+    agent.exchange(
+        &doomed,
+        &format!("{title}, and then tell nobody about vjqkzwxq."),
+        &format!("export TOKEN={secret}"),
+        "",
+        &format!("Done: {secret} is set."),
+    );
+    let bench = Bench::new(agent);
+    bench.sync();
+    let dir = bench.dir();
+    let id = trashed(&bench, &doomed);
+    assert!(!held_anywhere(dir, secret.as_bytes()).is_empty());
+    assert!(!held_anywhere(dir, b"vjqkzwxq").is_empty());
+
+    bench.delete_for_good(&id).unwrap();
+    for needle in [secret.as_bytes(), b"vjqkzwxq"] {
+        assert_eq!(held_anywhere(dir, needle), Vec::<PathBuf>::new());
+    }
+    /* Nor does the search index keep a run of three characters of it, nor its log. */
+    let search: Vec<PathBuf> = common::files_under(dir)
+        .into_iter()
+        .filter(|file| {
+            file.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("search.db"))
+        })
+        .collect();
+    assert!(!search.is_empty());
+    for run in secret.as_bytes().windows(3) {
+        for file in &search {
+            assert!(
+                !fs::read(file).unwrap().windows(3).any(|found| found == run),
+                "{} in {}",
+                String::from_utf8_lossy(run),
+                file.display()
+            );
+        }
+    }
+    /* The start of its first prompt beyond its title was in its row: it is gone too. */
+    assert_eq!(held_anywhere(dir, b"tell nobody"), Vec::<PathBuf>::new());
+    let start: String = format!("{title}, and then").chars().take(80).collect();
+    assert_eq!(
+        bench.archive().catalogue().tombstones().unwrap()[0].title,
+        Some(start)
+    );
+    bench.assert_mirrors(&[kept]);
+}
+
+/**
+ * A file of a deleted session that can't be removed (another program holds it) stays pending:
+ * verify says so apart from what the catalogue doesn't record, setting strays aside leaves it,
+ * the delete says how many are left, and the next start removes it.
+ */
+fn a_removal_that_fails_stays_pending_and_is_no_stray<A: Agent + Default>() {
+    let mut agent = A::default();
+    let key = agent.add_session(3);
+    let mut bench = Bench::new(agent);
+    bench.sync();
+    let id = trashed(&bench, &key);
+    /* Where a segment is, a folder that holds a file: no removal of a file removes it. */
+    let segment = bench.segment_files_of(&key).remove(0);
+    fs::remove_file(&segment).unwrap();
+    fs::create_dir(&segment).unwrap();
+
+    let deleted = bench.delete_for_good(&id).unwrap();
+    assert!(deleted.pending > 0);
+    let report = bench
+        .archive()
+        .verify(&sb_core::CancelToken::new())
+        .unwrap();
+    assert_eq!(report.uncatalogued, Vec::<PathBuf>::new());
+    let relative = segment.strip_prefix(bench.dir()).unwrap();
+    assert!(report.removing.iter().any(|path| path == relative));
+    let item = relative.parent().unwrap().parent().unwrap();
+    assert!(report.removing.iter().all(|path| path.starts_with(item)));
+    assert_eq!(
+        bench.archive().set_aside_uncatalogued().unwrap(),
+        Vec::<PathBuf>::new()
+    );
+    assert!(segment.exists() && bench.orphans().is_empty());
+
+    /* The other program lets go: the next start removes it. */
+    fs::remove_dir_all(&segment).unwrap();
+    bench.reopen();
+    bench.assert_verifies();
+    assert!(bench.segment_files().is_empty());
+
+    /* Where the operating system refuses the removal of the very bytes, they stay too, until
+    it lets them go; and then the next start removes them. */
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut agent = A::default();
+        let key = agent.add_session(3);
+        let mut bench = Bench::new(agent);
+        bench.sync();
+        let id = trashed(&bench, &key);
+        let segment = bench.segment_files_of(&key).remove(0);
+        let folder = segment.parent().unwrap().to_path_buf();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o500)).unwrap();
+        let deleted = bench.delete_for_good(&id).unwrap();
+        assert!(deleted.pending > 0 && segment.exists());
+        assert_eq!(
+            bench.archive().set_aside_uncatalogued().unwrap(),
+            Vec::<PathBuf>::new()
+        );
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+        bench.reopen();
+        assert!(!segment.exists() && bench.orphans().is_empty());
+        bench.assert_verifies();
+    }
+}
+
+/// What verify's strays were set aside from a deleted item's folder before the delete are
+/// that session's bytes: they go with it. What was set aside of another item stays.
+fn what_was_set_aside_of_a_deleted_item_goes_with_it<A: Agent + Default>() {
+    let mut agent = A::default();
+    let keys = [agent.add_session(3), agent.add_session(3)];
+    let bench = Bench::new(agent);
+    bench.sync();
+    let orphans = bench.dir().join("orphans");
+    let set_aside = |key: &str, number: &str| {
+        let segment = bench.segment_files_of(key).remove(0);
+        let relative = segment.strip_prefix(bench.dir()).unwrap();
+        let mut item = orphans.join(relative.parent().unwrap().parent().unwrap());
+        item.as_mut_os_string().push(number);
+        fs::create_dir_all(item.join("v0001")).unwrap();
+        fs::copy(
+            &segment,
+            item.join("v0001").join(segment.file_name().unwrap()),
+        )
+        .unwrap();
+    };
+    set_aside(&keys[0], "");
+    set_aside(&keys[0], ".1");
+    set_aside(&keys[1], "");
+    assert_eq!(bench.orphans().len(), 3);
+    let id = trashed(&bench, &keys[0]);
+    bench.delete_for_good(&id).unwrap();
+    let left = bench.orphans();
+    assert_eq!(left.len(), 1);
+    let other = Hash::of(keys[1].as_bytes()).to_hex();
+    assert!(left[0].iter().any(|part| part == &other[..32]));
+}
+
+/**
+ * What is deleted is what the confirmation showed: a session that gained bytes since is not
+ * deleted, and says so; shown again, it is. What the confirmation shows is read from the
+ * session's items, so it is the same while its index row is missing.
+ */
+fn a_session_that_changed_since_it_was_shown_is_not_deleted<A: Agent + Default>() {
+    let mut agent = A::default();
+    let key = agent.add_session(3);
+    let mut bench = Bench::new(agent);
+    bench.sync();
+    let id = trashed(&bench, &key);
+    let catalogue = bench.archive().catalogue();
+    let shown = catalogue.deletion(&id).unwrap();
+    assert_eq!(shown.versions, 1);
+    catalogue.drop_index().unwrap();
+    assert_eq!(catalogue.deletion(&id).unwrap(), shown);
+    bench.index();
+
+    bench.agent.append(&key, 2);
+    bench.sync();
+    let files = snapshot(&bench.dir().join("files"));
+    assert!(matches!(
+        bench.archive().delete_for_good(&shown),
+        Err(ArchiveError::Catalogue(CatalogueError::DeletionChanged(_)))
+    ));
+    assert!(snapshot(&bench.dir().join("files")) == files);
+    assert!(bench.archive().catalogue().tombstones().unwrap().is_empty());
+    let shown = bench.archive().catalogue().deletion(&id).unwrap();
+    assert!(bench.archive().delete_for_good(&shown).is_ok());
+    assert!(bench.segment_files().is_empty());
+}
+
+/**
+ * Another location can hold a session of the same key: the same agent's session ids at two
+ * machines. Deleting one leaves the other's rows and files as they were, and the other's
+ * syncs go on.
+ */
+fn a_session_of_the_same_key_at_another_location_is_left_alone<A: Agent + Default>() {
+    let mut agent = A::default();
+    let key = agent.add_session(3);
+    let bench = Bench::new(agent);
+    let mut there = A::default();
+    assert_eq!(there.add_session(3), key);
+    let elsewhere = bench
+        .archive()
+        .catalogue()
+        .add_location(sb_core::location::LocationKind::Local, "elsewhere")
+        .unwrap()
+        .id;
+    let sync_there = |bench: &Bench<A>, there: &A| {
+        sb_core::sync::sync_location(
+            bench.archive(),
+            &elsewhere,
+            &there.transport(),
+            &[there.provider()],
+            &sb_core::CancelToken::new(),
+            &mut |_| {},
+        )
+        .unwrap()
+    };
+    bench.sync();
+    sync_there(&bench, &there);
+    let other = SessionId {
+        location: elsewhere.clone(),
+        ..bench.session_id(&key)
+    };
+    let its_rows = rows_of(bench.dir(), &other);
+    let its_files: BTreeMap<_, _> = snapshot(&bench.dir().join("files"))
+        .into_iter()
+        .filter(|(path, _)| path.starts_with(elsewhere.as_str()))
+        .collect();
+    assert!(!its_files.is_empty());
+
+    let id = trashed(&bench, &key);
+    bench.delete_for_good(&id).unwrap();
+    assert_eq!(rows_of(bench.dir(), &other), its_rows);
+    let files: BTreeMap<_, _> = snapshot(&bench.dir().join("files"))
+        .into_iter()
+        .filter(|(path, _)| path.starts_with(elsewhere.as_str()))
+        .collect();
+    assert!(files == its_files);
+    assert!(
+        bench
+            .archive()
+            .catalogue()
+            .session(&other)
+            .unwrap()
+            .is_some()
+    );
+
+    there.append(&key, 2);
+    let passes = sync_there(&bench, &there);
+    let report = passes[0].outcome.as_ref().unwrap();
+    assert_eq!((report.appended, report.deleted), (1, 0));
+    assert_eq!(bench.sync().deleted, 1);
+    bench.assert_verifies();
+}
+
+/// When a newer parser makes one session of two and one of them was in Trash, the one there
+/// is now is in Trash: out of sight until the owner says otherwise.
+fn a_session_merged_with_one_in_trash_stays_in_trash<A: Agent + Default>() {
+    let mut agent = A::default();
+    let keys = [agent.add_session(3), agent.add_session(3)];
+    let bench = Bench::new(agent);
+    bench.sync();
+    let catalogue = bench.archive().catalogue();
+    catalogue
+        .set_starred(&bench.session_id(&keys[0]), true)
+        .unwrap();
+    trashed(&bench, &keys[1]);
+    let merged = || {
+        bench.meddling(Meddle::Classifier(|_, (kind, session)| {
+            (kind, session.map(|_| "merged".to_string()))
+        }))
+    };
+    bench.index_with(merged());
+    let sessions = catalogue.sessions(Shelf::Trash).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id.key, "merged");
+    assert!(catalogue.sessions(Shelf::All).unwrap().is_empty());
 }

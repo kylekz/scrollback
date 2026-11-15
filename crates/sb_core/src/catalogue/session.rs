@@ -18,9 +18,7 @@ use toolbox_store::rusqlite::{
     self, Connection, OptionalExtension as _, Row, ToSql, params, params_from_iter,
 };
 
-use super::{
-    Catalogue, CatalogueError, Held, Result, VERSION, Version, folder, search, version_from,
-};
+use super::{Catalogue, CatalogueError, Held, Result, VERSION, Version, folder, version_from};
 use crate::filing::{FolderId, NormalPath};
 use crate::hash::{Hash, Hasher};
 use crate::location::LocationId;
@@ -245,6 +243,9 @@ pub(super) const SESSION: &str = "
     LEFT JOIN session_state st
       ON st.location_id = s.location_id AND st.provider = s.provider AND st.session = s.session";
 
+/// What a row was made from, in one word ([`Catalogue::made`]).
+const MADE_FROM: &str = "s.indexed_from || ' ' || s.parser_version || ' ' || s.index_version";
+
 /// The session that did something last comes first; those with no time come last.
 pub(super) const BY_ACTIVITY: &str =
     "ORDER BY s.ended_at DESC NULLS LAST, s.location_id, s.provider, s.session";
@@ -416,6 +417,49 @@ impl Catalogue {
         })
     }
 
+    /**
+     * What the row of each session of `provider` at `location` (or at every location, or of
+     * every provider) was made from: its items' fingerprint, the parser's version and the
+     * index's. A session's search text is of the row it was made with ([`crate::search`]).
+     */
+    pub(crate) fn made(
+        &self,
+        location: Option<&LocationId>,
+        provider: Option<&str>,
+    ) -> Result<Vec<(SessionId, String)>> {
+        self.db.read(|c| {
+            Ok(c.prepare(&format!(
+                "SELECT s.location_id, s.provider, s.session, {MADE_FROM} FROM session s
+                 WHERE (?1 IS NULL OR s.location_id = ?1) AND (?2 IS NULL OR s.provider = ?2)
+                 {BY_ACTIVITY}"
+            ))?
+            .query_map(params![location, provider], |row| {
+                let id = SessionId {
+                    location: row.get(0)?,
+                    provider: row.get(1)?,
+                    key: row.get(2)?,
+                };
+                Ok((id, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// What the row of the session `id` was made from ([`Catalogue::made`]), if it has one.
+    pub(crate) fn made_of(&self, id: &SessionId) -> Result<Option<String>> {
+        self.db.read(|c| {
+            Ok(c.query_row(
+                &format!(
+                    "SELECT {MADE_FROM} FROM session s
+                     WHERE s.location_id = ?1 AND s.provider = ?2 AND s.session = ?3"
+                ),
+                params![id.location, id.provider, id.key],
+                |row| row.get(0),
+            )
+            .optional()?)
+        })
+    }
+
     /// Removes the rows of `sessions`, which are sessions no more ([`Catalogue::stale`]). What
     /// the owner decided about them stays, for the day they are sessions again.
     pub(crate) fn forget_sessions(&self, sessions: &[SessionId]) -> Result<()> {
@@ -525,21 +569,7 @@ impl Catalogue {
                     from
                 ],
             )?;
-            let Some(derived) = &derived else {
-                return Ok(false);
-            };
-            let row: i64 = tx.query_row(
-                "SELECT id FROM session WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
-                params![id.location, id.provider, id.key],
-                |row| row.get(0),
-            )?;
-            search::record_spans(
-                tx,
-                row,
-                derived.index.title.as_deref(),
-                &derived.index.spans,
-            )?;
-            Ok(folder::file_by_rule(tx, id, project.as_ref())?)
+            Ok(derived.is_some() && folder::file_by_rule(tx, id, project.as_ref())?)
         })
     }
 
@@ -678,15 +708,7 @@ impl Catalogue {
     /// Empties the derived tables (PLAN §2.2). The next index fills them again from the
     /// archive; what the owner decided about each session stays.
     pub fn drop_index(&self) -> Result<()> {
-        self.db.write(|tx| {
-            /* The search text at once, rather than a session's spans at a time as the rows go. */
-            tx.execute_batch(
-                "INSERT INTO session_text (session_text) VALUES ('delete-all');
-                 DELETE FROM span;
-                 DELETE FROM session;",
-            )?;
-            Ok(())
-        })
+        self.execute("DELETE FROM session", [])
     }
 
     /**
@@ -752,7 +774,8 @@ impl Catalogue {
  *   with that item;
  * - either way only to a session about which nothing is decided yet. What is then left under
  *   an id that no item has is dropped: two sessions that become one keep the decisions of
- *   the first to arrive, and those about a session whose items belong to none are gone.
+ *   the first to arrive, and those about a session whose items belong to none are gone;
+ *   but the one kept is in Trash if either was.
  */
 pub(super) fn classify(
     connection: &Connection,
@@ -785,6 +808,16 @@ pub(super) fn classify(
     )?;
     let own = (was_kind, kind) == (ItemKind::Transcript, ItemKind::Transcript);
     if let Some(session) = session.filter(|_| own || left) {
+        /* Where the session it goes to has state already, which this state does not replace,
+        it is in Trash if either was: of the two, keeping a session out of sight until the
+        owner says otherwise is the side that loses nothing. */
+        connection.execute(
+            "UPDATE session_state SET trashed_at = COALESCE(trashed_at, (
+                 SELECT trashed_at FROM session_state
+                 WHERE location_id = ?1 AND provider = ?2 AND session = ?3))
+             WHERE location_id = ?1 AND provider = ?2 AND session = ?4",
+            params![location, provider, was, session],
+        )?;
         connection.execute(
             "UPDATE OR IGNORE session_state SET session = ?4
              WHERE location_id = ?1 AND provider = ?2 AND session = ?3",

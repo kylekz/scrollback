@@ -4,12 +4,13 @@
 
 use std::collections::HashMap;
 
-use toolbox_store::rusqlite::{self, params_from_iter};
+use toolbox_store::rusqlite::{self, ToSql, params_from_iter};
 
 use super::session::{BY_ACTIVITY, SESSION, session_from};
-use super::{Catalogue, Result, Session};
+use super::{Catalogue, Result, Session, SessionId};
 use crate::filing::{FolderId, NormalPath};
 use crate::location::LocationId;
+use crate::search::Filters;
 
 /// The sessions one page of the library lists. Every page but Trash leaves out the sessions
 /// in Trash (PLAN §4.5).
@@ -102,6 +103,50 @@ impl Catalogue {
             Ok(c.prepare(&format!("{SESSION} WHERE {of} {BY_ACTIVITY}"))?
                 .query_map(params_from_iter(folder), session_from)?
                 .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// Every session `filters` let through (PLAN §10), the one that did something last first.
+    pub(crate) fn filtered(&self, filters: &Filters) -> Result<Vec<SessionId>> {
+        let (shelf, folder) = on_shelf(filters.shelf, ":folder");
+        let location = filters.location.as_ref();
+        let agent = filters.agent.map(|agent| agent.as_str());
+        let mut named: Vec<(&str, &dyn ToSql)> = vec![
+            (":location", &location),
+            (":agent", &agent),
+            (":model", &filters.model),
+            (":branch", &filters.branch),
+            (":after", &filters.after),
+            (":before", &filters.before),
+        ];
+        if let Some(folder) = &folder {
+            named.push((":folder", folder));
+        }
+        self.db.read(|c| {
+            Ok(c.prepare(&format!(
+                "SELECT s.location_id, s.provider, s.session FROM session s
+                 LEFT JOIN session_state st
+                   ON st.location_id = s.location_id AND st.provider = s.provider
+                  AND st.session = s.session
+                 WHERE {shelf}
+                   AND (:location IS NULL OR s.location_id = :location)
+                   AND (:agent IS NULL OR s.provider = :agent)
+                   AND (:model IS NULL OR EXISTS (
+                       SELECT 1 FROM json_each(s.models)
+                       WHERE instr(lower(value), lower(:model))))
+                   AND (:branch IS NULL OR s.branch = :branch COLLATE NOCASE)
+                   AND (:after IS NULL OR COALESCE(s.ended_at, s.started_at) >= :after)
+                   AND (:before IS NULL OR COALESCE(s.started_at, s.ended_at) < :before)
+                 {BY_ACTIVITY}"
+            ))?
+            .query_map(named.as_slice(), |row| {
+                Ok(SessionId {
+                    location: row.get(0)?,
+                    provider: row.get(1)?,
+                    key: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
         })
     }
 

@@ -216,7 +216,8 @@ ALTER TABLE location ADD COLUMN unreachable_reason TEXT;
 ALTER TABLE location ADD COLUMN drive_mount TEXT;
 ";
 
-/// Search (PLAN §10), Trash and deleting for good (PLAN §4.5).
+/// Trash and deleting for good (PLAN §4.5). Search's text is not here but in a database of its
+/// own (`crate::search`), so the catalogue and its backups hold none of it.
 const SEARCH_AND_DELETING: &str = "
 -- When the owner moved the session to Trash, while it is there.
 ALTER TABLE session_state ADD COLUMN trashed_at INTEGER;
@@ -254,49 +255,21 @@ CREATE INDEX reading_choice_version ON reading_choice (version_id);
 
 -- A file of a session deleted for good whose removal from files/ is not done yet, in the folder
 -- of an item that is no longer in the catalogue: a segment, by its version's number and its
--- offset, or with neither, the item's source.json.
+-- offset, with the length and SHA-256 of what it holds; or with none of those, the item's
+-- source.json. A file that no longer holds what it held when it was deleted is not removed.
 CREATE TABLE removal (
     location_id TEXT NOT NULL,
     provider TEXT NOT NULL,
     folder TEXT NOT NULL,
     version INTEGER,
     offset INTEGER,
-    CHECK ((version IS NULL) = (offset IS NULL))
+    length INTEGER,
+    hash TEXT,
+    CHECK ((version IS NULL) = (offset IS NULL) AND (version IS NULL) = (length IS NULL)
+           AND (version IS NULL) = (hash IS NULL))
 ) STRICT;
 
 CREATE INDEX removal_item ON removal (location_id, provider, folder);
-
--- Derived: the text search matches (PLAN §10), a row per span of a session's row. id is the
--- session's row id times 2^24 plus the span's place among the session's, from 0, so a session's
--- spans are a range of ids, in the order of its conversation. kind is title, prompt, reply,
--- command or path; subagent: the text is a subagent's. A match opens the session at turn and
--- block (for a subagent's text, the call it ran under), or at the subagent unattached that no
--- call is known to have started; a title opens it at its start.
-CREATE TABLE span (
-    id INTEGER PRIMARY KEY,
-    kind TEXT NOT NULL,
-    subagent INTEGER NOT NULL,
-    turn INTEGER,
-    block INTEGER,
-    unattached INTEGER,
-    text TEXT NOT NULL
-) STRICT;
-
--- The index of span's text. It holds no copy of the text, which is span's.
-CREATE VIRTUAL TABLE session_text USING fts5 (
-    text,
-    content = 'span',
-    content_rowid = 'id',
-    tokenize = 'trigram case_sensitive 0 remove_diacritics 1'
-);
-
--- A session's row goes with its spans, however it goes.
-CREATE TRIGGER session_spans_go AFTER DELETE ON session BEGIN
-    INSERT INTO session_text (session_text, rowid, text)
-        SELECT 'delete', id, text FROM span
-        WHERE id BETWEEN old.id * 16777216 AND old.id * 16777216 + 16777215;
-    DELETE FROM span WHERE id BETWEEN old.id * 16777216 AND old.id * 16777216 + 16777215;
-END;
 ";
 
 #[cfg(test)]

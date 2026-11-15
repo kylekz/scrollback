@@ -1,14 +1,19 @@
 //! Search (PLAN §10, DESIGN §4.9, §12): what the index step keeps of each session's text, what
 //! a query finds in it, with which filters, and where a match opens the session. The cases
 //! run against both agents, the file-tree one and the made-up one that keeps a database; a
-//! subagent's text, which only the file-tree agent writes, has a case of its own.
+//! subagent's text, which only the file-tree agent writes, has a case of its own. Each ends by
+//! verifying the archive, which checks the search index against the text it indexes.
 
 mod common;
 
+use std::fs;
+
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
-use sb_core::catalogue::{CatalogueError, Shelf};
-use sb_core::search::{self, Filters, Limit, MatchKind, Names, Query, Results};
+use sb_core::catalogue::Shelf;
+use sb_core::search::{
+    self, Filters, Key, Limit, MatchKind, Names, Query, Results, SearchError, Searched,
+};
 use sb_core::transcript::{At, Content};
 use sb_test_support::{Agent, FileAgent, Items, ProjectsTree};
 use serde_json::json;
@@ -17,10 +22,12 @@ use common::{Bench, for_both_agents};
 
 for_both_agents!(
     a_sessions_text_is_found_where_it_is_and_tool_output_is_not,
-    a_short_term_is_read_for_and_a_long_one_looked_up,
+    a_session_holds_every_term_somewhere_and_spans_with_all_show_first,
+    a_short_term_is_read_for_or_narrows_or_waits_for_more,
     what_is_typed_is_text_whatever_it_holds,
     the_filters_narrow_what_is_found,
     the_index_emptied_and_built_again_finds_the_same,
+    the_search_text_is_made_again_when_it_is_missing_or_unreadable,
     a_session_in_trash_is_found_only_there_and_one_deleted_for_good_nowhere,
     the_first_matches_of_a_session_are_given_and_the_rest_counted,
 );
@@ -39,7 +46,7 @@ fn bench<A: Agent + Default>() -> (Bench<A>, [String; 2]) {
     let second = agent.add_session(2);
     agent.exchange(
         &second,
-        "Rename the 解析器 widget, Café edition",
+        "Rename the 解析器 widget, Café edition, for the Юг office",
         "cargo test -p widget",
         "ok",
         "Done: the widget is renamed.",
@@ -51,18 +58,20 @@ fn bench<A: Agent + Default>() -> (Bench<A>, [String; 2]) {
 
 /// What `input`, typed into the palette, finds.
 fn find<A: Agent>(bench: &Bench<A>, input: &str) -> Results {
-    try_find(bench, input, Limit::default()).unwrap()
+    match try_find(bench, input, Limit::default()).unwrap() {
+        Searched::Results(results) => results,
+        Searched::KeepTyping => panic!("{input:?} waits for more"),
+    }
 }
 
 fn try_find<A: Agent>(
     bench: &Bench<A>,
     input: &str,
     limit: Limit,
-) -> Result<Results, CatalogueError> {
-    let catalogue = bench.archive().catalogue();
+) -> Result<Searched, SearchError> {
     let (query, unresolved) = search::query(input, &names(bench));
     assert_eq!(unresolved, [], "{input}");
-    catalogue.search(&query, limit, &CancelToken::new())
+    bench.archive().search(&query, limit, &CancelToken::new())
 }
 
 fn names<A: Agent>(bench: &Bench<A>) -> Names<'static> {
@@ -98,6 +107,17 @@ fn transcript_of<A: Agent>(bench: &Bench<A>, session: &str) -> String {
         .key
 }
 
+/// The kind of each match shown of the one session `input` finds.
+fn kinds<A: Agent>(bench: &Bench<A>, input: &str) -> Vec<MatchKind> {
+    let results = find(bench, input);
+    assert_eq!(results.sessions.len(), 1, "{input}");
+    results.sessions[0]
+        .shown
+        .iter()
+        .map(|found| found.kind)
+        .collect()
+}
+
 fn a_sessions_text_is_found_where_it_is_and_tool_output_is_not<A: Agent + Default>() {
     let (bench, [first, second]) = bench::<A>();
     let results = find(&bench, "parse_args");
@@ -113,7 +133,7 @@ fn a_sessions_text_is_found_where_it_is_and_tool_output_is_not<A: Agent + Defaul
     let transcript = bench.agent.provider().parse(&items);
     let conversation = transcript.conversation.unwrap();
     for found in shown {
-        assert!(!found.subagent);
+        assert!(!found.subagent && !found.cut);
         assert_eq!(found.snippet.hits.len(), 1, "{found:?}");
         let hit = found.snippet.hits[0].clone();
         assert_eq!(&found.snippet.text[hit], "parse_args");
@@ -134,19 +154,18 @@ fn a_sessions_text_is_found_where_it_is_and_tool_output_is_not<A: Agent + Defaul
     assert_eq!(hits(&bench, "MAIN MODULE"), [first.as_str()]);
     assert_eq!(hits(&bench, "MaIn MoD"), [first.as_str()]);
     assert_eq!(hits(&bench, "odul"), [first.as_str()]);
-    assert_eq!(hits(&bench, "renamed")[..], [second.as_str()]);
-    /* Without regard to accents either. */
+    assert_eq!(hits(&bench, "renamed"), [second.as_str()]);
+    /* Without regard to accents either, both ways. */
     assert_eq!(hits(&bench, "cafe"), [second.as_str()]);
+    assert_eq!(hits(&bench, "CAFÉ"), [second.as_str()]);
     /* A path, whole or in part. */
     assert_eq!(hits(&bench, "src/main.rs"), [first.as_str()]);
     assert_eq!(hits(&bench, "main.rs"), [first.as_str()]);
-    /* Every term in one span: the two are in different ones. */
-    assert_eq!(find(&bench, "defined module").total_matches, 0);
     /* What the tool said is not searched (PLAN D10). */
     assert_eq!(find(&bench, "parse_args_from_output").total_matches, 0);
     /* Text in any script. */
     assert_eq!(hits(&bench, "解析器"), [second.as_str()]);
-    /* Both sessions have "the" in some span: the one that did something last comes first. */
+    /* Both sessions have "the" somewhere: the one that did something last comes first. */
     let both = find(&bench, "the");
     let mut sessions = found(&bench, &both);
     sessions.sort();
@@ -155,28 +174,73 @@ fn a_sessions_text_is_found_where_it_is_and_tool_output_is_not<A: Agent + Defaul
         both.sessions[0].session.ended >= both.sessions[1].session.ended,
         "{both:?}"
     );
+    bench.assert_verifies();
 }
 
-fn a_short_term_is_read_for_and_a_long_one_looked_up<A: Agent + Default>() {
+fn a_session_holds_every_term_somewhere_and_spans_with_all_show_first<A: Agent + Default>() {
     let (bench, [first, second]) = bench::<A>();
-    /* Two characters are too few for the index to hold: the text is read for them. */
+    /* "defined" is in the prompt, "module" in the reply: the session holds both. */
+    assert_eq!(hits(&bench, "defined module"), [first.as_str()]);
+    assert_eq!(
+        kinds(&bench, "defined module"),
+        [MatchKind::Prompt, MatchKind::Reply]
+    );
+    /* The command holds both terms, so it comes first; then each that holds one. */
+    assert_eq!(
+        kinds(&bench, "main parse_args"),
+        [MatchKind::Command, MatchKind::Prompt, MatchKind::Reply]
+    );
+    /* Every term, not any: nothing holds both of these. */
+    assert_eq!(find(&bench, "defined renamed").total_sessions, 0);
+    assert_eq!(hits(&bench, "widget renamed"), [second.as_str()]);
+    bench.assert_verifies();
+}
+
+fn a_short_term_is_read_for_or_narrows_or_waits_for_more<A: Agent + Default>() {
+    let (bench, [first, second]) = bench::<A>();
+    /* Two characters are too few for the index to hold: the text is read for them, folded
+    as the index folds it. */
     let short = find(&bench, "解析");
     assert_eq!(found(&bench, &short), [second.as_str()]);
-    let hit = short.sessions[0].shown[0].snippet.hits[0].clone();
-    assert_eq!(&short.sessions[0].shown[0].snippet.text[hit], "解析");
-    assert_eq!(hits(&bench, "-p"), [second.as_str()]);
-    /* A short term with a long one narrows what the long one finds. */
+    let snippet = &short.sessions[0].shown[0].snippet;
+    assert_eq!(&snippet.text[snippet.hits[0].clone()], "解析");
+    assert_eq!(hits(&bench, "ЮГ"), [second.as_str()]);
+    /* A letter or two of ASCII alone would match nearly everything. */
+    for input in ["ok", "-p", "_", "%", "a b", "é"] {
+        assert_eq!(
+            try_find(&bench, input, Limit::default()).unwrap(),
+            Searched::KeepTyping,
+            "{input}"
+        );
+    }
+    /* A short term with a long one narrows what the long one finds, and is marked too. */
     assert_eq!(hits(&bench, "is main"), [first.as_str()]);
     assert_eq!(hits(&bench, "-p widget"), [second.as_str()]);
     assert_eq!(find(&bench, "zz widget").total_matches, 0);
-    /* `%` and `_` are what they are, not patterns. */
-    assert_eq!(hits(&bench, "_"), [first.as_str()]);
-    assert_eq!(find(&bench, "%").total_matches, 0);
+    let narrowed = find(&bench, "-p widget");
+    let command = narrowed.sessions[0]
+        .shown
+        .iter()
+        .find(|found| found.kind == MatchKind::Command)
+        .unwrap();
+    let marked: Vec<&str> = command
+        .snippet
+        .hits
+        .iter()
+        .map(|hit| &command.snippet.text[hit.clone()])
+        .collect();
+    assert_eq!(marked, ["-p", "widget"]);
+    bench.assert_verifies();
 }
 
 fn what_is_typed_is_text_whatever_it_holds<A: Agent + Default>() {
     let (bench, [first, _]) = bench::<A>();
     let long = "parse_args ".repeat(10_000);
+    let repeated = "parse ".repeat(500);
+    let many: String = (0..2000).map(|at| format!("t{at} ")).collect();
+    let short: String = (0..2000)
+        .map(|at| format!("解{} ", char::from_u32(0x4e00 + at).unwrap()))
+        .collect();
     for input in [
         "\"",
         "\"\"",
@@ -195,13 +259,20 @@ fn what_is_typed_is_text_whatever_it_holds<A: Agent + Default>() {
         "(",
         ")",
         "\u{0}",
+        "par\u{0}se_args",
         "\u{1}parse\u{2}",
         long.as_str(),
+        repeated.as_str(),
+        many.as_str(),
+        short.as_str(),
     ] {
         try_find(&bench, input, Limit::default()).unwrap_or_else(|error| {
             panic!("{input:?}: {error}");
         });
     }
+    /* A NUL is no part of a term. */
+    assert_eq!(hits(&bench, "par\u{0}se_args"), [first.as_str()]);
+    assert_eq!(find(&bench, "\u{0}"), Results::default());
     /* A quoted phrase is one term, spaces and all; an unclosed quote runs to the end. */
     assert_eq!(hits(&bench, "\"where is parse\""), [first.as_str()]);
     assert_eq!(hits(&bench, "\"is parse_args"), [first.as_str()]);
@@ -209,20 +280,20 @@ fn what_is_typed_is_text_whatever_it_holds<A: Agent + Default>() {
     /* No terms, no results. */
     assert_eq!(find(&bench, ""), Results::default());
     assert_eq!(find(&bench, "   "), Results::default());
-    /* A cancelled search says so. */
-    let catalogue = bench.archive().catalogue();
+    /* A cancelled search says so, whether it looks terms up or reads the text. */
     let cancel = CancelToken::new();
     cancel.cancel();
-    for terms in [["parse_args"], ["is"]] {
+    for terms in [["parse_args"], ["解析"]] {
         let query = Query {
             terms: terms.map(str::to_string).to_vec(),
             filters: Filters::default(),
         };
         assert!(matches!(
-            catalogue.search(&query, Limit::default(), &cancel),
-            Err(CatalogueError::Cancelled)
+            bench.archive().search(&query, Limit::default(), &cancel),
+            Err(SearchError::Cancelled)
         ));
     }
+    bench.assert_verifies();
 }
 
 fn the_filters_narrow_what_is_found<A: Agent + Default>() {
@@ -234,9 +305,13 @@ fn the_filters_narrow_what_is_found<A: Agent + Default>() {
             terms: vec!["the".to_string()],
             filters,
         };
-        let results = catalogue
+        let Searched::Results(results) = bench
+            .archive()
             .search(&query, Limit::default(), &CancelToken::new())
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("the waits for more");
+        };
         let mut found = found(&bench, &results);
         found.sort();
         found
@@ -245,32 +320,44 @@ fn the_filters_narrow_what_is_found<A: Agent + Default>() {
     all.sort();
     assert_eq!(both(Filters::default()), all);
 
-    /* Pages of the library. */
+    /* Pages of the library, and folders: a folder named as a page is reached by folder:. */
     let folder = catalogue.create_folder("Widgets", None).unwrap();
     catalogue.file_by_hand(&ids[1], folder).unwrap();
+    let trash = catalogue.create_folder("Trash", None).unwrap();
+    catalogue.file_by_hand(&ids[0], trash).unwrap();
     catalogue.set_starred(&ids[0], true).unwrap();
+    catalogue.trash(&ids[1]).unwrap();
     for (input, expected) in [
-        ("the in:widgets", vec![second.clone()]),
-        ("the IN:\"Widgets\"", vec![second.clone()]),
+        ("the in:widgets", vec![]),
+        ("the folder:WIDGETS", vec![]),
         ("the in:starred", vec![first.clone()]),
-        ("the in:unsorted", vec![first.clone()]),
-        ("the in:all", all.clone()),
-        ("the in:trash", vec![]),
-        ("the from:fixture", all.clone()),
+        ("the in:unsorted", vec![]),
+        ("the in:all", vec![first.clone()]),
+        ("the in:trash", vec![second.clone()]),
+        ("the folder:trash", vec![first.clone()]),
+        ("the from:fixture", vec![first.clone()]),
         (
             &format!("the agent:{}", bench.agent.provider().id()),
-            all.clone(),
+            vec![first.clone()],
         ),
     ] {
         let mut found = found(&bench, &find(&bench, input));
         found.sort();
         assert_eq!(found, expected, "{input}");
     }
-    /* A token that names nothing is left out, and said to be. */
+    catalogue.restore(&ids[1]).unwrap();
+    assert_eq!(hits(&bench, "the folder:\"widgets\""), [second.as_str()]);
+    /* A token that names nothing is left out, and said to be; one with no value yet is no
+    filter and no text. */
     let (query, unresolved) =
         search::query("the from:elsewhere agent:other after:soon", &names(&bench));
     assert_eq!(query.filters, Filters::default());
     assert_eq!(unresolved.len(), 3);
+    let parsed = search::parse("the in: model:");
+    assert_eq!(
+        (parsed.terms, parsed.tokens, parsed.incomplete),
+        (vec!["the".to_string()], vec![], vec![Key::In, Key::Model])
+    );
 
     /* What a session's row says: its model, its branch, its times. */
     let session = catalogue.session(&ids[0]).unwrap().unwrap();
@@ -313,6 +400,7 @@ fn the_filters_narrow_what_is_found<A: Agent + Default>() {
         })
         .contains(&first)
     };
+    bench.assert_verifies();
     /* A session with no time is in no span of time. */
     let (Some(started), Some(ended)) = (session.started, session.ended) else {
         assert!(!within(Some(0), Some(i64::MAX)));
@@ -328,23 +416,68 @@ fn the_filters_narrow_what_is_found<A: Agent + Default>() {
 
 fn the_index_emptied_and_built_again_finds_the_same<A: Agent + Default>() {
     let (bench, _) = bench::<A>();
-    let inputs = ["parse_args", "the", "解析", "main.rs", "cafe"];
+    let inputs = [
+        "parse_args",
+        "the",
+        "解析",
+        "main.rs",
+        "cafe",
+        "defined module",
+    ];
     let before: Vec<Results> = inputs.iter().map(|input| find(&bench, input)).collect();
     assert!(before.iter().all(|results| results.total_matches > 0));
 
     /* Indexing what has not changed changes nothing. */
-    assert_eq!(bench.index().sessions, 0);
-    let again: Vec<Results> = inputs.iter().map(|input| find(&bench, input)).collect();
-    assert_eq!(again, before);
+    let again = bench.index();
+    assert_eq!((again.sessions, again.searchable), (0, 0));
+    let found: Vec<Results> = inputs.iter().map(|input| find(&bench, input)).collect();
+    assert_eq!(found, before);
 
     /* Emptied, the index finds nothing; built again, what it found. */
     bench.archive().catalogue().drop_index().unwrap();
     for input in inputs {
         assert_eq!(find(&bench, input), Results::default(), "{input}");
     }
-    assert_eq!(bench.index().sessions, 2);
-    let rebuilt: Vec<Results> = inputs.iter().map(|input| find(&bench, input)).collect();
-    assert_eq!(rebuilt, before);
+    /* The rows are made again as they were, so the text made of them before still is. */
+    let rebuilt = bench.index();
+    assert_eq!((rebuilt.sessions, rebuilt.searchable), (2, 0));
+    assert_eq!(bench.archive().unsearchable().unwrap(), 0);
+    let found: Vec<Results> = inputs.iter().map(|input| find(&bench, input)).collect();
+    assert_eq!(found, before);
+    bench.assert_verifies();
+}
+
+fn the_search_text_is_made_again_when_it_is_missing_or_unreadable<A: Agent + Default>() {
+    let (mut bench, _) = bench::<A>();
+    let before = find(&bench, "parse_args");
+    for spoil in [
+        |path: &std::path::Path| fs::remove_file(path).unwrap(),
+        |path: &std::path::Path| fs::write(path, b"not a database at all").unwrap(),
+    ] {
+        bench.close();
+        let search = bench.dir().join("search.db");
+        for suffix in ["-wal", "-shm"] {
+            let _ = fs::remove_file(bench.dir().join(format!("search.db{suffix}")));
+        }
+        spoil(&search);
+        bench.reopen();
+        /* The library is all there; its text is to be made again, and then is. */
+        assert_eq!(bench.sessions().len(), 2);
+        assert_eq!(bench.archive().unsearchable().unwrap(), 2);
+        assert_eq!(find(&bench, "parse_args").total_sessions, 0);
+        assert_eq!(bench.index().searchable, 2);
+        assert_eq!(find(&bench, "parse_args"), before);
+    }
+    /* The catalogue's backups hold no search text: it is never backed up. */
+    let backups = common::files_under(&bench.dir().join("backups"));
+    assert!(!backups.is_empty());
+    assert!(backups.iter().all(|backup| {
+        !fs::read(backup)
+            .unwrap()
+            .windows(10)
+            .any(|run| run == b"parse_args")
+    }));
+    bench.assert_verifies();
 }
 
 fn a_session_in_trash_is_found_only_there_and_one_deleted_for_good_nowhere<A: Agent + Default>() {
@@ -363,12 +496,13 @@ fn a_session_in_trash_is_found_only_there_and_one_deleted_for_good_nowhere<A: Ag
     );
 
     /* Its text stays in the index while it is in Trash, and goes with it for good. */
-    bench.archive().delete_for_good(&id).unwrap();
+    bench.delete_for_good(&id).unwrap();
     assert_eq!(find(&bench, "parse_args in:trash").total_matches, 0);
     assert_eq!(find(&bench, "parse_args in:all").total_matches, 0);
     assert_eq!(hits(&bench, "the"), [second.as_str()]);
     bench.sync();
     assert_eq!(find(&bench, "parse_args in:trash").total_matches, 0);
+    bench.assert_verifies();
 }
 
 fn the_first_matches_of_a_session_are_given_and_the_rest_counted<A: Agent + Default>() {
@@ -387,7 +521,9 @@ fn the_first_matches_of_a_session_are_given_and_the_rest_counted<A: Agent + Defa
         sessions: 1,
         per_session: 3,
     };
-    let results = try_find(&bench, "parse_args", one).unwrap();
+    let Searched::Results(results) = try_find(&bench, "parse_args", one).unwrap() else {
+        panic!("parse_args waits for more");
+    };
     assert_eq!((results.total_sessions, results.total_matches), (1, 7));
     let session = &results.sessions[0];
     assert_eq!(session.matches, 7);
@@ -407,7 +543,7 @@ fn the_first_matches_of_a_session_are_given_and_the_rest_counted<A: Agent + Defa
     assert!(at(&session.shown[0]) < at(&session.shown[1]));
     assert!(at(&session.shown[1]) < at(&session.shown[2]));
     /* Of the sessions, as many as asked for. */
-    let none = try_find(
+    let Searched::Results(none) = try_find(
         &bench,
         "the",
         Limit {
@@ -415,15 +551,19 @@ fn the_first_matches_of_a_session_are_given_and_the_rest_counted<A: Agent + Defa
             per_session: 0,
         },
     )
-    .unwrap();
+    .unwrap() else {
+        panic!("the waits for more");
+    };
     assert_eq!((none.sessions.len(), none.total_sessions), (1, 2));
     assert!(none.sessions[0].shown.is_empty());
+    bench.assert_verifies();
 }
 
 /**
  * A subagent's text is searched under its parent session, and a match in it opens the parent
  * at the call that started the subagent (PLAN §10). A session's title is searched too, and
- * a session whose title matches comes before one that only says the words.
+ * a session whose title holds the words comes before one that only says them; one with no
+ * title of its own is not taken for one whose title matches.
  */
 #[test]
 fn a_subagents_text_opens_its_session_at_the_call_and_a_title_comes_first() {
@@ -467,11 +607,34 @@ fn a_subagents_text_opens_its_session_at_the_call_and_a_title_comes_first() {
         panic!("{inside:?}");
     };
     assert!(matches!(conversation[block].content, Content::ToolCall(_)));
+    bench.assert_verifies();
+}
+
+/// What is pasted whole into a prompt is searched as far as its first tens of kilobytes, and
+/// the match says so.
+#[test]
+fn a_long_span_is_searched_from_its_start() {
+    let mut tree = ProjectsTree::new();
+    let mut session = tree.session("/home/user/code/app", 0);
+    let pasted = format!("startmark {} endmark", "lorem ipsum ".repeat(20_000));
+    session.transcript.prompt(&pasted);
+    let bench = Bench::new(FileAgent::on(tree));
+    bench.sync();
+    let results = find(&bench, "startmark");
+    assert_eq!(results.total_sessions, 1);
+    assert!(
+        results.sessions[0]
+            .shown
+            .iter()
+            .all(|found| found.cut || found.kind == MatchKind::Title)
+    );
+    assert_eq!(find(&bench, "endmark").total_sessions, 0);
+    bench.assert_verifies();
 }
 
 #[test]
 fn each_token_of_the_palette_is_parsed_in_one_place() {
-    use search::{Key, Parsed, Token};
+    use search::{Parsed, Token};
     let token = |key, value: &str| Token {
         key,
         value: value.to_string(),
@@ -485,7 +648,8 @@ fn each_token_of_the_palette_is_parsed_in_one_place() {
     assert_eq!(
         search::parse(
             "parse_args in:fc FROM:\"my mac\" model:opus \"two words\" agent:x branch:main \
-             after:2026-03 before:2027 C:\\Users\\user https://example.com/a in: x:y"
+             after:2026-03 before:2027 C:\\Users\\user https://example.com/a in: x:y \
+             folder:Trash"
         ),
         Parsed {
             terms: terms(&[
@@ -493,7 +657,6 @@ fn each_token_of_the_palette_is_parsed_in_one_place() {
                 "two words",
                 "C:\\Users\\user",
                 "https://example.com/a",
-                "in:",
                 "x:y",
             ]),
             tokens: vec![
@@ -504,7 +667,9 @@ fn each_token_of_the_palette_is_parsed_in_one_place() {
                 token(Key::Branch, "main"),
                 token(Key::After, "2026-03"),
                 token(Key::Before, "2027"),
+                token(Key::Folder, "Trash"),
             ],
+            incomplete: vec![Key::In],
         }
     );
     assert_eq!(
@@ -512,6 +677,7 @@ fn each_token_of_the_palette_is_parsed_in_one_place() {
         terms(&["unclosed quote  "])
     );
     assert_eq!(search::parse("\"\" a").terms, terms(&["a"]));
+    assert_eq!(search::parse("a\u{0}b \u{0}").terms, terms(&["ab"]));
     assert_eq!(search::parse("").terms, terms(&[]));
 }
 
@@ -552,21 +718,30 @@ fn a_date_is_the_start_of_its_day_month_or_year_in_local_time() {
 }
 
 #[test]
-fn in_names_a_folder_before_a_page() {
+fn in_names_a_page_before_a_folder_and_folder_names_a_folder() {
     use sb_core::catalogue::Folder;
     use sb_core::filing::FolderId;
-    let folders = [Folder {
-        id: FolderId(7),
-        parent: None,
-        name: "Trash".to_string(),
-    }];
+    let folders = [
+        Folder {
+            id: FolderId(7),
+            parent: None,
+            name: "Trash".to_string(),
+        },
+        Folder {
+            id: FolderId(8),
+            parent: None,
+            name: "Widgets".to_string(),
+        },
+    ];
     let names = Names {
         folders: &folders,
         locations: &[],
         agents: &[],
     };
     let shelf = |input: &str| search::query(input, &names).0.filters.shelf;
-    assert_eq!(shelf("in:trash"), Shelf::Folder(FolderId(7)));
+    assert_eq!(shelf("in:trash"), Shelf::Trash);
+    assert_eq!(shelf("folder:trash"), Shelf::Folder(FolderId(7)));
+    assert_eq!(shelf("in:widgets"), Shelf::Folder(FolderId(8)));
     assert_eq!(shelf("in:Starred"), Shelf::Starred);
     assert_eq!(shelf("in:unsorted"), Shelf::Unsorted);
     assert_eq!(shelf("x"), Shelf::All);

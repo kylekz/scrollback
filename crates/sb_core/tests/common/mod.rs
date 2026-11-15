@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sb_core::CancelToken;
-use sb_core::archive::Archive;
+use sb_core::archive::{Archive, ArchiveError, Deleted};
 use sb_core::catalogue::{Item, Segment, Session, SessionId, Shelf, Version};
 use sb_core::hash::Hash;
 use sb_core::location::{Location, LocationId, LocationKind};
@@ -289,11 +289,22 @@ impl<A: Agent> Bench<A> {
         self.assert_verifies();
     }
 
+    /// Asserts the archive verifies: every byte as recorded, nothing unrecorded or still to
+    /// be removed, and the search index as the text it indexes.
     pub fn assert_verifies(&self) {
         let report = self.archive().verify(&CancelToken::new()).unwrap();
         assert!(report.damaged.is_empty(), "{:?}", report.damaged);
         assert!(report.unread.is_empty(), "{:?}", report.unread);
         assert!(report.uncatalogued.is_empty(), "{:?}", report.uncatalogued);
+        assert!(report.removing.is_empty(), "{:?}", report.removing);
+        assert!(!report.search_rebuilt);
+    }
+
+    /// Deletes the session `id` for good, as the owner does once the confirmation showed what
+    /// that removes.
+    pub fn delete_for_good(&self, id: &SessionId) -> Result<Deleted, ArchiveError> {
+        let shown = self.archive().catalogue().deletion(id)?;
+        self.archive().delete_for_good(&shown)
     }
 
     /// Every segment file under the archive's `files/`.

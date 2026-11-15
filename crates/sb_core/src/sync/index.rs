@@ -16,6 +16,11 @@
 //! - **[`index_session`]** indexes one session at once: after the owner chose a version to
 //!   read, say.
 //!
+//! An index is two steps. The first makes each session's row, so a first sync's sessions are
+//! in the library as soon as they can be; the second parses each again and makes its text
+//! searchable ([`crate::search`]), the sessions whose text is not of their row as it is now,
+//! the newest first. How many are left is [`crate::archive::Archive::unsearchable`].
+//!
 //! Sessions are indexed one at a time, each from its start with every subagent read, and each
 //! row is committed on its own. Nothing parsed is kept between two sessions, so the memory an
 //! index takes is that of its largest session's transcript model (PLAN §7.5), and no catalogue
@@ -36,7 +41,8 @@ use crate::archive::{Archive, ArchivedSession};
 use crate::catalogue::{Derived, Held, Indexed, Reading, SessionId, fingerprint};
 use crate::location::LocationId;
 use crate::provider::{ItemKind, Provider};
-use crate::transcript::{self, Content, Conversation, Ending, Subagent, Transcript};
+use crate::search::Text;
+use crate::transcript::{self, Content, Conversation, Ending, SessionIndex, Subagent, Transcript};
 
 /// What an index did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -51,6 +57,8 @@ pub struct IndexReport {
     /// The versions newly held back because their transcript no longer parses where the copy
     /// being read does.
     pub held_back: usize,
+    /// The sessions whose text was made searchable.
+    pub searchable: usize,
 }
 
 /**
@@ -111,6 +119,12 @@ pub fn index_session(
     }
     let mut report = IndexReport::default();
     session(archive, provider, id, &mut report)?;
+    if let Some(made) = archive.catalogue().made_of(id)? {
+        let texts: Vec<Text> = text(archive, provider, id.clone(), made)?
+            .into_iter()
+            .collect();
+        report.searchable += record(archive, &texts)?;
+    }
     Ok(report)
 }
 
@@ -156,7 +170,109 @@ fn run(
             bytes,
         });
     }
+    searchable(archive, location, providers, cancel, &mut report)?;
     Ok(report)
+}
+
+/// How much text the second step of an index writes at a time: the sessions parsed for it,
+/// up to this many bytes of their text, or [`TEXTS`] sessions.
+const TEXT_BYTES: usize = 16 * 1024 * 1024;
+const TEXTS: usize = 256;
+
+/**
+ * The second step of an index (the module docs): makes the text of each session of
+ * `providers` at `location` (or at every location) searchable, where it is not of the
+ * session's row as it is now, the session that did something last first, some sessions at a
+ * time; and takes out the text of each that has no row any more.
+ */
+fn searchable(
+    archive: &Archive,
+    location: Option<&LocationId>,
+    providers: &[&dyn Provider],
+    cancel: &CancelToken,
+    report: &mut IndexReport,
+) -> Result<(), SyncError> {
+    let search = archive.search_index();
+    let mut docs = search.docs()?;
+    let mut batch: Vec<Text> = Vec::new();
+    for provider in providers {
+        let rows = archive
+            .catalogue()
+            .made(location, Some(provider.id().as_str()))?;
+        for (id, made) in rows {
+            if docs.remove(&id).as_ref() == Some(&made) {
+                continue;
+            }
+            if cancel.is_cancelled() {
+                return Err(SyncError::Cancelled);
+            }
+            batch.extend(text(archive, *provider, id, made)?);
+            if batch.len() >= TEXTS || batch.iter().map(Text::bytes).sum::<usize>() >= TEXT_BYTES {
+                report.searchable += record(archive, &std::mem::take(&mut batch))?;
+            }
+        }
+    }
+    report.searchable += record(archive, &batch)?;
+    let gone: Vec<SessionId> = docs
+        .into_keys()
+        .filter(|id| {
+            location.is_none_or(|location| id.location == *location)
+                && providers
+                    .iter()
+                    .any(|provider| provider.id().as_str() == id.provider)
+        })
+        .collect();
+    Ok(search.forget(&gone)?)
+}
+
+/// Writes `texts`, of those sessions whose rows are still what the texts were made of.
+fn record(archive: &Archive, texts: &[Text]) -> Result<usize, SyncError> {
+    Ok(archive.search_index().record(texts, |text| {
+        Ok(archive.catalogue().made_of(&text.id)?.as_deref() == Some(&*text.made))
+    })?)
+}
+
+/**
+ * The text of the session `id`, as of its row, which was made from what `made` says
+ * ([`crate::catalogue::Catalogue::made`]). There is none of a session whose items are no
+ * longer what its row was made from (the next index makes its row again first), nor of one
+ * the archive could not be read for (the next index tries again); a session its parser stops
+ * on has its title alone.
+ */
+fn text(
+    archive: &Archive,
+    provider: &dyn Provider,
+    id: SessionId,
+    made: String,
+) -> Result<Option<Text>, SyncError> {
+    let catalogue = archive.catalogue();
+    let readings = catalogue.session_items(&id)?;
+    if made.split(' ').next() != Some(fingerprint(&readings).to_hex().as_str()) {
+        return Ok(None);
+    }
+    let parsed = panic::catch_unwind(AssertUnwindSafe(|| {
+        let items = ArchivedSession::of(archive, &readings);
+        let mut transcript = provider.parse(&items);
+        transcript.read_subagents(provider, &items);
+        items
+            .fault()
+            .is_none()
+            .then(|| transcript::index(&transcript))
+    }));
+    let index = match parsed {
+        Ok(Some(index)) => index,
+        Ok(None) => return Ok(None),
+        Err(_) => SessionIndex {
+            title: catalogue.session(&id)?.and_then(|session| session.title),
+            ..SessionIndex::default()
+        },
+    };
+    Ok(Some(Text {
+        id,
+        made,
+        title: index.title,
+        spans: index.spans,
+    }))
 }
 
 /// Parses and indexes one session, and records what came of it.

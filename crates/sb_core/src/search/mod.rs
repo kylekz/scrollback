@@ -1,22 +1,54 @@
 //! Search (PLAN §10, DESIGN §4.9): what the palette asks and what it is answered with. The
 //! query is free text and filters, typed as `key:value` tokens and parsed here, so the syntax is
-//! the same wherever it is typed; [`crate::catalogue::Catalogue::search`] runs it over the index
-//! the index step keeps of every session (`session_text`, PLAN §4.3).
+//! the same wherever it is typed; [`crate::archive::Archive::search`] runs it over the text the
+//! index step keeps of every session, in `search.db` ([`store`]).
 //!
-//! The text is matched as substrings, without regard to case or accents, through FTS5's
-//! `trigram` tokenizer: a term of three characters or more is looked up in the index; a shorter
-//! one (`ok`, a two-character CJK word) only narrows what longer terms found, or, alone, is
-//! looked for by reading the text, which is slower and is cancelled with the query. A span
-//! matches when it holds every term; results are grouped by session.
+//! **Matching.** A term is matched as a substring, without regard to case or to the accents of
+//! Latin letters ([`text`]). A session is found when every term is somewhere in it: its title,
+//! prompts, replies, tool calls' commands and paths, its subagents' included. A term of three
+//! characters or more is looked up in the index; a shorter one beside it only narrows what it
+//! found. A query of short terms alone is looked for by reading the text, which is slower and
+//! is cancelled with the query, unless they are all ASCII (`ok`, `-p`): that is
+//! [`Searched::KeepTyping`], since a letter or two of English matches nearly every session,
+//! where two characters of Chinese or Japanese are often a whole word.
+//!
+//! **Ranking.** Sessions whose title holds every term come first, then the one that did
+//! something last. A session's matches are its spans that hold a term, those that hold every
+//! term first, each lot in the order of the conversation.
+
+mod run;
+mod store;
+mod text;
 
 use std::ops::Range;
 
 use chrono::{Local, NaiveDate, TimeZone as _};
+use thiserror::Error;
+use toolbox_store::rusqlite;
 
-use crate::catalogue::{Folder, Session, Shelf};
+use crate::catalogue::{CatalogueError, Folder, Session, Shelf};
 use crate::location::{Location, LocationId};
 use crate::provider::ProviderId;
 use crate::transcript::{At, SpanKind};
+
+pub use run::{MOST_TERMS, TERM_CHARS};
+pub(crate) use store::{SearchIndex, Text, checkpoint};
+
+#[derive(Debug, Error)]
+pub enum SearchError {
+    #[error(transparent)]
+    Database(#[from] toolbox_store::Error),
+    #[error(transparent)]
+    Catalogue(#[from] CatalogueError),
+    #[error("the search was cancelled")]
+    Cancelled,
+}
+
+impl From<rusqlite::Error> for SearchError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error.into())
+    }
+}
 
 /// What a matched span is (DESIGN §4.9's kind column).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -121,8 +153,10 @@ pub enum Filter {
 /// The keys of the filter tokens (DESIGN §4.9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
-    /// `in:` a folder, or a page of the library: `starred`, `unsorted`, `trash`, `all`.
+    /// `in:` a page of the library (`all`, `starred`, `unsorted`, `trash`), or else a folder.
     In,
+    /// `folder:` a folder, whatever its name.
+    Folder,
     /// `from:` a location, by its name.
     From,
     /// `agent:` a provider's id.
@@ -137,8 +171,9 @@ pub enum Key {
 }
 
 impl Key {
-    const ALL: [(Self, &'static str); 7] = [
+    const ALL: [(Self, &'static str); 8] = [
         (Self::In, "in"),
+        (Self::Folder, "folder"),
         (Self::From, "from"),
         (Self::Agent, "agent"),
         (Self::Model, "model"),
@@ -163,23 +198,26 @@ pub struct Token {
 }
 
 /// What a query's text says: its free text's terms and its filter tokens, each in the order
-/// typed.
+/// typed, and the keys typed with no value yet (`in:`), which are no filter and no text.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Parsed {
     pub terms: Vec<String>,
     pub tokens: Vec<Token>,
+    pub incomplete: Vec<Key>,
 }
 
 /**
  * Splits what was typed into terms and filter tokens. Terms are separated by white space; text
  * in double quotes is one term, spaces and all, and a quote with no partner runs to the end. A
- * word `key:value` whose key is one of [`Key`]'s, in any case, with a value (which may be
- * quoted), is a token; any other word with a colon (`C:\Users`, `https://…`) is a term.
- * Nothing typed is an error: whatever it holds, it is text to look for.
+ * word `key:value` whose key is one of [`Key`]'s, in any case, is a token, and with no value
+ * an incomplete one; any other word with a colon (`C:\Users`, `https://…`) is a term. A NUL is
+ * no character of any term. Nothing typed is an error: whatever it holds, it is text to look
+ * for.
  */
 pub fn parse(input: &str) -> Parsed {
     let mut parsed = Parsed::default();
-    let mut rest = input;
+    let input = input.replace('\0', "");
+    let mut rest = input.as_str();
     loop {
         rest = rest.trim_start();
         if rest.is_empty() {
@@ -191,14 +229,14 @@ pub fn parse(input: &str) -> Parsed {
             let (key, _) = Key::ALL
                 .iter()
                 .find(|(_, name)| name.eq_ignore_ascii_case(key))?;
-            let value = unquote(value);
-            (!value.is_empty()).then(|| Token {
-                key: *key,
-                value: value.to_string(),
-            })
+            Some((*key, unquote(value)))
         });
         match token {
-            Some(token) => parsed.tokens.push(token),
+            Some((key, "")) => parsed.incomplete.push(key),
+            Some((key, value)) => parsed.tokens.push(Token {
+                key,
+                value: value.to_string(),
+            }),
             None => {
                 let term = unquote(word);
                 if !term.trim().is_empty() {
@@ -239,30 +277,34 @@ pub struct Names<'a> {
 
 impl Token {
     /**
-     * The filter the token names, if it names one. `in:` takes a folder's name first (the first
-     * folder of that name, in the order [`crate::catalogue::Catalogue::folders`] gives them),
-     * then a page's; `from:` a location's name; `agent:` a provider's id; names are matched in
-     * any case. `model:` and `branch:` take any value. A date that is not one is no filter.
+     * The filter the token names, if it names one. `in:` takes a page's name first, then a
+     * folder's, and `folder:` a folder's: the first folder of that name, in the order
+     * [`crate::catalogue::Catalogue::folders`] gives them, so a folder named like a page is
+     * reached by `folder:`. `from:` takes a location's name, `agent:` a provider's id; names
+     * are matched in any case. `model:` and `branch:` take any value. A date that is not one
+     * is no filter.
      */
     pub fn resolve(&self, names: &Names<'_>) -> Option<Filter> {
         let value = self.value.as_str();
-        match self.key {
-            Key::In => names
+        let folder = || {
+            names
                 .folders
                 .iter()
                 .find(|folder| folder.name.eq_ignore_ascii_case(value))
                 .map(|folder| Filter::Shelf(Shelf::Folder(folder.id)))
-                .or_else(|| {
-                    [
-                        ("all", Shelf::All),
-                        ("starred", Shelf::Starred),
-                        ("unsorted", Shelf::Unsorted),
-                        ("trash", Shelf::Trash),
-                    ]
-                    .into_iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(value))
-                    .map(|(_, shelf)| Filter::Shelf(shelf))
-                }),
+        };
+        match self.key {
+            Key::In => [
+                ("all", Shelf::All),
+                ("starred", Shelf::Starred),
+                ("unsorted", Shelf::Unsorted),
+                ("trash", Shelf::Trash),
+            ]
+            .into_iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(value))
+            .map(|(_, shelf)| Filter::Shelf(shelf))
+            .or_else(folder),
+            Key::Folder => folder(),
             Key::From => names
                 .locations
                 .iter()
@@ -344,11 +386,20 @@ impl Default for Limit {
     }
 }
 
+/// What a search answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Searched {
+    /// The query's terms are a letter or two of ASCII alone, which nearly every session holds:
+    /// it was not run (the module docs).
+    KeepTyping,
+    Results(Results),
+}
+
 /// What a search found.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Results {
-    /// The sessions with matches, the best first: those whose title matches, then by how well
-    /// their best match matches, then the one that did something last.
+    /// The sessions found, the best first: those whose title holds every term, then the one
+    /// that did something last.
     pub sessions: Vec<Found>,
     /// Every session with a match, and every match, of which `sessions` are the first.
     pub total_sessions: usize,
@@ -359,9 +410,10 @@ pub struct Results {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Found {
     pub session: Session,
-    /// How many of its spans match.
+    /// How many of its spans hold a term.
     pub matches: usize,
-    /// Its first matches, title first, then in the order of the conversation.
+    /// Its first matches: those that hold every term, then the others, each lot in the order
+    /// of the conversation (the title first).
     pub shown: Vec<Match>,
 }
 
@@ -374,6 +426,8 @@ pub struct Match {
     pub subagent: bool,
     /// Where the match opens the session; `None` for its title, which opens it at its start.
     pub at: Option<At>,
+    /// Only the start of the span's text is searched: it is longer than search indexes.
+    pub cut: bool,
     pub snippet: Snippet,
 }
 
