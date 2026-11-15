@@ -18,12 +18,16 @@ use crate::archive::{Archive, ArchiveError};
 use crate::catalogue::{self, CatalogueError};
 use crate::location::LocationId;
 use crate::provider::{Provider, ProviderError, ProviderId, Source, Unlisted};
-use crate::transport::Transport;
+use crate::transport::{Transport, TransportError};
 
 #[derive(Debug, Error)]
 pub enum SyncError {
     #[error("the sync was cancelled")]
     Cancelled,
+    /// The location could not be connected to: a machine that is asleep or off the network.
+    /// Not a failure (PLAN §5); what was archived before the connection went stays.
+    #[error("the location could not be reached: {0}")]
+    Unreachable(String),
     #[error("location {0} is already being synced")]
     Busy(LocationId),
     #[error(transparent)]
@@ -130,6 +134,8 @@ pub struct Pass {
  *
  * The attempt is recorded with the location, and so is how it ended: as a success only when
  * every pass could read everything its agent has there, and otherwise with what went wrong.
+ * A location that can't be connected to, at the start or from some point on, is recorded as
+ * unreachable, which is not an error, and the sync ends with [`SyncError::Unreachable`].
  */
 pub fn sync_location(
     archive: &Archive,
@@ -156,6 +162,14 @@ pub fn sync_location(
         };
         match &outcome {
             Err(SyncError::Cancelled) => return Err(SyncError::Cancelled),
+            /* A transport stopped by the cancel fails its call: that is the cancel, too. */
+            Err(_) if cancel.is_cancelled() => return Err(SyncError::Cancelled),
+            Err(SyncError::Provider(ProviderError::Transport(TransportError::Unreachable(
+                reason,
+            )))) => {
+                catalogue.record_unreachable(location, reason)?;
+                return Err(SyncError::Unreachable(reason.clone()));
+            }
             Err(error) => problems.push(format!("{id}: {error}")),
             Ok(report) => {
                 problems.extend(report.shortfall().map(|short| format!("{id}: {short}")));
