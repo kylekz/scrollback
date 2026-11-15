@@ -9,9 +9,11 @@
 //! through the real engine, then the folders are made and their paths attached, which files
 //! the sessions as it would for the owner. The three locations are of the three kinds, this
 //! machine, a WSL distro and a host over SSH, though each is synced from a folder here: they
-//! are rows of the catalogue. The app a scenario starts reaches the distro as this machine
-//! and never reaches the host (`scrollback`'s `automation::connect`), so the host shows as
-//! unreachable.
+//! are rows of the catalogue. The app a scenario starts reads the distro from the scenario's
+//! home, which holds nothing, and never reaches the host (`scrollback`'s `automation::StandIns`),
+//! so the host shows as unreachable. With `boards-held-back`, one of player's sessions has a
+//! newer version held back and is filed by hand, so that fc's page has every piece a card's
+//! last line can hold.
 //!
 //! Everything here is illustrative: made-up titles in placeholder names.
 
@@ -20,7 +22,7 @@ use std::path::Path;
 use anyhow::{Context as _, Result, bail, ensure};
 use sb_core::CancelToken;
 use sb_core::archive::Archive;
-use sb_core::catalogue::SessionId;
+use sb_core::catalogue::{SessionId, Shelf};
 use sb_core::filing::FolderId;
 use sb_core::location::{LocationId, LocationKind};
 use sb_core::provider;
@@ -775,9 +777,57 @@ pub fn agent(tree: &mut ProjectsTree) {
     }
 }
 
+/// Where the sessions of fc's subfolder player started: the newest of them has its newest
+/// version held back.
+const HELD_BACK: &str = "/home/user/code/fc/crates/fc_player";
+
+/**
+ * Has the agent at `location` replace the transcript of the newest session started at
+ * [`HELD_BACK`] with lines that are no
+ * records, longer than it was, and syncs that: the new version reads worse than the one the
+ * archive has, so it is held back and the session keeps what it was (docs/PLAN.md §4.2).
+ */
+fn hold_back(
+    archive: &Archive,
+    location: &LocationId,
+    tree: &ProjectsTree,
+    providers: &[Box<dyn provider::Provider>],
+) -> Result<SessionId> {
+    let session = archive
+        .catalogue()
+        .sessions(Shelf::All)?
+        .into_iter()
+        .find(|session| {
+            session.id.location == *location && session.project_path.as_deref() == Some(HELD_BACK)
+        })
+        .with_context(|| format!("a session at {HELD_BACK} is synced"))?
+        .id;
+    let file = tree.path(&format!("projects/{}.jsonl", session.key));
+    let length = std::fs::metadata(&file)?.len() as usize;
+    std::fs::write(&file, "this is not a transcript\n".repeat(length / 20 + 1))?;
+    sync_location(
+        archive,
+        location,
+        &tree.transport(),
+        providers,
+        &CancelToken::new(),
+        &mut |_| {},
+    )?;
+    ensure!(
+        archive
+            .catalogue()
+            .sessions(Shelf::All)?
+            .iter()
+            .any(|it| it.id == session && it.held_back),
+        "the session at {HELD_BACK} is not held back"
+    );
+    Ok(session)
+}
+
 /// Builds the archive in `archive_dir`, writing each location's transcripts under `scratch`
-/// on the way, which is removed again.
-pub fn build(archive_dir: &Path, scratch: &Path) -> Result<()> {
+/// on the way, which is removed again. With `held_back`, one of player's sessions has a newer
+/// version held back and is filed by hand ([`hold_back`]).
+pub fn build(archive_dir: &Path, scratch: &Path, held_back: bool) -> Result<()> {
     let providers = provider::builtin();
     let provider = providers
         .first()
@@ -788,6 +838,7 @@ pub fn build(archive_dir: &Path, scratch: &Path) -> Result<()> {
 
     let mut writer = Writer::new();
     let mut locations: Vec<LocationId> = Vec::new();
+    let mut held = None;
     for (index, name) in LOCATIONS.into_iter().enumerate() {
         let mut tree = ProjectsTree::in_home(&scratch.join(index.to_string()));
         let starred = writer.location(index, &mut tree);
@@ -825,6 +876,9 @@ pub fn build(archive_dir: &Path, scratch: &Path) -> Result<()> {
             };
             catalogue.set_starred(&session, true)?;
         }
+        if held_back && index == WSL {
+            held = Some(hold_back(&archive, &location.id, &tree, &providers)?);
+        }
         locations.push(location.id);
     }
 
@@ -844,6 +898,16 @@ pub fn build(archive_dir: &Path, scratch: &Path) -> Result<()> {
             catalogue.attach_path(folder, path, location.map(|at| &locations[at]))?;
         }
         made.push((name, folder));
+    }
+    // The session held back is filed by hand where its path files it: a card of fc's page
+    // whose last line holds every piece one can (docs/DESIGN.md §4.4).
+    if let Some(held) = held {
+        let player = made
+            .iter()
+            .find(|(name, _)| *name == "player")
+            .context("player is one of the folders")?
+            .1;
+        catalogue.file_by_hand(&held, player)?;
     }
     if writer.filler_stars != 0 {
         bail!(
@@ -889,7 +953,7 @@ mod tests {
     fn the_archive_holds_the_library_the_boards_draw() {
         let dir = tempfile::tempdir().unwrap();
         let archive_dir = dir.path().join("archive");
-        build(&archive_dir, &dir.path().join("locations")).unwrap();
+        build(&archive_dir, &dir.path().join("locations"), true).unwrap();
         let archive = Archive::open(&archive_dir).unwrap();
         let catalogue = archive.catalogue();
 

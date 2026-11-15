@@ -66,11 +66,7 @@ fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
     };
     // A scripted run reaches only what its scenario put there.
     #[cfg(feature = "automation")]
-    let reach = if cli.automation_enabled() {
-        crate::automation::stand_ins()
-    } else {
-        reach
-    };
+    let reach = crate::automation::stand_ins(&cli).unwrap_or(reach);
     sb_ui::services::init(
         ServicesConfig {
             archive_dir: data_dir.join(ARCHIVE),

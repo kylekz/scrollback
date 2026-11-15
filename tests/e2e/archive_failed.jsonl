@@ -4,10 +4,12 @@
 {"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
 {"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
 
-// The 600-wide column is centred in the main area; the title bar's controls are there, disabled, and the sidebar has no library to show.
+// The 600-wide column is centred in the main area; the title bar's controls are there, disabled, and the sidebar has no library to show: its counts read "—", and New folder and Sync all are there, disabled (DESIGN §4.14).
 {"cmd": "bounds", "target": "archive/failed", "expect_result": [{"pointer": "/x", "equals": 544}, {"pointer": "/w", "equals": 600}]}
 {"cmd": "bounds", "target": "titlebar/sync-all", "expect_result": {"pointer": "/visible", "not_equals": null}}
-{"cmd": "query", "prefix": "sidebar/", "expect_result": {"pointer": "", "len": 4}}
+{"cmd": "query", "prefix": "sidebar/", "expect_result": {"pointer": "", "len": 6}}
+{"cmd": "bounds", "target": "sidebar/new-folder", "expect_result": [{"pointer": "/h", "equals": 22}, {"pointer": "/visible", "not_equals": null}]}
+{"cmd": "click", "target": "sidebar/new-folder", "expect": {"pointer": "/library/folders", "equals": []}}
 {"cmd": "screenshot", "name": "archive-failed-dark"}
 {"cmd": "pin_appearance", "appearance": "light"}
 {"cmd": "settle"}

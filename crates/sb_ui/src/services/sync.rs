@@ -21,8 +21,12 @@
 //! and what a new parser version asks for. And a pass that was stopped, or that failed, is
 //! followed by an index of its location, so that what it stored before it ended shows. These
 //! run in the background like a pass, with their progress for the sidebar
-//! ([`SyncService::indexing`]). A location's index and its pass never run together: a sync
-//! asked for while its location is indexed starts when the index is over.
+//! ([`SyncService::indexing`]). A location's own index and its pass never run together: a
+//! sync asked for while that index runs starts when it is over, so that the row says one thing
+//! at a time and the pass does not index again what the index is indexing. The start's index
+//! of every location is not waited for: passes start beside it, since a first sync must not
+//! wait on a full re-index, and both are safe together: each indexes what the catalogue says
+//! is stale, a session at a time, at worst one twice.
 //!
 //! **The owner's locations** ([`locations`]): adding, renaming and removing one are the
 //! service's writes, each on a background job, as are the connection test and the listing of
@@ -213,6 +217,9 @@ struct HoldState {
     after: Option<(usize, Held)>,
     /// A pass is waiting to be released.
     waiting: bool,
+    /// How many times the hold was released: a pass waiting goes on at the next release,
+    /// even when a hold is set again before its thread wakes.
+    releases: u64,
 }
 
 /// A point at which the next pass waits or stops, for the tests and the scenarios that need a
@@ -239,11 +246,11 @@ impl Hold {
                 cancel.cancel();
             }
             Some((after, Held::Pause)) if items >= after => {
+                let releases = state.releases;
                 state.waiting = true;
-                while state.after.is_some() {
+                while state.releases == releases {
                     state = self.0.1.wait(state).unwrap_or_else(PoisonError::into_inner);
                 }
-                state.waiting = false;
             }
             _ => {}
         }
@@ -255,6 +262,7 @@ impl Hold {
         let mut state = self.state();
         state.after = None;
         state.waiting = false;
+        state.releases += 1;
         self.0.1.notify_all();
     }
 }
@@ -866,5 +874,30 @@ impl SyncService {
 impl Drop for SyncService {
     fn drop(&mut self) {
         self.stop_everything();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hold_set_again_right_after_a_release_lets_the_waiting_pass_go() {
+        let hold = Hold::default();
+        hold.state().after = Some((1, Held::Pause));
+        let pass = {
+            let hold = hold.clone();
+            std::thread::spawn(move || {
+                hold.reached(&Progress::Stored { items: 1 }, &CancelToken::new());
+            })
+        };
+        while !hold.state().waiting {
+            std::thread::yield_now();
+        }
+        // Released, then held again before the pass's thread has woken.
+        hold.release();
+        hold.state().after = Some((1, Held::Pause));
+        pass.join().expect("the pass went on");
+        assert!(!hold.state().waiting);
     }
 }

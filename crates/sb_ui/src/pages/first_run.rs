@@ -91,6 +91,22 @@ struct Host {
     sessions: Option<usize>,
 }
 
+/**
+ * `path` with a word joiner (U+2060, which draws nothing) between each two of its characters,
+ * so that a line never breaks inside it (`D:` at a line's end, `\Software\…` on the next) and
+ * wraps before it instead.
+ */
+fn unbroken(path: &str) -> String {
+    let mut joined = String::with_capacity(path.len() * 4);
+    for (at, character) in path.chars().enumerate() {
+        if at > 0 {
+            joined.push('\u{2060}');
+        }
+        joined.push(character);
+    }
+    joined
+}
+
 pub struct FirstRun {
     sync: Entity<SyncService>,
     archive: Entity<ArchiveService>,
@@ -383,7 +399,7 @@ impl FirstRun {
         const BEFORE: &str = "The archive goes in scrollback's data folder, ";
         const AFTER: &str = ". Settings can point it somewhere else later.";
         let c = &theme.colors;
-        let folder = self.archive.read(cx).dir().display().to_string();
+        let folder = unbroken(&self.archive.read(cx).dir().display().to_string());
         let run = |len: usize, family: &gpui::SharedString| TextRun {
             len,
             font: font(family.clone()),
@@ -420,6 +436,7 @@ impl Render for FirstRun {
         let theme = cx.sb_theme().clone();
         let c = &theme.colors;
         let checked = self.checked(cx).len();
+        let looked = self.sync.read(cx).found().is_some();
         let ready = checked > 0 && !self.adding;
         let names: Vec<&str> = cx
             .services()
@@ -555,8 +572,10 @@ impl Render for FirstRun {
                                         this.on_click(cx.listener(|this, _, _, cx| this.add(cx)))
                                     })
                                     // It counts what is checked; with nothing checked there
-                                    // is nothing to count.
+                                    // is nothing to count, and until this machine has been
+                                    // looked at, nothing to check.
                                     .child(match checked {
+                                        _ if !looked => "Looking for transcripts…".to_string(),
                                         0 => "Add a location and sync".to_string(),
                                         1 => "Add 1 location and sync".to_string(),
                                         many => format!("Add {many} locations and sync"),

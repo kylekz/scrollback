@@ -3,9 +3,10 @@
 //! window drag region; its controls occlude it.
 //!
 //! **Room.** The bar is three groups: the mark's, the search field, and the buttons'. The two
-//! outer groups share what the field leaves equally, which centres the field on the window; a
-//! group that needs more than its half keeps its own width and the field moves over by the
-//! difference. Each outer group's padding is on an inner box, so the two shares start equal.
+//! outer groups share what the field leaves equally, which centres the field on the window
+//! (DESIGN §2). Each is at least as wide as the wider of the two needs, so where the caption
+//! buttons leave too little room the field gives up width rather than its place. Each outer
+//! group's padding is on an inner box, so the two shares start equal.
 //!
 //! **States** (DESIGN §4.1). The first run shows the mark alone: no search, Sync all or
 //! Settings (DESIGN §4.10). With a library, Sync all syncs every location, and while a pass
@@ -32,7 +33,7 @@ use super::{Shell, SidebarPlacement};
 use crate::actions::library::SyncAll;
 use crate::actions::shell::{Dismiss, ToggleSidebar};
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{DISABLED_OPACITY, icon, kbd, sync_glyph, tab_stop};
+use crate::components::{DISABLED_OPACITY, icon, kbd, sync_glyph, tab_stop, text_width};
 use crate::icons::SbIcon;
 use crate::keymap;
 use crate::pages::Showing;
@@ -56,6 +57,30 @@ impl Shell {
         let first_run = showing == Showing::FirstRun;
         let has_library = showing.is_library();
         let syncing = cx.services().sync.read(cx).is_syncing();
+        let traffic_lights = cfg!(target_os = "macos") && !window.is_fullscreen();
+        let captions = CaptionButton::row(window);
+        // The room each outer group needs; both get the larger, so the field stays centred.
+        let left = if traffic_lights {
+            theme.sizes.traffic_lights_inset
+        } else {
+            theme.spacing.lg
+        } + if sidebar == SidebarPlacement::Docked {
+            px(0.)
+        } else {
+            theme.sizes.control_height + GAP
+        } + px(18.)
+            + theme.spacing.md
+            + text_width("scrollback", &theme.text.title, window);
+        let buttons = (!first_run).then(|| {
+            sync_all_width(has_library && syncing, theme, window) + GAP + theme.sizes.control_height
+        });
+        let right = match (buttons, captions) {
+            (Some(buttons), Some(_)) => buttons + GAP + theme.sizes.caption_button_width * 3.,
+            (None, Some(_)) => theme.sizes.caption_button_width * 3.,
+            (Some(buttons), None) => buttons + theme.spacing.lg,
+            (None, None) => theme.spacing.lg,
+        };
+        let side = left.max(right);
         div()
             .id("titlebar")
             .flex_none()
@@ -78,12 +103,12 @@ impl Shell {
             })
             .debug_selector(|| "titlebar".into())
             .child(
-                div().flex_1().flex().child(
+                div().flex_1().flex_basis(px(0.)).min_w(side).flex().child(
                     div()
                         .flex()
                         .items_center()
                         .gap(GAP)
-                        .pl(if cfg!(target_os = "macos") && !window.is_fullscreen() {
+                        .pl(if traffic_lights {
                             theme.sizes.traffic_lights_inset
                         } else {
                             theme.spacing.lg
@@ -96,21 +121,27 @@ impl Shell {
             )
             .when(!first_run, |this| this.child(search_field(theme)))
             .child(
-                div().flex_1().flex().justify_end().child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(GAP)
-                        .when(!first_run, |this| {
-                            this.child(sync_all_button(has_library, syncing, theme, cx))
-                                .child(settings_button(theme))
-                        })
-                        // The caption buttons sit side by side, flush with the window's edge.
-                        .map(|this| match CaptionButton::row(window) {
-                            Some(buttons) => this.child(div().flex().children(buttons)),
-                            None => this.pr(theme.spacing.lg),
-                        }),
-                ),
+                div()
+                    .flex_1()
+                    .flex_basis(px(0.))
+                    .min_w(side)
+                    .flex()
+                    .justify_end()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(GAP)
+                            .when(!first_run, |this| {
+                                this.child(sync_all_button(has_library, syncing, theme, cx))
+                                    .child(settings_button(theme))
+                            })
+                            // The caption buttons sit side by side, flush with the window's edge.
+                            .map(|this| match captions {
+                                Some(buttons) => this.child(div().flex().children(buttons)),
+                                None => this.pr(theme.spacing.lg),
+                            }),
+                    ),
             )
             .automation_target("titlebar")
     }
@@ -211,7 +242,8 @@ fn search_field(theme: &SbTheme) -> AnyElement {
             "Search the archive ({})",
             keymap::label(keymap::SEARCH_KEYS)
         ))
-        .flex_none()
+        .flex_shrink(1.)
+        .min_w_0()
         .flex()
         .items_center()
         .gap(theme.spacing.md)
@@ -235,6 +267,20 @@ fn search_field(theme: &SbTheme) -> AnyElement {
         )
         .child(kbd(keymap::label(keymap::SEARCH_KEYS), theme))
         .automation_target("titlebar/search")
+}
+
+/// What Sync all says: whether a pass runs.
+fn sync_all_label(syncing: bool) -> &'static str {
+    if syncing { "Syncing…" } else { "Sync all" }
+}
+
+/// How wide [`sync_all_button`] is: its border, padding, glyph, gap and label.
+fn sync_all_width(syncing: bool, theme: &SbTheme, window: &Window) -> Pixels {
+    px(2.)
+        + theme.spacing.md * 2.
+        + theme.sizes.icon_sm
+        + theme.spacing.sm
+        + text_width(sync_all_label(syncing), &theme.text.control_small, window)
 }
 
 /// Sync all (DESIGN §4.1): a small button that syncs every location (`F5`). While a pass runs
@@ -281,11 +327,7 @@ fn sync_all_button(
             }
         })
         .child(sync_glyph(enabled && syncing, c.fg, theme))
-        .child(if enabled && syncing {
-            "Syncing…"
-        } else {
-            "Sync all"
-        })
+        .child(sync_all_label(enabled && syncing))
         .automation_target("titlebar/sync-all")
 }
 

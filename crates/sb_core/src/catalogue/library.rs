@@ -8,7 +8,7 @@ use toolbox_store::rusqlite::{self, params_from_iter};
 
 use super::session::{BY_ACTIVITY, SESSION, session_from};
 use super::{Catalogue, Result, Session};
-use crate::filing::{FolderId, NormalPath};
+use crate::filing::{self, FolderId, NormalPath};
 use crate::location::LocationId;
 
 /// The sessions one page of the library lists.
@@ -46,6 +46,12 @@ pub struct PathGroup {
     pub locations: Vec<LocationId>,
     /// The path as its sessions recorded it, each spelling once.
     pub spellings: Vec<String>,
+    /**
+     * A drive's path as Windows writes it (`D:\Projects\fc`), to show and to attach: a
+     * spelling a session recorded so, or else one under a WSL distro's drive mount, read by
+     * that location's own mount. `None` for a path that is no drive's.
+     */
+    pub drive: Option<String>,
     pub sessions: Vec<Session>,
 }
 
@@ -123,6 +129,11 @@ impl Catalogue {
         sessions with no path are not taken for those at `/`. */
         type Place = (Option<NormalPath>, Option<LocationId>, Option<String>);
         let mut places: HashMap<Place, usize> = HashMap::new();
+        let mounts: HashMap<LocationId, Option<String>> = self
+            .locations()?
+            .into_iter()
+            .map(|location| (location.id, location.drive_mount))
+            .collect();
         for session in self.sessions(Shelf::Unsorted)? {
             let on_drive = session.project.as_ref().is_some_and(NormalPath::is_drive);
             let location = (!on_drive).then(|| session.id.location.clone());
@@ -137,6 +148,7 @@ impl Catalogue {
                         project: session.project.clone(),
                         locations: Vec::new(),
                         spellings: Vec::new(),
+                        drive: None,
                         sessions: Vec::new(),
                     });
                     groups.len() - 1
@@ -149,9 +161,27 @@ impl Catalogue {
                 && !group.spellings.contains(spelling)
             {
                 group.spellings.push(spelling.clone());
+                /* The first spelling on a drive leads; until there is one, the first under
+                a mount stands in for it. */
+                if on_drive && !group.drive.as_deref().is_some_and(on_windows_drive) {
+                    group.drive = if on_windows_drive(spelling) {
+                        Some(spelling.clone())
+                    } else {
+                        group.drive.take().or_else(|| {
+                            let mount = mounts.get(&session.id.location).cloned().flatten();
+                            filing::drive_form(spelling, mount.as_deref())
+                        })
+                    };
+                }
             }
             group.sessions.push(session);
         }
         Ok(groups)
     }
+}
+
+/// Whether `path` is written as Windows writes a path on a drive: `D:\…` or `D:/…`.
+fn on_windows_drive(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }

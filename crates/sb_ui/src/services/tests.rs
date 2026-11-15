@@ -734,37 +734,105 @@ fn sessions_with_no_path_and_those_at_the_root_offer_no_folder(cx: &mut TestAppC
 fn a_drives_group_is_written_in_its_drive_form() {
     use sb_core::catalogue::PathGroup;
     use sb_core::filing::{NormalPath, WSL_DRIVE_MOUNT};
-    let group = |project: &str, spellings: &[&str]| PathGroup {
+    let group = |project: &str, spellings: &[&str], drive: Option<&str>| PathGroup {
         project: NormalPath::new(project, Some(WSL_DRIVE_MOUNT)),
         locations: Vec::new(),
         spellings: spellings.iter().map(|it| it.to_string()).collect(),
+        drive: drive.map(str::to_string),
         sessions: Vec::new(),
     };
     let also = |others: &[&str]| others.iter().map(|it| it.to_string()).collect::<Vec<_>>();
-    // DESIGN §4.6: the drive's own spelling leads, whichever was recorded first.
+    // DESIGN §4.6: the drive form leads, whichever spelling was recorded first.
     assert_eq!(
         group_path(&group(
             "D:\\Projects\\fc",
-            &["/mnt/d/Projects/fc", "D:\\Projects\\fc"]
+            &["/mnt/d/Projects/fc", "D:\\Projects\\fc"],
+            Some("D:\\Projects\\fc"),
         )),
         Some((
             "D:\\Projects\\fc".to_string(),
             also(&["/mnt/d/Projects/fc"])
         ))
     );
-    // Recorded only through its mount, it is still shown as the drive's path.
+    // Recorded only through a mount, it is shown as the catalogue read it by that mount.
     assert_eq!(
-        group_path(&group("/mnt/d/Projects/fc", &["/mnt/d/Projects/fc"])),
+        group_path(&group(
+            "/mnt/d/Projects/fc",
+            &["/win/d/Projects/fc"],
+            Some("D:\\Projects\\fc"),
+        )),
         Some((
             "D:\\Projects\\fc".to_string(),
-            also(&["/mnt/d/Projects/fc"])
+            also(&["/win/d/Projects/fc"])
         ))
     );
     assert_eq!(
-        group_path(&group("/home/user/code/app", &["/home/user/code/app"])),
+        group_path(&group(
+            "/home/user/code/app",
+            &["/home/user/code/app"],
+            None
+        )),
         Some(("/home/user/code/app".to_string(), Vec::new()))
     );
-    assert_eq!(group_path(&group("", &[])), None);
+    assert_eq!(group_path(&group("", &[], None)), None);
+}
+
+#[gpui::test]
+fn a_folder_made_from_a_drive_under_a_locations_own_mount_takes_the_drive_form(
+    cx: &mut TestAppContext,
+) {
+    let mut machine = machine();
+    machine.outlined(&Outline {
+        project: "/win/d/Projects/fc",
+        title: "Started on a drive mounted at /win/",
+        prompt: "Where am I?",
+        model: "model-a",
+        day: (2026, 11, 14),
+        calls: 0,
+    });
+    init(machine, cx);
+    let (sync, library) = services(cx);
+    sync.update(cx, |sync, cx| sync.add_local(cx));
+    cx.run_until_parked();
+    // The location mounts the drives at /win/, as a distro's /etc/wsl.conf can say.
+    let location = locations(&sync, cx)[0].id.clone();
+    cx.update(|cx| {
+        let archive = cx.services().archive.read(cx).archive().cloned().unwrap();
+        archive
+            .catalogue()
+            .set_drive_mount(&location, Some("/win/"))
+            .unwrap();
+    });
+    library.update(cx, |library, cx| library.show(Shelf::Unsorted, cx));
+    cx.run_until_parked();
+    let group = library.read_with(cx, |library, _| {
+        let group = library
+            .groups()
+            .iter()
+            .find(|group| group.spellings == ["/win/d/Projects/fc"])
+            .expect("the drive's group");
+        assert_eq!(
+            group_path(group),
+            Some((
+                "D:\\Projects\\fc".to_string(),
+                vec!["/win/d/Projects/fc".to_string()]
+            ))
+        );
+        group_key(group)
+    });
+    library.update(cx, |library, cx| library.create_folder_from(&group, cx));
+    cx.run_until_parked();
+    library.read_with(cx, |library, _| {
+        let names: Vec<_> = library.folders().iter().map(|it| &it.name).collect();
+        assert_eq!(names, ["fc"]);
+        assert!(
+            library
+                .groups()
+                .iter()
+                .all(|it| it.spellings != ["/win/d/Projects/fc"]),
+            "the group is filed into its folder"
+        );
+    });
 }
 
 #[gpui::test]

@@ -19,6 +19,8 @@
 //! - `"boards"`: an archive already in the data dir, holding the library the design boards
 //!   draw ([`boards`]), so that the pages can be captured as the boards show them
 //!   (docs/DESIGN.md §6).
+//! - `"boards-held-back"`: the same, with one of the subfolder player's sessions held back
+//!   and filed by hand ([`boards::build`]).
 //! - `"locations"`: an archive in the data dir with one location of each kind, the host's
 //!   last good sync twelve days ago, and this machine's agent in the home
 //!   ([`fixture::locations`]): the locations sheet's states (docs/DESIGN.md §4.11).
@@ -30,6 +32,7 @@ mod boards;
 mod fixture;
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -47,6 +50,7 @@ enum Library {
     Agent,
     AgentLarge,
     Boards,
+    BoardsHeldBack,
     Locations,
     ArchiveRemains,
 }
@@ -59,9 +63,11 @@ struct Header {
     fixture: Library,
 }
 
-/// What every launch of a scenario's app is started with.
+/// What every launch of a scenario's app is started with: the environment that points this
+/// machine at the scenario's home, and that home as the stand-in for a WSL distro.
 struct Home {
     env: Vec<(OsString, Option<OsString>)>,
+    home: PathBuf,
 }
 
 /// The year the fixtures' newest sessions are dated in. The app writes its dates as seen
@@ -74,7 +80,12 @@ impl Fixture<NoAction> for Home {
     }
 
     fn args(&self) -> Vec<String> {
-        vec!["--automation-calendar".to_string(), CALENDAR.to_string()]
+        vec![
+            "--automation-calendar".to_string(),
+            CALENDAR.to_string(),
+            "--automation-wsl-home".to_string(),
+            self.home.display().to_string(),
+        ]
     }
 
     fn run(&mut self, action: &NoAction) -> Result<Value> {
@@ -119,11 +130,15 @@ impl RunnerApp for Scrollback {
             Library::Agent => fixture::agent(&mut tree),
             Library::AgentLarge => boards::agent(&mut tree),
             Library::NoAgent => std::fs::remove_dir_all(&home)?,
-            Library::Boards => {
+            Library::Boards | Library::BoardsHeldBack => {
                 // Its locations' trees are synced into the archive here, and gone by the
                 // time the app starts: the app finds no agent, and syncs nothing away.
                 std::fs::remove_dir_all(&home)?;
-                boards::build(&cx.data_dir.join("archive"), &cx.out_dir.join("locations"))?;
+                boards::build(
+                    &cx.data_dir.join("archive"),
+                    &cx.out_dir.join("locations"),
+                    matches!(header.fixture, Library::BoardsHeldBack),
+                )?;
             }
             Library::Locations => fixture::locations(
                 &mut tree,
@@ -135,7 +150,7 @@ impl RunnerApp for Scrollback {
                 std::fs::create_dir_all(cx.data_dir.join("archive/files/location"))?;
             }
         }
-        Ok(Box::new(Home { env }))
+        Ok(Box::new(Home { env, home }))
     }
 }
 

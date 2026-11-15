@@ -4,10 +4,10 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Div, ElementId, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Role, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, TextRun, Transformation, Window, div, font,
-    percentage, prelude::FluentBuilder as _, px, relative, svg,
+    Animation, AnimationExt as _, AnyElement, BoxShadow, Div, ElementId, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Role, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled as _, StyledText, TextRun, Transformation, Window, div,
+    font, percentage, point, prelude::FluentBuilder as _, px, relative, svg,
 };
 use sb_core::location::LocationKind;
 
@@ -213,6 +213,75 @@ pub fn warn_chip(label: impl Into<SharedString>, theme: &SbTheme) -> Div {
         .text_spec(&theme.text.small)
         .whitespace_nowrap()
         .child(label.into())
+}
+
+/// The ring around what has the keyboard (`.inp.focus`: an `accent` edge and 3px of
+/// `accent-soft` around it). An element with a border takes the edge as its border colour and
+/// the ring alone (`edge` false); one without is given the edge inside it.
+pub fn focus_ring(edge: bool, theme: &SbTheme) -> Vec<BoxShadow> {
+    let ring = |color, spread: f32, inset| BoxShadow {
+        color,
+        offset: point(px(0.), px(0.)),
+        blur_radius: px(0.),
+        spread_radius: px(spread),
+        inset,
+    };
+    let c = &theme.colors;
+    let mut rings = vec![ring(c.accent_soft, 3., false)];
+    if edge {
+        rings.push(ring(c.accent, 1., true));
+    }
+    rings
+}
+
+/// `text` in `color` and `spec`'s face, with every number in it (a run of digits, with the
+/// `,` `.` `:` between them) in the face for numbers (DESIGN §1.3: Geist Mono, whose digits
+/// are all as wide).
+pub fn with_numbers(
+    text: impl Into<SharedString>,
+    color: Hsla,
+    spec: &TextSpec,
+    theme: &SbTheme,
+) -> StyledText {
+    let text: SharedString = text.into();
+    let runs = number_spans(&text)
+        .into_iter()
+        .map(|(len, number)| {
+            let mut face = font(if number {
+                theme.fonts.numbers.clone()
+            } else {
+                spec.family.clone()
+            });
+            face.weight = spec.weight;
+            TextRun {
+                len,
+                font: face,
+                color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }
+        })
+        .collect();
+    StyledText::new(text).with_runs(runs)
+}
+
+/// `text` cut into spans, each its length in bytes and whether it is a number.
+fn number_spans(text: &str) -> Vec<(usize, bool)> {
+    let bytes = text.as_bytes();
+    let mut spans: Vec<(usize, bool)> = Vec::new();
+    for (at, byte) in bytes.iter().enumerate() {
+        let between_digits = matches!(byte, b',' | b'.' | b':')
+            && at > 0
+            && bytes[at - 1].is_ascii_digit()
+            && bytes.get(at + 1).is_some_and(u8::is_ascii_digit);
+        let number = byte.is_ascii_digit() || between_digits;
+        match spans.last_mut() {
+            Some((len, of)) if *of == number => *len += 1,
+            _ => spans.push((1, number)),
+        }
+    }
+    spans
 }
 
 /// Makes a control one the keyboard reaches with `Tab` (DESIGN §4.1), in the order it is
@@ -529,4 +598,25 @@ pub fn kind_tile(kind: &LocationKind, theme: &SbTheme) -> impl IntoElement {
         .rounded(theme.radii.input)
         .bg(fill)
         .child(icon(kind_icon(kind), theme.sizes.icon, color))
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn numbers_are_cut_from_the_words_around_them() {
+        // DESIGN §1.3: "3 of 28 MB", "started 09:02", "1,414 sessions"; `·` is two bytes.
+        assert_eq!(
+            number_spans("WSL · 3 of 28 MB"),
+            [(7, false), (1, true), (4, false), (2, true), (3, false)]
+        );
+        assert_eq!(number_spans("started 09:02"), [(8, false), (5, true)]);
+        assert_eq!(number_spans("1,414 sessions"), [(5, true), (9, false)]);
+        // A separator not between digits is a word's.
+        assert_eq!(number_spans("x, 1."), [(3, false), (1, true), (1, false)]);
+        assert_eq!(number_spans(""), []);
+    }
 }

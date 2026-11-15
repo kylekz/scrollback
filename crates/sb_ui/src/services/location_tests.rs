@@ -291,3 +291,56 @@ fn a_sync_asked_for_while_its_location_is_indexed_waits_for_the_index(cx: &mut T
         assert_eq!(cx.services().library.read(cx).counts().all, 300);
     });
 }
+
+#[gpui::test]
+fn stopping_every_sync_drops_one_waiting_for_its_locations_index(cx: &mut TestAppContext) {
+    // More sessions than a pass stores in one batch, so that one stops between two.
+    let mut machine = ProjectsTree::new();
+    for at in 0..300 {
+        machine.outlined(&Outline {
+            project: "/home/user/code/app",
+            title: &format!("Session {at}"),
+            prompt: "One of many.",
+            model: "model-a",
+            day: (2026, 11, 1 + at % 28),
+            calls: 1,
+        });
+    }
+    init(machine, cx);
+    let sync = sync_service(cx);
+    // When the stopped pass's index starts, a sync of the same location is asked for, then
+    // every sync is stopped.
+    let asked = Rc::new(RefCell::new(false));
+    let _watching = cx.update(|cx| {
+        let asked = asked.clone();
+        cx.observe(&sync, move |sync, cx| {
+            let Some(id) = sync
+                .read(cx)
+                .locations()
+                .and_then(|it| it.first())
+                .map(|it| it.id.clone())
+            else {
+                return;
+            };
+            if sync.read(cx).indexing(Some(&id)).is_some() && !asked.replace(true) {
+                sync.update(cx, |sync, cx| {
+                    sync.sync(&id, cx);
+                    sync.stop_all();
+                });
+            }
+        })
+    });
+    sync.update(cx, |sync, cx| {
+        sync.hold_after(1, Held::Stop);
+        sync.add_local(cx);
+    });
+    cx.run_until_parked();
+    assert!(*asked.borrow(), "the stopped pass's location was indexed");
+    // The sync that waited was dropped: the location never synced in full.
+    let (_, status) = locations(cx).remove(0);
+    assert!(!matches!(status, LocationStatus::Synced(_)), "{status:?}");
+    cx.update(|cx| {
+        assert!(cx.services().is_settled(cx));
+        assert!(cx.services().library.read(cx).counts().all < 300);
+    });
+}

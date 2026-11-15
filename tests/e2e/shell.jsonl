@@ -51,8 +51,8 @@
 {"cmd": "bounds", "target": "shell/sidebar", "expect_error": "no target"}
 {"cmd": "bounds", "target": "shell/main", "expect_result": [{"pointer": "/x", "equals": 0}, {"pointer": "/w", "equals": 960}, {"pointer": "/h", "equals": 560}]}
 {"cmd": "bounds", "target": "titlebar/search", "platforms": ["macos"], "expect_result": [{"pointer": "/x", "equals": 250}, {"pointer": "/w", "equals": 460}]}
-// The caption buttons need more than half of what the field leaves, so the field moves left of centre.
-{"cmd": "bounds", "target": "titlebar/search", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "lte": 250}, {"pointer": "/x", "gte": 160}, {"pointer": "/w", "equals": 460}]}
+// The caption buttons need more than half of what a 460 field leaves, so the field narrows and stays centred on the window (DESIGN §2): about 400 wide from about 280.
+{"cmd": "bounds", "target": "titlebar/search", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "gte": 265}, {"pointer": "/x", "lte": 295}, {"pointer": "/w", "gte": 370}, {"pointer": "/w", "lte": 430}]}
 {"cmd": "screenshot", "name": "shell-960x600"}
 // The button and Ctrl B show it over the main area; Esc and a press of any button outside it, on the main area or on the title bar, close it.
 {"cmd": "click", "target": "titlebar/sidebar", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}

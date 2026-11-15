@@ -141,10 +141,11 @@ impl MainArea {
             services.sync.clone(),
             services.library.clone(),
         );
+        let focus_handle = cx.focus_handle().tab_stop(true);
         Self {
-            focus_handle: cx.focus_handle().tab_stop(true),
-            sessions: cx.new(SessionsView::new),
-            unsorted: cx.new(UnsortedView::new),
+            sessions: cx.new(|cx| SessionsView::new(focus_handle.clone(), cx)),
+            unsorted: cx.new(|cx| UnsortedView::new(focus_handle.clone(), cx)),
+            focus_handle,
             first_run: cx.new(FirstRun::new),
             _observers: [
                 cx.observe(&archive, |_, _, cx| cx.notify()),

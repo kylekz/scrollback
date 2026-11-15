@@ -14,7 +14,7 @@ use sb_core::location::{Location, LocationKind};
 
 use super::{NO_LOCATIONS, Sidebar, SidebarEvent, note};
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{icon, kind_icon, kind_name, progress_bar};
+use crate::components::{icon, kind_icon, kind_name, progress_bar, with_numbers};
 use crate::format;
 use crate::icons::SbIcon;
 use crate::services::{LocationStatus, PassProgress};
@@ -28,13 +28,13 @@ const BUSY_GAP: gpui::Pixels = px(3.);
 fn doing(progress: &PassProgress) -> Option<String> {
     if progress.is_indexing() {
         Some(format!(
-            "{} / {}",
+            "{} / {} sessions",
             format::count(progress.sessions_done as u64),
             format::count(progress.sessions as u64)
         ))
     } else if progress.planned {
         Some(format!(
-            "{} / {}",
+            "{} / {} files",
             format::count(progress.items_done as u64),
             format::count(progress.items as u64)
         ))
@@ -117,6 +117,7 @@ fn row(id: impl Into<SharedString>, glyph: SbIcon, theme: &SbTheme) -> Stateful<
     div()
         .id(id.into())
         .role(Role::ListItem)
+        .flex_none()
         .flex()
         .items_center()
         .gap(theme.spacing.md)
@@ -134,15 +135,14 @@ fn name(name: &str, theme: &SbTheme) -> Div {
         .child(name.to_string())
 }
 
-/// A row's second line.
+/// A row's second line, its numbers in the face for numbers (DESIGN §1.3).
 fn line(text: String, color: Hsla, theme: &SbTheme) -> Div {
     div()
         .min_w_0()
         .overflow_hidden()
         .text_ellipsis()
-        .text_color(color)
         .text_spec(&theme.text.small)
-        .child(text)
+        .child(with_numbers(text, color, &theme.text.small, theme))
 }
 
 /// A second line led by a glyph, both in `color`.
@@ -367,7 +367,7 @@ mod tests {
         });
         progress.apply(&Progress::Fetched { bytes: 41 << 20 });
         progress.apply(&Progress::Stored { items: 38 });
-        assert_eq!(doing(&progress).as_deref(), Some("38 / 212"));
+        assert_eq!(doing(&progress).as_deref(), Some("38 / 212 files"));
         assert_eq!(doing_line(local, &progress, false), "Local · 41 of 96 MB");
         assert_eq!(
             doing_line(local, &progress, true),
@@ -382,7 +382,7 @@ mod tests {
             sessions: 362,
             bytes: 0,
         });
-        assert_eq!(doing(&progress).as_deref(), Some("362 / 1,418"));
+        assert_eq!(doing(&progress).as_deref(), Some("362 / 1,418 sessions"));
         assert_eq!(doing_line(local, &progress, false), "Local · indexing");
     }
 }

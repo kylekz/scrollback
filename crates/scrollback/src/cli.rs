@@ -53,6 +53,13 @@ pub struct Cli {
     #[arg(long, value_name = "YEAR", requires = "automation_mode")]
     pub automation_calendar: Option<i32>,
 
+    #[cfg(feature = "automation")]
+    /// Under automation, read a WSL distro's location from this home folder, as a stand-in
+    /// for the distro. Without it a scripted run reaches no distro. The e2e runner passes the
+    /// scenario's home. Needs `--automation` or `--automation-pipe`.
+    #[arg(long, value_name = "DIR", requires = "automation_mode")]
+    pub automation_wsl_home: Option<PathBuf>,
+
     /// Window size in logical pixels, e.g. 1440x900 (minimum 960x600) [default: 1440x900].
     #[arg(long, value_name = "WxH")]
     pub window_size: Option<WindowSize>,

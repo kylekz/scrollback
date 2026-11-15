@@ -20,7 +20,8 @@
 //!
 //! **At quit** what is still queued is written in one background job, for as long as gpui
 //! waits for it: [`gpui::SHUTDOWN_TIMEOUT`], 200 ms. A change queued behind a pass's last batch
-//! may need longer to reach the database; what was not written by then is lost, and logged.
+//! may need longer to reach the database; what is not known to be written by then is logged as
+//! what may not have been: the job writing the change in hand may still finish it.
 
 use std::cmp::Reverse;
 use std::collections::{HashSet, VecDeque};
@@ -155,25 +156,13 @@ pub fn group_key(group: &PathGroup) -> String {
 /**
  * How a group's path is written on its chip, and the other ways its sessions recorded it. A
  * drive's path is shown in its drive form (DESIGN §4.6: `D:\Projects\fc`, "also as
- * /mnt/d/Projects/fc"), which is made from a mount path when no session recorded it so.
- * `None` for the sessions that recorded no path.
+ * /mnt/d/Projects/fc"), which the catalogue read by its location's drive mount when no
+ * session recorded it so. `None` for the sessions that recorded no path.
  */
 pub fn group_path(group: &PathGroup) -> Option<(String, Vec<String>)> {
-    let on_drive = |path: &str| {
-        let bytes = path.as_bytes();
-        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
-    };
     let first = group.spellings.first()?;
-    if !group.project.as_ref().is_some_and(NormalPath::is_drive) {
+    let Some(shown) = group.drive.clone() else {
         return Some((first.clone(), group.spellings[1..].to_vec()));
-    }
-    let shown = match group.spellings.iter().find(|spelling| on_drive(spelling)) {
-        Some(drive) => drive.clone(),
-        None => {
-            let below = first.strip_prefix(filing::WSL_DRIVE_MOUNT).unwrap_or(first);
-            let (letter, rest) = below.split_at(below.len().min(1));
-            format!("{}:{}", letter.to_uppercase(), rest.replace('/', "\\"))
-        }
     };
     let others = group
         .spellings
@@ -320,8 +309,8 @@ impl Change {
     }
 }
 
-/// The changes a quit is writing, and how many of them are written: those that are not when
-/// gpui stops waiting, and this is dropped, are logged.
+/// The changes a quit is writing, and how many of them are written: those that are not known
+/// to be when gpui stops waiting, and this is dropped, are logged.
 struct Unwritten {
     changes: Vec<String>,
     written: Arc<AtomicUsize>,
@@ -333,7 +322,8 @@ impl Drop for Unwritten {
         let left = &self.changes[written..];
         if !left.is_empty() {
             log::error!(
-                "the app quit before {} of the owner's changes were written: {}",
+                "the app quit before {} of the owner's changes were seen written; they may not \
+                 have been written: {}",
                 left.len(),
                 left.join("; ")
             );

@@ -40,9 +40,12 @@ use sb_core::location::LocationId;
 
 use crate::actions::sidebar::{Collapse, DropName, Expand, KeepName, Next, Open, Previous};
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{count, icon, icon_button, overline, sync_glyph};
+use crate::components::{
+    DISABLED_OPACITY, count, focus_ring, icon, icon_button, overline, sync_glyph,
+};
 use crate::icons::SbIcon;
 use crate::keymap;
+use crate::pages::Showing;
 use crate::services::library::LibraryEvent;
 use crate::services::{ActiveServices as _, LibraryService, SyncService};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
@@ -423,10 +426,13 @@ impl Sidebar {
 
     /// A library row (DESIGN §4.1): 32 high, radius 8, icon `fg3`, name `fg2`, its count at
     /// the right; `s3` with the name in `fg` at 500 while its page is shown.
+    /// `enabled` while there is a library to show; `known` while the counts are, which they
+    /// aren't while the archive can't be opened (DESIGN §4.14: "—"); `keyboard` while the
+    /// keyboard is on the rows.
     fn library_row(
         &self,
         (glyph, name, target, shelf): (SbIcon, &'static str, &'static str, Option<Shelf>),
-        enabled: bool,
+        (enabled, known, keyboard): (bool, bool, bool),
         theme: &SbTheme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -440,14 +446,18 @@ impl Sidebar {
             Some(Shelf::Folder(_)) | None => 0,
         };
         let selected = enabled && shelf == Some(library.highlighted());
-        let count_color = if selected {
-            c.fg2
-        } else if shelf == Some(Shelf::Unsorted) && value > 0 {
+        // Unsorted's count is an accent while there is something to file, selected or not.
+        let count_color = if known && shelf == Some(Shelf::Unsorted) && value > 0 {
             c.accent_text
+        } else if selected {
+            c.fg2
         } else {
             c.fg3
         };
         row_base(selected, theme)
+            .when(selected && keyboard, |this| {
+                this.shadow(focus_ring(true, theme))
+            })
             .id(target)
             .role(Role::ListItem)
             // A row with no page yet is drawn as the rows that can't be opened are.
@@ -468,7 +478,13 @@ impl Sidebar {
                 if selected { c.fg2 } else { c.fg3 },
             ))
             .child(name)
-            .child(count(value, count_color, theme))
+            .map(|this| {
+                if known {
+                    this.child(count(value, count_color, theme))
+                } else {
+                    this.child(unknown_count(theme))
+                }
+            })
             .automation_target(target)
     }
 
@@ -476,13 +492,21 @@ impl Sidebar {
     /// `line` guide, a chevron when it has
     /// folders in it (a click on it opens or closes the folder without selecting it), the
     /// folder glyph, its name and the count of its sessions and its folders' (DESIGN §4.1).
-    fn folder_row(&self, row: TreeRow, theme: &SbTheme, cx: &mut Context<Self>) -> AnyElement {
+    /// `marked` is the folder whose row is selected ([`Self::marked`]), and `keyboard` says
+    /// the keyboard is on the rows.
+    fn folder_row(
+        &self,
+        row: TreeRow,
+        (marked, keyboard): (Option<FolderId>, bool),
+        theme: &SbTheme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let c = &theme.colors;
         let library = self.library.read(cx);
         let folder = &library.folders()[row.folder];
         let id = folder.id;
         let name: SharedString = folder.name.clone().into();
-        let selected = library.highlighted() == Shelf::Folder(id);
+        let selected = marked == Some(id);
         let sessions = library.counts().folders.get(&id).copied().unwrap_or(0);
         let renaming = self
             .renaming
@@ -534,7 +558,7 @@ impl Sidebar {
                             // The row is an input while its folder is named (`.inp.focus`).
                             this.bg(c.s1).border_1().border_color(c.accent)
                         } else if selected {
-                            this
+                            this.when(keyboard, |this| this.shadow(focus_ring(true, theme)))
                         } else {
                             this.hover(|style| style.bg(c.s2))
                         }
@@ -543,22 +567,30 @@ impl Sidebar {
                         this.show(Shelf::Folder(id), cx);
                         cx.emit(SidebarEvent::Picked);
                     }))
-                    .children((0..row.depth.min(INDENTED_LEVELS)).map(|_| {
+                    // The levels' guides and the chevron's place, with no gap between them,
+                    // so that each level moves the row's glyph in by the indent alone. A
+                    // level's guide runs under the middle of its folder's chevron.
+                    .child(
                         div()
                             .flex_none()
+                            .flex()
                             .h_full()
-                            .w(theme.sizes.folder_indent)
-                            .pl(theme.spacing.md)
-                            .child(div().h_full().w(px(1.)).bg(c.line))
-                    }))
-                    .when(row.chevron_room, |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .size(theme.sizes.icon_xs)
-                                .children(chevron),
-                        )
-                    })
+                            .items_center()
+                            .children((0..row.depth.min(INDENTED_LEVELS)).map(|_| {
+                                div()
+                                    .flex_none()
+                                    .h_full()
+                                    .w(theme.sizes.folder_indent)
+                                    .pl(theme.sizes.icon_xs / 2.)
+                                    .child(div().h_full().w(px(1.)).bg(c.line))
+                            }))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .size(theme.sizes.icon_xs)
+                                    .children(chevron),
+                            ),
+                    )
                     .child(icon(
                         SbIcon::Folder,
                         theme.sizes.icon,
@@ -605,14 +637,36 @@ impl Sidebar {
     fn folder_rows(
         &mut self,
         range: Range<usize>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let theme = cx.sb_theme().clone();
+        let marked = (self.marked(cx), self.keyboard(window));
         range
             .filter_map(|at| self.tree.get(at).copied())
-            .map(|row| self.folder_row(row, &theme, cx))
+            .map(|row| self.folder_row(row, marked, &theme, cx))
             .collect()
+    }
+
+    /**
+     * The folder whose row is drawn selected (DESIGN §4.1): the one whose page is shown, or
+     * whose session is read; when a closed folder hides its row, the nearest folder around it
+     * that has one, so that the sidebar still says where the page is.
+     */
+    fn marked(&self, cx: &App) -> Option<FolderId> {
+        let library = self.library.read(cx);
+        let Shelf::Folder(folder) = library.highlighted() else {
+            return None;
+        };
+        std::iter::once(folder)
+            .chain(tree::ancestors(library.folders(), folder))
+            .find(|folder| self.row_of(*folder, cx).is_some())
+    }
+
+    /// Whether the keyboard is on the rows, and came there by the keyboard: the selected row
+    /// then has the keyboard's ring.
+    fn keyboard(&self, window: &Window) -> bool {
+        self.focus_handle.is_focused(window) && window.last_input_was_keyboard()
     }
 }
 
@@ -636,6 +690,16 @@ fn row_base(selected: bool, theme: &SbTheme) -> Div {
                 this.text_color(c.fg2)
             }
         })
+}
+
+/// What a row says for its count while the archive can't be opened (DESIGN §4.14).
+fn unknown_count(theme: &SbTheme) -> impl IntoElement {
+    div()
+        .flex_none()
+        .ml_auto()
+        .text_color(theme.colors.fg3)
+        .text_spec(&theme.text.count)
+        .child("—")
 }
 
 /// The row a section's overline and its button sit in.
@@ -666,12 +730,30 @@ fn note(text: &'static str, theme: &SbTheme) -> impl IntoElement {
 }
 
 impl Render for Sidebar {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.sb_theme().clone();
         let c = &theme.colors;
         let has_library = self.has_library(cx);
         let first_run = self.sync.read(cx).is_first_run();
         let syncing = self.sync.read(cx).is_syncing();
+        // While the archive can't be opened the counts aren't known and the section buttons
+        // are drawn disabled (DESIGN §4.14).
+        let unavailable = Showing::now(cx) == Showing::ArchiveFailed;
+        let rows = (has_library, !unavailable, self.keyboard(window));
+        let disabled_button = |glyph: AnyElement, label: String, target: &'static str| {
+            div()
+                .id(target)
+                .role(Role::Button)
+                .aria_label(label)
+                .flex()
+                .items_center()
+                .justify_center()
+                .ml_auto()
+                .size(theme.sizes.section_button)
+                .opacity(DISABLED_OPACITY)
+                .child(glyph)
+                .automation_target(target)
+        };
         div()
             .id("sidebar-rows")
             // The landmark is the element the keyboard rests on.
@@ -700,7 +782,7 @@ impl Render for Sidebar {
                     .children(
                         LIBRARY_ROWS
                             .into_iter()
-                            .map(|row| self.library_row(row, has_library, &theme, cx)),
+                            .map(|row| self.library_row(row, rows, &theme, cx)),
                     ),
             )
             .child(
@@ -724,6 +806,13 @@ impl Render for Sidebar {
                             }))
                             .automation_target("sidebar/new-folder"),
                         )
+                    })
+                    .when(unavailable, |this| {
+                        this.child(disabled_button(
+                            icon(SbIcon::Plus, theme.sizes.icon_sm, c.fg2).into_any_element(),
+                            "New folder".to_string(),
+                            "sidebar/new-folder",
+                        ))
                     }),
             )
             .map(|this| {
@@ -780,6 +869,13 @@ impl Render for Sidebar {
                                 }))
                                 .automation_target("sidebar/sync-all"),
                             )
+                    })
+                    .when(unavailable, |this| {
+                        this.child(disabled_button(
+                            sync_glyph(false, c.fg2, &theme),
+                            "Sync all locations".to_string(),
+                            "sidebar/sync-all",
+                        ))
                     })
                     .map(|this| {
                         if has_library {
