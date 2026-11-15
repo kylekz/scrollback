@@ -45,6 +45,9 @@ use crate::transport::{Env, RangeSink, Transport};
 
 const ID: ProviderId = ProviderId::new("claude-code");
 
+/// The version of [`parse`].
+const PARSER_VERSION: u32 = 1;
+
 /// Where the items are, under the root.
 const SUBTREE: &str = "projects";
 
@@ -74,6 +77,10 @@ impl Provider for Agent {
                 root,
             }) as Box<dyn Source>
         }))
+    }
+
+    fn parser_version(&self) -> u32 {
+        PARSER_VERSION
     }
 
     fn parse(&self, items: &dyn SessionItems) -> Transcript {

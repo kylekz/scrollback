@@ -1,12 +1,15 @@
 //! A temporary command-line trigger for the sync engine (PLAN §13), for use until the app has
 //! locations in its UI. It syncs this machine's agents into the archive in a folder, creating
-//! the archive if the folder has none, or verifies that archive, or sets aside what verify
-//! found under its `files/` that the catalogue doesn't record. It prints totals only.
+//! the archive if the folder has none, and indexes what the sync changed; or verifies that
+//! archive; or sets aside what verify found under its `files/` that the catalogue doesn't
+//! record; or empties the session index and builds it again from the archive, and says
+//! whether it came back the same. It prints totals only.
 //!
 //! ```text
 //! cargo run --release -p sb_core --example sync -- <archive folder>
 //! cargo run --release -p sb_core --example sync -- <archive folder> verify
 //! cargo run --release -p sb_core --example sync -- <archive folder> set-aside
+//! cargo run --release -p sb_core --example sync -- <archive folder> reindex
 //! ```
 
 use std::error::Error;
@@ -15,17 +18,52 @@ use std::time::Instant;
 
 use sb_core::CancelToken;
 use sb_core::archive::{Archive, ArchiveError};
+use sb_core::catalogue::{Catalogue, Session, Shelf};
 use sb_core::location::LocationKind;
 use sb_core::provider;
-use sb_core::sync::{Progress, sync_location};
+use sb_core::sync::{IndexReport, Progress, index, sync_location};
+use sb_core::transcript::Ending;
 use sb_core::transport::LocalTransport;
+
+/// What an index did, in a line.
+fn indexed(report: &IndexReport) -> String {
+    format!(
+        "indexed {} sessions: {} could not be parsed, {} filed by a rule, {} versions held \
+         back for how they parse",
+        report.sessions,
+        report.failed.len(),
+        report.filed,
+        report.held_back
+    )
+}
+
+/// Prints what the index holds, as counts.
+fn print_index(catalogue: &Catalogue) -> Result<(), Box<dyn Error>> {
+    let sessions = catalogue.sessions(Shelf::All)?;
+    let count =
+        |of: &dyn Fn(&Session) -> bool| sessions.iter().filter(|session| of(session)).count();
+    println!(
+        "the index holds {} sessions: {} with a title, {} with a project path, {} without a \
+         transcript of their own, {} that end inside a record, {} that could not be read \
+         through, {} that could not be parsed, {} with a version held back",
+        sessions.len(),
+        count(&|session| session.title.is_some()),
+        count(&|session| session.project.is_some()),
+        count(&|session| session.main_item.is_none() && session.failure.is_none()),
+        count(&|session| session.ending == Some(Ending::MidRecord)),
+        count(&|session| matches!(session.ending, Some(Ending::Unreadable(_)))),
+        count(&|session| session.failure.is_some()),
+        count(&|session| session.held_back),
+    );
+    Ok(())
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (dir, action) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         [dir] => (dir, "sync"),
-        [dir, action @ ("verify" | "set-aside")] => (dir, action),
-        _ => return Err("usage: sync <archive folder> [verify | set-aside]".into()),
+        [dir, action @ ("verify" | "set-aside" | "reindex")] => (dir, action),
+        _ => return Err("usage: sync <archive folder> [verify | set-aside | reindex]".into()),
     };
     let archive = match Archive::open(Path::new(dir)) {
         Err(ArchiveError::NotAnArchive(_)) => Archive::create(Path::new(dir))?,
@@ -79,12 +117,46 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let catalogue = archive.catalogue();
+    if action == "reindex" {
+        let before = catalogue.sessions(Shelf::All)?;
+        catalogue.drop_index()?;
+        let report = index(
+            &archive,
+            None,
+            &provider::builtin(),
+            &CancelToken::new(),
+            &mut |progress| {
+                if let Progress::Indexing { sessions, bytes } = progress {
+                    println!("indexing {sessions} sessions, {bytes} bytes");
+                }
+            },
+        )?;
+        println!("{} in {:.1?}", indexed(&report), started.elapsed());
+        let after = catalogue.sessions(Shelf::All)?;
+        let differ = before
+            .iter()
+            .zip(&after)
+            .filter(|(before, after)| before != after)
+            .count();
+        println!(
+            "the index held {} sessions and holds {}, of which {differ} are not as they were",
+            before.len(),
+            after.len()
+        );
+        print_index(catalogue)?;
+        return if before == after {
+            Ok(())
+        } else {
+            Err("the index did not come back as it was".into())
+        };
+    }
     let location = match catalogue.locations()?.into_iter().next() {
         Some(location) => location,
         None => catalogue.add_location(LocationKind::Local, "This machine")?,
     };
     let mut planned = (0, 0);
     let mut fetched = 0;
+    let mut indexing = None;
     let passes = sync_location(
         &archive,
         &location.id,
@@ -102,6 +174,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "fetched {items} of {} items, {fetched} of {} bytes",
                 planned.0, planned.1
             ),
+            Progress::Indexing { sessions, bytes } => {
+                indexing = Some(Instant::now());
+                println!("indexing {sessions} sessions, {bytes} bytes");
+            }
+            Progress::Indexed { .. } => {}
         },
     )?;
     for pass in passes {
@@ -132,6 +209,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             report.bytes_fetched,
             report.bytes_stored
         );
+        println!("{}: {}", pass.provider, indexed(&report.index));
         let mut reasons: Vec<_> = report
             .failed
             .iter()
@@ -145,6 +223,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("  not archived: {reason}");
         }
     }
-    println!("synced in {:.1?}", started.elapsed());
+    println!(
+        "synced in {:.1?}, of which the last index took {:.1?}",
+        started.elapsed(),
+        indexing
+            .map(|indexing| indexing.elapsed())
+            .unwrap_or_default()
+    );
+    print_index(catalogue)?;
     Ok(())
 }

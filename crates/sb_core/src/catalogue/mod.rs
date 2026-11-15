@@ -3,9 +3,16 @@
 //! folder, with `toolbox_store`'s checked backups beside it in `backups/`.
 //!
 //! Sync only ever adds rows and moves an item's or a version's own fields forward (PLAN §2.3):
-//! nothing here deletes.
+//! nothing here deletes what sync wrote.
+//!
+//! The library is here too (PLAN §2.2): the owner's folders, attached paths and what they
+//! decided about a session ([`folder`]), and the derived index of each session ([`session`]),
+//! which is read through [`library`].
 
+mod folder;
+mod library;
 mod schema;
+mod session;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,9 +24,15 @@ use toolbox_store::rusqlite::{self, Connection, OptionalExtension as _, Row, ToS
 use toolbox_store::{Backups, Database, OpenOptions};
 
 use crate::archive::item_folder;
+use crate::filing::FolderId;
 use crate::hash::Hash;
 use crate::location::{Location, LocationId, LocationKind};
 use crate::provider::{ItemKind, ScannedItem};
+
+pub use folder::{Folder, FolderPath};
+pub use library::{LibraryCounts, PathGroup, Shelf};
+pub(crate) use session::{Derived, Reading, fingerprint};
+pub use session::{Filed, Session, SessionId, Usage};
 
 #[derive(Debug, Error)]
 pub enum CatalogueError {
@@ -29,6 +42,20 @@ pub enum CatalogueError {
     /// pass that fetched the range found it. Nothing was recorded.
     #[error("version {version} is no longer {length} bytes long, so nothing is appended to it")]
     VersionMoved { version: i64, length: u64 },
+    /// A path that names no directory (an empty one, `/`) would claim every session.
+    #[error("{0:?} names no directory, so it is not attached to a folder")]
+    NoPath(String),
+    /// The path is attached already for the same locations (PLAN §8): to `folder`, as `typed`.
+    #[error("{typed} is already attached to the folder {name}")]
+    PathAttached {
+        folder: FolderId,
+        name: String,
+        typed: String,
+    },
+    #[error("a folder is not moved into itself or into a folder inside it")]
+    FolderInItself,
+    #[error("version {0} is not a version of one of the session's items")]
+    NotOfSession(i64),
 }
 
 impl From<rusqlite::Error> for CatalogueError {
@@ -147,9 +174,12 @@ pub struct Version {
     /// The length and SHA-256 of the content so far.
     pub length: u64,
     pub hash: Hash,
-    /// The version was a loss when it started, so it is not the reading copy unless the owner
-    /// chooses it.
+    /// The version is a loss beside the copy being read (it is shorter, or `held_by_parse`),
+    /// so it is not the reading copy unless the owner chooses it.
     pub held_back: bool,
+    /// Its transcript no longer parses where the copy being read does (PLAN §4.2). It stays
+    /// held back however long it grows, until an index finds it parses again.
+    pub held_by_parse: bool,
     /// Verify, or a sync extending it, found its stored bytes missing or changed.
     pub damaged: bool,
     pub export_version: Option<u32>,
@@ -235,7 +265,7 @@ pub(crate) const DATABASE: &str = "scrollback.db";
 
 const ITEM: &str = "i.id, i.key, i.kind, i.session, i.seen_length, i.seen_stamp, i.gone_since";
 const VERSION: &str = "v.id, v.number, v.reason, v.started_at, v.length, v.hash, v.held_back, \
-                       v.damaged, v.export_version";
+                       v.held_by_parse, v.damaged, v.export_version";
 const LOCATION: &str = "id, kind, name, last_attempt_at, last_success_at, last_error";
 
 /// The open catalogue: a cheap-to-clone handle. Every method blocks on disk I/O.
@@ -499,7 +529,8 @@ impl Catalogue {
      * to, all in one transaction.
      * Returns for each whether a version it starts is held back (PLAN §4.2): it is shorter
      * than the copy being read, which is the newest version not itself held back. A held-back
-     * version that grows to that copy's length is no longer a loss and stops being held back.
+     * version that grows to that copy's length is no longer a loss and stops being held back,
+     * unless it is held back for how it parses ([`Catalogue::hold_for_parse`]).
      */
     pub(crate) fn commit(&self, commits: &[Recorded<'_>]) -> Result<Vec<bool>> {
         let now = now_ms();
@@ -560,7 +591,7 @@ impl Catalogue {
                         seen(tx, item, scanned)?;
                         let extended = tx.execute(
                             "UPDATE version SET length = ?2, hash = ?3,
-                                 held_back = COALESCE(held_back AND ?2 < (
+                                 held_back = held_by_parse OR COALESCE(held_back AND ?2 < (
                                      SELECT length FROM version reading
                                      WHERE reading.item_id = version.item_id
                                        AND reading.held_back = 0
@@ -756,8 +787,9 @@ fn version_from(row: &Row<'_>, at: usize) -> rusqlite::Result<Version> {
         length: row.get(at + 4)?,
         hash: row.get(at + 5)?,
         held_back: row.get(at + 6)?,
-        damaged: row.get(at + 7)?,
-        export_version: row.get(at + 8)?,
+        held_by_parse: row.get(at + 7)?,
+        damaged: row.get(at + 8)?,
+        export_version: row.get(at + 9)?,
     })
 }
 

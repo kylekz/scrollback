@@ -1,7 +1,10 @@
 //! Filing (PLAN §8): path normalisation, and matching a session's project path to a folder.
 //!
 //! This is the logic alone: paths and attached paths in, a decision out. The catalogue holds
-//! the folders and says when the rules run.
+//! the folders and runs the rules ([`crate::catalogue`]).
+
+use toolbox_store::rusqlite::types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef};
+use toolbox_store::rusqlite::{self, ToSql};
 
 use crate::location::LocationId;
 
@@ -92,6 +95,19 @@ impl NormalPath {
             .0
             .strip_prefix(&self.0)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    }
+}
+
+impl ToSql for NormalPath {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.0.to_sql()
+    }
+}
+
+/// The catalogue holds paths as they were normalised.
+impl FromSql for NormalPath {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        String::column_result(value).map(Self)
     }
 }
 

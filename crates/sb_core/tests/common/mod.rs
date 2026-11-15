@@ -4,6 +4,8 @@
 
 #![allow(
     dead_code,
+    unused_macros,
+    unused_imports,
     reason = "each test binary uses its own part of this module"
 )]
 
@@ -14,17 +16,43 @@ use std::sync::Mutex;
 
 use sb_core::CancelToken;
 use sb_core::archive::Archive;
-use sb_core::catalogue::{Item, Segment, Version};
+use sb_core::catalogue::{Item, Segment, Session, SessionId, Shelf, Version};
 use sb_core::location::{Location, LocationId, LocationKind};
 use sb_core::provider::{
     Hashed, ItemPrefix, ItemRange, Provider, ProviderError, ProviderId, RangeFailure, Scan,
     SessionItems, Source,
 };
-use sb_core::sync::{Pass, PassReport, Progress, SyncError, sync_location};
-use sb_core::transcript::Transcript;
+use sb_core::sync::{IndexReport, Pass, PassReport, Progress, SyncError, index, sync_location};
+use sb_core::transcript::{Subagent, Transcript};
 use sb_core::transport::{Halt, RangeSink, Transport};
 use sb_test_support::Agent;
 use tempfile::TempDir;
+
+/// Runs each named test against both agents: the one that keeps files and the made-up one
+/// that keeps a database.
+macro_rules! for_both_agents {
+    ($($test:ident),* $(,)?) => {
+        mod files {
+            $(
+                #[test]
+                fn $test() {
+                    super::$test::<sb_test_support::FileAgent>();
+                }
+            )*
+        }
+
+        mod database {
+            $(
+                #[test]
+                fn $test() {
+                    super::$test::<sb_test_support::DbAgent>();
+                }
+            )*
+        }
+    };
+}
+
+pub(crate) use for_both_agents;
 
 pub struct Bench<A> {
     pub agent: A,
@@ -119,6 +147,45 @@ impl<A: Agent> Bench<A> {
         assert!(report.deferred.is_empty(), "{:?}", report.deferred);
         assert!(report.unlisted.is_empty(), "{:?}", report.unlisted);
         report
+    }
+
+    /// An index of every session of the fixture's agent that is out of date, as a start runs.
+    pub fn index(&self) -> IndexReport {
+        self.index_with(self.agent.provider())
+    }
+
+    pub fn index_with(&self, provider: Box<dyn Provider + '_>) -> IndexReport {
+        index(
+            self.archive(),
+            None,
+            &[provider],
+            &CancelToken::new(),
+            &mut |_| {},
+        )
+        .unwrap()
+    }
+
+    /// The identity of the session whose transcript is the item `key`.
+    pub fn session_id(&self, key: &str) -> SessionId {
+        SessionId {
+            location: self.location.clone(),
+            provider: self.agent.provider().id().to_string(),
+            key: self.item(key).session.unwrap(),
+        }
+    }
+
+    /// The indexed session whose transcript is the item `key`.
+    pub fn session(&self, key: &str) -> Session {
+        self.archive()
+            .catalogue()
+            .session(&self.session_id(key))
+            .unwrap()
+            .unwrap_or_else(|| panic!("{key} is not indexed"))
+    }
+
+    /// Every indexed session, the one that did something last first.
+    pub fn sessions(&self) -> Vec<Session> {
+        self.archive().catalogue().sessions(Shelf::All).unwrap()
     }
 
     pub fn location(&self) -> Location {
@@ -262,6 +329,10 @@ pub enum Meddle<'a> {
     FewerProofs,
     /// Fails when it is asked for proofs.
     NoProofs,
+    /// Says its parser is of this version.
+    ParserVersion(u32),
+    /// Its parser stops, with a panic, on the session that has the item of this key.
+    FaultyParser(String),
 }
 
 impl<'a> Meddle<'a> {
@@ -316,8 +387,24 @@ impl Provider for Meddling<'_> {
         }))
     }
 
+    fn parser_version(&self) -> u32 {
+        match self.meddle {
+            Meddle::ParserVersion(version) => version,
+            _ => self.inner.parser_version(),
+        }
+    }
+
     fn parse(&self, items: &dyn SessionItems) -> Transcript {
+        if let Meddle::FaultyParser(key) = &self.meddle
+            && items.list().iter().any(|item| item.key == *key)
+        {
+            panic!("the test's parser can't read {key}");
+        }
         self.inner.parse(items)
+    }
+
+    fn subagent(&self, items: &dyn SessionItems, item: &str) -> Subagent {
+        self.inner.subagent(items, item)
     }
 }
 

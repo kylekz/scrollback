@@ -197,7 +197,7 @@ fn a_catalogue_that_records_nothing_does_not_get_the_files_set_aside() {
     /* This archive's catalogue as it was before its first sync, as an early backup has it. */
     edit_catalogue(
         bench.dir(),
-        "DELETE FROM segment; DELETE FROM version; DELETE FROM item;",
+        "DELETE FROM session; DELETE FROM segment; DELETE FROM version; DELETE FROM item;",
     );
 
     bench.reopen();

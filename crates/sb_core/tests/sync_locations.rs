@@ -35,6 +35,10 @@ impl Provider for Unreachable {
         Err(TransportError::NoHome.into())
     }
 
+    fn parser_version(&self) -> u32 {
+        1
+    }
+
     fn parse(&self, _items: &dyn SessionItems) -> Transcript {
         Transcript {
             facts: Facts {

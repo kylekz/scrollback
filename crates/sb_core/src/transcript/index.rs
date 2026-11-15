@@ -5,13 +5,18 @@ use std::collections::BTreeMap;
 
 use super::{BlockId, Content, Conversation, Subagent, Tokens, ToolInput, ToolKind, Transcript};
 
+/// The version of what the index holds of a session: of [`index`], and of how the catalogue
+/// derives and keeps a session's row from it. Rows made by another version are made again
+/// (PLAN §7.5), so it goes up whenever either would give an archived session another row.
+pub const INDEX_VERSION: u32 = 1;
+
 /// How much of the first prompt stands in for a title the agent didn't store.
 const TITLE_CHARS: usize = 80;
 /// How much of the first prompt a session's card and row show.
 const PROMPT_CHARS: usize = 240;
 
 /// A session's derived fields and search text.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionIndex {
     /// The title the agent stored, else the start of the first prompt.
     pub title: Option<String>,

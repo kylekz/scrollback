@@ -108,6 +108,10 @@ impl Provider for DbProvider {
         }))
     }
 
+    fn parser_version(&self) -> u32 {
+        1
+    }
+
     fn parse(&self, items: &dyn SessionItems) -> Transcript {
         let mut facts = Facts {
             agent: ID,

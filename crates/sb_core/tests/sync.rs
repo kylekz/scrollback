@@ -13,30 +13,7 @@ use sb_core::provider::ItemKind;
 use sb_core::sync::{Progress, SyncError};
 use sb_test_support::{Agent, break_segment_commits, mend_segment_commits};
 
-use common::{Bench, Meddle, When, files_under};
-
-/// Runs each named test against both agents.
-macro_rules! for_both_agents {
-    ($($test:ident),* $(,)?) => {
-        mod files {
-            $(
-                #[test]
-                fn $test() {
-                    super::$test::<sb_test_support::FileAgent>();
-                }
-            )*
-        }
-
-        mod database {
-            $(
-                #[test]
-                fn $test() {
-                    super::$test::<sb_test_support::DbAgent>();
-                }
-            )*
-        }
-    };
-}
+use common::{Bench, Meddle, When, files_under, for_both_agents};
 
 for_both_agents!(
     first_sync_archives_every_item,
@@ -292,12 +269,15 @@ fn a_pass_cancelled_at_each_step_resumes<A: Agent + Default>() {
             }
             (bench, keys)
         };
-        /* Scanned, planned, each of the three ranges fetched, and the batch stored. */
+        /* Scanned, planned, each of the three ranges fetched, and the batch stored; then what
+        there is to index, and each of the three sessions indexed. */
         let all = steps(&prepare().0);
         assert_eq!(all[0], Progress::Scanned { items: 3 });
         assert!(matches!(all[1], Progress::Planned { items: 3, .. }));
         assert_eq!(all[5], Progress::Stored { items: 3 });
-        assert_eq!(all.len(), 6);
+        assert!(matches!(all[6], Progress::Indexing { sessions: 3, .. }));
+        assert!(matches!(all[9], Progress::Indexed { sessions: 3, .. }));
+        assert_eq!(all.len(), 10);
 
         for stop_at in 0..all.len() {
             let (bench, keys) = prepare();
@@ -309,9 +289,9 @@ fn a_pass_cancelled_at_each_step_resumes<A: Agent + Default>() {
                 }
                 seen += 1;
             });
-            /* Once the batch is stored there is nothing left to cancel. */
-            let stored = stop_at + 1 == all.len();
-            if !stored {
+            /* Once the last session is indexed there is nothing left to cancel. */
+            let stored = stop_at >= 5;
+            if stop_at + 1 < all.len() {
                 assert!(
                     matches!(stopped, Err(SyncError::Cancelled)),
                     "stopped at step {stop_at}: {stopped:?}"
@@ -329,6 +309,13 @@ fn a_pass_cancelled_at_each_step_resumes<A: Agent + Default>() {
                 if stored { 0 } else { 3 },
                 "resumed after step {stop_at}"
             );
+            /* The sessions the stopped pass did not index are indexed by the next. */
+            assert_eq!(
+                resumed.index.sessions,
+                3 - stop_at.saturating_sub(6),
+                "resumed after step {stop_at}"
+            );
+            assert_eq!(bench.sessions().len(), 3);
             bench.assert_mirrors(&keys);
         }
     }

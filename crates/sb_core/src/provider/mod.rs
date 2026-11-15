@@ -176,6 +176,11 @@ pub trait Provider: Send + Sync {
         scratch: &'a Path,
     ) -> Result<Option<Box<dyn Source + 'a>>, ProviderError>;
 
+    /// The version of the provider's parser. It goes up whenever [`Provider::parse`] or
+    /// [`Provider::subagent`] would read an archived session differently, and every session
+    /// indexed by another version is then parsed and indexed again (PLAN §7.5).
+    fn parser_version(&self) -> u32;
+
     /**
      * The transcript of the session whose archived items are `items` (PLAN §7.4), with its own
      * conversation read and the subagents its calls started named, not read. Nothing fails a

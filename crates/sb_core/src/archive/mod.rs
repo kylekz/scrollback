@@ -1,7 +1,7 @@
 //! The archive on disk (PLAN §4): the folder scrollback owns, holding the stored bytes and the
 //! catalogue. [`layout`] says where things are, [`segment`] writes and reads the stored bytes,
-//! [`disk`] gets files into place and durable, and [`verify`] re-hashes everything against the
-//! catalogue.
+//! [`disk`] gets files into place and durable, [`verify`] re-hashes everything against the
+//! catalogue, and [`items`] hands a session's archived items to its provider's parser.
 //!
 //! What keeps archived bytes safe (PLAN §2.3):
 //! - a segment is a new file, written whole before the catalogue records it, and it is moved
@@ -18,6 +18,7 @@
 //!   is not opened, and one is not created over a folder that holds a catalogue or files.
 
 mod disk;
+mod items;
 mod layout;
 mod segment;
 mod verify;
@@ -34,6 +35,7 @@ use thiserror::Error;
 use crate::catalogue::{self, Catalogue, CatalogueError, Commit, Recorded, Stored};
 use crate::location::LocationId;
 
+pub use items::ArchivedSession;
 pub(crate) use layout::item_folder;
 pub use segment::{Problem, SEGMENT_BYTES, VersionReader};
 pub(crate) use segment::{RangeWriter, Sealed};

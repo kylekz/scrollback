@@ -124,10 +124,14 @@ fn a_rewrite_is_held_back_by_what_was_stored_of_it_until_the_rest_arrives() {
     let versions = bench.versions(&key);
     assert_eq!((versions[1].length, versions[1].held_back), (3, true));
 
-    /* The line is finished: the version has outgrown the one being read. */
+    /* The line is finished: the version has outgrown the one being read, and is no longer
+    held back for its length. It is for what it holds, which is no conversation. */
     bench.agent.append_raw(&key, "\"}\n");
-    assert_eq!(bench.sync().appended, 1);
-    assert!(!bench.versions(&key)[1].held_back);
+    let report = bench.sync();
+    assert_eq!((report.appended, report.index.held_back), (1, 1));
+    let version = &bench.versions(&key)[1];
+    assert!(version.length > before.len() as u64);
+    assert!(version.held_back && version.held_by_parse);
     assert!(bench.read(&bench.versions(&key)[0]) == before);
     bench.assert_mirrors(&[key]);
 }

@@ -1,11 +1,12 @@
 //! The sync engine (PLAN §5). A pass syncs one location with one provider: the provider scans
-//! and fetches through the location's transport, and the engine plans ([`plan`]) and stores
-//! ([`store`]) without knowing the agent. Indexing joins with phase 2 (PLAN §13).
+//! and fetches through the location's transport, and the engine plans ([`plan`]), stores
+//! ([`store`]) and indexes ([`index`]) without knowing the agent: it asks the provider to parse.
 //!
 //! A pass can stop anywhere, by cancel or by failure. Everything committed stays, and the next
 //! pass continues from the catalogue. A sync only adds (PLAN §2.3): it never changes or deletes
 //! a stored segment, and nothing is ever written to a location.
 
+mod index;
 mod plan;
 mod store;
 
@@ -19,6 +20,8 @@ use crate::catalogue::{self, CatalogueError};
 use crate::location::LocationId;
 use crate::provider::{Provider, ProviderError, ProviderId, Source, Unlisted};
 use crate::transport::Transport;
+
+pub use index::{IndexReport, index};
 
 #[derive(Debug, Error)]
 pub enum SyncError {
@@ -53,6 +56,10 @@ pub enum Progress {
     Fetched { bytes: u64 },
     /// So many of the planned items are dealt with: stored, or left for another pass.
     Stored { items: usize },
+    /// What there is to index: this many sessions, whose transcripts hold this many bytes.
+    Indexing { sessions: usize, bytes: u64 },
+    /// So many of those sessions are indexed, and so many of those bytes read.
+    Indexed { sessions: usize, bytes: u64 },
 }
 
 /// An item a pass did not archive, and why.
@@ -96,6 +103,8 @@ pub struct PassReport {
     pub bytes_fetched: u64,
     /// The bytes that went into segments.
     pub bytes_stored: u64,
+    /// What the pass indexed, once everything was stored.
+    pub index: IndexReport,
 }
 
 impl PassReport {
@@ -124,9 +133,9 @@ pub struct Pass {
 
 /**
  * Syncs `location`, reached through `transport`, with each of `providers` whose agent is there,
- * one after another (PLAN §5). One provider's failure does not keep the others from their
- * passes. `progress` is called as each pass advances; `cancel` stops the sync at the next step,
- * with [`SyncError::Cancelled`].
+ * one after another (PLAN §5), each pass ending with the index of what it changed. One
+ * provider's failure does not keep the others from their passes. `progress` is called as each
+ * pass advances; `cancel` stops the sync at the next step, with [`SyncError::Cancelled`].
  *
  * The attempt is recorded with the location, and so is how it ended: as a success only when
  * every pass could read everything its agent has there, and otherwise with what went wrong.
@@ -149,11 +158,19 @@ pub fn sync_location(
     let mut problems = Vec::new();
     for provider in providers {
         let id = provider.id();
-        let outcome = match provider.detect(transport, &scratch) {
+        let stored = match provider.detect(transport, &scratch) {
             Ok(None) => continue,
             Ok(Some(mut source)) => pass(archive, location, id, source.as_mut(), cancel, progress),
             Err(error) => Err(error.into()),
         };
+        /* The source is done with: indexing reads the archive alone. */
+        let outcome = stored.and_then(|report| {
+            let indexed = std::slice::from_ref(provider);
+            Ok(PassReport {
+                index: index(archive, Some(location), indexed, cancel, progress)?,
+                ..report
+            })
+        });
         match &outcome {
             Err(SyncError::Cancelled) => return Err(SyncError::Cancelled),
             Err(error) => problems.push(format!("{id}: {error}")),
@@ -174,7 +191,7 @@ pub fn sync_location(
     Ok(passes)
 }
 
-/// One pass: scan, plan, fetch and store (PLAN §5).
+/// One pass up to its index: scan, plan, fetch and store (PLAN §5).
 fn pass(
     archive: &Archive,
     location: &LocationId,
