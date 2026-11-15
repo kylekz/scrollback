@@ -671,7 +671,11 @@ fn a_path_in_a_folder_that_may_not_be_searched_is_an_error_and_not_a_missing_fil
 #[test]
 fn a_file_stat_cannot_look_at_is_unlisted_and_an_error_and_never_missing() {
     /* A file whose path is longer than the system takes, in a folder whose path is not: it
-    is there for `find`, and `stat` fails on it with something other than "no such file". */
+    is there for `find`, and `stat` fails on it with something other than "no such file".
+    How long that is, is this system's to say: not when the tools are another's. */
+    if std::env::var_os(sb_test_support::SHELL_VIA).is_some() {
+        return;
+    }
     let limit = if cfg!(target_os = "macos") {
         1024
     } else {
