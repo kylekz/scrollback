@@ -56,10 +56,13 @@ impl Launcher {
             ]),
             /*
              * `-T`: no terminal, whatever the config asks for, so the stream stays binary.
-             * `LogLevel=ERROR`: a config that silences ssh would leave a failure without a
-             * reason, and one that makes it chatty would bury the reason. No forwardings: a
-             * second connection to a host must not take the ports the owner's own session
-             * forwards. `--`: a host is never read as an option.
+             * `LogLevel=INFO`, ssh's own default: a config that silences ssh would leave a
+             * failure without a reason, and one that makes it chatty would bury the reason.
+             * Not `ERROR`: OpenSSH for Windows says that a connection was refused at the
+             * level below it, and with nothing said the host would count as failed where it
+             * can't be reached. No forwardings: a second connection to a host must not take
+             * the ports the owner's own session forwards. `--`: a host is never read as an
+             * option.
              *
              * With `ControlMaster auto` in the owner's config, a call that finds no master
              * becomes it, and a cancel that kills the call takes the shared connection down
@@ -79,7 +82,7 @@ impl Launcher {
                 "-o",
                 "ClearAllForwardings=yes",
                 "-o",
-                "LogLevel=ERROR",
+                "LogLevel=INFO",
                 "--",
                 host,
                 "sh",
@@ -302,7 +305,7 @@ mod tests {
         assert_eq!(run(&ssh), (ssh.words(), Vec::new()));
         assert!(
             ssh.command_line()
-                .ends_with("-o LogLevel=ERROR -- '-oProxyCommand=touch /tmp/x' sh -s")
+                .ends_with("-o LogLevel=INFO -- '-oProxyCommand=touch /tmp/x' sh -s")
         );
         assert_eq!(
             ssh.words(),
@@ -320,7 +323,7 @@ mod tests {
                 "-o",
                 "ClearAllForwardings=yes",
                 "-o",
-                "LogLevel=ERROR",
+                "LogLevel=INFO",
                 "--",
                 "-oProxyCommand=touch /tmp/x",
                 "sh",
@@ -431,7 +434,8 @@ mod tests {
         for unreachable in [
             "ssh: Could not resolve hostname macbook.local: nodename nor servname provided, or not known",
             "ssh: Could not resolve hostname macbook: Name or service not known",
-            /* OpenSSH for Windows. */
+            /* OpenSSH for Windows. A refused connection is all it says of one, and only
+            at the level INFO or below. */
             "ssh: Could not resolve hostname macbook.local: No such host is known. ",
             "banner exchange: Connection to UNKNOWN port -1: Connection refused",
             "ssh: connect to host macbook.local port 22: Operation timed out",
