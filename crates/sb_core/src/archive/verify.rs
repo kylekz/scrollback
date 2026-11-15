@@ -5,13 +5,18 @@
 //!
 //! A read the file system failed (a file in use, a disk error) says nothing about the stored
 //! bytes. Such a version is reported as unread and is not marked.
+//!
+//! It also reports what `files/` holds that the catalogue doesn't record, which a start only
+//! looks for when it has a reason to (the archive's module docs).
 
 use std::fs;
 use std::io::{self, Read as _};
+use std::path::PathBuf;
+use std::sync::PoisonError;
 
 use toolbox_process::CancelToken;
 
-use super::{Archive, ArchiveError, Problem, layout};
+use super::{Archive, ArchiveError, Problem, layout, uncatalogued};
 use crate::location::LocationId;
 
 /// A version whose stored bytes are not the ones that were archived.
@@ -44,16 +49,29 @@ pub struct VerifyReport {
     pub stored_bytes: u64,
     pub damaged: Vec<Damage>,
     pub unread: Vec<Unread>,
+    /// Item folders and segment files under `files/` that the catalogue doesn't record, by
+    /// their paths relative to the archive.
+    pub uncatalogued: Vec<PathBuf>,
 }
 
 impl Archive {
     /// Checks every stored byte against the catalogue (the module docs).
     pub fn verify(&self, cancel: &CancelToken) -> Result<VerifyReport, ArchiveError> {
-        let mut report = VerifyReport::default();
+        let files = self.files()?;
+        /* The catalogue is read while no segment is between its place and its commit: every
+        file found above is then either recorded or not going to be. */
+        let stored = {
+            let _quiet = self.placing.write().unwrap_or_else(PoisonError::into_inner);
+            self.catalogue.stored()?
+        };
+        let mut report = VerifyReport {
+            uncatalogued: uncatalogued(files, &stored),
+            ..VerifyReport::default()
+        };
         let mut damaged = Vec::new();
         let mut repaired = Vec::new();
         let mut buffer = vec![0; 128 * 1024];
-        for stored in self.catalogue.stored()? {
+        for stored in stored {
             let (id, number, was_damaged) = (
                 stored.version.id,
                 stored.version.number,

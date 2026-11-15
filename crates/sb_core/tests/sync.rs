@@ -5,6 +5,7 @@ mod common;
 
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
+use sb_core::archive::ArchiveError;
 use sb_core::catalogue::Reason;
 use sb_core::provider::ItemKind;
 use sb_core::sync::{Progress, SyncError};
@@ -360,7 +361,7 @@ fn a_crash_between_rename_and_commit_loses_nothing<A: Agent + Default>() {
         break_segment_commits(bench.dir());
         let crashed = bench.pass_with(bench.agent.provider());
         assert!(
-            matches!(crashed, Err(SyncError::Catalogue(_))),
+            matches!(crashed, Err(SyncError::Archive(ArchiveError::Catalogue(_)))),
             "{crashed:?}"
         );
         /* The segment reached its place and the catalogue never heard of it. */

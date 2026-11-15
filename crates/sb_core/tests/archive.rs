@@ -150,12 +150,11 @@ fn a_start_empties_tmp_and_keeps_what_the_catalogue_records() {
     bench.assert_mirrors(&[key]);
 }
 
-#[test]
-fn a_start_sets_aside_what_the_catalogue_does_not_record() {
-    let (mut bench, key) = synced();
+/// Puts a segment file and an item folder the catalogue doesn't record under the bench's
+/// `files/`, and returns them.
+fn strays(bench: &Bench<FileAgent>) -> (PathBuf, PathBuf) {
     let segment = bench.segment_files().remove(0);
-    let version_dir = segment.parent().unwrap();
-    let stray_segment = version_dir.join("0000000000999999.zst");
+    let stray_segment = segment.parent().unwrap().join("0000000000999999.zst");
     fs::write(&stray_segment, "not a recorded segment").unwrap();
     let stray_item = bench
         .dir()
@@ -166,21 +165,99 @@ fn a_start_sets_aside_what_the_catalogue_does_not_record() {
     fs::create_dir_all(stray_item.join("v0001")).unwrap();
     fs::write(stray_item.join("source.json"), "{}").unwrap();
     fs::write(stray_item.join("v0001/0000000000000000.zst"), "stray").unwrap();
+    (stray_segment, stray_item)
+}
 
-    bench.reopen();
+/// Asserts the bench's strays were set aside with their bytes, under the paths they had.
+fn assert_set_aside(bench: &Bench<FileAgent>, (stray_segment, stray_item): &(PathBuf, PathBuf)) {
     assert!(!stray_segment.exists() && !stray_item.exists());
-    /* Set aside with their bytes, under the paths they had. */
     let orphans = bench.dir().join("orphans");
     let moved = |path: &PathBuf| orphans.join(path.strip_prefix(bench.dir()).unwrap());
     assert_eq!(
-        fs::read(moved(&stray_segment)).unwrap(),
+        fs::read(moved(stray_segment)).unwrap(),
         b"not a recorded segment"
     );
     assert_eq!(
-        fs::read(moved(&stray_item).join("v0001/0000000000000000.zst")).unwrap(),
+        fs::read(moved(stray_item).join("v0001/0000000000000000.zst")).unwrap(),
         b"stray"
     );
     assert_eq!(bench.orphans().len(), 3);
+}
+
+#[test]
+fn a_start_after_a_sync_that_did_not_end_sets_aside_what_the_catalogue_does_not_record() {
+    let (mut bench, key) = synced();
+    let strays = strays(&bench);
+    /* As a sync that was storing when the app died leaves it. */
+    let state = bench.dir().join("state.json");
+    let syncing = fs::read_to_string(&state)
+        .unwrap()
+        .replace("\"syncing\":false", "\"syncing\":true");
+    fs::write(&state, syncing).unwrap();
+
+    bench.reopen();
+    assert_set_aside(&bench, &strays);
+    bench.assert_mirrors(&[key]);
+}
+
+#[test]
+fn a_start_with_no_word_of_the_last_one_sets_aside_what_the_catalogue_does_not_record() {
+    let (mut bench, key) = synced();
+    let strays = strays(&bench);
+    fs::remove_file(bench.dir().join("state.json")).unwrap();
+
+    bench.reopen();
+    assert_set_aside(&bench, &strays);
+    bench.assert_mirrors(&[key]);
+}
+
+#[test]
+fn a_start_after_a_sync_that_ended_well_does_not_look_and_verify_reports_instead() {
+    let (mut bench, _) = synced();
+    let (stray_segment, stray_item) = strays(&bench);
+
+    bench.reopen();
+    assert!(stray_segment.exists() && stray_item.exists());
+    assert!(bench.orphans().is_empty());
+    let mut uncatalogued = bench
+        .archive()
+        .verify(&CancelToken::new())
+        .unwrap()
+        .uncatalogued;
+    uncatalogued.sort();
+    let relative = |path: &PathBuf| path.strip_prefix(bench.dir()).unwrap().to_path_buf();
+    let mut expected = [relative(&stray_segment), relative(&stray_item)];
+    expected.sort();
+    assert_eq!(uncatalogued, expected);
+}
+
+#[test]
+fn a_catalogue_restored_from_before_the_last_sync_costs_no_segment() {
+    let mut agent = FileAgent::new();
+    let key = agent.add_session(20);
+    let mut bench = Bench::new(agent);
+    bench.sync();
+    bench.close();
+    let database = bench.dir().join("scrollback.db");
+    let backup = fs::read(&database).unwrap();
+    bench.reopen();
+    bench.agent.append(&key, 5);
+    bench.sync();
+    let newer = bench.segment_files();
+    let stored: Vec<_> = newer.iter().map(|file| fs::read(file).unwrap()).collect();
+    assert_eq!(newer.len(), 2);
+
+    /* The catalogue goes back to its backup, which knows one segment. */
+    bench.close();
+    fs::write(&database, backup).unwrap();
+    bench.reopen();
+    assert_eq!(bench.segment_files().len(), 1);
+    let orphans = bench.orphans();
+    assert_eq!(orphans.len(), 1);
+    assert!(stored.contains(&fs::read(&orphans[0]).unwrap()));
+
+    /* And the source still has what that segment held. */
+    assert_eq!(bench.sync().appended, 1);
     bench.assert_mirrors(&[key]);
 }
 

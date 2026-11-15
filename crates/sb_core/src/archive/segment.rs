@@ -82,6 +82,19 @@ pub(super) fn write_new(tmp: &Path, to: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Writes `bytes` to `to`, in place of what is there, through a file in `tmp`, and flushes it
+/// and its folder: `to` holds either what it held or `bytes`, whole.
+pub(super) fn write_over(tmp: &Path, to: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = NamedTempFile::new_in(tmp)?;
+    file.write_all(bytes)?;
+    file.as_file().sync_all()?;
+    file.persist(to).map_err(|error| error.error)?;
+    match to.parent() {
+        Some(dir) => sync_dir(dir),
+        None => Ok(()),
+    }
+}
+
 /// Creates `dir` and whichever of its parents are missing, and adds to `changed` each folder
 /// that gained one of them.
 pub(super) fn create_dirs(dir: &Path, changed: &mut BTreeSet<PathBuf>) -> io::Result<()> {

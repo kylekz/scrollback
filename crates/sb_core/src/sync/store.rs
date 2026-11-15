@@ -218,31 +218,26 @@ impl Store<'_> {
         segment: Option<Sealed>,
         content: Hasher,
     ) -> Result<(), SyncError> {
-        let key = &planned.scanned.key;
         /* Nothing to store yet when the source is empty, or is lines with no newline so far. */
         let segment = segment.filter(|segment| segment.length > 0);
         let recorded = segment
             .as_ref()
             .map(|segment| (planned.offset, segment.length, segment.hash));
         let stored = recorded.map_or(0, |(_, length, _)| length);
-        self.archive.store(
+        let held_back = self.archive.store(
             segment,
-            self.location,
-            self.provider,
-            key,
-            planned.number,
-            planned.offset,
+            &Commit {
+                location: self.location,
+                provider: self.provider,
+                scanned: planned.scanned,
+                folder: &item_folder(&planned.scanned.key),
+                target: planned.target,
+                number: planned.number,
+                segment: recorded,
+                length: planned.offset + stored,
+                hash: content.finish(),
+            },
         )?;
-        let held_back = self.archive.catalogue().commit(&Commit {
-            location: self.location,
-            provider: self.provider,
-            scanned: planned.scanned,
-            folder: &item_folder(key),
-            target: planned.target,
-            segment: recorded,
-            length: planned.offset + stored,
-            hash: content.finish(),
-        })?;
         match planned.target {
             Target::NewItem => self.report.new_items += 1,
             Target::NewVersion { .. } => self.report.new_versions += 1,

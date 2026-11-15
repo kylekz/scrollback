@@ -201,6 +201,8 @@ pub(crate) struct Commit<'a> {
     pub scanned: &'a ScannedItem,
     pub folder: &'a str,
     pub target: Target,
+    /// The number of the version the commit writes to.
+    pub number: u32,
     /// The segment now durable on disk: its offset, length and hash. `None` when the source had
     /// nothing to store yet.
     pub segment: Option<(u64, u64, Hash)>,
@@ -233,6 +235,17 @@ impl Catalogue {
             .daily_backup(chrono::Local::now().date_naive());
         Ok(Self {
             db: Database::open(&dir.join(DATABASE), &options)?,
+        })
+    }
+
+    /// How many segments are recorded, and when the newest of them was stored.
+    pub(crate) fn segments_recorded(&self) -> Result<(u64, Option<i64>)> {
+        self.db.read(|c| {
+            Ok(
+                c.query_row("SELECT count(*), max(stored_at) FROM segment", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?,
+            )
         })
     }
 

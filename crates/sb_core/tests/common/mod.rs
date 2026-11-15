@@ -191,6 +191,7 @@ impl<A: Agent> Bench<A> {
         let report = self.archive().verify(&CancelToken::new()).unwrap();
         assert!(report.damaged.is_empty(), "{:?}", report.damaged);
         assert!(report.unread.is_empty(), "{:?}", report.unread);
+        assert!(report.uncatalogued.is_empty(), "{:?}", report.uncatalogued);
     }
 
     /// Every segment file under the archive's `files/`.

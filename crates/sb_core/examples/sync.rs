@@ -53,11 +53,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 unread.version, unread.error
             );
         }
-        if !report.damaged.is_empty() || !report.unread.is_empty() {
+        if !(report.damaged.is_empty()
+            && report.unread.is_empty()
+            && report.uncatalogued.is_empty())
+        {
             return Err(format!(
-                "{} versions are damaged, {} could not be read",
+                "{} versions are damaged, {} could not be read, and the catalogue doesn't \
+                 record {} files or folders under files/",
                 report.damaged.len(),
-                report.unread.len()
+                report.unread.len(),
+                report.uncatalogued.len()
             )
             .into());
         }
