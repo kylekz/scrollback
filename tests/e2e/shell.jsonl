@@ -24,7 +24,8 @@
 // The sidebar's empty state (DESIGN §4.1, §4.10): four library rows 32 high inside its 8px padding and 1px right border, then the section buttons.
 {"cmd": "query", "prefix": "sidebar/", "expect_result": {"pointer": "", "len": 6}}
 {"cmd": "bounds", "target": "sidebar/all-sessions", "expect_result": [{"pointer": "/x", "equals": 8}, {"pointer": "/y", "equals": 50}, {"pointer": "/w", "equals": 231}, {"pointer": "/h", "equals": 32}]}
-{"cmd": "bounds", "target": "sidebar/trash", "expect_result": [{"pointer": "/y", "equals": 149}, {"pointer": "/h", "equals": 32}]}
+// Three rows and three 1px gaps down: 149, or 148 where a fractional display scale (125%, 150%) rounds the gaps to whole device pixels.
+{"cmd": "bounds", "target": "sidebar/trash", "expect_result": [{"pointer": "/y", "gte": 148}, {"pointer": "/y", "lte": 149}, {"pointer": "/h", "equals": 32}]}
 {"cmd": "bounds", "target": "sidebar/new-folder", "expect_result": [{"pointer": "/w", "equals": 22}, {"pointer": "/h", "equals": 22}]}
 {"cmd": "bounds", "target": "sidebar/sync-all", "expect_result": [{"pointer": "/w", "equals": 22}, {"pointer": "/h", "equals": 22}]}
 
