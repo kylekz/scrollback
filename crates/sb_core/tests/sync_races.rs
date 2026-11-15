@@ -6,13 +6,14 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::catalogue::Reason;
 use sb_core::provider::ProviderError;
-use sb_core::sync::{SyncError, WAITING_HOURS};
+use sb_core::sync::{Progress, SyncError, WAITING_HOURS};
 use sb_test_support::{Agent, FileAgent, edit_catalogue};
 
 use common::{Bench, Meddle, When, files_under};
@@ -108,6 +109,31 @@ fn new_bytes_that_changed_under_the_pass_are_not_taken_for_a_rewrite() {
 
     assert_eq!(bench.sync().appended, 1);
     assert_eq!(bench.versions(&key).len(), 1);
+    bench.assert_mirrors(&[key]);
+}
+
+#[test]
+fn new_bytes_that_changed_are_left_alone_when_the_source_does_not_prove_its_start() {
+    let (mut bench, key) = synced();
+    bench.agent.append(&key, 5);
+    let mut later = bench.agent.content(&key);
+    let changed = later.len() - 10;
+    later[changed] ^= 1;
+
+    /* The first proof fails; the second, of what is archived, gets no answer. Nothing says
+    the source was rewritten, so it is not fetched whole, which would be proven and stored. */
+    let report = bench
+        .pass_with(bench.meddling(Meddle::second_proofs_unanswered(|| {
+            bench.agent.overwrite(&key, &later);
+        })))
+        .unwrap();
+    assert_eq!(
+        (report.appended, report.new_versions, report.deferred.len()),
+        (0, 0, 1)
+    );
+    assert_eq!(bench.versions(&key).len(), 1);
+
+    assert_eq!(bench.sync().appended, 1);
     bench.assert_mirrors(&[key]);
 }
 
@@ -251,6 +277,38 @@ fn an_item_that_has_waited_too_long_counts_against_the_sync() {
 }
 
 #[test]
+fn a_wait_recorded_while_the_clock_ran_ahead_does_not_last_into_the_future() {
+    let mut agent = FileAgent::new();
+    let session = agent.add_session(2);
+    let mut bench = Bench::new(agent);
+    bench.sync();
+    let key = bench.agent.session(&session).tool_result(700_000);
+    let missed = |round: u8| {
+        bench
+            .pass_with(bench.meddling(Meddle::at(When::InsideARange, || {
+                bench.agent.overwrite(&key, &vec![b'a' + round; 700_000]);
+            })))
+            .unwrap();
+        bench
+            .archive()
+            .catalogue()
+            .waiting(&bench.location, bench.agent.provider().id().as_str())
+            .unwrap()[0]
+            .since
+    };
+    let now = || {
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
+        i64::try_from(now.unwrap().as_millis()).unwrap()
+    };
+    missed(0);
+    edit_catalogue(bench.dir(), "UPDATE waiting SET since = since + 172800000");
+
+    let before = now();
+    let since = missed(1);
+    assert!((before..=now()).contains(&since), "{since}");
+}
+
+#[test]
 fn a_whole_file_that_grew_after_the_scan_waits_for_the_next_pass() {
     let mut agent = FileAgent::new();
     let session = agent.add_session(2);
@@ -345,6 +403,32 @@ fn a_pass_cancelled_with_a_batch_fetched_and_not_proven_leaves_nothing_behind() 
 
     assert_eq!(bench.sync().new_items, 3);
     bench.assert_mirrors(&keys);
+}
+
+#[test]
+fn a_pass_cancelled_as_its_last_range_arrives_asks_for_no_proofs() {
+    let (bench, keys) = unsynced();
+    let cancel = CancelToken::new();
+    let asked = AtomicBool::new(false);
+    let mut arrived = 0;
+    let stopped = bench.try_sync_with(
+        bench.meddling(Meddle::at(When::BeforeProof, || {
+            asked.store(true, Ordering::Relaxed);
+        })),
+        &cancel,
+        &mut |progress| {
+            if matches!(progress, Progress::Fetched { .. }) {
+                arrived += 1;
+                if arrived == keys.len() {
+                    cancel.cancel();
+                }
+            }
+        },
+    );
+    assert!(matches!(stopped, Err(SyncError::Cancelled)), "{stopped:?}");
+    assert!(!asked.load(Ordering::Relaxed));
+    assert!(files_under(&bench.dir().join("tmp")).is_empty());
+    assert!(bench.items().is_empty());
 }
 
 #[test]
