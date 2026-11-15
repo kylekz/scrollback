@@ -252,8 +252,11 @@ impl VersionReader {
                 error
             }
         })?;
-        /* No more is decompressed than the segment may hold, whatever the file claims. */
-        let mut bytes = Vec::new();
+        /* No more is decompressed than the segment may hold, whatever the file claims. The
+        buffer is as large as the segment from the start: one that grows as it is filled
+        leaves the allocator holding every size it passed through, which over the segments
+        of a long session's items is hundreds of megabytes. */
+        let mut bytes = Vec::with_capacity(recorded.length.min(SEGMENT_BYTES) as usize + 1);
         Decoder::new(file)?
             .take(recorded.length + 1)
             .read_to_end(&mut bytes)
