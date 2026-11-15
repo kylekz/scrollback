@@ -24,6 +24,7 @@
 {"cmd": "bounds", "target": "card/3", "expect_result": [{"pointer": "/x", "equals": 1139}, {"pointer": "/y", "equals": 239}, {"pointer": "/w", "equals": 277}]}
 // October's four cards: 16 under November's, the overline, and 16 more.
 {"cmd": "bounds", "target": "card/4", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/y", "equals": 397}]}
+{"cmd": "bounds", "target": "page/month", "expect_error": "no target"}
 {"cmd": "screenshot", "name": "folder-dark"}
 
 // The chevron opens fc without leaving its page: player's row, one level in.
@@ -56,6 +57,8 @@
 // The list is virtual: far down it, cards are still where the rows put them, and the first ones are gone.
 {"cmd": "scroll", "target": "page/cards", "dy": -6000}
 {"cmd": "bounds", "target": "card/0", "expect_error": "no target"}
+// The overline of the month at the top stays there while its cards scroll under it (DESIGN §4.4).
+{"cmd": "bounds", "target": "page/month", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/y", "equals": 209}, {"pointer": "/h", "equals": 30}]}
 {"cmd": "screenshot", "name": "folder-scrolled-dark"}
 
 // Unsorted, as E-Unsorted draws it: six paths, the one with the most sessions first, five sessions of each showing.

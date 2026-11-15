@@ -116,6 +116,38 @@ pub(crate) fn row_sizes(rows: &[Row], theme: &SbTheme) -> Vec<Size<Pixels>> {
         .collect()
 }
 
+/// The month whose cards are at the top of a list scrolled `scrolled` down, as an index into
+/// the page's months: the one whose overline stays at the top while its cards scroll
+/// (DESIGN §4.4). `None` at the very top, where the first overline is in its own place.
+fn month_at(
+    rows: &[Row],
+    sizes: &[Size<Pixels>],
+    months: &[Month],
+    scrolled: Pixels,
+) -> Option<usize> {
+    if scrolled <= px(0.) {
+        return None;
+    }
+    let mut bottom = px(0.);
+    let row = rows.iter().zip(sizes).find_map(|(row, size)| {
+        bottom += size.height;
+        (bottom > scrolled).then_some(row)
+    })?;
+    Some(match row {
+        Row::Month(month) => *month,
+        Row::Cards(sessions) => {
+            months.partition_point(|month| month.sessions.end <= sessions.start)
+        }
+    })
+}
+
+/// What a month's overline says.
+fn month_name(month: &Month) -> String {
+    month
+        .month
+        .map_or_else(|| "No date".to_string(), format::month_label)
+}
+
 /// The session at `index` moved by a key: `by` cards along the reading order, or `lines` rows
 /// up or down in the same column.
 fn moved(rows: &[Row], index: usize, by: isize, lines: isize) -> Option<usize> {
@@ -265,12 +297,7 @@ impl SessionsView {
             .filter_map(|at| self.rows.get(at))
             .map(|row| match row {
                 Row::Month(month) => div()
-                    .child(overline(
-                        &page.months[*month]
-                            .month
-                            .map_or_else(|| "No date".to_string(), format::month_label),
-                        &theme,
-                    ))
+                    .child(overline(&month_name(&page.months[*month]), &theme))
                     .into_any_element(),
                 Row::Cards(sessions) => div()
                     .w_full()
@@ -672,6 +699,11 @@ impl Render for SessionsView {
         };
         let is_folder = matches!(shelf, Shelf::Folder(_));
         let syncing_first = first_sync.is_some();
+        let pinned = page.and_then(|page| {
+            let scrolled = -self.scroll.base_handle().offset().y;
+            let month = month_at(&self.rows, &self.sizes, &page.months, scrolled)?;
+            Some(month_name(page.months.get(month)?))
+        });
         div()
             .size_full()
             .flex()
@@ -715,6 +747,18 @@ impl Render for SessionsView {
                             )
                             .track_scroll(&self.scroll),
                         )
+                        // The overline of the month at the top, over the list.
+                        .children(pinned.map(|month| {
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .h(theme.text.overline.line_height + theme.spacing.xl)
+                                .bg(theme.colors.bg_app)
+                                .child(overline(&month, &theme))
+                                .automation_target("page/month")
+                        }))
                         .child(Scrollbar::vertical(&self.scroll))
                         .automation_target("page/cards"),
                 ),
@@ -798,6 +842,25 @@ mod tests {
                 px(136.),
             ]
         );
+    }
+
+    #[test]
+    fn the_overline_of_the_month_at_the_top_stays_while_its_cards_scroll() {
+        let theme = SbTheme::new(Appearance::Dark, Material::Opaque);
+        let months = months(&[5, 1]);
+        let rows = rows(&months, 4);
+        let sizes = row_sizes(&rows, &theme);
+        let at = |scrolled: f32| month_at(&rows, &sizes, &months, px(scrolled));
+        // At the top the first overline is where it belongs.
+        assert_eq!(at(0.), None);
+        // The first month: its overline (30), its two rows of cards (124 and 128).
+        assert_eq!(at(1.), Some(0));
+        assert_eq!(at(281.), Some(0));
+        // Then the second month's overline reaches the top.
+        assert_eq!(at(282.), Some(1));
+        assert_eq!(at(400.), Some(1));
+        // Past the end there is nothing at the top.
+        assert_eq!(at(5000.), None);
     }
 
     #[test]

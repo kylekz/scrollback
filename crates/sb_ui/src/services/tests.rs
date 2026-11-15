@@ -10,7 +10,7 @@ use sb_core::sync::Progress;
 use sb_test_support::{Outline, ProjectsTree};
 
 use super::library::LibraryEvent;
-use super::sync::local_name;
+use super::sync::{SYNC_INTERVAL, local_name};
 use super::*;
 use crate::test_support::{
     SESSIONS, archive_dir, init, init_in, init_library, machine, write_session,
@@ -134,6 +134,33 @@ fn a_later_sync_brings_what_the_agent_wrote_since(cx: &mut TestAppContext) {
     sync.read_with(cx, |sync, _| assert!(!sync.is_syncing()));
     assert_eq!(titles(&library, cx)[0], "Cache the fetcher's responses");
     library.read_with(cx, |library, _| assert_eq!(library.counts().all, 4));
+}
+
+#[gpui::test]
+fn every_location_syncs_again_on_the_interval(cx: &mut TestAppContext) {
+    init_library(cx);
+    let (sync, library) = services(cx);
+    write_session(
+        &Outline {
+            project: "/home/user/notes",
+            title: "Written while the app was open",
+            prompt: "Nobody asks for this sync.",
+            model: "model-a",
+            day: (2026, 11, 15),
+            calls: 0,
+        },
+        cx,
+    );
+    // Short of the interval nothing happens; at it, a pass runs by itself.
+    cx.executor()
+        .advance_clock(SYNC_INTERVAL - std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+    library.read_with(cx, |library, _| assert_eq!(library.counts().all, 3));
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+    sync.read_with(cx, |sync, _| assert!(sync.is_settled()));
+    assert_eq!(titles(&library, cx)[0], "Written while the app was open");
 }
 
 #[gpui::test]
