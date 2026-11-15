@@ -119,8 +119,14 @@ impl ProjectsTree {
 
     /// A memory file of the project at `project`. Returns its key.
     pub fn memory(&self, project: &str, name: &str, text: &str) -> String {
-        let key = format!("projects/{}/memory/{name}.md", project_folder(project));
-        write(&self.path(&key), text.as_bytes());
+        self.project_file(project, &format!("memory/{name}.md"), text.as_bytes())
+    }
+
+    /// The file `path` in the folder of the project at `project`, holding `bytes`: any file
+    /// the agent keeps there, whatever it is. Returns its key.
+    pub fn project_file(&self, project: &str, path: &str, bytes: &[u8]) -> String {
+        let key = format!("projects/{}/{path}", project_folder(project));
+        write(&self.path(&key), bytes);
         key
     }
 
@@ -158,16 +164,12 @@ impl Session {
     /// transcript's key.
     pub fn subagent(&mut self, records: usize) -> String {
         self.extras += 1;
-        let agent = format!("agent-a{:016x}", self.extras);
-        let key = format!("{}/subagents/{agent}.jsonl", self.dir);
+        let agent = format!("subagents/agent-a{:016x}", self.extras);
         let lines: String = (0..records)
             .map(|n| record(&self.id, &self.project, n, self.record_bytes, true))
             .collect();
-        write(&self.root.join(&key), lines.as_bytes());
-        write(
-            &self
-                .root
-                .join(format!("{}/subagents/{agent}.meta.json", self.dir)),
+        self.file(
+            &format!("{agent}.meta.json"),
             json!({
                 "agentType": "general-purpose",
                 "description": "Look something up",
@@ -176,6 +178,14 @@ impl Session {
             .to_string()
             .as_bytes(),
         );
+        self.file(&format!("{agent}.jsonl"), lines.as_bytes())
+    }
+
+    /// The file `path` in the session's own folder, holding `bytes`: any file the agent keeps
+    /// there, whatever it is. Returns its key.
+    pub fn file(&self, path: &str, bytes: &[u8]) -> String {
+        let key = format!("{}/{path}", self.dir);
+        write(&self.root.join(&key), bytes);
         key
     }
 

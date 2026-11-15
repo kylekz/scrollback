@@ -2,7 +2,8 @@
 //!
 //! Its data is a file tree (PLAN §7.2). The root is `$CLAUDE_CONFIG_DIR` when set, else
 //! `~/.claude`, and every file under `projects/` is an item, keyed by its path relative to the
-//! root. Under `projects/<project>/`:
+//! root, whether or not it is one of these. Under `projects/<project>/`, with `<session>` a
+//! session id, which is a UUID:
 //!
 //! | Path | Item |
 //! |---|---|
@@ -11,10 +12,12 @@
 //! | `<session>/subagents/…/agent-<id>.jsonl` | a subagent's transcript |
 //! | `<session>/tool-results/…` | tool output saved outside the transcript |
 //! | `<session>/…` | a sidecar of the session: titles, subagent metadata, workflows |
-//! | `memory/…` | the project's memory files: sidecars of no session |
+//! | anything else (`memory/…`, an index file) | a sidecar of no session |
 //!
-//! `<project>` is the starting directory with its punctuation replaced by `-`, so it can't be
-//! turned back into a path and is not read here. Every `.jsonl` file is appended to line by line.
+//! A session's folder can be there without its transcript, and the transcript without the
+//! folder. `<project>` is the starting directory with its punctuation replaced by `-`, so it
+//! can't be turned back into a path and is not read here. Every `.jsonl` file is appended to
+//! line by line.
 
 use std::path::Path;
 
@@ -132,30 +135,43 @@ fn classify(key: &str) -> FileClass {
     /* `projects/<project>/` and then the path inside the project. */
     let inside: Vec<&str> = key.split('/').skip(2).collect();
     let (kind, session) = match inside[..] {
+        [file] => match session_of(file) {
+            Some(session) if &file[session.len()..] == ".jsonl" => {
+                (ItemKind::Transcript, Some(session))
+            }
+            session => (ItemKind::Sidecar, session),
+        },
+        [folder, ref rest @ ..] => match (session_of(folder), rest) {
+            (Some(session), ["subagents", .., file])
+                if session == folder && file.starts_with("agent-") && file.ends_with(".jsonl") =>
+            {
+                (ItemKind::Subagent, Some(session))
+            }
+            (Some(session), ["tool-results", ..]) if session == folder => {
+                (ItemKind::ToolResult, Some(session))
+            }
+            (Some(session), _) if session == folder => (ItemKind::Sidecar, Some(session)),
+            _ => (ItemKind::Sidecar, None),
+        },
         [] => (ItemKind::Sidecar, None),
-        [file] => {
-            let session = file.split('.').next().unwrap_or(file);
-            let kind = if file.strip_prefix(session) == Some(".jsonl") {
-                ItemKind::Transcript
-            } else {
-                ItemKind::Sidecar
-            };
-            (kind, Some(session))
-        }
-        ["memory", ..] => (ItemKind::Sidecar, None),
-        [session, "subagents", .., file]
-            if file.starts_with("agent-") && file.ends_with(".jsonl") =>
-        {
-            (ItemKind::Subagent, Some(session))
-        }
-        [session, "tool-results", ..] => (ItemKind::ToolResult, Some(session)),
-        [session, ..] => (ItemKind::Sidecar, Some(session)),
     };
     FileClass {
         kind,
         session: session.map(str::to_string),
         lines: key.ends_with(".jsonl"),
     }
+}
+
+/// The session id `name` starts with, when it is one alone or one followed by `.` and more: a
+/// UUID, as in `01234567-89ab-cdef-0123-456789abcdef.jsonl`. Other names in a project folder
+/// are not a session's.
+fn session_of(name: &str) -> Option<&str> {
+    let id = name.get(..36)?;
+    let shaped = id.bytes().enumerate().all(|(at, byte)| match at {
+        8 | 13 | 18 | 23 => byte == b'-',
+        _ => byte.is_ascii_hexdigit(),
+    });
+    (shaped && matches!(name.as_bytes().get(36), None | Some(b'.'))).then_some(id)
 }
 
 #[cfg(test)]
@@ -175,40 +191,75 @@ mod tests {
     #[test]
     fn files_are_classified_by_where_they_are() {
         use ItemKind::{Sidecar, Subagent, ToolResult, Transcript};
-        for (inside, expected) in [
-            ("s1.jsonl", class(Transcript, Some("s1"), true)),
-            ("s1.released.json", class(Sidecar, Some("s1"), false)),
+        const ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+        let in_session = |path: &str| format!("{ID}{path}");
+        for (inside, kind, session, lines) in [
+            (in_session(".jsonl"), Transcript, true, true),
+            (in_session(".released.json"), Sidecar, true, false),
             (
-                "s1/subagents/agent-a1.jsonl",
-                class(Subagent, Some("s1"), true),
+                in_session("/subagents/agent-a1.jsonl"),
+                Subagent,
+                true,
+                true,
             ),
             (
-                "s1/subagents/agent-a1.meta.json",
-                class(Sidecar, Some("s1"), false),
+                in_session("/subagents/agent-a1.meta.json"),
+                Sidecar,
+                true,
+                false,
             ),
             (
-                "s1/subagents/workflows/w1/agent-a2.jsonl",
-                class(Subagent, Some("s1"), true),
+                in_session("/subagents/agent-a1.prefix.json"),
+                Sidecar,
+                true,
+                false,
             ),
             (
-                "s1/subagents/workflows/w1/journal.jsonl",
-                class(Sidecar, Some("s1"), true),
+                in_session("/subagents/workflows/w1/agent-a2.jsonl"),
+                Subagent,
+                true,
+                true,
             ),
             (
-                "s1/tool-results/r1.txt",
-                class(ToolResult, Some("s1"), false),
+                in_session("/subagents/workflows/w1/journal.jsonl"),
+                Sidecar,
+                true,
+                true,
+            ),
+            (in_session("/tool-results/r1.txt"), ToolResult, true, false),
+            (in_session("/tool-results/r2.png"), ToolResult, true, false),
+            (in_session("/tool-results/r3.html"), ToolResult, true, false),
+            (in_session("/custom-title.json"), Sidecar, true, false),
+            (in_session("/notes.txt"), Sidecar, true, false),
+            (in_session("/workflows/w1.json"), Sidecar, true, false),
+            (in_session("/workflows/w1/main.js"), Sidecar, true, false),
+            /* Not a session's: no session id leads the name. */
+            ("memory/notes.md".to_string(), Sidecar, false, false),
+            ("sessions-index.json".to_string(), Sidecar, false, false),
+            ("notes.jsonl".to_string(), Sidecar, false, true),
+            (
+                "other/tool-results/r1.txt".to_string(),
+                Sidecar,
+                false,
+                false,
+            ),
+            (format!("{ID}x.jsonl"), Sidecar, false, true),
+            (
+                format!("{ID}x/subagents/agent-a1.jsonl"),
+                Sidecar,
+                false,
+                true,
             ),
             (
-                "s1/tool-results/r2.png",
-                class(ToolResult, Some("s1"), false),
+                "01234567-89ab-cdef-0123-456789abcdeg.jsonl".to_string(),
+                Sidecar,
+                false,
+                true,
             ),
-            ("s1/custom-title.json", class(Sidecar, Some("s1"), false)),
-            ("s1/workflows/w1/main.js", class(Sidecar, Some("s1"), false)),
-            ("memory/notes.md", class(Sidecar, None, false)),
         ] {
             assert_eq!(
                 classify(&format!("projects/-home-user-code-app/{inside}")),
-                expected,
+                class(kind, session.then_some(ID), lines),
                 "{inside}"
             );
         }

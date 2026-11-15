@@ -98,6 +98,34 @@ fn an_empty_file_is_an_item_with_nothing_stored() {
     bench.assert_mirrors(&[key]);
 }
 
+#[test]
+fn a_rewrite_is_held_back_by_what_was_stored_of_it_until_the_rest_arrives() {
+    let (bench, key) = file_bench();
+    bench.sync();
+    let before = bench.agent.content(&key);
+
+    /* The agent rewrites the file: one short line, and a long one it has not finished. The
+    file is longer than it was, but what can be stored of it is not. */
+    let unfinished = format!(
+        "{{\"type\":\"user\",\"text\":\"{}",
+        "x".repeat(before.len())
+    );
+    bench
+        .agent
+        .overwrite(&key, format!("{{}}\n{unfinished}").as_bytes());
+    let report = bench.sync();
+    assert_eq!((report.new_versions, report.held_back), (1, 1));
+    let versions = bench.versions(&key);
+    assert_eq!((versions[1].length, versions[1].held_back), (3, true));
+
+    /* The line is finished: the version has outgrown the one being read. */
+    bench.agent.append_raw(&key, "\"}\n");
+    assert_eq!(bench.sync().appended, 1);
+    assert!(!bench.versions(&key)[1].held_back);
+    assert!(bench.read(&bench.versions(&key)[0]) == before);
+    bench.assert_mirrors(&[key]);
+}
+
 /// A transcript many times the size the transport reads at once, so that every piece of it
 /// ends inside a line.
 fn long_transcript() -> (Bench<FileAgent>, String) {
@@ -180,6 +208,113 @@ fn every_file_of_a_session_is_archived_under_its_session() {
             .unwrap(),
         [(bench.agent.provider().id().to_string(), Some(45))]
     );
+}
+
+#[test]
+fn every_file_under_a_project_is_archived_recognised_or_not() {
+    use ItemKind::{Sidecar, Subagent, ToolResult, Transcript};
+    const PROJECT: &str = "/home/user/code/app";
+
+    let mut agent = FileAgent::new();
+    let transcript = agent.add_session(5);
+    let no_transcript = agent.add_session(1);
+    let no_folder = agent.add_session(2);
+    let empty = agent.add_session(0);
+    let mut expected = vec![
+        (transcript.clone(), Transcript, true),
+        (no_folder.clone(), Transcript, true),
+        (empty, Transcript, true),
+    ];
+    /* What the agent keeps in a session's folder, beside and under what the provider knows. */
+    let session = agent.session(&transcript);
+    for (path, kind) in [
+        ("subagents/agent-a1.jsonl", Subagent),
+        ("subagents/agent-a1.meta.json", Sidecar),
+        ("subagents/agent-a1.prefix.json", Sidecar),
+        ("subagents/workflows/wf_1/agent-a2.jsonl", Subagent),
+        ("subagents/workflows/wf_1/agent-a2.meta.json", Sidecar),
+        ("subagents/workflows/wf_1/agent-a2.prefix.json", Sidecar),
+        ("subagents/workflows/wf_1/journal.jsonl", Sidecar),
+        ("tool-results/toolu_1.txt", ToolResult),
+        ("tool-results/toolu_2.json", ToolResult),
+        ("tool-results/toolu_3.png", ToolResult),
+        ("tool-results/toolu_4.jpg", ToolResult),
+        ("tool-results/toolu_5.html", ToolResult),
+        ("workflows/wf_1.json", Sidecar),
+        ("workflows/wf_1/main.js", Sidecar),
+        ("custom-title.json", Sidecar),
+        ("notes.txt", Sidecar),
+        ("something/new/in-a-later-release.bin", Sidecar),
+        ("empty.txt", Sidecar),
+    ] {
+        let bytes: &[u8] = match path {
+            "empty.txt" => b"",
+            _ if path.ends_with(".jsonl") => b"{\"type\":\"user\"}\n",
+            _ => b"\x89generated, not text\xff",
+        };
+        expected.push((session.file(path, bytes), kind, true));
+    }
+    /* A session whose transcript is gone and whose folder is not, and the other way round. */
+    let subagent_only = agent
+        .session(&no_transcript)
+        .file("subagents/agent-a3.jsonl", b"{\"type\":\"user\"}\n");
+    expected.push((subagent_only, Subagent, true));
+    fs::remove_file(agent.tree().path(&no_transcript)).unwrap();
+    fs::remove_dir(agent.tree().path(&no_folder).with_extension("")).unwrap();
+    /* A released session's marker beside its transcript, and files of no session. */
+    let id = agent.session(&transcript).id.clone();
+    let tree = agent.tree();
+    expected.push((
+        tree.project_file(PROJECT, &format!("{id}.released.json"), b"{}"),
+        Sidecar,
+        true,
+    ));
+    for path in [
+        "sessions-index.json",
+        "memory/notes.md",
+        "notes.jsonl",
+        "unknown/folder/file",
+    ] {
+        expected.push((tree.project_file(PROJECT, path, b"{}\n"), Sidecar, false));
+    }
+    fs::create_dir_all(tree.path("projects/-home-user-code-other/memory")).unwrap();
+    let bench = Bench::new(agent);
+
+    let report = bench.sync();
+    assert_eq!(
+        (report.scanned, report.new_items),
+        (expected.len(), expected.len())
+    );
+    for (key, kind, in_session) in &expected {
+        let item = bench.item(key);
+        assert_eq!(
+            (item.kind, item.session.is_some()),
+            (*kind, *in_session),
+            "{key}"
+        );
+    }
+    assert_eq!(bench.item(&transcript).session, Some(id));
+    let keys: Vec<_> = expected.into_iter().map(|(key, ..)| key).collect();
+    bench.assert_mirrors(&keys);
+}
+
+#[test]
+fn a_transcript_over_a_hundred_megabytes_is_stored_whole() {
+    let mut agent = FileAgent::new();
+    agent.tree_mut().record_bytes(200_000);
+    let key = agent.add_session(520);
+    let mut bench = Bench::new(agent);
+    let length = bench.agent.content(&key).len() as u64;
+    assert!(length > 100_000_000);
+
+    let report = bench.sync();
+    assert_eq!(
+        (report.bytes_fetched, report.bytes_stored),
+        (length, length)
+    );
+    bench.agent.append(&key, 3);
+    assert_eq!(bench.sync().appended, 1);
+    bench.assert_mirrors(&[key]);
 }
 
 #[test]
