@@ -14,7 +14,7 @@ use sb_core::catalogue::Reason;
 use sb_core::provider::ItemKind;
 use sb_test_support::{Agent, FileAgent, ProjectsTree, edit_catalogue};
 
-use common::{Bench, Meddle, When};
+use common::Bench;
 
 fn file_bench() -> (Bench<FileAgent>, String) {
     let mut agent = FileAgent::new();
@@ -551,6 +551,7 @@ mod unreadable {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::common::{Meddle, When};
 
     fn set_mode(path: &Path, mode: u32) {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
