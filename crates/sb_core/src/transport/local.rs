@@ -100,7 +100,7 @@ impl Transport for LocalTransport {
                 if kind.is_dir() {
                     pending.push((entry.path(), path));
                 } else if kind.is_file() {
-                    match entry.metadata().and_then(|metadata| stat_of(&metadata)) {
+                    match listed_metadata(&entry).and_then(|metadata| stat_of(&metadata)) {
                         Ok(stat) => listing.files.push(FileEntry { path, stat }),
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                         Err(error) => unlisted(entry.path(), error, false),
@@ -225,6 +225,23 @@ impl Chunks {
             }
         }
     }
+}
+
+/// The metadata of a regular file found in a listing.
+///
+/// On Windows it is asked of the file, not taken from the directory's entry: NTFS brings an
+/// entry's size and times up to date only when a handle to the file is closed or flushed, so a
+/// file its writer keeps open would be listed as it was when the writer opened it, and a sync
+/// would take it for unchanged for as long as it is being written.
+#[cfg(windows)]
+fn listed_metadata(entry: &fs::DirEntry) -> io::Result<Metadata> {
+    fs::metadata(entry.path())
+}
+
+/// The metadata of a regular file found in a listing.
+#[cfg(not(windows))]
+fn listed_metadata(entry: &fs::DirEntry) -> io::Result<Metadata> {
+    entry.metadata()
 }
 
 fn stat_of(metadata: &Metadata) -> io::Result<FileStat> {
@@ -365,6 +382,25 @@ mod tests {
         assert_eq!(listing.files.len(), 1);
         assert_eq!(listing.unlisted.len(), 1);
         assert_eq!(listing.unlisted[0].reason, "its name is not Unicode");
+    }
+
+    #[test]
+    fn a_listing_sees_what_a_writer_with_an_open_handle_has_appended() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("live.jsonl");
+        fs::write(&file, "0123456789").unwrap();
+        let listed = || LocalTransport.list(&text(dir.path())).unwrap().files[0].stat;
+        let before = listed();
+        assert_eq!(before.size, 10);
+
+        // The agent goes on writing and keeps its handle, without flushing to disk.
+        let mut writer = File::options().append(true).open(&file).unwrap();
+        writer.write_all(b"abcde").unwrap();
+        assert_eq!(listed().size, 15);
+        drop(writer);
+        assert_eq!(listed().size, 15);
     }
 
     #[test]

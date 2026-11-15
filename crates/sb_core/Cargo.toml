@@ -24,6 +24,9 @@ toolbox_store.workspace = true
 uuid.workspace = true
 zstd.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 pretty_assertions.workspace = true
 sb_test_support.workspace = true

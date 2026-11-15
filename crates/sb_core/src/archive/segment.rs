@@ -76,8 +76,8 @@ pub(super) fn write_new(tmp: &Path, to: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = NamedTempFile::new_in(tmp)?;
     file.write_all(bytes)?;
     file.as_file().sync_all()?;
-    match file.persist_noclobber(to) {
-        Err(blocked) if blocked.error.kind() != io::ErrorKind::AlreadyExists => Err(blocked.error),
+    match place(file.into_temp_path(), to) {
+        Err((error, _)) if error.kind() != io::ErrorKind::AlreadyExists => Err(error),
         _ => Ok(()),
     }
 }
@@ -102,6 +102,58 @@ pub(super) fn create_dirs(dir: &Path, changed: &mut BTreeSet<PathBuf>) -> io::Re
     }
 }
 
+/// Moves the written, flushed `file` to `to`, where nothing may be: a file already there fails
+/// the move and stays as it is, and `file` is handed back with the error. [`sync_dir`] on
+/// `to`'s folder then makes the move durable.
+#[cfg(not(windows))]
+pub(super) fn place(file: TempPath, to: &Path) -> Result<(), (io::Error, TempPath)> {
+    file.persist_noclobber(to)
+        .map_err(|blocked| (blocked.error, blocked.path))
+}
+
+/**
+ * Moves the written, flushed `file` to `to`, where nothing may be: a file already there fails
+ * the move and stays as it is, and `file` is handed back with the error.
+ *
+ * Windows has no flush for a folder ([`sync_dir`]), and a plain rename returns before NTFS has
+ * written its log record, so a catalogue commit made right after it could reach the disk first
+ * and record a segment a power cut then leaves in `tmp/`. `MOVEFILE_WRITE_THROUGH` returns once
+ * the move is on disk. This is `tempfile`'s own persist with that flag: it also clears the
+ * temporary attribute `tempfile` creates its files with.
+ */
+#[cfg(windows)]
+pub(super) fn place(mut file: TempPath, to: &Path) -> Result<(), (io::Error, TempPath)> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TEMPORARY, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        SetFileAttributesW,
+    };
+
+    let wide = |path: &Path| -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    /* The file is closed already; dropping `file` removes it unless the move succeeds. */
+    let (from_wide, to_wide) = (wide(&file), wide(to));
+    // SAFETY: both are NUL-terminated UTF-16 strings that outlive the calls.
+    unsafe {
+        if SetFileAttributesW(from_wide.as_ptr(), FILE_ATTRIBUTE_NORMAL) == 0 {
+            return Err((io::Error::last_os_error(), file));
+        }
+        /* Without `MOVEFILE_REPLACE_EXISTING` a file at `to` fails the move. */
+        if MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), MOVEFILE_WRITE_THROUGH) == 0 {
+            let error = io::Error::last_os_error();
+            SetFileAttributesW(from_wide.as_ptr(), FILE_ATTRIBUTE_TEMPORARY);
+            return Err((error, file));
+        }
+    }
+    file.disable_cleanup(true);
+    Ok(())
+}
+
 /// Flushes `dir`'s entries to disk, which is what makes a rename into it or a file created in
 /// it survive a power cut.
 #[cfg(unix)]
@@ -109,7 +161,7 @@ pub(super) fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
-/// Windows cannot flush a directory; NTFS journals the rename itself.
+/// Windows cannot flush a directory; [`place`] makes its move durable itself.
 #[cfg(not(unix))]
 pub(super) fn sync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
@@ -301,6 +353,39 @@ impl Read for VersionReader {
                     });
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_already_in_place_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let to = dir.path().join("placed");
+        let placed = |bytes: &[u8]| {
+            let mut file = NamedTempFile::new_in(dir.path()).unwrap();
+            file.write_all(bytes).unwrap();
+            place(file.into_temp_path(), &to)
+        };
+        placed(b"first").unwrap();
+        let (error, unplaced) = placed(b"second").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&to).unwrap(), b"first");
+        /* The file that could not be placed is handed back, and goes when it is dropped. */
+        assert_eq!(fs::read(&unplaced).unwrap(), b"second");
+        drop(unplaced);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        /* What is placed is an ordinary file, not one marked temporary. */
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
+            let attributes = fs::metadata(&to).unwrap().file_attributes();
+            assert_eq!(attributes & FILE_ATTRIBUTE_TEMPORARY, 0);
         }
     }
 }

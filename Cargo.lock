@@ -5928,6 +5928,7 @@ dependencies = [
  "toolbox_process",
  "toolbox_store",
  "uuid",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 

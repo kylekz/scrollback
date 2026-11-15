@@ -132,6 +132,7 @@ pub struct Archive {
 impl Archive {
     /// Creates an archive in `dir`, which is made if missing and must not hold one already.
     pub fn create(dir: &Path) -> Result<Self> {
+        let dir = &absolute(dir)?;
         fs::create_dir_all(dir).map_err(io_error("create", dir))?;
         let lock = lock(dir)?;
         let manifest_path = dir.join(layout::MANIFEST);
@@ -157,6 +158,7 @@ impl Archive {
     /// Opens the archive in `dir`. A folder without one is [`ArchiveError::NotAnArchive`], and
     /// an archive without its catalogue is [`ArchiveError::CatalogueMissing`].
     pub fn open(dir: &Path) -> Result<Self> {
+        let dir = &absolute(dir)?;
         let manifest_path = dir.join(layout::MANIFEST);
         if !manifest_path.is_file() {
             return Err(ArchiveError::NotAnArchive(dir.to_path_buf()));
@@ -324,10 +326,10 @@ impl Archive {
             let relative = version.join(layout::segment_file(offset));
             let to = self.dir.join(&relative);
             let mut file = sealed.file;
-            /* The rename refuses to replace a file, so nothing here can overwrite one. */
-            while let Err(blocked) = file.persist_noclobber(&to) {
-                if blocked.error.kind() != io::ErrorKind::AlreadyExists {
-                    return Err(io_error("store", &to)(blocked.error));
+            /* The move refuses to replace a file, so nothing here can overwrite one. */
+            while let Err((error, unplaced)) = segment::place(file, &to) {
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(io_error("store", &to)(error));
                 }
                 if self
                     .catalogue
@@ -336,7 +338,7 @@ impl Archive {
                     return Err(ArchiveError::SegmentExists(to));
                 }
                 self.set_aside(&relative)?;
-                file = blocked.path;
+                file = unplaced;
             }
             changed.insert(version_dir);
         }
@@ -455,6 +457,13 @@ impl Archive {
         }
         Ok(names)
     }
+}
+
+/// `dir` as an absolute path: the archive stays the folder it was opened on wherever the
+/// process's working directory goes, and the catalogue's own reads of its database, which name
+/// it by a `file:` URI, need the whole path.
+fn absolute(dir: &Path) -> Result<PathBuf> {
+    std::path::absolute(dir).map_err(io_error("resolve", dir))
 }
 
 /// Takes the archive's lock, which lasts as long as the returned file is open.
