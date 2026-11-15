@@ -13,6 +13,7 @@ use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sb_core::CancelToken;
 use sb_core::archive::Archive;
@@ -333,11 +334,24 @@ pub enum Meddle<'a> {
     ParserVersion(u32),
     /// Its parser stops, with a panic, on the session that has the item of this key.
     FaultyParser(String),
+    /// Runs something before the first proofs it is asked for, and answers none of the second
+    /// lot it is asked for: `asked` counts the lots.
+    SecondProofsUnanswered {
+        before_first: Mutex<Option<Box<dyn FnOnce() + Send + 'a>>>,
+        asked: AtomicUsize,
+    },
 }
 
 impl<'a> Meddle<'a> {
     pub fn at(when: When, action: impl FnOnce() + Send + 'a) -> Self {
         Self::At(when, Mutex::new(Some(Box::new(action))))
+    }
+
+    pub fn second_proofs_unanswered(before_first: impl FnOnce() + Send + 'a) -> Self {
+        Self::SecondProofsUnanswered {
+            before_first: Mutex::new(Some(Box::new(before_first))),
+            asked: AtomicUsize::new(0),
+        }
     }
 
     /// Runs the action if this is its moment and it has not run.
@@ -421,6 +435,22 @@ impl Source for MeddlingSource<'_, '_> {
         requests: &[ItemPrefix],
     ) -> Result<Vec<Result<Hashed, RangeFailure>>, ProviderError> {
         self.meddle.reached(When::BeforeProof);
+        if let Meddle::SecondProofsUnanswered {
+            before_first,
+            asked,
+        } = self.meddle
+        {
+            match asked.fetch_add(1, Ordering::Relaxed) {
+                0 => before_first
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .into_iter()
+                    .for_each(|run| run()),
+                1 => return Ok(Vec::new()),
+                _ => {}
+            }
+        }
         let mut hashes = self.inner.hash_prefixes(requests)?;
         match self.meddle {
             Meddle::FewerProofs => drop(hashes.pop()),

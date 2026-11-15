@@ -32,7 +32,7 @@ use std::sync::{Mutex, PoisonError, RwLock};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::catalogue::{self, Catalogue, CatalogueError, Commit, Recorded, Stored};
+use crate::catalogue::{self, Catalogue, CatalogueError, Commit, Recorded, Stored, Target};
 use crate::location::LocationId;
 
 pub use items::ArchivedSession;
@@ -360,10 +360,11 @@ impl Archive {
      * A file already where one goes is one the catalogue never recorded: it is what a store
      * that was interrupted before its commit leaves. When it holds the very bytes that are
      * being placed, it stays and is recorded now, so a pass that takes up where another was
-     * killed moves nothing. When it holds anything else, it is set aside. A segment the
-     * catalogue does record is never touched: [`ArchiveError::SegmentExists`]. An item's
-     * `source.json` says only what the catalogue says too, so one that is not what it should
-     * be is set aside and written again.
+     * killed moves nothing. When it holds anything else, or is no file, it is set aside, and
+     * so is what sits where one of the item's folders goes. A segment the catalogue does
+     * record is never touched: [`ArchiveError::SegmentExists`]. An item's `source.json` says
+     * only what the catalogue says too, so one that is not what it should be is set aside and
+     * written again.
      */
     pub(crate) fn store(&self, batch: Vec<(Commit<'_>, Vec<Sealed>)>) -> Result<Vec<bool>> {
         if batch.is_empty() {
@@ -379,7 +380,7 @@ impl Archive {
             let folder = item_folder(&commit.scanned.key);
             let item = layout::item_dir(commit.location, commit.provider, &folder);
             let item_dir = self.dir.join(&item);
-            fs::create_dir_all(&item_dir).map_err(io_error("create", &item_dir))?;
+            self.make_folder(&item)?;
             folders.extend(
                 item.ancestors()
                     .take_while(|folder| !folder.as_os_str().is_empty())
@@ -392,8 +393,12 @@ impl Archive {
             })
             .expect("a struct of text always serializes");
             let source = item.join(layout::SOURCE);
-            /* One that is there and is not this (a write cut short) is set aside by `place`. */
-            if !fs::read(self.dir.join(&source)).is_ok_and(|existing| existing == json) {
+            /* An item that is recorded has had its `source.json` made durable. Before that,
+            one that is there goes through `place` like a segment, which also sets aside one
+            that is not this. */
+            if matches!(commit.target, Target::NewItem)
+                || !fs::read(self.dir.join(&source)).is_ok_and(|existing| existing == json)
+            {
                 let file =
                     disk::new_file(&self.tmp(), &json).map_err(io_error("write", &item_dir))?;
                 self.place(file, &source, || Ok(false))?;
@@ -402,9 +407,8 @@ impl Archive {
             let version = item.join(layout::version_dir(commit.number));
             let mut placed = Vec::new();
             for sealed in segments {
-                let version_dir = self.dir.join(&version);
-                fs::create_dir_all(&version_dir).map_err(io_error("create", &version_dir))?;
-                folders.insert(version_dir);
+                self.make_folder(&version)?;
+                folders.insert(self.dir.join(&version));
                 self.place(
                     sealed.file,
                     &version.join(layout::segment_file(sealed.offset)),
@@ -452,8 +456,9 @@ impl Archive {
             if recorded()? {
                 return Err(ArchiveError::SegmentExists(to));
             }
-            if disk::same_bytes(&unplaced, &to).map_err(io_error("read", &to))? {
-                return Ok(());
+            if disk::same_file(&unplaced, &to).map_err(io_error("read", &unplaced))? {
+                /* Whoever left it may have been stopped before making it durable. */
+                return disk::push_at(&to).map_err(io_error("flush", &to));
             }
             self.set_aside(relative)?;
             file = unplaced;
@@ -461,21 +466,46 @@ impl Archive {
         Ok(())
     }
 
+    /// Makes the folder `relative` (to the archive, under `files/`) and the ones it is in. What
+    /// sits where one of them goes and is no folder is set aside: the catalogue records
+    /// nothing there.
+    fn make_folder(&self, relative: &Path) -> Result<()> {
+        let dir = self.dir.join(relative);
+        if fs::create_dir_all(&dir).is_ok() {
+            return Ok(());
+        }
+        let in_the_way = relative.ancestors().find(|ancestor| {
+            let path = self.dir.join(ancestor);
+            fs::symlink_metadata(&path).is_ok() && !path.is_dir()
+        });
+        if let Some(in_the_way) = in_the_way {
+            self.set_aside(in_the_way)?;
+        }
+        fs::create_dir_all(&dir).map_err(io_error("create", &dir))
+    }
+
     /// Moves the file or folder at `relative` (to the archive, under `files/`) to the same path
-    /// under `orphans/`.
+    /// under `orphans/`, or as near to it as is free.
     fn set_aside(&self, relative: &Path) -> Result<()> {
         let from = self.dir.join(relative);
-        let mut to = self.dir.join(layout::ORPHANS).join(relative);
+        let mut to = self.dir.join(layout::ORPHANS);
+        let mut names = relative.iter().peekable();
+        while let Some(name) = names.next() {
+            /* Never onto something set aside earlier: its name is taken, and so is, for a
+            folder on the way, the name of anything that is no folder. */
+            let last = names.peek().is_none();
+            let mut next = to.join(name);
+            let mut again = 0;
+            while fs::symlink_metadata(&next).is_ok_and(|taken| last || !taken.is_dir()) {
+                again += 1;
+                let mut numbered = name.to_owned();
+                numbered.push(format!(".{again}"));
+                next = to.join(numbered);
+            }
+            to = next;
+        }
         if let Some(dir) = to.parent() {
             fs::create_dir_all(dir).map_err(io_error("create", dir))?;
-        }
-        /* Never onto something set aside earlier. */
-        let mut again = 0;
-        while to.exists() {
-            again += 1;
-            let mut name = relative.as_os_str().to_owned();
-            name.push(format!(".{again}"));
-            to = self.dir.join(layout::ORPHANS).join(name);
         }
         fs::rename(&from, &to).map_err(io_error("set aside", &from))
     }
@@ -701,6 +731,190 @@ mod tests {
             .unwrap();
         assert_eq!((report.versions, report.damaged.len()), (2, 0));
         assert!(report.uncatalogued.is_empty());
+    }
+
+    #[test]
+    fn what_sits_where_a_segment_or_its_folders_go_is_set_aside_whatever_it_is() {
+        let (_dir, archive, location) = archive();
+        let items = [
+            scanned("items/one"),
+            scanned("items/two"),
+            scanned("items/three"),
+        ];
+        let segments = items
+            .each_ref()
+            .map(|item| archive.dir().join(first_segment(&location, item)));
+        let [segment, version, item] = [
+            segments[0].as_path(),
+            segments[1].parent().unwrap(),
+            segments[2].parent().unwrap().parent().unwrap(),
+        ];
+        /* A folder where the first item's segment goes, and files where the second's version
+        folder and the third's own folder go. */
+        fs::create_dir_all(segment).unwrap();
+        fs::write(segment.join("inside"), "a folder").unwrap();
+        fs::create_dir_all(version.parent().unwrap()).unwrap();
+        fs::write(version, "a version").unwrap();
+        fs::create_dir_all(item.parent().unwrap()).unwrap();
+        fs::write(item, "an item").unwrap();
+        /* And, set aside earlier, a file of the name the folder they are set aside in has. */
+        let earlier = archive.dir().join(layout::ORPHANS).join(layout::FILES);
+        fs::create_dir_all(earlier.parent().unwrap()).unwrap();
+        fs::write(&earlier, "earlier").unwrap();
+
+        archive
+            .store(
+                items
+                    .iter()
+                    .map(|item| first(&archive, &location, item, b"first"))
+                    .collect(),
+            )
+            .unwrap();
+        let report = archive
+            .verify(&toolbox_process::CancelToken::new())
+            .unwrap();
+        assert_eq!((report.versions, report.damaged.len()), (3, 0));
+        assert!(report.uncatalogued.is_empty());
+        /* Each was set aside with what it held, beside what was there already. */
+        assert_eq!(fs::read_to_string(&earlier).unwrap(), "earlier");
+        let aside = |path: &Path| {
+            let relative = path
+                .strip_prefix(archive.dir().join(layout::FILES))
+                .unwrap();
+            fs::read_to_string(earlier.with_file_name("files.1").join(relative)).unwrap()
+        };
+        assert_eq!(aside(&segment.join("inside")), "a folder");
+        assert_eq!(aside(version), "a version");
+        assert_eq!(aside(item), "an item");
+        assert_eq!(orphans(&archive), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_where_a_segment_goes_is_not_taken_for_the_segment() {
+        use std::os::unix::fs::symlink;
+
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (dir, archive, location) = archive();
+        let (same, dangling) = (scanned("items/same"), scanned("items/dangling"));
+        /* A file as long as the segment that can't be read: not known to be the segment. */
+        let unread = scanned("items/unread");
+        let closed = archive.dir().join(first_segment(&location, &unread));
+        fs::create_dir_all(closed.parent().unwrap()).unwrap();
+        fs::copy(
+            &first(&archive, &location, &unread, b"first").1[0].file,
+            &closed,
+        )
+        .unwrap();
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+        /* A link to a file elsewhere that holds the very segment, and a link to nothing. */
+        let elsewhere = dir.path().join("elsewhere");
+        fs::copy(
+            &first(&archive, &location, &same, b"first").1[0].file,
+            &elsewhere,
+        )
+        .unwrap();
+        let places =
+            [&same, &dangling].map(|item| archive.dir().join(first_segment(&location, item)));
+        for (place, target) in places.iter().zip([&elsewhere, &dir.path().join("nothing")]) {
+            fs::create_dir_all(place.parent().unwrap()).unwrap();
+            symlink(target, place).unwrap();
+        }
+
+        archive
+            .store(vec![
+                first(&archive, &location, &same, b"first"),
+                first(&archive, &location, &dangling, b"first"),
+                first(&archive, &location, &unread, b"first"),
+            ])
+            .unwrap();
+        assert_eq!(orphans(&archive), 3);
+        /* Both segments are files of the archive's own, and the links were set aside. */
+        for (place, item) in places.iter().zip([&same, &dangling]) {
+            assert!(fs::symlink_metadata(place).unwrap().is_file());
+            let orphan = archive
+                .dir()
+                .join(layout::ORPHANS)
+                .join(first_segment(&location, item));
+            assert!(fs::symlink_metadata(orphan).unwrap().is_symlink());
+        }
+        assert!(elsewhere.exists());
+        let report = archive
+            .verify(&toolbox_process::CancelToken::new())
+            .unwrap();
+        assert_eq!((report.versions, report.damaged.len()), (3, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_kept_as_the_segment_is_flushed_before_it_is_recorded() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        /* Once the segment and once the item's source.json is the file that can't be opened
+        for its flush. */
+        for segment_locked in [true, false] {
+            let (_dir, archive, location) = archive();
+            let scanned = scanned("items/one");
+            /* What a store that was stopped before its commit left, as this one writes it. */
+            let segment = archive.dir().join(first_segment(&location, &scanned));
+            let source = segment.parent().unwrap().with_file_name(layout::SOURCE);
+            fs::create_dir_all(segment.parent().unwrap()).unwrap();
+            fs::copy(
+                &first(&archive, &location, &scanned, b"first").1[0].file,
+                &segment,
+            )
+            .unwrap();
+            let json = serde_json::to_vec_pretty(&SourceManifest {
+                provider: "fixture",
+                location: location.as_str(),
+                key: &scanned.key,
+            });
+            fs::write(&source, json.unwrap()).unwrap();
+            let locked = if segment_locked { &segment } else { &source };
+            fs::set_permissions(locked, fs::Permissions::from_mode(0o400)).unwrap();
+
+            let failed = archive.store(vec![first(&archive, &location, &scanned, b"first")]);
+            assert!(
+                matches!(
+                    failed,
+                    Err(ArchiveError::Io {
+                        action: "flush",
+                        ..
+                    })
+                ),
+                "{failed:?}"
+            );
+            assert!(!archive.catalogue().has_items().unwrap());
+
+            fs::set_permissions(locked, fs::Permissions::from_mode(0o600)).unwrap();
+            archive
+                .store(vec![first(&archive, &location, &scanned, b"first")])
+                .unwrap();
+            assert_eq!(orphans(&archive), 0);
+        }
+    }
+
+    #[test]
+    fn an_item_that_is_stored_stops_waiting() {
+        let (_dir, archive, location) = archive();
+        let scanned = scanned("items/one");
+        let catalogue = archive.catalogue();
+        catalogue
+            .record_waiting(
+                &location,
+                "fixture",
+                &[(&scanned.key, "it changed"), ("items/other", "it changed")],
+            )
+            .unwrap();
+
+        /* Whether or not the pass that stored it gets as far as saying what still waits. */
+        archive
+            .store(vec![first(&archive, &location, &scanned, b"first")])
+            .unwrap();
+        let waiting = catalogue.waiting(&location, "fixture").unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].key, "items/other");
     }
 
     #[test]
