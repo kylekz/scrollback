@@ -2,8 +2,8 @@
 //! state, and the glyph that syncs them all. A location whose sessions are being indexed
 //! outside a pass says so as a syncing one does, and so does the index of every location
 //! that runs when the app starts, in a row of its own. Why a sync failed is the main area's
-//! to say in full (`crate::pages`); the row says that it did. The rows open the locations
-//! sheet once there is one (PLAN §13).
+//! to say in full (`crate::pages`); the row says that it did. A row opens the locations
+//! sheet with its location selected (DESIGN §4.1).
 
 use gpui::{
     AnyElement, Context, Div, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Role,
@@ -12,7 +12,7 @@ use gpui::{
 };
 use sb_core::location::{Location, LocationKind};
 
-use super::{NO_LOCATIONS, Sidebar, note};
+use super::{NO_LOCATIONS, Sidebar, SidebarEvent, note};
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{icon, kind_icon, kind_name, progress_bar};
 use crate::format;
@@ -81,12 +81,16 @@ impl Sidebar {
             .flex_col()
             .gap(px(2.))
             .children(locations.iter().map(|location| {
+                let id = location.id.clone();
                 location_row(
                     location,
                     sync.status(location),
                     sync.indexing(Some(&location.id)),
                     now,
                     theme,
+                    cx.listener(move |_, _, _, cx| {
+                        cx.emit(SidebarEvent::Locations(Some(id.clone())));
+                    }),
                 )
             }))
             // The index of every location, while it has sessions to index.
@@ -210,6 +214,7 @@ fn location_row(
     indexing: Option<PassProgress>,
     now: i64,
     theme: &SbTheme,
+    open: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
     let c = &theme.colors;
     let kind = kind_name(&location.kind);
@@ -224,11 +229,15 @@ fn location_row(
                 None => this.border(px(1.5)).border_color(c.fg3),
             })
     };
+    let hover = c.s2;
     let row = row(
         format!("location-{}", location.id),
         kind_icon(&location.kind),
         theme,
-    );
+    )
+    .cursor_pointer()
+    .hover(move |style| style.bg(hover))
+    .on_click(open);
     // A state that is one line under the name.
     let resting = |row: Stateful<Div>, state: Div| {
         row.h(theme.sizes.location_row_height).child(

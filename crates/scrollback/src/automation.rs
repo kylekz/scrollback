@@ -32,6 +32,8 @@
 //!   listed, or `{"error": …}`); and `test`, the connection test (`null`, or its `place` and
 //!   `state`: `running`, `passed`, or the failure: `unreachable`, `refused`, `host_key`,
 //!   `not_installed`, `missing`, `other`).
+//! - `sheet`: the locations sheet while it is open (`null` otherwise): the name of its
+//!   `selected` location, and its `dialog` (`add`, `remove` or `null`).
 //! - `library`: `shelf` (`all`, `starred`, `unsorted`, or `{"folder": name}`), `counts` (`all`,
 //!   `starred`, `unsorted`), `folders` (each with its `name`, its `parent`'s name and its
 //!   `sessions`, in the catalogue's order), `sessions` and `groups` (how many the shown page
@@ -106,6 +108,14 @@ impl AutomationHost for ScrollbackAutomation {
             "archive": archive(cx),
             "sync": sync(cx),
             "library": library(cx),
+            "sheet": shell.locations_sheet().map(|sheet| {
+                let sheet = sheet.read(cx);
+                let sync = cx.services().sync.read(cx);
+                json!({
+                    "selected": sheet.selected().and_then(|id| sync.location(id)).map(|it| &it.name),
+                    "dialog": sheet.dialog(),
+                })
+            }),
         })
     }
 

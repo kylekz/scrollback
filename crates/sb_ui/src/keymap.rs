@@ -10,7 +10,7 @@
 
 use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, SharedString};
 
-use crate::actions::{app, first_run, library, sessions, shell, sidebar};
+use crate::actions::{app, first_run, library, locations, sessions, shell, sidebar};
 
 /// Key context of the shell's root element: everything in the main window.
 pub const SHELL: &str = "Shell";
@@ -24,6 +24,13 @@ pub const SESSIONS: &str = "Sessions";
 pub const UNSORTED: &str = "Unsorted";
 /// Key context of the main area while it shows the first run.
 pub const FIRST_RUN: &str = "FirstRun";
+/// Key context of the locations sheet (DESIGN §4.11), and of its list while it has the
+/// keyboard.
+pub const LOCATIONS_SHEET: &str = "LocationsSheet";
+pub const LOCATIONS_LIST: &str = "LocationsList";
+/// Key context of a dialog over the sheet or the first run: adding a location (DESIGN
+/// §4.12), confirming a removal.
+pub const LOCATION_DIALOG: &str = "LocationDialog";
 
 /// One row of the keymap.
 #[derive(Clone, Copy)]
@@ -84,6 +91,8 @@ pub const SYNC_ALL: Shortcut = shortcut!("f5", SHELL, library::SyncAll);
 pub const BACK: Shortcut = shortcut!("alt-left", SHELL, library::Back);
 /// `S`. Named, because a card's star button says it.
 pub const STAR: Shortcut = shortcut!("s", SESSIONS, sessions::Star);
+/// `Ctrl L`. Named, because the Locations overline's label says it.
+pub const LOCATIONS: Shortcut = shortcut!("secondary-l", SHELL, shell::OpenLocations);
 
 /// Every binding scrollback defines.
 pub const SHORTCUTS: &[Shortcut] = &[
@@ -111,6 +120,13 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut!("down", UNSORTED, sessions::Down),
     shortcut!("enter", UNSORTED, sessions::Open),
     shortcut!("enter", FIRST_RUN, first_run::Add),
+    LOCATIONS,
+    shortcut!("escape", LOCATIONS_SHEET, locations::Close),
+    shortcut!("up", LOCATIONS_LIST, locations::Previous),
+    shortcut!("down", LOCATIONS_LIST, locations::Next),
+    shortcut!("enter", LOCATIONS_LIST, locations::Open),
+    shortcut!("escape", LOCATION_DIALOG, locations::Close),
+    shortcut!("enter", LOCATION_DIALOG, locations::Confirm),
 ];
 
 /// `Ctrl K`, the palette's key (module docs).

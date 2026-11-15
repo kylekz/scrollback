@@ -1,0 +1,48 @@
+{"scenario": {"window_size": "960x600", "fixture": "locations", "description": "The locations sheet and the add dialog in the smallest window (DESIGN §2: 960 × 600): both keep inside the window, the margin around them, and scroll what doesn't fit; Tab stays inside the sheet. Captured dark and light"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/shell/sidebar", "equals": "collapsed"}]}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+{"cmd": "key", "keystroke": "secondary-l"}
+{"cmd": "settle", "expect": {"pointer": "/sheet/selected", "equals": "This PC"}}
+// 24 from each side and under the title bar: 912 × 512.
+{"cmd": "bounds", "target": "sheet", "expect_result": [{"pointer": "/x", "equals": 24}, {"pointer": "/y", "equals": 64}, {"pointer": "/w", "equals": 912}, {"pointer": "/h", "equals": 512}]}
+{"cmd": "key", "keystroke": "down"}
+{"cmd": "key", "keystroke": "down"}
+{"cmd": "settle", "expect": {"pointer": "/sheet/selected", "equals": "user@macbook"}}
+{"cmd": "screenshot", "name": "narrow-sheet-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "narrow-sheet-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+// Tab walks the sheet's controls and comes back round; it never reaches the page under the scrim.
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": {"pointer": "/sheet", "equals": null}}
+
+// The add dialog: as wide as it is anywhere, and as high as the window lets it be.
+{"cmd": "key", "keystroke": "secondary-l"}
+{"cmd": "click", "target": "sheet/add"}
+{"cmd": "click", "target": "add/kind/ssh"}
+{"cmd": "type", "text": "asleep-mac"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "asleep-mac", "state": "unreachable"}}}
+{"cmd": "bounds", "target": "add", "expect_result": [{"pointer": "/w", "equals": 440}, {"pointer": "/y", "equals": 64}, {"pointer": "/h", "lte": 512}]}
+{"cmd": "screenshot", "name": "narrow-add-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "narrow-add-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": [{"pointer": "/sheet/dialog", "equals": null}, {"pointer": "/sync/test", "equals": null}]}

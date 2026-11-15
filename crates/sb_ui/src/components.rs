@@ -199,7 +199,7 @@ pub fn location_tag(
 }
 
 /// A chip that warns (`.chip.warn`), as low as a card's last line.
-pub fn warn_chip(label: &'static str, theme: &SbTheme) -> impl IntoElement {
+pub fn warn_chip(label: impl Into<SharedString>, theme: &SbTheme) -> Div {
     let (fill, text) = Tone::Warn.colors(theme);
     div()
         .flex_none()
@@ -212,7 +212,7 @@ pub fn warn_chip(label: &'static str, theme: &SbTheme) -> impl IntoElement {
         .text_color(text)
         .text_spec(&theme.text.small)
         .whitespace_nowrap()
-        .child(label)
+        .child(label.into())
 }
 
 /// Makes a control one the keyboard reaches with `Tab` (DESIGN §4.1), in the order it is

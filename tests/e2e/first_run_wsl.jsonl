@@ -1,0 +1,41 @@
+{"scenario": {"window_size": "1440x900", "fixture": "agent", "description": "The first run on a Windows-shaped stand-in (DESIGN §4.10): WSL's distros join what was found, a running one looked in and checked, a stopped one listed as it is, unchecked and not counted, Docker's own left out; an SSH host chosen through Add an SSH host… joins the list checked; one button adds the three checked places and syncs them. Captured dark and light"}}
+{"cmd": "wait_ready", "timeout_ms": 20000}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "first-run"}, {"pointer": "/sync/distros", "equals": null}]}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+// No WSL: only this machine is offered.
+{"cmd": "query", "prefix": "first-run/distro/", "expect_result": {"pointer": "", "len": 0}}
+{"cmd": "stand_in", "distros": [{"name": "Ubuntu-24.04", "running": true, "default": true}, {"name": "Debian"}, {"name": "docker-desktop", "running": true, "utility": true}], "places": {"user@macbook": "passes"}}
+{"cmd": "settle", "expect": {"pointer": "/sync/distros", "equals": ["Ubuntu-24.04", "Debian", "docker-desktop"]}}
+{"cmd": "query", "prefix": "first-run/distro/", "expect_result": [{"pointer": "", "len": 2}, {"pointer": "/0/target", "equals": "first-run/distro/Ubuntu-24.04"}, {"pointer": "/1/target", "equals": "first-run/distro/Debian"}]}
+{"cmd": "screenshot", "name": "first-run-wsl-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "first-run-wsl-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// Add an SSH host…: the add dialog's SSH step; its test passes and the host joins the list, checked.
+{"cmd": "click", "target": "first-run/add-host"}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "add/host", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "type", "text": "user@macbook"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "user@macbook", "state": "passed"}}}
+{"cmd": "screenshot", "name": "first-run-add-host-dark"}
+{"cmd": "click", "target": "add/add-sync"}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "first-run"}, {"pointer": "/sync/locations", "equals": []}, {"pointer": "/sync/test", "equals": null}]}
+{"cmd": "bounds", "target": "add", "expect_error": "no target"}
+{"cmd": "bounds", "target": "first-run/host/user@macbook", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "first-run-with-host-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "first-run-with-host-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// The button adds this machine, the running distro and the host, and syncs them; the stopped distro stays unadded.
+{"cmd": "click", "target": "first-run/add"}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/sync/locations", "len": 3}, {"pointer": "/sync/syncing", "equals": false}]}
+{"cmd": "query", "prefix": "sidebar/location/", "expect_result": {"pointer": "", "len": 3}}
+{"cmd": "query", "prefix": "sidebar/location/Debian", "expect_result": {"pointer": "", "len": 0}}
+{"cmd": "query", "prefix": "sidebar/location/Ubuntu-24.04", "expect_result": {"pointer": "", "len": 1}}
+{"cmd": "query", "prefix": "sidebar/location/user@macbook", "expect_result": {"pointer": "", "len": 1}}

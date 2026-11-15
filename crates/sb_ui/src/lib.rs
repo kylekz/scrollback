@@ -15,6 +15,7 @@
 //! [`automation::open_window`].
 
 pub mod actions;
+pub mod add_location;
 pub mod agents;
 pub mod app_menu;
 pub mod appearance;
@@ -24,6 +25,8 @@ pub mod components;
 pub mod format;
 pub mod icons;
 pub mod keymap;
+pub mod locations_sheet;
+pub mod overlay;
 pub mod pages;
 pub mod services;
 pub mod shell;

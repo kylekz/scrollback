@@ -36,6 +36,7 @@ use gpui::{
 use gpui_component::input::{Input, InputState};
 use sb_core::catalogue::{FOLDER_NAME_CHARS, Shelf};
 use sb_core::filing::FolderId;
+use sb_core::location::LocationId;
 
 use crate::actions::sidebar::{Collapse, DropName, Expand, KeepName, Next, Open, Previous};
 use crate::automation::AutomationTargetExt as _;
@@ -101,6 +102,8 @@ pub enum SidebarEvent {
     /// A folder is being renamed in its row, which has the keyboard: a narrow window shows
     /// the sidebar for it.
     Renaming,
+    /// The locations sheet opens, with this location selected (DESIGN §4.1).
+    Locations(Option<LocationId>),
 }
 
 /// A folder being renamed in its row.
@@ -753,23 +756,37 @@ impl Render for Sidebar {
             )
             .child(
                 section_header(&theme)
+                    .id("sidebar-locations")
                     .flex_none()
                     .pb(theme.spacing.xs)
                     .min_h(theme.spacing.xs + theme.sizes.section_button)
                     .child(overline("Locations", &theme))
                     .when(has_library, |this| {
-                        this.child(
-                            header_button(
-                                sync_glyph(syncing, c.fg2, &theme),
-                                format!("Sync all locations ({})", keymap::SYNC_ALL.label()),
-                                "sidebar/sync-all",
-                                &theme,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.sync.update(cx, |sync, cx| sync.sync_all(cx));
+                        // The overline's area opens the sheet (DESIGN §4.1).
+                        this.cursor_pointer()
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(SidebarEvent::Locations(None));
                             }))
-                            .automation_target("sidebar/sync-all"),
-                        )
+                            .child(
+                                header_button(
+                                    sync_glyph(syncing, c.fg2, &theme),
+                                    format!("Sync all locations ({})", keymap::SYNC_ALL.label()),
+                                    "sidebar/sync-all",
+                                    &theme,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.sync.update(cx, |sync, cx| sync.sync_all(cx));
+                                }))
+                                .automation_target("sidebar/sync-all"),
+                            )
+                    })
+                    .map(|this| {
+                        if has_library {
+                            this.automation_target("sidebar/locations")
+                        } else {
+                            this.into_any_element()
+                        }
                     }),
             )
             .child(self.render_locations(&theme, cx))

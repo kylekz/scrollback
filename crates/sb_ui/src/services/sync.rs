@@ -718,6 +718,8 @@ impl SyncService {
                 this.update(cx, |this, cx| {
                     this.indexes.remove(&location);
                     if this.indexed(indexed) {
+                        // What the locations hold counts the sessions just indexed.
+                        this.read_details(cx);
                         cx.emit(SyncEvent::Archived);
                     }
                     if let Some(id) = location.filter(|id| this.waiting.remove(id)) {

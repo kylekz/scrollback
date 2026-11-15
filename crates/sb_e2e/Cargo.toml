@@ -19,6 +19,8 @@ sb_core.workspace = true
 sb_test_support.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The locations fixture dates a location's last sync back in its catalogue.
+toolbox_store.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
