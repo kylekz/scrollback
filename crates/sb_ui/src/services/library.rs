@@ -113,16 +113,16 @@ pub enum Page {
 }
 
 /// What one load reads.
-struct Loaded {
+pub(super) struct Loaded {
     shelf: Shelf,
     counts: LibraryCounts,
     folders: Vec<Folder>,
     agents: usize,
-    page: Page,
+    pub(super) page: Page,
 }
 
 /// Reads what the sidebar and the page of `shelf` show.
-fn load(archive: &Archive, shelf: Shelf) -> Result<Loaded, CatalogueError> {
+pub(super) fn load(archive: &Archive, shelf: Shelf) -> Result<Loaded, CatalogueError> {
     let catalogue = archive.catalogue();
     let mut agents = HashSet::new();
     for location in catalogue.locations()? {
@@ -349,29 +349,23 @@ impl LibraryService {
         }
     }
 
-    /// Stars or unstars a session of the shown page.
-    pub fn set_starred(&mut self, id: &SessionId, starred: bool, cx: &mut Context<Self>) {
+    /// Stars the session at `index` of the shown page's sessions, or takes its star away.
+    pub fn toggle_star(&mut self, index: usize, cx: &mut Context<Self>) {
         let shelf = self.shelf;
         let Some((_, Page::Sessions(page))) = &mut self.page else {
             return;
         };
-        let at = match &self.selected {
-            Some((selected, Some(at))) if selected == id => Some(*at),
-            _ => page.sessions.iter().position(|session| session.id == *id),
-        };
-        let Some(session) = at.and_then(|at| page.sessions.get_mut(at)) else {
+        let Some(session) = page.sessions.get_mut(index) else {
             return;
         };
-        if session.starred == starred {
-            return;
-        }
+        let starred = !session.starred;
         session.starred = starred;
         if starred {
             self.counts.starred += 1;
         } else {
             self.counts.starred = self.counts.starred.saturating_sub(1);
         }
-        let id = id.clone();
+        let id = session.id.clone();
         self.write(
             cx,
             move |archive| archive.catalogue().set_starred(&id, starred),

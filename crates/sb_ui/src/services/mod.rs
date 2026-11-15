@@ -13,6 +13,8 @@
 
 pub mod archive;
 pub mod library;
+#[cfg(test)]
+mod scale;
 pub mod sync;
 #[cfg(test)]
 mod tests;

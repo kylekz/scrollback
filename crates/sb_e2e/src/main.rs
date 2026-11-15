@@ -19,6 +19,9 @@
 //! - `"boards"`: an archive already in the data dir, holding the library the design boards
 //!   draw ([`boards`]), so that the pages can be captured as the boards show them
 //!   (docs/DESIGN.md §6).
+//! - `"archive-remains"`: what is left of an archive in the data dir, its files without its
+//!   `archive.json`: the app must say it can't open it, and make no new one in its place
+//!   (docs/PLAN.md §4.4).
 
 mod boards;
 mod fixture;
@@ -41,6 +44,7 @@ enum Library {
     Agent,
     AgentLarge,
     Boards,
+    ArchiveRemains,
 }
 
 /// scrollback's header keys: `{"scenario": {"fixture": "boards"}}`.
@@ -109,6 +113,10 @@ impl RunnerApp for Scrollback {
                 // time the app starts: the app finds no agent, and syncs nothing away.
                 std::fs::remove_dir_all(&home)?;
                 boards::build(&cx.data_dir.join("archive"), &cx.out_dir.join("locations"))?;
+            }
+            Library::ArchiveRemains => {
+                std::fs::remove_dir_all(&home)?;
+                std::fs::create_dir_all(cx.data_dir.join("archive/files/location"))?;
             }
         }
         Ok(Box::new(Home { env }))

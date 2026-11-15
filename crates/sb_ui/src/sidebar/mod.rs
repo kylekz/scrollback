@@ -440,7 +440,16 @@ impl Sidebar {
                     .id(("folder", row.folder))
                     .role(Role::ListItem)
                     .cursor_pointer()
-                    .when(!selected, |this| this.hover(|style| style.bg(c.s2)))
+                    .map(|this| {
+                        if renaming.is_some() {
+                            // The row is an input while its folder is named (`.inp.focus`).
+                            this.bg(c.s1).border_1().border_color(c.accent)
+                        } else if selected {
+                            this
+                        } else {
+                            this.hover(|style| style.bg(c.s2))
+                        }
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.show(Shelf::Folder(id), cx);
                         cx.emit(SidebarEvent::Picked);
@@ -578,6 +587,7 @@ impl Render for Sidebar {
         let theme = cx.sb_theme().clone();
         let c = &theme.colors;
         let has_library = self.has_library(cx);
+        let first_run = self.sync.read(cx).locations().is_some_and(<[_]>::is_empty);
         let syncing = self.sync.read(cx).is_syncing();
         div()
             .id("sidebar-rows")
@@ -633,7 +643,8 @@ impl Render for Sidebar {
             )
             .map(|this| {
                 if !has_library {
-                    this.child(note(NO_FOLDERS_FIRST_RUN, &theme))
+                    // The first run says so; while there is no archive there is nothing to say.
+                    this.children(first_run.then(|| note(NO_FOLDERS_FIRST_RUN, &theme)))
                         .child(div().flex_1())
                 } else if self.tree.is_empty() {
                     this.child(note(NO_FOLDERS, &theme)).child(div().flex_1())

@@ -185,10 +185,7 @@ fn a_folder_that_holds_what_is_left_of_an_archive_gets_no_new_one(cx: &mut TestA
 fn a_star_shows_at_once_and_is_kept(cx: &mut TestAppContext) {
     init_library(cx);
     let (_, library) = services(cx);
-    let id = library.read_with(cx, |library, _| {
-        library.sessions().unwrap().sessions[1].id.clone()
-    });
-    library.update(cx, |library, cx| library.set_starred(&id, true, cx));
+    library.update(cx, |library, cx| library.toggle_star(1, cx));
     // Before the catalogue has it.
     library.read_with(cx, |library, _| {
         assert!(library.sessions().unwrap().sessions[1].starred);
@@ -201,7 +198,7 @@ fn a_star_shows_at_once_and_is_kept(cx: &mut TestAppContext) {
     library.update(cx, |library, cx| library.show(Shelf::Starred, cx));
     cx.run_until_parked();
     assert_eq!(titles(&library, cx), ["Add retries to the fetcher"]);
-    library.update(cx, |library, cx| library.set_starred(&id, false, cx));
+    library.update(cx, |library, cx| library.toggle_star(0, cx));
     cx.run_until_parked();
     assert_eq!(titles(&library, cx), [""; 0]);
     library.read_with(cx, |library, _| assert_eq!(library.counts().starred, 0));

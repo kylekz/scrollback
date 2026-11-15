@@ -47,6 +47,11 @@ const EMPTY_FOLDER: &str = "Attach a project path above and its sessions file he
 /// A card's padding at its sides (`design/project/sb.css`, `.scard`: 12px 14px).
 const CARD_PADDING: Pixels = px(14.);
 
+/// The narrowest card whose last line has room for a location's tag beside the model and the
+/// day, and for a subfolder's tag beside those. A narrower card leaves the location out.
+const LOCATION_FROM: Pixels = px(256.);
+const LOCATION_AND_FOLDER_FROM: Pixels = px(320.);
+
 /// One item of the list of cards.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Row {
@@ -96,7 +101,7 @@ fn card_height(theme: &SbTheme) -> Pixels {
 
 /// Each row's height with the gap under it: 16 under an overline and under a month's last
 /// cards, 12 between rows of cards, and the page's 24 under the last row.
-fn row_sizes(rows: &[Row], theme: &SbTheme) -> Vec<Size<Pixels>> {
+pub(crate) fn row_sizes(rows: &[Row], theme: &SbTheme) -> Vec<Size<Pixels>> {
     rows.iter()
         .enumerate()
         .map(|(at, row)| {
@@ -141,6 +146,8 @@ pub struct SessionsView {
     rows: Vec<Row>,
     sizes: Rc<Vec<Size<Pixels>>>,
     columns: usize,
+    /// How wide a card is, as far as the window's width says.
+    card_width: Pixels,
     /// The rows are of what the library held before it last changed.
     stale: bool,
     _observers: [Subscription; 2],
@@ -164,6 +171,7 @@ impl SessionsView {
             rows: Vec::new(),
             sizes: Rc::default(),
             columns: 0,
+            card_width: px(0.),
             stale: true,
         }
     }
@@ -176,7 +184,9 @@ impl SessionsView {
         } else {
             px(0.)
         };
-        let columns = columns(viewport - sidebar - theme.sizes.page_side * 2., theme);
+        let room = viewport - sidebar - theme.sizes.page_side * 2.;
+        let columns = columns(room, theme);
+        self.card_width = (room - theme.spacing.lg * (columns as f32 - 1.)) / columns as f32;
         if !self.stale && columns == self.columns {
             return;
         }
@@ -235,12 +245,8 @@ impl SessionsView {
     }
 
     fn star(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.library.update(cx, |library, cx| {
-            if let Some(session) = library.sessions().and_then(|page| page.sessions.get(index)) {
-                let (id, starred) = (session.id.clone(), !session.starred);
-                library.set_starred(&id, starred, cx);
-            }
-        });
+        self.library
+            .update(cx, |library, cx| library.toggle_star(index, cx));
     }
 
     fn render_rows(
@@ -318,7 +324,6 @@ impl SessionsView {
             .chain(model)
             .collect::<Vec<_>>()
             .join(" · ");
-        let location = self.sync.read(cx).location(&session.id.location);
         // On a folder's page a tag names the folder of a session from one inside it.
         let subfolder = match (session.filed, library.shelf()) {
             (Filed::ByRule(folder) | Filed::ByHand(folder), Shelf::Folder(shown))
@@ -328,6 +333,18 @@ impl SessionsView {
             }
             _ => None,
         };
+        let location = self
+            .sync
+            .read(cx)
+            .location(&session.id.location)
+            .filter(|_| {
+                self.card_width
+                    >= if subfolder.is_some() {
+                        LOCATION_AND_FOLDER_FROM
+                    } else {
+                        LOCATION_FROM
+                    }
+            });
         let when = session
             .ended
             .or(session.started)
@@ -360,6 +377,7 @@ impl SessionsView {
             .automation_target_with(move || format!("card/{index}/star").into());
         div()
             .id(("card", index))
+            .debug_selector(move || format!("card-{index}"))
             .group("card")
             .role(Role::ListItem)
             .relative()
@@ -442,8 +460,8 @@ impl SessionsView {
                     .text_spec(&theme.text.small)
                     .whitespace_nowrap()
                     .child(agents::mark(&session.id.provider, px(12.), cx))
-                    // On a narrow card the location gives way first, down to a few letters,
-                    // and then the model, so that the day and the calls stay whole.
+                    // The day and the calls stay whole: a long location's name gives way
+                    // first, and a long model's after it.
                     .child(
                         div()
                             .flex_shrink(0.001)

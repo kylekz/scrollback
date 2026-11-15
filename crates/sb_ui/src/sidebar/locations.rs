@@ -65,7 +65,7 @@ impl Sidebar {
                 .flex_none()
                 .pt(theme.spacing.xs)
                 .pb(theme.spacing.md)
-                .child(note(NO_LOCATIONS, theme))
+                .children(sync.locations().map(|_| note(NO_LOCATIONS, theme)))
                 .into_any_element();
         }
         let now = format::now();

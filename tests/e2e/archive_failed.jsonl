@@ -1,0 +1,24 @@
+{"scenario": {"window_size": "1440x900", "fixture": "archive-remains", "description": "An archive that doesn't open (PLAN §4.4): the data dir holds an archive's files without its archive.json, so the app says why it can't open it, makes no new archive in its place, and syncs nothing; Try again tries again. The whole screen of DESIGN §4.14 comes with Settings"}}
+{"cmd": "wait_ready", "timeout_ms": 20000}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "archive-failed"}, {"pointer": "/archive/state", "equals": "failed"}, {"pointer": "/archive/error", "contains": "without its archive.json"}, {"pointer": "/sync/locations", "equals": []}, {"pointer": "/sync/syncing", "equals": false}]}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+
+// The 600-wide column is centred in the main area; the title bar's controls are there, disabled, and the sidebar has no library to show.
+{"cmd": "bounds", "target": "archive/failed", "expect_result": [{"pointer": "/x", "equals": 544}, {"pointer": "/w", "equals": 600}]}
+{"cmd": "bounds", "target": "titlebar/sync-all", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "query", "prefix": "sidebar/", "expect_result": {"pointer": "", "len": 4}}
+{"cmd": "screenshot", "name": "archive-failed-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "archive-failed-light"}
+
+// Sync all does nothing without an archive, and trying again finds the folder as it was.
+{"cmd": "click", "target": "titlebar/sync-all", "expect": {"pointer": "/sync/syncing", "equals": false}}
+{"cmd": "key", "keystroke": "f5", "expect": {"pointer": "/sync/syncing", "equals": false}}
+{"cmd": "click", "target": "archive/retry"}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "archive-failed"}, {"pointer": "/archive/error", "contains": "without its archive.json"}]}
+
+// A restart is no different: still no archive.json, and no first run offering to start over.
+{"restart": {}, "expect": {"pointer": "/window/w", "equals": 1440}}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "archive-failed"}, {"pointer": "/archive/state", "equals": "failed"}]}
