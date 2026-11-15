@@ -13,7 +13,9 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
+base64.workspace = true
 sb_core.workspace = true
-serde_json.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 tempfile.workspace = true
 toolbox_store.workspace = true

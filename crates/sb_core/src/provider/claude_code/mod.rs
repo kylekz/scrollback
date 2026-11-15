@@ -15,15 +15,28 @@
 //!
 //! `<project>` is the starting directory with its punctuation replaced by `-`, so it can't be
 //! turned back into a path and is not read here. Every `.jsonl` file is appended to line by line.
+//!
+//! [`parse`] turns a session's archived files into the transcript model, and [`tools`] maps
+//! Claude Code's tools onto the common kinds.
+
+mod parse;
+mod record;
+#[cfg(test)]
+mod tests;
+mod tools;
 
 use serde_json::Value;
 
 use super::{
-    FileClass, FileTree, ItemKind, ItemPrefix, ItemRange, Provider, ProviderError, ScannedItem,
-    Source,
+    FileClass, FileTree, ItemKind, ItemPrefix, ItemRange, ParseError, Provider, ProviderError,
+    ScannedItem, SessionItems, Source,
 };
 use crate::hash::Hash;
+use crate::transcript::{ToolKind, Transcript};
 use crate::transport::{RangeSink, Transport};
+
+/// The provider's identity (PLAN §2.1).
+const ID: &str = "claude-code";
 
 /// Where the items are, under the root.
 const SUBTREE: &str = "projects";
@@ -37,7 +50,7 @@ pub struct Agent;
 
 impl Provider for Agent {
     fn id(&self) -> &'static str {
-        "claude-code"
+        ID
     }
 
     fn detect<'a>(
@@ -57,6 +70,14 @@ impl Provider for Agent {
                 root,
             }) as Box<dyn Source>
         }))
+    }
+
+    fn parse(&self, items: &dyn SessionItems) -> Result<Transcript, ParseError> {
+        parse::parse(items)
+    }
+
+    fn tool_kind(&self, name: &str) -> ToolKind {
+        tools::kind(name)
     }
 }
 
@@ -146,7 +167,7 @@ fn classify(key: &str) -> FileClass {
 }
 
 #[cfg(test)]
-mod tests {
+mod source_tests {
     use std::fs;
 
     use super::*;

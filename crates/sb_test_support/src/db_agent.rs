@@ -1,18 +1,32 @@
 //! A made-up agent that keeps its sessions in a SQLite database, and the test-only provider
 //! for it (PLAN §7.2, §12). The provider copies the database through `DbSnapshot` and archives
 //! one export per session: its messages, one JSON line each, in the order they were inserted.
+//!
+//! Its sessions are shaped unlike a file-keeping agent's, so that the transcript model is
+//! tested against a second shape (PLAN §7.4): a message is a row with a role, the rows have no
+//! links between them, a tool call and its result are one row, and where the session started
+//! is a row of its own.
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead as _, BufReader};
+use std::sync::Arc;
 
 use sb_core::hash::Hash;
 use sb_core::provider::{
-    DbSnapshot, ItemKind, ItemPrefix, ItemRange, Provider, ProviderError, ScannedItem, Source,
+    DbSnapshot, ItemKind, ItemPrefix, ItemRange, ParseError, Provider, ProviderError, ScannedItem,
+    SessionItems, Source,
+};
+use sb_core::transcript::{
+    Block, BlockId, Content, Conversation, Encoding, Facts, Output, Stored, Tokens, ToolCall,
+    ToolInput, ToolKind, ToolResult, ToolStatus, Transcript, Turn, Unrecognised,
 };
 use sb_core::transport::{
     Halt, LocalTransport, RangeFailure, RangeSink, Transport, TransportError,
 };
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::value::RawValue;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use toolbox_store::rusqlite::{Connection, params};
 
@@ -21,9 +35,40 @@ use crate::Agent;
 /// Where the agent keeps its database, under the location's home.
 const DATABASE: &str = ".dbagent/sessions.db";
 
-/// One message as a line of a session's export.
-fn export_line(id: i64, role: &str, body: &str) -> String {
-    json!({ "id": id, "role": role, "body": body }).to_string() + "\n"
+/// The provider's identity.
+const ID: &str = "db-agent";
+
+/// One message as a line of a session's export. `call` is a tool call's row: the tool, its
+/// arguments, its output and whether it worked.
+fn export_line(id: i64, role: &str, body: &str, call: Option<&str>) -> String {
+    let call: Option<Value> = call.map(|call| serde_json::from_str(call).unwrap());
+    json!({ "id": id, "role": role, "body": body, "call": call }).to_string() + "\n"
+}
+
+/// A line of an export, as the parser reads it.
+#[derive(Deserialize)]
+struct Row<'a> {
+    role: String,
+    body: String,
+    #[serde(borrow)]
+    call: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct CallRow<'a> {
+    tool: String,
+    #[serde(borrow)]
+    args: &'a RawValue,
+    #[serde(borrow)]
+    output: &'a RawValue,
+    ok: bool,
+}
+
+/// The arguments of the tools the agent has: `exec` runs a command, `open` reads a file.
+#[derive(Deserialize)]
+struct Args {
+    cmd: Option<String>,
+    file: Option<String>,
 }
 
 /// The provider for [`DbAgent`].
@@ -40,7 +85,7 @@ impl Default for DbProvider {
 
 impl Provider for DbProvider {
     fn id(&self) -> &'static str {
-        "db-agent"
+        ID
     }
 
     fn detect<'a>(
@@ -57,6 +102,159 @@ impl Provider for DbProvider {
                 sessions: HashMap::new(),
             }) as Box<dyn Source>
         }))
+    }
+
+    fn parse(&self, items: &dyn SessionItems) -> Result<Transcript, ParseError> {
+        let item = items
+            .list()
+            .iter()
+            .find(|item| item.kind == ItemKind::Transcript)
+            .ok_or(ParseError::NoTranscript)?;
+        let failed = |source| ParseError::Read {
+            key: item.key.clone(),
+            source,
+        };
+        let key: Arc<str> = Arc::from(item.key.as_str());
+        let mut blocks: Vec<Block> = Vec::new();
+        let mut turns: Vec<Turn> = Vec::new();
+        let mut project_path = None;
+        let mut offset = 0;
+        for line in BufReader::new(items.open(&item.key, 0).map_err(failed)?).split(b'\n') {
+            let line = line.map_err(failed)?;
+            let whole = Stored {
+                item: key.clone(),
+                offset,
+                length: line.len() as u64,
+                encoding: Encoding::Plain,
+            };
+            let content = match serde_json::from_slice::<Row>(&line) {
+                Ok(Row { role, body, call }) => match (role.as_str(), call) {
+                    ("start", _) => {
+                        project_path = Some(body);
+                        None
+                    }
+                    ("user", _) => Some(Content::Prompt {
+                        text: body,
+                        images: Vec::new(),
+                        from: None,
+                    }),
+                    ("assistant", _) => Some(Content::Reply { text: body }),
+                    ("tool", Some(call)) => {
+                        Some(match serde_json::from_str::<CallRow>(call.get()) {
+                            Ok(call) => {
+                                Content::ToolCall(Box::new(self.call(call, |raw, encoding| {
+                                    Stored::part(&key, offset, &line, raw.get(), encoding)
+                                })))
+                            }
+                            Err(_) => Content::Unrecognised(Unrecognised {
+                                kind: role,
+                                misfit: Some("call"),
+                                raw: whole,
+                            }),
+                        })
+                    }
+                    _ => Some(Content::Unrecognised(Unrecognised {
+                        kind: role,
+                        misfit: None,
+                        raw: whole,
+                    })),
+                },
+                Err(_) => Some(Content::Unrecognised(Unrecognised {
+                    kind: String::new(),
+                    misfit: Some("not a row"),
+                    raw: whole,
+                })),
+            };
+            if let Some(content) = content {
+                let id = BlockId(blocks.len());
+                match turns.last_mut() {
+                    Some(turn) if !matches!(content, Content::Prompt { .. }) => {
+                        turn.blocks.push(id);
+                    }
+                    _ => turns.push(Turn { blocks: vec![id] }),
+                }
+                blocks.push(Block {
+                    parent: id.0.checked_sub(1).map(BlockId),
+                    at: None,
+                    offset,
+                    model: None,
+                    content,
+                });
+            }
+            offset += line.len() as u64 + 1;
+        }
+        Ok(Transcript {
+            facts: Facts {
+                agent: ID,
+                title: None,
+                project_path,
+                branch: None,
+                entrypoint: None,
+            },
+            conversation: Conversation {
+                item: key,
+                blocks,
+                turns,
+                unplaced: Vec::new(),
+                models: Vec::new(),
+                tokens: Tokens::default(),
+                cut_short: false,
+            },
+            unattached: Vec::new(),
+        })
+    }
+
+    fn tool_kind(&self, name: &str) -> ToolKind {
+        match name {
+            "exec" => ToolKind::Shell,
+            "open" => ToolKind::Read,
+            _ => ToolKind::Other,
+        }
+    }
+}
+
+impl DbProvider {
+    /// A `tool` row as a call with its result. `part` says where a piece of the row is archived.
+    fn call(&self, call: CallRow, part: impl Fn(&RawValue, Encoding) -> Stored) -> ToolCall {
+        ToolCall {
+            input: match (
+                self.tool_kind(&call.tool),
+                serde_json::from_str(call.args.get()),
+            ) {
+                (
+                    ToolKind::Shell,
+                    Ok(Args {
+                        cmd: Some(command), ..
+                    }),
+                ) => ToolInput::Shell {
+                    command,
+                    description: None,
+                },
+                (
+                    ToolKind::Read,
+                    Ok(Args {
+                        file: Some(path), ..
+                    }),
+                ) => ToolInput::Read {
+                    path,
+                    first_line: None,
+                    lines: None,
+                },
+                _ => ToolInput::Other,
+            },
+            name: call.tool,
+            raw_input: part(call.args, Encoding::Plain),
+            result: Some(ToolResult {
+                at: None,
+                status: if call.ok {
+                    ToolStatus::Ok
+                } else {
+                    ToolStatus::Failed
+                },
+                output: vec![Output::Text(part(call.output, Encoding::JsonString))],
+            }),
+            subagents: Vec::new(),
+        }
     }
 }
 
@@ -88,8 +286,9 @@ impl Source for Exports<'_> {
             .prepare("SELECT id, updated FROM session ORDER BY id")?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<_, _>>()?;
-        let mut messages = connection
-            .prepare("SELECT id, role, body FROM message WHERE session_id = ?1 ORDER BY id")?;
+        let mut messages = connection.prepare(
+            "SELECT id, role, body, call FROM message WHERE session_id = ?1 ORDER BY id",
+        )?;
         let mut items = Vec::new();
         for (session, updated) in sessions {
             let export: String = messages
@@ -98,6 +297,7 @@ impl Source for Exports<'_> {
                         row.get(0)?,
                         &row.get::<_, String>(1)?,
                         &row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?.as_deref(),
                     ))
                 })?
                 .collect::<Result<_, _>>()?;
@@ -184,7 +384,8 @@ impl DbAgent {
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
                      session_id TEXT NOT NULL REFERENCES session (id),
                      role TEXT NOT NULL,
-                     body TEXT NOT NULL
+                     body TEXT NOT NULL,
+                     call TEXT
                  );",
             )
             .unwrap();
@@ -221,18 +422,37 @@ impl DbAgent {
                 "assistant"
             };
             let body = format!("message {} of the made-up agent", self.messages);
-            self.connection
-                .execute(
-                    "INSERT INTO message (session_id, role, body) VALUES (?1, ?2, ?3)",
-                    params![Self::session_id(key), role, body],
-                )
-                .unwrap();
-            let id = self.connection.last_insert_rowid();
-            self.expected
-                .get_mut(key)
-                .unwrap()
-                .push((id, export_line(id, role, &body)));
+            self.row(key, role, &body, None);
         }
+    }
+
+    fn row(&mut self, key: &str, role: &str, body: &str, call: Option<&str>) {
+        self.connection
+            .execute(
+                "INSERT INTO message (session_id, role, body, call) VALUES (?1, ?2, ?3, ?4)",
+                params![Self::session_id(key), role, body, call],
+            )
+            .unwrap();
+        let id = self.connection.last_insert_rowid();
+        self.expected
+            .get_mut(key)
+            .unwrap()
+            .push((id, export_line(id, role, body, call)));
+    }
+
+    /// One more message of the session: `role` says `body`. The agent's roles are `start`
+    /// (the body is the directory the session started in), `user` and `assistant`.
+    pub fn say(&mut self, key: &str, role: &str, body: &str) {
+        self.row(key, role, body, None);
+        self.bump(key);
+    }
+
+    /// One more message of the session: a call of `tool` with the arguments `args`, and what
+    /// came of it.
+    pub fn call(&mut self, key: &str, tool: &str, args: Value, output: &str, ok: bool) {
+        let call = json!({ "tool": tool, "args": args, "output": output, "ok": ok });
+        self.row(key, "tool", "", Some(&call.to_string()));
+        self.bump(key);
     }
 }
 
@@ -268,7 +488,7 @@ impl Agent for DbAgent {
                 params![first.0, body],
             )
             .unwrap();
-        first.1 = export_line(first.0, "user", body);
+        first.1 = export_line(first.0, "user", body, None);
         self.insert(key, 1);
         self.bump(key);
     }
