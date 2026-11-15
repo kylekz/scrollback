@@ -21,7 +21,7 @@ use toolbox_store::rusqlite;
 
 use crate::transport::{Halt, RangeSink, Transport, TransportError};
 
-pub use crate::transport::{Fetched, Hashed, RangeFailure, Unlisted};
+pub use crate::transport::{Hashed, RangeFailure, Unlisted};
 pub use db_snapshot::DbSnapshot;
 pub use file_tree::{FileClass, FileTree};
 
@@ -105,8 +105,11 @@ pub struct ScannedItem {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Scan {
     pub items: Vec<ScannedItem>,
-    /// What the agent has here that could not be scanned, so is not among the items.
+    /// What the agent has here that could not be scanned. While there is any, the items are
+    /// not all the agent has: an archived item that is not among them may still be there.
     pub unlisted: Vec<Unlisted>,
+    /// What the provider leaves out on purpose, such as symbolic links.
+    pub skipped: Vec<Unlisted>,
 }
 
 /// The first `length` bytes of the item `key`, to be hashed.
@@ -174,9 +177,10 @@ pub trait Provider: Send + Sync {
  * operations of a provider that touch a location. Whatever the source keeps for the pass (a
  * scratch copy of a database) goes when it is dropped.
  *
- * The agent may be writing while the pass reads. [`Source::fetch`] says of each range whether
- * its bytes are ones the item held together ([`Fetched`]), and [`Source::hash_prefixes`] gives
- * the item's length with each hash, which is what the engine proves a doubtful range with.
+ * The agent may be writing while the pass reads, so what [`Source::fetch`] delivers may mix
+ * two states of an item. The engine stores nothing it has not proven with
+ * [`Source::hash_prefixes`], asked after the fetch: the item's own hash of its start, with its
+ * length.
  */
 pub trait Source {
     /// Every item the agent has here.

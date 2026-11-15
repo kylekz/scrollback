@@ -7,7 +7,8 @@
 //! bytes. Such a version is reported as unread and is not marked.
 //!
 //! It also reports what `files/` holds that the catalogue doesn't record, which a start only
-//! looks for when it has a reason to (the archive's module docs).
+//! looks for when it has a reason to (the archive's module docs). Finding any is such a reason:
+//! the next start sets it aside.
 
 use std::fs;
 use std::io::{self, Read as _};
@@ -16,7 +17,7 @@ use std::sync::PoisonError;
 
 use toolbox_process::CancelToken;
 
-use super::{Archive, ArchiveError, Problem, layout, uncatalogued};
+use super::{Archive, ArchiveError, Problem, accounted, layout};
 use crate::location::LocationId;
 
 /// A version whose stored bytes are not the ones that were archived.
@@ -49,23 +50,31 @@ pub struct VerifyReport {
     pub stored_bytes: u64,
     pub damaged: Vec<Damage>,
     pub unread: Vec<Unread>,
-    /// Item folders and segment files under `files/` that the catalogue doesn't record, by
-    /// their paths relative to the archive.
+    /// What is under `files/` that the catalogue doesn't record, by its path relative to the
+    /// archive. A folder is one path, whatever it holds.
     pub uncatalogued: Vec<PathBuf>,
 }
 
 impl Archive {
     /// Checks every stored byte against the catalogue (the module docs).
     pub fn verify(&self, cancel: &CancelToken) -> Result<VerifyReport, ArchiveError> {
-        let files = self.files()?;
-        /* The catalogue is read while no segment is between its place and its commit: every
-        file found above is then either recorded or not going to be. */
+        /* What `files/` holds beyond what the catalogue records now, less what it records once
+        no segment is between its place and its commit: every file found is then either
+        recorded or not going to be. */
+        let mut uncatalogued = self.uncatalogued(&accounted(&self.catalogue.stored()?))?;
         let stored = {
             let _quiet = self.placing.write().unwrap_or_else(PoisonError::into_inner);
             self.catalogue.stored()?
         };
+        if !uncatalogued.is_empty() {
+            let accounted = accounted(&stored);
+            uncatalogued.retain(|path| !accounted.contains(path));
+        }
+        if !uncatalogued.is_empty() {
+            self.note_unrecorded();
+        }
         let mut report = VerifyReport {
-            uncatalogued: uncatalogued(files, &stored),
+            uncatalogued,
             ..VerifyReport::default()
         };
         let mut damaged = Vec::new();
@@ -100,7 +109,7 @@ impl Archive {
                 stored.provider.clone(),
                 stored.key.clone(),
             );
-            let mut reader = self.reader(stored);
+            let mut reader = self.reader(stored, 0);
             let mut problems = Vec::new();
             let mut unread = None;
             loop {

@@ -5,20 +5,19 @@
 //!
 //! A file's size and modification time stand for its content only once the modification time
 //! is safely in the past: a file written again within the same tick of the file system's clock
-//! keeps its time. So a file modified as recently as the scan itself is not trusted (git's rule
-//! for the same race). Its stamp is one no later scan repeats, which makes the next pass check
-//! its bytes, and a fetch of it is never reported stable, which makes the engine prove them.
-
-use std::collections::HashMap;
+//! keeps its time. So the stamp of a file modified as recently as the scan, or later by its
+//! clock, says so (git's rule for the same race). When the file is found on a later pass with
+//! a time that is in the past by then, the two stamps differ, and that pass compares its bytes
+//! with what is archived.
 
 use super::{
     Hashed, ItemKind, ItemPrefix, ItemRange, ProviderError, RangeFailure, Scan, ScannedItem, Source,
 };
-use crate::transport::{FileStat, PrefixRequest, RangeRequest, RangeSink, Transport};
+use crate::transport::{PrefixRequest, RangeRequest, RangeSink, Transport};
 
 /// How long before the scan a file must have been modified last for its modification time to
 /// be trusted. The coarsest timestamps in use tick every two seconds.
-const RACY_NS: i64 = 2_000_000_000;
+const FRESH_NS: i64 = 2_000_000_000;
 
 /// What a file is, from its key alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,8 +34,6 @@ pub struct FileTree<'a> {
     root: String,
     subtree: &'static str,
     classify: fn(&str) -> FileClass,
-    /// Each file the scan found with a trusted modification time, as it was then, by key.
-    scanned: HashMap<String, FileStat>,
 }
 
 impl<'a> FileTree<'a> {
@@ -53,7 +50,6 @@ impl<'a> FileTree<'a> {
             root,
             subtree,
             classify,
-            scanned: HashMap::new(),
         }
     }
 
@@ -65,7 +61,6 @@ impl<'a> FileTree<'a> {
 impl Source for FileTree<'_> {
     fn scan(&mut self) -> Result<Scan, ProviderError> {
         let listing = self.transport.list(&self.path(self.subtree))?;
-        self.scanned.clear();
         let items = listing
             .files
             .into_iter()
@@ -73,18 +68,16 @@ impl Source for FileTree<'_> {
                 let key = format!("{}/{}", self.subtree, file.path);
                 let class = (self.classify)(&key);
                 let mtime = file.stat.mtime_ns;
-                let stamp = if mtime < listing.clock_ns - RACY_NS {
-                    self.scanned.insert(key.clone(), file.stat);
-                    mtime.to_string()
-                } else {
-                    format!("{mtime} seen at {}", listing.clock_ns)
-                };
                 ScannedItem {
                     key,
                     kind: class.kind,
                     session: class.session,
                     length: file.stat.size,
-                    stamp,
+                    stamp: if mtime < listing.clock_ns - FRESH_NS {
+                        mtime.to_string()
+                    } else {
+                        format!("{mtime} fresh")
+                    },
                     lines: class.lines,
                     export_version: None,
                 }
@@ -93,6 +86,7 @@ impl Source for FileTree<'_> {
         Ok(Scan {
             items,
             unlisted: listing.unlisted,
+            skipped: listing.skipped,
         })
     }
 
@@ -121,7 +115,6 @@ impl Source for FileTree<'_> {
                 path: self.path(&request.key),
                 offset: request.offset,
                 length: request.length,
-                expect: self.scanned.get(&request.key).copied(),
             })
             .collect();
         Ok(self.transport.read_ranges(&requests, sink)?)

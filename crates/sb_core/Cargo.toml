@@ -24,6 +24,10 @@ toolbox_store.workspace = true
 uuid.workspace = true
 zstd.workspace = true
 
+# Apple systems only: the plain `fsync` std does not expose there (`sb_core::archive`).
+[target.'cfg(target_vendor = "apple")'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 

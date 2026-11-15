@@ -4,9 +4,11 @@
 //! No operation writes, and none runs an agent's own tools (PLAN §2.3, invariant 5). Paths are
 //! the location's own, absolute, as text; a relative path a transport returns uses `/`.
 //!
-//! A location is read while its agent writes to it, and nothing is locked. So a read says
-//! whether the file stood still around it ([`Fetched`]), and a hash comes with the file's size
-//! ([`Hashed`]): with those the caller can tell bytes the file held together from a mixture.
+//! A location is read while its agent writes to it, and nothing is locked, so what a read
+//! returns may be a mixture of two states of a file. A file's size and modification time
+//! can't rule that out (a writer can leave both as they were), so the caller proves what it
+//! read: [`Transport::hash_prefixes`] has the location hash the file's own start, and gives
+//! the file's size with the hash ([`Hashed`]).
 //!
 //! [`LocalTransport`] reads this machine with `std::fs`. The shell transport for WSL and SSH
 //! comes with phase 5 (PLAN §13).
@@ -43,21 +45,24 @@ pub struct FileEntry {
     pub stat: FileStat,
 }
 
-/// Something under a listed directory that could not be listed.
+/// Something under a listed directory that is not among the listing's files.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unlisted {
     /// The location's path of it, as far as it can be shown.
     pub path: String,
     pub reason: String,
-    /// It is a folder: everything under it is missing from the listing.
-    pub folder: bool,
 }
 
 /// What [`Transport::list`] found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Listing {
     pub files: Vec<FileEntry>,
+    /// What could not be listed: a folder or a file that could not be read, or was gone when
+    /// it was looked at. While there is any, the files are not all there is.
     pub unlisted: Vec<Unlisted>,
+    /// What was left out on purpose: symbolic links, and whatever is neither a file nor a
+    /// folder.
+    pub skipped: Vec<Unlisted>,
     /// The location's clock when the listing began, in nanoseconds since the Unix epoch: what
     /// the files' modification times are measured against.
     pub clock_ns: i64,
@@ -83,20 +88,6 @@ pub struct RangeRequest {
     pub path: String,
     pub offset: u64,
     pub length: u64,
-    /// The size and modification time the caller last saw the file with. The read reports
-    /// whether the file still had them before and after ([`Fetched`]).
-    pub expect: Option<FileStat>,
-}
-
-/// How far the bytes of a range that arrived whole can be trusted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Fetched {
-    /// The source was as the request expected it before the read and after it, so the bytes are
-    /// ones it held together.
-    Stable,
-    /// The source changed around the read, or nothing was expected of it. The bytes may be a
-    /// mixture of two states and have to be proven before they are kept.
-    Unstable,
 }
 
 /// What a sink returns to stop the stream it is being fed: the pass was cancelled, or the sink
@@ -125,7 +116,7 @@ pub trait RangeSink {
     fn data(&mut self, request: usize, bytes: &[u8]) -> Result<(), Halt>;
 
     /// The request at index `request` is over: all its bytes arrived, or it failed.
-    fn end(&mut self, request: usize, result: Result<Fetched, RangeFailure>) -> Result<(), Halt>;
+    fn end(&mut self, request: usize, result: Result<(), RangeFailure>) -> Result<(), Halt>;
 }
 
 #[derive(Debug, Error)]
@@ -152,9 +143,9 @@ pub trait Transport: Send + Sync {
     /// Each path's size and modification time, or `None` where nothing is there.
     fn stat(&self, paths: &[&str]) -> Result<Vec<Option<FileStat>>, TransportError>;
 
-    /// Every regular file under the directory `root`, however deep; none when `root` is missing.
-    /// Symbolic links are neither listed nor followed. A folder or file that can't be listed is
-    /// reported in the listing and does not fail it.
+    /// Every regular file under the directory `root`, however deep. Symbolic links are not
+    /// followed. What can't be listed, `root` itself when it is missing, and what is left out
+    /// are reported in the listing and do not fail it.
     fn list(&self, root: &str) -> Result<Listing, TransportError>;
 
     /// The SHA-256 of each requested prefix. A file that is missing, unreadable or shorter than

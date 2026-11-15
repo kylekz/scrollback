@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    Env, Fetched, FileEntry, FileStat, Halt, Hashed, Listing, PrefixRequest, RangeFailure,
-    RangeRequest, RangeSink, Transport, TransportError, Unlisted,
+    Env, FileEntry, FileStat, Halt, Hashed, Listing, PrefixRequest, RangeFailure, RangeRequest,
+    RangeSink, Transport, TransportError, Unlisted,
 };
 use crate::hash::Hasher;
 
@@ -47,24 +47,25 @@ impl Transport for LocalTransport {
         let mut listing = Listing {
             files: Vec::new(),
             unlisted: Vec::new(),
+            skipped: Vec::new(),
             clock_ns: ns_since_epoch(SystemTime::now()),
+        };
+        let entry_of = |path: PathBuf, reason: String| Unlisted {
+            path: path.to_string_lossy().into_owned(),
+            reason,
         };
         /* Directories still to read, each with its path relative to `root`. */
         let mut pending = vec![(PathBuf::from(root), String::new())];
         while let Some((dir, relative)) = pending.pop() {
-            let mut unlisted = |path: PathBuf, error: io::Error, folder| {
-                listing.unlisted.push(Unlisted {
-                    path: path.to_string_lossy().into_owned(),
-                    reason: error.to_string(),
-                    folder,
-                });
+            let mut unlisted = |path: PathBuf, error: io::Error| {
+                listing.unlisted.push(entry_of(path, error.to_string()));
             };
+            /* A folder that is gone was there a moment ago, when it was found: what it held
+            can't be told from here, any more than what an unreadable one holds. */
             let entries = match fs::read_dir(&dir) {
                 Ok(entries) => entries,
-                /* Missing, or removed since its parent was read. */
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => {
-                    unlisted(dir, error, true);
+                    unlisted(dir, error);
                     continue;
                 }
             };
@@ -73,14 +74,12 @@ impl Transport for LocalTransport {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
-                        unlisted(dir, error, true);
+                        unlisted(dir, error);
                         break;
                     }
                 };
                 let Ok(name) = entry.file_name().into_string() else {
-                    let error = io::Error::other("its name is not Unicode");
-                    /* Whether it is a file or a folder of files, none of it is listed. */
-                    unlisted(entry.path(), error, true);
+                    unlisted(entry.path(), io::Error::other("its name is not Unicode"));
                     continue;
                 };
                 let path = if relative.is_empty() {
@@ -93,7 +92,7 @@ impl Transport for LocalTransport {
                     /* Removed since the directory was read. */
                     Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                     Err(error) => {
-                        unlisted(entry.path(), error, true);
+                        unlisted(entry.path(), error);
                         continue;
                     }
                 };
@@ -103,8 +102,17 @@ impl Transport for LocalTransport {
                     match listed_metadata(&entry).and_then(|metadata| stat_of(&metadata)) {
                         Ok(stat) => listing.files.push(FileEntry { path, stat }),
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => unlisted(entry.path(), error, false),
+                        Err(error) => unlisted(entry.path(), error),
                     }
+                } else {
+                    let what = if kind.is_symlink() {
+                        "it is a symbolic link"
+                    } else {
+                        "it is neither a file nor a folder"
+                    };
+                    listing
+                        .skipped
+                        .push(entry_of(entry.path(), what.to_string()));
                 }
             }
         }
@@ -144,35 +152,28 @@ impl Transport for LocalTransport {
         sink: &mut dyn RangeSink,
     ) -> Result<(), TransportError> {
         for (index, request) in requests.iter().enumerate() {
-            /* The file is compared with what the caller expects through the one open handle,
-            before the read and after it: a file replaced by another of the same name is not
-            mistaken for this one. */
             let opened = File::open(&request.path).and_then(|mut file| {
-                let before = stat_of(&file.metadata()?)?;
                 file.seek(SeekFrom::Start(request.offset))?;
-                Ok((file, before))
+                Ok(file)
             });
             let result = match opened {
-                Ok((file, before)) => {
+                Ok(file) => {
                     let mut chunks = Chunks::new(file, request.length);
                     let read = loop {
                         match chunks.next() {
                             Ok(Some(bytes)) => sink
                                 .data(index, bytes)
                                 .map_err(|Halt| TransportError::Halted)?,
-                            Ok(None) => break chunks.file.metadata().and_then(|m| stat_of(&m)),
+                            Ok(None) => break Ok(()),
                             Err(error) => break Err(error),
                         }
                     };
                     match read {
-                        Ok(_) if chunks.left > 0 => Err(RangeFailure::Short {
+                        Ok(()) if chunks.left > 0 => Err(RangeFailure::Short {
                             expected: request.length,
                             got: request.length - chunks.left,
                         }),
-                        Ok(after) if Some(before) == request.expect && before == after => {
-                            Ok(Fetched::Stable)
-                        }
-                        Ok(_) => Ok(Fetched::Unstable),
+                        Ok(()) => Ok(()),
                         Err(error) => Err(failure(error)),
                     }
                 }
@@ -285,7 +286,7 @@ mod tests {
     #[derive(Default)]
     struct Collect {
         bytes: Vec<Vec<u8>>,
-        ends: Vec<Result<Fetched, String>>,
+        ends: Vec<Result<(), String>>,
     }
 
     impl RangeSink for Collect {
@@ -295,11 +296,7 @@ mod tests {
             Ok(())
         }
 
-        fn end(
-            &mut self,
-            request: usize,
-            result: Result<Fetched, RangeFailure>,
-        ) -> Result<(), Halt> {
+        fn end(&mut self, request: usize, result: Result<(), RangeFailure>) -> Result<(), Halt> {
             self.bytes.resize(request + 1, Vec::new());
             self.ends
                 .push(result.map_err(|failure| failure.to_string()));
@@ -311,18 +308,14 @@ mod tests {
         path.to_str().unwrap().to_string()
     }
 
-    fn stat(path: &Path) -> Option<FileStat> {
-        LocalTransport.stat(&[&text(path)]).unwrap()[0]
-    }
-
     #[test]
-    fn lists_files_however_deep_and_skips_links() {
+    fn lists_files_however_deep_and_reports_links() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("a/b")).unwrap();
         fs::write(dir.path().join("top.txt"), "1").unwrap();
         fs::write(dir.path().join("a/b/deep.txt"), "22").unwrap();
         #[cfg(unix)]
-        std::os::unix::fs::symlink(dir.path().join("top.txt"), dir.path().join("a/link")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("a/b"), dir.path().join("a/link")).unwrap();
 
         let before = ns_since_epoch(SystemTime::now());
         let mut listing = LocalTransport.list(&text(dir.path())).unwrap();
@@ -334,37 +327,56 @@ mod tests {
             .collect();
         assert_eq!(listed, [("a/b/deep.txt", 2), ("top.txt", 1)]);
         assert_eq!(listing.unlisted, []);
-        assert!(listing.clock_ns >= before);
+        assert!(before <= listing.clock_ns);
+        #[cfg(unix)]
+        assert_eq!(
+            listing.skipped,
+            [Unlisted {
+                path: text(&dir.path().join("a/link")),
+                reason: "it is a symbolic link".to_string(),
+            }]
+        );
+    }
 
-        let missing = LocalTransport
-            .list(&text(&dir.path().join("missing")))
-            .unwrap();
-        assert!(missing.files.is_empty() && missing.unlisted.is_empty());
+    #[test]
+    fn a_folder_that_is_not_there_is_reported_not_listed_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = text(&dir.path().join("missing"));
+        let listing = LocalTransport.list(&missing).unwrap();
+        assert!(listing.files.is_empty());
+        assert_eq!(listing.unlisted.len(), 1);
+        assert_eq!(listing.unlisted[0].path, missing);
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_folder_that_cannot_be_read_is_reported_and_the_rest_is_listed() {
+    fn what_cannot_be_read_is_reported_and_the_rest_is_listed() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::tempdir().unwrap();
-        let locked = dir.path().join("locked");
-        fs::create_dir_all(&locked).unwrap();
-        fs::write(locked.join("inside.txt"), "1").unwrap();
+        let set_mode = |path: &Path, mode| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        /* One folder that can't be listed, and one whose files can't be looked at. */
+        let (locked, opaque) = (dir.path().join("locked"), dir.path().join("opaque"));
+        for folder in [&locked, &opaque] {
+            fs::create_dir_all(folder).unwrap();
+            fs::write(folder.join("inside.txt"), "1").unwrap();
+        }
         fs::write(dir.path().join("open.txt"), "1").unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        set_mode(&locked, 0o000);
+        set_mode(&opaque, 0o444);
 
         let listing = LocalTransport.list(&text(dir.path())).unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        set_mode(&locked, 0o755);
+        set_mode(&opaque, 0o755);
         let listed: Vec<_> = listing.files.iter().map(|file| &file.path).collect();
         assert_eq!(listed, ["open.txt"]);
-        assert_eq!(listing.unlisted.len(), 1);
+        let mut unlisted: Vec<_> = listing.unlisted.iter().map(|entry| &entry.path).collect();
+        unlisted.sort();
         assert_eq!(
-            (
-                listing.unlisted[0].path.as_str(),
-                listing.unlisted[0].folder
-            ),
-            (text(&locked).as_str(), true)
+            unlisted,
+            [&text(&locked), &text(&opaque.join("inside.txt"))]
         );
     }
 
@@ -412,7 +424,6 @@ mod tests {
             path: text(path),
             offset,
             length,
-            expect: stat(path),
         };
         let mut sink = Collect::default();
         LocalTransport
@@ -430,43 +441,10 @@ mod tests {
         assert_eq!(
             sink.ends,
             [
-                Ok(Fetched::Stable),
+                Ok(()),
                 Err("it is no longer there".to_string()),
                 Err("the source ended after 2 of 5 bytes".to_string()),
-                Ok(Fetched::Stable),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_read_is_stable_only_when_the_file_is_as_expected() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("file");
-        fs::write(&file, "0123456789").unwrap();
-        let seen = stat(&file).unwrap();
-        let request = |expect| RangeRequest {
-            path: text(&file),
-            offset: 0,
-            length: 10,
-            expect,
-        };
-        let moved = FileStat {
-            mtime_ns: seen.mtime_ns - 1,
-            ..seen
-        };
-        let mut sink = Collect::default();
-        LocalTransport
-            .read_ranges(
-                &[request(Some(seen)), request(Some(moved)), request(None)],
-                &mut sink,
-            )
-            .unwrap();
-        assert_eq!(
-            sink.ends,
-            [
-                Ok(Fetched::Stable),
-                Ok(Fetched::Unstable),
-                Ok(Fetched::Unstable)
+                Ok(()),
             ]
         );
     }

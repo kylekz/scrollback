@@ -12,6 +12,11 @@ pub(super) const SCHEMA: Schema = Schema {
 /// What sync writes (PLAN §2.2): locations, items, versions and segments. Times are Unix
 /// milliseconds; hashes are SHA-256 as hex.
 const SYNC: &str = "
+-- The id of the archive the catalogue belongs to, as in its archive.json: one row.
+CREATE TABLE archive (
+    id TEXT NOT NULL
+) STRICT;
+
 CREATE TABLE location (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -62,6 +67,17 @@ CREATE TABLE version (
     export_version INTEGER,
     UNIQUE (item_id, number)
 ) STRICT;
+
+-- An item the last pass of its provider at its location could not archive (it kept changing,
+-- or could not be read), since the pass that first could not. It need not be in item.
+CREATE TABLE waiting (
+    location_id TEXT NOT NULL REFERENCES location (id),
+    provider TEXT NOT NULL,
+    key TEXT NOT NULL,
+    since INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    PRIMARY KEY (location_id, provider, key)
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE segment (
     version_id INTEGER NOT NULL REFERENCES version (id),

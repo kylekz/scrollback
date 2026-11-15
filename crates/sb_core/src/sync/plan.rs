@@ -1,16 +1,18 @@
 //! Plan (PLAN §5, step 2): what a pass does with each item, from the scan and the catalogue
-//! (PLAN §4.2). With the archived length `L` and hash `H` of the item's newest version, the
-//! source's length `S`, and "as last seen" meaning the length and stamp a pass last recorded:
+//! alone (PLAN §4.2). With the archived length `L` of the item's newest version, the source's
+//! length `S`, and "as last seen" meaning the length and stamp a pass last recorded:
 //!
-//! | Source | Meaning | Action |
+//! | Source | Planned | If the source's start is not what is archived |
 //! |---|---|---|
-//! | Not in the catalogue | New | Fetch it whole as version 1 |
-//! | As last seen, `S == L` | Unchanged | Skip |
-//! | `S > L`, and the first `L` bytes hash to `H` | Appended | Fetch `[L, S)` into the version |
-//! | `S == L`, not as last seen, hashes to `H` | Touched | Record the new stamp |
-//! | `S < L`, or the first `L` bytes hash otherwise | Shrank or rewritten | Fetch it whole as the next version |
-//! | Its newest version is damaged, or its export format changed | | Fetch it whole as the next version |
-//! | In the catalogue, not in the scan | Gone | Mark it; keep everything |
+//! | Not in the catalogue | Fetch it whole as version 1 | |
+//! | As last seen, `S == L` | Nothing: unchanged | |
+//! | `S == L`, not as last seen | Fetch nothing, compare | Fetch it whole as the next version |
+//! | `S > L` | Fetch `[L, S)` into the version | Fetch it whole as the next version |
+//! | `S < L`, its newest version damaged, or its export format changed | Fetch it whole as the next version | |
+//! | In the catalogue, not in the scan | Mark it gone; keep everything | |
+//!
+//! Whether the source's start is what is archived is not decided here. Every planned range is
+//! proven after it is fetched ([`super::store`]), and that proof is the comparison.
 //!
 //! An item made of lines is stored up to its last newline, since its writer may be mid-record
 //! (PLAN §4.2). When it is still as last seen on a later pass, nothing is writing it, and the
@@ -19,11 +21,11 @@
 
 use std::collections::HashMap;
 
-use super::Failure;
 use crate::catalogue::{Archived, Reason, Target};
-use crate::provider::{ItemPrefix, ProviderError, RangeFailure, ScannedItem, Source};
+use crate::hash::Hash;
+use crate::provider::ScannedItem;
 
-/// A range of one item to fetch and store.
+/// A range of one item to fetch, prove and store.
 pub(super) struct Planned<'a> {
     pub scanned: &'a ScannedItem,
     pub target: Target,
@@ -31,26 +33,47 @@ pub(super) struct Planned<'a> {
     pub number: u32,
     /// Where the range starts, which is the version's length before it.
     pub offset: u64,
-    /// How many bytes to fetch: the rest of the source. 0 when the source is empty, which is
-    /// recorded without a fetch.
+    /// The version's hash before the range.
+    pub base: Hash,
+    /// How many bytes to fetch: the rest of the source. 0 when there is nothing to fetch and
+    /// only the source's start to compare with what is archived.
     pub length: u64,
     /// Whether to store only up to the last newline of the range.
     pub cut: bool,
+    /// Whether the source must end where the stored bytes do for them to be kept: so for an
+    /// item that is not lines, and for lines taken with their unfinished end.
+    pub whole: bool,
+    /// What to fetch the source whole as, when its start turns out not to be what is archived.
+    pub otherwise: Option<Target>,
+}
+
+impl<'a> Planned<'a> {
+    /// The whole source as version `number`.
+    pub(super) fn whole(scanned: &'a ScannedItem, target: Target, number: u32) -> Self {
+        Self {
+            scanned,
+            target,
+            number,
+            offset: 0,
+            base: Hash::of(b""),
+            length: scanned.length,
+            cut: scanned.lines,
+            whole: !scanned.lines,
+            otherwise: None,
+        }
+    }
 }
 
 pub(super) struct Plan<'a> {
-    pub fetches: Vec<Planned<'a>>,
-    /// Items whose source is as archived, to record as seen: touched ones, and ones that were
-    /// gone and are back.
+    pub work: Vec<Planned<'a>>,
+    /// Items that are as archived and whose row is not: ones that were gone and are back, and
+    /// ones whose kind or session the provider now gives differently.
     pub seen: Vec<(i64, &'a ScannedItem)>,
+    /// How many of `seen` were gone.
+    pub back: usize,
     /// Items missing at the source that are not marked gone yet.
     pub gone: Vec<i64>,
     pub unchanged: usize,
-    /// Items that changed between the scan and the hashing of their prefix. The next pass
-    /// decides about them.
-    pub deferred: usize,
-    /// Items whose archived bytes could not be compared with the source's.
-    pub failed: Vec<Failure>,
 }
 
 /// Decides about each of `scanned`. `whole` says the scan saw everything the agent has: only
@@ -59,58 +82,70 @@ pub(super) fn plan<'a>(
     scanned: &'a [ScannedItem],
     whole: bool,
     archived: Vec<Archived>,
-    source: &mut dyn Source,
-) -> Result<Plan<'a>, ProviderError> {
+) -> Plan<'a> {
     let mut archived: HashMap<String, Archived> = archived
         .into_iter()
         .map(|archived| (archived.item.key.clone(), archived))
         .collect();
     let mut plan = Plan {
-        fetches: Vec::new(),
+        work: Vec::new(),
         seen: Vec::new(),
+        back: 0,
         gone: Vec::new(),
         unchanged: 0,
-        deferred: 0,
-        failed: Vec::new(),
     };
-    /* Items whose first `L` bytes must be hashed at the source before they can be decided. */
-    let mut undecided = Vec::new();
     for scanned in scanned {
-        let Some(archived) = archived.remove(&scanned.key) else {
-            plan.fetches.push(Planned {
-                scanned,
-                target: Target::NewItem,
-                number: 1,
-                offset: 0,
-                length: scanned.length,
-                cut: scanned.lines,
-            });
+        let Some(Archived { item, current }) = archived.remove(&scanned.key) else {
+            plan.work.push(Planned::whole(scanned, Target::NewItem, 1));
             continue;
         };
-        let (item, current) = (&archived.item, &archived.current);
         let as_seen = (scanned.length, &scanned.stamp) == (item.seen_length, &item.seen_stamp);
         let was_gone = item.gone_since.is_some();
+        let next = |reason| {
+            let target = Target::NewVersion {
+                item: item.id,
+                reason,
+            };
+            Planned::whole(scanned, target, current.number + 1)
+        };
+        /* What it is, when the source is not the archived version's continuation. */
+        let changed = if was_gone {
+            Reason::Replaced
+        } else {
+            Reason::Rewritten
+        };
         if current.damaged {
-            plan.fetches
-                .push(next_version(scanned, &archived, Reason::Refetched));
+            plan.work.push(next(Reason::Refetched));
         } else if scanned.export_version != current.export_version {
-            plan.fetches
-                .push(next_version(scanned, &archived, Reason::Replaced));
-        } else if as_seen && scanned.length == current.length {
-            if was_gone {
-                plan.seen.push((item.id, scanned));
-            } else {
-                plan.unchanged += 1;
-            }
+            plan.work.push(next(Reason::Replaced));
         } else if scanned.length < current.length {
-            let reason = if was_gone {
+            plan.work.push(next(if was_gone {
                 Reason::Replaced
             } else {
                 Reason::Shrank
-            };
-            plan.fetches.push(next_version(scanned, &archived, reason));
+            }));
+        } else if as_seen && scanned.length == current.length {
+            if was_gone || (scanned.kind, &scanned.session) != (item.kind, &item.session) {
+                plan.seen.push((item.id, scanned));
+                plan.back += usize::from(was_gone);
+            }
+            plan.unchanged += usize::from(!was_gone);
         } else {
-            undecided.push((scanned, archived, as_seen));
+            plan.work.push(Planned {
+                scanned,
+                target: Target::Append {
+                    item: item.id,
+                    version: current.id,
+                },
+                number: current.number,
+                offset: current.length,
+                base: current.hash,
+                length: scanned.length - current.length,
+                /* As last seen: nothing is writing it, so its unfinished last line is taken. */
+                cut: scanned.lines && !as_seen,
+                whole: !scanned.lines || as_seen,
+                otherwise: Some(next(changed).target),
+            });
         }
     }
     if whole {
@@ -120,80 +155,5 @@ pub(super) fn plan<'a>(
             .map(|archived| archived.item.id)
             .collect();
     }
-
-    /* An empty version's prefix is nothing, which needs no asking. */
-    let requests: Vec<_> = undecided
-        .iter()
-        .filter(|(_, archived, _)| archived.current.length > 0)
-        .map(|(scanned, archived, _)| ItemPrefix {
-            key: scanned.key.clone(),
-            length: archived.current.length,
-        })
-        .collect();
-    let mut hashes = if requests.is_empty() {
-        Vec::new()
-    } else {
-        source.hash_prefixes(&requests)?
-    }
-    .into_iter();
-    for (scanned, archived, as_seen) in undecided {
-        let current = &archived.current;
-        let prefix = if current.length > 0 {
-            /* A provider that answers fewer requests than it was sent has not hashed this. */
-            hashes
-                .next()
-                .unwrap_or(Err(RangeFailure::Missing))
-                .map(|hashed| hashed.hash)
-        } else {
-            Ok(current.hash)
-        };
-        match prefix {
-            Err(RangeFailure::Missing | RangeFailure::Short { .. }) => plan.deferred += 1,
-            Err(failure @ RangeFailure::Unreadable(_)) => plan.failed.push(Failure {
-                key: scanned.key.clone(),
-                reason: failure.to_string(),
-            }),
-            Ok(prefix) if prefix != current.hash => {
-                let reason = if archived.item.gone_since.is_some() {
-                    Reason::Replaced
-                } else {
-                    Reason::Rewritten
-                };
-                plan.fetches.push(next_version(scanned, &archived, reason));
-            }
-            Ok(_) if scanned.length == current.length => {
-                plan.seen.push((archived.item.id, scanned));
-            }
-            Ok(_) => plan.fetches.push(Planned {
-                scanned,
-                target: Target::Append {
-                    item: archived.item.id,
-                    version: current.id,
-                },
-                number: current.number,
-                offset: current.length,
-                length: scanned.length - current.length,
-                /* As last seen: nothing is writing it, so its unfinished last line is taken. */
-                cut: scanned.lines && !as_seen,
-            }),
-        }
-    }
-    Ok(plan)
-}
-
-/// The whole source as the version after `archived`'s newest.
-fn next_version<'a>(scanned: &'a ScannedItem, archived: &Archived, reason: Reason) -> Planned<'a> {
-    let number = archived.current.number + 1;
-    Planned {
-        scanned,
-        target: Target::NewVersion {
-            item: archived.item.id,
-            number,
-            reason,
-        },
-        number,
-        offset: 0,
-        length: scanned.length,
-        cut: scanned.lines,
-    }
+    plan
 }

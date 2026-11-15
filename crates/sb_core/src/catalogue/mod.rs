@@ -16,6 +16,7 @@ use toolbox_store::rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql
 use toolbox_store::rusqlite::{self, Connection, OptionalExtension as _, Row, ToSql, params};
 use toolbox_store::{Backups, Database, OpenOptions};
 
+use crate::archive::item_folder;
 use crate::hash::Hash;
 use crate::location::{Location, LocationId, LocationKind};
 use crate::provider::{ItemKind, ScannedItem};
@@ -184,7 +185,6 @@ pub(crate) enum Target {
     NewItem,
     NewVersion {
         item: i64,
-        number: u32,
         reason: Reason,
     },
     Append {
@@ -193,22 +193,36 @@ pub(crate) enum Target {
     },
 }
 
-/// Everything one stored range changes, written in one transaction (PLAN §4.1).
+/// What storing one range of an item changes in the catalogue (PLAN §4.1). The segments the
+/// range was stored as are recorded with it.
 pub(crate) struct Commit<'a> {
     pub location: &'a LocationId,
     pub provider: &'a str,
     /// The item as the pass's scan found it. Its length and stamp become the item's seen ones.
     pub scanned: &'a ScannedItem,
-    pub folder: &'a str,
     pub target: Target,
     /// The number of the version the commit writes to.
     pub number: u32,
-    /// The segment now durable on disk: its offset, length and hash. `None` when the source had
-    /// nothing to store yet.
-    pub segment: Option<(u64, u64, Hash)>,
-    /// The version's length and hash with the segment included.
+    /// The version's length and hash with the range included.
     pub length: u64,
     pub hash: Hash,
+}
+
+/// A commit with the segments its range was stored as, now durable on disk: for each, its
+/// offset in the version, its length and its hash.
+pub(crate) struct Recorded<'a> {
+    pub commit: Commit<'a>,
+    pub segments: Vec<(u64, u64, Hash)>,
+}
+
+/// An item a pass could not archive, and since when it has been waiting (PLAN §5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Waiting {
+    pub key: String,
+    /// When a pass first could not archive it, in Unix milliseconds.
+    pub since: i64,
+    /// Why the last pass could not.
+    pub reason: String,
 }
 
 /// The catalogue's file in the archive's folder.
@@ -487,121 +501,106 @@ impl Catalogue {
     }
 
     /**
-     * Records a stored range and the source state it brings the item up to. Returns whether a
-     * version this starts is held back (PLAN §4.2): it is shorter than the copy being read,
-     * which is the newest version not itself held back. A held-back version that grows to that
-     * copy's length is no longer a loss and stops being held back.
+     * Records stored ranges, each with its segments and the source state it brings its item up
+     * to, all in one transaction.
+     * Returns for each whether a version it starts is held back (PLAN §4.2): it is shorter
+     * than the copy being read, which is the newest version not itself held back. A held-back
+     * version that grows to that copy's length is no longer a loss and stops being held back.
      */
-    pub(crate) fn commit(&self, commit: &Commit<'_>) -> Result<bool> {
+    pub(crate) fn commit(&self, commits: &[Recorded<'_>]) -> Result<Vec<bool>> {
         let now = now_ms();
-        let scanned = commit.scanned;
         self.db.write(|tx| {
-            let seen = |item: i64| {
-                tx.execute(
-                    "UPDATE item SET kind = ?2, session = ?3, seen_length = ?4, seen_stamp = ?5,
-                                     gone_since = NULL
-                     WHERE id = ?1",
-                    params![
-                        item,
-                        scanned.kind,
-                        scanned.session,
-                        scanned.length,
-                        scanned.stamp
-                    ],
-                )
-            };
-            let start = |item: i64, number: u32, reason: Reason, held_back: bool| {
-                tx.execute(
-                    "INSERT INTO version (item_id, number, reason, started_at, length, hash,
-                                          held_back, export_version)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![
-                        item,
-                        number,
-                        reason,
-                        now,
-                        commit.length,
-                        commit.hash,
-                        held_back,
-                        scanned.export_version
-                    ],
-                )?;
-                Ok::<_, rusqlite::Error>(tx.last_insert_rowid())
-            };
-            let (version, held_back) = match commit.target {
-                Target::NewItem => {
+            let mut held_back = Vec::new();
+            for Recorded { commit, segments } in commits {
+                let scanned = commit.scanned;
+                let start = |item: i64, number: u32, reason: Reason, held_back: bool| {
                     tx.execute(
-                        "INSERT INTO item (location_id, provider, key, item_id, kind, session,
-                                           seen_length, seen_stamp)
+                        "INSERT INTO version (item_id, number, reason, started_at, length, hash,
+                                              held_back, export_version)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         params![
-                            commit.location,
-                            commit.provider,
-                            scanned.key,
-                            commit.folder,
-                            scanned.kind,
-                            scanned.session,
-                            scanned.length,
-                            scanned.stamp
+                            item,
+                            number,
+                            reason,
+                            now,
+                            commit.length,
+                            commit.hash,
+                            held_back,
+                            scanned.export_version
                         ],
                     )?;
-                    let item = tx.last_insert_rowid();
-                    (start(item, 1, Reason::FirstSync, false)?, false)
-                }
-                Target::NewVersion {
-                    item,
-                    number,
-                    reason,
-                } => {
-                    seen(item)?;
-                    let reading: u64 = tx.query_row(
-                        "SELECT length FROM version WHERE item_id = ?1 AND held_back = 0
-                         ORDER BY number DESC LIMIT 1",
-                        [item],
-                        |row| row.get(0),
-                    )?;
-                    let held_back = commit.length < reading;
-                    (start(item, number, reason, held_back)?, held_back)
-                }
-                Target::Append { item, version } => {
-                    seen(item)?;
+                    Ok::<_, rusqlite::Error>(tx.last_insert_rowid())
+                };
+                let (version, held) = match commit.target {
+                    Target::NewItem => {
+                        tx.execute(
+                            "INSERT INTO item (location_id, provider, key, item_id, kind, session,
+                                               seen_length, seen_stamp)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            params![
+                                commit.location,
+                                commit.provider,
+                                scanned.key,
+                                item_folder(&scanned.key),
+                                scanned.kind,
+                                scanned.session,
+                                scanned.length,
+                                scanned.stamp
+                            ],
+                        )?;
+                        let item = tx.last_insert_rowid();
+                        (start(item, 1, Reason::FirstSync, false)?, false)
+                    }
+                    Target::NewVersion { item, reason } => {
+                        seen(tx, item, scanned)?;
+                        let reading: u64 = tx.query_row(
+                            "SELECT length FROM version WHERE item_id = ?1 AND held_back = 0
+                             ORDER BY number DESC LIMIT 1",
+                            [item],
+                            |row| row.get(0),
+                        )?;
+                        let held = commit.length < reading;
+                        (start(item, commit.number, reason, held)?, held)
+                    }
+                    Target::Append { item, version } => {
+                        seen(tx, item, scanned)?;
+                        tx.execute(
+                            "UPDATE version SET length = ?2, hash = ?3,
+                                 held_back = COALESCE(held_back AND ?2 < (
+                                     SELECT length FROM version reading
+                                     WHERE reading.item_id = version.item_id
+                                       AND reading.held_back = 0
+                                       AND reading.number < version.number
+                                     ORDER BY reading.number DESC LIMIT 1
+                                 ), 0)
+                             WHERE id = ?1",
+                            params![version, commit.length, commit.hash],
+                        )?;
+                        (version, false)
+                    }
+                };
+                for (offset, length, hash) in segments {
                     tx.execute(
-                        "UPDATE version SET length = ?2, hash = ?3,
-                             held_back = COALESCE(held_back AND ?2 < (
-                                 SELECT length FROM version reading
-                                 WHERE reading.item_id = version.item_id
-                                   AND reading.held_back = 0 AND reading.number < version.number
-                                 ORDER BY reading.number DESC LIMIT 1
-                             ), 0)
-                         WHERE id = ?1",
-                        params![version, commit.length, commit.hash],
+                        "INSERT INTO segment (version_id, offset, length, hash, stored_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![version, offset, length, hash, now],
                     )?;
-                    (version, false)
                 }
-            };
-            if let Some((offset, length, hash)) = commit.segment {
-                tx.execute(
-                    "INSERT INTO segment (version_id, offset, length, hash, stored_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![version, offset, length, hash, now],
-                )?;
+                held_back.push(held);
             }
             Ok(held_back)
         })
     }
 
-    /// What a pass found without storing anything: `seen` items whose source is as archived
-    /// (their stamps may have moved, and any that were gone are back), and `gone` items that
-    /// are missing at the source, which keep everything (PLAN §2.3).
+    /// What a pass found without storing anything: `seen` items whose source holds what is
+    /// archived (their stamps or what they are may have changed, and any that were gone are
+    /// back), and `gone` items that are missing at the source, which keep everything
+    /// (PLAN §2.3).
     pub(crate) fn record_scan(&self, seen: &[(i64, &ScannedItem)], gone: &[i64]) -> Result<()> {
         let now = now_ms();
         self.db.write(|tx| {
-            let mut update = tx.prepare(
-                "UPDATE item SET seen_length = ?2, seen_stamp = ?3, gone_since = NULL
-                 WHERE id = ?1",
-            )?;
             for (item, scanned) in seen {
-                update.execute(params![item, scanned.length, scanned.stamp])?;
+                self::seen(tx, *item, scanned)?;
             }
             let mut mark =
                 tx.prepare("UPDATE item SET gone_since = ?2 WHERE id = ?1 AND gone_since IS NULL")?;
@@ -609,6 +608,79 @@ impl Catalogue {
                 mark.execute(params![item, now])?;
             }
             Ok(())
+        })
+    }
+
+    /// Replaces what is recorded as waiting to be archived from `provider` at `location` with
+    /// `waiting`, each a key and why. An item that was waiting already keeps since when.
+    pub(crate) fn record_waiting(
+        &self,
+        location: &LocationId,
+        provider: &str,
+        waiting: &[(&str, &str)],
+    ) -> Result<()> {
+        let now = now_ms();
+        self.db.write(|tx| {
+            let mut since: HashMap<String, i64> = tx
+                .prepare("SELECT key, since FROM waiting WHERE location_id = ?1 AND provider = ?2")?
+                .query_map(params![location, provider], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            tx.execute(
+                "DELETE FROM waiting WHERE location_id = ?1 AND provider = ?2",
+                params![location, provider],
+            )?;
+            let mut insert = tx.prepare(
+                "INSERT OR REPLACE INTO waiting (location_id, provider, key, since, reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for (key, reason) in waiting {
+                let since = since.remove(*key).unwrap_or(now);
+                insert.execute(params![location, provider, key, since, reason])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// The items of `provider` at `location` that its last pass could not archive, by key.
+    pub fn waiting(&self, location: &LocationId, provider: &str) -> Result<Vec<Waiting>> {
+        self.db.read(|c| {
+            Ok(c.prepare(
+                "SELECT key, since, reason FROM waiting
+                 WHERE location_id = ?1 AND provider = ?2 ORDER BY key",
+            )?
+            .query_map(params![location, provider], |row| {
+                Ok(Waiting {
+                    key: row.get(0)?,
+                    since: row.get(1)?,
+                    reason: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// The id of the archive this catalogue belongs to, once it has been given one.
+    pub(crate) fn archive_id(&self) -> Result<Option<String>> {
+        self.db.read(|c| {
+            Ok(c.query_row("SELECT id FROM archive", [], |row| row.get(0))
+                .optional()?)
+        })
+    }
+
+    pub(crate) fn set_archive_id(&self, id: &str) -> Result<()> {
+        self.execute("INSERT INTO archive (id) VALUES (?1)", [id])
+    }
+
+    /// Whether any location was ever added.
+    pub(crate) fn has_locations(&self) -> Result<bool> {
+        self.db.read(|c| {
+            Ok(
+                c.query_row("SELECT EXISTS (SELECT 1 FROM location)", [], |row| {
+                    row.get(0)
+                })?,
+            )
         })
     }
 
@@ -621,6 +693,23 @@ impl Catalogue {
             Ok(())
         })
     }
+}
+
+/// Records that `item` was found at its source as `scanned`: what it is, and its length and
+/// stamp. An item that was gone is back.
+fn seen(connection: &Connection, item: i64, scanned: &ScannedItem) -> rusqlite::Result<usize> {
+    connection.execute(
+        "UPDATE item SET kind = ?2, session = ?3, seen_length = ?4, seen_stamp = ?5,
+                         gone_since = NULL
+         WHERE id = ?1",
+        params![
+            item,
+            scanned.kind,
+            scanned.session,
+            scanned.length,
+            scanned.stamp
+        ],
+    )
 }
 
 fn segments_of(connection: &Connection, version: i64) -> Result<Vec<Segment>> {

@@ -4,13 +4,17 @@
 mod common;
 
 use std::fs;
+use std::io::Read as _;
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 use pretty_assertions::assert_eq;
+use sb_core::archive::{Problem, SEGMENT_BYTES};
 use sb_core::catalogue::Reason;
 use sb_core::provider::ItemKind;
-use sb_test_support::{Agent, FileAgent, ProjectsTree};
+use sb_test_support::{Agent, FileAgent, ProjectsTree, edit_catalogue};
 
-use common::Bench;
+use common::{Bench, Meddle, When};
 
 fn file_bench() -> (Bench<FileAgent>, String) {
     let mut agent = FileAgent::new();
@@ -312,6 +316,13 @@ fn a_transcript_over_a_hundred_megabytes_is_stored_whole() {
         (report.bytes_fetched, report.bytes_stored),
         (length, length)
     );
+    /* In segments that are full, but for the last. */
+    let segments = bench.segments(&bench.versions(&key)[0]);
+    let (last, full) = segments.split_last().unwrap();
+    assert_eq!(full.len() as u64, length / SEGMENT_BYTES);
+    assert!(full.iter().all(|segment| segment.length == SEGMENT_BYTES));
+    assert_eq!(last.length, length % SEGMENT_BYTES);
+
     bench.agent.append(&key, 3);
     assert_eq!(bench.sync().appended, 1);
     bench.assert_mirrors(&[key]);
@@ -336,23 +347,31 @@ fn the_agent_is_found_where_the_environment_says_its_data_is() {
     );
 }
 
+/// How long before now the tests that follow give a file its modification time, and how long
+/// they then wait: a time the scan can't trust yet, and one it can.
+const JUST_NOW: Duration = Duration::from_millis(900);
+const A_WHILE: Duration = Duration::from_millis(1600);
+
 #[test]
 fn a_file_modified_as_the_scan_ran_is_stored_and_checked_again() {
     let (bench, key) = file_bench();
-    bench.agent.tree().freshen(&key);
+    bench.agent.tree().modified_ago(&key, JUST_NOW);
 
-    /* Its modification time can't vouch for it, so its bytes are proven before they are
-    stored, and the next pass compares them again. */
+    /* Its modification time can't vouch for it. A pass that finds it with that time, once
+    the time is safely in the past, compares its bytes with what is archived. */
     assert_eq!(bench.sync().new_items, 1);
     bench.assert_mirrors(std::slice::from_ref(&key));
-    let again = bench.sync();
-    assert_eq!((again.touched, again.unchanged), (1, 0));
+    thread::sleep(A_WHILE);
+    let later = bench.sync();
+    assert_eq!((later.touched, later.unchanged), (1, 0));
+    let settled = bench.sync();
+    assert_eq!((settled.touched, settled.unchanged), (0, 1));
 }
 
 #[test]
 fn a_rewrite_in_the_same_tick_as_the_scan_is_not_missed() {
     let (bench, key) = file_bench();
-    bench.agent.tree().freshen(&key);
+    bench.agent.tree().modified_ago(&key, JUST_NOW);
     bench.sync();
     let before = bench.agent.content(&key);
 
@@ -362,11 +381,140 @@ fn a_rewrite_in_the_same_tick_as_the_scan_is_not_missed() {
     bytes[12] ^= 1;
     bench.agent.overwrite_unseen(&key, &bytes);
 
+    thread::sleep(A_WHILE);
     assert_eq!(bench.sync().new_versions, 1);
     let versions = bench.versions(&key);
     assert_eq!(versions[1].reason, Reason::Rewritten);
     assert!(bench.read(&versions[0]) == before);
     bench.assert_mirrors(&[key]);
+}
+
+#[test]
+fn an_unfinished_last_line_is_taken_on_the_second_pass_whatever_the_files_time() {
+    /* Modified long ago, just now, and at a time ahead of the clock. */
+    for modified in [
+        None,
+        Some(SystemTime::now()),
+        Some(SystemTime::now() + A_WHILE * 1000),
+    ] {
+        let (bench, key) = file_bench();
+        bench.agent.append_raw(&key, r#"{"type":"user","mess"#);
+        if let Some(modified) = modified {
+            bench.agent.tree().set_modified(&key, modified);
+        }
+        bench.sync();
+        assert!(bench.versions(&key)[0].length < bench.agent.content(&key).len() as u64);
+
+        let second = bench.sync();
+        assert_eq!((second.appended, second.unchanged), (1, 0), "{modified:?}");
+        bench.assert_mirrors(std::slice::from_ref(&key));
+        /* And it is not compared again on every pass after that. */
+        if modified.is_none_or(|modified| modified > SystemTime::now()) {
+            let third = bench.sync();
+            assert_eq!((third.touched, third.unchanged), (0, 1), "{modified:?}");
+        }
+    }
+}
+
+#[test]
+fn growth_that_holds_no_whole_line_is_not_counted_as_an_append() {
+    let (bench, key) = file_bench();
+    bench.sync();
+    bench.agent.append_raw(&key, r#"{"type":"user","mess"#);
+    let report = bench.sync();
+    assert_eq!(
+        (report.appended, report.touched, report.bytes_stored),
+        (0, 1, 0)
+    );
+    assert_eq!(bench.segment_files().len(), 1);
+}
+
+#[test]
+fn what_an_unchanged_item_is_follows_the_provider() {
+    let mut agent = FileAgent::new();
+    let key = agent.add_session(4);
+    let id = agent.session(&key).id.clone();
+    let bench = Bench::new(agent);
+    bench.sync();
+    /* As a build that classified it otherwise would have recorded it. */
+    edit_catalogue(
+        bench.dir(),
+        "UPDATE item SET kind = 'sidecar', session = NULL",
+    );
+    assert_eq!(bench.item(&key).kind, ItemKind::Sidecar);
+
+    let report = bench.sync();
+    assert_eq!((report.unchanged, report.touched), (1, 0));
+    let item = bench.item(&key);
+    assert_eq!((item.kind, item.session), (ItemKind::Transcript, Some(id)));
+}
+
+#[test]
+fn a_file_longer_than_a_segment_is_stored_as_several_and_read_from_any_offset() {
+    let mut agent = FileAgent::new();
+    let session = agent.add_session(1);
+    let length = usize::try_from(SEGMENT_BYTES).unwrap() * 2 + 12_345;
+    let key = agent.session(&session).tool_result(length);
+    let bench = Bench::new(agent);
+    bench.sync();
+
+    let version = bench.versions(&key).remove(0);
+    let segments: Vec<_> = bench
+        .segments(&version)
+        .iter()
+        .map(|segment| (segment.offset, segment.length))
+        .collect();
+    assert_eq!(
+        segments,
+        [
+            (0, SEGMENT_BYTES),
+            (SEGMENT_BYTES, SEGMENT_BYTES),
+            (SEGMENT_BYTES * 2, 12_345)
+        ]
+    );
+    let content = bench.agent.content(&key);
+    for offset in [
+        0,
+        1,
+        SEGMENT_BYTES - 1,
+        SEGMENT_BYTES,
+        SEGMENT_BYTES + 7,
+        SEGMENT_BYTES * 2 + 12_344,
+        SEGMENT_BYTES * 2 + 12_345,
+        SEGMENT_BYTES * 3,
+    ] {
+        let mut read = Vec::new();
+        bench
+            .archive()
+            .read_version_from(version.id, offset)
+            .unwrap()
+            .read_to_end(&mut read)
+            .unwrap();
+        let from = usize::try_from(offset).unwrap().min(content.len());
+        assert!(read == content[from..], "from {offset}");
+    }
+    bench.assert_mirrors(std::slice::from_ref(&key));
+
+    /* A read from an offset checks the segments it reads like any other. */
+    let last = bench
+        .segment_files()
+        .into_iter()
+        .find(|file| file.ends_with(format!("{:016}.zst", SEGMENT_BYTES * 2)))
+        .unwrap();
+    fs::write(&last, zstd::encode_all(&b"other bytes"[..], 3).unwrap()).unwrap();
+    let mut read = Vec::new();
+    let error = bench
+        .archive()
+        .read_version_from(version.id, SEGMENT_BYTES + 7)
+        .unwrap()
+        .read_to_end(&mut read)
+        .unwrap_err();
+    assert_eq!(
+        Problem::of(&error),
+        Some(&Problem::SegmentChanged {
+            offset: SEGMENT_BYTES * 2
+        })
+    );
 }
 
 #[test]
@@ -453,25 +601,76 @@ mod unreadable {
     }
 
     #[test]
-    fn a_folder_that_cannot_be_listed_is_reported_and_nothing_under_it_is_marked_gone() {
+    fn what_cannot_be_listed_is_reported_and_nothing_is_marked_gone() {
+        /* A folder that can't be read, and one whose files can't be looked at. */
+        for mode in [0o000, 0o444] {
+            let mut agent = FileAgent::new();
+            let key = agent.add_session(4);
+            let subagent = agent.session(&key).subagent(3);
+            let bench = Bench::new(agent);
+            bench.sync();
+            let folder = bench.agent.tree().path(&subagent);
+            let folder = folder.parent().unwrap();
+            set_mode(folder, mode);
+
+            let report = bench.pass_with(bench.agent.provider()).unwrap();
+            set_mode(folder, 0o755);
+            /* The folder as one, or its two files each. */
+            assert_eq!(report.unlisted.len(), if mode == 0o000 { 1 } else { 2 });
+            assert_eq!((report.scanned, report.gone), (1, 0));
+            assert_eq!(bench.item(&subagent).gone_since, None);
+            let error = bench.location().last_error.unwrap();
+            assert!(error.contains("could not be archived"), "{error}");
+
+            /* Readable again, and grown: it goes on in its version, as nothing happened. */
+            bench.agent.append_raw(&subagent, "{\"type\":\"user\"}\n");
+            let report = bench.sync();
+            assert_eq!(
+                (report.unchanged, report.appended, report.new_versions),
+                (2, 1, 0)
+            );
+            assert_eq!(bench.location().last_error, None);
+            bench.assert_mirrors(&[key, subagent]);
+        }
+    }
+
+    #[test]
+    fn a_tree_that_is_gone_when_it_is_listed_marks_nothing_gone() {
         let mut agent = FileAgent::new();
-        let key = agent.add_session(4);
-        let subagent = agent.session(&key).subagent(3);
+        let keys = [agent.add_session(4), agent.add_session(2)];
         let bench = Bench::new(agent);
         bench.sync();
-        let folder = bench.agent.tree().path(&subagent);
-        let folder = folder.parent().unwrap();
-        set_mode(folder, 0o000);
+        let projects = bench.agent.tree().path("projects");
+        let away = projects.with_extension("away");
 
-        let report = bench.pass_with(bench.agent.provider()).unwrap();
-        set_mode(folder, 0o755);
-        assert_eq!((report.unlisted.len(), report.gone), (1, 0));
-        assert!(report.unlisted[0].folder);
-        assert_eq!(bench.item(&subagent).gone_since, None);
-        let error = bench.location().last_error.unwrap();
-        assert!(error.contains("1 could not be archived"), "{error}");
+        /* The agent was found, and its folder is moved before the scan lists it. */
+        let report = bench
+            .pass_with(bench.meddling(Meddle::at(When::BeforeScan, || {
+                fs::rename(&projects, &away).unwrap();
+            })))
+            .unwrap();
+        fs::rename(&away, &projects).unwrap();
+        assert_eq!(
+            (report.scanned, report.gone, report.unlisted.len()),
+            (0, 0, 1)
+        );
+        assert!(keys.iter().all(|key| bench.item(key).gone_since.is_none()));
+        assert_eq!(bench.sync().unchanged, 2);
+    }
 
-        assert_eq!(bench.sync().unchanged, 3);
+    #[test]
+    fn a_symbolic_link_is_reported_as_skipped_and_fails_nothing() {
+        let mut agent = FileAgent::new();
+        let key = agent.add_session(4);
+        let bench = Bench::new(agent);
+        let target = bench.agent.tree().path(&key);
+        let link = target.with_file_name("linked.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let report = bench.sync();
+        assert_eq!((report.scanned, report.new_items), (1, 1));
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].path, link.to_str().unwrap());
         assert_eq!(bench.location().last_error, None);
     }
 }

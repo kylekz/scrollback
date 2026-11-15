@@ -46,6 +46,7 @@ for_both_agents!(
     an_item_deleted_at_the_source_is_marked_gone_and_kept,
     an_item_that_comes_back_changed_is_a_new_version,
     a_pass_cancelled_at_each_step_resumes,
+    a_pass_stopped_between_batches_keeps_the_batches_it_stored,
     a_pass_cancelled_inside_a_range_stores_none_of_it,
     a_crash_between_rename_and_commit_loses_nothing,
     a_failed_commit_is_retried_without_a_restart,
@@ -288,10 +289,12 @@ fn a_pass_cancelled_at_each_step_resumes<A: Agent + Default>() {
             }
             (bench, keys)
         };
+        /* Scanned, planned, each of the three ranges fetched, and the batch stored. */
         let all = steps(&prepare().0);
         assert_eq!(all[0], Progress::Scanned { items: 3 });
         assert!(matches!(all[1], Progress::Planned { items: 3, .. }));
-        assert_eq!(all.len(), 5);
+        assert_eq!(all[5], Progress::Stored { items: 3 });
+        assert_eq!(all.len(), 6);
 
         for stop_at in 0..all.len() {
             let (bench, keys) = prepare();
@@ -303,28 +306,56 @@ fn a_pass_cancelled_at_each_step_resumes<A: Agent + Default>() {
                 }
                 seen += 1;
             });
-            /* After the last item is stored there is nothing left to cancel. */
-            if stop_at + 1 < all.len() {
+            /* Once the batch is stored there is nothing left to cancel. */
+            let stored = stop_at + 1 == all.len();
+            if !stored {
                 assert!(
                     matches!(stopped, Err(SyncError::Cancelled)),
                     "stopped at step {stop_at}: {stopped:?}"
                 );
                 assert_eq!(seen, stop_at + 1);
             }
-            /* What was committed before the stop is whole. */
+            /* A stopped pass leaves nothing half done: no file in tmp/, none unrecorded. */
+            assert!(files_under(&bench.dir().join("tmp")).is_empty());
+            assert_eq!(bench.segment_files().len(), bench.catalogued_segments());
             bench.assert_verifies();
 
             let resumed = bench.sync();
-            let stored_before = stop_at.saturating_sub(1);
             assert_eq!(
                 resumed.new_items + resumed.appended,
-                3 - stored_before.min(3),
+                if stored { 0 } else { 3 },
                 "resumed after step {stop_at}"
             );
             bench.assert_mirrors(&keys);
-            assert_eq!(bench.segment_files().len(), bench.catalogued_segments());
         }
     }
+}
+
+fn a_pass_stopped_between_batches_keeps_the_batches_it_stored<A: Agent + Default>() {
+    let mut agent = A::default();
+    let keys: Vec<_> = (0..600).map(|_| agent.add_session(1)).collect();
+    let bench = Bench::new(agent);
+    let cancel = CancelToken::new();
+    let mut stored = Vec::new();
+    let stopped = bench.try_sync(&cancel, &mut |progress| {
+        if let Progress::Stored { items } = progress {
+            stored.push(*items);
+            cancel.cancel();
+        }
+    });
+    assert!(matches!(stopped, Err(SyncError::Cancelled)), "{stopped:?}");
+    /* One batch was stored, whole, and no other was begun. */
+    assert_eq!(stored.len(), 1);
+    assert_eq!(bench.items().len(), stored[0]);
+    assert!((1..600).contains(&stored[0]));
+    assert!(files_under(&bench.dir().join("tmp")).is_empty());
+
+    let resumed = bench.sync();
+    assert_eq!(
+        (resumed.unchanged, resumed.new_items),
+        (stored[0], 600 - stored[0])
+    );
+    bench.assert_mirrors(&keys);
 }
 
 fn a_pass_cancelled_inside_a_range_stores_none_of_it<A: Agent + Default>() {
@@ -357,6 +388,8 @@ fn a_crash_between_rename_and_commit_loses_nothing<A: Agent + Default>() {
             bench.agent.append(&keys[0], 4);
         }
         let recorded = bench.catalogued_segments();
+        /* The batch that is in place when its commit fails: every new item, or the append. */
+        let placed = if grown { 1 } else { 3 };
 
         break_segment_commits(bench.dir());
         let crashed = bench.pass_with(bench.agent.provider());
@@ -364,19 +397,19 @@ fn a_crash_between_rename_and_commit_loses_nothing<A: Agent + Default>() {
             matches!(crashed, Err(SyncError::Archive(ArchiveError::Catalogue(_)))),
             "{crashed:?}"
         );
-        /* The segment reached its place and the catalogue never heard of it. */
-        assert_eq!(bench.segment_files().len(), recorded + 1);
+        /* The segments reached their places and the catalogue never heard of them. */
+        assert_eq!(bench.segment_files().len(), recorded + placed);
         assert_eq!(bench.catalogued_segments(), recorded);
         assert!(bench.location().last_error.is_some());
         mend_segment_commits(bench.dir());
 
-        /* A start sets it aside, unless the catalogue is still empty: then nothing under
-        files/ is touched, and the segment is set aside when the next one takes its place.
+        /* A start sets them aside, unless the catalogue is still empty: then nothing under
+        files/ is touched, and each is set aside when the next segment takes its place.
         Nothing is deleted either way. */
         bench.reopen();
         assert_eq!(
             bench.segment_files().len(),
-            if grown { recorded } else { recorded + 1 }
+            if grown { recorded } else { recorded + placed }
         );
 
         /* And the next sync fetches the range again. */
@@ -390,7 +423,7 @@ fn a_crash_between_rename_and_commit_loses_nothing<A: Agent + Default>() {
             .iter()
             .filter(|file| file.extension().is_some_and(|extension| extension == "zst"))
             .count();
-        assert_eq!(set_aside, 1);
+        assert_eq!(set_aside, placed);
         bench.assert_mirrors(&keys);
         assert_eq!(bench.segment_files().len(), bench.catalogued_segments());
         assert_eq!(bench.location().last_error, None);

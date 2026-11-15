@@ -17,8 +17,7 @@ use sb_core::archive::Archive;
 use sb_core::catalogue::{Item, Segment, Version};
 use sb_core::location::{Location, LocationId, LocationKind};
 use sb_core::provider::{
-    Fetched, Hashed, ItemPrefix, ItemRange, Provider, ProviderError, ProviderId, RangeFailure,
-    Scan, Source,
+    Hashed, ItemPrefix, ItemRange, Provider, ProviderError, ProviderId, RangeFailure, Scan, Source,
 };
 use sb_core::sync::{Pass, PassReport, Progress, SyncError, sync_location};
 use sb_core::transport::{Halt, RangeSink, Transport};
@@ -115,6 +114,7 @@ impl<A: Agent> Bench<A> {
     pub fn sync(&self) -> PassReport {
         let report = self.pass_with(self.agent.provider()).unwrap();
         assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert!(report.deferred.is_empty(), "{:?}", report.deferred);
         assert!(report.unlisted.is_empty(), "{:?}", report.unlisted);
         report
     }
@@ -238,12 +238,14 @@ pub fn files_under(dir: &Path) -> Vec<PathBuf> {
 /// A moment in a pass.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum When {
-    /// After the scan, before the engine has prefixes hashed to plan with.
-    BeforeHashing,
-    /// After the plan's prefixes were hashed, before anything is fetched.
-    AfterHashing,
+    /// After the agent was found at the location, before the scan.
+    BeforeScan,
+    /// After the scan, before anything is fetched.
+    AfterScan,
     /// After the first bytes of the first range reached the engine.
     InsideARange,
+    /// After a batch was fetched, before the engine has it proven.
+    BeforeProof,
 }
 
 /// What a [`Meddling`] provider does to its pass.
@@ -254,6 +256,10 @@ pub enum Meddle<'a> {
     DropsAByte,
     /// Hands the engine the first range's bytes as those of the request after it.
     WrongRequest,
+    /// Answers one proof fewer than it is asked for.
+    FewerProofs,
+    /// Fails when it is asked for proofs.
+    NoProofs,
 }
 
 impl<'a> Meddle<'a> {
@@ -311,8 +317,9 @@ impl Provider for Meddling<'_> {
 
 impl Source for MeddlingSource<'_, '_> {
     fn scan(&mut self) -> Result<Scan, ProviderError> {
+        self.meddle.reached(When::BeforeScan);
         let scan = self.inner.scan();
-        self.meddle.reached(When::BeforeHashing);
+        self.meddle.reached(When::AfterScan);
         scan
     }
 
@@ -320,9 +327,14 @@ impl Source for MeddlingSource<'_, '_> {
         &mut self,
         requests: &[ItemPrefix],
     ) -> Result<Vec<Result<Hashed, RangeFailure>>, ProviderError> {
-        let hashes = self.inner.hash_prefixes(requests);
-        self.meddle.reached(When::AfterHashing);
-        hashes
+        self.meddle.reached(When::BeforeProof);
+        let mut hashes = self.inner.hash_prefixes(requests)?;
+        match self.meddle {
+            Meddle::FewerProofs => drop(hashes.pop()),
+            Meddle::NoProofs => return Err(ProviderError::Halted),
+            _ => {}
+        }
+        Ok(hashes)
     }
 
     fn fetch(
@@ -330,8 +342,6 @@ impl Source for MeddlingSource<'_, '_> {
         requests: &[ItemRange],
         sink: &mut dyn RangeSink,
     ) -> Result<(), ProviderError> {
-        /* A pass that hashes nothing to plan with has still passed that point by now. */
-        self.meddle.reached(When::AfterHashing);
         self.inner.fetch(
             requests,
             &mut MeddlingSink {
@@ -361,7 +371,7 @@ impl RangeSink for MeddlingSink<'_, '_> {
         taken
     }
 
-    fn end(&mut self, request: usize, result: Result<Fetched, RangeFailure>) -> Result<(), Halt> {
+    fn end(&mut self, request: usize, result: Result<(), RangeFailure>) -> Result<(), Halt> {
         self.inner.end(request, result)
     }
 }

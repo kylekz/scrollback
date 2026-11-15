@@ -5,7 +5,7 @@
 //! Every file is given a modification time well in the past, a second later at each write, as
 //! if the agent had written it a while ago: sync does not trust a file modified in the last
 //! moments before it is scanned, which a file a test has just written would be.
-//! [`ProjectsTree::freshen`] makes a file one of those.
+//! [`ProjectsTree::modified_ago`] makes a file one of those.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -130,9 +130,15 @@ impl ProjectsTree {
         key
     }
 
-    /// Gives the file at `key` a modification time of now, as a file the agent is writing has.
-    pub fn freshen(&self, key: &str) {
-        set_modified(&self.path(key), SystemTime::now());
+    /// Gives the file at `key` the modification time `modified`.
+    pub fn set_modified(&self, key: &str, modified: SystemTime) {
+        set_modified(&self.path(key), modified);
+    }
+
+    /// Gives the file at `key` a modification time `ago` before now: for a short `ago`, the
+    /// time of a file the agent has just written.
+    pub fn modified_ago(&self, key: &str, ago: Duration) {
+        self.set_modified(key, SystemTime::now() - ago);
     }
 }
 

@@ -15,7 +15,7 @@ use toolbox_process::CancelToken;
 use crate::archive::{Archive, ArchiveError};
 use crate::catalogue::CatalogueError;
 use crate::location::LocationId;
-use crate::provider::{ItemRange, Provider, ProviderError, ProviderId, Source, Unlisted};
+use crate::provider::{Provider, ProviderError, ProviderId, Source, Unlisted};
 use crate::transport::Transport;
 
 #[derive(Debug, Error)]
@@ -40,13 +40,15 @@ pub enum SyncError {
 pub enum Progress {
     /// The scan found this many items at the location.
     Scanned { items: usize },
-    /// The plan: this many items to fetch, of this many bytes together.
+    /// The plan: this many items to deal with, and this many bytes to fetch for them.
     Planned { items: usize, bytes: u64 },
-    /// So many of the planned items are dealt with, and so many of the bytes read.
-    Fetched { items: usize, bytes: u64 },
+    /// So many bytes have been read from the location.
+    Fetched { bytes: u64 },
+    /// So many of the planned items are dealt with: stored, or left for another pass.
+    Stored { items: usize },
 }
 
-/// An item a pass could not store. The pass goes on; the next one tries the item again.
+/// An item a pass did not archive, and why.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Failure {
     pub key: String,
@@ -64,7 +66,7 @@ pub struct PassReport {
     pub new_items: usize,
     /// Grew at the source; the new bytes extended the current version.
     pub appended: usize,
-    /// The stamp changed and the bytes did not.
+    /// The stamp changed, or the item was gone and is back, and the bytes are as archived.
     pub touched: usize,
     /// Rewritten, shrunk or replaced at the source, or damaged in the archive: fetched whole as
     /// a new version.
@@ -73,21 +75,25 @@ pub struct PassReport {
     pub held_back: usize,
     /// Newly missing at the source. Everything archived of them stays.
     pub gone: usize,
-    /// Changed while the pass ran, so nothing of them was stored; left for the next pass.
-    pub deferred: usize,
+    /// Items that changed while the pass read them, so that nothing of them was stored: the
+    /// next pass tries again. The catalogue keeps since when each has been waiting.
+    pub deferred: Vec<Failure>,
     /// Items that could not be read or stored.
     pub failed: Vec<Failure>,
     /// What the agent has at the location that could not even be scanned.
     pub unlisted: Vec<Unlisted>,
+    /// What the provider does not archive, such as symbolic links.
+    pub skipped: Vec<Unlisted>,
     /// Bytes read from the location.
     pub bytes_fetched: u64,
-    /// Of those, the bytes that went into segments.
+    /// The bytes that went into segments.
     pub bytes_stored: u64,
 }
 
 impl PassReport {
     /// Why the pass did not archive everything the agent has, if it did not: how many items it
-    /// missed and the first reason.
+    /// could not read and the first reason. Items that only changed under the pass are not a
+    /// reason: the next pass has them.
     fn shortfall(&self) -> Option<String> {
         let first = self
             .failed
@@ -115,7 +121,7 @@ pub struct Pass {
  * with [`SyncError::Cancelled`].
  *
  * The attempt is recorded with the location, and so is how it ended: as a success only when
- * every pass archived everything its agent has there, and otherwise with what went wrong.
+ * every pass could read everything its agent has there, and otherwise with what went wrong.
  */
 pub fn sync_location(
     archive: &Archive,
@@ -143,7 +149,9 @@ pub fn sync_location(
         match &outcome {
             Err(SyncError::Cancelled) => return Err(SyncError::Cancelled),
             Err(error) => problems.push(format!("{id}: {error}")),
-            Ok(report) => problems.extend(report.shortfall().map(|short| format!("{id}: {short}"))),
+            Ok(report) => {
+                problems.extend(report.shortfall().map(|short| format!("{id}: {short}")));
+            }
         }
         passes.push(Pass {
             provider: id,
@@ -189,19 +197,16 @@ fn pass(
     });
     stop_if_cancelled()?;
 
-    /* What is under a folder that could not be listed is not missing at the source. */
-    let whole = !scan.unlisted.iter().any(|unlisted| unlisted.folder);
+    /* What could not be listed may hold items: none that is missing from the scan is taken
+    for missing at the source. */
     let plan = plan::plan(
         &scan.items,
-        whole,
+        scan.unlisted.is_empty(),
         catalogue.archived(location, provider.as_str())?,
-        source,
-    )?;
-    let (empty, fetches): (Vec<_>, Vec<_>) =
-        plan.fetches.iter().partition(|planned| planned.length == 0);
+    );
     progress(&Progress::Planned {
-        items: fetches.len(),
-        bytes: fetches.iter().map(|planned| planned.length).sum(),
+        items: plan.work.len(),
+        bytes: plan.work.iter().map(|planned| planned.length).sum(),
     });
     stop_if_cancelled()?;
 
@@ -209,40 +214,29 @@ fn pass(
     let mut report = PassReport {
         scanned: scan.items.len(),
         unchanged: plan.unchanged,
-        touched: plan.seen.len(),
+        touched: plan.back,
         gone: plan.gone.len(),
-        deferred: plan.deferred,
-        failed: plan.failed,
         unlisted: scan.unlisted,
+        skipped: scan.skipped,
         ..PassReport::default()
     };
-    let mut store = store::Store {
+    store::Storing {
         archive,
         location,
         provider: provider.as_str(),
-        fetches: &fetches,
         cancel,
         progress,
         report: &mut report,
-        open: None,
-        ended: 0,
-        unproven: Vec::new(),
-        stopped: None,
-    };
-    for planned in empty {
-        store.store_empty(planned)?;
+        done: 0,
     }
-    if !fetches.is_empty() {
-        let requests: Vec<_> = fetches
-            .iter()
-            .map(|planned| ItemRange {
-                key: planned.scanned.key.clone(),
-                offset: planned.offset,
-                length: planned.length,
-            })
-            .collect();
-        let fetched = source.fetch(&requests, &mut store);
-        store.finish(fetched, source)?;
-    }
+    .all(plan.work, source)?;
+
+    let waiting: Vec<_> = report
+        .deferred
+        .iter()
+        .chain(&report.failed)
+        .map(|failure| (failure.key.as_str(), failure.reason.as_str()))
+        .collect();
+    catalogue.record_waiting(location, provider.as_str(), &waiting)?;
     Ok(report)
 }

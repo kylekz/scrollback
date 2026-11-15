@@ -1,8 +1,15 @@
 //! [`DbSnapshot`]: a scratch copy of an agent's SQLite database (PLAN §7.2). The database file
 //! and its journals (the write-ahead log, or a rollback journal) are read through the
 //! transport, so nothing is written at the location and the agent's own tools are not run
-//! there. The agent may be writing while the copy is made, so the files are compared before
-//! and after, and copied again if any changed.
+//! there.
+//!
+//! The agent may be writing while the copy is made, and SQLite writes in place: a file's size
+//! and modification time need not show it. So once all three files are copied, the location
+//! hashes each of them, and the copy is kept only if every hash is that of what was copied
+//! and no file has appeared, gone or changed length. Otherwise it is made again. The
+//! write-ahead log alone may have grown: SQLite only adds to it between checkpoints, and a
+//! checkpoint changes the database file, so the copied start of the log is a state the
+//! database was in.
 //!
 //! The provider reads the copy and defines its items as exports of the rows. Only those are
 //! archived; the copy is deleted when the snapshot is dropped.
@@ -17,8 +24,9 @@ use tempfile::TempDir;
 use toolbox_store::rusqlite::{Connection, OpenFlags};
 
 use super::ProviderError;
+use crate::hash::{Hash, Hasher};
 use crate::transport::{
-    Fetched, Halt, RangeFailure, RangeRequest, RangeSink, Transport, TransportError,
+    Halt, Hashed, PrefixRequest, RangeFailure, RangeRequest, RangeSink, Transport, TransportError,
 };
 
 /// How many times the copy is made before a database that keeps changing is given up on.
@@ -58,30 +66,34 @@ impl DbSnapshot {
             if attempt > 0 {
                 thread::sleep(PAUSE * 2u32.pow(attempt - 1));
             }
-            let before = transport.stat(&paths)?;
-            if before[0].is_none() {
+            /* How long each file is, 0 for one that isn't there: SQLite treats an empty journal
+            as none. */
+            let sizes: Vec<u64> = transport
+                .stat(&paths)?
+                .iter()
+                .map(|stat| stat.map_or(0, |stat| stat.size))
+                .collect();
+            if sizes[0] == 0 {
                 return Ok(None);
             }
             let dir = tempfile::tempdir_in(scratch).map_err(failed("create"))?;
             let mut requests = Vec::new();
-            let mut files = Vec::new();
-            for ((path, suffix), stat) in paths.iter().zip(SUFFIXES).zip(&before) {
-                if let Some(stat) = stat.filter(|stat| stat.size > 0) {
+            let mut copies = Vec::new();
+            for ((path, suffix), size) in paths.iter().zip(SUFFIXES).zip(&sizes) {
+                if *size > 0 {
                     requests.push(RangeRequest {
                         path: (*path).to_string(),
                         offset: 0,
-                        length: stat.size,
-                        expect: Some(stat),
+                        length: *size,
                     });
-                    files.push(
-                        File::create(dir.path().join(format!("{NAME}{suffix}")))
-                            .map_err(failed("create"))?,
-                    );
+                    let file = File::create(dir.path().join(format!("{NAME}{suffix}")))
+                        .map_err(failed("create"))?;
+                    copies.push((file, Hasher::new()));
                 }
             }
-            let mut sink = Copy {
-                files,
-                held: true,
+            let mut sink = Scratch {
+                copies,
+                whole: true,
                 failed: None,
             };
             match transport.read_ranges(&requests, &mut sink) {
@@ -91,7 +103,38 @@ impl DbSnapshot {
             if let Some(error) = sink.failed {
                 return Err(failed("write")(error));
             }
-            if sink.held && transport.stat(&paths)? == before {
+            if !sink.whole {
+                continue;
+            }
+            let mut copied = sink.copies.into_iter().map(|(_, hasher)| hasher.finish());
+            let expected: Vec<Option<Hash>> = sizes
+                .iter()
+                .map(|size| (*size > 0).then(|| copied.next()).flatten())
+                .collect();
+            let proofs: Vec<_> = paths
+                .iter()
+                .zip(&sizes)
+                .map(|(path, size)| PrefixRequest {
+                    path: (*path).to_string(),
+                    length: *size,
+                })
+                .collect();
+            let held = transport
+                .hash_prefixes(&proofs)?
+                .into_iter()
+                .zip(expected.iter().zip(&sizes))
+                .zip(SUFFIXES)
+                .all(
+                    |((hashed, (expected, size)), suffix)| match (hashed, expected) {
+                        (Ok(Hashed { hash, size: now }), Some(copied)) => {
+                            hash == *copied && (now == *size || (suffix == "-wal" && now > *size))
+                        }
+                        (Ok(Hashed { size: now, .. }), None) => now == 0,
+                        (Err(RangeFailure::Missing), None) => true,
+                        _ => false,
+                    },
+                );
+            if held {
                 return Ok(Some(Self { dir }));
             }
         }
@@ -117,24 +160,26 @@ impl DbSnapshot {
     }
 }
 
-/// Writes each range to its scratch file.
-struct Copy {
-    files: Vec<File>,
-    /// Whether every file so far arrived whole and stood still while it was read.
-    held: bool,
+/// Writes each range to its scratch file, hashing it on the way.
+struct Scratch {
+    copies: Vec<(File, Hasher)>,
+    /// Whether every file so far arrived whole.
+    whole: bool,
     failed: Option<io::Error>,
 }
 
-impl RangeSink for Copy {
+impl RangeSink for Scratch {
     fn data(&mut self, request: usize, bytes: &[u8]) -> Result<(), Halt> {
-        self.files[request].write_all(bytes).map_err(|error| {
+        let (file, hasher) = &mut self.copies[request];
+        hasher.update(bytes);
+        file.write_all(bytes).map_err(|error| {
             self.failed = Some(error);
             Halt
         })
     }
 
-    fn end(&mut self, _request: usize, result: Result<Fetched, RangeFailure>) -> Result<(), Halt> {
-        self.held &= matches!(result, Ok(Fetched::Stable));
+    fn end(&mut self, _request: usize, result: Result<(), RangeFailure>) -> Result<(), Halt> {
+        self.whole &= result.is_ok();
         Ok(())
     }
 }

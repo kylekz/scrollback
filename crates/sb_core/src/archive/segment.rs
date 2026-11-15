@@ -1,22 +1,22 @@
 //! Segments (PLAN §4.1): each is the zstd-compressed bytes of one range of a version, written
 //! once and never changed. A version's content is its segments decompressed in order.
 //!
-//! A segment is written in `tmp/`, flushed to disk and only then renamed into place, so a file
-//! under `files/` is always whole. The catalogue records it after that (PLAN §2.3, invariant 2).
+//! A segment is written in `tmp/` and moved into place whole, and it is durable before the
+//! catalogue records it (PLAN §2.3, invariant 2).
 //!
 //! Reading goes through [`VersionReader`], the one place stored bytes are decompressed. It
 //! checks each segment, and the version as a whole, against what the catalogue recorded, so no
 //! reader is handed bytes other than the ones that were archived.
 
-use std::collections::BTreeSet;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, BufReader, Read, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use tempfile::{NamedTempFile, TempPath};
 use thiserror::Error;
 use zstd::stream::{read::Decoder, write::Encoder};
 
+use super::disk;
 use crate::catalogue::Segment;
 use crate::hash::{Hash, Hasher};
 
@@ -24,160 +24,104 @@ use crate::hash::{Hash, Hasher};
 /// faster than a location can be read.
 const LEVEL: i32 = 3;
 
-/// A segment being written in `tmp/`. Dropped, it leaves nothing behind.
-pub(crate) struct SegmentWriter {
-    encoder: Encoder<'static, NamedTempFile>,
-    hasher: Hasher,
-    length: u64,
-}
+/**
+ * The most a segment holds, uncompressed. A longer range is stored as several segments.
+ *
+ * Reading from an offset starts at the head of the segment that holds it, so this bounds what
+ * is decompressed to reach any byte: a few milliseconds' worth. It is four times the window
+ * zstd compresses with at this level, so cutting a range here costs next to nothing in size,
+ * and small enough that a transcript of a hundred megabytes is a dozen files, not hundreds.
+ */
+pub const SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
 
-impl SegmentWriter {
-    pub(super) fn create(tmp: &Path) -> io::Result<Self> {
-        let mut encoder = Encoder::new(NamedTempFile::new_in(tmp)?, LEVEL)?;
-        /* The frame carries a checksum of its content, so damage shows without the catalogue. */
-        encoder.include_checksum(true)?;
-        Ok(Self {
-            encoder,
-            hasher: Hasher::new(),
-            length: 0,
-        })
-    }
-
-    pub(crate) fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.encoder.write_all(bytes)?;
-        self.hasher.update(bytes);
-        self.length += bytes.len() as u64;
-        Ok(())
-    }
-
-    /// Ends the segment and flushes it to disk, still in `tmp/`.
-    pub(crate) fn seal(self) -> io::Result<Sealed> {
-        let file = self.encoder.finish()?;
-        file.as_file().sync_all()?;
-        Ok(Sealed {
-            file: file.into_temp_path(),
-            length: self.length,
-            hash: self.hasher.finish(),
-        })
-    }
-}
-
-/// A whole segment in `tmp/`, durable there and not yet in its place. Dropped, it is removed.
+/// A whole segment in `tmp/`, not yet in its place. Dropped, it is removed.
 pub(crate) struct Sealed {
     pub(super) file: TempPath,
+    /// Where in its version the segment starts.
+    pub offset: u64,
     /// The length and hash of its uncompressed bytes.
     pub length: u64,
     pub hash: Hash,
 }
 
-/// Writes `bytes` to the new file `to` through a file in `tmp`, so `to` is either absent or
-/// whole. A `to` that already exists is left as it is.
-pub(super) fn write_new(tmp: &Path, to: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = NamedTempFile::new_in(tmp)?;
-    file.write_all(bytes)?;
-    file.as_file().sync_all()?;
-    match place(file.into_temp_path(), to) {
-        Err((error, _)) if error.kind() != io::ErrorKind::AlreadyExists => Err(error),
-        _ => Ok(()),
-    }
+/// A segment being written in `tmp/`.
+struct Open {
+    encoder: Encoder<'static, NamedTempFile>,
+    hasher: Hasher,
+    length: u64,
 }
 
-/// Writes `bytes` to `to`, in place of what is there, through a file in `tmp`, and flushes it
-/// and its folder: `to` holds either what it held or `bytes`, whole.
-pub(super) fn write_over(tmp: &Path, to: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = NamedTempFile::new_in(tmp)?;
-    file.write_all(bytes)?;
-    file.as_file().sync_all()?;
-    file.persist(to).map_err(|error| error.error)?;
-    match to.parent() {
-        Some(dir) => sync_dir(dir),
-        None => Ok(()),
-    }
+/// A range of a version being written in `tmp/`, as one segment after another. Dropped, it
+/// leaves nothing behind.
+pub(crate) struct RangeWriter {
+    tmp: PathBuf,
+    /// Where in the version the next byte goes.
+    end: u64,
+    open: Option<Open>,
+    sealed: Vec<Sealed>,
 }
 
-/// Creates `dir` and whichever of its parents are missing, and adds to `changed` each folder
-/// that gained one of them.
-pub(super) fn create_dirs(dir: &Path, changed: &mut BTreeSet<PathBuf>) -> io::Result<()> {
-    if dir.is_dir() {
-        return Ok(());
-    }
-    let Some(parent) = dir.parent() else {
-        return fs::create_dir(dir);
-    };
-    create_dirs(parent, changed)?;
-    match fs::create_dir(dir) {
-        Ok(()) => {
-            changed.insert(parent.to_path_buf());
-            Ok(())
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-/// Moves the written, flushed `file` to `to`, where nothing may be: a file already there fails
-/// the move and stays as it is, and `file` is handed back with the error. [`sync_dir`] on
-/// `to`'s folder then makes the move durable.
-#[cfg(not(windows))]
-pub(super) fn place(file: TempPath, to: &Path) -> Result<(), (io::Error, TempPath)> {
-    file.persist_noclobber(to)
-        .map_err(|blocked| (blocked.error, blocked.path))
-}
-
-/**
- * Moves the written, flushed `file` to `to`, where nothing may be: a file already there fails
- * the move and stays as it is, and `file` is handed back with the error.
- *
- * Windows has no flush for a folder ([`sync_dir`]), and a plain rename returns before NTFS has
- * written its log record, so a catalogue commit made right after it could reach the disk first
- * and record a segment a power cut then leaves in `tmp/`. `MOVEFILE_WRITE_THROUGH` returns once
- * the move is on disk. This is `tempfile`'s own persist with that flag: it also clears the
- * temporary attribute `tempfile` creates its files with.
- */
-#[cfg(windows)]
-pub(super) fn place(mut file: TempPath, to: &Path) -> Result<(), (io::Error, TempPath)> {
-    use std::os::windows::ffi::OsStrExt as _;
-
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TEMPORARY, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-        SetFileAttributesW,
-    };
-
-    let wide = |path: &Path| -> Vec<u16> {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    };
-    /* The file is closed already; dropping `file` removes it unless the move succeeds. */
-    let (from_wide, to_wide) = (wide(&file), wide(to));
-    // SAFETY: both are NUL-terminated UTF-16 strings that outlive the calls.
-    unsafe {
-        if SetFileAttributesW(from_wide.as_ptr(), FILE_ATTRIBUTE_NORMAL) == 0 {
-            return Err((io::Error::last_os_error(), file));
-        }
-        /* Without `MOVEFILE_REPLACE_EXISTING` a file at `to` fails the move. */
-        if MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), MOVEFILE_WRITE_THROUGH) == 0 {
-            let error = io::Error::last_os_error();
-            SetFileAttributesW(from_wide.as_ptr(), FILE_ATTRIBUTE_TEMPORARY);
-            return Err((error, file));
+impl RangeWriter {
+    /// A range that starts at `offset` of its version, written in `tmp`.
+    pub(super) fn new(tmp: PathBuf, offset: u64) -> Self {
+        Self {
+            tmp,
+            end: offset,
+            open: None,
+            sealed: Vec::new(),
         }
     }
-    file.disable_cleanup(true);
-    Ok(())
-}
 
-/// Flushes `dir`'s entries to disk, which is what makes a rename into it or a file created in
-/// it survive a power cut.
-#[cfg(unix)]
-pub(super) fn sync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
-}
+    pub(crate) fn write(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        while !bytes.is_empty() {
+            let open = match &mut self.open {
+                Some(open) => open,
+                None => {
+                    let mut encoder = Encoder::new(NamedTempFile::new_in(&self.tmp)?, LEVEL)?;
+                    /* The frame carries a checksum of its content, so damage shows without the
+                    catalogue. */
+                    encoder.include_checksum(true)?;
+                    self.open.insert(Open {
+                        encoder,
+                        hasher: Hasher::new(),
+                        length: 0,
+                    })
+                }
+            };
+            let room = usize::try_from(SEGMENT_BYTES - open.length).unwrap_or(usize::MAX);
+            let (now, later) = bytes.split_at(bytes.len().min(room));
+            open.encoder.write_all(now)?;
+            open.hasher.update(now);
+            open.length += now.len() as u64;
+            self.end += now.len() as u64;
+            bytes = later;
+            if open.length == SEGMENT_BYTES {
+                self.seal()?;
+            }
+        }
+        Ok(())
+    }
 
-/// Windows cannot flush a directory; [`place`] makes its move durable itself.
-#[cfg(not(unix))]
-pub(super) fn sync_dir(_dir: &Path) -> io::Result<()> {
-    Ok(())
+    /// Ends the segment being written and hands its data to the drive.
+    fn seal(&mut self) -> io::Result<()> {
+        if let Some(open) = self.open.take() {
+            let file = open.encoder.finish()?;
+            disk::push(file.as_file())?;
+            self.sealed.push(Sealed {
+                file: file.into_temp_path(),
+                offset: self.end - open.length,
+                length: open.length,
+                hash: open.hasher.finish(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The range's segments, whole, still in `tmp/`: none when nothing was written.
+    pub(crate) fn finish(mut self) -> io::Result<Vec<Sealed>> {
+        self.seal()?;
+        Ok(self.sealed)
+    }
 }
 
 /// What is wrong with a version's stored bytes.
@@ -214,9 +158,9 @@ impl From<Problem> for io::Error {
 }
 
 /**
- * A version's content: its segments decompressed one after another, each checked against the
- * length and hash the catalogue recorded for it, and all of them together against the
- * version's.
+ * A version's content from some offset on: its segments decompressed one after another, each
+ * checked against the length and hash the catalogue recorded for it, and, when read from the
+ * start, all of them together against the version's.
  *
  * A check that fails is a read error holding the [`Problem`] ([`Problem::of`]). After it the
  * reader stands at the next segment, so reading on finds every problem a version has; what was
@@ -227,18 +171,20 @@ pub struct VersionReader {
     segments: std::vec::IntoIter<Segment>,
     /// Problems known before anything is read.
     gaps: std::vec::IntoIter<Problem>,
-    open: Option<Open>,
+    open: Option<Reading>,
+    /// How many bytes of the segment opened next come before the offset reading starts at.
+    skip: u64,
     /// The hash of everything read.
     content: Hasher,
-    /// The version's recorded length and hash.
-    recorded: (u64, Hash),
-    /// Whether every byte so far was read and passed its checks.
+    /// The version's recorded hash.
+    recorded: Hash,
+    /// Whether every byte of the version so far was read and passed its checks.
     whole: bool,
     ended: bool,
 }
 
 /// The segment being read.
-struct Open {
+struct Reading {
     decoder: Decoder<'static, BufReader<File>>,
     recorded: Segment,
     hasher: Hasher,
@@ -246,8 +192,15 @@ struct Open {
 }
 
 impl VersionReader {
-    /// The version of `length` bytes hashing to `hash`, whose `segments` are in `dir`.
-    pub(super) fn new(dir: PathBuf, segments: Vec<Segment>, length: u64, hash: Hash) -> Self {
+    /// The version of `length` bytes hashing to `hash`, whose `segments` are in `dir`, from
+    /// its byte `start` on.
+    pub(super) fn new(
+        dir: PathBuf,
+        segments: Vec<Segment>,
+        length: u64,
+        hash: Hash,
+        start: u64,
+    ) -> Self {
         let mut end = 0;
         let mut gaps = Vec::new();
         for segment in &segments {
@@ -261,26 +214,38 @@ impl VersionReader {
         if gaps.is_empty() && end != length {
             gaps.push(Problem::VersionChanged);
         }
+        /* The segments that end at or before `start` are not read at all. */
+        let before = segments
+            .iter()
+            .take_while(|segment| segment.offset + segment.length <= start)
+            .count();
+        let skip = segments
+            .get(before)
+            .map_or(0, |first| start.saturating_sub(first.offset));
+        let mut segments = segments.into_iter();
+        segments.by_ref().take(before).for_each(drop);
         Self {
             dir,
-            segments: segments.into_iter(),
-            whole: gaps.is_empty(),
+            segments,
+            whole: gaps.is_empty() && start == 0,
             gaps: gaps.into_iter(),
             open: None,
+            skip,
             content: Hasher::new(),
-            recorded: (length, hash),
+            recorded: hash,
             ended: false,
         }
     }
 
-    /// The hash state of what was read: once the reader has reached the end without an error,
-    /// that of the version's content, ready to be continued with what is appended to it.
+    /// The hash state of what was read: once the reader has reached the end from the start
+    /// without an error, that of the version's content, ready to be continued with what is
+    /// appended to it.
     pub(crate) fn into_content(self) -> Hasher {
         self.content
     }
 
     /// Opens the next segment; `None` when there is none.
-    fn open_next(&mut self) -> io::Result<Option<Open>> {
+    fn open_next(&mut self) -> io::Result<Option<Reading>> {
         let Some(recorded) = self.segments.next() else {
             return Ok(None);
         };
@@ -295,7 +260,7 @@ impl VersionReader {
                 error
             }
         })?;
-        Ok(Some(Open {
+        Ok(Some(Reading {
             decoder: Decoder::new(file)?,
             recorded,
             hasher: Hasher::new(),
@@ -320,14 +285,14 @@ impl Read for VersionReader {
                     /* The end: each segment was what was recorded; are they the version? */
                     Ok(None) => {
                         let ended = std::mem::replace(&mut self.ended, true);
-                        if !ended && self.whole && self.content.clone().finish() != self.recorded.1
-                        {
+                        if !ended && self.whole && self.content.clone().finish() != self.recorded {
                             return Err(Problem::VersionChanged.into());
                         }
                         return Ok(0);
                     }
                     Err(error) => {
                         self.whole = false;
+                        self.skip = 0;
                         return Err(error);
                     }
                 },
@@ -338,6 +303,7 @@ impl Read for VersionReader {
                     let matches = open.length == open.recorded.length
                         && open.hasher.clone().finish() == open.recorded.hash;
                     self.open = None;
+                    self.skip = 0;
                     if !matches {
                         self.whole = false;
                         return Err(Problem::SegmentChanged { offset }.into());
@@ -346,14 +312,22 @@ impl Read for VersionReader {
                 Ok(read) => {
                     open.hasher.update(&buffer[..read]);
                     open.length += read as u64;
-                    self.content.update(&buffer[..read]);
-                    return Ok(read);
+                    /* What comes before the offset reading starts at is checked like the rest
+                    and not handed out. */
+                    let skipped = usize::try_from(self.skip).map_or(read, |skip| skip.min(read));
+                    self.skip -= skipped as u64;
+                    if skipped < read {
+                        buffer.copy_within(skipped..read, 0);
+                        self.content.update(&buffer[..read - skipped]);
+                        return Ok(read - skipped);
+                    }
                 }
                 /* The caller reads again. */
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
                 Err(error) => {
                     self.open = None;
                     self.whole = false;
+                    self.skip = 0;
                     /* An error with no code from the operating system is the decoder's: the
                     file is not the frame that was written. */
                     return Err(match error.raw_os_error() {
@@ -375,30 +349,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_file_already_in_place_is_never_replaced() {
+    fn a_range_is_cut_into_segments_wherever_its_writes_fall() {
         let dir = tempfile::tempdir().unwrap();
-        let to = dir.path().join("placed");
-        let placed = |bytes: &[u8]| {
-            let mut file = NamedTempFile::new_in(dir.path()).unwrap();
-            file.write_all(bytes).unwrap();
-            place(file.into_temp_path(), &to)
-        };
-        placed(b"first").unwrap();
-        let (error, unplaced) = placed(b"second").unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(fs::read(&to).unwrap(), b"first");
-        /* The file that could not be placed is handed back, and goes when it is dropped. */
-        assert_eq!(fs::read(&unplaced).unwrap(), b"second");
-        drop(unplaced);
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
-
-        /* What is placed is an ordinary file, not one marked temporary. */
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt as _;
-            const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
-            let attributes = fs::metadata(&to).unwrap().file_attributes();
-            assert_eq!(attributes & FILE_ATTRIBUTE_TEMPORARY, 0);
+        let mut writer = RangeWriter::new(dir.path().to_path_buf(), 100);
+        /* Writes of a length that the most a segment holds is no multiple of. */
+        let bytes: Vec<u8> = (0..20_000_000_u32).map(|n| (n % 251) as u8).collect();
+        for piece in bytes.chunks(200_001) {
+            writer.write(piece).unwrap();
         }
+        let sealed = writer.finish().unwrap();
+        let shape: Vec<_> = sealed.iter().map(|s| (s.offset, s.length)).collect();
+        assert_eq!(
+            shape,
+            [
+                (100, SEGMENT_BYTES),
+                (100 + SEGMENT_BYTES, SEGMENT_BYTES),
+                (100 + SEGMENT_BYTES * 2, 20_000_000 - SEGMENT_BYTES * 2)
+            ]
+        );
+        let mut at = 0;
+        for segment in &sealed {
+            let stored = zstd::decode_all(File::open(&segment.file).unwrap()).unwrap();
+            let end = at + stored.len();
+            assert!(stored == bytes[at..end]);
+            assert_eq!(segment.hash, Hash::of(&stored));
+            at = end;
+        }
+        assert_eq!(at, bytes.len());
     }
 }

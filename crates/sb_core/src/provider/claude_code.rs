@@ -14,6 +14,7 @@
 //! | `<session>/…` | a sidecar of the session: titles, subagent metadata, workflows |
 //! | anything else (`memory/…`, an index file) | a sidecar of no session |
 //!
+//! A file or folder belongs to a session when its name is the id or starts with it and a `.`.
 //! A session's folder can be there without its transcript, and the transcript without the
 //! folder. `<project>` is the starting directory with its punctuation replaced by `-`, so it
 //! can't be turned back into a path and is not read here. Every `.jsonl` file is appended to
@@ -134,26 +135,16 @@ fn retention_days(settings: Option<&[u8]>) -> Option<u32> {
 fn classify(key: &str) -> FileClass {
     /* `projects/<project>/` and then the path inside the project. */
     let inside: Vec<&str> = key.split('/').skip(2).collect();
-    let (kind, session) = match inside[..] {
-        [file] => match session_of(file) {
-            Some(session) if &file[session.len()..] == ".jsonl" => {
-                (ItemKind::Transcript, Some(session))
-            }
-            session => (ItemKind::Sidecar, session),
-        },
-        [folder, ref rest @ ..] => match (session_of(folder), rest) {
-            (Some(session), ["subagents", .., file])
-                if session == folder && file.starts_with("agent-") && file.ends_with(".jsonl") =>
-            {
-                (ItemKind::Subagent, Some(session))
-            }
-            (Some(session), ["tool-results", ..]) if session == folder => {
-                (ItemKind::ToolResult, Some(session))
-            }
-            (Some(session), _) if session == folder => (ItemKind::Sidecar, Some(session)),
-            _ => (ItemKind::Sidecar, None),
-        },
-        [] => (ItemKind::Sidecar, None),
+    let session = inside.first().and_then(|name| session_of(name));
+    let kind = match (session, &inside[..]) {
+        (Some(session), [file]) if &file[session.len()..] == ".jsonl" => ItemKind::Transcript,
+        (Some(_), [_, "subagents", .., file])
+            if file.starts_with("agent-") && file.ends_with(".jsonl") =>
+        {
+            ItemKind::Subagent
+        }
+        (Some(_), [_, "tool-results", _, ..]) => ItemKind::ToolResult,
+        _ => ItemKind::Sidecar,
     };
     FileClass {
         kind,
@@ -162,9 +153,9 @@ fn classify(key: &str) -> FileClass {
     }
 }
 
-/// The session id `name` starts with, when it is one alone or one followed by `.` and more: a
-/// UUID, as in `01234567-89ab-cdef-0123-456789abcdef.jsonl`. Other names in a project folder
-/// are not a session's.
+/// The session id that leads `name`, the name of a file or folder in a project: a UUID, alone
+/// or followed by `.` and more, as in `01234567-89ab-cdef-0123-456789abcdef.jsonl`. Other
+/// names there are not a session's.
 fn session_of(name: &str) -> Option<&str> {
     let id = name.get(..36)?;
     let shaped = id.bytes().enumerate().all(|(at, byte)| match at {
@@ -241,6 +232,14 @@ mod tests {
                 "other/tool-results/r1.txt".to_string(),
                 Sidecar,
                 false,
+                false,
+            ),
+            /* A folder is a session's by the same rule as a file. */
+            (in_session(".d/notes.txt"), Sidecar, true, false),
+            (
+                in_session(".d/tool-results/r1.txt"),
+                ToolResult,
+                true,
                 false,
             ),
             (format!("{ID}x.jsonl"), Sidecar, false, true),

@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use sb_core::hash::Hash;
 use sb_core::provider::{
-    DbSnapshot, Fetched, Hashed, ItemKind, ItemPrefix, ItemRange, Provider, ProviderError,
-    ProviderId, RangeFailure, Scan, ScannedItem, Source,
+    DbSnapshot, Hashed, ItemKind, ItemPrefix, ItemRange, Provider, ProviderError, ProviderId,
+    RangeFailure, Scan, ScannedItem, Source,
 };
 use sb_core::transport::{RangeSink, Transport};
 use serde_json::json;
@@ -131,7 +131,7 @@ impl Source for Exports<'_> {
         }
         Ok(Scan {
             items,
-            unlisted: Vec::new(),
+            ..Scan::default()
         })
     }
 
@@ -150,8 +150,6 @@ impl Source for Exports<'_> {
             .collect())
     }
 
-    /// Every export comes from the one snapshot the scan took, so each range is bytes its
-    /// session held together.
     fn fetch(
         &mut self,
         requests: &[ItemRange],
@@ -162,7 +160,7 @@ impl Source for Exports<'_> {
             for chunk in range.iter().flat_map(|range| range.chunks(CHUNK)) {
                 sink.data(index, chunk)?;
             }
-            sink.end(index, range.map(|_| Fetched::Stable))?;
+            sink.end(index, range.map(drop))?;
         }
         Ok(())
     }

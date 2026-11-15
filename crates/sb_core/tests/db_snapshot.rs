@@ -44,15 +44,23 @@ fn rows(snapshot: &DbSnapshot) -> usize {
         .unwrap()
 }
 
-/// This machine, with an agent that writes a row right after each of the first `writes` copies
-/// of its database were read.
-struct WritingAgent {
-    connection: Mutex<Connection>,
-    writes: usize,
+/// This machine, with an agent that does something to its database right after each copy of
+/// it was read: it is told how many copies there were before.
+struct BusyAgent<'a> {
+    after_copy: Mutex<Box<dyn FnMut(usize) + Send + 'a>>,
     copies: AtomicUsize,
 }
 
-impl Transport for WritingAgent {
+impl<'a> BusyAgent<'a> {
+    fn new(after_copy: impl FnMut(usize) + Send + 'a) -> Self {
+        Self {
+            after_copy: Mutex::new(Box::new(after_copy)),
+            copies: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Transport for BusyAgent<'_> {
     fn env(&self, names: &[&str]) -> Result<Env, TransportError> {
         LocalTransport.env(names)
     }
@@ -78,9 +86,7 @@ impl Transport for WritingAgent {
         sink: &mut dyn RangeSink,
     ) -> Result<(), TransportError> {
         LocalTransport.read_ranges(requests, sink)?;
-        if self.copies.fetch_add(1, Ordering::Relaxed) < self.writes {
-            write(&self.connection.lock().unwrap());
-        }
+        (self.after_copy.lock().unwrap())(self.copies.fetch_add(1, Ordering::Relaxed));
         Ok(())
     }
 
@@ -143,15 +149,34 @@ fn a_transaction_under_way_in_a_rollback_journal_is_not_in_the_snapshot() {
 }
 
 #[test]
+fn rows_written_after_the_copy_wait_for_the_next_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let (path, connection) = database(dir.path(), 3);
+    /* The agent goes on adding to its log, which leaves what was copied a state it was in. */
+    let transport = BusyAgent::new(move |_| write(&connection));
+
+    let snapshot = DbSnapshot::take(&transport, &path, scratch.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(transport.copies.load(Ordering::Relaxed), 1);
+    assert_eq!(rows(&snapshot), 3);
+}
+
+#[test]
 fn a_database_that_changed_while_it_was_copied_is_copied_again() {
     let dir = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
     let (path, connection) = database(dir.path(), 3);
-    let transport = WritingAgent {
-        connection: Mutex::new(connection),
-        writes: 2,
-        copies: AtomicUsize::new(0),
-    };
+    /* After the first two copies the agent folds its log into the database file. */
+    let transport = BusyAgent::new(move |copies| {
+        if copies < 2 {
+            write(&connection);
+            connection
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+        }
+    });
 
     let snapshot = DbSnapshot::take(&transport, &path, scratch.path())
         .unwrap()
@@ -161,15 +186,46 @@ fn a_database_that_changed_while_it_was_copied_is_copied_again() {
 }
 
 #[test]
+fn a_change_that_leaves_size_and_time_alone_is_still_copied_again() {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let (path, connection) = database(dir.path(), 3);
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let before = std::fs::metadata(&path).unwrap();
+    /* A write in place, in the same tick of the clock as the copy: a byte of the file's
+    header changes and nothing else about the file does. After the second copy it is put
+    back, which is a change again; after the third nothing changes. */
+    let transport = BusyAgent::new(|copies| {
+        let mut file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(40)).unwrap();
+        file.write_all(&[if copies == 0 { 0xff } else { 0 }])
+            .unwrap();
+        file.set_modified(before.modified().unwrap()).unwrap();
+    });
+
+    let snapshot = DbSnapshot::take(&transport, &path, scratch.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), before.len());
+    assert_eq!(transport.copies.load(Ordering::Relaxed), 3);
+    assert_eq!(rows(&snapshot), 3);
+}
+
+#[test]
 fn a_database_that_never_settles_is_given_up_on() {
     let dir = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
     let (path, connection) = database(dir.path(), 1);
-    let transport = WritingAgent {
-        connection: Mutex::new(connection),
-        writes: usize::MAX,
-        copies: AtomicUsize::new(0),
-    };
+    let transport = BusyAgent::new(move |_| {
+        write(&connection);
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+    });
 
     assert!(matches!(
         DbSnapshot::take(&transport, &path, scratch.path()),

@@ -115,23 +115,108 @@ fn an_archive_that_lost_its_catalogue_is_not_opened_with_an_empty_one() {
 }
 
 #[test]
+fn a_catalogue_that_is_not_the_archives_is_not_opened() {
+    let (mut bench, key) = synced();
+    let files = files_under(&bench.dir().join("files"));
+    bench.close();
+    let database = bench.dir().join("scrollback.db");
+    let kept = fs::read(&database).unwrap();
+    /* The catalogue of another archive, in the place of this one's. */
+    let other = tempfile::tempdir().unwrap();
+    drop(Archive::create(other.path()).unwrap());
+    fs::copy(other.path().join("scrollback.db"), &database).unwrap();
+
+    assert!(matches!(
+        Archive::open(bench.dir()),
+        Err(ArchiveError::AnothersCatalogue {
+            catalogue: Some(_),
+            ..
+        })
+    ));
+    /* Nothing archived was moved, and nothing was set aside. */
+    assert_eq!(files_under(&bench.dir().join("files")), files);
+    assert!(bench.orphans().is_empty());
+
+    fs::write(&database, kept).unwrap();
+    bench.reopen();
+    bench.assert_mirrors(&[key]);
+}
+
+#[test]
+fn an_archive_is_not_created_over_what_is_left_of_one() {
+    let (mut bench, _) = synced();
+    let before = files_under(&bench.dir().join("files"));
+    bench.close();
+    fs::remove_file(bench.dir().join("archive.json")).unwrap();
+    assert!(matches!(
+        Archive::create(bench.dir()),
+        Err(ArchiveError::HoldsAnArchivesFiles(_))
+    ));
+
+    /* Nor over a catalogue alone that has been used. */
+    fs::rename(bench.dir().join("files"), bench.dir().join("files.away")).unwrap();
+    assert!(matches!(
+        Archive::create(bench.dir()),
+        Err(ArchiveError::HoldsAnArchivesFiles(_))
+    ));
+    fs::rename(bench.dir().join("files.away"), bench.dir().join("files")).unwrap();
+
+    /* Nor over files alone. */
+    for file in ["scrollback.db", "scrollback.db-wal", "scrollback.db-shm"] {
+        let _ = fs::remove_file(bench.dir().join(file));
+    }
+    assert!(matches!(
+        Archive::create(bench.dir()),
+        Err(ArchiveError::HoldsAnArchivesFiles(_))
+    ));
+    assert!(!bench.dir().join("scrollback.db").exists());
+    assert!(!bench.dir().join("archive.json").exists());
+    assert_eq!(files_under(&bench.dir().join("files")), before);
+}
+
+#[test]
+fn a_create_that_was_cut_short_can_be_done_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = Archive::create(dir.path()).unwrap().id().to_string();
+    /* As a create that stopped before its last step leaves the folder. */
+    fs::remove_file(dir.path().join("archive.json")).unwrap();
+
+    let again = Archive::create(dir.path()).unwrap();
+    assert_eq!(again.id(), id);
+    drop(again);
+    assert_eq!(Archive::open(dir.path()).unwrap().id(), id);
+}
+
+#[test]
+fn an_archive_whose_state_cannot_be_written_still_opens() {
+    let (mut bench, key) = synced();
+    bench.close();
+    /* As after a sync that died storing; and nothing can take the file's place, as when the
+    disk is full. */
+    let state = bench.dir().join("state.json");
+    fs::remove_file(&state).unwrap();
+    fs::create_dir(&state).unwrap();
+    fs::write(state.join("in the way"), "").unwrap();
+
+    bench.reopen();
+    let version = bench.versions(&key).remove(0);
+    assert!(bench.read(&version) == bench.agent.content(&key));
+    bench.assert_verifies();
+}
+
+#[test]
 fn a_catalogue_that_records_nothing_does_not_get_the_files_set_aside() {
     let (mut bench, _) = synced();
     let files = files_under(&bench.dir().join("files"));
     bench.close();
-    /* The catalogue of a fresh archive, in the place of this one's. */
-    let fresh = tempfile::tempdir().unwrap();
-    drop(Archive::create(fresh.path()).unwrap());
-    for file in ["scrollback.db-wal", "scrollback.db-shm"] {
-        let _ = fs::remove_file(bench.dir().join(file));
-    }
-    fs::copy(
-        fresh.path().join("scrollback.db"),
-        bench.dir().join("scrollback.db"),
-    )
-    .unwrap();
+    /* This archive's catalogue as it was before its first sync, as an early backup has it,
+    and a start that looks. */
+    edit_catalogue(
+        bench.dir(),
+        "DELETE FROM segment; DELETE FROM version; DELETE FROM item;",
+    );
 
-    drop(Archive::open(bench.dir()).unwrap());
+    bench.reopen();
     assert_eq!(files_under(&bench.dir().join("files")), files);
     assert!(bench.orphans().is_empty());
 }
@@ -150,38 +235,50 @@ fn a_start_empties_tmp_and_keeps_what_the_catalogue_records() {
     bench.assert_mirrors(&[key]);
 }
 
-/// Puts a segment file and an item folder the catalogue doesn't record under the bench's
-/// `files/`, and returns them.
-fn strays(bench: &Bench<FileAgent>) -> (PathBuf, PathBuf) {
+/// Puts things the catalogue doesn't record under the bench's `files/`, of every sort, and
+/// returns each as the path verify reports it by, relative to the archive, with the bytes of
+/// a file in it.
+fn strays(bench: &Bench<FileAgent>) -> Vec<(PathBuf, PathBuf, &'static str)> {
+    let dir = bench.dir();
     let segment = bench.segment_files().remove(0);
-    let stray_segment = segment.parent().unwrap().join("0000000000999999.zst");
-    fs::write(&stray_segment, "not a recorded segment").unwrap();
-    let stray_item = bench
-        .dir()
-        .join("files")
-        .join(bench.location.as_str())
-        .join(bench.agent.provider().id().as_str())
-        .join("ff/ff000000000000000000000000000000");
-    fs::create_dir_all(stray_item.join("v0001")).unwrap();
-    fs::write(stray_item.join("source.json"), "{}").unwrap();
-    fs::write(stray_item.join("v0001/0000000000000000.zst"), "stray").unwrap();
-    (stray_segment, stray_item)
+    let version = segment.parent().unwrap().strip_prefix(dir).unwrap();
+    let item = version.parent().unwrap();
+    let provider = item.parent().unwrap().parent().unwrap();
+    let strays = vec![
+        /* A segment-like file the catalogue has no row for. */
+        (version.join("0000000000999999.zst"), PathBuf::new(), "a"),
+        /* A recorded segment and a recorded version under names the layout doesn't give. */
+        (version.join("0.zst"), PathBuf::new(), "b"),
+        (item.join("v1"), PathBuf::from("0000000000000000.zst"), "c"),
+        /* Files and folders where the layout has none. */
+        (item.join("stray.txt"), PathBuf::new(), "d"),
+        (provider.join("stray"), PathBuf::from("deep/file"), "e"),
+        (PathBuf::from("files/stray.txt"), PathBuf::new(), "f"),
+        /* An item the catalogue doesn't have, the only one in its folder. */
+        (
+            provider.join("ff"),
+            PathBuf::from("ff000000000000000000000000000000/v0001/0000000000000000.zst"),
+            "g",
+        ),
+    ];
+    for (reported, inside, bytes) in &strays {
+        let mut file = dir.join(reported);
+        file.extend(inside);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, bytes).unwrap();
+    }
+    strays
 }
 
 /// Asserts the bench's strays were set aside with their bytes, under the paths they had.
-fn assert_set_aside(bench: &Bench<FileAgent>, (stray_segment, stray_item): &(PathBuf, PathBuf)) {
-    assert!(!stray_segment.exists() && !stray_item.exists());
-    let orphans = bench.dir().join("orphans");
-    let moved = |path: &PathBuf| orphans.join(path.strip_prefix(bench.dir()).unwrap());
-    assert_eq!(
-        fs::read(moved(stray_segment)).unwrap(),
-        b"not a recorded segment"
-    );
-    assert_eq!(
-        fs::read(moved(stray_item).join("v0001/0000000000000000.zst")).unwrap(),
-        b"stray"
-    );
-    assert_eq!(bench.orphans().len(), 3);
+fn assert_set_aside(bench: &Bench<FileAgent>, strays: &[(PathBuf, PathBuf, &'static str)]) {
+    for (reported, inside, bytes) in strays {
+        assert!(!bench.dir().join(reported).exists(), "{reported:?}");
+        let mut moved = bench.dir().join("orphans").join(reported);
+        moved.extend(inside);
+        assert_eq!(fs::read_to_string(moved).unwrap(), *bytes, "{reported:?}");
+    }
+    assert_eq!(bench.orphans().len(), strays.len());
 }
 
 #[test]
@@ -213,11 +310,15 @@ fn a_start_with_no_word_of_the_last_one_sets_aside_what_the_catalogue_does_not_r
 
 #[test]
 fn a_start_after_a_sync_that_ended_well_does_not_look_and_verify_reports_instead() {
-    let (mut bench, _) = synced();
-    let (stray_segment, stray_item) = strays(&bench);
+    let (mut bench, key) = synced();
+    let strays = strays(&bench);
 
     bench.reopen();
-    assert!(stray_segment.exists() && stray_item.exists());
+    assert!(
+        strays
+            .iter()
+            .all(|(path, ..)| bench.dir().join(path).exists())
+    );
     assert!(bench.orphans().is_empty());
     let mut uncatalogued = bench
         .archive()
@@ -225,10 +326,14 @@ fn a_start_after_a_sync_that_ended_well_does_not_look_and_verify_reports_instead
         .unwrap()
         .uncatalogued;
     uncatalogued.sort();
-    let relative = |path: &PathBuf| path.strip_prefix(bench.dir()).unwrap().to_path_buf();
-    let mut expected = [relative(&stray_segment), relative(&stray_item)];
+    let mut expected: Vec<_> = strays.iter().map(|(path, ..)| path.clone()).collect();
     expected.sort();
     assert_eq!(uncatalogued, expected);
+
+    /* What verify found is a reason for the next start to look. */
+    bench.reopen();
+    assert_set_aside(&bench, &strays);
+    bench.assert_mirrors(&[key]);
 }
 
 #[test]

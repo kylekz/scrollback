@@ -5919,6 +5919,7 @@ dependencies = [
  "chrono",
  "log",
  "pretty_assertions",
+ "rustix",
  "sb_test_support",
  "serde",
  "serde_json",

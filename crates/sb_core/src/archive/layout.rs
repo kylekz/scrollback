@@ -32,7 +32,6 @@ pub(super) const TMP: &str = "tmp";
 pub(super) const FILES: &str = "files";
 pub(super) const ORPHANS: &str = "orphans";
 pub(super) const SOURCE: &str = "source.json";
-const SEGMENT_SUFFIX: &str = ".zst";
 
 /// An item's folder name: the first 32 hex digits of the SHA-256 of its key.
 pub(crate) fn item_folder(key: &str) -> String {
@@ -52,18 +51,8 @@ pub(super) fn version_dir(number: u32) -> String {
     format!("v{number:04}")
 }
 
-/// The version number a folder named by [`version_dir`] is for.
-pub(super) fn version_of(dir: &str) -> Option<u32> {
-    dir.strip_prefix('v')?.parse().ok()
-}
-
 pub(super) fn segment_file(offset: u64) -> String {
-    format!("{offset:016}{SEGMENT_SUFFIX}")
-}
-
-/// The offset a file named by [`segment_file`] starts at.
-pub(super) fn offset_of(file: &str) -> Option<u64> {
-    file.strip_suffix(SEGMENT_SUFFIX)?.parse().ok()
+    format!("{offset:016}.zst")
 }
 
 #[cfg(test)]
@@ -71,13 +60,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn names_are_fixed_width_and_read_back() {
+    fn names_are_fixed_width() {
         assert_eq!(version_dir(1), "v0001");
-        assert_eq!(version_of("v0001"), Some(1));
-        assert_eq!(version_of(&version_dir(12345)), Some(12345));
+        assert_eq!(version_dir(12345), "v12345");
         assert_eq!(segment_file(184_467), "0000000000184467.zst");
-        assert_eq!(offset_of("0000000000184467.zst"), Some(184_467));
-        assert_eq!(offset_of("source.json"), None);
         let folder = item_folder("projects/-home-user-code-app/s1.jsonl");
         assert_eq!(folder.len(), 32);
         assert_eq!(folder, item_folder("projects/-home-user-code-app/s1.jsonl"));

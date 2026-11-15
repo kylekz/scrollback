@@ -75,6 +75,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => catalogue.add_location(LocationKind::Local, "This machine")?,
     };
     let mut planned = (0, 0);
+    let mut fetched = 0;
     let passes = sync_location(
         &archive,
         &location.id,
@@ -87,13 +88,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 planned = (items, bytes);
                 println!("planned {items} items, {bytes} bytes");
             }
-            Progress::Fetched { items, bytes } if items % 100 == 0 || items == planned.0 => {
-                println!(
-                    "fetched {items} of {} items, {bytes} of {} bytes",
-                    planned.0, planned.1
-                );
-            }
-            Progress::Fetched { .. } => {}
+            Progress::Fetched { bytes } => fetched = bytes,
+            Progress::Stored { items } => println!(
+                "fetched {items} of {} items, {fetched} of {} bytes",
+                planned.0, planned.1
+            ),
         },
     )?;
     for pass in passes {
@@ -106,8 +105,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         println!(
             "{}: {} items: {} unchanged, {} new, {} appended, {} touched, {} new versions \
-             ({} held back), {} gone, {} deferred, {} failed, {} unlisted; {} bytes fetched, \
-             {} stored",
+             ({} held back), {} gone, {} deferred, {} failed, {} unlisted, {} skipped; {} bytes \
+             fetched, {} stored",
             pass.provider,
             report.scanned,
             report.unchanged,
@@ -117,15 +116,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             report.new_versions,
             report.held_back,
             report.gone,
-            report.deferred,
+            report.deferred.len(),
             report.failed.len(),
             report.unlisted.len(),
+            report.skipped.len(),
             report.bytes_fetched,
             report.bytes_stored
         );
         let mut reasons: Vec<_> = report
             .failed
             .iter()
+            .chain(&report.deferred)
             .map(|failure| &failure.reason)
             .chain(report.unlisted.iter().map(|unlisted| &unlisted.reason))
             .collect();
