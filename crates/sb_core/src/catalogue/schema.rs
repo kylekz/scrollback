@@ -1,12 +1,12 @@
 //! The catalogue's schema (PLAN §4.3), as `toolbox_store` migrations: append-only, a shipped
-//! step is never edited. Tables that later phases own (folders, session state, tombstones, the
-//! session index and its search text, settings) arrive as further steps with those phases.
+//! step is never edited. Tables that later phases own (tombstones, the search text, settings)
+//! arrive as further steps with those phases.
 
 use toolbox_store::Schema;
 
 pub(super) const SCHEMA: Schema = Schema {
     domain: "scrollback",
-    steps: &[SYNC, LOCATIONS],
+    steps: &[SYNC, LIBRARY, LOCATIONS],
 };
 
 /// What sync writes (PLAN §2.2): locations, items, versions and segments. Times are Unix
@@ -89,6 +89,120 @@ CREATE TABLE segment (
 ) STRICT, WITHOUT ROWID;
 ";
 
+/// What the library is made of (PLAN §2.2). `folder`, `folder_path`, `session_state` and
+/// `reading_choice` are the owner's and only here; `session` is derived from the archive and can
+/// be emptied and rebuilt, so the owner's tables name a session by its identity (location,
+/// provider and the provider's id for it) and never by its row in `session`.
+const LIBRARY: &str = "
+-- Held back because its transcript no longer parses where the copy being read does (PLAN §4.2),
+-- whatever its length: held_back stays set for as long as this is.
+ALTER TABLE version ADD COLUMN held_by_parse INTEGER NOT NULL DEFAULT 0
+    CHECK (held_by_parse = 0 OR held_back = 1);
+
+-- The owner chose to read the version while it was held back. It is not held back again.
+ALTER TABLE version ADD COLUMN accepted INTEGER NOT NULL DEFAULT 0
+    CHECK (accepted = 0 OR held_back = 0);
+
+-- The version of the provider's parser whose classifier last said what each archived item of
+-- the provider at the location is (its kind and its session).
+ALTER TABLE location_provider ADD COLUMN classified_by INTEGER;
+
+-- A session's items, by key.
+CREATE INDEX item_session ON item (location_id, provider, session, key);
+
+-- position orders a folder among those with the same parent.
+CREATE TABLE folder (
+    id INTEGER PRIMARY KEY,
+    parent_id INTEGER REFERENCES folder (id),
+    name TEXT NOT NULL,
+    position INTEGER NOT NULL
+) STRICT;
+
+-- path is the path as filing compares it, typed as the owner gave it. location_id limits the
+-- path to one location's sessions; NULL is every location's.
+CREATE TABLE folder_path (
+    folder_id INTEGER NOT NULL REFERENCES folder (id),
+    path TEXT NOT NULL,
+    typed TEXT NOT NULL,
+    location_id TEXT REFERENCES location (id)
+) STRICT;
+
+-- A path is attached once for each scope. NULLs are distinct to UNIQUE, so the scope of every
+-- location is indexed as the empty text, which no location's id is.
+CREATE UNIQUE INDEX folder_path_scope ON folder_path (path, COALESCE(location_id, ''));
+
+-- by_hand: the owner put the session in its folder, and no rule moves it.
+CREATE TABLE session_state (
+    location_id TEXT NOT NULL REFERENCES location (id),
+    provider TEXT NOT NULL,
+    session TEXT NOT NULL,
+    folder_id INTEGER REFERENCES folder (id),
+    by_hand INTEGER NOT NULL DEFAULT 0 CHECK (by_hand = 0 OR folder_id IS NOT NULL),
+    starred INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (location_id, provider, session)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX session_state_folder ON session_state (folder_id);
+
+-- The version of an item the owner chose to read in place of its newest. It goes when the
+-- item gets a newer version than there was to choose from.
+CREATE TABLE reading_choice (
+    item_id INTEGER PRIMARY KEY REFERENCES item (id),
+    version_id INTEGER NOT NULL REFERENCES version (id)
+) STRICT;
+
+-- Derived: what the index holds of a session (PLAN §7.5). id is what other derived tables name
+-- the session by (the search text, PLAN §10). main_item is the session's own transcript, NULL
+-- when its items hold none; reading_version and newest_version are the numbers of the version
+-- of it that is read and of its newest. project is project_path as filing compares it. models
+-- is a JSON array. The own_ counts are of the session's own conversation, the all_ counts of
+-- it and its subagents. ending is how the main transcript ended (whole, mid_record,
+-- unreadable), with why in unreadable. unread: some part of the session, its own conversation
+-- or a subagent's or what goes with them, could not be read. held_back: the newest version of
+-- one of its transcripts is held back. failure is why the last index of the session did not
+-- parse it; the other derived columns are then what the index before it found.
+-- parser_version, index_version and indexed_from say what the row was made by and from: a
+-- session is indexed again when any of them is no longer so. retry: the archive could not be
+-- read when the row was made, and an index of a start tries again.
+CREATE TABLE session (
+    id INTEGER PRIMARY KEY,
+    location_id TEXT NOT NULL REFERENCES location (id),
+    provider TEXT NOT NULL,
+    session TEXT NOT NULL,
+    main_item INTEGER REFERENCES item (id),
+    reading_version INTEGER,
+    newest_version INTEGER,
+    title TEXT,
+    first_prompt TEXT,
+    project_path TEXT,
+    project TEXT,
+    branch TEXT,
+    entrypoint TEXT,
+    started_at INTEGER,
+    ended_at INTEGER,
+    models TEXT NOT NULL,
+    own_calls INTEGER NOT NULL,
+    own_input INTEGER NOT NULL,
+    own_output INTEGER NOT NULL,
+    own_cache_read INTEGER NOT NULL,
+    own_cache_write INTEGER NOT NULL,
+    all_calls INTEGER NOT NULL,
+    all_input INTEGER NOT NULL,
+    all_output INTEGER NOT NULL,
+    all_cache_read INTEGER NOT NULL,
+    all_cache_write INTEGER NOT NULL,
+    ending TEXT,
+    unreadable TEXT,
+    unread INTEGER NOT NULL,
+    held_back INTEGER NOT NULL,
+    failure TEXT,
+    retry INTEGER NOT NULL,
+    parser_version INTEGER NOT NULL,
+    index_version INTEGER NOT NULL,
+    indexed_from TEXT NOT NULL,
+    UNIQUE (location_id, provider, session)
+) STRICT;
+";
 /// WSL and SSH locations (PLAN §6), and a location that can't be reached (PLAN §5).
 const LOCATIONS: &str = "
 -- What a location's kind connects to: the WSL distro's name or the host as ssh takes it. NULL
@@ -97,6 +211,9 @@ ALTER TABLE location ADD COLUMN detail TEXT;
 -- Set while the last sync could not connect: since which try, and the launcher's words.
 ALTER TABLE location ADD COLUMN unreachable_since INTEGER;
 ALTER TABLE location ADD COLUMN unreachable_reason TEXT;
+-- Where a WSL distro mounts the Windows drives, when it is not the usual place: as its
+-- /etc/wsl.conf says, with a slash at each end. NULL for the usual place.
+ALTER TABLE location ADD COLUMN drive_mount TEXT;
 ";
 
 #[cfg(test)]
@@ -112,7 +229,7 @@ mod tests {
     fn a_catalogue_from_before_wsl_and_ssh_keeps_its_location() {
         const BEFORE: Schema = Schema {
             domain: SCHEMA.domain,
-            steps: &[SYNC],
+            steps: &[SYNC, LIBRARY],
         };
         let dir = tempfile::tempdir().unwrap();
         Database::open(&dir.path().join(DATABASE), &OpenOptions::new(&BEFORE))

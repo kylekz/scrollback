@@ -82,7 +82,7 @@ impl Copy {
                         reason: version.reason,
                         length: version.length,
                         hash: version.hash,
-                        held_back: version.held_back,
+                        held_back: version.held_back.is_some(),
                     })
                     .collect(),
                 key: item.key,

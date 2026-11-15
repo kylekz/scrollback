@@ -19,6 +19,24 @@
 //! folder. `<project>` is the starting directory with its punctuation replaced by `-`, so it
 //! can't be turned back into a path and is not read here. Every `.jsonl` file is appended to
 //! line by line.
+//!
+//! This provider's id for a session is `<project>/<session>`. The id alone is not enough: the
+//! same one is found under two projects' folders, and those are two transcripts, each with
+//! what goes with it.
+//!
+//! [`parse`] turns a session's archived files into the transcript model, [`tools`] maps
+//! Claude Code's tools onto the common kinds, and [`audit`] counts a session's records another
+//! way to check the parse against.
+
+mod audit;
+mod parse;
+mod record;
+mod said;
+#[cfg(test)]
+mod tests;
+mod tools;
+
+pub(super) use audit::audit;
 
 use std::path::Path;
 
@@ -26,11 +44,15 @@ use serde_json::Value;
 
 use super::{
     FileClass, FileTree, Hashed, ItemKind, ItemPrefix, ItemRange, Provider, ProviderError,
-    ProviderId, RangeFailure, Scan, Source,
+    ProviderId, RangeFailure, Scan, SessionItems, Source,
 };
+use crate::transcript::{Subagent, Transcript};
 use crate::transport::{Env, RangeSink, Transport};
 
-const ID: ProviderId = ProviderId::new("claude-code");
+pub(super) const ID: ProviderId = ProviderId::new("claude-code");
+
+/// The version of [`parse`].
+const PARSER_VERSION: u32 = 1;
 
 /// Where the items are, under the root.
 const SUBTREE: &str = "projects";
@@ -61,6 +83,23 @@ impl Provider for Agent {
                 root,
             }) as Box<dyn Source>
         }))
+    }
+
+    fn parser_version(&self) -> u32 {
+        PARSER_VERSION
+    }
+
+    fn parse(&self, items: &dyn SessionItems) -> Transcript {
+        parse::parse(items)
+    }
+
+    fn subagent(&self, items: &dyn SessionItems, item: &str) -> Subagent {
+        parse::subagent(items, item)
+    }
+
+    fn classify(&self, key: &str) -> (ItemKind, Option<String>) {
+        let class = classify(key);
+        (class.kind, class.session)
     }
 }
 
@@ -148,7 +187,8 @@ fn classify(key: &str) -> FileClass {
     };
     FileClass {
         kind,
-        session: session.map(str::to_string),
+        /* The id alone is not the session: the same one can be in two projects' folders. */
+        session: session.map(|id| format!("{}/{id}", key.split('/').nth(1).unwrap_or_default())),
         lines: key.ends_with(".jsonl"),
     }
 }
@@ -166,7 +206,7 @@ fn session_of(name: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
+mod source_tests {
     use std::collections::HashMap;
 
     use super::*;
@@ -183,6 +223,12 @@ mod tests {
     fn files_are_classified_by_where_they_are() {
         use ItemKind::{Sidecar, Subagent, ToolResult, Transcript};
         const ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+        /* A session is its id in its project's folder: the same id elsewhere is another. */
+        const SESSION: &str = "-home-user-code-app/01234567-89ab-cdef-0123-456789abcdef";
+        assert_eq!(
+            classify(&format!("projects/-home-user-code-other/{ID}.jsonl")).session,
+            Some(format!("-home-user-code-other/{ID}"))
+        );
         let in_session = |path: &str| format!("{ID}{path}");
         for (inside, kind, session, lines) in [
             (in_session(".jsonl"), Transcript, true, true),
@@ -258,7 +304,7 @@ mod tests {
         ] {
             assert_eq!(
                 classify(&format!("projects/-home-user-code-app/{inside}")),
-                class(kind, session.then_some(ID), lines),
+                class(kind, session.then_some(SESSION), lines),
                 "{inside}"
             );
         }

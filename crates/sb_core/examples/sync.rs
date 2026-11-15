@@ -1,7 +1,10 @@
 //! A temporary command-line trigger for the sync engine (PLAN §13), for use until the app has
 //! locations in its UI. It syncs a location's agents into the archive in a folder, creating
-//! the archive if the folder has none, or verifies that archive, or sets aside what verify
-//! found under its `files/` that the catalogue doesn't record. It prints totals only.
+//! the archive if the folder has none, and indexes what the sync changed; or verifies that
+//! archive, listing what is under its `files/` that the catalogue doesn't record; or sets
+//! that aside; or brings the session index up to date as a start does; or empties it and
+//! builds it again from the archive, and says whether it came back the same. It prints
+//! totals, and of the archive's own files their paths in it.
 //!
 //! ```text
 //! cargo run --release -p sb_core --example sync -- <archive folder> [<location>]
@@ -9,6 +12,8 @@
 //! cargo run --release -p sb_core --example sync -- <archive folder> set-aside
 //! cargo run --release -p sb_core --example sync -- test <location>
 //! cargo run --release -p sb_core --example sync -- distros
+//! cargo run --release -p sb_core --example sync -- <archive folder> index
+//! cargo run --release -p sb_core --example sync -- <archive folder> reindex
 //! ```
 //!
 //! `<location>` is this machine when left out, or one of:
@@ -31,12 +36,15 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use sb_core::CancelToken;
 use sb_core::archive::{Archive, ArchiveError};
+use sb_core::catalogue::{Catalogue, Session, Shelf};
 use sb_core::location::LocationKind;
 use sb_core::provider;
-use sb_core::sync::{Progress, SyncError, sync_location};
+use sb_core::sync::{IndexReport, Progress, SyncError, index, sync_location};
+use sb_core::transcript::Ending;
 use sb_core::transport::{Launcher, ShellTransport, Transport, wsl};
 
-const USAGE: &str = "usage: sync <archive folder> [<location> | verify | set-aside]
+const USAGE: &str = "usage: sync <archive folder> [<location>]
+       sync <archive folder> verify | set-aside | index | reindex
        sync test <location>
        sync distros
 <location>: --wsl <distro> [--home <folder>] | --ssh <host> | --loopback <home folder>";
@@ -162,12 +170,50 @@ fn test(place: &Place) -> Result<(), Box<dyn Error>> {
         Some(shell) => println!("variables: as the login shell {shell} has them"),
         None => println!("variables: the login shell did not answer; a bare command's"),
     }
+    if let Some(mount) = &probe.drive_mount {
+        println!("drives: mounted under {mount}");
+    }
     if probe.missing.is_empty() {
         println!("tools: all there");
         Ok(())
     } else {
         Err(format!("tools missing: {}", probe.missing.join(", ")).into())
     }
+}
+
+/// What an index did, in a line.
+fn indexed(report: &IndexReport) -> String {
+    format!(
+        "indexed {} sessions: {} could not be parsed, {} filed by a rule, {} versions held \
+         back for how they parse",
+        report.sessions,
+        report.failed.len(),
+        report.filed,
+        report.held_back
+    )
+}
+
+/// Prints what the index holds, as counts.
+fn print_index(catalogue: &Catalogue) -> Result<(), Box<dyn Error>> {
+    let sessions = catalogue.sessions(Shelf::All)?;
+    let count =
+        |of: &dyn Fn(&Session) -> bool| sessions.iter().filter(|session| of(session)).count();
+    println!(
+        "the index holds {} sessions: {} with a title, {} with a project path, {} without a \
+         transcript of their own, {} that end inside a record, {} that could not be read \
+         through, {} with a part that could not be read, {} that could not be parsed, {} \
+         with a version held back",
+        sessions.len(),
+        count(&|session| session.title.is_some()),
+        count(&|session| session.project.is_some()),
+        count(&|session| session.main_item.is_none() && session.failure.is_none()),
+        count(&|session| session.ending == Some(Ending::MidRecord)),
+        count(&|session| matches!(session.ending, Some(Ending::Unreadable(_)))),
+        count(&|session| session.unread),
+        count(&|session| session.failure.is_some()),
+        count(&|session| session.held_back),
+    );
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -200,7 +246,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Ok(());
         }
         ["test", ref place @ ..] => return test(&Place::from(place)?),
-        [dir, action @ ("verify" | "set-aside")] => (dir, action, Place::from(&[])?),
+        [dir, action @ ("verify" | "set-aside" | "index" | "reindex")] => {
+            (dir, action, Place::from(&[])?)
+        }
         [dir, ref place @ ..] => (dir, "sync", Place::from(place)?),
         [] => return Err(USAGE.into()),
     };
@@ -239,16 +287,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 unread.version, unread.error
             );
         }
-        if !(report.damaged.is_empty()
-            && report.unread.is_empty()
-            && report.uncatalogued.is_empty())
-        {
+        /* What the catalogue doesn't record is no damage: every archived byte is as it was. */
+        for unrecorded in &report.uncatalogued {
+            println!("not recorded by the catalogue: {}", unrecorded.display());
+        }
+        if !(report.damaged.is_empty() && report.unread.is_empty()) {
             return Err(format!(
-                "{} versions are damaged, {} could not be read, and the catalogue doesn't \
-                 record {} files or folders under files/",
+                "{} versions are damaged and {} could not be read",
                 report.damaged.len(),
-                report.unread.len(),
-                report.uncatalogued.len()
+                report.unread.len()
             )
             .into());
         }
@@ -256,6 +303,41 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let catalogue = archive.catalogue();
+    if action == "index" || action == "reindex" {
+        let before = catalogue.sessions(Shelf::All)?;
+        if action == "reindex" {
+            catalogue.drop_index()?;
+        }
+        let report = index(
+            &archive,
+            None,
+            &provider::builtin(),
+            &CancelToken::new(),
+            &mut |progress| {
+                if let Progress::Indexing { sessions, bytes } = progress {
+                    println!("indexing {sessions} sessions, {bytes} bytes");
+                }
+            },
+        )?;
+        println!("{} in {:.1?}", indexed(&report), started.elapsed());
+        let after = catalogue.sessions(Shelf::All)?;
+        let differ = before
+            .iter()
+            .zip(&after)
+            .filter(|(before, after)| before != after)
+            .count();
+        println!(
+            "the index held {} sessions and holds {}, of which {differ} are not as they were",
+            before.len(),
+            after.len()
+        );
+        print_index(catalogue)?;
+        return if action == "index" || before == after {
+            Ok(())
+        } else {
+            Err("the index did not come back as it was".into())
+        };
+    }
     let known = catalogue
         .locations()?
         .into_iter()
@@ -265,12 +347,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => catalogue.add_location(place.kind.clone(), &place.name)?,
     };
     let cancel = CancelToken::new();
+    /* Where a distro mounts the drives is the connection test's to find, as the app has it
+    do when a location is added. */
+    if let (LocationKind::Wsl { .. }, Some(launcher)) = (&place.kind, place.launcher()) {
+        let probe = ShellTransport::new(launcher).cancelled_by(&cancel).probe();
+        if let Ok(probe) = probe {
+            catalogue.set_drive_mount(&location.id, probe.drive_mount.as_deref())?;
+        }
+    }
     let transport: Box<dyn Transport> = match place.launcher.clone() {
         Some(launcher) => Box::new(ShellTransport::new(launcher).cancelled_by(&cancel)),
         None => place.kind.transport(&cancel),
     };
     let mut planned = (0, 0);
     let mut fetched = 0;
+    let mut indexing = None;
     let passes = sync_location(
         &archive,
         &location.id,
@@ -293,12 +384,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "fetched {items} of {} items, {fetched} of {} bytes",
                 planned.0, planned.1
             ),
+            Progress::Indexing { sessions, bytes } => {
+                indexing = Some(Instant::now());
+                println!("indexing {sessions} sessions, {bytes} bytes");
+            }
+            Progress::Indexed { .. } => {}
         },
     )?;
     if passes.is_empty() {
         println!("no agent was found there");
     }
     for pass in passes {
+        match &pass.index {
+            Ok(index) => println!("{}: {}", pass.provider, indexed(index)),
+            Err(error) => println!("{}: the index failed: {error}", pass.provider),
+        }
         let report = match pass.outcome {
             Ok(report) => report,
             /* Not an error to the app; here it is why the sync stopped. */
@@ -345,6 +445,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("  not archived: {reason}");
         }
     }
-    println!("synced in {:.1?}", started.elapsed());
+    println!(
+        "synced in {:.1?}, of which the last index took {:.1?}",
+        started.elapsed(),
+        indexing
+            .map(|indexing| indexing.elapsed())
+            .unwrap_or_default()
+    );
+    print_index(catalogue)?;
     Ok(())
 }

@@ -177,7 +177,8 @@ Given the archived length `L` and hash `H` of the current version, and the sourc
 - **Line-oriented items (JSONL) are cut at the last newline while they are changing.** A transcript being written may end mid-record; the tail after the last `\n` is left for the next sync. When a later pass finds the item with the size and stamp it had before, the tail has settled and is stored too, so a file that never gets its final newline is still archived whole. A stored version can therefore end mid-line, and parsers tolerate it (§7.5). Other items are taken whole.
 - **A version only ever holds bytes the source held at one instant.** That is what the proof above enforces. An item whose proof fails because it was changing under the pass is deferred to the next one, and the catalogue records which items are waiting and since when.
 - **Versions belong to items, not sessions.** The version number the reader shows for a session is its main transcript's. The session's other items (subagent transcripts, saved tool results) version on their own.
-- **Held back.** When version n+1 is shorter than the reading copy (the newest version that is not itself held back), or its transcript no longer parses where n did, the reading copy stays and n+1 is flagged for the owner (FEATURES: Versions). Otherwise the newest version is the reading copy.
+- **Held back.** Only transcripts (a session's own and its subagents') can be held back; for any other item the newest version is the one read. A new version of a transcript is held back when it is shorter than the reading copy (the newest version that is not itself held back), or parses worse than it: it has fewer recognised blocks over all branches. An append can therefore never be held, and damage in the archive is not a parsing matter (verify and the refetch deal with it, §4.4). The reading copy stays, and the newer version is flagged for the owner (FEATURES: Versions). A hold for parsing is recorded apart from a hold for length. Storing never lifts a hold: an append to a held version leaves it held, and the index lifts it once the version is no shorter than the copy before it and parses no worse. A read that failed, or damage in the archive, never decides a hold.
+- **The owner's choice** is per item. Choosing a held-back version accepts it: its hold is cleared for good and later versions follow the rule as usual (if the rule would still read another version, the acceptance also acts as a pin). Choosing an older version pins it until a version arrives that is newer than any that existed when the choice was made, or until the pinned version is found damaged; then the pin lapses. A damaged version can't be chosen.
 - **Each version records why it started:** first sync, rewritten, shrank, replaced (the item was gone and came back with other content, or its export format changed), refetched (the version before it was found damaged, §4.4).
 
 ### 4.3 Catalogue
@@ -189,11 +190,12 @@ Tables, in outline (the schema is `toolbox_store` migrations, append-only):
 | `location` | id, kind, name, connection details (distro, or SSH host), last sync attempt and success, last error |
 | `location_provider` | per provider found at a location: the retention last read |
 | `item` | location, provider, key, item id, kind (transcript, subagent, tool result, sidecar), the session it belongs to, last seen length and stamp, gone-since |
-| `version` | item, number, reason, started, length, hash, held-back, damaged, the provider's export version when the item is an export |
+| `version` | item, number, reason, started, length, hash, held-back, held for parsing, accepted by the owner, damaged, the provider's export version when the item is an export |
 | `segment` | version, offset, length, hash, stored-at |
 | `folder` | id, parent, name, position |
 | `folder_path` | folder, normalised path, the path as typed, location (nullable) |
-| `session_state` | session identity → folder, filed-by (rule or hand), starred, chosen reading version, trashed-at |
+| `session_state` | session identity → folder, filed-by (rule or hand), starred, trashed-at (phase 6). Keyed by identity, never by the derived row, so it survives a rebuild of the index |
+| `reading_choice` | item → the version the owner chose to read; removed when a newer version of the item starts (§4.2) |
 | `tombstone` | session identity of a session deleted for good, and when |
 | `session` *(derived)* | session identity, main item, title, project path, first and last timestamp, models, branch, entrypoint, counts, tokens, parser version |
 | `session_text` *(derived)* | the FTS5 index (§10) |
@@ -225,7 +227,7 @@ One **pass** syncs one location with one provider. The engine drives it and know
 2. **Plan** (engine): drop the items of tombstoned sessions (§4.5), compare the rest with `item` and decide per item what to fetch (§4.2). Planning touches nothing at the location.
 3. **Fetch and prove** (provider), a batch at a time: the planned byte ranges, in one stream, then one request for the source's hash up to the end of each.
 4. **Store** (engine): each proven range becomes one or more segments (§4.1); the batch is made durable and its rows are committed in one transaction. A range whose proof fails is not stored: the item is fetched whole as a new version later in the pass, or **deferred** to the next pass if it is still changing.
-5. **Index** (engine, with the provider's parser): sessions whose items changed are re-parsed and re-indexed (§7); new sessions are filed (§8).
+5. **Index** (engine, with the provider's parser): sessions whose items changed are parsed and indexed (§7.5), and filed (§8). Which sessions are stale is decided from the catalogue, so an index that was cancelled or killed is picked up by the next pass or the next start. It runs whenever the store step ended for any reason but a cancel, after the pass's outcome is recorded. One session that fails to index is recorded and doesn't stop the others, and isn't a failure of the sync.
 
 - **Passes for different locations run in parallel.** One location runs one pass at a time; when it has several agents, their passes follow one another.
 - **One item's failure is one item's.** A file that can't be read, a folder that can't be listed and a name that isn't Unicode are reported with the pass; everything else is archived, and nothing under an unlisted folder is marked gone. One provider's failure doesn't stop the others at the location. A pass counts as a success for the location only when nothing failed and nothing has been waiting, deferred pass after pass, for more than a day; otherwise the location keeps its last success and records how many items could not be archived and why.
@@ -300,6 +302,8 @@ Everything specific to an agent is behind this trait (D8). The archive, the sync
 | `Source` | `retention_days()` | How long the agent keeps transcripts there, if it says |
 | `Provider` | `parse(session items)` | The transcript model (§7.4) of a session's own conversation, from its archived items |
 | `Provider` | `subagent(session items, item)` | One subagent's conversation, read when asked for |
+| `Provider` | `classify(key)` | The kind of an item and the session it belongs to, from its key alone |
+| `Provider` | `parser_version()` | Bumped when parsing or classifying changes; drives re-indexing (§7.5) |
 
 - **A `Provider` is what is known about an agent; a `Source` is that agent at one location for one pass.** The source holds what `detect` found (the root) and any scratch state (a database snapshot, §7.2), and is dropped when the pass ends. Only a source touches a location. `parse` and `subagent` read from the archive, and never fail: what can't be read is recorded in the transcript. The index (§7.5) and the tool kinds (§7.4) are derived from the parsed transcript, not asked of the provider.
 - **An item** is whatever unit the provider archives: a byte stream with a key the provider chooses, stable across passes. The engine versions it (§4.2) without knowing what it is.
@@ -350,6 +354,9 @@ Observed with Claude Code 2.1.325 on macOS, 2026-11-15, from the structure of re
 - **Compaction:** a `system` record of subtype `compact_boundary` with no parent, a `logicalParentUuid` and the token counts before and after; its summary is a `user` record marked `isCompactSummary`.
 - **Saved output:** a result too large for the transcript is a note in the transcript carrying the path of a file under `tool-results/`; the file's name is not the tool-use id. Images are inline base64, and image files under `tool-results/` duplicate them.
 - **Subagents** are linked to the call that started them by the `agentId` (or, for a workflow, the `runId`) in the call's result, with the `toolUseId` in `.meta.json` as the fallback. A subagent can start subagents. A few link to nothing and are kept as unattached.
+- **A session's key is its project folder and its id.** The same id can appear under two project folders; those are two sessions.
+- **Older releases wrote subagents inline:** records marked `isSidechain` inside the main transcript, with their own parent chain. They are gathered into a subagent conversation, attached to the call whose prompt matches when exactly one does, and never shown as the owner's turns. This shape is from memory of older releases and is unverified until the check runs over an older archive.
+- **Shell mode:** a command the owner ran with `!` is a prompt whose text is the command; its output is a note.
 - **Project path** (D9): the first `cwd` in the main transcript. It matched the directory name's encoding in every session sampled; a minority touched more than one directory later.
 - **Title:** the last `custom-title` record, else `custom-title.json`; else the start of the first prompt.
 - **Retention:** `cleanupPeriodDays` in `settings.json`, 30 days when absent and at least 1 (confirmed against Claude Code's documentation). The same cutoff removes a session's `subagents/` and `tool-results/`. Sessions started from the desktop app have their own setting, `desktopSessionCleanupPeriodDays`. The provider reads the user-level `settings.json` at the agent's root only; a project or managed override is not seen. When the sweep runs, and whether age is by modification time, is not documented.
@@ -371,6 +378,8 @@ Provider-neutral, what the reader renders:
 
 - Parsing streams a transcript line by line and never holds the file in memory; the model holds a few percent of the bytes parsed.
 - **The index is one agent-neutral function over a parsed transcript:** title, first prompt, project path, branch, entrypoint, start and end, models, the session's own totals and the totals with its subagents, and the search spans (prompts, replies, tool commands and paths, each with the block it opens at; a subagent's text opens at the call that started it).
+- **Staleness is a fingerprint** over each of the session's items (its kind, the version read and the newest version, with their lengths, and whether the version read is damaged), stored with the row beside the parser's and the index's versions. A pass indexes sessions whose fingerprint moved; a version bump is worked off in the background, never-indexed sessions first, then newest first. A read error from the operating system is not recorded as the session's state: the row keeps what it had and is tried again.
+- **A provider can reclassify archived items** (`classify(key)`): when its parser version changes, the engine re-applies it to every archived item, including those gone at the source, so a fix to how files map to sessions reaches the whole archive. The owner's state follows the session's own transcript: when one session becomes two it goes with the first own transcript; when two become one the first to arrive keeps its state; state left under an id that no item has is removed. A pass and the background index change an item's session through the same code, so neither can strand state.
 - A session is always parsed from its start. That is fast enough that the reader needs no per-turn byte offsets; search results name a turn and a block.
 - Parser output is cached in memory per open session only; nothing parsed is written to the archive except the derived tables.
 - The index rows carry the parser's version and the index's. A new version of either re-indexes in the background, newest sessions first.
@@ -392,12 +401,12 @@ Nothing else changes: no migration, and no change to the archive, sync, filing, 
 - **Normalising a path** for comparison: split into components; on Windows-style paths (`X:\…`) fold case and accept either separator; map a WSL mount path to its drive form (§6.3); drop a trailing separator. A share path (`\\server\share\…`) is its own root, and one that names a WSL distro keeps its case. A path with no components (empty, `.`, `/`) can't be attached. The path as typed is kept for display.
 - **A session's candidates** are the attached paths whose components are a prefix of the session's project path, and whose location is unset or is the session's.
 - **The longest candidate wins,** and of two equal ones the path attached for the session's location beats the same path attached for all. Its folder gets the session, marked as filed by rule.
-- **The same path can't be attached to two folders** for the same location scope; the second attach is refused and names the first folder.
-- **When rules run:** on a new session; and when a folder's paths change, over sessions in Unsorted and sessions filed by rule. A session filed by hand is never moved by a rule.
+- **The same path can't be attached to two folders** for the same location scope; the second attach is refused and names the first folder. Spellings that normalise alike are the same path, and a WSL mount path is its drive form everywhere (`/mnt/d/Projects/app` is `D:\Projects\app`); a WSL location whose distro mounts drives elsewhere supplies its own mount (§6.3). A typed path is trimmed and must be absolute.
+- **When rules run:** whenever a session that isn't filed by hand is indexed; and when a folder's paths change or a folder is deleted, over every session not filed by hand. So such a session is always where the rules put it. A session filed by hand is never moved by a rule. A session whose parse failed stays where it is.
 - **File automatically** hands a hand-filed session back to the rules: it clears the mark and runs filing on that session.
 - **A folder contains its subfolders' sessions.** Its page lists them and its count includes them.
-- **Deleting a folder** sends its sessions to Unsorted and drops its paths; its subfolders move up to its parent.
-- **Unsorted** is every session without a folder, grouped by project path.
+- **Deleting a folder** drops its paths, moves its subfolders up to its parent, and hands its sessions back to the rules, hand-filed ones included: each goes to the folder another attached path claims, or to Unsorted.
+- **Unsorted** is every session without a folder, grouped by project path and location: the same path on two machines is two places. Groups merge across locations only where the path has a drive form (a WSL mount path and its Windows path).
 
 ---
 

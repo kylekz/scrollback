@@ -297,6 +297,26 @@ fn nanoseconds(time: &str) -> Option<i64> {
         .checked_add(fraction)
 }
 
+/**
+ * Where a WSL distro mounts the Windows drives, from its `/etc/wsl.conf`: the `root` of its
+ * `[automount]` section, with a slash at each end, as the default `/mnt/` has. `None` when
+ * the file sets none, or sets the default.
+ */
+pub(super) fn automount_root(conf: &str) -> Option<String> {
+    let mut section = "";
+    let root = conf.lines().map(str::trim).find_map(|line| {
+        if let Some(name) = line.strip_prefix('[') {
+            section = name.trim_end_matches(']').trim();
+            return None;
+        }
+        let (key, value) = line.split_once('=')?;
+        (section.eq_ignore_ascii_case("automount") && key.trim().eq_ignore_ascii_case("root"))
+            .then(|| value.trim().trim_matches(['"', '\'']))
+    })?;
+    let root = format!("/{}/", root.trim_matches('/'));
+    (root.len() > 2 && root != crate::filing::WSL_DRIVE_MOUNT).then_some(root)
+}
+
 /// What a clock record read.
 pub(super) fn clock(time: &str) -> Result<i64, TransportError> {
     nanoseconds(time).ok_or_else(|| TransportError::Protocol(format!("the clock read {time:?}")))
@@ -431,6 +451,31 @@ mod tests {
             assert_eq!(unread(other).to_string(), other);
         }
         assert_eq!(Trouble::of(" \n"), Trouble::Nothing);
+    }
+
+    #[test]
+    fn a_distros_drive_mount_is_read_from_its_wsl_conf() {
+        let conf = "# where the drives go\n[boot]\nsystemd=true\nroot = /not-this\n\n\
+                    [automount]\nenabled = true\nroot = /windows\noptions = \"metadata\"\n\
+                    [network]\nroot=/nor-this/\n";
+        assert_eq!(automount_root(conf), Some("/windows/".to_string()));
+        assert_eq!(
+            automount_root("[Automount]\r\nRoot=\"/c drives/\"\r\n"),
+            Some("/c drives/".to_string())
+        );
+        /* None set, the usual one set, the root of everything, and a file of something
+        else. */
+        for conf in [
+            "",
+            "[automount]\nenabled = true\n",
+            "[automount]\nroot = /mnt/\n",
+            "[automount]\nroot = /mnt\n",
+            "[automount]\nroot = /\n",
+            "root = /windows/\n",
+            "\0\u{1}binary",
+        ] {
+            assert_eq!(automount_root(conf), None, "{conf:?}");
+        }
     }
 
     fn request(path: &str, length: u64) -> PrefixRequest {

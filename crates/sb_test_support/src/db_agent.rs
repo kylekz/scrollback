@@ -1,18 +1,31 @@
 //! A made-up agent that keeps its sessions in a SQLite database, and the test-only provider
 //! for it (PLAN §7.2, §12). The provider copies the database through `DbSnapshot` and archives
 //! one export per session: its messages, one JSON line each, in the order they were inserted.
+//!
+//! Its sessions are shaped unlike a file-keeping agent's, so that the transcript model is
+//! tested against a second shape (PLAN §7.4): a message is a row with a role, the rows have no
+//! links between them, a tool call and its result are one row, and where the session started
+//! is a row of its own.
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use sb_core::hash::Hash;
 use sb_core::provider::{
     DbSnapshot, Hashed, ItemKind, ItemPrefix, ItemRange, Provider, ProviderError, ProviderId,
-    RangeFailure, Scan, ScannedItem, Source,
+    RangeFailure, Scan, ScannedItem, SessionItems, Source,
+};
+use sb_core::transcript::{
+    Builder, Content, Conversation, Encoding, Ending, Facts, Output, Stored, ToolCall, ToolInput,
+    ToolKind, ToolResult, ToolStatus, Transcript, Unrecognised,
 };
 use sb_core::transport::{RangeSink, Transport};
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::value::RawValue;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use toolbox_store::rusqlite::{Connection, params};
 
@@ -27,9 +40,39 @@ const DATABASE: &str = ".dbagent/sessions.db";
 /// pieces.
 const CHUNK: usize = 1024;
 
-/// One message as a line of a session's export.
-fn export_line(id: i64, role: &str, body: &str) -> String {
-    json!({ "id": id, "role": role, "body": body }).to_string() + "\n"
+/// One message as a line of a session's export. `call` is a tool call's row: the tool, its
+/// arguments, its output and whether it worked. A row whose `call` is not JSON is exported
+/// with what it holds, as text: an export loses nothing, whatever the agent wrote.
+fn export_line(id: i64, role: &str, body: &str, call: Option<&str>) -> String {
+    let call: Option<Value> = call
+        .map(|call| serde_json::from_str(call).unwrap_or_else(|_| Value::String(call.to_string())));
+    json!({ "id": id, "role": role, "body": body, "call": call }).to_string() + "\n"
+}
+
+/// A line of an export, as the parser reads it.
+#[derive(Deserialize)]
+struct Row<'a> {
+    role: String,
+    body: String,
+    #[serde(borrow)]
+    call: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct CallRow<'a> {
+    tool: String,
+    #[serde(borrow)]
+    args: &'a RawValue,
+    #[serde(borrow)]
+    output: &'a RawValue,
+    ok: bool,
+}
+
+/// The arguments of the tools the agent has: `exec` runs a command, `open` reads a file.
+#[derive(Deserialize)]
+struct Args {
+    cmd: Option<String>,
+    file: Option<String>,
 }
 
 /// The provider for [`DbAgent`].
@@ -65,6 +108,148 @@ impl Provider for DbProvider {
                 sessions: HashMap::new(),
             }) as Box<dyn Source>
         }))
+    }
+
+    fn parser_version(&self) -> u32 {
+        1
+    }
+
+    fn classify(&self, key: &str) -> (ItemKind, Option<String>) {
+        let session = key.strip_prefix("sessions/").map(str::to_string);
+        (ItemKind::Transcript, session)
+    }
+
+    fn parse(&self, items: &dyn SessionItems) -> Transcript {
+        let mut facts = Facts {
+            agent: ID,
+            title: None,
+            project_path: None,
+            branch: None,
+            entrypoint: None,
+        };
+        let export = items
+            .list()
+            .iter()
+            .find(|item| item.kind == ItemKind::Transcript);
+        Transcript {
+            conversation: export.map(|item| self.conversation(items, &item.key, &mut facts)),
+            facts,
+            unattached: Vec::new(),
+        }
+    }
+}
+
+impl DbProvider {
+    /// The conversation in the export `key`. Its rows have no links: each follows the last.
+    fn conversation(&self, items: &dyn SessionItems, key: &str, facts: &mut Facts) -> Conversation {
+        let mut builder = Builder::new(Arc::from(key));
+        let item = builder.item().clone();
+        let rows = match items.open(key, 0) {
+            Ok(export) => BufReader::new(export).split(b'\n'),
+            Err(error) => return builder.finish(Ending::Unreadable(error.to_string())),
+        };
+        let mut last = None;
+        let mut offset = 0;
+        for line in rows {
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => return builder.finish(Ending::Unreadable(error.to_string())),
+            };
+            let whole = Stored {
+                item: item.clone(),
+                offset,
+                length: line.len() as u64,
+                encoding: Encoding::Plain,
+            };
+            let content = match serde_json::from_slice::<Row>(&line) {
+                Ok(Row { role, body, call }) => match (role.as_str(), call) {
+                    ("start", _) => {
+                        facts.project_path = Some(body);
+                        None
+                    }
+                    ("user", _) => Some(Content::Prompt {
+                        text: body,
+                        images: Vec::new(),
+                        from: None,
+                    }),
+                    ("assistant", _) => Some(Content::Reply { text: body }),
+                    ("tool", Some(call)) => Some(match serde_json::from_str(call.get()) {
+                        Ok(call) => {
+                            Content::ToolCall(Box::new(self.call(call, |raw, encoding| {
+                                Stored::part(&item, offset, &line, raw.get(), encoding)
+                            })))
+                        }
+                        Err(_) => Content::Unrecognised(Unrecognised {
+                            kind: role,
+                            misfit: Some("call"),
+                            raw: whole,
+                        }),
+                    }),
+                    _ => Some(Content::Unrecognised(Unrecognised {
+                        kind: role,
+                        misfit: None,
+                        raw: whole,
+                    })),
+                },
+                Err(_) => Some(Content::Unrecognised(Unrecognised {
+                    kind: String::new(),
+                    misfit: Some("not a row"),
+                    raw: whole,
+                })),
+            };
+            if let Some(content) = content {
+                last = Some(builder.show(last, None, None, content));
+            }
+            offset += line.len() as u64 + 1;
+        }
+        builder.finish(Ending::Whole)
+    }
+
+    /// A `tool` row as a call with its result. `part` says where a piece of the row is archived.
+    fn call(&self, call: CallRow, part: impl Fn(&RawValue, Encoding) -> Stored) -> ToolCall {
+        let kind = match call.tool.as_str() {
+            "exec" => ToolKind::Shell,
+            "open" => ToolKind::Read,
+            _ => ToolKind::Other,
+        };
+        ToolCall {
+            kind,
+            input: match (kind, serde_json::from_str(call.args.get())) {
+                (
+                    ToolKind::Shell,
+                    Ok(Args {
+                        cmd: Some(command), ..
+                    }),
+                ) => ToolInput::Shell {
+                    command,
+                    description: None,
+                },
+                (
+                    ToolKind::Read,
+                    Ok(Args {
+                        file: Some(path), ..
+                    }),
+                ) => ToolInput::Read {
+                    path,
+                    first_line: None,
+                    lines: None,
+                },
+                _ => ToolInput::Other,
+            },
+            name: call.tool,
+            raw_input: part(call.args, Encoding::Plain),
+            result: Some(ToolResult {
+                at: None,
+                status: if call.ok {
+                    ToolStatus::Ok
+                } else {
+                    ToolStatus::Failed
+                },
+                output: vec![Output::Text(part(call.output, Encoding::JsonString))],
+                brief: None,
+            }),
+            subagents: Vec::new(),
+        }
     }
 }
 
@@ -104,8 +289,9 @@ impl Source for Exports<'_> {
             .prepare("SELECT id, updated FROM session ORDER BY id")?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<_, _>>()?;
-        let mut messages = connection
-            .prepare("SELECT id, role, body FROM message WHERE session_id = ?1 ORDER BY id")?;
+        let mut messages = connection.prepare(
+            "SELECT id, role, body, call FROM message WHERE session_id = ?1 ORDER BY id",
+        )?;
         let mut items = Vec::new();
         for (session, updated) in sessions {
             let export: String = messages
@@ -114,6 +300,7 @@ impl Source for Exports<'_> {
                         row.get(0)?,
                         &row.get::<_, String>(1)?,
                         &row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?.as_deref(),
                     ))
                 })?
                 .collect::<Result<_, _>>()?;
@@ -166,6 +353,14 @@ impl Source for Exports<'_> {
     }
 }
 
+/// A row of the agent's `message` table.
+struct Message {
+    id: i64,
+    role: String,
+    body: String,
+    call: Option<String>,
+}
+
 /// The agent's database under a home folder.
 pub struct DbAgent {
     home: PathBuf,
@@ -173,8 +368,8 @@ pub struct DbAgent {
     _temp: Option<TempDir>,
     /// Kept open, as a running agent's is: what it wrote last is only in the write-ahead log.
     connection: Connection,
-    /// What each session should hold, by item key: the id, role and body of its messages.
-    expected: HashMap<String, Vec<(i64, &'static str, String)>>,
+    /// What each session should hold, by item key.
+    expected: HashMap<String, Vec<Message>>,
     sessions: usize,
     messages: usize,
     /// What [`Agent::provider`] gives the provider.
@@ -212,7 +407,8 @@ impl DbAgent {
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
                      session_id TEXT NOT NULL REFERENCES session (id),
                      role TEXT NOT NULL,
-                     body TEXT NOT NULL
+                     body TEXT NOT NULL,
+                     call TEXT
                  );",
             )
             .unwrap();
@@ -250,25 +446,56 @@ impl DbAgent {
                 "assistant"
             };
             let body = format!("message {} of the made-up agent", self.messages);
-            self.connection
-                .execute(
-                    "INSERT INTO message (session_id, role, body) VALUES (?1, ?2, ?3)",
-                    params![Self::session_id(key), role, body],
-                )
-                .unwrap();
-            let id = self.connection.last_insert_rowid();
-            self.expected.get_mut(key).unwrap().push((id, role, body));
+            self.row(key, role, &body, None);
         }
+    }
+
+    fn row(&mut self, key: &str, role: &str, body: &str, call: Option<&str>) {
+        self.connection
+            .execute(
+                "INSERT INTO message (session_id, role, body, call) VALUES (?1, ?2, ?3, ?4)",
+                params![Self::session_id(key), role, body, call],
+            )
+            .unwrap();
+        let id = self.connection.last_insert_rowid();
+        self.expected.get_mut(key).unwrap().push(Message {
+            id,
+            role: role.to_string(),
+            body: body.to_string(),
+            call: call.map(str::to_string),
+        });
+    }
+
+    /// One more message of the session: `role` says `body`. The agent's roles are `start`
+    /// (the body is the directory the session started in), `user` and `assistant`.
+    pub fn say(&mut self, key: &str, role: &str, body: &str) {
+        self.row(key, role, body, None);
+        self.bump(key);
+    }
+
+    /// One more message of the session: a call of `tool` with the arguments `args`, and what
+    /// came of it.
+    pub fn call(&mut self, key: &str, tool: &str, args: Value, output: &str, ok: bool) {
+        let call = json!({ "tool": tool, "args": args, "output": output, "ok": ok });
+        self.row(key, "tool", "", Some(&call.to_string()));
+        self.bump(key);
+    }
+
+    /// One more message of the session: a tool's row whose `call` holds `call` as it is,
+    /// which need not be what the agent's own tools write there.
+    pub fn call_raw(&mut self, key: &str, call: &str) {
+        self.row(key, "tool", "", Some(call));
+        self.bump(key);
     }
 
     /// Gives the session's first message the body `edit` makes of the one it has.
     fn edit_first(&mut self, key: &str, edit: impl FnOnce(&str) -> String) {
         let first = &mut self.expected.get_mut(key).unwrap()[0];
-        first.2 = edit(&first.2);
+        first.body = edit(&first.body);
         self.connection
             .execute(
                 "UPDATE message SET body = ?2 WHERE id = ?1",
-                params![first.0, first.2],
+                params![first.id, first.body],
             )
             .unwrap();
         self.bump(key);
@@ -309,7 +536,7 @@ impl Agent for DbAgent {
 
     fn truncate(&mut self, key: &str, records: usize) {
         let expected = self.expected.get_mut(key).unwrap();
-        for (id, ..) in expected.split_off(expected.len() - records) {
+        for Message { id, .. } in expected.split_off(expected.len() - records) {
             self.connection
                 .execute("DELETE FROM message WHERE id = ?1", [id])
                 .unwrap();
@@ -346,7 +573,15 @@ impl Agent for DbAgent {
     fn content(&self, key: &str) -> Vec<u8> {
         self.expected[key]
             .iter()
-            .flat_map(|(id, role, body)| export_line(*id, role, body).into_bytes())
+            .flat_map(|message| {
+                export_line(
+                    message.id,
+                    &message.role,
+                    &message.body,
+                    message.call.as_deref(),
+                )
+                .into_bytes()
+            })
             .collect()
     }
 }

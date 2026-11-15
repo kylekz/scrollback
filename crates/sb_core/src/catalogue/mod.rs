@@ -3,9 +3,16 @@
 //! folder, with `toolbox_store`'s checked backups beside it in `backups/`.
 //!
 //! Sync only ever adds rows and moves an item's or a version's own fields forward (PLAN §2.3):
-//! nothing here deletes.
+//! nothing here deletes what sync wrote.
+//!
+//! The library is here too (PLAN §2.2): the owner's folders, attached paths and what they
+//! decided about a session ([`folder`]), and the derived index of each session ([`session`]),
+//! which is read through [`library`].
 
+mod folder;
+mod library;
 mod schema;
+mod session;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,9 +24,15 @@ use toolbox_store::rusqlite::{self, Connection, OptionalExtension as _, Row, ToS
 use toolbox_store::{Backups, Database, OpenOptions};
 
 use crate::archive::item_folder;
+use crate::filing::FolderId;
 use crate::hash::Hash;
 use crate::location::{Location, LocationId, LocationKind, Unreachable};
 use crate::provider::{ItemKind, ScannedItem};
+
+pub use folder::{Folder, FolderPath};
+pub use library::{LibraryCounts, PathGroup, Shelf};
+pub(crate) use session::{Derived, Indexed, Reading, fingerprint};
+pub use session::{Filed, Session, SessionId, Usage};
 
 #[derive(Debug, Error)]
 pub enum CatalogueError {
@@ -29,7 +42,40 @@ pub enum CatalogueError {
     /// pass that fetched the range found it. Nothing was recorded.
     #[error("version {version} is no longer {length} bytes long, so nothing is appended to it")]
     VersionMoved { version: i64, length: u64 },
+    /// A path that names no directory (an empty one, `/`) would claim every session.
+    #[error("{0:?} names no directory, so it is not attached to a folder")]
+    NoPath(String),
+    /// The path is attached already for the same locations (PLAN §8): to `folder`, as `typed`.
+    #[error("{typed} is already attached to the folder {name}")]
+    PathAttached {
+        folder: FolderId,
+        name: String,
+        typed: String,
+    },
+    #[error("a folder is not moved into itself or into a folder inside it")]
+    FolderInItself,
+    #[error("there is no folder {}", .0.0)]
+    NoFolder(FolderId),
+    /// A folder's name is some text, of at most [`FOLDER_NAME_CHARS`] characters.
+    #[error("a folder's name is not empty and not longer than {FOLDER_NAME_CHARS} characters")]
+    FolderName,
+    /// Nothing is archived of a session of this identity.
+    #[error("nothing is archived of a session {} of {} at location {}", .0.key, .0.provider, .0.location)]
+    NoSession(SessionId),
+    #[error("item {0} is not one of the session's items")]
+    NotOfSession(i64),
+    #[error("version {version} is not a version of item {item}")]
+    NotOfItem { version: i64, item: i64 },
+    /// A version whose stored bytes are damaged is not chosen to be read.
+    #[error("version {0} is damaged")]
+    Damaged(i64),
+    /// The path is not attached to the folder for those locations.
+    #[error("{0} is not attached to the folder")]
+    NotAttached(String),
 }
+
+/// The most characters a folder's name has.
+pub const FOLDER_NAME_CHARS: usize = 200;
 
 impl From<rusqlite::Error> for CatalogueError {
     fn from(error: rusqlite::Error) -> Self {
@@ -147,12 +193,23 @@ pub struct Version {
     /// The length and SHA-256 of the content so far.
     pub length: u64,
     pub hash: Hash,
-    /// The version was a loss when it started, so it is not the reading copy unless the owner
-    /// chooses it.
-    pub held_back: bool,
+    /// Why the version is not the reading copy unless the owner chooses it, when it is a loss
+    /// beside the copy being read (PLAN §4.2). Only a transcript's version is held back.
+    pub held_back: Option<Held>,
     /// Verify, or a sync extending it, found its stored bytes missing or changed.
     pub damaged: bool,
     pub export_version: Option<u32>,
+}
+
+/// Why a version is held back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    /// It was shorter than the copy being read when it started. It stops being held back once
+    /// an index finds it as long as that copy and parsing no worse.
+    Shorter,
+    /// Its transcript no longer parses where the copy being read does. It stays held back
+    /// however long it grows, until an index finds it parses as well again.
+    ParsesWorse,
 }
 
 /// One stored byte range of a version (PLAN §4.1).
@@ -235,9 +292,9 @@ pub(crate) const DATABASE: &str = "scrollback.db";
 
 const ITEM: &str = "i.id, i.key, i.kind, i.session, i.seen_length, i.seen_stamp, i.gone_since";
 const VERSION: &str = "v.id, v.number, v.reason, v.started_at, v.length, v.hash, v.held_back, \
-                       v.damaged, v.export_version";
+                       v.held_by_parse, v.damaged, v.export_version";
 const LOCATION: &str = "id, kind, detail, name, last_attempt_at, last_success_at, last_error, \
-                        unreachable_since, unreachable_reason";
+                        unreachable_since, unreachable_reason, drive_mount";
 
 /// The open catalogue: a cheap-to-clone handle. Every method blocks on disk I/O.
 #[derive(Clone, Debug)]
@@ -286,6 +343,34 @@ impl Catalogue {
             last_success: None,
             last_error: None,
             unreachable: None,
+            drive_mount: None,
+        })
+    }
+
+    /**
+     * Records where `location` mounts the Windows drives, as the connection test found it
+     * ([`crate::transport::Probe::drive_mount`]); `None` for the usual place. The project
+     * paths of sessions indexed from then on are read by it, and so is a path attached for
+     * the location; sessions indexed before keep how they were read until they are indexed
+     * again.
+     */
+    pub fn set_drive_mount(&self, location: &LocationId, mount: Option<&str>) -> Result<()> {
+        self.execute(
+            "UPDATE location SET drive_mount = ?2 WHERE id = ?1",
+            params![location, mount],
+        )
+    }
+
+    /// Where `location` mounts the Windows drives, when it is not the usual place.
+    pub(crate) fn drive_mount(&self, location: &LocationId) -> Result<Option<String>> {
+        self.db.read(|c| {
+            Ok(c.query_row(
+                "SELECT drive_mount FROM location WHERE id = ?1",
+                [location],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
         })
     }
 
@@ -516,9 +601,11 @@ impl Catalogue {
     /**
      * Records stored ranges, each with its segments and the source state it brings its item up
      * to, all in one transaction.
-     * Returns for each whether a version it starts is held back (PLAN §4.2): it is shorter
-     * than the copy being read, which is the newest version not itself held back. A held-back
-     * version that grows to that copy's length is no longer a loss and stops being held back.
+     * Returns for each whether a version it starts is held back (PLAN §4.2): it is a
+     * transcript's and is shorter than the copy being read, which is the newest version not
+     * itself held back. It stays held back while it grows: the index, which parses it, says
+     * when it is no loss any more ([`Catalogue::set_hold`]). A version that starts also ends
+     * the owner's choice of an earlier one to read ([`Catalogue::set_reading_version`]).
      */
     pub(crate) fn commit(&self, commits: &[Recorded<'_>]) -> Result<Vec<bool>> {
         let now = now_ms();
@@ -572,25 +659,20 @@ impl Catalogue {
                     Target::NewVersion { item, reason } => {
                         seen(tx, item, scanned)?;
                         let reading: u64 = tx.query_row(
-                            "SELECT length FROM version WHERE item_id = ?1 AND held_back = 0
-                             ORDER BY number DESC LIMIT 1",
+                            &format!("SELECT {}", session::copy("length", "?1", None)),
                             [item],
                             |row| row.get(0),
                         )?;
-                        let held = commit.length < reading;
+                        let held = scanned.kind.is_transcript() && commit.length < reading;
+                        tx.execute("DELETE FROM reading_choice WHERE item_id = ?1", [item])?;
                         (start(item, commit.number, reason, held)?, held)
                     }
                     Target::Append { item, version } => {
                         seen(tx, item, scanned)?;
+                        /* A version that is held back stays so however it grows: whether it
+                        is still a loss is for the index to say, which parses it. */
                         let extended = tx.execute(
-                            "UPDATE version SET length = ?2, hash = ?3,
-                                 held_back = COALESCE(held_back AND ?2 < (
-                                     SELECT length FROM version reading
-                                     WHERE reading.item_id = version.item_id
-                                       AND reading.held_back = 0
-                                       AND reading.number < version.number
-                                     ORDER BY reading.number DESC LIMIT 1
-                                 ), 0)
+                            "UPDATE version SET length = ?2, hash = ?3
                              WHERE id = ?1 AND length = ?4",
                             params![version, commit.length, commit.hash, commit.from],
                         )?;
@@ -711,11 +793,17 @@ impl Catalogue {
         })
     }
 
+    /// Marks `versions` as damaged, or as damaged no more. A damaged version is not read by
+    /// the owner's choice: a choice of one ends here.
     pub(crate) fn set_damaged(&self, versions: &[i64], damaged: bool) -> Result<()> {
         self.db.write(|tx| {
             let mut update = tx.prepare("UPDATE version SET damaged = ?2 WHERE id = ?1")?;
+            let mut unchoose = tx.prepare("DELETE FROM reading_choice WHERE version_id = ?1")?;
             for version in versions {
                 update.execute(params![version, damaged])?;
+                if damaged {
+                    unchoose.execute([version])?;
+                }
             }
             Ok(())
         })
@@ -725,17 +813,10 @@ impl Catalogue {
 /// Records that `item` was found at its source as `scanned`: what it is, and its length and
 /// stamp. An item that was gone is back.
 fn seen(connection: &Connection, item: i64, scanned: &ScannedItem) -> rusqlite::Result<usize> {
+    session::classify(connection, item, scanned.kind, scanned.session.as_deref())?;
     connection.execute(
-        "UPDATE item SET kind = ?2, session = ?3, seen_length = ?4, seen_stamp = ?5,
-                         gone_since = NULL
-         WHERE id = ?1",
-        params![
-            item,
-            scanned.kind,
-            scanned.session,
-            scanned.length,
-            scanned.stamp
-        ],
+        "UPDATE item SET seen_length = ?2, seen_stamp = ?3, gone_since = NULL WHERE id = ?1",
+        params![item, scanned.length, scanned.stamp],
     )
 }
 
@@ -763,6 +844,7 @@ fn location_from(row: &Row<'_>) -> rusqlite::Result<Location> {
             (Some(since), Some(reason)) => Some(Unreachable { since, reason }),
             _ => None,
         },
+        drive_mount: row.get(9)?,
     })
 }
 
@@ -788,9 +870,13 @@ fn version_from(row: &Row<'_>, at: usize) -> rusqlite::Result<Version> {
         started_at: row.get(at + 3)?,
         length: row.get(at + 4)?,
         hash: row.get(at + 5)?,
-        held_back: row.get(at + 6)?,
-        damaged: row.get(at + 7)?,
-        export_version: row.get(at + 8)?,
+        held_back: match (row.get(at + 6)?, row.get(at + 7)?) {
+            (false, _) => None,
+            (true, false) => Some(Held::Shorter),
+            (true, true) => Some(Held::ParsesWorse),
+        },
+        damaged: row.get(at + 8)?,
+        export_version: row.get(at + 9)?,
     })
 }
 

@@ -9,22 +9,26 @@
 //! - [`Agent`]: what the sync tests do to a source, so each test runs against both.
 //! - [`HomeTransport`]: a fixture as a location, read with `std::fs` or through the shell
 //!   transport by a local shell ([`loopback`]), so each test runs over both too.
+//! - [`Items`]: a session's items as a parser reads them, fetched from an [`Agent`].
 //!
 //! gpui: **never** (`script/check` step 3).
 
 mod claude_code;
 mod db_agent;
 
+use std::collections::HashMap;
+use std::io::{self, Read};
 use std::path::Path;
 
-use sb_core::provider::{Hashed, Provider, RangeFailure};
+use sb_core::provider::{Hashed, ItemRange, Provider, RangeFailure, SessionItem, SessionItems};
 use sb_core::transport::{
-    Env, FileStat, Launcher, Listing, LocalTransport, PrefixRequest, RangeRequest, RangeSink,
+    Env, FileStat, Halt, Launcher, Listing, LocalTransport, PrefixRequest, RangeRequest, RangeSink,
     ShellTransport, Transport, TransportError,
 };
 use toolbox_store::rusqlite::Connection;
+use toolbox_store::rusqlite::types::ValueRef;
 
-pub use claude_code::{FileAgent, ProjectsTree, Session};
+pub use claude_code::{Call, FileAgent, ProjectsTree, Records, Session, image_block};
 pub use db_agent::{DbAgent, DbProvider};
 
 /// The environment variable that names a shell (`sh`, `dash`) to read every fixture location
@@ -218,6 +222,108 @@ pub trait Agent {
 
     /// The bytes the item `key` holds at the source now.
     fn content(&self, key: &str) -> Vec<u8>;
+}
+
+/// One session's items, held in memory: what a parser reads in place of the archive.
+pub struct Items {
+    list: Vec<SessionItem>,
+    bytes: HashMap<String, Vec<u8>>,
+}
+
+impl Items {
+    /// The items of the session whose transcript is `transcript`, scanned and fetched through
+    /// the agent's provider as a sync does.
+    pub fn of(agent: &impl Agent, transcript: &str) -> Self {
+        let transport = agent.transport();
+        let provider = agent.provider();
+        let scratch = tempfile::tempdir().unwrap();
+        let mut source = provider
+            .detect(&transport, scratch.path())
+            .unwrap()
+            .unwrap();
+        let scanned = source.scan().unwrap().items;
+        let session = &scanned
+            .iter()
+            .find(|item| item.key == transcript)
+            .unwrap()
+            .session;
+        let mut list: Vec<SessionItem> = scanned
+            .iter()
+            .filter(|item| item.session == *session)
+            .map(|item| SessionItem {
+                key: item.key.clone(),
+                kind: item.kind,
+                length: item.length,
+            })
+            .collect();
+        list.sort_by(|a, b| a.key.cmp(&b.key));
+        let ranges: Vec<ItemRange> = list
+            .iter()
+            .map(|item| ItemRange {
+                key: item.key.clone(),
+                offset: 0,
+                length: item.length,
+            })
+            .collect();
+        let mut fetched = Fetched(vec![Vec::new(); list.len()]);
+        source.fetch(&ranges, &mut fetched).unwrap();
+        let bytes = list
+            .iter()
+            .map(|item| item.key.clone())
+            .zip(fetched.0)
+            .collect();
+        Self { list, bytes }
+    }
+
+    /// Takes the item `key` away, as if it had not been archived.
+    pub fn remove(&mut self, key: &str) {
+        self.list.retain(|item| item.key != key);
+        self.bytes.remove(key);
+    }
+}
+
+impl SessionItems for Items {
+    fn list(&self) -> &[SessionItem] {
+        &self.list
+    }
+
+    fn open(&self, key: &str, offset: u64) -> io::Result<Box<dyn Read + '_>> {
+        let bytes = self.bytes.get(key).ok_or(io::ErrorKind::NotFound)?;
+        Ok(Box::new(&bytes[bytes.len().min(offset as usize)..]))
+    }
+}
+
+/// The bytes of each fetched range.
+struct Fetched(Vec<Vec<u8>>);
+
+impl RangeSink for Fetched {
+    fn data(&mut self, request: usize, bytes: &[u8]) -> Result<(), Halt> {
+        self.0[request].extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn end(&mut self, _request: usize, result: Result<(), RangeFailure>) -> Result<(), Halt> {
+        result.unwrap();
+        Ok(())
+    }
+}
+
+/// What `sql` reads from the catalogue of the archive in `dir`, behind the archive's back: the
+/// first column of each row, as text. For what the catalogue keeps and has no call to say.
+pub fn read_catalogue(dir: &Path, sql: &str) -> Vec<String> {
+    let connection = Connection::open(dir.join("scrollback.db")).unwrap();
+    let mut select = connection.prepare(sql).unwrap();
+    select
+        .query_map([], |row| {
+            row.get_ref(0).map(|value| match value {
+                ValueRef::Integer(number) => number.to_string(),
+                ValueRef::Text(text) => String::from_utf8_lossy(text).into_owned(),
+                other => format!("{other:?}"),
+            })
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
 }
 
 const FAIL_COMMITS: &str = "fail_segment_commits";

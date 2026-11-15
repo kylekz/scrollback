@@ -8,35 +8,12 @@ use std::fs;
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::archive::ArchiveError;
-use sb_core::catalogue::Reason;
+use sb_core::catalogue::{Held, Reason};
 use sb_core::provider::ItemKind;
 use sb_core::sync::{Progress, SyncError};
 use sb_test_support::{Agent, break_segment_commits, mend_segment_commits};
 
-use common::{Bench, Meddle, When, files_under};
-
-/// Runs each named test against both agents.
-macro_rules! for_both_agents {
-    ($($test:ident),* $(,)?) => {
-        mod files {
-            $(
-                #[test]
-                fn $test() {
-                    super::$test::<sb_test_support::FileAgent>();
-                }
-            )*
-        }
-
-        mod database {
-            $(
-                #[test]
-                fn $test() {
-                    super::$test::<sb_test_support::DbAgent>();
-                }
-            )*
-        }
-    };
-}
+use common::{Bench, Meddle, When, files_under, for_both_agents};
 
 for_both_agents!(
     first_sync_archives_every_item,
@@ -90,7 +67,7 @@ fn first_sync_archives_every_item<A: Agent + Default>() {
                 versions[0].reason,
                 versions[0].held_back
             ),
-            (1, Reason::FirstSync, false)
+            (1, Reason::FirstSync, None)
         );
         assert_eq!(bench.segments(&versions[0]).len(), 1);
         assert_eq!(bench.item(key).kind, ItemKind::Transcript);
@@ -155,7 +132,7 @@ fn a_rewrite_starts_a_new_version<A: Agent + Default>() {
             versions[1].reason,
             versions[1].held_back
         ),
-        (2, Reason::Rewritten, false)
+        (2, Reason::Rewritten, None)
     );
     /* The earlier version is as it was. */
     assert!(bench.read(&versions[0]) == before);
@@ -191,7 +168,7 @@ fn a_truncation_starts_a_version_that_is_held_back_until_it_outgrows_the_one_rea
     let versions = bench.versions(&keys[2]);
     assert_eq!(
         (versions[1].reason, versions[1].held_back),
-        (Reason::Shrank, true)
+        (Reason::Shrank, Some(Held::Shorter))
     );
     assert!(bench.read(&versions[0]) == before);
     bench.assert_mirrors(&keys);
@@ -201,14 +178,14 @@ fn a_truncation_starts_a_version_that_is_held_back_until_it_outgrows_the_one_rea
     assert_eq!(bench.sync().appended, 1);
     let versions = bench.versions(&keys[2]);
     assert_eq!(versions.len(), 2);
-    assert!(versions[1].held_back);
+    assert_eq!(versions[1].held_back, Some(Held::Shorter));
 
     /* Once it is as long as the version being read, it is no loss any more. */
     bench.agent.append(&keys[2], 12);
     assert_eq!(bench.sync().appended, 1);
     let versions = bench.versions(&keys[2]);
     assert!(versions[1].length > versions[0].length);
-    assert!(!versions[1].held_back);
+    assert_eq!(versions[1].held_back, None);
     bench.assert_mirrors(&keys);
 }
 
@@ -292,12 +269,15 @@ fn a_pass_cancelled_at_each_step_resumes<A: Agent + Default>() {
             }
             (bench, keys)
         };
-        /* Scanned, planned, each of the three ranges fetched, and the batch stored. */
+        /* Scanned, planned, each of the three ranges fetched, and the batch stored; then what
+        there is to index, and each of the three sessions indexed. */
         let all = steps(&prepare().0);
         assert_eq!(all[0], Progress::Scanned { items: 3 });
         assert!(matches!(all[1], Progress::Planned { items: 3, .. }));
         assert_eq!(all[5], Progress::Stored { items: 3 });
-        assert_eq!(all.len(), 6);
+        assert!(matches!(all[6], Progress::Indexing { sessions: 3, .. }));
+        assert!(matches!(all[9], Progress::Indexed { sessions: 3, .. }));
+        assert_eq!(all.len(), 10);
 
         for stop_at in 0..all.len() {
             let (bench, keys) = prepare();
@@ -309,9 +289,9 @@ fn a_pass_cancelled_at_each_step_resumes<A: Agent + Default>() {
                 }
                 seen += 1;
             });
-            /* Once the batch is stored there is nothing left to cancel. */
-            let stored = stop_at + 1 == all.len();
-            if !stored {
+            /* Once the last session is indexed there is nothing left to cancel. */
+            let stored = stop_at >= 5;
+            if stop_at + 1 < all.len() {
                 assert!(
                     matches!(stopped, Err(SyncError::Cancelled)),
                     "stopped at step {stop_at}: {stopped:?}"
@@ -329,6 +309,13 @@ fn a_pass_cancelled_at_each_step_resumes<A: Agent + Default>() {
                 if stored { 0 } else { 3 },
                 "resumed after step {stop_at}"
             );
+            /* The sessions the stopped pass did not index are indexed by the next. */
+            assert_eq!(
+                resumed.index.sessions,
+                3 - stop_at.saturating_sub(6),
+                "resumed after step {stop_at}"
+            );
+            assert_eq!(bench.sessions().len(), 3);
             bench.assert_mirrors(&keys);
         }
     }

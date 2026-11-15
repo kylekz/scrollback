@@ -5917,6 +5917,7 @@ dependencies = [
 name = "sb_core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "log",
  "pretty_assertions",
@@ -5945,7 +5946,9 @@ dependencies = [
 name = "sb_test_support"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "sb_core",
+ "serde",
  "serde_json",
  "tempfile",
  "toolbox_store",

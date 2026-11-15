@@ -10,9 +10,13 @@ use std::thread;
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::archive::Archive;
+use sb_core::catalogue::Shelf;
 use sb_core::location::LocationKind;
-use sb_core::provider::{Hashed, Provider, ProviderError, ProviderId, RangeFailure, Source};
+use sb_core::provider::{
+    Hashed, ItemKind, Provider, ProviderError, ProviderId, RangeFailure, SessionItems, Source,
+};
 use sb_core::sync::{Pass, SyncError, sync_location};
+use sb_core::transcript::{Facts, Transcript};
 use sb_core::transport::{
     Env, FileStat, Listing, PrefixRequest, RangeRequest, RangeSink, Transport, TransportError,
 };
@@ -35,6 +39,28 @@ impl Provider for Unreachable {
         _scratch: &'a Path,
     ) -> Result<Option<Box<dyn Source + 'a>>, ProviderError> {
         Err(TransportError::NoHome.into())
+    }
+
+    fn parser_version(&self) -> u32 {
+        1
+    }
+
+    fn classify(&self, _key: &str) -> (ItemKind, Option<String>) {
+        (ItemKind::Sidecar, None)
+    }
+
+    fn parse(&self, _items: &dyn SessionItems) -> Transcript {
+        Transcript {
+            facts: Facts {
+                agent: self.id(),
+                title: None,
+                project_path: None,
+                branch: None,
+                entrypoint: None,
+            },
+            conversation: None,
+            unattached: Vec::new(),
+        }
     }
 }
 
@@ -320,6 +346,9 @@ fn a_location_that_drops_away_mid_pass_keeps_what_was_committed() {
     let location = bench.location();
     assert!(location.unreachable.is_some());
     assert_eq!((location.last_success, location.last_error), (None, None));
+    /* And what is archived is indexed, though the location went. */
+    let sessions = bench.archive().catalogue().sessions(Shelf::All).unwrap();
+    assert_eq!(sessions.len(), archived);
 
     let report = bench.sync();
     assert_eq!(

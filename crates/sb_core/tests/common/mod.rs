@@ -4,6 +4,8 @@
 
 #![allow(
     dead_code,
+    unused_macros,
+    unused_imports,
     reason = "each test binary uses its own part of this module"
 )]
 
@@ -12,21 +14,53 @@ pub mod shell;
 
 use std::fs;
 use std::io::Read as _;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sb_core::CancelToken;
 use sb_core::archive::Archive;
-use sb_core::catalogue::{Item, Segment, Version};
+use sb_core::catalogue::{Item, Segment, Session, SessionId, Shelf, Version};
+use sb_core::hash::Hash;
 use sb_core::location::{Location, LocationId, LocationKind};
 use sb_core::provider::{
-    Hashed, ItemPrefix, ItemRange, Provider, ProviderError, ProviderId, RangeFailure, Scan, Source,
+    Hashed, ItemKind, ItemPrefix, ItemRange, Provider, ProviderError, ProviderId, RangeFailure,
+    Scan, SessionItems, Source,
 };
-use sb_core::sync::{Pass, PassReport, Progress, SyncError, sync_location};
+use sb_core::sync::{
+    IndexReport, Pass, PassReport, Progress, SyncError, index, index_session, sync_location,
+};
+use sb_core::transcript::{Subagent, Transcript};
 use sb_core::transport::{Halt, RangeSink, Transport};
 use sb_test_support::Agent;
 use tempfile::TempDir;
+
+/// Runs each named test against both agents: the one that keeps files and the made-up one
+/// that keeps a database.
+macro_rules! for_both_agents {
+    ($($test:ident),* $(,)?) => {
+        mod files {
+            $(
+                #[test]
+                fn $test() {
+                    super::$test::<sb_test_support::FileAgent>();
+                }
+            )*
+        }
+
+        mod database {
+            $(
+                #[test]
+                fn $test() {
+                    super::$test::<sb_test_support::DbAgent>();
+                }
+            )*
+        }
+    };
+}
+
+pub(crate) use for_both_agents;
 
 pub struct Bench<A> {
     pub agent: A,
@@ -99,11 +133,25 @@ impl<A: Agent> Bench<A> {
 
     /// The one pass of a sync with `provider` that was not cancelled, whatever it found.
     pub fn pass_with(&self, provider: Box<dyn Provider + '_>) -> Result<PassReport, SyncError> {
+        self.pass(provider).outcome
+    }
+
+    /// The one pass of a sync with `provider`, and what was indexed after it.
+    pub fn pass(&self, provider: Box<dyn Provider + '_>) -> Pass {
         let mut passes = self
             .try_sync_with(provider, &CancelToken::new(), &mut |_| {})
             .unwrap();
         assert_eq!(passes.len(), 1);
-        passes.remove(0).outcome
+        passes.remove(0)
+    }
+
+    /// A sync with `provider` whose pass and index must both come through.
+    pub fn synced_with(&self, provider: Box<dyn Provider + '_>) -> Synced {
+        let pass = self.pass(provider);
+        Synced {
+            report: pass.outcome.unwrap(),
+            index: pass.index.unwrap(),
+        }
     }
 
     /// The fixture's provider, meddled with.
@@ -115,12 +163,62 @@ impl<A: Agent> Bench<A> {
     }
 
     /// A sync that must succeed with nothing failed: its one pass.
-    pub fn sync(&self) -> PassReport {
-        let report = self.pass_with(self.agent.provider()).unwrap();
+    pub fn sync(&self) -> Synced {
+        let report = self.synced_with(self.agent.provider());
         assert!(report.failed.is_empty(), "{:?}", report.failed);
         assert!(report.deferred.is_empty(), "{:?}", report.deferred);
         assert!(report.unlisted.is_empty(), "{:?}", report.unlisted);
         report
+    }
+
+    /// An index of every session of the fixture's agent that is out of date, as a start runs.
+    pub fn index(&self) -> IndexReport {
+        self.index_with(self.agent.provider())
+    }
+
+    pub fn index_with(&self, provider: Box<dyn Provider + '_>) -> IndexReport {
+        index(
+            self.archive(),
+            None,
+            &[provider],
+            &CancelToken::new(),
+            &mut |_| {},
+        )
+        .unwrap()
+    }
+
+    /// An index of the one session whose transcript is the item `key`, as follows a choice of
+    /// the owner's.
+    pub fn index_session(&self, key: &str) -> IndexReport {
+        index_session(
+            self.archive(),
+            self.agent.provider().as_ref(),
+            &self.session_id(key),
+        )
+        .unwrap()
+    }
+
+    /// The identity of the session whose transcript is the item `key`.
+    pub fn session_id(&self, key: &str) -> SessionId {
+        SessionId {
+            location: self.location.clone(),
+            provider: self.agent.provider().id().to_string(),
+            key: self.item(key).session.unwrap(),
+        }
+    }
+
+    /// The indexed session whose transcript is the item `key`.
+    pub fn session(&self, key: &str) -> Session {
+        self.archive()
+            .catalogue()
+            .session(&self.session_id(key))
+            .unwrap()
+            .unwrap_or_else(|| panic!("{key} is not indexed"))
+    }
+
+    /// Every indexed session, the one that did something last first.
+    pub fn sessions(&self) -> Vec<Session> {
+        self.archive().catalogue().sessions(Shelf::All).unwrap()
     }
 
     pub fn location(&self) -> Location {
@@ -206,6 +304,16 @@ impl<A: Agent> Bench<A> {
             .collect()
     }
 
+    /// The segment files of the item `key`, in the order of their versions and offsets.
+    pub fn segment_files_of(&self, key: &str) -> Vec<PathBuf> {
+        /* An item's folder is named by the start of its key's hash (PLAN §4.1). */
+        let folder = &Hash::of(key.as_bytes()).to_hex()[..32];
+        self.segment_files()
+            .into_iter()
+            .filter(|file| file.iter().any(|part| part == folder))
+            .collect()
+    }
+
     /// Every file set aside under the archive's `orphans/`.
     pub fn orphans(&self) -> Vec<PathBuf> {
         files_under(&self.dir.path().join("orphans"))
@@ -265,6 +373,24 @@ pub fn files_under(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// What an item is, said again: from its key and what its provider says of it.
+pub type Classifier = fn(&str, (ItemKind, Option<String>)) -> (ItemKind, Option<String>);
+
+/// What a sync's one pass archived, with what was indexed after it.
+#[derive(Debug)]
+pub struct Synced {
+    pub report: PassReport,
+    pub index: IndexReport,
+}
+
+impl Deref for Synced {
+    type Target = PassReport;
+
+    fn deref(&self) -> &PassReport {
+        &self.report
+    }
+}
+
 /// A moment in a pass.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum When {
@@ -290,6 +416,18 @@ pub enum Meddle<'a> {
     FewerProofs,
     /// Fails when it is asked for proofs.
     NoProofs,
+    /// Says its parser is of this version.
+    ParserVersion(u32),
+    /// Its parser stops, with a panic, on the session that has the item of this key.
+    FaultyParser(String),
+    /// Says its parser is of the next version, and of each item what this makes of its key and
+    /// of what the provider says of it, in its scan as in its classifier.
+    Classifier(Classifier),
+    /// The same, with the parser's version as it was.
+    SameParser(Classifier),
+    /// Fails when it is asked for its second lot of proofs, as a connection that drops after
+    /// a batch was stored: `asked` counts the lots.
+    SecondProofsFail(AtomicUsize),
     /// Runs something before the first proofs it is asked for, and answers none of the second
     /// lot it is asked for: `asked` counts the lots.
     SecondProofsUnanswered {
@@ -356,12 +494,50 @@ impl Provider for Meddling<'_> {
             }) as Box<dyn Source + 's>
         }))
     }
+
+    fn parser_version(&self) -> u32 {
+        match self.meddle {
+            Meddle::ParserVersion(version) => version,
+            Meddle::Classifier(_) => self.inner.parser_version() + 1,
+            _ => self.inner.parser_version(),
+        }
+    }
+
+    fn parse(&self, items: &dyn SessionItems) -> Transcript {
+        if let Meddle::FaultyParser(key) = &self.meddle
+            && items.list().iter().any(|item| item.key == *key)
+        {
+            panic!("the test's parser can't read {key}");
+        }
+        self.inner.parse(items)
+    }
+
+    fn subagent(&self, items: &dyn SessionItems, item: &str) -> Subagent {
+        self.inner.subagent(items, item)
+    }
+
+    fn classify(&self, key: &str) -> (ItemKind, Option<String>) {
+        match &self.meddle {
+            Meddle::Classifier(classify) | Meddle::SameParser(classify) => {
+                classify(key, self.inner.classify(key))
+            }
+            _ => self.inner.classify(key),
+        }
+    }
 }
 
 impl Source for MeddlingSource<'_, '_> {
     fn scan(&mut self) -> Result<Scan, ProviderError> {
         self.meddle.reached(When::BeforeScan);
-        let scan = self.inner.scan();
+        let mut scan = self.inner.scan();
+        /* A provider's scan and its classifier say the same of an item. */
+        if let (Ok(scan), Meddle::Classifier(classify) | Meddle::SameParser(classify)) =
+            (&mut scan, self.meddle)
+        {
+            for item in &mut scan.items {
+                (item.kind, item.session) = classify(&item.key, (item.kind, item.session.take()));
+            }
+        }
         self.meddle.reached(When::AfterScan);
         scan
     }
@@ -388,9 +564,12 @@ impl Source for MeddlingSource<'_, '_> {
             }
         }
         let mut hashes = self.inner.hash_prefixes(requests)?;
-        match self.meddle {
+        match &self.meddle {
             Meddle::FewerProofs => drop(hashes.pop()),
             Meddle::NoProofs => return Err(ProviderError::Halted),
+            Meddle::SecondProofsFail(asked) if asked.fetch_add(1, Ordering::Relaxed) == 1 => {
+                return Err(ProviderError::Halted);
+            }
             _ => {}
         }
         Ok(hashes)

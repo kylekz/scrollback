@@ -418,8 +418,9 @@ small() {
 
 # probe: the connection test. "T <tool>" for each tool the transport needs that is missing,
 # "K", the home folder, the clock, "N 1" when modification times come with nanoseconds ("N 0":
-# whole seconds), and "L", then where the shell that runs this is found and, after a NUL, the
-# user's login shell.
+# whole seconds), "L", then where the shell that runs this is found and, after a NUL, the
+# user's login shell, and last /etc/wsl.conf as `small` gives a file: a WSL distro says there
+# where it mounts the Windows drives. Without the tools to read it, "M 2" and nothing.
 probe() {
     lacks find stat head tail dd cat date sha256 /dev/zero
     printf 'K\n'
@@ -431,4 +432,5 @@ probe() {
     *) printf 'N 0\n' ;;
     esac
     printf 'L\n%s\0%s\0' "$(command -v sh)" "${SHELL:-sh}"
+    if [ -z "$sb_missing" ]; then small /etc/wsl.conf; else printf 'M 2\n\0'; fi
 }

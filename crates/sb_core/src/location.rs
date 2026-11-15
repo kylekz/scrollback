@@ -128,6 +128,10 @@ pub struct Location {
     /// Set while the last sync could not reach it. What is known from when it was last
     /// reached, `last_success` and `last_error`, stays as it was.
     pub unreachable: Option<Unreachable>,
+    /// Where a WSL distro mounts the Windows drives, when its `/etc/wsl.conf` puts them
+    /// somewhere other than `/mnt/` (PLAN §6.3), as the connection test read it: its
+    /// sessions' project paths under there are the drives' (PLAN §8).
+    pub drive_mount: Option<String>,
 }
 
 #[cfg(test)]

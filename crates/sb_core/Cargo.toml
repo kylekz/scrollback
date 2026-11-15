@@ -12,10 +12,12 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
+base64.workspace = true
 chrono.workspace = true
 log.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `raw_value`: a parser notes where a record's large parts are without copying them (PLAN §7.5).
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true

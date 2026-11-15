@@ -9,8 +9,9 @@
 //! [`provider`]. No other module names an agent (`script/check` step 4).
 //!
 //! The modules are the homes PLAN §3 names. Syncing a location into the archive is built
-//! ([`archive`], [`catalogue`], [`transport`], [`provider`], [`sync`]); [`transcript`],
-//! [`filing`] and [`search`] are empty until the phases that build them (PLAN §13).
+//! ([`archive`], [`catalogue`], [`transport`], [`provider`], [`sync`]), and so are parsing an
+//! archived session into the [`transcript`] model, indexing it and filing it in the owner's
+//! folders ([`filing`]). [`search`] is empty until the phase that builds it (PLAN §13).
 
 pub mod archive;
 pub mod catalogue;

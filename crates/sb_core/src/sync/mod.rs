@@ -1,11 +1,12 @@
 //! The sync engine (PLAN §5). A pass syncs one location with one provider: the provider scans
-//! and fetches through the location's transport, and the engine plans ([`plan`]) and stores
-//! ([`store`]) without knowing the agent. Indexing joins with phase 2 (PLAN §13).
+//! and fetches through the location's transport, and the engine plans ([`plan`]), stores
+//! ([`store`]) and indexes ([`index`]) without knowing the agent: it asks the provider to parse.
 //!
 //! A pass can stop anywhere, by cancel or by failure. Everything committed stays, and the next
 //! pass continues from the catalogue. A sync only adds (PLAN §2.3): it never changes or deletes
 //! a stored segment, and nothing is ever written to a location.
 
+mod index;
 mod plan;
 mod store;
 
@@ -19,6 +20,8 @@ use crate::catalogue::{self, CatalogueError};
 use crate::location::LocationId;
 use crate::provider::{Provider, ProviderError, ProviderId, Source, Unlisted};
 use crate::transport::{Transport, TransportError};
+
+pub use index::{IndexReport, index, index_session};
 
 #[derive(Debug, Error)]
 pub enum SyncError {
@@ -36,6 +39,12 @@ pub enum SyncError {
     /// The provider's fetch did not keep to the order ranges are streamed in.
     #[error("the provider broke the fetch protocol: {0}")]
     Protocol(String),
+    /// A session was to be indexed by another agent's provider than its own.
+    #[error("the session is {session}'s, and {provider} does not parse it")]
+    NotItsProvider {
+        session: String,
+        provider: ProviderId,
+    },
     #[error(transparent)]
     Archive(#[from] ArchiveError),
     #[error(transparent)]
@@ -58,6 +67,10 @@ pub enum Progress {
     Fetched { bytes: u64 },
     /// So many of the planned items are dealt with: stored, or left for another pass.
     Stored { items: usize },
+    /// What there is to index: this many sessions, whose transcripts hold this many bytes.
+    Indexing { sessions: usize, bytes: u64 },
+    /// So many of those sessions are indexed, and so many of those bytes read.
+    Indexed { sessions: usize, bytes: u64 },
 }
 
 /// An item a pass did not archive, and why.
@@ -124,7 +137,11 @@ impl PassReport {
 #[derive(Debug)]
 pub struct Pass {
     pub provider: ProviderId,
+    /// What the pass archived, or why it stopped.
     pub outcome: Result<PassReport, SyncError>,
+    /// What was indexed once every pass was over, however this one ended: the provider's
+    /// sessions at the location whose items changed.
+    pub index: Result<IndexReport, SyncError>,
 }
 
 /**
@@ -135,6 +152,9 @@ pub struct Pass {
  *
  * The attempt is recorded with the location, and so is how it ended: as a success only when
  * every pass could read everything its agent has there, and otherwise with what went wrong.
+ * Only then are the sessions the passes changed indexed, those of a pass that failed too:
+ * what it stored before it failed is archived, and the backup is on record whatever becomes
+ * of the index.
  *
  * When the location itself fails, at the start or from some point on, the sync stops there:
  * the provider after would only meet the same. The pass it stopped in is the last of those
@@ -158,8 +178,10 @@ pub fn sync_location(
     let catalogue = archive.catalogue();
     catalogue.record_attempt(location)?;
     let scratch = archive.tmp();
-    let mut passes = Vec::new();
+    let mut stored = Vec::new();
     let mut problems = Vec::new();
+    /* Whether it is the location that failed, and not a provider's pass over it. */
+    let mut the_locations = false;
     for provider in providers {
         let id = provider.id();
         let outcome = match provider.detect(transport, &scratch) {
@@ -173,8 +195,7 @@ pub fn sync_location(
             )))) => Err(SyncError::Unreachable(reason)),
             outcome => outcome,
         };
-        /* Whether it is the location that failed, and not this provider's pass over it. */
-        let the_locations = match &outcome {
+        the_locations = match &outcome {
             Err(SyncError::Cancelled) => return Err(SyncError::Cancelled),
             /* A transport stopped by the cancel fails its call: that is the cancel, too. */
             Err(_) if cancel.is_cancelled() => return Err(SyncError::Cancelled),
@@ -197,23 +218,32 @@ pub fn sync_location(
                 false
             }
         };
-        passes.push(Pass {
-            provider: id,
-            outcome,
-        });
+        stored.push((provider, outcome));
         if the_locations {
-            return Ok(passes);
+            break;
         }
     }
-    if problems.is_empty() {
-        catalogue.record_outcome(location, None)?;
-    } else {
-        catalogue.record_outcome(location, Some(&problems.join("; ")))?;
+    /* The location's own failure is on record already. */
+    if !the_locations {
+        let problems = (!problems.is_empty()).then(|| problems.join("; "));
+        catalogue.record_outcome(location, problems.as_deref())?;
+    }
+    let mut passes = Vec::new();
+    for (provider, outcome) in stored {
+        let index = index::changed(archive, location, provider.as_ref(), cancel, progress);
+        if matches!(index, Err(SyncError::Cancelled)) {
+            return Err(SyncError::Cancelled);
+        }
+        passes.push(Pass {
+            provider: provider.id(),
+            outcome,
+            index,
+        });
     }
     Ok(passes)
 }
 
-/// One pass: scan, plan, fetch and store (PLAN §5).
+/// One pass: scan, plan, fetch and store (PLAN §5). Its index follows the last pass.
 fn pass(
     archive: &Archive,
     location: &LocationId,

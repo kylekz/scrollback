@@ -253,7 +253,7 @@ impl Storing<'_> {
                     stored,
                     content,
                 } => {
-                    counts.push((planned.target, stored));
+                    counts.push((planned, stored));
                     commits.push((
                         Commit {
                             location: self.location,
@@ -286,9 +286,19 @@ impl Storing<'_> {
             }
         }
         self.stop_if_cancelled()?;
-        let held_back = self.archive.store(commits)?;
-        for ((target, stored), held_back) in counts.into_iter().zip(held_back) {
-            match target {
+        let outcomes = self.archive.store(commits)?;
+        for ((planned, stored), outcome) in counts.into_iter().zip(outcomes) {
+            let held_back = match outcome {
+                Ok(held_back) => held_back,
+                Err(error) => {
+                    self.report.failed.push(Failure {
+                        key: planned.scanned.key.clone(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            match planned.target {
                 Target::NewItem => self.report.new_items += 1,
                 Target::NewVersion { .. } => self.report.new_versions += 1,
                 Target::Append { .. } if stored > 0 => self.report.appended += 1,

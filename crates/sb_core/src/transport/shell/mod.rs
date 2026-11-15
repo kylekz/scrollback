@@ -114,6 +114,10 @@ pub struct Probe {
     /// The user's login shell, when it answered: the variables its profile sets are seen.
     /// `None` when it did not, and only the bare environment of a command is.
     pub login_shell: Option<String>,
+    /// Where a WSL distro mounts the Windows drives, when its `/etc/wsl.conf` says it is not
+    /// `/mnt/` (PLAN §6.3), with a slash at each end: what the location is to be given
+    /// ([`crate::catalogue::Catalogue::set_drive_mount`]). `None` anywhere else.
+    pub drive_mount: Option<String>,
     /// How long the test took, from starting the launcher to the end of the answer.
     pub took: Duration,
 }
@@ -164,6 +168,11 @@ impl ShellTransport {
         reply.field("L")?;
         let shell = reply.words()?;
         let login_shell = reply.words()?;
+        /* A file that is not there, or can't be read, sets nothing. */
+        let drive_mount = small(&mut reply, "/etc/wsl.conf")
+            .ok()
+            .flatten()
+            .and_then(|conf| parse::automount_root(&String::from_utf8_lossy(&conf)));
         let answered = login.read(&mut reply)?.is_some();
         reply.end()?;
         Ok(Probe {
@@ -173,6 +182,7 @@ impl ShellTransport {
             whole_seconds,
             shell,
             login_shell: answered.then_some(login_shell),
+            drive_mount,
             took: started.elapsed(),
         })
     }
@@ -621,29 +631,35 @@ impl Transport for ShellTransport {
     fn read_small(&self, path: &str) -> Result<Option<Vec<u8>>, TransportError> {
         let script = Script::new().call("small", &[], path)?;
         let mut reply = self.ask("stat head /dev/zero", script)?;
-        let found = reply.line()?;
-        let content = match found.split(' ').collect::<Vec<_>>()[..] {
-            ["M", "0", size] => {
-                let mut content = Vec::new();
-                let read = range(&mut reply, number(size)?, &mut |bytes| {
-                    content.extend_from_slice(bytes);
-                    Ok(())
-                })?;
-                match read {
-                    /* Shorter than it was a moment ago: this is the whole of it now. */
-                    Ok(()) | Err(RangeFailure::Short { .. }) => Some(content),
-                    Err(RangeFailure::Missing) => None,
-                    Err(RangeFailure::Unreadable(why)) => return Err(remote("read", path, why)),
-                }
-            }
-            ["M", "2"] => match Trouble::of(&reply.words()?) {
-                Trouble::Gone => None,
-                trouble => return Err(remote("read", path, trouble.reason())),
-            },
-            _ => return Err(unexpected("M", &found)),
-        };
+        let content = small(&mut reply, path)?;
         reply.end()?;
         Ok(content)
+    }
+}
+
+/// Reads what `small` in `shell.sh` answered for the file at `path`: the file whole, or
+/// `None` when it is not there.
+fn small(reply: &mut Reply<'_>, path: &str) -> Result<Option<Vec<u8>>, TransportError> {
+    let found = reply.line()?;
+    match found.split(' ').collect::<Vec<_>>()[..] {
+        ["M", "0", size] => {
+            let mut content = Vec::new();
+            let read = range(reply, number(size)?, &mut |bytes| {
+                content.extend_from_slice(bytes);
+                Ok(())
+            })?;
+            match read {
+                /* Shorter than it was a moment ago: this is the whole of it now. */
+                Ok(()) | Err(RangeFailure::Short { .. }) => Ok(Some(content)),
+                Err(RangeFailure::Missing) => Ok(None),
+                Err(RangeFailure::Unreadable(why)) => Err(remote("read", path, why)),
+            }
+        }
+        ["M", "2"] => match Trouble::of(&reply.words()?) {
+            Trouble::Gone => Ok(None),
+            trouble => Err(remote("read", path, trouble.reason())),
+        },
+        _ => Err(unexpected("M", &found)),
     }
 }
 

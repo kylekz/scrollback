@@ -6,12 +6,15 @@
 //! Where it is, it hands back a [`Source`]: the agent's data at that location for one sync pass,
 //! through which the engine scans, hashes and fetches without knowing what an item is.
 //!
-//! Indexing, parsing and the tool map (PLAN §7.1) join [`Provider`] with phase 2; they read the
-//! archive, never a location.
+//! Parsing (PLAN §7.1) is on [`Provider`] itself: it reads a session's archived items
+//! ([`SessionItems`]), never a location, and maps the agent's tools onto the common kinds as it
+//! goes. What the index holds is derived from the parsed transcript, the same way for every
+//! agent ([`crate::transcript::index`]).
 
 mod claude_code;
 mod db_snapshot;
 mod file_tree;
+mod session;
 
 use std::fmt;
 use std::path::Path;
@@ -19,11 +22,13 @@ use std::path::Path;
 use thiserror::Error;
 use toolbox_store::rusqlite;
 
+use crate::transcript::{Subagent, Transcript};
 use crate::transport::{Halt, RangeSink, Transport, TransportError};
 
 pub use crate::transport::{Hashed, RangeFailure, Unlisted};
 pub use db_snapshot::DbSnapshot;
 pub use file_tree::{FileClass, FileTree};
+pub use session::{Audit, SessionItem, SessionItems};
 
 /// The providers scrollback ships. Every location is asked by each of them (PLAN §7.1).
 pub fn builtin() -> Vec<Box<dyn Provider>> {
@@ -78,6 +83,15 @@ pub enum ItemKind {
     ToolResult,
     /// Anything else the agent keeps: titles, metadata, memory.
     Sidecar,
+}
+
+impl ItemKind {
+    /// Whether the item is a conversation: a session's own transcript or a subagent's. Those
+    /// are what a parser reads as conversations, what makes a group of items a session, and
+    /// the only items of which a version can be held back (PLAN §4.2).
+    pub fn is_transcript(self) -> bool {
+        matches!(self, Self::Transcript | Self::Subagent)
+    }
 }
 
 /// One item the agent has at a location, as a scan finds it (PLAN §5).
@@ -170,6 +184,47 @@ pub trait Provider: Send + Sync {
         transport: &'a dyn Transport,
         scratch: &'a Path,
     ) -> Result<Option<Box<dyn Source + 'a>>, ProviderError>;
+
+    /// The version of the provider's parser. It goes up whenever [`Provider::parse`] or
+    /// [`Provider::subagent`] would read an archived session differently, and every session
+    /// indexed by another version is then parsed and indexed again (PLAN §7.5).
+    fn parser_version(&self) -> u32;
+
+    /**
+     * The transcript of the session whose archived items are `items` (PLAN §7.4), with its own
+     * conversation read and the subagents its calls started named, not read. Nothing fails a
+     * parse: records the provider doesn't know are kept (PLAN D5), and what can't be read is
+     * said in the transcript.
+     */
+    fn parse(&self, items: &dyn SessionItems) -> Transcript;
+
+    /// The subagent whose conversation is the item `item`, read, with the subagents its own
+    /// calls started named. An agent without subagents has none to read.
+    fn subagent(&self, _items: &dyn SessionItems, item: &str) -> Subagent {
+        Subagent::Unread { item: item.into() }
+    }
+
+    /**
+     * What the item `key` is: its kind, and the provider's id of the session it belongs to,
+     * if it belongs to one. It is what the provider's scan says of an item at a location, said
+     * of an archived one. The engine asks it again of everything archived when the parser's
+     * version changes, so that a better answer reaches the items that are gone from their
+     * location too.
+     */
+    fn classify(&self, key: &str) -> (ItemKind, Option<String>);
+}
+
+/**
+ * For development (the `check` example): checks `transcript`, which `provider` parsed from
+ * `items` with every subagent read, against the session's records read another way. `None`
+ * for a provider that has no such check.
+ */
+pub fn audit(
+    provider: ProviderId,
+    items: &dyn SessionItems,
+    transcript: &Transcript,
+) -> Option<Audit> {
+    (provider == claude_code::ID).then(|| claude_code::audit(items, transcript))
 }
 
 /**
