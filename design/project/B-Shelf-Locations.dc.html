@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Shelf locations page</title>
+<script src="./support.js"></script>
+<link rel="stylesheet" href="./sb.css">
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0}
+.days{display:flex;gap:2px}
+.days i{display:block;width:8px;height:16px;border-radius:2px;background:var(--green);opacity:.75}
+.days i.n{background:var(--s3);opacity:1}
+.days i.f{background:var(--red);opacity:.85}
+.lcard{display:flex;flex-direction:column;gap:12px;padding:16px;border-radius:12px;background:var(--s1);border:1px solid var(--line-subtle)}
+</style>
+</helmet>
+<div class="sb {{theme}}" style="width: 100%; height: 900px">
+<svg width="0" height="0" style="position: absolute" aria-hidden="true">
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"></path><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"></path></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"></path></symbol>
+<symbol id="i-lib" viewBox="0 0 24 24"><path d="m16 6 4 14"></path><path d="M12 6v14"></path><path d="M8 8v12"></path><path d="M4 4v16"></path></symbol>
+<symbol id="i-pin" viewBox="0 0 24 24"><circle cx="12" cy="10" r="3"></circle><path d="M12 21.7C17.3 17 20 13 20 10a8 8 0 1 0-16 0c0 3 2.7 6.9 8 11.7z"></path></symbol>
+<symbol id="i-sync" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path><path d="M8 16H3v5"></path></symbol>
+<symbol id="i-monitor" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="3" rx="2"></rect><path d="M8 21h8"></path><path d="M12 17v4"></path></symbol>
+<symbol id="i-box" viewBox="0 0 24 24"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"></path><path d="m3.3 7 8.7 5 8.7-5"></path><path d="M12 22V12"></path></symbol>
+<symbol id="i-laptop" viewBox="0 0 24 24"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"></path></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"></path><path d="M12 5v14"></path></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle><circle cx="5" cy="12" r="1"></circle></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"></path><path d="M12 9v4"></path><path d="M12 17h.01"></path></symbol>
+<symbol id="i-terminal" viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"></path><path d="M12 19h8"></path></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></symbol>
+<symbol id="i-min" viewBox="0 0 24 24"><path d="M5 12h14"></path></symbol>
+<symbol id="i-max" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="1"></rect></symbol>
+</svg>
+
+<div class="win">
+  <div class="row grow" style="align-items: stretch">
+    <nav class="side" style="width: 240px; padding: 0 8px 8px" aria-label="Library">
+      <div class="row" style="height: 52px; padding: 0 8px"><div class="mark"><i><b></b><b></b><b></b></i><span>scrollback</span></div></div>
+      <div class="col" style="gap: 1px">
+        <div class="srow"><svg class="ic"><use href="#i-lib"></use></svg>Library<span class="cnt">2,318</span></div>
+        <div class="srow"><svg class="ic"><use href="#i-inbox"></use></svg>Unsorted<span class="cnt acc">37</span></div>
+        <div class="srow"><svg class="ic"><use href="#i-star"></use></svg>Starred<span class="cnt">14</span></div>
+        <div class="srow sel"><svg class="ic"><use href="#i-pin"></use></svg>Locations<span class="row gap4" style="margin-left: auto"><span class="dot busy"></span><span class="dot ok"></span><span class="dot off"></span></span></div>
+      </div>
+      <div class="row" style="padding: 16px 8px 6px"><span class="over">Folders</span></div>
+      <div class="col" style="gap: 1px">
+        <div class="srow"><svg class="ic"><use href="#i-folder"></use></svg>dv<span class="cnt">412</span></div>
+        <div class="srow"><svg class="ic"><use href="#i-folder"></use></svg>fc<span class="cnt">288</span></div>
+        <div class="srow"><svg class="ic"><use href="#i-folder"></use></svg>folio<span class="cnt">356</span></div>
+        <div class="srow"><svg class="ic"><use href="#i-folder"></use></svg>slide<span class="cnt">97</span></div>
+        <div class="srow"><svg class="ic"><use href="#i-folder"></use></svg>toolbox-rs<span class="cnt">141</span></div>
+        <div class="srow"><svg class="ic"><use href="#i-folder"></use></svg>scrollback<span class="cnt">12</span></div>
+      </div>
+    </nav>
+
+    <div class="col grow">
+      <div class="row gap8" style="height: 52px; padding: 0 0 0 20px; border-bottom: 1px solid var(--line-subtle); flex: none">
+        <span class="w6">Locations</span><span class="t12 f3">Where scrollback pulls transcripts from. It reads only its own copies in D:\scrollback.</span>
+        <div class="grow"></div>
+        <span class="btn"><svg class="ic s14"><use href="#i-plus"></use></svg>Add location</span>
+        <span class="btn primary"><svg class="ic s14"><use href="#i-sync"></use></svg>Sync all now</span>
+        <div class="caps"><span><svg class="ic s14"><use href="#i-min"></use></svg></span><span><svg class="ic s12"><use href="#i-max"></use></svg></span><span><svg class="ic s14"><use href="#i-x"></use></svg></span></div>
+      </div>
+
+      <div class="row grow" style="align-items: stretch; min-height: 0">
+        <div class="col grow" style="padding: 20px 24px; gap: 14px; overflow: hidden">
+          <!-- WSL syncing -->
+          <div class="lcard">
+            <div class="row gap12">
+              <div class="av" style="width: 36px; height: 36px; border-radius: 9px; background: var(--blue-soft); color: var(--blue)"><svg class="ic s18"><use href="#i-box"></use></svg></div>
+              <div class="col grow gap4"><div class="row gap8"><span class="w6 t15">Ubuntu-24.04</span><span class="tag wsl">WSL</span><span class="t12 f3">found automatically · default distro</span></div><span class="mono t12 f3">/home/user/.claude/projects</span></div>
+              <span class="btn sm">Pause</span><span class="ibtn"><svg class="ic"><use href="#i-more"></use></svg></span>
+            </div>
+            <div class="col gap6">
+              <div class="row gap8 t12"><span class="dot busy"></span><span class="w5">Syncing</span><span class="f2">reading <span class="mono">-home-user-code-fc/6c1e…a2.jsonl</span></span><div class="grow"></div><span class="nums acc">212 of 1,412 files · 48 MB</span></div>
+              <span class="bar" style="height: 6px"><i style="width: 15%"></i></span>
+              <div class="row gap16 t12 f3"><span>1,374 sessions archived</span><span>38 changed since last sync → new versions</span><span>2 new</span></div>
+            </div>
+            <div class="row gap12"><span class="t11 f3" style="width: 80px">Last 30 days</span><div class="days"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></div>
+          </div>
+          <!-- Local ok -->
+          <div class="lcard">
+            <div class="row gap12">
+              <div class="av" style="width: 36px; height: 36px; border-radius: 9px; background: var(--accent-soft); color: var(--accent-text)"><svg class="ic s18"><use href="#i-monitor"></use></svg></div>
+              <div class="col grow gap4"><div class="row gap8"><span class="w6 t15">This PC</span><span class="tag win">Local</span></div><span class="mono t12 f3">C:\Users\user\.claude\projects</span></div>
+              <span class="btn sm">Sync now</span><span class="ibtn"><svg class="ic"><use href="#i-more"></use></svg></span>
+            </div>
+            <div class="row gap8 t12"><span class="dot ok"></span><span class="w5">Synced 2 min ago</span><span class="f3">· 412 sessions · nothing changed</span></div>
+            <div class="row gap12"><span class="t11 f3" style="width: 80px">Last 30 days</span><div class="days"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></div>
+          </div>
+          <!-- SSH unreachable -->
+          <div class="lcard">
+            <div class="row gap12">
+              <div class="av" style="width: 36px; height: 36px; border-radius: 9px; background: var(--s3); color: var(--fg2)"><svg class="ic s18"><use href="#i-laptop"></use></svg></div>
+              <div class="col grow gap4"><div class="row gap8"><span class="w6 t15">MacBook</span><span class="tag mac">SSH</span><span class="mono t12 f3">user@macbook.local</span></div><span class="mono t12 f3">/Users/user/.claude/projects</span></div>
+              <span class="btn sm">Try now</span><span class="ibtn"><svg class="ic"><use href="#i-more"></use></svg></span>
+            </div>
+            <div class="row gap8 t12"><span class="dot off"></span><span class="w5">Not reachable</span><span class="f3">· asleep or off the network · tries every 15 min</span></div>
+            <div class="row gap8 t12 f2" style="padding: 8px 10px; border-radius: 8px; background: var(--bg-panel)">Last good sync <span class="w5 nums" style="color: var(--fg)">13 Nov, 22:40</span><span class="f3">— 2 days old. 486 sessions are in the archive; anything newer on the MacBook isn't yet.</span></div>
+            <div class="row gap12"><span class="t11 f3" style="width: 80px">Last 30 days</span><div class="days"><i></i><i></i><i class="n"></i><i class="n"></i><i></i><i></i><i></i><i></i><i class="n"></i><i></i><i></i><i></i><i class="n"></i><i class="n"></i><i class="n"></i><i></i><i></i><i></i><i></i><i></i><i class="n"></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i class="n"></i><i class="n"></i></div><span class="t11 f3">grey: not reachable that day</span></div>
+          </div>
+          <!-- SSH failed -->
+          <div class="lcard" style="border-color: var(--red-soft)">
+            <div class="row gap12">
+              <div class="av" style="width: 36px; height: 36px; border-radius: 9px; background: var(--red-soft); color: var(--red)"><svg class="ic s18"><use href="#i-terminal"></use></svg></div>
+              <div class="col grow gap4"><div class="row gap8"><span class="w6 t15">buildbox</span><span class="tag mac">SSH</span><span class="mono t12 f3">user@10.0.0.42</span></div><span class="mono t12 f3">/home/user/.claude/projects</span></div>
+              <span class="btn sm">Edit</span><span class="ibtn"><svg class="ic"><use href="#i-more"></use></svg></span>
+            </div>
+            <div class="row gap8 t12 rd"><svg class="ic s14"><use href="#i-alert"></use></svg><span class="w5">Failed 11 min ago:</span><span class="mono">Permission denied (publickey).</span></div>
+            <span class="t12 f3">The host answered but refused the key C:\Users\user\.ssh\id_ed25519. Nothing was copied; 61 archived sessions are untouched.</span>
+          </div>
+        </div>
+
+        <!-- recent activity -->
+        <aside class="col" style="width: 360px; flex: none; border-left: 1px solid var(--line-subtle); background: var(--bg-panel); padding: 18px 16px; gap: 10px" aria-label="Sync activity">
+          <span class="over">Activity</span>
+          <div class="col" style="gap: 10px">
+            <div class="col gap4"><div class="row gap8 t12"><span class="dot busy"></span><span class="w5">Ubuntu-24.04</span><span class="f3 nums" style="margin-left: auto">now</span></div><span class="t12 f2">Sync started: 1,412 files to check</span></div>
+            <div class="col gap4"><div class="row gap8 t12"><span class="dot ok"></span><span class="w5">This PC</span><span class="f3 nums" style="margin-left: auto">11:58</span></div><span class="t12 f2">Nothing changed</span></div>
+            <div class="col gap4"><div class="row gap8 t12"><span class="dot" style="background: var(--red)"></span><span class="w5">buildbox</span><span class="f3 nums" style="margin-left: auto">11:49</span></div><span class="t12 f2">Permission denied (publickey)</span></div>
+            <div class="col gap4"><div class="row gap8 t12"><span class="dot off"></span><span class="w5">MacBook</span><span class="f3 nums" style="margin-left: auto">11:45</span></div><span class="t12 f2">Not reachable (timed out after 8 s)</span></div>
+            <div class="col gap4"><div class="row gap8 t12"><span class="dot ok"></span><span class="w5">Ubuntu-24.04</span><span class="f3 nums" style="margin-left: auto">11:30</span></div><span class="t12 f2">3 new sessions, 5 changed: kept as new versions. Filed 6 into folders, 2 to Unsorted.</span></div>
+            <div class="col gap4"><div class="row gap8 t12"><span class="dot warn"></span><span class="w5">Ubuntu-24.04</span><span class="f3 nums" style="margin-left: auto">10 Nov</span></div><span class="t12 f2">1 transcript shrank by 1,120 lines; held back as v4, v3 stays the reading copy.</span></div>
+          </div>
+          <div class="grow"></div>
+          <div class="card col gap8" style="padding: 12px">
+            <span class="t12 w5">Schedule</span>
+            <div class="row gap8 t12 f2"><span class="grow">Every 15 min while scrollback is open</span><span class="toggle on"></span></div>
+            <div class="row gap8 t12 f2"><span class="grow">On launch</span><span class="toggle on"></span></div>
+            <div class="row gap8 t12 f2"><span class="grow">Start a stopped WSL distro to sync it</span><span class="toggle"></span></div>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["dark","light"],"default":"light"},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { theme: this.props.theme === 'dark' ? 'dark' : 'light' };
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Log sync tab</title>
+<script src="./support.js"></script>
+<link rel="stylesheet" href="./sb.css">
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0}
+.tab{display:flex;align-items:center;gap:8px;height:32px;padding:0 10px 0 12px;border-radius:8px 8px 0 0;font-size:12.5px;color:var(--fg2);white-space:nowrap;align-self:flex-end;max-width:240px}
+.tab.on{background:var(--bg-app);color:var(--fg);font-weight:500;border:1px solid var(--line-subtle);border-bottom-color:var(--bg-app);margin-bottom:-1px;height:33px}
+.rail{width:52px;flex:none;display:flex;flex-direction:column;align-items:center;gap:4px;padding:10px 0;background:var(--bg-side);border-right:1px solid var(--line-subtle)}
+.rail .ibtn{width:36px;height:36px;border-radius:9px}
+.lr{display:flex;align-items:center;gap:10px;height:28px;padding:0 14px;font-size:12px;white-space:nowrap;border-bottom:1px solid var(--line-subtle)}
+.lr .tm{font-family:'Geist Mono',ui-monospace,monospace;font-size:11px;color:var(--fg3);width:84px;flex:none}
+.lr .lc{width:120px;flex:none}
+.lr .ev{width:96px;flex:none;font-weight:500}
+.lr .dt{flex:1 1 0;min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--fg2)}
+.loc{display:flex;flex-direction:column;gap:4px;padding:10px 12px;border-radius:8px}
+</style>
+</helmet>
+<div class="sb {{theme}}" style="width: 100%; height: 900px">
+<svg width="0" height="0" style="position: absolute" aria-hidden="true">
+<symbol id="i-kanban" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M8 7v7"></path><path d="M12 7v4"></path><path d="M16 7v9"></path></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></symbol>
+<symbol id="i-sync" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path><path d="M8 16H3v5"></path></symbol>
+<symbol id="i-set" viewBox="0 0 24 24"><path d="M20 7h-9"></path><path d="M14 17H5"></path><circle cx="17" cy="17" r="3"></circle><circle cx="7" cy="7" r="3"></circle></symbol>
+<symbol id="i-monitor" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="3" rx="2"></rect><path d="M8 21h8"></path><path d="M12 17v4"></path></symbol>
+<symbol id="i-box" viewBox="0 0 24 24"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"></path><path d="m3.3 7 8.7 5 8.7-5"></path><path d="M12 22V12"></path></symbol>
+<symbol id="i-laptop" viewBox="0 0 24 24"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"></path></symbol>
+<symbol id="i-term" viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"></path><path d="M12 19h8"></path></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"></path><path d="M12 5v14"></path></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"></path><path d="M12 9v4"></path><path d="M12 17h.01"></path></symbol>
+<symbol id="i-claude" viewBox="0 0 24 24"><path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4"></path></symbol>
+<symbol id="i-min" viewBox="0 0 24 24"><path d="M5 12h14"></path></symbol>
+<symbol id="i-max" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="1"></rect></symbol>
+<symbol id="i-hist" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path><path d="M3 3v5h5"></path><path d="M12 7v5l4 2"></path></symbol>
+</svg>
+
+<div class="win">
+  <div class="titlebar" style="padding-left: 14px; gap: 6px; align-items: stretch">
+    <div class="mark" style="width: 38px"><i><b></b><b></b><b></b></i></div>
+    <div class="row" style="gap: 2px; align-items: flex-end">
+      <div class="tab on"><svg class="ic s14"><use href="#i-sync"></use></svg>Sync</div>
+      <div class="tab"><svg class="mm ic s14"><use href="#i-claude"></use></svg><span class="ell">Throttle yt-dlp metadata backfill</span><svg class="ic s12 f3"><use href="#i-x"></use></svg></div>
+      <div class="tab"><svg class="ic s14"><use href="#i-plus"></use></svg></div>
+    </div>
+    <div class="grow"></div>
+    <div class="caps"><span><svg class="ic s14"><use href="#i-min"></use></svg></span><span><svg class="ic s12"><use href="#i-max"></use></svg></span><span><svg class="ic s14"><use href="#i-x"></use></svg></span></div>
+  </div>
+
+  <div class="row grow" style="align-items: stretch">
+    <nav class="rail" aria-label="Views">
+      <button class="ibtn" aria-label="Search"><svg class="ic s18"><use href="#i-search"></use></svg></button>
+      <button class="ibtn" aria-label="Folders board"><svg class="ic s18"><use href="#i-kanban"></use></svg></button>
+      <button class="ibtn on" aria-label="Sync" style="position: relative"><svg class="ic s18"><use href="#i-sync"></use></svg><span class="dot busy" style="position: absolute; right: 6px; top: 6px"></span></button>
+      <div class="grow"></div>
+      <button class="ibtn" aria-label="Settings"><svg class="ic s18"><use href="#i-set"></use></svg></button>
+    </nav>
+
+    <!-- locations -->
+    <aside class="col" style="width: 300px; flex: none; border-right: 1px solid var(--line-subtle); background: var(--bg-panel); padding: 12px 8px; gap: 4px" aria-label="Locations">
+      <div class="row gap8" style="padding: 0 8px 8px"><span class="w6">Locations</span><div class="grow"></div><span class="btn sm"><svg class="ic s14"><use href="#i-plus"></use></svg>Add</span></div>
+      <div class="loc" style="background: var(--s3)">
+        <div class="row gap8"><svg class="ic" style="color: var(--blue)"><use href="#i-box"></use></svg><span class="w5">Ubuntu-24.04</span><span class="tag wsl">WSL</span><span class="cnt acc">15%</span></div>
+        <span class="bar"><i style="width: 15%"></i></span>
+        <span class="t11 f3">212 of 1,412 files · started 12:01</span>
+      </div>
+      <div class="loc">
+        <div class="row gap8"><svg class="ic acc"><use href="#i-monitor"></use></svg><span class="w5">This PC</span><span class="tag win">Local</span><span class="cnt">2 min</span></div>
+        <span class="t11 f3">C:\Users\user\.claude · 412 sessions</span>
+      </div>
+      <div class="loc">
+        <div class="row gap8"><svg class="ic f3"><use href="#i-laptop"></use></svg><span class="w5">MacBook</span><span class="tag mac">SSH</span><span class="cnt">2 days</span></div>
+        <span class="t11 f2">Not reachable · last good sync 13 Nov, 22:40</span>
+        <span class="t11 f3">486 sessions here; newer ones on the Mac aren't</span>
+      </div>
+      <div class="loc">
+        <div class="row gap8"><svg class="ic rd"><use href="#i-term"></use></svg><span class="w5">buildbox</span><span class="tag mac">SSH</span><span class="cnt rd">failed</span></div>
+        <span class="mono t11 rd">Permission denied (publickey).</span>
+      </div>
+      <div class="loc" style="opacity: .7">
+        <div class="row gap8"><svg class="ic f3"><use href="#i-box"></use></svg><span class="w5 f2">Debian</span><span class="tag wsl">WSL</span><span class="cnt">not added</span></div>
+        <span class="t11 f3">Found on this PC · stopped</span>
+      </div>
+      <div class="grow"></div>
+      <div class="card col gap6" style="padding: 10px 12px">
+        <div class="row gap8 t12 f2"><span class="grow">Sync every 15 min</span><span class="toggle on"></span></div>
+        <div class="row gap8 t12 f2"><span class="grow">Archive</span><span class="mono t11">D:\scrollback · 4.1 GB</span></div>
+      </div>
+    </aside>
+
+    <main class="col grow" style="min-width: 0">
+      <div class="row gap8" style="height: 48px; padding: 0 14px; border-bottom: 1px solid var(--line-subtle); flex: none">
+        <span class="w6">Sync log</span>
+        <span class="chip acc">All</span><span class="chip">Changes</span><span class="chip">Problems 3</span>
+        <div class="grow"></div>
+        <span class="btn sm primary"><svg class="ic s14"><use href="#i-sync"></use></svg>Sync all now</span>
+      </div>
+      <div class="col" style="flex: none">
+        <div class="lr" style="color: var(--fg3); font-size: 11px; height: 26px; background: var(--bg-panel)"><span class="tm">TIME</span><span class="lc">LOCATION</span><span class="ev">EVENT</span><span class="dt" style="color: var(--fg3)">DETAIL</span></div>
+        <div class="lr"><span class="tm">12:01:44</span><span class="lc"><span class="tag wsl">Ubuntu-24.04</span></span><span class="ev acc">copying</span><span class="dt mono" style="font-size: 11.5px">-home-user-code-fc/6c1e5f0a…a2.jsonl · 812 KB</span></div>
+        <div class="lr"><span class="tm">12:01:40</span><span class="lc"><span class="tag wsl">Ubuntu-24.04</span></span><span class="ev">new version</span><span class="dt">"Portrait layout for vertical cams" v2 → v3, resumed, +214 lines</span></div>
+        <div class="lr"><span class="tm">12:01:39</span><span class="lc"><span class="tag wsl">Ubuntu-24.04</span></span><span class="ev">new</span><span class="dt">"Read WSL distros from the registry" → filed in scrollback by /mnt/d/Projects/scrollback</span></div>
+        <div class="lr"><span class="tm">12:01:38</span><span class="lc"><span class="tag wsl">Ubuntu-24.04</span></span><span class="ev">new</span><span class="dt">"Spike: tail JSONL while Claude writes" → Unsorted (/home/user/code/scrollback-spike)</span></div>
+        <div class="lr"><span class="tm">12:01:02</span><span class="lc"><span class="tag wsl">Ubuntu-24.04</span></span><span class="ev">started</span><span class="dt">1,412 files to check · 38 changed since 11:46</span></div>
+        <div class="lr"><span class="tm">11:58:10</span><span class="lc"><span class="tag win">This PC</span></span><span class="ev gr">done</span><span class="dt">412 checked · nothing changed · 0.8 s</span></div>
+        <div class="lr" style="background: var(--red-soft)"><span class="tm">11:49:31</span><span class="lc"><span class="tag mac">buildbox</span></span><span class="ev rd">failed</span><span class="dt rd mono" style="font-size: 11.5px">ssh user@10.0.0.42: Permission denied (publickey).</span></div>
+        <div class="lr"><span class="tm">11:45:08</span><span class="lc"><span class="tag mac">MacBook</span></span><span class="ev f3">unreachable</span><span class="dt">macbook.local didn't answer in 8 s · probably asleep · next try 12:00</span></div>
+        <div class="lr" style="background: var(--yellow-soft)"><span class="tm">10 Nov 08:02</span><span class="lc"><span class="tag wsl">Ubuntu-24.04</span></span><span class="ev yl">held back</span><span class="dt">"GPUI list virtualisation for 10k rows" shrank 1,522 → 402 lines · kept as v4, v3 stays the reading copy</span></div>
+      </div>
+
+      <!-- version comparison -->
+      <section class="col grow" style="border-top: 1px solid var(--line); min-height: 0" aria-label="Versions">
+        <div class="row gap8" style="height: 44px; padding: 0 14px; background: var(--bg-panel); border-bottom: 1px solid var(--line-subtle); flex: none">
+          <svg class="ic s14 f3"><use href="#i-hist"></use></svg><span class="w6">GPUI list virtualisation for 10k rows</span><span class="tag wsl">Ubuntu-24.04</span>
+          <div class="grow"></div>
+          <div class="seg"><span>v1</span><span>v2</span><span class="on">v3 ↔ v4</span></div>
+          <span class="btn sm">Keep v3</span><span class="btn sm">Read v4 instead</span>
+        </div>
+        <div class="row grow" style="align-items: stretch; min-height: 0">
+          <div class="col grow" style="padding: 12px 16px; gap: 8px; border-right: 1px solid var(--line-subtle)">
+            <div class="row gap8 t12"><span class="w5">v3</span><span class="f3 nums">9 Nov, 18:40 · 1,522 lines · 104 turns</span><span class="chip acc" style="height: 18px">reading</span></div>
+            <div class="diff" style="border: 1px solid var(--line-subtle); border-radius: 6px; overflow: hidden">
+              <div class="dl"><span class="ln">1</span><span class="mk"></span><span class="tx f2">{"type":"summary","summary":"GPUI list virtualisation"…}</span></div>
+              <div class="dl del"><span class="ln">2</span><span class="mk">−</span><span class="tx">{"type":"user","message":{"content":"ListState in gpui with 10k…"}}</span></div>
+              <div class="dl del"><span class="ln">3</span><span class="mk">−</span><span class="tx">{"type":"assistant","message":{"model":"claude-opus-5-5"…}}</span></div>
+              <div class="dl hunk"><span class="ln"></span><span class="mk"></span><span class="tx">··· 1,117 more lines only in v3</span></div>
+            </div>
+          </div>
+          <div class="col grow" style="padding: 12px 16px; gap: 8px">
+            <div class="row gap8 t12"><span class="w5">v4</span><span class="f3 nums">10 Nov, 08:02 · 402 lines · 21 turns</span><span class="chip warn" style="height: 18px">held back</span></div>
+            <div class="diff" style="border: 1px solid var(--line-subtle); border-radius: 6px; overflow: hidden">
+              <div class="dl"><span class="ln">1</span><span class="mk"></span><span class="tx f2">{"type":"summary","summary":"GPUI list virtualisation"…}</span></div>
+              <div class="dl add"><span class="ln">2</span><span class="mk">+</span><span class="tx">{"type":"system","subtype":"compact_boundary"…}</span></div>
+              <div class="dl add"><span class="ln">3</span><span class="mk">+</span><span class="tx">{"type":"user","isCompactSummary":true,…}</span></div>
+              <div class="dl hunk"><span class="ln"></span><span class="mk"></span><span class="tx">··· 398 lines, mostly also in v3</span></div>
+            </div>
+            <span class="t12 f2">Looks like the session was compacted at the source. Both versions stay in the archive whichever you read.</span>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <div class="statusbar"><span class="row gap6"><span class="dot busy"></span>Ubuntu-24.04 syncing 15%</span><span class="row gap6"><span class="dot ok"></span>This PC</span><span class="row gap6"><span class="dot off"></span>MacBook 2 days old</span><span class="row gap6 rd"><span class="dot" style="background: var(--red)"></span>buildbox failed</span></div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["dark","light"],"default":"light"},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { theme: this.props.theme === 'dark' ? 'dark' : 'light' };
+  }
+}
+</script>
+</body>
+</html>

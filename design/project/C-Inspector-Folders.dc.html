@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Inspector library switcher</title>
+<script src="./support.js"></script>
+<link rel="stylesheet" href="./sb.css">
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0}
+.ses{display:flex;align-items:center;gap:10px;height:40px;padding:0 10px;border-radius:7px;white-space:nowrap}
+</style>
+</helmet>
+<div class="sb {{theme}}" style="width: 100%; height: 900px">
+<svg width="0" height="0" style="position: absolute" aria-hidden="true">
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"></path><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"></path></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"></path><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"></path><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"></path></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"></path></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></symbol>
+<symbol id="i-cd" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"></path></symbol>
+<symbol id="i-cr" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"></path></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"></path><path d="M12 5v14"></path></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></symbol>
+<symbol id="i-claude" viewBox="0 0 24 24"><path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4"></path></symbol>
+<symbol id="i-branch" viewBox="0 0 24 24"><path d="M6 3v12"></path><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></symbol>
+<symbol id="i-panel" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M15 3v18"></path></symbol>
+<symbol id="i-min" viewBox="0 0 24 24"><path d="M5 12h14"></path></symbol>
+<symbol id="i-max" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="1"></rect></symbol>
+<symbol id="i-pen" viewBox="0 0 24 24"><path d="M21.17 6.81a1 1 0 0 0-3.99-3.99L3.84 16.17a2 2 0 0 0-.5.83l-1.32 4.35a.5.5 0 0 0 .62.62l4.35-1.32a2 2 0 0 0 .83-.5z"></path></symbol>
+</svg>
+
+<div class="win">
+  <div class="titlebar">
+    <div class="mark"><i><b></b><b></b><b></b></i></div>
+    <button class="row gap8" style="height: 28px; padding: 0 8px; border-radius: 6px; background: var(--s3)"><span class="w6">fc</span><span class="f3">·</span><span class="ell">Throttle yt-dlp metadata backfill</span><span class="tag wsl">Ubuntu-24.04</span><svg class="ic s14 f3"><use href="#i-cd"></use></svg><span class="kbd">Ctrl O</span></button>
+    <div class="grow row" style="justify-content: center"><span class="field" style="width: 420px"><svg class="ic s14"><use href="#i-search"></use></svg><span class="grow">Search the archive or run a command</span><span class="kbd">Ctrl K</span></span></div>
+    <span class="ibtn"><svg class="ic"><use href="#i-panel"></use></svg></span>
+    <div class="caps"><span><svg class="ic s14"><use href="#i-min"></use></svg></span><span><svg class="ic s12"><use href="#i-max"></use></svg></span><span><svg class="ic s14"><use href="#i-x"></use></svg></span></div>
+  </div>
+  <div class="row grow" style="align-items: stretch">
+    <div class="side" style="width: 248px"></div>
+    <div class="grow"></div>
+    <div style="width: 540px; border-left: 1px solid var(--line-subtle); background: var(--bg-panel)"></div>
+  </div>
+  <div class="statusbar"><span class="row gap6"><span class="dot ok"></span>All reachable locations synced 2 min ago</span><span class="row gap6"><span class="dot off"></span>MacBook 2 days old</span></div>
+
+  <div class="scrim" style="top: 40px"></div>
+
+  <!-- the switcher -->
+  <section class="sheet" style="left: 90px; top: 48px; width: 1000px; height: 780px" aria-label="Library">
+    <div class="row gap8" style="height: 46px; padding: 0 14px; border-bottom: 1px solid var(--line-subtle)">
+      <svg class="ic f3"><use href="#i-search"></use></svg><span class="grow f3">Filter sessions and folders</span><span class="t11 f3">↑↓ move · Enter open · F2 rename · drag to file</span>
+    </div>
+    <div class="row grow" style="align-items: stretch; min-height: 0">
+      <!-- folders -->
+      <div class="col" style="width: 260px; border-right: 1px solid var(--line-subtle); padding: 8px; gap: 1px; background: var(--bg-side)">
+        <div class="srow"><svg class="ic"><use href="#i-layers"></use></svg>All sessions<span class="cnt">2,318</span></div>
+        <div class="srow"><svg class="ic"><use href="#i-star"></use></svg>Starred<span class="cnt">14</span></div>
+        <div class="srow drop"><svg class="ic"><use href="#i-inbox"></use></svg>Unsorted<span class="cnt" style="color: var(--accent-text)">37</span></div>
+        <div class="row" style="padding: 14px 8px 6px"><span class="over">Folders</span><span class="ibtn" style="margin-left: auto; width: 22px; height: 22px"><svg class="ic s14"><use href="#i-plus"></use></svg></span></div>
+        <div class="srow"><span class="chev"><svg class="ic s12"><use href="#i-cr"></use></svg></span><svg class="ic"><use href="#i-folder"></use></svg>dv<span class="cnt">412</span></div>
+        <div class="srow sel"><span class="chev"><svg class="ic s12"><use href="#i-cd"></use></svg></span><svg class="ic"><use href="#i-folder"></use></svg>fc<span class="cnt">288</span></div>
+        <div class="srow"><span class="indent"></span><svg class="ic"><use href="#i-folder"></use></svg>player<span class="cnt">41</span></div>
+        <div class="srow"><span class="chev"></span><svg class="ic"><use href="#i-folder"></use></svg>folio<span class="cnt">356</span></div>
+        <div class="srow"><span class="chev"></span><svg class="ic"><use href="#i-folder"></use></svg>slide<span class="cnt">97</span></div>
+        <div class="srow"><span class="chev"></span><svg class="ic"><use href="#i-folder"></use></svg>toolbox-rs<span class="cnt">141</span></div>
+        <div class="srow"><span class="chev"></span><svg class="ic"><use href="#i-folder"></use></svg>scrollback<span class="cnt">12</span></div>
+        <div class="srow"><span class="chev"></span><svg class="ic"><use href="#i-folder"></use></svg>dotfiles<span class="cnt">44</span></div>
+        <div class="srow"><span class="chev"></span><svg class="ic"><use href="#i-folder"></use></svg>Scratch<span class="cnt">61</span></div>
+      </div>
+      <!-- folder detail + sessions -->
+      <div class="col grow" style="min-width: 0">
+        <div class="col" style="padding: 12px 14px; gap: 8px; border-bottom: 1px solid var(--line-subtle)">
+          <div class="row gap8"><span class="t15 w6">fc</span><span class="t12 f3">288 sessions · 1 subfolder</span><div class="grow"></div><span class="btn sm"><svg class="ic s14"><use href="#i-pen"></use></svg>Rename</span></div>
+          <div class="col" style="border: 1px solid var(--line); border-radius: 8px; overflow: hidden">
+            <div class="pathrow" style="background: var(--s1)"><svg class="ic s14 f3"><use href="#i-link"></use></svg><span class="t12 w5 grow">Project paths</span><span class="t11 f3">sessions under any of these file here on sync</span></div>
+            <div class="pathrow"><span class="tag win" style="width: 96px; justify-content: center">This PC</span><span class="mono t12 grow">D:\Projects\fc</span><span class="cnt">61</span><span class="ibtn" style="width: 22px; height: 22px"><svg class="ic s14"><use href="#i-x"></use></svg></span></div>
+            <div class="pathrow"><span class="tag wsl" style="width: 96px; justify-content: center">Ubuntu-24.04</span><span class="mono t12 grow">/home/user/code/fc</span><span class="cnt">173</span><span class="ibtn" style="width: 22px; height: 22px"><svg class="ic s14"><use href="#i-x"></use></svg></span></div>
+            <div class="pathrow"><span class="tag wsl" style="width: 96px; justify-content: center">Ubuntu-24.04</span><span class="mono t12 grow">/mnt/d/Projects/fc</span><span class="cnt">22</span><span class="ibtn" style="width: 22px; height: 22px"><svg class="ic s14"><use href="#i-x"></use></svg></span></div>
+            <div class="pathrow"><span class="tag mac" style="width: 96px; justify-content: center">MacBook</span><span class="mono t12 grow">/Users/user/code/fc</span><span class="cnt">32</span><span class="ibtn" style="width: 22px; height: 22px"><svg class="ic s14"><use href="#i-x"></use></svg></span></div>
+            <div class="pathrow"><svg class="ic s14 f3"><use href="#i-plus"></use></svg><span class="t12 f3 grow">Add path… <span class="mono">/mnt/d/</span> is offered for every <span class="mono">D:\</span> path, and the other way round</span></div>
+          </div>
+        </div>
+        <div class="col grow" style="padding: 6px; overflow: hidden">
+          <div class="ses"><svg class="mm ic s14"><use href="#i-claude"></use></svg><div class="col grow" style="min-width: 0"><span class="w5 ell">Portrait layout for vertical cams</span><span class="t11 f3 row gap6"><svg class="ic s12"><use href="#i-branch"></use></svg>main · Opus 5.5 · 118 calls</span></div><span class="tag win">This PC</span><span class="t11 f3 nums" style="width: 64px; text-align: right">2 Nov</span></div>
+          <div class="ses"><svg class="mm ic s14"><use href="#i-claude"></use></svg><div class="col grow" style="min-width: 0"><span class="w5 ell">Downloads: paste a whole playlist</span><span class="t11 f3 row gap6"><svg class="ic s12"><use href="#i-branch"></use></svg>playlists · Fable 5.2 · 68 calls</span></div><span class="tag mac">MacBook</span><span class="t11 f3 nums" style="width: 64px; text-align: right">12 Nov</span></div>
+          <div class="ses" style="opacity: .45; box-shadow: inset 0 0 0 1px var(--line-strong)"><svg class="mm ic s14"><use href="#i-claude"></use></svg><div class="col grow" style="min-width: 0"><span class="w5 ell">Scratch: test yt-dlp cookies flag</span><span class="t11 f3 row gap6"><svg class="ic s12"><use href="#i-branch"></use></svg>main · Haiku 4.5 · 6 calls</span></div><span class="tag wsl">Ubuntu-24.04</span><span class="t11 f3 nums" style="width: 64px; text-align: right">29 Oct</span></div>
+          <div class="ses"><svg class="mm ic s14"><use href="#i-claude"></use></svg><div class="col grow" style="min-width: 0"><span class="w5 ell">Line up four cams by their sound</span><span class="t11 f3 row gap6"><svg class="ic s12"><use href="#i-branch"></use></svg>av-sync · Opus 5.5 · 241 calls</span></div><span class="tag wsl">Ubuntu-24.04</span><span class="t11 f3 nums" style="width: 64px; text-align: right">21 Oct</span></div>
+          <div class="ses"><svg class="mm ic s14"><use href="#i-claude"></use></svg><div class="col grow" style="min-width: 0"><span class="w5 ell">Inbox auto-accept threshold</span><span class="t11 f3 row gap6"><svg class="ic s12"><use href="#i-branch"></use></svg>inbox · Sonnet 5 · 68 calls</span></div><span class="tag wsl">Ubuntu-24.04</span><span class="t11 f3 nums" style="width: 64px; text-align: right">6 Oct</span></div>
+          <div class="ses" style="background: var(--s3)"><svg class="mm ic s14"><use href="#i-claude"></use></svg><div class="col grow" style="min-width: 0"><span class="w6 ell">Throttle yt-dlp metadata backfill</span><span class="t11 f3 row gap6"><svg class="ic s12"><use href="#i-branch"></use></svg>backfill-throttle · Opus 4.6 · 62 calls · open</span></div><span class="tag wsl">Ubuntu-24.04</span><span class="t11 f3 nums" style="width: 64px; text-align: right">14 Mar</span></div>
+          <div class="ses"><svg class="mm ic s14"><use href="#i-claude"></use></svg><div class="col grow" style="min-width: 0"><span class="w5 ell">First pass at the sidebar tree</span><span class="t11 f3 row gap6"><svg class="ic s12"><use href="#i-branch"></use></svg>main · Opus 4.5 · 156 calls</span></div><span class="tag win">This PC</span><span class="t11 f3 nums" style="width: 64px; text-align: right">19 Dec 2025</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="row gap12 t12 f3" style="height: 36px; padding: 0 14px; border-top: 1px solid var(--line-subtle); background: var(--s1)">
+      <span>A session you file by hand stays where you put it. Path rules only file sessions that are new or still unsorted.</span>
+    </div>
+  </section>
+
+  <div class="row gap8" style="position: absolute; left: 210px; top: 152px; height: 30px; padding: 0 12px; border-radius: 8px; background: var(--s2); border: 1px solid var(--line); box-shadow: 0 14px 30px rgba(0,0,0,.45); font-size: 12px; white-space: nowrap">
+    <span class="w5">Scratch: test yt-dlp cookies flag</span><span class="f3">→</span><span class="acc w5">Unsorted</span>
+  </div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["dark","light"],"default":"dark"},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { theme: this.props.theme === 'light' ? 'light' : 'dark' };
+  }
+}
+</script>
+</body>
+</html>

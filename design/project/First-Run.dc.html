@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>First run, add a location</title>
+<script src="./support.js"></script>
+<link rel="stylesheet" href="./sb.css">
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0}
+.opt{display:flex;align-items:center;gap:12px;padding:12px 14px;border-top:1px solid var(--line-subtle)}
+.opt:first-child{border-top:0}
+</style>
+</helmet>
+<div class="sb {{theme}}" style="width: 100%; height: 900px">
+<svg width="0" height="0" style="position: absolute" aria-hidden="true">
+<symbol id="i-monitor" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="3" rx="2"></rect><path d="M8 21h8"></path><path d="M12 17v4"></path></symbol>
+<symbol id="i-box" viewBox="0 0 24 24"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"></path><path d="m3.3 7 8.7 5 8.7-5"></path><path d="M12 22V12"></path></symbol>
+<symbol id="i-laptop" viewBox="0 0 24 24"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"></path></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"></path></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><path d="M6 3l14 9-14 9V3z"></path></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"></path><path d="M12 5v14"></path></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="5.5"></circle><path d="m21 2-9.6 9.6"></path><path d="m15.5 7.5 3 3L22 7l-3-3"></path></symbol>
+<symbol id="i-min" viewBox="0 0 24 24"><path d="M5 12h14"></path></symbol>
+<symbol id="i-max" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="1"></rect></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></symbol>
+</svg>
+
+<div class="win">
+  <div class="titlebar"><div class="mark"><i><b></b><b></b><b></b></i><span>scrollback</span></div><div class="caps"><span><svg class="ic s14"><use href="#i-min"></use></svg></span><span><svg class="ic s12"><use href="#i-max"></use></svg></span><span><svg class="ic s14"><use href="#i-x"></use></svg></span></div></div>
+  <main class="grow row" style="justify-content: center; align-items: flex-start; padding-top: 64px">
+    <div class="col" style="width: 640px; gap: 20px">
+      <div class="col gap8">
+        <h1 style="margin: 0; font-size: 22px; line-height: 28px; font-weight: 600">Where are your transcripts?</h1>
+        <p class="f2" style="margin: 0; font-size: 14px; line-height: 21px">scrollback copies Claude Code transcripts from each location into its own archive and reads only the copies. A transcript that changes later is kept as a new version; nothing is overwritten.</p>
+      </div>
+
+      <div class="col gap8">
+        <span class="over">Found on this PC</span>
+        <div class="col" style="border: 1px solid var(--line); border-radius: 10px; background: var(--s1); overflow: hidden">
+          <label class="opt">
+            <span class="cb done"><svg class="ic s12" style="stroke-width: 2.4"><use href="#i-check"></use></svg></span>
+            <svg class="ic acc"><use href="#i-monitor"></use></svg>
+            <span class="col grow gap4"><span class="row gap6"><span class="w5">This PC</span><span class="tag win">Local</span></span><span class="mono t11 f3">C:\Users\user\.claude\projects</span></span>
+            <span class="t12 f2 nums">412 sessions</span>
+          </label>
+          <label class="opt">
+            <span class="cb done"><svg class="ic s12" style="stroke-width: 2.4"><use href="#i-check"></use></svg></span>
+            <svg class="ic bl"><use href="#i-box"></use></svg>
+            <span class="col grow gap4"><span class="row gap6"><span class="w5">Ubuntu-24.04</span><span class="tag wsl">WSL</span><span class="t11 f3">running · default</span></span><span class="mono t11 f3">/home/user/.claude/projects</span></span>
+            <span class="t12 f2 nums">1,412 sessions</span>
+          </label>
+          <label class="opt">
+            <span class="cb"></span>
+            <svg class="ic f3"><use href="#i-box"></use></svg>
+            <span class="col grow gap4"><span class="row gap6"><span class="w5 f2">Debian</span><span class="tag wsl">WSL</span><span class="t11 f3">stopped</span></span><span class="t11 f3">scrollback won't start a distro to look inside it unless you ask.</span></span>
+            <span class="btn sm"><svg class="ic s14"><use href="#i-play"></use></svg>Start and look</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="col gap8">
+        <span class="over">Another machine</span>
+        <div class="col gap12" style="border: 1px solid var(--line); border-radius: 10px; background: var(--s1); padding: 14px">
+          <div class="row gap8"><svg class="ic f2"><use href="#i-laptop"></use></svg><span class="w5">SSH host</span><span class="t12 f3">for a Mac or another PC; it can be asleep most of the time</span></div>
+          <div class="row gap8">
+            <label class="col gap4 grow"><span class="t12 f2 w5">Host</span><span class="field"><span class="mono t12" style="color: var(--fg)">user@macbook.local</span></span></label>
+            <label class="col gap4" style="width: 220px"><span class="t12 f2 w5">Transcripts folder</span><span class="field"><span class="mono t12" style="color: var(--fg)">~/.claude/projects</span></span></label>
+          </div>
+          <div class="row gap8"><svg class="ic s14 f3"><use href="#i-key"></use></svg><span class="t12 f2 grow">Uses your SSH agent or <span class="mono">~/.ssh/config</span>; no password is stored.</span><span class="btn sm">Test</span><span class="chip ok"><svg class="ic s12"><use href="#i-check"></use></svg>reachable · 486 sessions</span></div>
+        </div>
+        <span class="btn ghost" style="align-self: flex-start"><svg class="ic s14"><use href="#i-plus"></use></svg>Add a local folder instead</span>
+      </div>
+
+      <div class="hair"></div>
+      <div class="row gap12">
+        <div class="col gap4 grow"><span class="t12 f2 w5">Archive</span><span class="row gap6"><svg class="ic s14 f3"><use href="#i-folder"></use></svg><span class="mono t12">D:\scrollback</span><span class="t12 acc">Change</span></span></div>
+        <span class="btn">Skip for now</span>
+        <span class="btn primary">Sync 2,310 sessions</span>
+      </div>
+    </div>
+  </main>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["dark","light"],"default":"dark"},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { theme: this.props.theme === 'light' ? 'light' : 'dark' };
+  }
+}
+</script>
+</body>
+</html>

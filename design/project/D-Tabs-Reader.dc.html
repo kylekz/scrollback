@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Log reading view</title>
+<script src="./support.js"></script>
+<link rel="stylesheet" href="./sb.css">
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0}
+.tab{display:flex;align-items:center;gap:8px;height:32px;padding:0 10px 0 12px;border-radius:8px 8px 0 0;font-size:12.5px;color:var(--fg2);white-space:nowrap;align-self:flex-end;max-width:240px}
+.tab.on{background:var(--bg-app);color:var(--fg);font-weight:500;border:1px solid var(--line-subtle);border-bottom-color:var(--bg-app);margin-bottom:-1px;height:33px}
+.rail{width:52px;flex:none;display:flex;flex-direction:column;align-items:center;gap:4px;padding:10px 0;background:var(--bg-side);border-right:1px solid var(--line-subtle)}
+.rail .ibtn{width:36px;height:36px;border-radius:9px}
+.lg{display:flex;align-items:center;gap:10px;height:26px;padding:0 12px;font-size:12.5px;white-space:nowrap}
+.lg .tm{font-family:'Geist Mono',ui-monospace,monospace;font-size:11px;color:var(--fg3);width:52px;flex:none}
+.lg .kd{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:11.5px;width:52px;flex:none;color:var(--fg2)}
+.lg .ic{color:var(--fg3)}
+.lg .sm{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1 1 0}
+.lg .mt{font-family:'Geist Mono',ui-monospace,monospace;font-size:11px;color:var(--fg3);flex:none}
+.lg.prose .sm{font-family:inherit}
+.body{margin:2px 12px 8px 138px}
+.kf{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 8px;border-radius:6px;font-size:12px;border:1px solid var(--line);background:var(--s1);color:var(--fg2);white-space:nowrap;flex:none}
+.kf.off{background:transparent;border-style:dashed;color:var(--fg3);text-decoration:line-through}
+.kf .n{font-family:'Geist Mono',ui-monospace,monospace;font-size:11px;color:var(--fg3)}
+.mini{width:14px;flex:none;display:flex;flex-direction:column;gap:2px;padding:8px 3px;border-left:1px solid var(--line-subtle);background:var(--bg-panel);position:relative}
+.mini i{display:block;height:3px;border-radius:1px}
+.u{background:var(--fg)}.b{background:var(--blue)}.r{background:var(--line-strong)}.e{background:var(--green)}.a{background:var(--claude)}.t{background:var(--accent)}.p{background:var(--fg3)}
+</style>
+</helmet>
+<div class="sb {{theme}}" style="width: 100%; height: 900px">
+<svg width="0" height="0" style="position: absolute" aria-hidden="true">
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path></symbol>
+<symbol id="i-kanban" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M8 7v7"></path><path d="M12 7v4"></path><path d="M16 7v9"></path></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></symbol>
+<symbol id="i-sync" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path><path d="M8 16H3v5"></path></symbol>
+<symbol id="i-set" viewBox="0 0 24 24"><path d="M20 7h-9"></path><path d="M14 17H5"></path><circle cx="17" cy="17" r="3"></circle><circle cx="7" cy="7" r="3"></circle></symbol>
+<symbol id="i-cd" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"></path></symbol>
+<symbol id="i-cr" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"></path></symbol>
+<symbol id="i-term" viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"></path><path d="M12 19h8"></path></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"></path><path d="M14 2v4a2 2 0 0 0 2 2h4"></path><path d="M16 13H8"></path><path d="M16 17H8"></path></symbol>
+<symbol id="i-pen" viewBox="0 0 24 24"><path d="M21.17 6.81a1 1 0 0 0-3.99-3.99L3.84 16.17a2 2 0 0 0-.5.83l-1.32 4.35a.5.5 0 0 0 .62.62l4.35-1.32a2 2 0 0 0 .83-.5z"></path></symbol>
+<symbol id="i-todo" viewBox="0 0 24 24"><rect x="3" y="5" width="6" height="6" rx="1"></rect><path d="m3 17 2 2 4-4"></path><path d="M13 6h8"></path><path d="M13 12h8"></path><path d="M13 18h8"></path></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><path d="M12 8V4H8"></path><rect width="16" height="12" x="4" y="8" rx="2"></rect><path d="M2 14h2"></path><path d="M20 14h2"></path><path d="M15 13v2"></path><path d="M9 13v2"></path></symbol>
+<symbol id="i-bulb" viewBox="0 0 24 24"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"></path><path d="M9 18h6"></path><path d="M10 22h4"></path></symbol>
+<symbol id="i-img" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"></rect><circle cx="9" cy="9" r="2"></circle><path d="m21 15-3.09-3.09a2 2 0 0 0-2.82 0L6 21"></path></symbol>
+<symbol id="i-claude" viewBox="0 0 24 24"><path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4"></path></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="5"></circle><path d="M20 21a8 8 0 0 0-16 0"></path></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"></path></symbol>
+<symbol id="i-hist" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path><path d="M3 3v5h5"></path><path d="M12 7v5l4 2"></path></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"></path><path d="M12 5v14"></path></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></symbol>
+<symbol id="i-min" viewBox="0 0 24 24"><path d="M5 12h14"></path></symbol>
+<symbol id="i-max" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="1"></rect></symbol>
+<symbol id="i-branch" viewBox="0 0 24 24"><path d="M6 3v12"></path><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></symbol>
+</svg>
+
+<div class="win">
+  <div class="titlebar" style="padding-left: 14px; gap: 6px; align-items: stretch">
+    <div class="mark" style="width: 38px"><i><b></b><b></b><b></b></i></div>
+    <div class="row" style="gap: 2px; align-items: flex-end">
+      <div class="tab"><svg class="ic s14"><use href="#i-search"></use></svg>Search</div>
+      <div class="tab on"><svg class="mm ic s14"><use href="#i-claude"></use></svg><span class="ell">Throttle yt-dlp metadata backfill</span><svg class="ic s12 f3"><use href="#i-x"></use></svg></div>
+      <div class="tab"><svg class="mm ic s14"><use href="#i-claude"></use></svg><span class="ell">WSL backend reconnect after shutdown</span><svg class="ic s12 f3"><use href="#i-x"></use></svg></div>
+      <div class="tab"><svg class="mm ic s14"><use href="#i-claude"></use></svg><span class="ell">AO3 import: split chapters on hr</span><svg class="ic s12 f3"><use href="#i-x"></use></svg></div>
+      <div class="tab"><svg class="ic s14"><use href="#i-plus"></use></svg></div>
+    </div>
+    <div class="grow"></div>
+    <div class="caps"><span><svg class="ic s14"><use href="#i-min"></use></svg></span><span><svg class="ic s12"><use href="#i-max"></use></svg></span><span><svg class="ic s14"><use href="#i-x"></use></svg></span></div>
+  </div>
+
+  <div class="row grow" style="align-items: stretch">
+    <nav class="rail" aria-label="Views">
+      <button class="ibtn" aria-label="Search"><svg class="ic s18"><use href="#i-search"></use></svg></button>
+      <button class="ibtn" aria-label="Folders board"><svg class="ic s18"><use href="#i-kanban"></use></svg></button>
+      <button class="ibtn" aria-label="Sync" style="position: relative"><svg class="ic s18"><use href="#i-sync"></use></svg><span class="dot busy" style="position: absolute; right: 6px; top: 6px"></span></button>
+      <div class="grow"></div>
+      <button class="ibtn" aria-label="Settings"><svg class="ic s18"><use href="#i-set"></use></svg></button>
+    </nav>
+
+    <main class="col grow" style="min-width: 0">
+      <div class="row gap8" style="height: 40px; padding: 0 14px; border-bottom: 1px solid var(--line-subtle); flex: none; font-size: 12px">
+        <span class="chip"><svg class="ic s12"><use href="#i-folder"></use></svg>fc</span>
+        <span class="tag wsl">Ubuntu-24.04</span><span class="mono f3" style="font-size: 11.5px">/home/user/code/fc</span>
+        <span class="row gap4 f3"><svg class="ic s12"><use href="#i-branch"></use></svg>backfill-throttle</span>
+        <span class="f3 nums">14 Mar 2026 · 09:12–09:51</span>
+        <span class="f3 nums">1.84M in · 41k out</span>
+        <div class="grow"></div>
+        <span class="btn sm ghost"><svg class="ic s14"><use href="#i-hist"></use></svg>v3</span>
+        <div class="seg"><span class="on">Log</span><span>Read</span></div>
+      </div>
+      <div class="row gap6" style="height: 40px; padding: 0 14px; border-bottom: 1px solid var(--line-subtle); flex: none">
+        <span class="t12 f3" style="margin-right: 4px">Show</span>
+        <span class="kf"><svg class="ic s12"><use href="#i-user"></use></svg>Prompts<span class="n">4</span></span>
+        <span class="kf"><svg class="ic s12"><use href="#i-claude"></use></svg>Replies<span class="n">11</span></span>
+        <span class="kf"><svg class="ic s12"><use href="#i-bulb"></use></svg>Thinking<span class="n">6</span></span>
+        <span class="kf"><svg class="ic s12"><use href="#i-term"></use></svg>Bash<span class="n">23</span></span>
+        <span class="kf"><svg class="ic s12"><use href="#i-pen"></use></svg>Edits<span class="n">11</span></span>
+        <span class="kf off"><svg class="ic s12"><use href="#i-file"></use></svg>Reads<span class="n">21</span></span>
+        <span class="kf"><svg class="ic s12"><use href="#i-bot"></use></svg>Agents<span class="n">2</span></span>
+        <span class="kf"><svg class="ic s12"><use href="#i-todo"></use></svg>Todos<span class="n">5</span></span>
+        <div class="grow"></div>
+        <span class="field" style="height: 26px; width: 220px"><svg class="ic s14"><use href="#i-search"></use></svg><span class="t12 grow">Find in log</span><span class="kbd">Ctrl F</span></span>
+      </div>
+
+      <div class="row grow" style="align-items: stretch; min-height: 0">
+        <div class="grow" style="overflow-y: auto; padding: 6px 0 30px">
+          <div class="lg prose" style="background: var(--s1)"><span class="tm">09:12:04</span><svg class="ic s14" style="color: var(--fg)"><use href="#i-user"></use></svg><span class="kd" style="color: var(--fg)">You</span><span class="sm w5">The metadata backfill hammers YouTube on a fresh library — 1,729 cams…</span><span class="mt">+1 image</span><svg class="ic s12"><use href="#i-cd"></use></svg></div>
+          <div class="body md" style="font-size: 13.5px; line-height: 21px"><p style="margin: 0 0 8px">The metadata backfill hammers YouTube on a fresh library — 1,729 cams means 1,729 <code>yt-dlp --dump-json</code> processes queued at once, and we start getting 429s after ~200. Throttle it: a few at a time, back off on 429, and show progress in Library health instead of the spinner.</p><div class="shot" style="width: 180px; height: 104px"><div class="img"><i style="width: 60%"></i><i style="width: 85%"></i><i style="width: 40%"></i></div><div class="cap"><svg class="ic s12"><use href="#i-img"></use></svg>Screenshot 091044.png</div></div></div>
+          <div class="lg prose"><span class="tm">09:12:06</span><svg class="ic s14"><use href="#i-bulb"></use></svg><span class="kd">think</span><span class="sm think" style="font-size: 12.5px">If it spawns one task per fancam, a semaphore around spawn still leaves 1,729 futures holding their args…</span><span class="mt">14s</span><svg class="ic s12"><use href="#i-cr"></use></svg></div>
+          <div class="lg prose"><span class="tm">09:12:20</span><svg class="ic s14" style="color: var(--claude)"><use href="#i-claude"></use></svg><span class="kd">opus</span><span class="sm">Let me find where the backfill is scheduled first.</span></div>
+          <div class="lg" style="background: var(--s1)"><span class="tm">09:12:21</span><svg class="ic s14"><use href="#i-term"></use></svg><span class="kd">bash</span><span class="sm">rg -n "backfill" crates --type rust</span><span class="chip ok" style="height: 18px">0</span><span class="mt">0.1s</span><svg class="ic s12"><use href="#i-cd"></use></svg></div>
+          <div class="body term" style="border: 1px solid var(--line-subtle); border-radius: 6px"><pre>crates/fc_tools/src/backfill.rs:14:pub struct Backfill {
+crates/fc_tools/src/backfill.rs:41:pub fn spawn_backfill(library: &amp;Library, cx: &amp;mut App) -&gt; Task&lt;()&gt; {
+crates/fc_tools/src/backfill.rs:58:        cx.background_spawn(fetch_metadata(cam.clone(), tools.clone()))
+crates/fc_ui/src/health/mod.rs:88:    let pending = state.backfill.pending();
+crates/fc/src/main.rs:211:    fc_tools::backfill::spawn_backfill(&amp;library, cx).detach();</pre></div>
+          <div class="lg" style="color: var(--fg3); height: 20px"><span class="tm"></span><span style="width: 14px"></span><span class="t11">1 read hidden</span></div>
+          <div class="lg"><span class="tm">09:12:24</span><svg class="ic s14"><use href="#i-todo"></use></svg><span class="kd">todos</span><span class="sm" style="font-family: inherit"><span class="cb done" style="display: inline-flex; vertical-align: -2px; width: 12px; height: 12px"></span> Find where · <span class="acc">◐ Bound concurrency to 4</span> · <span class="f3">429 backoff · Progress in health</span></span><span class="mt">1/4</span></div>
+          <div class="lg" style="background: var(--s1)"><span class="tm">09:13:02</span><svg class="ic s14" style="color: var(--claude)"><use href="#i-bot"></use></svg><span class="kd">agent</span><span class="sm" style="font-family: inherit">Explore · How does Library health show background work?</span><span class="mt">haiku 4.5 · 9 calls · 41s</span><svg class="ic s12"><use href="#i-cd"></use></svg></div>
+          <div class="row" style="margin: 0 12px 4px 76px; align-items: stretch">
+            <div style="width: 1px; background: var(--claude); opacity: .5; margin-right: 10px"></div>
+            <div class="col grow" style="min-width: 0">
+              <div class="lg" style="padding: 0; height: 22px"><span class="tm">09:13:04</span><svg class="ic s12"><use href="#i-search"></use></svg><span class="kd">grep</span><span class="sm">"HealthItem" crates/fc_ui</span><span class="mt">7</span></div>
+              <div class="lg" style="padding: 0; height: 22px; color: var(--fg3)"><span class="tm"></span><span class="t11">2 reads hidden</span></div>
+              <div class="lg" style="padding: 0; height: 22px"><span class="tm">09:13:31</span><svg class="ic s12"><use href="#i-search"></use></svg><span class="kd">grep</span><span class="sm">"set_progress" crates</span><span class="mt">0</span></div>
+              <div class="lg prose" style="padding: 0; height: auto; white-space: normal; align-items: flex-start; padding-top: 4px"><span class="tm">09:13:43</span><svg class="ic s12" style="color: var(--claude); margin-top: 3px"><use href="#i-claude"></use></svg><span class="kd">haiku</span><span class="t12 f2" style="line-height: 18px; flex: 1 1 0">Library health renders a <code class="mono">HealthItem</code> per check; each has <code class="mono">progress: Option&lt;(usize, usize)&gt;</code>, drawn by <code class="mono">health_row</code> (mod.rs:118). Nothing sets it for the backfill.</span></div>
+            </div>
+          </div>
+          <div class="lg prose"><span class="tm">09:13:50</span><svg class="ic s14" style="color: var(--claude)"><use href="#i-claude"></use></svg><span class="kd">opus</span><span class="sm">Library health already draws progress, so this is a scheduling change plus one set_progress call.</span></div>
+          <div class="lg" style="background: var(--s1)"><span class="tm">09:31:07</span><svg class="ic s14"><use href="#i-pen"></use></svg><span class="kd">edit</span><span class="sm">crates/fc_tools/src/backfill.rs</span><span class="mt"><span class="gr">+12</span> <span class="rd">−5</span></span><svg class="ic s12"><use href="#i-cd"></use></svg></div>
+          <div class="body diff" style="border: 1px solid var(--line-subtle); border-radius: 6px; overflow: hidden">
+            <div class="dl del"><span class="ln">39</span><span class="mk">−</span><span class="tx">    <span class="k">let</span> tasks: <span class="ty">Vec</span>&lt;_&gt; = missing.<span class="fn">iter</span>().<span class="fn">map</span>(|cam| cx.<span class="fn">background_spawn</span>(…)).<span class="fn">collect</span>();</span></div>
+            <div class="dl add"><span class="ln">39</span><span class="mk">+</span><span class="tx">    <span class="k">let</span> health = <span class="ty">HealthState</span>::<span class="fn">global</span>(cx).<span class="fn">clone</span>();</span></div>
+            <div class="dl del"><span class="ln">44</span><span class="mk">−</span><span class="tx">        future::<span class="fn">join_all</span>(<span class="dw">tasks</span>).<span class="k">await</span>;</span></div>
+            <div class="dl add"><span class="ln">42</span><span class="mk">+</span><span class="tx">        <span class="k">let mut</span> queue = stream::<span class="fn">iter</span>(<span class="aw">missing</span>).<span class="fn">map</span>(…).<span class="fn">buffer_unordered</span>(<span class="ty">CONCURRENCY</span>);</span></div>
+            <div class="dl add"><span class="ln">43</span><span class="mk">+</span><span class="tx">        <span class="k">while let</span> <span class="ty">Some</span>(result) = queue.<span class="fn">next</span>().<span class="k">await</span> { … health.<span class="fn">set_progress</span>(…) }</span></div>
+          </div>
+          <div class="lg"><span class="tm">09:33:40</span><svg class="ic s14"><use href="#i-pen"></use></svg><span class="kd">edit</span><span class="sm">crates/fc_tools/src/fetch.rs</span><span class="mt"><span class="gr">+9</span> <span class="rd">−1</span></span><svg class="ic s12"><use href="#i-cr"></use></svg></div>
+          <div class="lg"><span class="tm">09:34:12</span><svg class="ic s14"><use href="#i-pen"></use></svg><span class="kd">edit</span><span class="sm">crates/fc_ui/src/health/mod.rs</span><span class="mt"><span class="gr">+4</span> <span class="rd">−2</span></span><svg class="ic s12"><use href="#i-cr"></use></svg></div>
+          <div class="lg" style="background: var(--s1)"><span class="tm">09:38:55</span><svg class="ic s14"><use href="#i-term"></use></svg><span class="kd">bash</span><span class="sm">cargo test -p fc_tools backfill</span><span class="chip ok" style="height: 18px">0</span><span class="mt">15.4s</span><svg class="ic s12"><use href="#i-cd"></use></svg></div>
+          <div class="body term" style="border: 1px solid var(--line-subtle); border-radius: 6px"><pre>    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.82s
+test backfill::tests::backs_off_on_429 ... <span class="gr">ok</span>
+test backfill::tests::never_exceeds_concurrency ... <span class="gr">ok</span>
+test backfill::tests::reports_progress ... <span class="gr">ok</span>
+test backfill::tests::resets_after_success ... <span class="gr">ok</span>
+test result: <span class="gr">ok</span>. 4 passed; 0 failed; 0 ignored; finished in 0.31s</pre></div>
+          <div class="lg prose" style="background: var(--s1)"><span class="tm">09:39:20</span><svg class="ic s14" style="color: var(--claude)"><use href="#i-claude"></use></svg><span class="kd">opus</span><span class="sm w5">Backfill is throttled</span><span class="mt">reply · 182 words</span><svg class="ic s12"><use href="#i-cd"></use></svg></div>
+          <div class="body md" style="font-size: 13.5px; line-height: 21px">
+            <p>The backfill now runs through a bounded queue, so a fresh library never has more than <strong>4</strong> <code>yt-dlp</code> processes alive.</p>
+            <ul>
+              <li><strong>429s:</strong> <code>HTTP Error 429</code> on stderr becomes <code>FetchError::RateLimited</code>; the loop backs off, doubling.</li>
+              <li><strong>Progress:</strong> "Fetching metadata · 212 of 1,729" through the existing <a href="#">progress bar</a>.</li>
+            </ul>
+            <div class="tbl" style="max-width: 520px">
+              <div class="tr"><span>Setting</span><span>Default</span><span>Where</span></div>
+              <div class="tr"><span><code>backfill.concurrency</code></span><span class="nums">4</span><span><code>settings.toml</code></span></div>
+              <div class="tr"><span><code>backfill.backoff_start</code></span><span class="nums">30 s</span><span><code>settings.toml</code></span></div>
+              <div class="tr"><span><code>backfill.backoff_max</code></span><span class="nums">8 min</span><span><code>settings.toml</code></span></div>
+            </div>
+            <div class="codeblk" style="max-width: 520px"><div class="hd"><span class="mono">toml</span></div><pre><span class="pr">[backfill]</span>
+concurrency = <span class="nu">4</span>
+backoff_start = <span class="st">"30s"</span>
+backoff_max = <span class="st">"8m"</span></pre></div>
+          </div>
+          <div class="lg prose" style="background: var(--s1)"><span class="tm">09:40:02</span><svg class="ic s14" style="color: var(--fg)"><use href="#i-user"></use></svg><span class="kd" style="color: var(--fg)">You</span><span class="sm w5">Back off on 429 only. A 403 means the video is private; skip it and mark it in health.</span><svg class="ic s12"><use href="#i-cr"></use></svg></div>
+        </div>
+        <!-- minimap rail -->
+        <div class="mini" aria-hidden="true">
+          <i class="u"></i><i class="p"></i><i class="b"></i><i class="t"></i><i class="a"></i><i class="a"></i><i class="p"></i><i class="e"></i><i class="e"></i><i class="b"></i><i class="p"></i><i class="u"></i><i class="b"></i><i class="b"></i><i class="e"></i><i class="b"></i><i class="t"></i><i class="p"></i><i class="u"></i><i class="p"></i><i class="e"></i><i class="e"></i><i class="b"></i><i class="b"></i><i class="b"></i><i class="e"></i><i class="b"></i><i class="t"></i><i class="p"></i><i class="e"></i><i class="b"></i><i class="b"></i><i class="e"></i><i class="e"></i><i class="b"></i><i class="t"></i><i class="p"></i><i class="u"></i><i class="p"></i><i class="e"></i><i class="b"></i><i class="b"></i><i class="t"></i><i class="p"></i>
+          <div style="position: absolute; left: 1px; right: 1px; top: 6px; height: 120px; border: 1.5px solid var(--accent); border-radius: 3px"></div>
+        </div>
+      </div>
+    </main>
+  </div>
+  <div class="statusbar">
+    <span class="row gap6"><span class="dot busy"></span>Ubuntu-24.04 syncing 15%</span>
+    <span class="row gap6"><span class="dot ok"></span>This PC</span>
+    <span class="row gap6"><span class="dot off"></span>MacBook 2 days old</span>
+    <span style="margin-left: auto" class="f3 nums">62 events shown of 83 · 21 reads hidden</span>
+  </div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["dark","light"],"default":"light"},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { theme: this.props.theme === 'dark' ? 'dark' : 'light' };
+  }
+}
+</script>
+</body>
+</html>
