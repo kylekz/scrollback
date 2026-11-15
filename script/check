@@ -15,7 +15,8 @@ usage: script/check [--fast | --e2e-only]
   2. cargo clippy in scrollback's two shapes: default (with automation) and the shipped app
      (-p scrollback --no-default-features)
   3. gpui boundary: no gpui in the headless crates' dependency trees
-  4. agent names: no agent is named in sb_core outside its provider, nor anywhere in sb_ui
+  4. agent names: no agent is named in sb_core outside its provider, nor anywhere in sb_ui,
+     in a file's contents or in its path
   5. cargo test --workspace
   6. e2e scenarios in tests/e2e through sb_e2e (background)   skipped with --fast
      (--e2e-only: this step alone)
@@ -55,11 +56,44 @@ step() {
 # The crates that must never depend on gpui, even transitively (PLAN §3).
 headless_crates=(sb_core sb_test_support sb_e2e)
 
-# The agents scrollback has a provider for, as they are spelled in code and in copy. Each may be
-# named only in its provider: crates/sb_core/src/provider/<provider>, a file or a folder
-# (PLAN D8, §12). Matched whatever the case.
-agent_names=(claude)
-agent_providers=(claude_code)
+# The agents scrollback has a provider for, one entry each: the agent's name as one lowercase
+# word, then its provider's module. An agent may be named only in its provider,
+# crates/sb_core/src/provider/<module>, a file or a folder (PLAN D8, §12). Adding an agent is
+# adding an entry.
+agents=(claude:claude_code)
+# Where no agent may be named, in a file's contents or in a path.
+agent_scope=(crates/sb_core crates/sb_ui)
+# The one file outside the providers that has to refer to them: it declares each provider's
+# module and lists the providers. There, a line may name an agent only as its module's
+# identifier (`mod <module>;`, `<module>::…`).
+provider_list=crates/sb_core/src/provider/mod.rs
+
+# An extended regex for the agent name $1 as a whole word or as one word of an identifier, in the
+# casings identifiers use: `name`, `name_x`, `x-name`, `nameX`; `Name`, `NameX`, `xName`;
+# `NAME`, `NAME_X`. A name inside a longer word doesn't match, so a short name is safe to add.
+agent_pattern() {
+    local lower="$1" upper capital
+    upper="$(printf '%s' "$lower" | tr '[:lower:]' '[:upper:]')"
+    capital="$(printf '%s' "${lower:0:1}" | tr '[:lower:]' '[:upper:]')${lower:1}"
+    printf '(^|[^A-Za-z])%s($|[^a-z])|(^|[^A-Z])%s($|[^a-z])|(^|[^A-Za-z])%s($|[^A-Za-z])' \
+        "$lower" "$capital" "$upper"
+}
+
+# Filters `grep -n` lines on stdin: drops those from $provider_list in which the pattern $1
+# matches nothing once the module identifier $2 is taken out.
+drop_module_identifier_lines() {
+    local pattern="$1" strip="s/(^|[^A-Za-z0-9_])$2(\$|[^A-Za-z0-9_])/\\1\\2/g" line text
+    while IFS= read -r line; do
+        if [[ "$line" == "$provider_list":* ]]; then
+            text="${line#"$provider_list":*:}"
+            # Twice: two identifiers one character apart share that character.
+            if ! printf '%s\n' "$text" | sed -E -e "$strip" -e "$strip" | grep -qE -e "$pattern"; then
+                continue
+            fi
+        fi
+        printf '%s\n' "$line"
+    done
+}
 
 if [[ "$e2e_only" -eq 0 ]]; then
     step 1 "cargo fmt --all --check"
@@ -94,18 +128,24 @@ if [[ "$e2e_only" -eq 0 ]]; then
         exit 1
     fi
 
-    step 4 "agent names: ${agent_names[*]} only in crates/sb_core/src/provider/<provider>"
+    step 4 "agent names: each only in crates/sb_core/src/provider/<its module>"
     agents_ok=1
-    for i in "${!agent_names[@]}"; do
-        name="${agent_names[$i]}"
-        provider="crates/sb_core/src/provider/${agent_providers[$i]}"
-        # Every line naming the agent in the two crates, less the provider's own file or folder.
-        offenders="$(grep -rIin -e "$name" crates/sb_core crates/sb_ui |
-            grep -v -e "^$provider\.rs:" -e "^$provider/" || true)"
-        if [[ -n "$offenders" ]]; then
+    for agent in "${agents[@]}"; do
+        name="${agent%%:*}"
+        module="${agent#*:}"
+        provider="crates/sb_core/src/provider/$module"
+        pattern="$(agent_pattern "$name")"
+        # Every line naming the agent, less the provider's own file or folder and the module
+        # identifier in the provider list; then every path naming it, less the provider's own.
+        offenders="$(grep -rInE -e "$pattern" "${agent_scope[@]}" |
+            grep -v -e "^$provider\.rs:" -e "^$provider/" |
+            drop_module_identifier_lines "$pattern" "$module" || true)"
+        paths="$(find "${agent_scope[@]}" | grep -E -e "$pattern" |
+            grep -v -E -e "^$provider(\.rs|/.*)?\$" || true)"
+        if [[ -n "$offenders" || -n "$paths" ]]; then
             agents_ok=0
             echo "error: \"$name\" is named outside $provider:" >&2
-            printf '%s\n' "$offenders" | sed 's/^/  /' >&2
+            printf '%s\n' "$offenders" "$paths" | sed -e '/^$/d' -e 's/^/  /' >&2
         else
             echo "ok: $name"
         fi
