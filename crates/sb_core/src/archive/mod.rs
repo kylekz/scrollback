@@ -3,18 +3,21 @@
 //! and [`verify`] re-hashes them against the catalogue.
 //!
 //! What keeps archived bytes safe (PLAN §2.3):
-//! - a segment is a new file, written whole before the catalogue records it, and no file the
-//!   catalogue records is ever replaced ([`Archive::place_segment`]);
+//! - a segment is a new file, written whole before the catalogue records it, and it is moved
+//!   into place with a rename that fails if a file is already there ([`Archive::store`]), so
+//!   the file system itself refuses to replace one;
 //! - nothing here deletes a file under `files/`. A file there that the catalogue doesn't know (a
 //!   store that was interrupted between the rename and the commit, or a catalogue restored from
 //!   an older backup) is moved to `orphans/` when the archive is opened, so the tree holds only
-//!   what the catalogue records and no bytes are lost.
+//!   what the catalogue records and no bytes are lost;
+//! - an archive whose catalogue is missing is not opened, and one whose catalogue is empty
+//!   while `files/` is not has nothing set aside: neither is taken for a fresh archive.
 
 mod layout;
 mod segment;
 mod verify;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,13 +27,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::catalogue::{self, Catalogue, CatalogueError};
-use crate::hash::Hash;
 use crate::location::LocationId;
 
 pub(crate) use layout::item_folder;
-pub(crate) use segment::SegmentWriter;
-pub use segment::VersionReader;
-pub use verify::{Damage, Problem, VerifyReport};
+pub use segment::{Problem, VersionReader};
+pub(crate) use segment::{Sealed, SegmentWriter};
+pub use verify::{Damage, Unread, VerifyReport};
 
 /// The layout this build writes, in `archive.json`.
 const FORMAT: u32 = 1;
@@ -62,6 +64,20 @@ pub enum ArchiveError {
         .dir.display()
     )]
     NewerFormat { dir: PathBuf, found: u32 },
+    /// The archive's catalogue is gone. A new one is not started in its place: that would make
+    /// everything archived look unknown.
+    #[error(
+        "the archive at {} has lost its catalogue.{}",
+        .dir.display(),
+        match .newest_backup {
+            Some(backup) => format!(" The newest backup of it is {}.", backup.display()),
+            None => " There is no backup of it.".to_string(),
+        }
+    )]
+    CatalogueMissing {
+        dir: PathBuf,
+        newest_backup: Option<PathBuf>,
+    },
     /// A segment was about to be stored where the catalogue already records one.
     #[error("{} is already archived and is never overwritten", .0.display())]
     SegmentExists(PathBuf),
@@ -127,22 +143,31 @@ impl Archive {
             id: uuid::Uuid::new_v4().simple().to_string(),
             created: catalogue::now_ms(),
         };
-        let tmp = dir.join(layout::TMP);
-        fs::create_dir_all(&tmp).map_err(io_error("create", &tmp))?;
+        let archive = Self::start(dir, lock, manifest.id.clone())?;
+        /* The manifest comes last: it is what says the folder holds an archive, catalogue
+        included. */
         let json = serde_json::to_vec_pretty(&manifest)
             .expect("a struct of numbers and text always serializes");
-        segment::write_durable(&tmp, &manifest_path, &json)
+        segment::write_new(&archive.tmp(), &manifest_path, &json)
+            .and_then(|()| segment::sync_dir(dir))
             .map_err(io_error("write", &manifest_path))?;
-        Self::start(dir, lock, manifest.id)
+        Ok(archive)
     }
 
-    /// Opens the archive in `dir`. A folder without one is [`ArchiveError::NotAnArchive`].
+    /// Opens the archive in `dir`. A folder without one is [`ArchiveError::NotAnArchive`], and
+    /// an archive without its catalogue is [`ArchiveError::CatalogueMissing`].
     pub fn open(dir: &Path) -> Result<Self> {
         let manifest_path = dir.join(layout::MANIFEST);
         if !manifest_path.is_file() {
             return Err(ArchiveError::NotAnArchive(dir.to_path_buf()));
         }
         let lock = lock(dir)?;
+        if !dir.join(catalogue::DATABASE).is_file() {
+            return Err(ArchiveError::CatalogueMissing {
+                dir: dir.to_path_buf(),
+                newest_backup: catalogue::newest_backup(dir),
+            });
+        }
         let json = fs::read(&manifest_path).map_err(io_error("read", &manifest_path))?;
         let manifest: Manifest =
             serde_json::from_slice(&json).map_err(|source| ArchiveError::Manifest {
@@ -172,7 +197,10 @@ impl Archive {
             } else {
                 fs::remove_file(&path)
             };
-            removed.map_err(io_error("remove", &path))?;
+            /* A leftover another program holds open is no reason not to start. */
+            if let Err(error) = removed {
+                log::warn!("could not remove {}: {error}", path.display());
+            }
         }
         let archive = Self {
             dir: dir.to_path_buf(),
@@ -204,23 +232,34 @@ impl Archive {
         &self.catalogue
     }
 
-    /// The content of a version, read from its segments in order.
+    /// The archive's folder for work in flight. What is left in it is removed at the next start.
+    pub(crate) fn tmp(&self) -> PathBuf {
+        self.dir.join(layout::TMP)
+    }
+
+    /// The content of a version, read from its segments in order and checked against the
+    /// catalogue as it is read.
     pub fn read_version(&self, version: i64) -> Result<VersionReader> {
         let stored = self
             .catalogue
             .stored_version(version)?
             .ok_or(ArchiveError::UnknownVersion(version))?;
-        let dir = self
-            .dir
-            .join(layout::item_dir(
-                &stored.location,
-                &stored.provider,
-                &stored.folder,
-            ))
-            .join(layout::version_dir(stored.version.number));
-        Ok(VersionReader::new(stored.segments.iter().map(|segment| {
-            dir.join(layout::segment_file(segment.offset))
-        })))
+        Ok(self.reader(stored))
+    }
+
+    fn reader(&self, stored: catalogue::Stored) -> VersionReader {
+        VersionReader::new(
+            self.dir
+                .join(layout::item_dir(
+                    &stored.location,
+                    &stored.provider,
+                    &stored.folder,
+                ))
+                .join(layout::version_dir(stored.version.number)),
+            stored.segments,
+            stored.version.length,
+            stored.version.hash,
+        )
     }
 
     /// Marks `location` as being synced until the guard is dropped; `None` while it already is
@@ -238,22 +277,35 @@ impl Archive {
 
     /// A segment to fill, in `tmp/`.
     pub(crate) fn segment_writer(&self) -> Result<SegmentWriter> {
-        let tmp = self.dir.join(layout::TMP);
+        let tmp = self.tmp();
         SegmentWriter::create(&tmp).map_err(io_error("create a file in", &tmp))
     }
 
-    /// Makes sure the item's folder and its `source.json` exist.
-    pub(crate) fn prepare_item(
+    /**
+     * Makes the item `key` durable on disk as far as the catalogue is about to record it: its
+     * folder with its `source.json`, and `segment`, if there is one, in its place as the bytes
+     * from `offset` of version `number`. The caller commits to the catalogue next.
+     *
+     * A file already where the segment goes is one the catalogue never recorded (it is what an
+     * interrupted store leaves) and is set aside. One the catalogue does record is never
+     * replaced: [`ArchiveError::SegmentExists`].
+     */
+    pub(crate) fn store(
         &self,
+        segment: Option<Sealed>,
         location: &LocationId,
         provider: &str,
         key: &str,
+        number: u32,
+        offset: u64,
     ) -> Result<()> {
-        let dir = self
-            .dir
-            .join(layout::item_dir(location, provider, &item_folder(key)));
-        segment::create_dir_durable(&dir).map_err(io_error("create", &dir))?;
-        let source = dir.join(layout::SOURCE);
+        let folder = item_folder(key);
+        let item = layout::item_dir(location, provider, &folder);
+        let item_dir = self.dir.join(&item);
+        /* The folders that gain an entry here. Each is flushed once, at the end. */
+        let mut changed = BTreeSet::new();
+        segment::create_dirs(&item_dir, &mut changed).map_err(io_error("create", &item_dir))?;
+        let source = item_dir.join(layout::SOURCE);
         if !source.exists() {
             let json = serde_json::to_vec_pretty(&SourceManifest {
                 provider,
@@ -261,47 +313,37 @@ impl Archive {
                 key,
             })
             .expect("a struct of text always serializes");
-            segment::write_durable(&self.dir.join(layout::TMP), &source, &json)
-                .map_err(io_error("write", &source))?;
+            segment::write_new(&self.tmp(), &source, &json).map_err(io_error("write", &source))?;
+            changed.insert(item_dir.clone());
+        }
+        if let Some(sealed) = segment {
+            let version = item.join(layout::version_dir(number));
+            let version_dir = self.dir.join(&version);
+            segment::create_dirs(&version_dir, &mut changed)
+                .map_err(io_error("create", &version_dir))?;
+            let relative = version.join(layout::segment_file(offset));
+            let to = self.dir.join(&relative);
+            let mut file = sealed.file;
+            /* The rename refuses to replace a file, so nothing here can overwrite one. */
+            while let Err(blocked) = file.persist_noclobber(&to) {
+                if blocked.error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(io_error("store", &to)(blocked.error));
+                }
+                if self
+                    .catalogue
+                    .has_segment(location, provider, &folder, number, offset)?
+                {
+                    return Err(ArchiveError::SegmentExists(to));
+                }
+                self.set_aside(&relative)?;
+                file = blocked.path;
+            }
+            changed.insert(version_dir);
+        }
+        for dir in changed {
+            segment::sync_dir(&dir).map_err(io_error("flush", &dir))?;
         }
         Ok(())
-    }
-
-    /**
-     * Moves a written segment to its place as the bytes from `offset` of version `number` of
-     * the item `key`, durably, and returns the hash of its uncompressed bytes. The caller
-     * commits it to the catalogue next.
-     *
-     * A file already there is one the catalogue never recorded (it is what an interrupted store
-     * leaves) and is set aside. One the catalogue does record is never replaced.
-     */
-    pub(crate) fn place_segment(
-        &self,
-        writer: SegmentWriter,
-        location: &LocationId,
-        provider: &str,
-        key: &str,
-        number: u32,
-        offset: u64,
-    ) -> Result<Hash> {
-        let folder = item_folder(key);
-        let relative = layout::item_dir(location, provider, &folder)
-            .join(layout::version_dir(number))
-            .join(layout::segment_file(offset));
-        let to = self.dir.join(&relative);
-        if let Some(dir) = to.parent() {
-            segment::create_dir_durable(dir).map_err(io_error("create", dir))?;
-        }
-        if to.exists() {
-            if self
-                .catalogue
-                .has_segment(location, provider, &folder, number, offset)?
-            {
-                return Err(ArchiveError::SegmentExists(to));
-            }
-            self.set_aside(&relative)?;
-        }
-        writer.finish(&to).map_err(io_error("store", &to))
     }
 
     /// Moves the file or folder at `relative` (to the archive, under `files/`) to the same path
@@ -324,7 +366,8 @@ impl Archive {
     }
 
     /// Sets aside every segment file and item folder under `files/` that the catalogue doesn't
-    /// record (the module docs). Returns how many were moved.
+    /// record (the module docs). Returns how many were moved. One that can't be moved now (a
+    /// file another program holds) stays where it is, to be dealt with when it is in the way.
     fn set_aside_uncatalogued(&self) -> Result<usize> {
         let mut known: HashMap<PathBuf, HashSet<(u32, u64)>> = HashMap::new();
         for stored in self.catalogue.stored()? {
@@ -342,22 +385,32 @@ impl Archive {
                         .map(|segment| (stored.version.number, segment.offset)),
                 );
         }
-        let mut set_aside = 0;
         /* files/<location>/<provider>/<ab>/<item>: item folders are four levels down. */
-        let mut level = vec![PathBuf::from(layout::FILES)];
+        let mut items = vec![PathBuf::from(layout::FILES)];
         for _ in 0..4 {
             let mut below = Vec::new();
-            for dir in &level {
+            for dir in &items {
                 for name in self.entries(dir, true)? {
                     below.push(dir.join(name));
                 }
             }
-            level = below;
+            items = below;
         }
-        for item in level {
+        /* A catalogue that records nothing beside files that are there is not a fresh archive:
+        it is the wrong catalogue, and setting everything aside would empty the archive. */
+        if !self.catalogue.has_items()? && !items.is_empty() {
+            log::warn!(
+                "the catalogue of {} records nothing, but its files/ holds {} items; they are \
+                 left where they are",
+                self.dir.display(),
+                items.len()
+            );
+            return Ok(0);
+        }
+        let mut uncatalogued = Vec::new();
+        for item in items {
             let Some(segments) = known.get(&item) else {
-                self.set_aside(&item)?;
-                set_aside += 1;
+                uncatalogued.push(item);
                 continue;
             };
             for version in self.entries(&item, true)? {
@@ -368,12 +421,20 @@ impl Archive {
                         .zip(layout::offset_of(&file))
                         .is_some_and(|segment| segments.contains(&segment));
                     if !recorded {
-                        self.set_aside(&dir.join(file))?;
-                        set_aside += 1;
+                        uncatalogued.push(dir.join(file));
                     }
                 }
-                /* Only an empty folder goes; one with anything in it stays. */
-                let _ = fs::remove_dir(self.dir.join(&dir));
+            }
+        }
+        let mut set_aside = 0;
+        for relative in uncatalogued {
+            match self.set_aside(&relative) {
+                Ok(()) => set_aside += 1,
+                Err(error) => log::warn!("{error}"),
+            }
+            /* A version folder left empty goes; one with anything in it stays. */
+            if let Some(dir) = relative.parent() {
+                let _ = fs::remove_dir(self.dir.join(dir));
             }
         }
         Ok(set_aside)

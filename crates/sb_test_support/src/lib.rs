@@ -15,12 +15,73 @@ mod db_agent;
 
 use std::path::Path;
 
-use sb_core::provider::Provider;
-use sb_core::transport::LocalTransport;
+use sb_core::provider::{Hashed, Provider, RangeFailure};
+use sb_core::transport::{
+    Env, FileStat, Listing, LocalTransport, PrefixRequest, RangeRequest, RangeSink, Transport,
+    TransportError,
+};
 use toolbox_store::rusqlite::Connection;
 
 pub use claude_code::{FileAgent, ProjectsTree, Session};
 pub use db_agent::{DbAgent, DbProvider};
+
+/// A location in a temp dir: this machine's files, with a home folder and an environment of
+/// the test's choosing in place of the real ones.
+#[derive(Clone, Debug)]
+pub struct HomeTransport {
+    home: String,
+    vars: Vec<(String, String)>,
+}
+
+impl HomeTransport {
+    pub fn new(home: &Path, vars: Vec<(String, String)>) -> Self {
+        Self {
+            home: home.to_str().unwrap().to_string(),
+            vars,
+        }
+    }
+}
+
+impl Transport for HomeTransport {
+    fn env(&self, names: &[&str]) -> Result<Env, TransportError> {
+        Ok(Env {
+            home: self.home.clone(),
+            vars: self
+                .vars
+                .iter()
+                .filter(|(name, _)| names.contains(&name.as_str()))
+                .cloned()
+                .collect(),
+        })
+    }
+
+    fn stat(&self, paths: &[&str]) -> Result<Vec<Option<FileStat>>, TransportError> {
+        LocalTransport.stat(paths)
+    }
+
+    fn list(&self, root: &str) -> Result<Listing, TransportError> {
+        LocalTransport.list(root)
+    }
+
+    fn hash_prefixes(
+        &self,
+        requests: &[PrefixRequest],
+    ) -> Result<Vec<Result<Hashed, RangeFailure>>, TransportError> {
+        LocalTransport.hash_prefixes(requests)
+    }
+
+    fn read_ranges(
+        &self,
+        requests: &[RangeRequest],
+        sink: &mut dyn RangeSink,
+    ) -> Result<(), TransportError> {
+        LocalTransport.read_ranges(requests, sink)
+    }
+
+    fn read_small(&self, path: &str) -> Result<Option<Vec<u8>>, TransportError> {
+        LocalTransport.read_small(path)
+    }
+}
 
 /// An agent's data at a location in a temp dir, and the changes an agent makes to it. Sessions
 /// are named by the key of their transcript item.
@@ -29,7 +90,7 @@ pub trait Agent {
     fn provider(&self) -> Box<dyn Provider>;
 
     /// The location the data is at.
-    fn transport(&self) -> LocalTransport;
+    fn transport(&self) -> HomeTransport;
 
     /// A new session of `records` records. Returns its transcript's key.
     fn add_session(&mut self, records: usize) -> String;
@@ -40,6 +101,9 @@ pub trait Agent {
     /// The session's first record changes, and it gains one: earlier bytes differ, and it is
     /// no shorter than before.
     fn rewrite(&mut self, key: &str);
+
+    /// The session's first record changes and its length does not.
+    fn rewrite_same_size(&mut self, key: &str);
 
     /// The session loses its last `records` records.
     fn truncate(&mut self, key: &str, records: usize);
@@ -62,21 +126,25 @@ const FAIL_COMMITS: &str = "fail_segment_commits";
 /// Makes every commit of a segment to the catalogue of the archive in `dir` fail, as a crash
 /// between a segment's rename into place and its commit would leave things (PLAN §4.1).
 pub fn break_segment_commits(dir: &Path) {
-    catalogue(dir)
-        .execute_batch(&format!(
+    edit_catalogue(
+        dir,
+        &format!(
             "CREATE TRIGGER {FAIL_COMMITS} BEFORE INSERT ON segment
              BEGIN SELECT RAISE(ABORT, 'the test stops this commit'); END"
-        ))
-        .unwrap();
+        ),
+    );
 }
 
 /// Undoes [`break_segment_commits`].
 pub fn mend_segment_commits(dir: &Path) {
-    catalogue(dir)
-        .execute_batch(&format!("DROP TRIGGER {FAIL_COMMITS}"))
-        .unwrap();
+    edit_catalogue(dir, &format!("DROP TRIGGER {FAIL_COMMITS}"));
 }
 
-fn catalogue(dir: &Path) -> Connection {
-    Connection::open(dir.join("scrollback.db")).unwrap()
+/// Runs `sql` on the catalogue of the archive in `dir`, behind the archive's back: how a test
+/// puts the catalogue in a state the app never leaves it in.
+pub fn edit_catalogue(dir: &Path, sql: &str) {
+    Connection::open(dir.join("scrollback.db"))
+        .unwrap()
+        .execute_batch(sql)
+        .unwrap();
 }

@@ -1,5 +1,6 @@
 //! What the archive and sync tests share: an agent's fixture beside an archive in a temp dir,
-//! with one location that reads the fixture.
+//! with one location that reads the fixture, and a provider that meddles with a pass at a
+//! chosen moment.
 
 #![allow(
     dead_code,
@@ -9,13 +10,18 @@
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use sb_core::CancelToken;
 use sb_core::archive::Archive;
 use sb_core::catalogue::{Item, Segment, Version};
 use sb_core::location::{Location, LocationId, LocationKind};
-use sb_core::provider::Provider;
-use sb_core::sync::{PassReport, Progress, SyncError, sync_location};
+use sb_core::provider::{
+    Fetched, Hashed, ItemPrefix, ItemRange, Provider, ProviderError, ProviderId, RangeFailure,
+    Scan, Source,
+};
+use sb_core::sync::{Pass, PassReport, Progress, SyncError, sync_location};
+use sb_core::transport::{Halt, RangeSink, Transport};
 use sb_test_support::Agent;
 use tempfile::TempDir;
 
@@ -52,9 +58,14 @@ impl<A: Agent> Bench<A> {
         self.dir.path()
     }
 
+    /// Closes the archive, as quitting the app does.
+    pub fn close(&mut self) {
+        self.archive = None;
+    }
+
     /// Closes the archive and opens it again, as a restart of the app does.
     pub fn reopen(&mut self) {
-        self.archive = None;
+        self.close();
         self.archive = Some(Archive::open(self.dir.path()).unwrap());
     }
 
@@ -63,16 +74,16 @@ impl<A: Agent> Bench<A> {
         &self,
         cancel: &CancelToken,
         progress: &mut dyn FnMut(&Progress),
-    ) -> Result<Vec<PassReport>, SyncError> {
+    ) -> Result<Vec<Pass>, SyncError> {
         self.try_sync_with(self.agent.provider(), cancel, progress)
     }
 
     pub fn try_sync_with(
         &self,
-        provider: Box<dyn Provider>,
+        provider: Box<dyn Provider + '_>,
         cancel: &CancelToken,
         progress: &mut dyn FnMut(&Progress),
-    ) -> Result<Vec<PassReport>, SyncError> {
+    ) -> Result<Vec<Pass>, SyncError> {
         sync_location(
             self.archive(),
             &self.location,
@@ -83,13 +94,29 @@ impl<A: Agent> Bench<A> {
         )
     }
 
+    /// The one pass of a sync with `provider` that was not cancelled, whatever it found.
+    pub fn pass_with(&self, provider: Box<dyn Provider + '_>) -> Result<PassReport, SyncError> {
+        let mut passes = self
+            .try_sync_with(provider, &CancelToken::new(), &mut |_| {})
+            .unwrap();
+        assert_eq!(passes.len(), 1);
+        passes.remove(0).outcome
+    }
+
+    /// The fixture's provider, meddled with.
+    pub fn meddling<'a>(&self, meddle: Meddle<'a>) -> Box<dyn Provider + 'a> {
+        Box::new(Meddling {
+            inner: self.agent.provider(),
+            meddle,
+        })
+    }
+
     /// A sync that must succeed with nothing failed: its one pass.
     pub fn sync(&self) -> PassReport {
-        let mut passes = self.try_sync(&CancelToken::new(), &mut |_| {}).unwrap();
-        assert_eq!(passes.len(), 1);
-        let pass = passes.remove(0);
-        assert!(pass.failed.is_empty(), "{:?}", pass.failed);
-        pass
+        let report = self.pass_with(self.agent.provider()).unwrap();
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert!(report.unlisted.is_empty(), "{:?}", report.unlisted);
+        report
     }
 
     pub fn location(&self) -> Location {
@@ -103,14 +130,14 @@ impl<A: Agent> Bench<A> {
     pub fn items(&self) -> Vec<Item> {
         self.archive()
             .catalogue()
-            .items(&self.location, self.agent.provider().id())
+            .items(&self.location, self.agent.provider().id().as_str())
             .unwrap()
     }
 
     pub fn item(&self, key: &str) -> Item {
         self.archive()
             .catalogue()
-            .item(&self.location, self.agent.provider().id(), key)
+            .item(&self.location, self.agent.provider().id().as_str(), key)
             .unwrap()
             .unwrap_or_else(|| panic!("{key} is not archived"))
     }
@@ -163,6 +190,7 @@ impl<A: Agent> Bench<A> {
     pub fn assert_verifies(&self) {
         let report = self.archive().verify(&CancelToken::new()).unwrap();
         assert!(report.damaged.is_empty(), "{:?}", report.damaged);
+        assert!(report.unread.is_empty(), "{:?}", report.unread);
     }
 
     /// Every segment file under the archive's `files/`.
@@ -204,4 +232,135 @@ pub fn files_under(dir: &Path) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+/// A moment in a pass.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum When {
+    /// After the scan, before the engine has prefixes hashed to plan with.
+    BeforeHashing,
+    /// After the plan's prefixes were hashed, before anything is fetched.
+    AfterHashing,
+    /// After the first bytes of the first range reached the engine.
+    InsideARange,
+}
+
+/// What a [`Meddling`] provider does to its pass.
+pub enum Meddle<'a> {
+    /// Runs something once, at a moment: the agent writing while the pass reads.
+    At(When, Mutex<Option<Box<dyn FnOnce() + Send + 'a>>>),
+    /// Hands the engine one byte less than the first range holds, and ends the range well.
+    DropsAByte,
+    /// Hands the engine the first range's bytes as those of the request after it.
+    WrongRequest,
+}
+
+impl<'a> Meddle<'a> {
+    pub fn at(when: When, action: impl FnOnce() + Send + 'a) -> Self {
+        Self::At(when, Mutex::new(Some(Box::new(action))))
+    }
+
+    /// Runs the action if this is its moment and it has not run.
+    fn reached(&self, moment: When) {
+        if let Self::At(when, action) = self
+            && *when == moment
+            && let Some(action) = action.lock().unwrap().take()
+        {
+            action();
+        }
+    }
+}
+
+/// A provider that passes everything to another, meddling as it goes.
+struct Meddling<'a> {
+    inner: Box<dyn Provider>,
+    meddle: Meddle<'a>,
+}
+
+struct MeddlingSource<'s, 'a> {
+    inner: Box<dyn Source + 's>,
+    meddle: &'s Meddle<'a>,
+}
+
+struct MeddlingSink<'k, 'a> {
+    inner: &'k mut dyn RangeSink,
+    meddle: &'k Meddle<'a>,
+    /// Whether the first bytes have gone by.
+    begun: bool,
+}
+
+impl Provider for Meddling<'_> {
+    fn id(&self) -> ProviderId {
+        self.inner.id()
+    }
+
+    fn detect<'s>(
+        &'s self,
+        transport: &'s dyn Transport,
+        scratch: &'s Path,
+    ) -> Result<Option<Box<dyn Source + 's>>, ProviderError> {
+        Ok(self.inner.detect(transport, scratch)?.map(|inner| {
+            Box::new(MeddlingSource {
+                inner,
+                meddle: &self.meddle,
+            }) as Box<dyn Source + 's>
+        }))
+    }
+}
+
+impl Source for MeddlingSource<'_, '_> {
+    fn scan(&mut self) -> Result<Scan, ProviderError> {
+        let scan = self.inner.scan();
+        self.meddle.reached(When::BeforeHashing);
+        scan
+    }
+
+    fn hash_prefixes(
+        &mut self,
+        requests: &[ItemPrefix],
+    ) -> Result<Vec<Result<Hashed, RangeFailure>>, ProviderError> {
+        let hashes = self.inner.hash_prefixes(requests);
+        self.meddle.reached(When::AfterHashing);
+        hashes
+    }
+
+    fn fetch(
+        &mut self,
+        requests: &[ItemRange],
+        sink: &mut dyn RangeSink,
+    ) -> Result<(), ProviderError> {
+        /* A pass that hashes nothing to plan with has still passed that point by now. */
+        self.meddle.reached(When::AfterHashing);
+        self.inner.fetch(
+            requests,
+            &mut MeddlingSink {
+                inner: sink,
+                meddle: self.meddle,
+                begun: false,
+            },
+        )
+    }
+
+    fn retention_days(&mut self) -> Result<Option<u32>, ProviderError> {
+        self.inner.retention_days()
+    }
+}
+
+impl RangeSink for MeddlingSink<'_, '_> {
+    fn data(&mut self, request: usize, bytes: &[u8]) -> Result<(), Halt> {
+        let first = !std::mem::replace(&mut self.begun, true);
+        let taken = match self.meddle {
+            Meddle::DropsAByte if first => self.inner.data(request, &bytes[1..]),
+            Meddle::WrongRequest if first => self.inner.data(request + 1, bytes),
+            _ => self.inner.data(request, bytes),
+        };
+        if first {
+            self.meddle.reached(When::InsideARange);
+        }
+        taken
+    }
+
+    fn end(&mut self, request: usize, result: Result<Fetched, RangeFailure>) -> Result<(), Halt> {
+        self.inner.end(request, result)
+    }
 }

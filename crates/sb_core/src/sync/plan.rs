@@ -19,9 +19,9 @@
 
 use std::collections::HashMap;
 
+use super::Failure;
 use crate::catalogue::{Archived, Reason, Target};
-use crate::hash::Hash;
-use crate::provider::{ItemPrefix, ProviderError, ScannedItem, Source};
+use crate::provider::{ItemPrefix, ProviderError, RangeFailure, ScannedItem, Source};
 
 /// A range of one item to fetch and store.
 pub(super) struct Planned<'a> {
@@ -31,8 +31,6 @@ pub(super) struct Planned<'a> {
     pub number: u32,
     /// Where the range starts, which is the version's length before it.
     pub offset: u64,
-    /// The version's hash before the range, when it has content already.
-    pub hash: Option<Hash>,
     /// How many bytes to fetch: the rest of the source. 0 when the source is empty, which is
     /// recorded without a fetch.
     pub length: u64,
@@ -51,10 +49,15 @@ pub(super) struct Plan<'a> {
     /// Items that changed between the scan and the hashing of their prefix. The next pass
     /// decides about them.
     pub deferred: usize,
+    /// Items whose archived bytes could not be compared with the source's.
+    pub failed: Vec<Failure>,
 }
 
+/// Decides about each of `scanned`. `whole` says the scan saw everything the agent has: only
+/// then is an archived item that is not in it missing at the source.
 pub(super) fn plan<'a>(
     scanned: &'a [ScannedItem],
+    whole: bool,
     archived: Vec<Archived>,
     source: &mut dyn Source,
 ) -> Result<Plan<'a>, ProviderError> {
@@ -68,6 +71,7 @@ pub(super) fn plan<'a>(
         gone: Vec::new(),
         unchanged: 0,
         deferred: 0,
+        failed: Vec::new(),
     };
     /* Items whose first `L` bytes must be hashed at the source before they can be decided. */
     let mut undecided = Vec::new();
@@ -78,7 +82,6 @@ pub(super) fn plan<'a>(
                 target: Target::NewItem,
                 number: 1,
                 offset: 0,
-                hash: None,
                 length: scanned.length,
                 cut: scanned.lines,
             });
@@ -110,11 +113,13 @@ pub(super) fn plan<'a>(
             undecided.push((scanned, archived, as_seen));
         }
     }
-    plan.gone = archived
-        .into_values()
-        .filter(|archived| archived.item.gone_since.is_none())
-        .map(|archived| archived.item.id)
-        .collect();
+    if whole {
+        plan.gone = archived
+            .into_values()
+            .filter(|archived| archived.item.gone_since.is_none())
+            .map(|archived| archived.item.id)
+            .collect();
+    }
 
     /* An empty version's prefix is nothing, which needs no asking. */
     let requests: Vec<_> = undecided
@@ -134,13 +139,21 @@ pub(super) fn plan<'a>(
     for (scanned, archived, as_seen) in undecided {
         let current = &archived.current;
         let prefix = if current.length > 0 {
-            hashes.next().flatten()
+            /* A provider that answers fewer requests than it was sent has not hashed this. */
+            hashes
+                .next()
+                .unwrap_or(Err(RangeFailure::Missing))
+                .map(|hashed| hashed.hash)
         } else {
-            Some(current.hash)
+            Ok(current.hash)
         };
         match prefix {
-            None => plan.deferred += 1,
-            Some(prefix) if prefix != current.hash => {
+            Err(RangeFailure::Missing | RangeFailure::Short { .. }) => plan.deferred += 1,
+            Err(failure @ RangeFailure::Unreadable(_)) => plan.failed.push(Failure {
+                key: scanned.key.clone(),
+                reason: failure.to_string(),
+            }),
+            Ok(prefix) if prefix != current.hash => {
                 let reason = if archived.item.gone_since.is_some() {
                     Reason::Replaced
                 } else {
@@ -148,10 +161,10 @@ pub(super) fn plan<'a>(
                 };
                 plan.fetches.push(next_version(scanned, &archived, reason));
             }
-            Some(_) if scanned.length == current.length => {
+            Ok(_) if scanned.length == current.length => {
                 plan.seen.push((archived.item.id, scanned));
             }
-            Some(_) => plan.fetches.push(Planned {
+            Ok(_) => plan.fetches.push(Planned {
                 scanned,
                 target: Target::Append {
                     item: archived.item.id,
@@ -159,7 +172,6 @@ pub(super) fn plan<'a>(
                 },
                 number: current.number,
                 offset: current.length,
-                hash: Some(current.hash),
                 length: scanned.length - current.length,
                 /* As last seen: nothing is writing it, so its unfinished last line is taken. */
                 cut: scanned.lines && !as_seen,
@@ -181,7 +193,6 @@ fn next_version<'a>(scanned: &'a ScannedItem, archived: &Archived, reason: Reaso
         },
         number,
         offset: 0,
-        hash: None,
         length: scanned.length,
         cut: scanned.lines,
     }

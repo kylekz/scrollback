@@ -1,19 +1,16 @@
-//! Sync over fixtures (PLAN §12). Every case that applies to both shapes of source runs against
-//! both: the file-tree agent and the made-up agent that keeps a database.
+//! Sync over fixtures (PLAN §12): the cases that apply to both shapes of source, each run
+//! against both, the file-tree agent and the made-up agent that keeps a database.
 
 mod common;
 
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::catalogue::Reason;
-use sb_core::provider::{
-    ItemKind, ItemPrefix, ItemRange, Provider, ProviderError, ScannedItem, Source,
-};
-use sb_core::sync::{PassReport, Progress, SyncError};
-use sb_core::transport::{Halt, RangeFailure, RangeSink, Transport};
-use sb_test_support::{Agent, DbAgent, FileAgent, break_segment_commits, mend_segment_commits};
+use sb_core::provider::ItemKind;
+use sb_core::sync::{Progress, SyncError};
+use sb_test_support::{Agent, break_segment_commits, mend_segment_commits};
 
-use common::{Bench, files_under};
+use common::{Bench, Meddle, When, files_under};
 
 /// Runs each named test against both agents.
 macro_rules! for_both_agents {
@@ -42,7 +39,8 @@ for_both_agents!(
     first_sync_archives_every_item,
     appended_bytes_extend_the_version,
     a_rewrite_starts_a_new_version,
-    a_truncation_starts_a_version_that_is_held_back,
+    a_rewrite_of_the_same_size_starts_a_new_version,
+    a_truncation_starts_a_version_that_is_held_back_until_it_outgrows_the_one_read,
     a_touch_stores_nothing,
     an_item_deleted_at_the_source_is_marked_gone_and_kept,
     an_item_that_comes_back_changed_is_a_new_version,
@@ -51,6 +49,8 @@ for_both_agents!(
     a_crash_between_rename_and_commit_loses_nothing,
     a_failed_commit_is_retried_without_a_restart,
     a_location_runs_one_sync_at_a_time,
+    a_provider_that_sends_less_than_was_asked_stores_nothing,
+    a_provider_that_breaks_the_order_of_ranges_stops_the_pass,
 );
 
 /// A bench whose agent has three sessions of different sizes.
@@ -125,6 +125,10 @@ fn appended_bytes_extend_the_version<A: Agent + Default>() {
         .collect();
     assert_eq!(segments, [(0, before), (before, after - before)]);
     bench.assert_mirrors(&keys);
+
+    /* The append recorded what it saw of the source: the pass after it has nothing to do. */
+    let again = bench.sync();
+    assert_eq!((again.unchanged, again.touched, again.appended), (3, 0, 0));
 }
 
 fn a_rewrite_starts_a_new_version<A: Agent + Default>() {
@@ -153,7 +157,25 @@ fn a_rewrite_starts_a_new_version<A: Agent + Default>() {
     bench.assert_mirrors(&keys);
 }
 
-fn a_truncation_starts_a_version_that_is_held_back<A: Agent + Default>() {
+fn a_rewrite_of_the_same_size_starts_a_new_version<A: Agent + Default>() {
+    let (mut bench, keys) = bench::<A>();
+    bench.sync();
+    let before = bench.agent.content(&keys[1]);
+    bench.agent.rewrite_same_size(&keys[1]);
+    assert_eq!(bench.agent.content(&keys[1]).len(), before.len());
+
+    /* Only its bytes tell it from a touch. */
+    let report = bench.sync();
+    assert_eq!((report.new_versions, report.touched), (1, 0));
+    let versions = bench.versions(&keys[1]);
+    assert_eq!(versions[1].reason, Reason::Rewritten);
+    assert!(bench.read(&versions[0]) == before);
+    bench.assert_mirrors(&keys);
+}
+
+fn a_truncation_starts_a_version_that_is_held_back_until_it_outgrows_the_one_read<
+    A: Agent + Default,
+>() {
     let (mut bench, keys) = bench::<A>();
     bench.sync();
     let before = bench.agent.content(&keys[2]);
@@ -169,10 +191,19 @@ fn a_truncation_starts_a_version_that_is_held_back<A: Agent + Default>() {
     assert!(bench.read(&versions[0]) == before);
     bench.assert_mirrors(&keys);
 
-    /* What is appended after that extends the new version. */
+    /* What is appended after that extends the new version, which is still the shorter one. */
     bench.agent.append(&keys[2], 2);
     assert_eq!(bench.sync().appended, 1);
-    assert_eq!(bench.versions(&keys[2]).len(), 2);
+    let versions = bench.versions(&keys[2]);
+    assert_eq!(versions.len(), 2);
+    assert!(versions[1].held_back);
+
+    /* Once it is as long as the version being read, it is no loss any more. */
+    bench.agent.append(&keys[2], 12);
+    assert_eq!(bench.sync().appended, 1);
+    let versions = bench.versions(&keys[2]);
+    assert!(versions[1].length > versions[0].length);
+    assert!(!versions[1].held_back);
     bench.assert_mirrors(&keys);
 }
 
@@ -295,97 +326,18 @@ fn a_pass_cancelled_at_each_step_resumes<A: Agent + Default>() {
     }
 }
 
-/// A provider that cancels its pass as soon as the first bytes of a fetch arrive.
-struct CancelsMidRange {
-    inner: Box<dyn Provider>,
-    cancel: CancelToken,
-}
-
-struct CancellingSource<'a> {
-    inner: Box<dyn Source + 'a>,
-    cancel: CancelToken,
-}
-
-struct CancellingSink<'a> {
-    inner: &'a mut dyn RangeSink,
-    cancel: CancelToken,
-}
-
-impl Provider for CancelsMidRange {
-    fn id(&self) -> &'static str {
-        self.inner.id()
-    }
-
-    fn detect<'a>(
-        &self,
-        transport: &'a dyn Transport,
-    ) -> Result<Option<Box<dyn Source + 'a>>, ProviderError> {
-        Ok(self.inner.detect(transport)?.map(|inner| {
-            Box::new(CancellingSource {
-                inner,
-                cancel: self.cancel.clone(),
-            }) as Box<dyn Source>
-        }))
-    }
-}
-
-impl Source for CancellingSource<'_> {
-    fn scan(&mut self) -> Result<Vec<ScannedItem>, ProviderError> {
-        self.inner.scan()
-    }
-
-    fn hash_prefixes(
-        &mut self,
-        requests: &[ItemPrefix],
-    ) -> Result<Vec<Option<sb_core::hash::Hash>>, ProviderError> {
-        self.inner.hash_prefixes(requests)
-    }
-
-    fn fetch(
-        &mut self,
-        requests: &[ItemRange],
-        sink: &mut dyn RangeSink,
-    ) -> Result<(), ProviderError> {
-        self.inner.fetch(
-            requests,
-            &mut CancellingSink {
-                inner: sink,
-                cancel: self.cancel.clone(),
-            },
-        )
-    }
-}
-
-impl RangeSink for CancellingSink<'_> {
-    fn data(&mut self, request: usize, bytes: &[u8]) -> Result<(), Halt> {
-        let taken = self.inner.data(request, bytes);
-        self.cancel.cancel();
-        taken
-    }
-
-    fn end(&mut self, request: usize, result: Result<(), RangeFailure>) -> Result<(), Halt> {
-        self.inner.end(request, result)
-    }
-}
-
 fn a_pass_cancelled_inside_a_range_stores_none_of_it<A: Agent + Default>() {
     let (bench, keys) = bench::<A>();
     let cancel = CancelToken::new();
     let stopped = bench.try_sync_with(
-        Box::new(CancelsMidRange {
-            inner: bench.agent.provider(),
-            cancel: cancel.clone(),
-        }),
+        bench.meddling(Meddle::at(When::InsideARange, || cancel.cancel())),
         &cancel,
         &mut |_| {},
     );
     assert!(matches!(stopped, Err(SyncError::Cancelled)), "{stopped:?}");
     /* The half-written segment is gone with the pass, and nothing was recorded. */
-    assert_eq!(
-        files_under(&bench.dir().join("tmp")),
-        Vec::<std::path::PathBuf>::new()
-    );
-    assert_eq!(bench.segment_files(), Vec::<std::path::PathBuf>::new());
+    assert!(files_under(&bench.dir().join("tmp")).is_empty());
+    assert!(bench.segment_files().is_empty());
     assert!(bench.items().is_empty());
     /* A cancelled sync is not a failed one. */
     assert_eq!(bench.location().last_error, None);
@@ -406,7 +358,7 @@ fn a_crash_between_rename_and_commit_loses_nothing<A: Agent + Default>() {
         let recorded = bench.catalogued_segments();
 
         break_segment_commits(bench.dir());
-        let crashed = bench.try_sync(&CancelToken::new(), &mut |_| {});
+        let crashed = bench.pass_with(bench.agent.provider());
         assert!(
             matches!(crashed, Err(SyncError::Catalogue(_))),
             "{crashed:?}"
@@ -417,15 +369,14 @@ fn a_crash_between_rename_and_commit_loses_nothing<A: Agent + Default>() {
         assert!(bench.location().last_error.is_some());
         mend_segment_commits(bench.dir());
 
-        /* The next start sets it aside, deleting nothing. */
+        /* A start sets it aside, unless the catalogue is still empty: then nothing under
+        files/ is touched, and the segment is set aside when the next one takes its place.
+        Nothing is deleted either way. */
         bench.reopen();
-        assert_eq!(bench.segment_files().len(), recorded);
-        let set_aside = bench
-            .orphans()
-            .iter()
-            .filter(|file| file.extension().is_some_and(|extension| extension == "zst"))
-            .count();
-        assert_eq!(set_aside, 1);
+        assert_eq!(
+            bench.segment_files().len(),
+            if grown { recorded } else { recorded + 1 }
+        );
 
         /* And the next sync fetches the range again. */
         let report = bench.sync();
@@ -433,7 +384,14 @@ fn a_crash_between_rename_and_commit_loses_nothing<A: Agent + Default>() {
             (report.new_items, report.appended),
             if grown { (0, 1) } else { (3, 0) }
         );
+        let set_aside = bench
+            .orphans()
+            .iter()
+            .filter(|file| file.extension().is_some_and(|extension| extension == "zst"))
+            .count();
+        assert_eq!(set_aside, 1);
         bench.assert_mirrors(&keys);
+        assert_eq!(bench.segment_files().len(), bench.catalogued_segments());
         assert_eq!(bench.location().last_error, None);
     }
 }
@@ -443,9 +401,7 @@ fn a_failed_commit_is_retried_without_a_restart<A: Agent + Default>() {
     bench.sync();
     bench.agent.append(&keys[0], 4);
     break_segment_commits(bench.dir());
-    bench
-        .try_sync(&CancelToken::new(), &mut |_| {})
-        .unwrap_err();
+    bench.pass_with(bench.agent.provider()).unwrap_err();
     mend_segment_commits(bench.dir());
 
     /* The file the failed pass left where the segment goes is set aside, not replaced. */
@@ -474,162 +430,29 @@ fn a_location_runs_one_sync_at_a_time<A: Agent + Default>() {
     bench.assert_mirrors(&keys);
 }
 
-fn file_bench() -> (Bench<FileAgent>, String) {
-    let mut agent = FileAgent::new();
-    let key = agent.add_session(4);
-    (Bench::new(agent), key)
-}
-
-#[test]
-fn a_file_that_ends_mid_line_is_stored_up_to_its_last_newline() {
-    let (bench, key) = file_bench();
-    let whole_lines = bench.agent.content(&key);
-    bench
-        .agent
-        .append_raw(&key, r#"{"type":"user","message":"half a rec"#);
-
-    let report = bench.sync();
-    let version = bench.versions(&key).remove(0);
-    assert!(bench.read(&version) == whole_lines);
-    assert_eq!(report.bytes_stored, whole_lines.len() as u64);
-    assert!(report.bytes_fetched > report.bytes_stored);
-
-    /* The agent finishes the record and writes another: both arrive, as an append. */
-    bench
-        .agent
-        .append_raw(&key, "ord\"}\n{\"type\":\"assistant\"}\n");
-    let report = bench.sync();
-    assert_eq!((report.appended, report.new_versions), (1, 0));
-    bench.assert_mirrors(&[key]);
-}
-
-#[test]
-fn an_unfinished_last_line_is_taken_once_the_file_stops_changing() {
-    let (bench, key) = file_bench();
-    bench
-        .agent
-        .append_raw(&key, r#"{"type":"user","message":"never finis"#);
-    bench.sync();
-    assert!(bench.versions(&key)[0].length < bench.agent.content(&key).len() as u64);
-
-    /* The file is as the last pass saw it: nothing is writing it, so the rest is archived. */
-    let report = bench.sync();
-    assert_eq!((report.appended, report.unchanged), (1, 0));
-    bench.assert_mirrors(std::slice::from_ref(&key));
-    let settled = bench.sync();
-    assert_eq!((settled.appended, settled.unchanged), (0, 1));
-
-    /* Were the record finished after all, it would still be an append. */
-    bench.agent.append_raw(&key, "hed\"}\n");
-    assert_eq!(bench.sync().appended, 1);
-    assert_eq!(bench.versions(&key).len(), 1);
-    bench.assert_mirrors(&[key]);
-}
-
-#[test]
-fn a_file_with_no_whole_line_yet_is_recorded_and_stored_later() {
-    let mut agent = FileAgent::new();
-    let key = agent.add_session(0);
-    agent.append_raw(&key, r#"{"type":"us"#);
-    let bench = Bench::new(agent);
-
-    let report = bench.sync();
-    assert_eq!((report.new_items, report.bytes_stored), (1, 0));
-    let version = bench.versions(&key).remove(0);
-    assert_eq!((version.length, bench.segments(&version).len()), (0, 0));
+fn a_provider_that_sends_less_than_was_asked_stores_nothing<A: Agent + Default>() {
+    let (bench, keys) = bench::<A>();
+    let report = bench.pass_with(bench.meddling(Meddle::DropsAByte)).unwrap();
+    /* The first range ended well a byte short: that item is not stored, the others are. */
+    assert_eq!((report.new_items, report.failed.len()), (2, 1));
+    assert_eq!(bench.items().len(), 2);
+    assert!(bench.location().last_error.is_some());
     bench.assert_verifies();
 
-    bench.agent.append_raw(&key, "er\"}\n");
-    assert_eq!(bench.sync().appended, 1);
-    bench.assert_mirrors(&[key]);
-}
-
-#[test]
-fn an_empty_file_is_an_item_with_nothing_stored() {
-    let mut agent = FileAgent::new();
-    let key = agent.add_session(0);
-    let mut bench = Bench::new(agent);
-
     assert_eq!(bench.sync().new_items, 1);
-    assert_eq!(bench.segment_files(), Vec::<std::path::PathBuf>::new());
-    bench.assert_mirrors(std::slice::from_ref(&key));
-    assert_eq!(bench.sync().unchanged, 1);
-
-    bench.agent.append(&key, 2);
-    assert_eq!(bench.sync().appended, 1);
-    bench.assert_mirrors(&[key]);
+    bench.assert_mirrors(&keys);
 }
 
-#[test]
-fn every_file_of_a_session_is_archived_under_its_session() {
-    let mut agent = FileAgent::new();
-    agent.tree().record_bytes(4096);
-    let transcript = agent.add_session(12);
-    let session = agent.session(&transcript);
-    let id = session.id.clone();
-    let subagent = session.subagent(6);
-    let tool_result = session.tool_result(300_000);
-    let title = session.title("A generated session");
-    let memory = agent
-        .tree()
-        .memory("/home/user/code/app", "notes", "Remember the fixtures.\n");
-    agent.tree().write_settings(r#"{"cleanupPeriodDays": 45}"#);
-    let bench = Bench::new(agent);
-
-    let report = bench.sync();
-    /* The subagent's metadata file is the sixth. */
-    assert_eq!((report.scanned, report.new_items), (6, 6));
-    let kinds = [
-        (&transcript, ItemKind::Transcript, true),
-        (&subagent, ItemKind::Subagent, true),
-        (&tool_result, ItemKind::ToolResult, true),
-        (&title, ItemKind::Sidecar, true),
-        (&memory, ItemKind::Sidecar, false),
-    ];
-    for (key, kind, in_session) in kinds {
-        let item = bench.item(key);
-        assert_eq!(item.kind, kind, "{key}");
-        assert_eq!(item.session, in_session.then(|| id.clone()), "{key}");
-    }
-    bench.assert_mirrors(&[transcript, subagent, tool_result, title, memory]);
-    assert_eq!(
-        bench
-            .archive()
-            .catalogue()
-            .providers_found(&bench.location)
-            .unwrap(),
-        [(bench.agent.provider().id().to_string(), Some(45))]
+fn a_provider_that_breaks_the_order_of_ranges_stops_the_pass<A: Agent + Default>() {
+    let (bench, keys) = bench::<A>();
+    let stopped = bench.pass_with(bench.meddling(Meddle::WrongRequest));
+    assert!(
+        matches!(stopped, Err(SyncError::Protocol(_))),
+        "{stopped:?}"
     );
-}
+    assert!(bench.items().is_empty());
+    assert!(files_under(&bench.dir().join("tmp")).is_empty());
 
-#[test]
-fn a_new_export_format_starts_a_new_version() {
-    let mut agent = DbAgent::new();
-    let key = agent.add_session(5);
-    let mut bench = Bench::new(agent);
-    bench.sync();
-    assert_eq!(bench.versions(&key)[0].export_version, Some(1));
-
-    bench.agent.export_version = 2;
-    let report: PassReport = bench.sync();
-    assert_eq!((report.new_versions, report.held_back), (1, 0));
-    let versions = bench.versions(&key);
-    assert_eq!(
-        (versions[1].reason, versions[1].export_version),
-        (Reason::Replaced, Some(2))
-    );
-    bench.assert_mirrors(&[key]);
-}
-
-#[test]
-fn a_location_without_the_agent_is_not_synced() {
-    let bench = Bench::new(FileAgent::new());
-    let passes = bench
-        .try_sync_with(
-            Box::new(sb_test_support::DbProvider::default()),
-            &CancelToken::new(),
-            &mut |_| {},
-        )
-        .unwrap();
-    assert!(passes.is_empty());
+    assert_eq!(bench.sync().new_items, 3);
+    bench.assert_mirrors(&keys);
 }

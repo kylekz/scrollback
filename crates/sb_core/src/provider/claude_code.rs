@@ -16,14 +16,17 @@
 //! `<project>` is the starting directory with its punctuation replaced by `-`, so it can't be
 //! turned back into a path and is not read here. Every `.jsonl` file is appended to line by line.
 
+use std::path::Path;
+
 use serde_json::Value;
 
 use super::{
-    FileClass, FileTree, ItemKind, ItemPrefix, ItemRange, Provider, ProviderError, ScannedItem,
-    Source,
+    FileClass, FileTree, Hashed, ItemKind, ItemPrefix, ItemRange, Provider, ProviderError,
+    ProviderId, RangeFailure, Scan, Source,
 };
-use crate::hash::Hash;
-use crate::transport::{RangeSink, Transport};
+use crate::transport::{Env, RangeSink, Transport};
+
+const ID: ProviderId = ProviderId::new("claude-code");
 
 /// Where the items are, under the root.
 const SUBTREE: &str = "projects";
@@ -36,19 +39,16 @@ const DEFAULT_RETENTION_DAYS: u32 = 30;
 pub struct Agent;
 
 impl Provider for Agent {
-    fn id(&self) -> &'static str {
-        "claude-code"
+    fn id(&self) -> ProviderId {
+        ID
     }
 
     fn detect<'a>(
-        &self,
+        &'a self,
         transport: &'a dyn Transport,
+        _scratch: &'a Path,
     ) -> Result<Option<Box<dyn Source + 'a>>, ProviderError> {
-        let mut env = transport.env(&["CLAUDE_CONFIG_DIR"])?;
-        let root = match env.vars.remove("CLAUDE_CONFIG_DIR") {
-            Some(dir) if !dir.is_empty() => dir,
-            _ => format!("{}/.claude", env.home),
-        };
+        let root = root(transport.env(&["CLAUDE_CONFIG_DIR"])?);
         let present = transport.stat(&[&format!("{root}/{SUBTREE}")])?[0].is_some();
         Ok(present.then(|| {
             Box::new(Data {
@@ -60,6 +60,14 @@ impl Provider for Agent {
     }
 }
 
+/// Where Claude Code keeps its data at a location with the environment `env`.
+fn root(mut env: Env) -> String {
+    match env.vars.remove("CLAUDE_CONFIG_DIR") {
+        Some(dir) if !dir.is_empty() => dir,
+        _ => format!("{}/.claude", env.home),
+    }
+}
+
 /// Claude Code's data at one location.
 struct Data<'a> {
     tree: FileTree<'a>,
@@ -68,14 +76,14 @@ struct Data<'a> {
 }
 
 impl Source for Data<'_> {
-    fn scan(&mut self) -> Result<Vec<ScannedItem>, ProviderError> {
+    fn scan(&mut self) -> Result<Scan, ProviderError> {
         self.tree.scan()
     }
 
     fn hash_prefixes(
         &mut self,
         requests: &[ItemPrefix],
-    ) -> Result<Vec<Option<Hash>>, ProviderError> {
+    ) -> Result<Vec<Result<Hashed, RangeFailure>>, ProviderError> {
         self.tree.hash_prefixes(requests)
     }
 
@@ -87,30 +95,35 @@ impl Source for Data<'_> {
         self.tree.fetch(requests, sink)
     }
 
-    /**
-     * `cleanupPeriodDays` in the root's `settings.json`: Claude Code deletes transcripts older
-     * than that many days, 30 unless set, at least 1. A settings file it would reject (not
-     * JSON, or a period that isn't a whole number of days from 1 up) gives no answer, as Claude
-     * Code itself then stops deleting. Settings from other scopes (a project's, a managed
-     * policy) can override the value and are not read.
-     */
     fn retention_days(&mut self) -> Result<Option<u32>, ProviderError> {
-        let Some(settings) = self
-            .transport
-            .read_small(&format!("{}/settings.json", self.root))?
-        else {
-            return Ok(Some(DEFAULT_RETENTION_DAYS));
-        };
-        Ok(match serde_json::from_slice(&settings) {
-            Ok(Value::Object(settings)) => match settings.get("cleanupPeriodDays") {
-                None => Some(DEFAULT_RETENTION_DAYS),
-                Some(days) => days
-                    .as_u64()
-                    .filter(|days| *days >= 1)
-                    .map(|days| u32::try_from(days).unwrap_or(u32::MAX)),
-            },
-            _ => None,
-        })
+        Ok(retention_days(
+            self.transport
+                .read_small(&format!("{}/settings.json", self.root))?
+                .as_deref(),
+        ))
+    }
+}
+
+/**
+ * `cleanupPeriodDays` in the root's `settings.json`, given the file if there is one: Claude Code
+ * deletes transcripts older than that many days, 30 unless set, at least 1. A settings file it
+ * would reject (not JSON, or a period that isn't a whole number of days from 1 up) gives no
+ * answer, as Claude Code itself then stops deleting. Settings from other scopes (a project's, a
+ * managed policy) can override the value and are not read.
+ */
+fn retention_days(settings: Option<&[u8]>) -> Option<u32> {
+    let Some(settings) = settings else {
+        return Some(DEFAULT_RETENTION_DAYS);
+    };
+    match serde_json::from_slice(settings) {
+        Ok(Value::Object(settings)) => match settings.get("cleanupPeriodDays") {
+            None => Some(DEFAULT_RETENTION_DAYS),
+            Some(days) => days
+                .as_u64()
+                .filter(|days| *days >= 1)
+                .map(|days| u32::try_from(days).unwrap_or(u32::MAX)),
+        },
+        _ => None,
     }
 }
 
@@ -147,10 +160,9 @@ fn classify(key: &str) -> FileClass {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::collections::HashMap;
 
     use super::*;
-    use crate::transport::LocalTransport;
 
     fn class(kind: ItemKind, session: Option<&str>, lines: bool) -> FileClass {
         FileClass {
@@ -204,61 +216,27 @@ mod tests {
     }
 
     #[test]
-    fn the_root_is_the_config_dir_when_set_else_the_home_folder() {
-        let home = tempfile::tempdir().unwrap();
-        let home_text = home.path().to_str().unwrap().to_string();
-        let transport = LocalTransport::with_env(home_text.clone(), []);
-        assert!(Agent.detect(&transport).unwrap().is_none());
-
-        let project = home.path().join(".claude/projects/-home-user-code-app");
-        fs::create_dir_all(&project).unwrap();
-        fs::write(project.join("s1.jsonl"), "{}\n").unwrap();
-        let mut found = Agent.detect(&transport).unwrap().unwrap();
-        let keys: Vec<_> = found.scan().unwrap().into_iter().map(|i| i.key).collect();
-        assert_eq!(keys, ["projects/-home-user-code-app/s1.jsonl"]);
-
-        let elsewhere = home.path().join("config");
-        fs::create_dir_all(elsewhere.join("projects/-home-user-code-other")).unwrap();
-        fs::write(
-            elsewhere.join("projects/-home-user-code-other/s2.jsonl"),
-            "{}\n",
-        )
-        .unwrap();
-        let transport = LocalTransport::with_env(
-            home_text,
-            [(
-                "CLAUDE_CONFIG_DIR".to_string(),
-                elsewhere.to_str().unwrap().to_string(),
-            )],
-        );
-        let mut found = Agent.detect(&transport).unwrap().unwrap();
-        let keys: Vec<_> = found.scan().unwrap().into_iter().map(|i| i.key).collect();
-        assert_eq!(keys, ["projects/-home-user-code-other/s2.jsonl"]);
+    fn the_root_is_the_config_dir_when_set_else_under_the_home_folder() {
+        let env = |config_dir: Option<&str>| Env {
+            home: "/home/user".to_string(),
+            vars: config_dir
+                .map(|dir| ("CLAUDE_CONFIG_DIR".to_string(), dir.to_string()))
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        };
+        assert_eq!(root(env(None)), "/home/user/.claude");
+        assert_eq!(root(env(Some(""))), "/home/user/.claude");
+        assert_eq!(root(env(Some("/srv/agent"))), "/srv/agent");
     }
 
     #[test]
     fn retention_is_read_from_settings_with_the_documented_default() {
-        let home = tempfile::tempdir().unwrap();
-        let root = home.path().join(".claude");
-        fs::create_dir_all(root.join("projects")).unwrap();
-        let transport = LocalTransport::with_env(home.path().to_str().unwrap().to_string(), []);
-        let retention = |settings: Option<&str>| {
-            match settings {
-                Some(settings) => fs::write(root.join("settings.json"), settings).unwrap(),
-                None => drop(fs::remove_file(root.join("settings.json"))),
-            }
-            Agent
-                .detect(&transport)
-                .unwrap()
-                .unwrap()
-                .retention_days()
-                .unwrap()
-        };
-        assert_eq!(retention(None), Some(30));
-        assert_eq!(retention(Some(r#"{"theme": "dark"}"#)), Some(30));
-        assert_eq!(retention(Some(r#"{"cleanupPeriodDays": 365}"#)), Some(365));
-        assert_eq!(retention(Some(r#"{"cleanupPeriodDays": 0}"#)), None);
-        assert_eq!(retention(Some(r#"{"cleanupPeriodDays": "90"}"#)), None);
-        assert_eq!(retention(Some("{ not json")), None);
+        let retention = |settings: &str| retention_days(Some(settings.as_bytes()));
+        assert_eq!(retention_days(None), Some(30));
+        assert_eq!(retention(r#"{"theme": "dark"}"#), Some(30));
+        assert_eq!(retention(r#"{"cleanupPeriodDays": 365}"#), Some(365));
+        assert_eq!(retention(r#"{"cleanupPeriodDays": 0}"#), None);
+        assert_eq!(retention(r#"{"cleanupPeriodDays": "90"}"#), None);
+        assert_eq!(retention("{ not json"), None);
     }
 }

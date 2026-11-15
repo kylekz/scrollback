@@ -4,13 +4,14 @@
 mod common;
 
 use std::fs;
+use std::io::Read as _;
 use std::path::PathBuf;
 
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::archive::{Archive, ArchiveError, Problem};
 use sb_core::catalogue::Reason;
-use sb_test_support::{Agent, DbAgent, FileAgent};
+use sb_test_support::{Agent, DbAgent, FileAgent, edit_catalogue};
 
 use common::{Bench, files_under};
 
@@ -23,6 +24,11 @@ fn synced() -> (Bench<FileAgent>, String) {
     (bench, key)
 }
 
+/// A well-formed segment of bytes that were never archived: only the catalogue can tell.
+fn other_segment() -> Vec<u8> {
+    zstd::encode_all(&b"other bytes\n"[..], 3).unwrap()
+}
+
 #[test]
 fn a_folder_without_an_archive_is_not_opened_as_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -31,7 +37,7 @@ fn a_folder_without_an_archive_is_not_opened_as_one() {
         Err(ArchiveError::NotAnArchive(_))
     ));
     /* Nothing was created in its place. */
-    assert_eq!(files_under(dir.path()), Vec::<PathBuf>::new());
+    assert!(files_under(dir.path()).is_empty());
 
     let id = Archive::create(dir.path()).unwrap().id().to_string();
     assert!(matches!(
@@ -69,6 +75,53 @@ fn an_archive_from_a_newer_build_is_refused() {
 }
 
 #[test]
+fn an_archive_that_lost_its_catalogue_is_not_opened_with_an_empty_one() {
+    let (mut bench, key) = synced();
+    let files = files_under(&bench.dir().join("files"));
+    bench.close();
+    let database = bench.dir().join("scrollback.db");
+    let kept = fs::read(&database).unwrap();
+    fs::remove_file(&database).unwrap();
+
+    match Archive::open(bench.dir()) {
+        Err(ArchiveError::CatalogueMissing { newest_backup, .. }) => {
+            assert_eq!(newest_backup, None);
+        }
+        other => panic!("{other:?}"),
+    }
+    /* Nothing was created, and nothing archived was moved. */
+    assert!(!database.exists());
+    assert_eq!(files_under(&bench.dir().join("files")), files);
+    assert!(bench.orphans().is_empty());
+
+    fs::write(&database, kept).unwrap();
+    bench.reopen();
+    bench.assert_mirrors(&[key]);
+}
+
+#[test]
+fn a_catalogue_that_records_nothing_does_not_get_the_files_set_aside() {
+    let (mut bench, _) = synced();
+    let files = files_under(&bench.dir().join("files"));
+    bench.close();
+    /* The catalogue of a fresh archive, in the place of this one's. */
+    let fresh = tempfile::tempdir().unwrap();
+    drop(Archive::create(fresh.path()).unwrap());
+    for file in ["scrollback.db-wal", "scrollback.db-shm"] {
+        let _ = fs::remove_file(bench.dir().join(file));
+    }
+    fs::copy(
+        fresh.path().join("scrollback.db"),
+        bench.dir().join("scrollback.db"),
+    )
+    .unwrap();
+
+    drop(Archive::open(bench.dir()).unwrap());
+    assert_eq!(files_under(&bench.dir().join("files")), files);
+    assert!(bench.orphans().is_empty());
+}
+
+#[test]
 fn a_start_empties_tmp_and_keeps_what_the_catalogue_records() {
     let (mut bench, key) = synced();
     let recorded = bench.segment_files();
@@ -78,7 +131,7 @@ fn a_start_empties_tmp_and_keeps_what_the_catalogue_records() {
     bench.reopen();
     assert!(!leftover.exists());
     assert_eq!(bench.segment_files(), recorded);
-    assert_eq!(bench.orphans(), Vec::<PathBuf>::new());
+    assert!(bench.orphans().is_empty());
     bench.assert_mirrors(&[key]);
 }
 
@@ -93,7 +146,7 @@ fn a_start_sets_aside_what_the_catalogue_does_not_record() {
         .dir()
         .join("files")
         .join(bench.location.as_str())
-        .join(bench.agent.provider().id())
+        .join(bench.agent.provider().id().as_str())
         .join("ff/ff000000000000000000000000000000");
     fs::create_dir_all(stray_item.join("v0001")).unwrap();
     fs::write(stray_item.join("source.json"), "{}").unwrap();
@@ -114,6 +167,61 @@ fn a_start_sets_aside_what_the_catalogue_does_not_record() {
     );
     assert_eq!(bench.orphans().len(), 3);
     bench.assert_mirrors(&[key]);
+}
+
+#[test]
+fn a_version_whose_segments_are_more_than_it_records_is_not_extended() {
+    let (mut bench, key) = two_segments();
+    let version = bench.versions(&key).remove(0);
+    let segments = bench.segments(&version);
+    let files = bench.segment_files();
+    let stored: Vec<_> = files.iter().map(|file| fs::read(file).unwrap()).collect();
+
+    /* The version as it was after its first segment, with the second segment's row still
+    there: the next pass would mean to store at an offset where a recorded segment is. */
+    edit_catalogue(
+        bench.dir(),
+        &format!(
+            "UPDATE version SET length = {}, hash = '{}' WHERE id = {};
+             UPDATE item SET seen_stamp = 'earlier';",
+            segments[0].length,
+            segments[0].hash.to_hex(),
+            version.id
+        ),
+    );
+    let report = bench.pass_with(bench.agent.provider()).unwrap();
+    assert_eq!((report.appended, report.failed.len()), (0, 1));
+    assert!(bench.versions(&key)[0].damaged);
+    /* Both segments are where they were, byte for byte, and nothing was set aside. */
+    assert_eq!(bench.segment_files(), files);
+    for (file, stored) in files.iter().zip(&stored) {
+        assert!(&fs::read(file).unwrap() == stored);
+    }
+    assert!(bench.orphans().is_empty());
+    assert!(files_under(&bench.dir().join("tmp")).is_empty());
+
+    /* The source is then fetched whole, as a new version. */
+    bench.agent.append(&key, 1);
+    assert_eq!(bench.sync().new_versions, 1);
+}
+
+#[test]
+fn reading_a_version_fails_on_bytes_that_were_not_archived() {
+    let (bench, key) = synced();
+    let version = bench.versions(&key).remove(0);
+    fs::write(bench.segment_files().remove(0), other_segment()).unwrap();
+
+    let mut content = Vec::new();
+    let error = bench
+        .archive()
+        .read_version(version.id)
+        .unwrap()
+        .read_to_end(&mut content)
+        .unwrap_err();
+    assert_eq!(
+        Problem::of(&error),
+        Some(&Problem::SegmentChanged { offset: 0 })
+    );
 }
 
 #[test]
@@ -156,15 +264,29 @@ fn verify_finds_a_corrupted_segment() {
 }
 
 #[test]
-fn verify_finds_a_segment_replaced_by_other_bytes() {
+fn verify_finds_a_truncated_segment() {
     let (bench, key) = synced();
     let segment = bench.segment_files().remove(0);
-    /* A well-formed segment of the wrong content: only the catalogue's hash can tell. */
-    fs::write(
-        &segment,
-        zstd::encode_all(&b"other bytes\n"[..], 3).unwrap(),
-    )
-    .unwrap();
+    let bytes = fs::read(&segment).unwrap();
+    fs::write(&segment, &bytes[..bytes.len() / 2]).unwrap();
+
+    let report = bench.archive().verify(&CancelToken::new()).unwrap();
+    assert!(
+        matches!(
+            report.damaged[0].problems[..],
+            [Problem::SegmentUnreadable { offset: 0, .. }]
+        ),
+        "{:?}",
+        report.damaged[0].problems
+    );
+    assert!(report.unread.is_empty());
+    assert!(bench.versions(&key)[0].damaged);
+}
+
+#[test]
+fn verify_finds_a_segment_replaced_by_other_bytes() {
+    let (bench, key) = synced();
+    fs::write(bench.segment_files().remove(0), other_segment()).unwrap();
 
     let report = bench.archive().verify(&CancelToken::new()).unwrap();
     assert_eq!(
@@ -172,6 +294,84 @@ fn verify_finds_a_segment_replaced_by_other_bytes() {
         [Problem::SegmentChanged { offset: 0 }]
     );
     assert!(bench.versions(&key)[0].damaged);
+}
+
+/// A bench whose one session was synced twice, so its version has two segments.
+fn two_segments() -> (Bench<FileAgent>, String) {
+    let mut agent = FileAgent::new();
+    let key = agent.add_session(20);
+    let mut bench = Bench::new(agent);
+    bench.sync();
+    bench.agent.append(&key, 5);
+    bench.sync();
+    (bench, key)
+}
+
+#[test]
+fn verify_finds_every_problem_of_a_version() {
+    let (bench, key) = two_segments();
+    for file in bench.segment_files() {
+        fs::remove_file(file).unwrap();
+    }
+    let second = bench.segments(&bench.versions(&key)[0])[1].offset;
+
+    let report = bench.archive().verify(&CancelToken::new()).unwrap();
+    assert_eq!(
+        report.damaged[0].problems,
+        [
+            Problem::SegmentMissing { offset: 0 },
+            Problem::SegmentMissing { offset: second }
+        ]
+    );
+}
+
+#[test]
+fn verify_finds_segments_that_do_not_follow_one_another() {
+    let (bench, key) = two_segments();
+    let second = bench.segments(&bench.versions(&key)[0])[1].offset;
+    /* The catalogue loses the row of the first segment: nothing holds the bytes before the
+    second. */
+    edit_catalogue(bench.dir(), "DELETE FROM segment WHERE offset = 0");
+
+    let report = bench.archive().verify(&CancelToken::new()).unwrap();
+    assert_eq!(
+        report.damaged[0].problems,
+        [Problem::Gap { offset: second }]
+    );
+    assert!(bench.versions(&key)[0].damaged);
+}
+
+#[test]
+fn verify_finds_segments_that_are_not_the_version_together() {
+    for edit in [
+        "UPDATE version SET length = length + 1",
+        "UPDATE version SET hash = (SELECT hash FROM segment WHERE offset > 0)",
+    ] {
+        let (bench, key) = two_segments();
+        edit_catalogue(bench.dir(), edit);
+
+        let report = bench.archive().verify(&CancelToken::new()).unwrap();
+        assert_eq!(report.damaged.len(), 1, "{edit}");
+        assert_eq!(report.damaged[0].problems, [Problem::VersionChanged]);
+        assert!(bench.versions(&key)[0].damaged);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_segment_that_cannot_be_read_now_is_reported_and_not_marked_damaged() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (bench, key) = synced();
+    let segment = bench.segment_files().remove(0);
+    fs::set_permissions(&segment, fs::Permissions::from_mode(0o000)).unwrap();
+    let report = bench.archive().verify(&CancelToken::new()).unwrap();
+    fs::set_permissions(&segment, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(report.damaged.is_empty());
+    assert_eq!(report.unread.len(), 1);
+    assert_eq!(report.unread[0].key, key);
+    assert!(!bench.versions(&key)[0].damaged);
 }
 
 #[test]
@@ -206,16 +406,11 @@ fn a_version_found_damaged_while_it_is_extended_is_not_extended() {
     let key = agent.add_session(20);
     let mut bench = Bench::new(agent);
     bench.sync();
-    fs::write(
-        bench.segment_files().remove(0),
-        zstd::encode_all(&b"other bytes\n"[..], 3).unwrap(),
-    )
-    .unwrap();
+    fs::write(bench.segment_files().remove(0), other_segment()).unwrap();
     bench.agent.append(&key, 5);
 
     /* The pass that would append reads the version back first and finds it changed. */
-    let mut passes = bench.try_sync(&CancelToken::new(), &mut |_| {}).unwrap();
-    let report = passes.remove(0);
+    let report = bench.pass_with(bench.agent.provider()).unwrap();
     assert_eq!((report.appended, report.failed.len()), (0, 1));
     assert_eq!(report.failed[0].key, key);
     assert!(bench.versions(&key)[0].damaged);
@@ -226,6 +421,29 @@ fn a_version_found_damaged_while_it_is_extended_is_not_extended() {
     let versions = bench.versions(&key);
     assert_eq!(versions[1].reason, Reason::Refetched);
     assert!(bench.read(&versions[1]) == bench.agent.content(&key));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_version_that_cannot_be_read_while_it_is_extended_is_left_alone() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut agent = FileAgent::new();
+    let key = agent.add_session(20);
+    let mut bench = Bench::new(agent);
+    bench.sync();
+    let segment = bench.segment_files().remove(0);
+    fs::set_permissions(&segment, fs::Permissions::from_mode(0o000)).unwrap();
+    bench.agent.append(&key, 5);
+
+    let report = bench.pass_with(bench.agent.provider()).unwrap();
+    fs::set_permissions(&segment, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!((report.appended, report.failed.len()), (0, 1));
+    /* Nothing says its bytes are wrong: it is not fetched again whole, only tried again. */
+    assert!(!bench.versions(&key)[0].damaged);
+    assert_eq!(bench.sync().appended, 1);
+    assert_eq!(bench.versions(&key).len(), 1);
+    bench.assert_mirrors(&[key]);
 }
 
 #[test]

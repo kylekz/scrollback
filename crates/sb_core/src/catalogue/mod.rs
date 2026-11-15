@@ -7,7 +7,8 @@
 
 mod schema;
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
@@ -208,6 +209,9 @@ pub(crate) struct Commit<'a> {
     pub hash: Hash,
 }
 
+/// The catalogue's file in the archive's folder.
+pub(crate) const DATABASE: &str = "scrollback.db";
+
 const ITEM: &str = "i.id, i.key, i.kind, i.session, i.seen_length, i.seen_stamp, i.gone_since";
 const VERSION: &str = "v.id, v.number, v.reason, v.started_at, v.length, v.hash, v.held_back, \
                        v.damaged, v.export_version";
@@ -220,16 +224,22 @@ pub struct Catalogue {
 }
 
 impl Catalogue {
-    /// Opens `scrollback.db` in the archive folder `dir`, creating it if missing, with today's
+    /// Opens the catalogue in the archive folder `dir`, creating it if missing, with today's
     /// backup and one before any migration.
     pub(crate) fn open(dir: &Path) -> Result<Self> {
-        let backups = Backups::new(dir.join("backups"), "scrollback");
+        let backups = backups(dir);
         let options = OpenOptions::new(&schema::SCHEMA)
             .backups(&backups)
             .daily_backup(chrono::Local::now().date_naive());
         Ok(Self {
-            db: Database::open(&dir.join("scrollback.db"), &options)?,
+            db: Database::open(&dir.join(DATABASE), &options)?,
         })
+    }
+
+    /// Whether anything is archived.
+    pub(crate) fn has_items(&self) -> Result<bool> {
+        self.db
+            .read(|c| Ok(c.query_row("SELECT EXISTS (SELECT 1 FROM item)", [], |row| row.get(0))?))
     }
 
     /// Runs one statement as a write of its own.
@@ -388,28 +398,30 @@ impl Catalogue {
     /// Every version in the archive with its segments, in one snapshot.
     pub(crate) fn stored(&self) -> Result<Vec<Stored>> {
         self.db.read(|c| {
-            let mut versions: Vec<Stored> = c
-                .prepare(&format!(
-                    "SELECT i.location_id, i.provider, i.key, i.item_id, {VERSION}
-                     FROM version v JOIN item i ON i.id = v.item_id ORDER BY v.id"
-                ))?
-                .query_map([], stored_from)?
-                .collect::<rusqlite::Result<_>>()?;
-            let mut segments = c.prepare(
+            let mut segments: HashMap<i64, Vec<Segment>> = HashMap::new();
+            let mut select = c.prepare(
                 "SELECT version_id, offset, length, hash, stored_at FROM segment
                  ORDER BY version_id, offset",
             )?;
-            let mut rows = segments.query([])?;
-            let mut at = 0;
+            let mut rows = select.query([])?;
             while let Some(row) = rows.next()? {
-                let version: i64 = row.get(0)?;
-                /* Both lists are in version order, and a segment's version always exists. */
-                while versions[at].version.id != version {
-                    at += 1;
-                }
-                versions[at].segments.push(segment_from(row, 1)?);
+                segments
+                    .entry(row.get(0)?)
+                    .or_default()
+                    .push(segment_from(row, 1)?);
             }
-            Ok(versions)
+            Ok(c.prepare(&format!(
+                "SELECT i.location_id, i.provider, i.key, i.item_id, {VERSION}
+                 FROM version v JOIN item i ON i.id = v.item_id ORDER BY v.id"
+            ))?
+            .query_map([], |row| {
+                let stored = stored_from(row)?;
+                Ok(Stored {
+                    segments: segments.remove(&stored.version.id).unwrap_or_default(),
+                    ..stored
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
         })
     }
 
@@ -461,8 +473,12 @@ impl Catalogue {
         })
     }
 
-    /// Records a stored range and the source state it brings the item up to. Returns whether a
-    /// version this starts is held back (PLAN §4.2).
+    /**
+     * Records a stored range and the source state it brings the item up to. Returns whether a
+     * version this starts is held back (PLAN §4.2): it is shorter than the copy being read,
+     * which is the newest version not itself held back. A held-back version that grows to that
+     * copy's length is no longer a loss and stops being held back.
+     */
     pub(crate) fn commit(&self, commit: &Commit<'_>) -> Result<bool> {
         let now = now_ms();
         let scanned = commit.scanned;
@@ -525,21 +541,26 @@ impl Catalogue {
                     reason,
                 } => {
                     seen(item)?;
-                    /* A loss is measured against the copy being read: the newest version that
-                    was not itself held back. */
                     let reading: u64 = tx.query_row(
                         "SELECT length FROM version WHERE item_id = ?1 AND held_back = 0
                          ORDER BY number DESC LIMIT 1",
                         [item],
                         |row| row.get(0),
                     )?;
-                    let held_back = scanned.length < reading;
+                    let held_back = commit.length < reading;
                     (start(item, number, reason, held_back)?, held_back)
                 }
                 Target::Append { item, version } => {
                     seen(item)?;
                     tx.execute(
-                        "UPDATE version SET length = ?2, hash = ?3 WHERE id = ?1",
+                        "UPDATE version SET length = ?2, hash = ?3,
+                             held_back = COALESCE(held_back AND ?2 < (
+                                 SELECT length FROM version reading
+                                 WHERE reading.item_id = version.item_id
+                                   AND reading.held_back = 0 AND reading.number < version.number
+                                 ORDER BY reading.number DESC LIMIT 1
+                             ), 0)
+                         WHERE id = ?1",
                         params![version, commit.length, commit.hash],
                     )?;
                     (version, false)
@@ -656,6 +677,16 @@ fn stored_from(row: &Row<'_>) -> rusqlite::Result<Stored> {
         version: version_from(row, 4)?,
         segments: Vec::new(),
     })
+}
+
+/// The archive's backups of its catalogue.
+fn backups(dir: &Path) -> Backups {
+    Backups::new(dir.join("backups"), "scrollback")
+}
+
+/// The most recent backup of the catalogue of the archive in `dir`, if there is one.
+pub(crate) fn newest_backup(dir: &Path) -> Option<PathBuf> {
+    backups(dir).newest()
 }
 
 /// Now, in Unix milliseconds.

@@ -1,6 +1,16 @@
 //! Store (PLAN §5, step 4): the sink a provider's fetch streams into. Each range becomes a
 //! segment, durable on disk, and then its rows are committed (PLAN §4.1), one item at a time,
 //! so whatever a stopped pass finished stays and the next pass continues from the catalogue.
+//!
+//! Every state of a stored version is bytes the source held at one instant: for an item made
+//! of lines, the start of the source at that instant up to the end of a line. The source is
+//! read while its agent writes, so that is checked, not assumed:
+//! - a range the provider reports as read from a source that stood still since the scan
+//!   ([`Fetched::Stable`]) is stored as it arrives;
+//! - any other range waits in `tmp/` until the fetch is over. Then the source hashes its own
+//!   start, as far as the version would reach with the range, and the range is stored only if
+//!   that is the hash of the version's bytes (and, for an item that isn't lines, the source
+//!   ends there too). Otherwise nothing is stored and the item is left for the next pass.
 
 use std::io::{self, Read as _};
 
@@ -8,11 +18,12 @@ use toolbox_process::CancelToken;
 
 use super::plan::Planned;
 use super::{Failure, PassReport, Progress, SyncError};
-use crate::archive::{Archive, ArchiveError, SegmentWriter, item_folder};
+use crate::archive::{Archive, ArchiveError, Problem, Sealed, SegmentWriter, item_folder};
 use crate::catalogue::{Commit, Target};
 use crate::hash::Hasher;
 use crate::location::LocationId;
-use crate::transport::{Halt, RangeFailure, RangeSink};
+use crate::provider::{ItemPrefix, ProviderError, Source};
+use crate::transport::{Fetched, Halt, RangeFailure, RangeSink};
 
 pub(super) struct Store<'a> {
     pub archive: &'a Archive,
@@ -25,8 +36,10 @@ pub(super) struct Store<'a> {
     pub report: &'a mut PassReport,
     /// The range arriving now.
     pub open: Option<Open>,
-    /// How many ranges have ended.
+    /// How many ranges have ended. They end in request order, so it is the next one's index.
     pub ended: usize,
+    /// Ranges that arrived whole from a source that may have changed around them.
+    pub unproven: Vec<Unproven>,
     /// Why the sink stopped the stream, once it has.
     pub stopped: Option<SyncError>,
 }
@@ -41,6 +54,14 @@ pub(super) struct Open {
     held: Vec<u8>,
     received: u64,
     failed: Option<String>,
+}
+
+/// A range waiting in `tmp/` to be proven (the module docs).
+pub(super) struct Unproven {
+    request: usize,
+    segment: Sealed,
+    /// The version's hash with the segment.
+    content: Hasher,
 }
 
 impl Open {
@@ -77,17 +98,53 @@ impl Store<'_> {
         self.commit(planned, None, Hasher::new())
     }
 
-    /// After the provider's fetch returned: why the stream was stopped, if it was. Every range
-    /// the provider never ended is a failure of that item.
-    pub(super) fn finish(mut self) -> Result<(), SyncError> {
+    /// After the provider's fetch returned with `fetched`: fails the pass with why the stream
+    /// was stopped, if it was; counts every range the provider never ended as a failure of
+    /// that item; then proves the ranges that wait for it against `source`.
+    pub(super) fn finish(
+        mut self,
+        fetched: Result<(), ProviderError>,
+        source: &mut dyn Source,
+    ) -> Result<(), SyncError> {
         if let Some(stopped) = self.stopped.take() {
             return Err(stopped);
         }
+        fetched?;
         for planned in &self.fetches[self.ended..] {
             self.report.failed.push(Failure {
                 key: planned.scanned.key.clone(),
                 reason: "the provider did not send it".to_string(),
             });
+        }
+        let unproven = std::mem::take(&mut self.unproven);
+        if unproven.is_empty() {
+            return Ok(());
+        }
+        let requests: Vec<_> = unproven
+            .iter()
+            .map(|unproven| {
+                let planned = self.fetches[unproven.request];
+                ItemPrefix {
+                    key: planned.scanned.key.clone(),
+                    length: planned.offset + unproven.segment.length,
+                }
+            })
+            .collect();
+        let mut hashes = source.hash_prefixes(&requests)?.into_iter();
+        for (unproven, request) in unproven.into_iter().zip(requests) {
+            if self.cancel.is_cancelled() {
+                return Err(SyncError::Cancelled);
+            }
+            let planned = self.fetches[unproven.request];
+            let proven = hashes.next().and_then(Result::ok).is_some_and(|hashed| {
+                hashed.hash == unproven.content.clone().finish()
+                    && (planned.scanned.lines || hashed.size == request.length)
+            });
+            if proven {
+                self.commit(planned, Some(unproven.segment), unproven.content)?;
+            } else {
+                self.report.deferred += 1;
+            }
         }
         Ok(())
     }
@@ -98,29 +155,49 @@ impl Store<'_> {
         Halt
     }
 
+    /// The planned range the provider is at with `request`, which must be the one after the
+    /// last that ended; anything else stops the pass, since the bytes could not be told apart.
+    fn current(&mut self, request: usize) -> Result<&Planned<'_>, Halt> {
+        if request != self.ended || request >= self.fetches.len() {
+            return Err(self.stop(SyncError::Protocol(format!(
+                "it sent request {request} when request {} of {} was due",
+                self.ended,
+                self.fetches.len()
+            ))));
+        }
+        Ok(self.fetches[request])
+    }
+
     /// Starts the range of `planned`. Appending to a version starts from the hash of what the
-    /// archive holds of it, read back, which also checks those bytes are still the ones
-    /// recorded; a version that fails is marked damaged and not extended.
+    /// archive holds of it, read back and checked against the catalogue on the way. A version
+    /// that fails the check is marked damaged, and one that can't be read is left alone;
+    /// neither is extended.
     fn begin(&self, planned: &Planned<'_>) -> Result<Open, SyncError> {
         let mut content = Hasher::new();
         let mut failed = None;
-        if let (Target::Append { version, .. }, Some(recorded)) = (planned.target, planned.hash) {
+        if let Target::Append { version, .. } = planned.target {
             let mut reader = self.archive.read_version(version)?;
             let mut buffer = vec![0; 128 * 1024];
-            let read = loop {
+            loop {
                 match reader.read(&mut buffer) {
-                    Ok(0) => break Ok(()),
-                    Ok(read) => content.update(&buffer[..read]),
-                    Err(error) => break Err(error),
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) if Problem::of(&error).is_some() => {
+                        self.archive.catalogue().set_damaged(&[version], true)?;
+                        failed = Some(format!(
+                            "its archived version is damaged ({error}); the next sync fetches \
+                             it again whole"
+                        ));
+                        break;
+                    }
+                    Err(error) => {
+                        failed = Some(format!("its archived version could not be read: {error}"));
+                        break;
+                    }
                 }
-            };
-            if read.is_err() || content.clone().finish() != recorded {
-                self.archive.catalogue().set_damaged(&[version], true)?;
-                failed = Some(
-                    "its archived version is damaged; the next sync fetches it again whole"
-                        .to_string(),
-                );
             }
+            content = reader.into_content();
         }
         Ok(Open {
             writer: match failed {
@@ -138,36 +215,31 @@ impl Store<'_> {
     fn commit(
         &mut self,
         planned: &Planned<'_>,
-        writer: Option<SegmentWriter>,
+        segment: Option<Sealed>,
         content: Hasher,
     ) -> Result<(), SyncError> {
         let key = &planned.scanned.key;
-        self.archive
-            .prepare_item(self.location, self.provider, key)?;
         /* Nothing to store yet when the source is empty, or is lines with no newline so far. */
-        let segment = match writer.filter(|writer| writer.length() > 0) {
-            Some(writer) => {
-                let length = writer.length();
-                let hash = self.archive.place_segment(
-                    writer,
-                    self.location,
-                    self.provider,
-                    key,
-                    planned.number,
-                    planned.offset,
-                )?;
-                Some((planned.offset, length, hash))
-            }
-            None => None,
-        };
-        let stored = segment.map_or(0, |(_, length, _)| length);
+        let segment = segment.filter(|segment| segment.length > 0);
+        let recorded = segment
+            .as_ref()
+            .map(|segment| (planned.offset, segment.length, segment.hash));
+        let stored = recorded.map_or(0, |(_, length, _)| length);
+        self.archive.store(
+            segment,
+            self.location,
+            self.provider,
+            key,
+            planned.number,
+            planned.offset,
+        )?;
         let held_back = self.archive.catalogue().commit(&Commit {
             location: self.location,
             provider: self.provider,
             scanned: planned.scanned,
             folder: &item_folder(key),
             target: planned.target,
-            segment,
+            segment: recorded,
             length: planned.offset + stored,
             hash: content.finish(),
         })?;
@@ -180,55 +252,91 @@ impl Store<'_> {
         self.report.bytes_stored += stored;
         Ok(())
     }
+
+    /// What became of a range that arrived whole: stored, kept to be proven, or left for the
+    /// next pass.
+    fn arrived(
+        &mut self,
+        request: usize,
+        fetched: Fetched,
+        writer: SegmentWriter,
+        content: Hasher,
+    ) -> Result<(), SyncError> {
+        let planned = self.fetches[request];
+        let segment = writer.seal().map_err(|source| ArchiveError::Io {
+            action: "write a segment in",
+            path: self.archive.tmp(),
+            source,
+        })?;
+        match fetched {
+            Fetched::Stable => self.commit(planned, Some(segment), content)?,
+            /* The unfinished last line of a file is only taken from one that has stopped
+            changing, and a range with nothing to store has nothing to prove. */
+            Fetched::Unstable if (planned.scanned.lines && !planned.cut) || segment.length == 0 => {
+                self.report.deferred += 1;
+            }
+            Fetched::Unstable => self.unproven.push(Unproven {
+                request,
+                segment,
+                content,
+            }),
+        }
+        Ok(())
+    }
 }
 
 impl RangeSink for Store<'_> {
     fn data(&mut self, request: usize, bytes: &[u8]) -> Result<(), Halt> {
+        let cut = self.current(request)?.cut;
         if self.cancel.is_cancelled() {
             return Err(self.stop(SyncError::Cancelled));
         }
-        let planned = self.fetches[request];
         let mut open = match self.open.take() {
             Some(open) => open,
-            None => self.begin(planned).map_err(|error| self.stop(error))?,
+            None => self
+                .begin(self.fetches[request])
+                .map_err(|error| self.stop(error))?,
         };
-        let written = open.write(bytes, planned.cut);
+        let written = open.write(bytes, cut);
         self.open = Some(open);
         written.map_err(|source| {
             self.stop(ArchiveError::Io {
                 action: "write a segment in",
-                path: self.archive.dir().join("tmp"),
+                path: self.archive.tmp(),
                 source,
             })
         })
     }
 
-    fn end(&mut self, request: usize, result: Result<(), RangeFailure>) -> Result<(), Halt> {
+    fn end(&mut self, request: usize, result: Result<Fetched, RangeFailure>) -> Result<(), Halt> {
+        let length = self.current(request)?.length;
         if self.cancel.is_cancelled() {
             return Err(self.stop(SyncError::Cancelled));
         }
-        let planned = self.fetches[request];
         let open = match self.open.take() {
             Some(open) => open,
-            None => self.begin(planned).map_err(|error| self.stop(error))?,
+            None => self
+                .begin(self.fetches[request])
+                .map_err(|error| self.stop(error))?,
         };
         self.report.bytes_fetched += open.received;
-        let failed = match (result, open.failed) {
-            (Err(failure), _) => Some(failure.to_string()),
-            (Ok(()), Some(reason)) => Some(reason),
-            (Ok(()), None) if open.received != planned.length => Some(format!(
-                "the provider sent {} of {} bytes",
-                open.received, planned.length
+        let failed = match (result, open.failed, open.writer) {
+            (Err(failure), ..) => Some(failure.to_string()),
+            (Ok(_), Some(reason), _) => Some(reason),
+            (Ok(_), None, _) if open.received != length => Some(format!(
+                "the provider sent {} of {length} bytes",
+                open.received
             )),
-            (Ok(()), None) => {
-                self.commit(planned, open.writer, open.content)
+            (Ok(fetched), None, Some(writer)) => {
+                self.arrived(request, fetched, writer, open.content)
                     .map_err(|error| self.stop(error))?;
                 None
             }
+            (Ok(_), None, None) => None,
         };
         if let Some(reason) = failed {
             self.report.failed.push(Failure {
-                key: planned.scanned.key.clone(),
+                key: self.fetches[request].scanned.key.clone(),
                 reason,
             });
         }

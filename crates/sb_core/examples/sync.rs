@@ -47,8 +47,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 damage.version, damage.problems
             );
         }
-        if !report.damaged.is_empty() {
-            return Err(format!("{} versions are damaged", report.damaged.len()).into());
+        for unread in &report.unread {
+            println!(
+                "not read: version {} of an item: {}",
+                unread.version, unread.error
+            );
+        }
+        if !report.damaged.is_empty() || !report.unread.is_empty() {
+            return Err(format!(
+                "{} versions are damaged, {} could not be read",
+                report.damaged.len(),
+                report.unread.len()
+            )
+            .into());
         }
         return Ok(());
     }
@@ -62,7 +73,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let passes = sync_location(
         &archive,
         &location.id,
-        &LocalTransport::new(),
+        &LocalTransport,
         &provider::builtin(),
         &CancelToken::new(),
         &mut |progress| match *progress {
@@ -81,28 +92,42 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     )?;
     for pass in passes {
+        let report = match pass.outcome {
+            Ok(report) => report,
+            Err(error) => {
+                println!("{}: failed: {error}", pass.provider);
+                continue;
+            }
+        };
         println!(
             "{}: {} items: {} unchanged, {} new, {} appended, {} touched, {} new versions \
-             ({} held back), {} gone, {} deferred, {} failed; {} bytes fetched, {} stored",
+             ({} held back), {} gone, {} deferred, {} failed, {} unlisted; {} bytes fetched, \
+             {} stored",
             pass.provider,
-            pass.scanned,
-            pass.unchanged,
-            pass.new_items,
-            pass.appended,
-            pass.touched,
-            pass.new_versions,
-            pass.held_back,
-            pass.gone,
-            pass.deferred,
-            pass.failed.len(),
-            pass.bytes_fetched,
-            pass.bytes_stored
+            report.scanned,
+            report.unchanged,
+            report.new_items,
+            report.appended,
+            report.touched,
+            report.new_versions,
+            report.held_back,
+            report.gone,
+            report.deferred,
+            report.failed.len(),
+            report.unlisted.len(),
+            report.bytes_fetched,
+            report.bytes_stored
         );
-        let mut reasons: Vec<_> = pass.failed.iter().map(|failure| &failure.reason).collect();
+        let mut reasons: Vec<_> = report
+            .failed
+            .iter()
+            .map(|failure| &failure.reason)
+            .chain(report.unlisted.iter().map(|unlisted| &unlisted.reason))
+            .collect();
         reasons.sort();
         reasons.dedup();
         for reason in reasons {
-            println!("  failed: {reason}");
+            println!("  not archived: {reason}");
         }
     }
     println!("synced in {:.1?}", started.elapsed());

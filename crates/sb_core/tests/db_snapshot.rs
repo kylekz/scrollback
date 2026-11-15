@@ -5,10 +5,9 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use sb_core::hash::Hash;
-use sb_core::provider::{DbSnapshot, ProviderError};
+use sb_core::provider::{DbSnapshot, Hashed, ProviderError, RangeFailure};
 use sb_core::transport::{
-    Env, FileEntry, FileStat, LocalTransport, PrefixRequest, RangeRequest, RangeSink, Transport,
+    Env, FileStat, Listing, LocalTransport, PrefixRequest, RangeRequest, RangeSink, Transport,
     TransportError,
 };
 use toolbox_store::rusqlite::Connection;
@@ -55,22 +54,22 @@ struct WritingAgent {
 
 impl Transport for WritingAgent {
     fn env(&self, names: &[&str]) -> Result<Env, TransportError> {
-        LocalTransport::new().env(names)
+        LocalTransport.env(names)
     }
 
     fn stat(&self, paths: &[&str]) -> Result<Vec<Option<FileStat>>, TransportError> {
-        LocalTransport::new().stat(paths)
+        LocalTransport.stat(paths)
     }
 
-    fn list(&self, root: &str) -> Result<Vec<FileEntry>, TransportError> {
-        LocalTransport::new().list(root)
+    fn list(&self, root: &str) -> Result<Listing, TransportError> {
+        LocalTransport.list(root)
     }
 
     fn hash_prefixes(
         &self,
         requests: &[PrefixRequest],
-    ) -> Result<Vec<Option<Hash>>, TransportError> {
-        LocalTransport::new().hash_prefixes(requests)
+    ) -> Result<Vec<Result<Hashed, RangeFailure>>, TransportError> {
+        LocalTransport.hash_prefixes(requests)
     }
 
     fn read_ranges(
@@ -78,7 +77,7 @@ impl Transport for WritingAgent {
         requests: &[RangeRequest],
         sink: &mut dyn RangeSink,
     ) -> Result<(), TransportError> {
-        LocalTransport::new().read_ranges(requests, sink)?;
+        LocalTransport.read_ranges(requests, sink)?;
         if self.copies.fetch_add(1, Ordering::Relaxed) < self.writes {
             write(&self.connection.lock().unwrap());
         }
@@ -86,25 +85,67 @@ impl Transport for WritingAgent {
     }
 
     fn read_small(&self, path: &str) -> Result<Option<Vec<u8>>, TransportError> {
-        LocalTransport::new().read_small(path)
+        LocalTransport.read_small(path)
     }
 }
 
 #[test]
 fn rows_still_in_the_write_ahead_log_are_in_the_snapshot() {
     let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
     let (path, _agent) = database(dir.path(), 3);
     assert!(std::fs::metadata(format!("{path}-wal")).unwrap().len() > 0);
 
-    let snapshot = DbSnapshot::take(&LocalTransport::new(), &path)
+    let snapshot = DbSnapshot::take(&LocalTransport, &path, scratch.path())
         .unwrap()
         .unwrap();
     assert_eq!(rows(&snapshot), 3);
+
+    /* The copy is in the scratch folder it was given, and goes with the snapshot. */
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 1);
+    drop(snapshot);
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_transaction_under_way_in_a_rollback_journal_is_not_in_the_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agent.db");
+    let connection = Connection::open(&path).unwrap();
+    /* A cache this small makes the transaction write its pages to the database file before it
+    commits, with the pages they replace in the journal beside it. */
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode = DELETE;
+             PRAGMA cache_size = 2;
+             CREATE TABLE message (body TEXT NOT NULL);
+             INSERT INTO message (body) VALUES ('a committed message');
+             BEGIN;",
+        )
+        .unwrap();
+    for _ in 0..200 {
+        connection
+            .execute(
+                "INSERT INTO message (body) VALUES (?1)",
+                ["an uncommitted message ".repeat(40)],
+            )
+            .unwrap();
+    }
+    let path = path.to_str().unwrap();
+    assert!(std::fs::metadata(format!("{path}-journal")).unwrap().len() > 0);
+    assert!(std::fs::metadata(path).unwrap().len() > 100_000);
+
+    let snapshot = DbSnapshot::take(&LocalTransport, path, scratch.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(rows(&snapshot), 1);
 }
 
 #[test]
 fn a_database_that_changed_while_it_was_copied_is_copied_again() {
     let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
     let (path, connection) = database(dir.path(), 3);
     let transport = WritingAgent {
         connection: Mutex::new(connection),
@@ -112,7 +153,9 @@ fn a_database_that_changed_while_it_was_copied_is_copied_again() {
         copies: AtomicUsize::new(0),
     };
 
-    let snapshot = DbSnapshot::take(&transport, &path).unwrap().unwrap();
+    let snapshot = DbSnapshot::take(&transport, &path, scratch.path())
+        .unwrap()
+        .unwrap();
     assert_eq!(transport.copies.load(Ordering::Relaxed), 3);
     assert_eq!(rows(&snapshot), 5);
 }
@@ -120,6 +163,7 @@ fn a_database_that_changed_while_it_was_copied_is_copied_again() {
 #[test]
 fn a_database_that_never_settles_is_given_up_on() {
     let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
     let (path, connection) = database(dir.path(), 1);
     let transport = WritingAgent {
         connection: Mutex::new(connection),
@@ -128,9 +172,11 @@ fn a_database_that_never_settles_is_given_up_on() {
     };
 
     assert!(matches!(
-        DbSnapshot::take(&transport, &path),
+        DbSnapshot::take(&transport, &path, scratch.path()),
         Err(ProviderError::Unsettled { attempts: 5, .. })
     ));
+    /* No attempt's copy is left behind. */
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -138,7 +184,7 @@ fn a_missing_database_is_no_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("agent.db");
     assert!(
-        DbSnapshot::take(&LocalTransport::new(), missing.to_str().unwrap())
+        DbSnapshot::take(&LocalTransport, missing.to_str().unwrap(), dir.path())
             .unwrap()
             .is_none()
     );
@@ -147,6 +193,7 @@ fn a_missing_database_is_no_snapshot() {
 #[test]
 fn the_source_database_is_left_as_it_was() {
     let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
     let (path, _agent) = database(dir.path(), 3);
     let files = || -> BTreeMap<_, _> {
         std::fs::read_dir(dir.path())
@@ -159,7 +206,7 @@ fn the_source_database_is_left_as_it_was() {
     };
     let before = files();
 
-    let snapshot = DbSnapshot::take(&LocalTransport::new(), &path)
+    let snapshot = DbSnapshot::take(&LocalTransport, &path, scratch.path())
         .unwrap()
         .unwrap();
     assert_eq!(rows(&snapshot), 3);

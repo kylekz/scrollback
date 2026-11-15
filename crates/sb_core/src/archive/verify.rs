@@ -1,33 +1,20 @@
-//! Verify (PLAN §4.4): re-hashes every segment against the catalogue, and every version's
-//! content against its running hash, and reports what doesn't match or is missing. It repairs
-//! nothing; it marks the versions it finds damaged, and the next sync of an item whose newest
-//! version is damaged fetches the source again as a new version.
+//! Verify (PLAN §4.4): reads every version back through [`VersionReader`], which checks each
+//! segment and the version's content against the catalogue, and reports what doesn't match or
+//! is missing. It repairs nothing; it marks the versions it finds damaged, and the next sync of
+//! an item whose newest version is damaged fetches the source again as a new version.
+//!
+//! A read the file system failed (a file in use, a disk error) says nothing about the stored
+//! bytes. Such a version is reported as unread and is not marked.
 
-use std::io;
+use std::fs;
+use std::io::{self, Read as _};
 
 use toolbox_process::CancelToken;
 
-use super::{Archive, ArchiveError, layout, segment};
-use crate::hash::Hasher;
+use super::{Archive, ArchiveError, Problem, layout};
 use crate::location::LocationId;
 
-/// What is wrong with a version's stored bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Problem {
-    /// The segment's file is not there.
-    SegmentMissing { offset: u64 },
-    /// The segment's file can't be read or decompressed.
-    SegmentUnreadable { offset: u64, detail: String },
-    /// The segment's bytes are not the ones the catalogue recorded.
-    SegmentChanged { offset: u64 },
-    /// The segments don't follow one another: the catalogue has none for the bytes before
-    /// `offset`.
-    Gap { offset: u64 },
-    /// Each segment matches, but together they are not the version the catalogue recorded.
-    VersionChanged,
-}
-
-/// A version with something wrong, and the item it belongs to.
+/// A version whose stored bytes are not the ones that were archived.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Damage {
     pub location: LocationId,
@@ -35,6 +22,16 @@ pub struct Damage {
     pub key: String,
     pub version: u32,
     pub problems: Vec<Problem>,
+}
+
+/// A version that could not be read to the end, for a reason that isn't its bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unread {
+    pub location: LocationId,
+    pub provider: String,
+    pub key: String,
+    pub version: u32,
+    pub error: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -46,6 +43,7 @@ pub struct VerifyReport {
     /// The size of the segment files those bytes are stored in.
     pub stored_bytes: u64,
     pub damaged: Vec<Damage>,
+    pub unread: Vec<Unread>,
 }
 
 impl Archive {
@@ -54,7 +52,13 @@ impl Archive {
         let mut report = VerifyReport::default();
         let mut damaged = Vec::new();
         let mut repaired = Vec::new();
+        let mut buffer = vec![0; 128 * 1024];
         for stored in self.catalogue.stored()? {
+            let (id, number, was_damaged) = (
+                stored.version.id,
+                stored.version.number,
+                stored.version.damaged,
+            );
             let dir = self
                 .dir
                 .join(layout::item_dir(
@@ -62,60 +66,61 @@ impl Archive {
                     &stored.provider,
                     &stored.folder,
                 ))
-                .join(layout::version_dir(stored.version.number));
+                .join(layout::version_dir(number));
+            report.versions += 1;
+            report.segments += stored.segments.len();
+            report.stored_bytes += stored
+                .segments
+                .iter()
+                .filter_map(|segment| {
+                    fs::metadata(dir.join(layout::segment_file(segment.offset))).ok()
+                })
+                .map(|metadata| metadata.len())
+                .sum::<u64>();
+            let (location, provider, key) = (
+                stored.location.clone(),
+                stored.provider.clone(),
+                stored.key.clone(),
+            );
+            let mut reader = self.reader(stored);
             let mut problems = Vec::new();
-            let mut content = Hasher::new();
-            let mut end = 0;
-            for recorded in &stored.segments {
+            let mut unread = None;
+            loop {
                 if cancel.is_cancelled() {
                     return Err(ArchiveError::Cancelled);
                 }
-                let offset = recorded.offset;
-                if offset != end {
-                    problems.push(Problem::Gap { offset });
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => report.bytes += read as u64,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => match Problem::of(&error) {
+                        Some(problem) => problems.push(problem.clone()),
+                        None => {
+                            unread = Some(error.to_string());
+                            break;
+                        }
+                    },
                 }
-                end = offset + recorded.length;
-                let file = dir.join(layout::segment_file(offset));
-                let mut hasher = Hasher::new();
-                let mut length = 0;
-                let read = segment::read_segment(&file, |bytes| {
-                    hasher.update(bytes);
-                    content.update(bytes);
-                    length += bytes.len() as u64;
-                });
-                match read {
-                    Ok(()) if length == recorded.length && hasher.finish() == recorded.hash => {}
-                    Ok(()) => problems.push(Problem::SegmentChanged { offset }),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        problems.push(Problem::SegmentMissing { offset });
-                    }
-                    Err(error) => problems.push(Problem::SegmentUnreadable {
-                        offset,
-                        detail: error.to_string(),
-                    }),
-                }
-                report.segments += 1;
-                report.bytes += length;
-                report.stored_bytes += file.metadata().map_or(0, |metadata| metadata.len());
             }
-            if problems.is_empty()
-                && (end != stored.version.length || content.finish() != stored.version.hash)
-            {
-                problems.push(Problem::VersionChanged);
-            }
-            report.versions += 1;
-            if problems.is_empty() {
-                if stored.version.damaged {
-                    repaired.push(stored.version.id);
-                }
-            } else {
-                damaged.push(stored.version.id);
+            if !problems.is_empty() {
+                damaged.push(id);
                 report.damaged.push(Damage {
-                    location: stored.location,
-                    provider: stored.provider,
-                    key: stored.key,
-                    version: stored.version.number,
+                    location: location.clone(),
+                    provider: provider.clone(),
+                    key: key.clone(),
+                    version: number,
                     problems,
+                });
+            } else if unread.is_none() && was_damaged {
+                repaired.push(id);
+            }
+            if let Some(error) = unread {
+                report.unread.push(Unread {
+                    location,
+                    provider,
+                    key,
+                    version: number,
+                    error,
                 });
             }
         }
