@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Every local gate in one script (docs/PLAN.md §3, §12). Agents and the owner run this before a
-# change is committed. It stops at the first failing step with a non-zero exit.
+# The local gates in one script (docs/PLAN.md §3, §12), all but `cargo deny check` (deny.toml:
+# licences, advisories and sources), which needs cargo-deny and is run by hand until CI runs it.
+# Agents and the owner run this before a change is committed. It stops at the first failing step
+# with a non-zero exit.
 #
 #   script/check               steps 1-6
 #   script/check --fast        steps 1-5 (skips the e2e scenarios)

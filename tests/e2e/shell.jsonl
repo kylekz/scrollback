@@ -50,7 +50,7 @@
 // The caption buttons need more than half of what the field leaves, so the field moves left of centre.
 {"cmd": "bounds", "target": "titlebar/search", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "lte": 250}, {"pointer": "/x", "gte": 160}, {"pointer": "/w", "equals": 460}]}
 {"cmd": "screenshot", "name": "shell-960x600"}
-// The button and Ctrl B show it over the main area; Esc and a click outside close it.
+// The button and Ctrl B show it over the main area; Esc and a press of any button outside it, on the main area or on the title bar, close it.
 {"cmd": "click", "target": "titlebar/sidebar", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
 {"cmd": "bounds", "target": "shell/sidebar", "expect_result": [{"pointer": "/x", "equals": 0}, {"pointer": "/y", "equals": 40}, {"pointer": "/w", "equals": 248}, {"pointer": "/h", "equals": 560}]}
 {"cmd": "bounds", "target": "shell/main", "expect_result": {"pointer": "/w", "equals": 960}}
@@ -58,11 +58,19 @@
 {"cmd": "key", "keystroke": "escape", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
 {"cmd": "key", "keystroke": "secondary-b", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
 {"cmd": "click", "x": 600, "y": 300, "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+{"cmd": "key", "keystroke": "secondary-b", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
+{"cmd": "click", "x": 600, "y": 300, "button": "right", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+{"cmd": "key", "keystroke": "secondary-b", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
+{"cmd": "click", "target": "titlebar/search", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+// A press on the overlay leaves it open, and its own button toggles it.
 {"cmd": "click", "target": "titlebar/sidebar", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
+{"cmd": "click", "target": "sidebar/all-sessions", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
 {"cmd": "click", "target": "titlebar/sidebar", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
 
 // A smaller --window-size is raised to the minimum (DESIGN §2: 960x600).
 {"restart": {"app_args": ["--window-size", "800x500"]}, "expect": [{"pointer": "/window/w", "equals": 960}, {"pointer": "/window/h", "equals": 600}, {"pointer": "/appearance/pinned", "equals": null}]}
+// The window opens at exactly the size asked, whichever way centring it on the display rounds: 1440x900 above and 1441x901 here differ in parity, so one of them centres on a half pixel. A fractional display scale can't show an odd size exactly and lands within a pixel of it.
+{"restart": {"app_args": ["--window-size", "1441x901"]}, "expect": [{"pointer": "/window/w", "gte": 1440.3}, {"pointer": "/window/w", "lte": 1441.7}, {"pointer": "/window/h", "gte": 900.3}, {"pointer": "/window/h", "lte": 901.7}]}
 // --theme forces light or dark for the run without a pin.
 {"restart": {"app_args": ["--theme", "light"]}, "expect": [{"pointer": "/window/w", "equals": 1440}, {"pointer": "/appearance/mode", "equals": "light"}, {"pointer": "/appearance/pinned", "equals": null}, {"pointer": "/appearance/resolved/appearance", "equals": "light"}]}
 {"restart": {"app_args": ["--theme", "dark"]}, "expect": [{"pointer": "/appearance/mode", "equals": "dark"}, {"pointer": "/appearance/resolved/appearance", "equals": "dark"}]}

@@ -27,7 +27,7 @@ Before committing, search the staged changes for the local username, home direct
 Rust 1.98.1 (pinned in `rust-toolchain.toml`). Run `script/check` with bash; on Windows that is Git Bash.
 
 ```bash
-script/check                 # every gate: fmt, clippy x2, gpui boundary, agent names, tests, e2e
+script/check                 # the gates: fmt, clippy x2, gpui boundary, agent names, tests, e2e
 script/check --fast          # the same without the e2e scenarios
 script/check --e2e-only      # the e2e scenarios alone
 cargo deny check             # licences, advisories and sources (deny.toml); needs cargo-deny

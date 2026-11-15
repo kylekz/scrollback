@@ -381,7 +381,9 @@ macOS uses `Cmd` for every `Ctrl` above, keycaps in its menu symbols (`⌘K`, `�
 - **Title bar:** the boards always show the search field, Sync all and Settings; the first run and the unavailable archive hide or disable them (§4.10, §4.14). `E-Edge-Archive-Missing` still shows them enabled. Build per this file.
 - **Overline letter-spacing** (§1.3) is not drawn: this gpui has no letter-spacing. Add it when gpui does.
 - **Caption buttons** on Windows use Windows' own 10px glyphs with its Close hover red, as dv does, not the boards' Lucide glyphs.
-- **The phase 0 shell** (PLAN §13) draws the search field, Sync all and Settings disabled, because the first-run screen that hides them (§4.10) arrives in phase 3.
+- **The phase 0 shell** (PLAN §13) draws the search field, Sync all and Settings disabled, and a disabled New folder `+` and Sync glyph in the sidebar, because the first-run screen that hides them (§4.10, `E-First-Run`) arrives in phase 3.
+- **Disabled controls** are dimmed per painted piece, not as a group as the boards' `opacity: .45` does (gpui applies opacity per paint), so a disabled field's border and keycap come out a shade lighter than the boards'.
+- **Board buttons:** in the E board sources a reset rule for `button` outranks the row, field and button classes, so the boards draw sidebar rows without side padding and with `fg` names, and the search field and Sync all without their chrome. This file's values are the intent; build per this file.
 - **Dark danger fill:** white on `#f08a7e` is 2.4:1. **Open:** darken the fill or use `accent-ink`-style dark text before phase 6 draws it.
 - **macOS:** the boards draw Windows (caption buttons, `C:\` paths, WSL). macOS has the traffic lights, no WSL section, and its own data folder (§2, §4.10).
 - **History popover footer:** `E-Versions` mentions subagent and tool-result versions in a footer only; each call body with more than one version also shows its own (§4.3).

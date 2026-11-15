@@ -343,7 +343,7 @@ impl Default for Spacing {
     }
 }
 
-/// Elevation (DESIGN §1.1 `shadow-pop`; §1.2 for light).
+/// Elevation (DESIGN §1.1 `shadow-pop`; §1.2 for light), written as CSS writes it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Shadows {
     /// Popovers, menus, sheets, dialogs.
@@ -365,11 +365,13 @@ impl Shadows {
     }
 }
 
+/// A CSS `0 <y>px <blur>px <color>` shadow.
 fn shadow(color: Rgba, y: f32, blur: f32) -> BoxShadow {
     BoxShadow {
         color: color.into(),
         offset: point(px(0.), px(y)),
-        blur_radius: px(blur),
+        // gpui's blur radius is the Gaussian's sigma; CSS's is twice that.
+        blur_radius: px(blur / 2.),
         spread_radius: px(0.),
         inset: false,
     }

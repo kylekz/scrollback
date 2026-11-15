@@ -85,23 +85,48 @@ fn a_narrow_window_collapses_the_sidebar_and_ctrl_b_shows_it_over_the_main_area(
         "the main area keeps its width under the sidebar"
     );
 
-    // Esc closes it, and so does a click outside it; a click on it doesn't.
     cx.simulate_keystrokes("escape");
     assert_eq!(placement(&shell, cx), SidebarPlacement::Collapsed);
+}
+
+#[gpui::test]
+fn a_press_outside_the_overlay_closes_it_whatever_the_button(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell_sized(size(px(1000.), px(700.)), cx);
+    let press = |cx: &mut VisualTestContext, x: f32, y: f32, button: MouseButton| {
+        cx.simulate_mouse_down(point(px(x), px(y)), button, Modifiers::none());
+        cx.simulate_mouse_up(point(px(x), px(y)), button, Modifiers::none());
+    };
+    let button = bounds(cx, "titlebar-sidebar")
+        .expect("the sidebar's button")
+        .center();
+    // On the main area and on the title bar (here its search field), with any button.
+    for (x, y, mouse_button) in [
+        (600., 300., MouseButton::Left),
+        (600., 300., MouseButton::Right),
+        (600., 300., MouseButton::Middle),
+        (500., 20., MouseButton::Left),
+        (500., 20., MouseButton::Right),
+    ] {
+        cx.simulate_keystrokes("secondary-b");
+        assert_eq!(placement(&shell, cx), SidebarPlacement::Overlay);
+        press(cx, x, y, mouse_button);
+        assert_eq!(
+            placement(&shell, cx),
+            SidebarPlacement::Collapsed,
+            "{mouse_button:?} at {x}, {y}"
+        );
+    }
+    // A press on the overlay itself leaves it open.
     cx.simulate_keystrokes("secondary-b");
-    cx.simulate_click(point(px(100.), px(300.)), Modifiers::none());
-    assert_eq!(placement(&shell, cx), SidebarPlacement::Overlay);
-    cx.simulate_mouse_down(
-        point(px(600.), px(300.)),
-        MouseButton::Left,
-        Modifiers::none(),
-    );
-    cx.simulate_mouse_up(
-        point(px(600.), px(300.)),
-        MouseButton::Left,
-        Modifiers::none(),
-    );
+    for mouse_button in [MouseButton::Left, MouseButton::Right] {
+        press(cx, 100., 300., mouse_button);
+        assert_eq!(placement(&shell, cx), SidebarPlacement::Overlay);
+    }
+    // Its own button toggles: the press must not close it for the click to open it again.
+    cx.simulate_click(button, Modifiers::none());
     assert_eq!(placement(&shell, cx), SidebarPlacement::Collapsed);
+    cx.simulate_click(button, Modifiers::none());
+    assert_eq!(placement(&shell, cx), SidebarPlacement::Overlay);
 }
 
 #[gpui::test]
@@ -152,6 +177,23 @@ fn a_material_change_reaches_the_window(cx: &mut TestAppContext) {
             assert_eq!(cx.sb_theme().material, material);
             assert_eq!(cx.sb_theme().appearance, Appearance::Light);
         });
+    }
+}
+
+#[gpui::test]
+fn the_window_opens_on_whole_pixels_at_exactly_its_size(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    // Whatever the display's size, centring one of these two lands on a half pixel.
+    for asked in [size(px(1440.), px(900.)), size(px(1441.), px(901.))] {
+        let options = cx.update(|_, cx| window_options(asked, cx));
+        let Some(WindowBounds::Windowed(bounds)) = options.window_bounds else {
+            panic!("a windowed window");
+        };
+        assert_eq!(bounds.size, asked);
+        assert_eq!(
+            bounds.origin,
+            bounds.origin.map(|coordinate| coordinate.round())
+        );
     }
 }
 

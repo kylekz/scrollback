@@ -25,7 +25,7 @@ use gpui::{
 };
 
 use super::{Shell, SidebarPlacement};
-use crate::actions::shell::ToggleSidebar;
+use crate::actions::shell::{Dismiss, ToggleSidebar};
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{DISABLED_OPACITY, icon, kbd};
 use crate::icons::SbIcon;
@@ -58,6 +58,13 @@ impl Shell {
             .border_b_1()
             .border_color(c.line_subtle)
             .window_control_area(WindowControlArea::Drag)
+            // A press on the bar is a press outside the sidebar's overlay; the bar's buttons
+            // occlude it, so a press on one of them isn't.
+            .when(sidebar == SidebarPlacement::Overlay, |this| {
+                this.on_any_mouse_down(
+                    cx.listener(|this, _, window, cx| this.dismiss(&Dismiss, window, cx)),
+                )
+            })
             .debug_selector(|| "titlebar".into())
             .child(
                 div().flex_1().flex().child(
@@ -105,9 +112,11 @@ fn sidebar_button(
 ) -> AnyElement {
     let c = &theme.colors;
     let open = sidebar == SidebarPlacement::Overlay;
-    let (hover, pressed) = (c.s2, c.s3);
+    // Open, it is on (`s3`) whether or not the pointer is over it.
+    let fill = if open { c.s3 } else { c.s2 };
     div()
         .id("titlebar-sidebar")
+        .debug_selector(|| "titlebar-sidebar".into())
         .role(Role::Button)
         .aria_label(format!(
             "{} sidebar ({})",
@@ -123,8 +132,8 @@ fn sidebar_button(
         // A control inside the drag region.
         .occlude()
         .cursor_pointer()
-        .when(open, |this| this.bg(pressed))
-        .hover(move |style| style.bg(hover))
+        .when(open, |this| this.bg(fill))
+        .hover(move |style| style.bg(fill))
         .on_click(
             cx.listener(|this, _, window, cx| this.toggle_sidebar(&ToggleSidebar, window, cx)),
         )

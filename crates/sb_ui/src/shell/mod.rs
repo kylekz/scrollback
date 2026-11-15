@@ -8,8 +8,10 @@
 //!
 //! **Narrow windows** (DESIGN §2). Below 1040px the sidebar leaves the layout
 //! ([`SidebarPlacement::Collapsed`]) and a button appears left of the mark. The button and
-//! `Ctrl B` show the sidebar over the main area ([`SidebarPlacement::Overlay`]); `Esc`, a click
-//! outside it, either of those two again, or the window growing back closes it.
+//! `Ctrl B` show the sidebar over the main area ([`SidebarPlacement::Overlay`]). The button or
+//! `Ctrl B` again, `Esc`, the window growing back, or a press of any mouse button outside it
+//! closes it: on the main area or on the title bar, except on the title bar's own buttons (the
+//! sidebar's, which toggles, and Windows' caption buttons, which are the OS's).
 //!
 //! **Keyboard.** It rests on the main area, inside the shell's key context, until a view there
 //! takes it, so the shell's keys work at once. The main area is the window's `Main` landmark,
@@ -23,7 +25,7 @@ mod tests;
 use anyhow::{Context as _, Result};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, Role, Size,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, Role, Size,
     StatefulInteractiveElement as _, Styled as _, Subscription, TitlebarOptions, Window,
     WindowBounds, WindowHandle, WindowOptions, deferred, div, point, prelude::FluentBuilder as _,
     px, size,
@@ -130,7 +132,8 @@ impl Shell {
     }
 
     /// The sidebar over the main area of a narrow window, and under it a layer that takes the
-    /// click outside which closes it. The title bar stays clear, so its button still toggles.
+    /// press outside which closes it. The layer ends at the title bar and clips the sidebar's
+    /// shadow there, so the bar is neither covered nor darkened.
     fn render_sidebar_overlay(&self, theme: &SbTheme, cx: &mut Context<Self>) -> AnyElement {
         deferred(
             div()
@@ -139,9 +142,9 @@ impl Shell {
                 .bottom_0()
                 .left_0()
                 .right_0()
+                .overflow_hidden()
                 .occlude()
-                .on_mouse_down(
-                    MouseButton::Left,
+                .on_any_mouse_down(
                     cx.listener(|this, _, window, cx| this.dismiss(&Dismiss, window, cx)),
                 )
                 .child(
@@ -149,8 +152,8 @@ impl Shell {
                         .h_full()
                         .w(theme.sizes.sidebar_width)
                         .shadow(theme.shadows.pop.clone())
-                        // A click on the sidebar itself is not a click outside it.
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        // A press on the sidebar itself is not a press outside it.
+                        .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
                         .child(sidebar(theme.colors.bg_side_overlay, theme)),
                 ),
         )
@@ -206,16 +209,19 @@ impl Render for Shell {
     }
 }
 
-/// Options for the main window: centred at `window_size` (logical px), DESIGN §2's minimum
-/// size, a custom title bar, and the installed theme's material.
+/// Options for the main window: centred at exactly `window_size` (logical px), DESIGN §2's
+/// minimum size, a custom title bar, and the installed theme's material.
 pub fn window_options(window_size: Size<gpui::Pixels>, cx: &App) -> WindowOptions {
     let sizes = &cx.sb_theme().sizes;
     WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-            None,
-            window_size,
-            cx,
-        ))),
+        window_bounds: Some(WindowBounds::Windowed(Bounds {
+            // Centred, on whole pixels: from a half pixel the platform rounds the window's edges
+            // outwards and it opens a pixel larger than asked.
+            origin: Bounds::centered(None, window_size, cx)
+                .origin
+                .map(|coordinate| coordinate.floor()),
+            size: window_size,
+        })),
         titlebar: Some(TitlebarOptions {
             title: Some("scrollback".into()),
             // Hides the system title bar; the shell draws its own (`title_bar`).
