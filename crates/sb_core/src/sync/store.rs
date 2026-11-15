@@ -316,6 +316,12 @@ impl RangeSink for Store<'_> {
         };
         self.report.bytes_fetched += open.received;
         let failed = match (result, open.failed, open.writer) {
+            /* The source shrank or went after the plan was made: it changed, as one that did
+            so before its prefix was hashed, and the next pass decides about it. */
+            (Err(RangeFailure::Missing | RangeFailure::Short { .. }), ..) => {
+                self.report.deferred += 1;
+                None
+            }
             (Err(failure), ..) => Some(failure.to_string()),
             (Ok(_), Some(reason), _) => Some(reason),
             (Ok(_), None, _) if open.received != length => Some(format!(

@@ -181,6 +181,36 @@ fn a_file_that_shrank_or_went_after_the_scan_waits_for_the_next_pass() {
 }
 
 #[test]
+fn a_file_that_shrank_or_went_before_its_fetch_waits_for_the_next_pass_too() {
+    let mut agent = FileAgent::new();
+    let (shrinks, goes) = (agent.add_session(6), agent.add_session(6));
+    let mut bench = Bench::new(agent);
+    bench.sync();
+    bench.agent.append(&shrinks, 2);
+    bench.agent.append(&goes, 2);
+
+    /* The pass has hashed both files' starts and plans to append to each. */
+    let report = bench
+        .pass_with(bench.meddling(Meddle::at(When::AfterHashing, || {
+            bench.agent.overwrite(&shrinks, b"{}\n");
+            fs::remove_file(bench.agent.tree().path(&goes)).unwrap();
+        })))
+        .unwrap();
+    assert_eq!(
+        (report.deferred, report.appended, report.new_versions),
+        (2, 0, 0)
+    );
+    /* Neither is a failure: the location's sync succeeded. */
+    assert!(report.failed.is_empty());
+    assert!(common::files_under(&bench.dir().join("tmp")).is_empty());
+
+    let report = bench.sync();
+    assert_eq!((report.new_versions, report.gone), (1, 1));
+    assert_eq!(bench.versions(&shrinks)[1].reason, Reason::Shrank);
+    bench.assert_mirrors(&[shrinks]);
+}
+
+#[test]
 fn an_unfinished_last_line_is_not_taken_from_a_file_that_is_changing_after_all() {
     let (bench, key) = synced();
     bench.agent.append_raw(&key, r#"{"type":"user","mess"#);
