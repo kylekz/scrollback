@@ -66,7 +66,7 @@ impl Catalogue {
         location: Option<&LocationId>,
     ) -> Result<FolderId> {
         let name = named(name)?;
-        let (typed, path) = typed_path(typed)?;
+        let (typed, path) = self.typed_path(typed, location)?;
         self.db.write(|tx| {
             let folder = create(tx, name, parent)?;
             attach(tx, folder, typed, &path, location)?;
@@ -190,7 +190,7 @@ impl Catalogue {
         typed: &str,
         location: Option<&LocationId>,
     ) -> Result<()> {
-        let (typed, path) = typed_path(typed)?;
+        let (typed, path) = self.typed_path(typed, location)?;
         self.db
             .write(|tx| attach(tx, folder, typed, &path, location))
     }
@@ -243,23 +243,32 @@ impl Catalogue {
             Ok(folder.map(FolderId))
         })
     }
-}
 
-/// A project path as it is kept, and as filing compares it: without the white space around
-/// it and the double quotes a path copied from a file manager comes in. Refused when it
-/// names no directory or does not say where it is from the top.
-fn typed_path(typed: &str) -> Result<(&str, NormalPath)> {
-    let typed = typed.trim();
-    let typed = typed
-        .strip_prefix('"')
-        .and_then(|typed| typed.strip_suffix('"'))
-        .map_or(typed, str::trim);
-    /* The drive mount is the default one for every location until a location can say its
-    own (PLAN §6.3). */
-    let path = NormalPath::new(typed, None)
-        .filter(NormalPath::is_absolute)
-        .ok_or_else(|| CatalogueError::NoPath(typed.to_string()))?;
-    Ok((typed, path))
+    /**
+     * A project path as it is kept, and as filing compares it: without the white space around
+     * it and the double quotes a path copied from a file manager comes in, and for one location
+     * read under that location's drive mount, where it has one (PLAN §6.3). Refused when it
+     * names no directory or does not say where it is from the top.
+     */
+    fn typed_path<'a>(
+        &self,
+        typed: &'a str,
+        location: Option<&LocationId>,
+    ) -> Result<(&'a str, NormalPath)> {
+        let typed = typed.trim();
+        let typed = typed
+            .strip_prefix('"')
+            .and_then(|typed| typed.strip_suffix('"'))
+            .map_or(typed, str::trim);
+        let mount = match location {
+            Some(location) => self.drive_mount(location)?,
+            None => None,
+        };
+        let path = NormalPath::new(typed, mount.as_deref())
+            .filter(NormalPath::is_absolute)
+            .ok_or_else(|| CatalogueError::NoPath(typed.to_string()))?;
+        Ok((typed, path))
+    }
 }
 
 /// Makes the folder `name` in `parent`, or at the top, after the folders already there.
@@ -387,6 +396,46 @@ fn refile(connection: &Connection) -> rusqlite::Result<()> {
         }
     }
     Ok(())
+}
+
+/**
+ * Reads again, under the drive mount `location` now has, what was read under the one it had:
+ * the project path of each of its sessions and each path attached for it, from how they were
+ * recorded. Then files by the rules.
+ */
+pub(super) fn remount(
+    connection: &Connection,
+    location: &LocationId,
+    mount: Option<&str>,
+) -> rusqlite::Result<()> {
+    let sessions: Vec<(i64, String)> = connection
+        .prepare(
+            "SELECT id, project_path FROM session
+             WHERE location_id = ?1 AND project_path IS NOT NULL",
+        )?
+        .query_map([location], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut read = connection.prepare("UPDATE session SET project = ?2 WHERE id = ?1")?;
+    for (id, path) in sessions {
+        read.execute(params![id, NormalPath::new(&path, mount)])?;
+    }
+    let attached: Vec<(i64, String)> = connection
+        .prepare("SELECT folder_id, typed FROM folder_path WHERE location_id = ?1 ORDER BY rowid")?
+        .query_map([location], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    /* Taken off and attached again in the order they were: a path may now be what another
+    was a moment ago. One that now names what an earlier one does is not attached twice. */
+    connection.execute("DELETE FROM folder_path WHERE location_id = ?1", [location])?;
+    let mut attach = connection.prepare(
+        "INSERT OR IGNORE INTO folder_path (folder_id, path, typed, location_id)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (folder, typed) in attached {
+        if let Some(path) = NormalPath::new(&typed, mount).filter(NormalPath::is_absolute) {
+            attach.execute(params![folder, path, typed, location])?;
+        }
+    }
+    refile(connection)
 }
 
 /// The folder whose attached path claims a session started in `project` at `location`.

@@ -13,7 +13,8 @@ use chrono::{DateTime, Datelike as _, FixedOffset, Local, TimeZone as _, Utc};
 static PINNED_YEAR: OnceLock<i32> = OnceLock::new();
 
 /// Writes every date in UTC and as seen from `year`, whatever the machine's zone and clock
-/// say. The first call decides.
+/// say. The first call decides. Scripted runs only: the shipped app has no way to pin it.
+#[cfg(feature = "automation")]
 pub fn pin_calendar(year: i32) {
     PINNED_YEAR.get_or_init(|| year);
 }

@@ -7,8 +7,11 @@
 //!
 //! Each location's sessions are written as an agent's transcripts and synced into the archive
 //! through the real engine, then the folders are made and their paths attached, which files
-//! the sessions as it would for the owner. The three locations are all this machine's kind
-//! until the others exist (docs/PLAN.md §13, phase 5), so their tags share one colour.
+//! the sessions as it would for the owner. The three locations are of the three kinds, this
+//! machine, a WSL distro and a host over SSH, though each is synced from a folder here: they
+//! are rows of the catalogue. The app a scenario starts reaches the distro as this machine
+//! and never reaches the host (`scrollback`'s `automation::connect`), so the host shows as
+//! unreachable.
 //!
 //! Everything here is illustrative: made-up titles in placeholder names.
 
@@ -788,7 +791,16 @@ pub fn build(archive_dir: &Path, scratch: &Path) -> Result<()> {
     for (index, name) in LOCATIONS.into_iter().enumerate() {
         let mut tree = ProjectsTree::in_home(&scratch.join(index.to_string()));
         let starred = writer.location(index, &mut tree);
-        let location = catalogue.add_location(LocationKind::Local, name)?;
+        let kind = match index {
+            PC => LocationKind::Local,
+            WSL => LocationKind::Wsl {
+                distro: name.to_string(),
+            },
+            _ => LocationKind::Ssh {
+                host: name.to_string(),
+            },
+        };
+        let location = catalogue.add_location(kind, name)?;
         let passes = sync_location(
             &archive,
             &location.id,

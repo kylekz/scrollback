@@ -16,10 +16,10 @@ use thiserror::Error;
 use toolbox_process::CancelToken;
 
 use crate::archive::{Archive, ArchiveError};
-use crate::catalogue::{self, CatalogueError};
-use crate::location::LocationId;
+use crate::catalogue::{self, Catalogue, CatalogueError};
+use crate::location::{LocationId, LocationKind};
 use crate::provider::{Provider, ProviderError, ProviderId, Source, Unlisted};
-use crate::transport::Transport;
+use crate::transport::{Transport, TransportError, wsl};
 
 pub use index::{IndexReport, index, index_session};
 
@@ -27,6 +27,11 @@ pub use index::{IndexReport, index, index_session};
 pub enum SyncError {
     #[error("the sync was cancelled")]
     Cancelled,
+    /// The location could not be connected to: a machine that is asleep or off the network.
+    /// Not a failure (PLAN §5); what was archived before the connection went stays. With what
+    /// the launcher said, its verdict on the first line.
+    #[error("the location could not be reached: {0}")]
+    Unreachable(String),
     #[error("location {0} is already being synced")]
     Busy(LocationId),
     #[error(transparent)]
@@ -199,6 +204,15 @@ pub struct Pass {
  * Only then are the sessions the passes changed indexed, those of a pass that failed too:
  * what it stored before it failed is archived, and the backup is on record whatever becomes
  * of the index.
+ *
+ * When the location itself fails, at the start or from some point on, the sync stops there:
+ * the provider after would only meet the same. The pass it stopped in is the last of those
+ * returned, after whatever the providers before it did, and its failure is recorded as the
+ * location's, once, after what the providers before it fell short of. A location that can't
+ * be connected to ends that pass with
+ * [`SyncError::Unreachable`] and is recorded as unreachable, which is not an error; a
+ * launcher or a shell that fails (a sign-in refused, a host key not accepted, a missing
+ * tool) is recorded as the location's error.
  */
 pub fn sync_location(
     archive: &Archive,
@@ -216,6 +230,10 @@ pub fn sync_location(
     let scratch = archive.tmp();
     let mut stored = Vec::new();
     let mut problems = Vec::new();
+    /* Whether it is the location that failed, and not a provider's pass over it; and why
+    it could not be reached, when that is how. */
+    let mut the_locations = false;
+    let mut unreachable = None;
     for provider in providers {
         let id = provider.id();
         let outcome = match provider.detect(transport, &scratch) {
@@ -223,19 +241,54 @@ pub fn sync_location(
             Ok(Some(mut source)) => pass(archive, location, id, source.as_mut(), cancel, progress),
             Err(error) => Err(error.into()),
         };
-        match &outcome {
+        let outcome = match outcome {
+            Err(SyncError::Provider(ProviderError::Transport(TransportError::Unreachable(
+                reason,
+            )))) => Err(SyncError::Unreachable(reason)),
+            outcome => outcome,
+        };
+        the_locations = match &outcome {
             Err(SyncError::Cancelled) => return Err(SyncError::Cancelled),
-            Err(error) => problems.push(format!("{id}: {error}")),
+            /* A transport stopped by the cancel fails its call: that is the cancel, too. */
+            Err(_) if cancel.is_cancelled() => return Err(SyncError::Cancelled),
+            Err(SyncError::Unreachable(reason)) => {
+                unreachable = Some(reason.clone());
+                true
+            }
+            Err(SyncError::Provider(ProviderError::Transport(error)))
+                if error.is_the_locations() =>
+            {
+                problems.push(error.to_string());
+                true
+            }
+            Err(error) => {
+                problems.push(format!("{id}: {error}"));
+                false
+            }
             Ok(report) => {
                 problems.extend(report.shortfall().map(|short| format!("{id}: {short}")));
+                false
             }
-        }
+        };
         stored.push((provider, outcome));
+        if the_locations {
+            break;
+        }
     }
-    if problems.is_empty() {
-        catalogue.record_outcome(location, None)?;
-    } else {
-        catalogue.record_outcome(location, Some(&problems.join("; ")))?;
+    let problems = (!problems.is_empty()).then(|| problems.join("; "));
+    match unreachable {
+        /* No error, and it leaves what the last sync that reached the location said; but
+        what the providers before fell short of, this sync found when it did reach it. */
+        Some(reason) => {
+            if problems.is_some() {
+                catalogue.record_outcome(location, problems.as_deref())?;
+            }
+            catalogue.record_unreachable(location, &reason)?;
+        }
+        None => catalogue.record_outcome(location, problems.as_deref())?,
+    }
+    if !the_locations {
+        learn_drive_mount(catalogue, location, transport)?;
     }
     let mut passes = Vec::new();
     for (provider, outcome) in stored {
@@ -250,6 +303,31 @@ pub fn sync_location(
         });
     }
     Ok(passes)
+}
+
+/**
+ * Has a WSL distro say where it mounts the Windows drives, and records it: the project paths
+ * of its sessions are read by it (PLAN §6.3), so it is learnt before they are indexed, and
+ * anew at every sync, since the owner may change it. A file that can't be read just now
+ * leaves what is on record.
+ */
+fn learn_drive_mount(
+    catalogue: &Catalogue,
+    location: &LocationId,
+    transport: &dyn Transport,
+) -> Result<(), SyncError> {
+    let kind = catalogue.location(location)?.map(|location| location.kind);
+    if !matches!(kind, Some(LocationKind::Wsl { .. })) {
+        return Ok(());
+    }
+    match transport.read_small(wsl::CONF) {
+        Ok(conf) => {
+            let mount = conf.and_then(|conf| wsl::automount_root(&String::from_utf8_lossy(&conf)));
+            catalogue.set_drive_mount(location, mount.as_deref())?;
+        }
+        Err(error) => log::warn!("could not read {}: {error}", wsl::CONF),
+    }
+    Ok(())
 }
 
 /// One pass: scan, plan, fetch and store (PLAN §5). Its index follows the last pass.

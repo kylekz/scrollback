@@ -23,6 +23,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{App, AppContext as _, Entity, Global};
+use sb_core::CancelToken;
+use sb_core::location::LocationKind;
 use sb_core::provider::Provider;
 use sb_core::transport::Transport;
 
@@ -30,10 +32,17 @@ pub use archive::{ArchiveService, ArchiveState};
 pub use library::{
     LibraryService, Month, Page, PathChip, SessionsPage, Stats, can_attach, group_key, group_path,
 };
-pub use sync::{Held, LocationStatus, PassProgress, SyncEvent, SyncService};
+#[cfg(any(test, feature = "automation"))]
+pub use sync::Held;
+pub use sync::{LocationStatus, PassProgress, SyncEvent, SyncService};
 
 /// The providers of the agents scrollback archives, as the services and the views share them.
 pub type Providers = Arc<Vec<Box<dyn Provider>>>;
+
+/// The transport that reads a location of a kind, stopped by the token: what
+/// [`LocationKind::transport`] gives, or in tests homes of their choosing in place of this
+/// machine's, a distro's and a host's.
+pub type Connect = Arc<dyn Fn(&LocationKind, &CancelToken) -> Box<dyn Transport> + Send + Sync>;
 
 /// What [`init`] needs from the binary.
 pub struct ServicesConfig {
@@ -41,8 +50,8 @@ pub struct ServicesConfig {
     pub archive_dir: PathBuf,
     /// The providers of the agents to archive (`sb_core::provider::builtin`).
     pub providers: Vec<Box<dyn Provider>>,
-    /// This machine as a location: its real files, or a home of a test's choosing.
-    pub local: Arc<dyn Transport>,
+    /// How each kind of location is reached.
+    pub connect: Connect,
 }
 
 /// The app's services.
@@ -68,7 +77,8 @@ impl Services {
 pub fn init(config: ServicesConfig, cx: &mut App) {
     let providers: Providers = Arc::new(config.providers);
     let archive = cx.new(|cx| ArchiveService::new(config.archive_dir, cx));
-    let sync = cx.new(|cx| SyncService::new(archive.clone(), providers.clone(), config.local, cx));
+    let sync =
+        cx.new(|cx| SyncService::new(archive.clone(), providers.clone(), config.connect, cx));
     let library = cx.new(|cx| LibraryService::new(archive.clone(), sync.clone(), cx));
     cx.set_global(Services {
         archive,

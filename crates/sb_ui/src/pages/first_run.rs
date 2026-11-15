@@ -12,9 +12,13 @@ use gpui::{
     TextRun, Window, div, font, prelude::FluentBuilder as _, px,
 };
 
+use sb_core::location::LocationKind;
+
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{ButtonKind, Tone, button, checkbox, icon, kind_name, overline, tag};
+use crate::components::{
+    ButtonKind, button, checkbox, icon, kind_icon, kind_name, location_tag, overline,
+};
 use crate::format;
 use crate::icons::SbIcon;
 use crate::services::sync::{Survey, local_name};
@@ -148,7 +152,7 @@ impl FirstRun {
                 cx.notify();
             }))
             .child(checkbox(checked, theme))
-            .child(icon(SbIcon::Monitor, theme.sizes.icon, c.fg2))
+            .child(icon(kind_icon(&LocationKind::Local), theme.sizes.icon, c.fg2))
             .child(
                 div()
                     .flex_1()
@@ -162,9 +166,9 @@ impl FirstRun {
                             .items_center()
                             .gap(theme.spacing.sm)
                             .child(div().text_spec(&theme.text.control).child(local_name()))
-                            .child(tag(
-                                kind_name(sb_core::location::LocationKind::Local),
-                                Tone::Accent,
+                            .child(location_tag(
+                                kind_name(&LocationKind::Local),
+                                &LocationKind::Local,
                                 false,
                                 theme,
                             )),

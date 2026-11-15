@@ -10,7 +10,7 @@ use sb_core::catalogue::Shelf;
 
 use super::sessions::SessionsView;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{BANNER_GAP, ButtonKind, button, icon, progress_bar};
+use crate::components::{BANNER_GAP, ButtonKind, button, icon, kind_icon, progress_bar};
 use crate::format;
 use crate::icons::SbIcon;
 use crate::services::{LocationStatus, PassProgress, SyncService};
@@ -26,8 +26,8 @@ const ESTIMATE_AFTER_MS: i64 = 60_000;
 pub struct FirstSync {
     /// When the earliest started, in Unix milliseconds.
     started: i64,
-    /// Each location's name, how far its pass is and when it started.
-    locations: Vec<(String, PassProgress, i64)>,
+    /// Each location's name and its kind's glyph, how far its pass is and when it started.
+    locations: Vec<(String, SbIcon, PassProgress, i64)>,
 }
 
 /// The first syncs running now, if any is.
@@ -40,12 +40,17 @@ pub fn running(sync: &SyncService) -> Option<FirstSync> {
                 progress,
                 first: true,
                 started,
-            } => Some((location.name.clone(), progress, started)),
+            } => Some((
+                location.name.clone(),
+                kind_icon(&location.kind),
+                progress,
+                started,
+            )),
             _ => None,
         })
         .collect();
     Some(FirstSync {
-        started: locations.iter().map(|(_, _, started)| *started).min()?,
+        started: locations.iter().map(|(.., started)| *started).min()?,
         locations,
     })
 }
@@ -76,8 +81,8 @@ fn time_left(first_sync: &FirstSync, now: i64) -> Option<String> {
     let left = first_sync
         .locations
         .iter()
-        .filter(|(_, progress, _)| !progress.is_indexing())
-        .map(|(_, progress, started)| {
+        .filter(|(_, _, progress, _)| !progress.is_indexing())
+        .map(|(_, _, progress, started)| {
             let elapsed = now - started;
             let done = progress.fraction();
             (elapsed >= ESTIMATE_AFTER_MS && done > 0.)
@@ -138,7 +143,7 @@ pub fn card(first_sync: &FirstSync, theme: &SbTheme, cx: &Context<SessionsView>)
             div()
                 .flex()
                 .gap(theme.spacing.xl)
-                .children(first_sync.locations.iter().map(|(name, progress, _)| {
+                .children(first_sync.locations.iter().map(|(name, glyph, progress, _)| {
                     div()
                         .flex_1()
                         .min_w_0()
@@ -151,7 +156,7 @@ pub fn card(first_sync: &FirstSync, theme: &SbTheme, cx: &Context<SessionsView>)
                                 .items_center()
                                 .gap(theme.spacing.md)
                                 .text_spec(&theme.text.secondary)
-                                .child(icon(SbIcon::Monitor, theme.sizes.icon_sm, c.fg3))
+                                .child(icon(*glyph, theme.sizes.icon_sm, c.fg3))
                                 .child(
                                     div()
                                         .font_weight(theme.text.control.weight)
@@ -248,7 +253,7 @@ mod tests {
     fn the_time_left_waits_for_a_minute_of_progress() {
         let first_sync = |progress, started| FirstSync {
             started,
-            locations: vec![("This PC".to_string(), progress, started)],
+            locations: vec![("This PC".to_string(), SbIcon::Monitor, progress, started)],
         };
         let minute = 60_000;
         // A quarter done after five minutes: fifteen to go.

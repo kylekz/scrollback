@@ -2,9 +2,15 @@
 //! each pass is.
 //!
 //! A pass runs on a background thread, one per location at a time, and passes for different
-//! locations run side by side. It reports into a [`PassProgress`] the service reads a few times
-//! a second, and it stops at its next step when its location is stopped; what it committed
-//! stays (PLAN §5).
+//! locations run side by side. It reads its location through the transport its kind takes
+//! ([`Connect`]): this machine's files, or a shell in a WSL distro or on a host over SSH. It
+//! reports into a [`PassProgress`] the service reads a few times a second, and it stops at its
+//! next step when its location is stopped, the transport's running command with it; what it
+//! committed stays (PLAN §5).
+//!
+//! **Unreachable** (PLAN §5): a location that could not be connected to (a machine asleep or
+//! off the network) is in a state of its own, since when, which is not a failure: it has no
+//! banner, and the next sync tries again.
 //!
 //! **Triggers** (PLAN §5): the start (once the archive is open and its locations are read),
 //! the owner ([`SyncService::sync`], [`SyncService::sync_all`]), and [`SYNC_INTERVAL`] while
@@ -15,23 +21,25 @@
 //! and what a new parser version asks for. And a pass that was stopped, or that failed, is
 //! followed by an index of its location, so that what it stored before it ended shows. These
 //! run in the background like a pass, with their progress for the sidebar
-//! ([`SyncService::indexing`]).
+//! ([`SyncService::indexing`]). A location's index and its pass never run together: a sync
+//! asked for while its location is indexed starts when the index is over.
 //!
 //! Views observe the service for the locations' rows, and the library hears
 //! [`SyncEvent::Archived`] when what it shows may have changed. When the app quits, every pass
 //! and index is told to stop.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::collections::{HashMap, HashSet};
+#[cfg(any(test, feature = "automation"))]
+use std::sync::{Condvar, MutexGuard};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 use sb_core::CancelToken;
 use sb_core::location::{Location, LocationId, LocationKind};
 use sb_core::sync::{Found, IndexReport, Progress, SyncError, index, survey, sync_location};
-use sb_core::transport::Transport;
 
-use super::{ArchiveService, Providers};
+use super::{ArchiveService, Connect, Providers};
 use crate::format;
 
 /// How often every location is synced while the app is open (DESIGN §4.13 offers 5, 15, 30 and
@@ -120,8 +128,7 @@ impl PassProgress {
     }
 }
 
-/// What a location's row shows (PLAN §5). Unreachable arrives with the locations that can be
-/// (PLAN §13, phase 5).
+/// What a location's row shows (PLAN §5).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LocationStatus {
     Syncing {
@@ -134,6 +141,9 @@ pub enum LocationStatus {
     /// The last sync failed: why, in the failing tool's words, each agent's part led by its
     /// provider's id (`crate::agents::named` writes it for the owner).
     Failed(String),
+    /// The last sync could not reach it, nor any since the time given, in Unix milliseconds.
+    /// Not a failure: what the location's last good sync archived is all there.
+    Unreachable { since: i64 },
     /// When the last sync finished, in Unix milliseconds.
     Synced(i64),
     NeverSynced,
@@ -148,6 +158,7 @@ pub enum SyncEvent {
 }
 
 /// What a pass does when it reaches a [`Hold`].
+#[cfg(any(test, feature = "automation"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Held {
     /// Waits until it is released.
@@ -156,6 +167,7 @@ pub enum Held {
     Stop,
 }
 
+#[cfg(any(test, feature = "automation"))]
 #[derive(Default)]
 struct HoldState {
     /// The pass that has stored this many items acts on the hold.
@@ -165,10 +177,12 @@ struct HoldState {
 }
 
 /// A point at which the next pass waits or stops, for the tests and the scenarios that need a
-/// pass in a known state (`tests/e2e/first_sync.jsonl`). Nothing in the app sets one.
+/// pass in a known state (`tests/e2e/first_sync.jsonl`). The shipped app has none.
+#[cfg(any(test, feature = "automation"))]
 #[derive(Clone, Default)]
 struct Hold(Arc<(Mutex<HoldState>, Condvar)>);
 
+#[cfg(any(test, feature = "automation"))]
 impl Hold {
     fn state(&self) -> MutexGuard<'_, HoldState> {
         self.0.0.lock().unwrap_or_else(PoisonError::into_inner)
@@ -231,7 +245,7 @@ struct Indexing {
 pub struct SyncService {
     archive: Entity<ArchiveService>,
     providers: Providers,
-    local: Arc<dyn Transport>,
+    connect: Connect,
     /// `None` until they are read from the catalogue.
     locations: Option<Vec<Location>>,
     /// Why the locations could not be read.
@@ -241,6 +255,8 @@ pub struct SyncService {
     passes: HashMap<LocationId, Running>,
     /// The indexes running outside a pass (the module docs): of one location, or of all.
     indexes: HashMap<Option<LocationId>, Indexing>,
+    /// The locations to sync once their index is over.
+    waiting: HashSet<LocationId>,
     /// Why a location's last pass stopped, where the catalogue could not record it.
     errors: HashMap<LocationId, String>,
     /// This machine is being added as a location.
@@ -249,6 +265,7 @@ pub struct SyncService {
     /// at this machine.
     jobs: usize,
     stop_index: CancelToken,
+    #[cfg(any(test, feature = "automation"))]
     hold: Hold,
     _observers: [Subscription; 2],
     _interval: Option<Task<()>>,
@@ -260,7 +277,7 @@ impl SyncService {
     pub fn new(
         archive: Entity<ArchiveService>,
         providers: Providers,
-        local: Arc<dyn Transport>,
+        connect: Connect,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
@@ -273,16 +290,18 @@ impl SyncService {
             ],
             archive,
             providers,
-            local,
+            connect,
             locations: None,
             failure: None,
             found: None,
             passes: HashMap::new(),
             indexes: HashMap::new(),
+            waiting: HashSet::new(),
             errors: HashMap::new(),
             adding: false,
             jobs: 0,
             stop_index: CancelToken::new(),
+            #[cfg(any(test, feature = "automation"))]
             hold: Hold::default(),
             _interval: None,
         }
@@ -315,14 +334,17 @@ impl SyncService {
                 started: running.started,
             };
         }
-        let error = self
-            .errors
-            .get(&location.id)
-            .or(location.last_error.as_ref());
-        match (error, location.last_success) {
-            (Some(error), _) => LocationStatus::Failed(error.clone()),
-            (None, Some(at)) => LocationStatus::Synced(at),
-            (None, None) => LocationStatus::NeverSynced,
+        if let Some(error) = self.errors.get(&location.id) {
+            return LocationStatus::Failed(error.clone());
+        }
+        // The last sync's word: what one that could not reach it knew is from before.
+        match (&location.unreachable, &location.last_error, location.last_success) {
+            (Some(unreachable), ..) => LocationStatus::Unreachable {
+                since: unreachable.since,
+            },
+            (None, Some(error), _) => LocationStatus::Failed(error.clone()),
+            (None, None, Some(at)) => LocationStatus::Synced(at),
+            (None, None, None) => LocationStatus::NeverSynced,
         }
     }
 
@@ -404,11 +426,12 @@ impl SyncService {
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return;
         };
-        let (providers, local) = (self.providers.clone(), self.local.clone());
+        let (providers, connect) = (self.providers.clone(), self.connect.clone());
         self.run(
             cx,
             move || {
-                survey(&archive, local.as_ref(), &providers)
+                let here = connect(&LocationKind::Local, &CancelToken::new());
+                survey(&archive, here.as_ref(), &providers)
                     .into_iter()
                     .map(|found| {
                         found.map_err(|(id, error)| {
@@ -473,7 +496,8 @@ impl SyncService {
         }
     }
 
-    /// Syncs a location, unless it is syncing already.
+    /// Syncs a location, unless it is syncing already; while its index runs, once that is
+    /// over (the module docs).
     pub fn sync(&mut self, id: &LocationId, cx: &mut Context<Self>) {
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return;
@@ -484,17 +508,22 @@ impl SyncService {
         if self.passes.contains_key(id) {
             return;
         }
+        if self.indexes.contains_key(&Some(id.clone())) {
+            self.waiting.insert(id.clone());
+            return;
+        }
         let first = location.last_success.is_none();
-        // The one kind of location there is so far is this machine.
-        let transport = match location.kind {
-            LocationKind::Local => self.local.clone(),
-        };
         let cancel = CancelToken::new();
         let reported = Reported::default();
         let job = cx.background_spawn({
-            let (id, providers, hold) = (id.clone(), self.providers.clone(), self.hold.clone());
+            let (id, kind) = (id.clone(), location.kind.clone());
+            let (providers, connect) = (self.providers.clone(), self.connect.clone());
+            #[cfg(any(test, feature = "automation"))]
+            let hold = self.hold.clone();
             let (cancel, reported) = (cancel.clone(), reported.clone());
             async move {
+                // Stopping the pass stops what its transport runs at the location.
+                let transport = connect(&kind, &cancel);
                 let synced = sync_location(
                     &archive,
                     &id,
@@ -506,6 +535,7 @@ impl SyncService {
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .apply(progress);
+                        #[cfg(any(test, feature = "automation"))]
                         hold.reached(progress, &cancel);
                     },
                 );
@@ -540,6 +570,10 @@ impl SyncService {
                                     Ok(report) => {
                                         changed |=
                                             report.unchanged < report.scanned || report.gone > 0;
+                                    }
+                                    // A normal state (the module docs), on the location's row.
+                                    Err(SyncError::Unreachable(reason)) => {
+                                        log::info!("{id} could not be reached: {reason}");
                                     }
                                     Err(error) => {
                                         changed = true;
@@ -622,6 +656,9 @@ impl SyncService {
                     if this.indexed(indexed) {
                         cx.emit(SyncEvent::Archived);
                     }
+                    if let Some(id) = location.filter(|id| this.waiting.remove(id)) {
+                        this.sync(&id, cx);
+                    }
                     cx.notify();
                 })
                 .ok();
@@ -690,12 +727,14 @@ impl SyncService {
         })
     }
 
-    /// Stops every running pass at its next step, one waiting at a hold too. What each
-    /// committed stays (PLAN §5).
+    /// Stops every running pass at its next step, one waiting at a hold too, and drops the
+    /// syncs waiting for an index. What each pass committed stays (PLAN §5).
     pub fn stop_all(&mut self) {
         for running in self.passes.values() {
             running.cancel.cancel();
         }
+        self.waiting.clear();
+        #[cfg(any(test, feature = "automation"))]
         self.hold.release();
     }
 
@@ -713,11 +752,13 @@ impl SyncService {
     }
 
     /// Lets a pass that is waiting at a hold go on, and clears the hold.
+    #[cfg(any(test, feature = "automation"))]
     pub fn release(&mut self) {
         self.hold.release();
     }
 
     /// Whether a pass is waiting at a hold.
+    #[cfg(any(test, feature = "automation"))]
     pub fn is_held(&self) -> bool {
         self.hold.state().waiting
     }

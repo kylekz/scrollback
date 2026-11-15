@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use gpui::{App, QuitMode, px, size};
-use sb_core::transport::LocalTransport;
+use sb_core::location::LocationKind;
 use sb_ui::ActiveTheme as _;
 use sb_ui::appearance::MaterialSupport;
-use sb_ui::services::ServicesConfig;
+use sb_ui::services::{Connect, ServicesConfig};
 
 use crate::cli::Cli;
 
@@ -58,11 +58,20 @@ fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
     }
     // Light or dark and the material, before the first frame.
     sb_ui::appearance::init(MaterialSupport::probe(), cli.theme.unwrap_or_default(), cx);
+    // A scripted run reaches only what its scenario put there.
+    #[cfg(feature = "automation")]
+    let connect: Connect = if cli.automation_enabled() {
+        Arc::new(crate::automation::connect)
+    } else {
+        Arc::new(LocationKind::transport)
+    };
+    #[cfg(not(feature = "automation"))]
+    let connect: Connect = Arc::new(LocationKind::transport);
     sb_ui::services::init(
         ServicesConfig {
             archive_dir: data_dir.join(ARCHIVE),
             providers: sb_core::provider::builtin(),
-            local: Arc::new(LocalTransport),
+            connect,
         },
         cx,
     );

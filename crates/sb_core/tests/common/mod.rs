@@ -9,6 +9,9 @@
     reason = "each test binary uses its own part of this module"
 )]
 
+#[cfg(unix)]
+pub mod shell;
+
 use std::fs;
 use std::io::Read as _;
 use std::ops::Deref;
@@ -324,6 +327,32 @@ impl<A: Agent> Bench<A> {
             .map(|version| self.segments(&version).len())
             .sum()
     }
+}
+
+/**
+ * Runs this test binary's tests once more with every fixture location read through the
+ * shell transport, by this machine's `sh` (PLAN §12). The run it starts has the shell named
+ * in its environment and starts none itself; naming another there (`SB_TEST_SHELL=dash
+ * cargo test`) runs the tests through that one.
+ *
+ * It is a test like any other, so a run that names tests runs it only if it is among them,
+ * and then with every test of the binary: `SB_TEST_SHELL=sh cargo test <name>` is how to
+ * run some of them through a shell.
+ */
+pub fn again_through_a_shell() {
+    if sb_test_support::through_a_shell() {
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .env(sb_test_support::SHELL, "sh")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "with the locations read through sh:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Every file under `dir`, however deep; none when `dir` is missing.

@@ -12,6 +12,9 @@ use gpui::{
 };
 use gpui_appearance::{MaterialSupport, Mode};
 use gpui_component::Root;
+use sb_core::CancelToken;
+use sb_core::location::LocationKind;
+use sb_core::transport::Transport;
 use sb_test_support::{Outline, ProjectsTree};
 use tempfile::TempDir;
 
@@ -72,14 +75,37 @@ pub fn init(machine: ProjectsTree, cx: &mut TestAppContext) {
 /// [`init`] with the archive in the `archive` folder of the scratch folder `archive`, which a
 /// test may have put something in.
 pub fn init_in(archive: TempDir, machine: ProjectsTree, cx: &mut TestAppContext) {
+    init_with(
+        archive,
+        machine,
+        |kind, _| panic!("this test reaches no {kind:?}"),
+        cx,
+    );
+}
+
+/**
+ * [`init_in`], with the locations of the other kinds than this machine reached through
+ * `elsewhere`: never the real distro or host a kind names, but a home of the test's own, read
+ * through a local shell or a stand-in transport.
+ */
+pub fn init_with(
+    archive: TempDir,
+    machine: ProjectsTree,
+    elsewhere: impl Fn(&LocationKind, &CancelToken) -> Box<dyn Transport> + Send + Sync + 'static,
+    cx: &mut TestAppContext,
+) {
     cx.update(|cx| {
         crate::init(cx).expect("sb_ui initialises");
         crate::appearance::init(MaterialSupport::ALL, Mode::System, cx);
+        let here = machine.transport();
         services::init(
             ServicesConfig {
                 archive_dir: archive.path().join("archive"),
                 providers: sb_core::provider::builtin(),
-                local: Arc::new(machine.transport()),
+                connect: Arc::new(move |kind, cancel| match kind {
+                    LocationKind::Local => Box::new(here.clone()),
+                    other => elsewhere(other, cancel),
+                }),
             },
             cx,
         );

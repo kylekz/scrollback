@@ -576,7 +576,7 @@ impl SessionsView {
                         )
                     })
                     .children(location.map(|location| {
-                        location_tag(location.name.clone(), location.kind, true, theme)
+                        location_tag(location.name.clone(), &location.kind, true, theme)
                     }))
                     .children(subfolder.map(|folder| {
                         tag(folder.name.clone(), Tone::Neutral, true, theme)
@@ -675,7 +675,7 @@ fn paths_line(paths: &[PathChip], folder: &str, sync: &SyncService, theme: &SbTh
                 .whitespace_nowrap()
                 .child(match location {
                     Some(location) => {
-                        location_tag(location.name.clone(), location.kind, false, theme)
+                        location_tag(location.name.clone(), &location.kind, false, theme)
                             .into_any_element()
                     }
                     None => tag("any location", Tone::Neutral, false, theme).into_any_element(),

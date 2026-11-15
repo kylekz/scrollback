@@ -4,6 +4,9 @@
 //! documents the protocol and the builtin commands; `gpui_automation` adds `window` and
 //! `windows` to `state` itself.
 //!
+//! A scripted run never reaches a real WSL distro or SSH host ([`connect`]): a distro is read
+//! as this machine, and a host is unreachable.
+//!
 //! `state`:
 //! - `app`: `"scrollback"`.
 //! - `data_dir`: where this run keeps its files (`crate::data_dir`).
@@ -19,9 +22,10 @@
 //!   opened session).
 //! - `archive`: `dir`, and `state` (`opening`, `open` or `failed`, then with `error`).
 //! - `sync`: `syncing`, `indexing` (an index runs outside a pass), `held` (a pass waits at
-//!   `hold_sync`'s hold), and `locations`, each with its `name`, `kind` and `state` (`syncing`
-//!   with `progress`: the `items` to fetch and `items_done`, the `sessions` to index and
-//!   `sessions_done`; `synced`; `failed` with `error`; or `never`).
+//!   `hold_sync`'s hold), and `locations`, each with its `name`, `kind` (`local`, `wsl` or
+//!   `ssh`) and `state` (`syncing` with `progress`: the `items` to fetch and `items_done`, the
+//!   `sessions` to index and `sessions_done`; `synced`; `failed` with `error`; `unreachable`;
+//!   or `never`).
 //! - `library`: `shelf` (`all`, `starred`, `unsorted`, or `{"folder": name}`), `counts` (`all`,
 //!   `starred`, `unsorted`), `folders` (each with its `name`, its `parent`'s name and its
 //!   `sessions`, in the catalogue's order), `sessions` and `groups` (how many the shown page
@@ -48,8 +52,13 @@ use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Context, Entity, Window};
 use gpui_appearance::{Appearance, Material, Mode};
 use gpui_automation::AutomationHost;
+use sb_core::CancelToken;
 use sb_core::catalogue::{SessionId, Shelf};
 use sb_core::location::LocationKind;
+use sb_core::transport::{
+    Env, FileStat, Hashed, Listing, LocalTransport, PrefixRequest, RangeFailure, RangeRequest,
+    RangeSink, Transport, TransportError,
+};
 use sb_ui::Shell;
 use sb_ui::services::{ActiveServices as _, ArchiveState, Held, LocationStatus, Page};
 use serde::Deserialize;
@@ -157,12 +166,15 @@ fn sync(cx: &App) -> Value {
                 LocationStatus::Syncing { progress, .. } => ("syncing", None, Some(progress)),
                 LocationStatus::Synced(_) => ("synced", None, None),
                 LocationStatus::Failed(error) => ("failed", Some(error), None),
+                LocationStatus::Unreachable { .. } => ("unreachable", None, None),
                 LocationStatus::NeverSynced => ("never", None, None),
             };
             json!({
                 "name": location.name,
                 "kind": match location.kind {
                     LocationKind::Local => "local",
+                    LocationKind::Wsl { .. } => "wsl",
+                    LocationKind::Ssh { .. } => "ssh",
                 },
                 "state": state,
                 "error": error,
@@ -287,6 +299,59 @@ struct HoldSync {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReleaseSync {}
+
+/**
+ * How a scripted run reaches its locations: never the distro or the host a location names,
+ * which would be the machine's own and not the scenario's. This machine and a WSL distro are
+ * read as this machine, which the runner points at the scenario's home; a host over SSH can't
+ * be reached, which is how a scenario shows an unreachable location.
+ */
+pub fn connect(kind: &LocationKind, _cancel: &CancelToken) -> Box<dyn Transport> {
+    match kind {
+        LocationKind::Local | LocationKind::Wsl { .. } => Box::new(LocalTransport),
+        LocationKind::Ssh { .. } => Box::new(NoHost),
+    }
+}
+
+/// A host that is never there.
+struct NoHost;
+
+impl NoHost {
+    fn unreachable<T>(&self) -> Result<T, TransportError> {
+        Err(TransportError::Unreachable(
+            "a scripted run reaches no host".to_string(),
+        ))
+    }
+}
+
+impl Transport for NoHost {
+    fn env(&self, _: &[&str]) -> Result<Env, TransportError> {
+        self.unreachable()
+    }
+
+    fn stat(&self, _: &[&str]) -> Result<Vec<Option<FileStat>>, TransportError> {
+        self.unreachable()
+    }
+
+    fn list(&self, _: &str) -> Result<Listing, TransportError> {
+        self.unreachable()
+    }
+
+    fn hash_prefixes(
+        &self,
+        _: &[PrefixRequest],
+    ) -> Result<Vec<Result<Hashed, RangeFailure>>, TransportError> {
+        self.unreachable()
+    }
+
+    fn read_ranges(&self, _: &[RangeRequest], _: &mut dyn RangeSink) -> Result<(), TransportError> {
+        self.unreachable()
+    }
+
+    fn read_small(&self, _: &str) -> Result<Option<Vec<u8>>, TransportError> {
+        self.unreachable()
+    }
+}
 
 /// Starts automation on the main window.
 pub fn start(

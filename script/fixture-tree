@@ -1,0 +1,36 @@
+#!/bin/sh
+# A generated Claude Code tree for trying a transport by hand (docs/PLAN.md §12, §14): under
+# <home>/.claude/projects, <sessions> transcripts of ten made-up records each, 500 to a project
+# folder, and a megabyte of random bytes. Nothing in it comes from a real transcript. It runs in any POSIX shell, so inside a
+# WSL distro too, where the repository is under the Windows drive's mount:
+#
+#   script/fixture-tree /tmp/scrollback-fixture 20000
+#
+# Then, with that folder for a home (the example's own docs say more):
+#
+#   cargo run --release -p sb_core --example sync -- <archive folder> --loopback /tmp/scrollback-fixture
+#   cargo run --release -p sb_core --example sync -- <archive folder> --wsl Ubuntu-24.04 --home /tmp/scrollback-fixture
+set -eu
+
+if [ "$#" -ne 2 ]; then
+    echo "usage: script/fixture-tree <home folder> <sessions>" >&2
+    exit 2
+fi
+projects=$1/.claude/projects
+session=0
+while [ "$session" -lt "$2" ]; do
+    project=$projects/-home-user-code-app-$((session / 500))
+    [ "$((session % 500))" -ne 0 ] || mkdir -p "$project"
+    id=$(printf '00000000-0000-4000-8000-%012d' "$session")
+    record=0
+    while [ "$record" -lt 10 ]; do
+        printf '{"type":"user","sessionId":"%s","cwd":"/home/user/code/app-%d","uuid":"%d-%d","message":{"role":"user","content":"generated record %d of session %d, with some filler text to give the line the length of a short prompt in a transcript"}}\n' \
+            "$id" "$((session / 500))" "$session" "$record" "$record" "$session"
+        record=$((record + 1))
+    done >"$project/$id.jsonl"
+    session=$((session + 1))
+done
+# And one file of every byte there is, which a transport must not change on the way.
+mkdir -p "$projects/-home-user-code-app-0"
+head -c 1048576 /dev/urandom >"$projects/-home-user-code-app-0/random.bin"
+echo "generated $2 sessions under $projects"

@@ -68,9 +68,20 @@ pub fn sync_glyph(syncing: bool, color: Hsla, theme: &SbTheme) -> AnyElement {
 }
 
 /// What a location's kind is called (DESIGN §4.1: "Local · synced 2 min ago").
-pub fn kind_name(kind: LocationKind) -> &'static str {
+pub fn kind_name(kind: &LocationKind) -> &'static str {
     match kind {
         LocationKind::Local => "Local",
+        LocationKind::Wsl { .. } => "WSL",
+        LocationKind::Ssh { .. } => "SSH",
+    }
+}
+
+/// A location's kind's glyph (DESIGN §1.5: monitor Local, box WSL, laptop SSH).
+pub fn kind_icon(kind: &LocationKind) -> SbIcon {
+    match kind {
+        LocationKind::Local => SbIcon::Monitor,
+        LocationKind::Wsl { .. } => SbIcon::Box,
+        LocationKind::Ssh { .. } => SbIcon::Laptop,
     }
 }
 
@@ -120,6 +131,8 @@ pub enum Tone {
     Neutral,
     /// `accent-soft` with `accent-text`: this machine.
     Accent,
+    /// `blue-soft` with `blue`: a WSL distro.
+    Blue,
     /// `yellow-soft` with `yellow`: a warning.
     Warn,
 }
@@ -130,6 +143,7 @@ impl Tone {
         match self {
             Self::Neutral => (c.s3, c.fg2),
             Self::Accent => (c.accent_soft, c.accent_text),
+            Self::Blue => (c.blue_soft, c.blue),
             Self::Warn => (c.yellow_soft, c.yellow),
         }
     }
@@ -168,15 +182,18 @@ pub fn tag_width(label: &str, theme: &SbTheme, window: &Window) -> Pixels {
     text_width(label, &theme.text.tag, window) + theme.spacing.sm * 2.
 }
 
-/// The tag that names a location, in its kind's colours (`.tag.win` for this machine).
+/// The tag that names a location, in its kind's colours (DESIGN §1: `.tag.win` for this
+/// machine, `.tag.wsl` for a distro, `.tag.mac` for a host over SSH).
 pub fn location_tag(
     name: impl Into<SharedString>,
-    kind: LocationKind,
+    kind: &LocationKind,
     small: bool,
     theme: &SbTheme,
 ) -> Div {
     let tone = match kind {
         LocationKind::Local => Tone::Accent,
+        LocationKind::Wsl { .. } => Tone::Blue,
+        LocationKind::Ssh { .. } => Tone::Neutral,
     };
     tag(name, tone, small, theme)
 }

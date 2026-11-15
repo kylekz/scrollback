@@ -50,6 +50,7 @@ sb_icons! {
     Archive => "archive",
     ArrowLeft => "arrow-left",
     Bot => "bot",
+    Box => "box",
     Check => "check",
     ChevronDown => "chevron-down",
     ChevronRight => "chevron-right",
@@ -58,6 +59,7 @@ sb_icons! {
     FolderPlus => "folder-plus",
     Hand => "hand",
     Inbox => "inbox",
+    Laptop => "laptop",
     Layers => "layers",
     Link => "link",
     Monitor => "monitor",
@@ -68,6 +70,7 @@ sb_icons! {
     Settings => "settings",
     Star => "star",
     Trash => "trash-2",
+    TriangleAlert => "triangle-alert",
     X => "x",
 }
 

@@ -392,7 +392,7 @@ impl UnsortedView {
                                 .iter()
                                 .filter_map(|location| sync.location(location))
                                 .map(|location| {
-                                    location_tag(location.name.clone(), location.kind, false, theme)
+                                    location_tag(location.name.clone(), &location.kind, false, theme)
                                 }),
                         )
                         .child(

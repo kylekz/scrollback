@@ -26,7 +26,7 @@ use toolbox_store::{Backups, Database, OpenOptions};
 use crate::archive::item_folder;
 use crate::filing::FolderId;
 use crate::hash::Hash;
-use crate::location::{Location, LocationId, LocationKind};
+use crate::location::{Location, LocationId, LocationKind, Unreachable};
 use crate::provider::{ItemKind, ScannedItem};
 
 pub use folder::{Folder, FolderPath};
@@ -293,7 +293,8 @@ pub(crate) const DATABASE: &str = "scrollback.db";
 const ITEM: &str = "i.id, i.key, i.kind, i.session, i.seen_length, i.seen_stamp, i.gone_since";
 const VERSION: &str = "v.id, v.number, v.reason, v.started_at, v.length, v.hash, v.held_back, \
                        v.held_by_parse, v.damaged, v.export_version";
-const LOCATION: &str = "id, kind, name, last_attempt_at, last_success_at, last_error";
+const LOCATION: &str = "id, kind, detail, name, last_attempt_at, last_success_at, last_error, \
+                        unreachable_since, unreachable_reason, drive_mount";
 
 /// The open catalogue: a cheap-to-clone handle. Every method blocks on disk I/O.
 #[derive(Clone, Debug)]
@@ -328,9 +329,11 @@ impl Catalogue {
     /// Adds a location to pull from.
     pub fn add_location(&self, kind: LocationKind, name: &str) -> Result<Location> {
         let id = LocationId::new();
+        let (kind_name, detail) = kind.columns();
         self.execute(
-            "INSERT INTO location (id, kind, name, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![id, kind, name, now_ms()],
+            "INSERT INTO location (id, kind, detail, name, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, kind_name, detail, name, now_ms()],
         )?;
         Ok(Location {
             id,
@@ -339,6 +342,50 @@ impl Catalogue {
             last_attempt: None,
             last_success: None,
             last_error: None,
+            unreachable: None,
+            drive_mount: None,
+        })
+    }
+
+    /**
+     * Records where `location` mounts the Windows drives, as a sync or the connection test
+     * found it ([`crate::transport::Probe::drive_mount`]); `None` for the usual place. The
+     * project paths of its sessions and the paths attached for it are read by it. When it
+     * is another place than was on record, those that were read under the old one are read
+     * again, from the paths as they were recorded, and the sessions are filed anew by the
+     * rules (PLAN §8).
+     */
+    pub fn set_drive_mount(&self, location: &LocationId, mount: Option<&str>) -> Result<()> {
+        self.db.write(|tx| {
+            let before: Option<String> = tx
+                .query_row(
+                    "SELECT drive_mount FROM location WHERE id = ?1",
+                    [location],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            if before.as_deref() != mount {
+                tx.execute(
+                    "UPDATE location SET drive_mount = ?2 WHERE id = ?1",
+                    params![location, mount],
+                )?;
+                folder::remount(tx, location, mount)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Where `location` mounts the Windows drives, when it is not the usual place.
+    pub(crate) fn drive_mount(&self, location: &LocationId) -> Result<Option<String>> {
+        self.db.read(|c| {
+            Ok(c.query_row(
+                "SELECT drive_mount FROM location WHERE id = ?1",
+                [location],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
         })
     }
 
@@ -383,18 +430,33 @@ impl Catalogue {
         )
     }
 
-    /// A sync of `location` ended: without an error, or with `error`.
+    /// A sync of `location` reached it and ended: without an error, or with `error`.
     pub(crate) fn record_outcome(&self, location: &LocationId, error: Option<&str>) -> Result<()> {
         match error {
             None => self.execute(
-                "UPDATE location SET last_success_at = ?2, last_error = NULL WHERE id = ?1",
+                "UPDATE location SET last_success_at = ?2, last_error = NULL,
+                     unreachable_since = NULL, unreachable_reason = NULL
+                 WHERE id = ?1",
                 params![location, now_ms()],
             ),
             Some(error) => self.execute(
-                "UPDATE location SET last_error = ?2 WHERE id = ?1",
+                "UPDATE location SET last_error = ?2,
+                     unreachable_since = NULL, unreachable_reason = NULL
+                 WHERE id = ?1",
                 params![location, error],
             ),
         }
+    }
+
+    /// A sync could not connect to `location`, for `reason`. That is no error (PLAN §5): what
+    /// the last sync that reached it left, its success or its error, stays.
+    pub(crate) fn record_unreachable(&self, location: &LocationId, reason: &str) -> Result<()> {
+        self.execute(
+            "UPDATE location SET unreachable_since = COALESCE(unreachable_since, ?2),
+                 unreachable_reason = ?3
+             WHERE id = ?1",
+            params![location, now_ms(), reason],
+        )
     }
 
     pub(crate) fn record_provider(
@@ -784,13 +846,20 @@ fn segments_of(connection: &Connection, version: i64) -> Result<Vec<Segment>> {
 }
 
 fn location_from(row: &Row<'_>) -> rusqlite::Result<Location> {
+    let kind: String = row.get(1)?;
     Ok(Location {
         id: row.get(0)?,
-        kind: row.get(1)?,
-        name: row.get(2)?,
-        last_attempt: row.get(3)?,
-        last_success: row.get(4)?,
-        last_error: row.get(5)?,
+        kind: LocationKind::from_columns(&kind, row.get(2)?)
+            .ok_or_else(|| FromSqlError::Other(format!("no location is a {kind}").into()))?,
+        name: row.get(3)?,
+        last_attempt: row.get(4)?,
+        last_success: row.get(5)?,
+        last_error: row.get(6)?,
+        unreachable: match (row.get(7)?, row.get(8)?) {
+            (Some(since), Some(reason)) => Some(Unreachable { since, reason }),
+            _ => None,
+        },
+        drive_mount: row.get(9)?,
     })
 }
 

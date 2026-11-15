@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    Env, FileEntry, FileStat, Halt, Hashed, Listing, PrefixRequest, RangeFailure, RangeRequest,
-    RangeSink, Transport, TransportError, Unlisted,
+    Env, FileEntry, FileStat, Halt, Hashed, Listing, NOT_A_FILE, NOT_UNICODE, PrefixRequest,
+    RangeFailure, RangeRequest, RangeSink, SYMBOLIC_LINK, Transport, TransportError, Unlisted,
 };
 use crate::hash::Hasher;
 
@@ -79,7 +79,7 @@ impl Transport for LocalTransport {
                     }
                 };
                 let Ok(name) = entry.file_name().into_string() else {
-                    unlisted(entry.path(), io::Error::other("its name is not Unicode"));
+                    unlisted(entry.path(), io::Error::other(NOT_UNICODE));
                     continue;
                 };
                 let path = if relative.is_empty() {
@@ -106,9 +106,9 @@ impl Transport for LocalTransport {
                     }
                 } else {
                     let what = if kind.is_symlink() {
-                        "it is a symbolic link"
+                        SYMBOLIC_LINK
                     } else {
-                        "it is neither a file nor a folder"
+                        NOT_A_FILE
                     };
                     listing
                         .skipped
@@ -252,7 +252,7 @@ fn stat_of(metadata: &Metadata) -> io::Result<FileStat> {
     })
 }
 
-fn ns_since_epoch(time: SystemTime) -> i64 {
+pub(super) fn ns_since_epoch(time: SystemTime) -> i64 {
     match time.duration_since(UNIX_EPOCH) {
         Ok(after) => i64::try_from(after.as_nanos()).unwrap_or(i64::MAX),
         Err(before) => i64::try_from(before.duration().as_nanos()).map_or(i64::MIN, |ns| -ns),

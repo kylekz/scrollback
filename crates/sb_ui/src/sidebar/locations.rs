@@ -14,7 +14,7 @@ use sb_core::location::{Location, LocationKind};
 
 use super::{NO_LOCATIONS, Sidebar, note};
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{icon, kind_name, progress_bar};
+use crate::components::{icon, kind_icon, kind_name, progress_bar};
 use crate::format;
 use crate::icons::SbIcon;
 use crate::services::{LocationStatus, PassProgress};
@@ -44,7 +44,7 @@ fn doing(progress: &PassProgress) -> Option<String> {
 }
 
 /// What a syncing location's row says under its bar (DESIGN §4.1, `E-Edge-First-Sync`).
-fn doing_line(kind: LocationKind, progress: &PassProgress, first: bool) -> String {
+fn doing_line(kind: &LocationKind, progress: &PassProgress, first: bool) -> String {
     let what = if progress.is_indexing() {
         "indexing".to_string()
     } else if !progress.planned {
@@ -141,6 +141,27 @@ fn line(text: String, color: Hsla, theme: &SbTheme) -> Div {
         .child(text)
 }
 
+/// A second line led by a glyph, both in `color`.
+fn alerted(glyph: SbIcon, text: String, color: Hsla, theme: &SbTheme) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(theme.spacing.xs)
+        .min_w_0()
+        .child(icon(glyph, theme.sizes.icon_xs, color))
+        .child(line(text, color, theme))
+}
+
+/// What an unreachable location's row says (DESIGN §4.1: "SSH · last sync 12 days ago"): when
+/// it last synced whole, or, never having done so, since when it can't be reached.
+fn unreachable_line(kind: &LocationKind, last_success: Option<i64>, since: i64, now: i64) -> String {
+    let kind = kind_name(kind);
+    match last_success {
+        Some(at) => format!("{kind} · last sync {}", format::ago(at, now)),
+        None => format!("{kind} · not reachable since {}", format::day(since, now)),
+    }
+}
+
 /// A row with work in hand (DESIGN §4.1): 48 high, how far the work is at the right of its
 /// name, a bar, and what the work is under it.
 fn busy(
@@ -186,7 +207,7 @@ fn location_row(
     theme: &SbTheme,
 ) -> AnyElement {
     let c = &theme.colors;
-    let kind = kind_name(location.kind);
+    let kind = kind_name(&location.kind);
     let dot = |fill: Option<Hsla>| {
         div()
             .flex_none()
@@ -200,9 +221,7 @@ fn location_row(
     };
     let row = row(
         format!("location-{}", location.id),
-        match location.kind {
-            LocationKind::Local => SbIcon::Monitor,
-        },
+        kind_icon(&location.kind),
         theme,
     );
     // A state that is one line under the name.
@@ -227,7 +246,7 @@ fn location_row(
             row.aria_label(format!("{}: syncing", location.name)),
             &location.name,
             &progress,
-            doing_line(location.kind, &progress, first),
+            doing_line(&location.kind, &progress, first),
             theme,
         ),
         // What a stopped or a failed pass stored is being indexed.
@@ -252,14 +271,24 @@ fn location_row(
         }
         (LocationStatus::Failed(_), None) => resting(
             row,
-            div()
-                .flex()
-                .items_center()
-                .gap(theme.spacing.xs)
-                .min_w_0()
-                .child(icon(SbIcon::CircleAlert, theme.sizes.icon_xs, c.red))
-                .child(line(format!("{kind} · last sync failed"), c.red, theme)),
+            alerted(
+                SbIcon::CircleAlert,
+                format!("{kind} · last sync failed"),
+                c.red,
+                theme,
+            ),
         ),
+        // Not a failure: since when it is out of reach, by its last good sync.
+        (LocationStatus::Unreachable { since }, None) => resting(
+            row.aria_label(format!("{}: not reachable", location.name)),
+            alerted(
+                SbIcon::TriangleAlert,
+                unreachable_line(&location.kind, location.last_success, since, now),
+                c.yellow,
+                theme,
+            ),
+        )
+        .child(dot(None)),
     }
     .automation_target_with(move || target.clone().into())
 }
@@ -274,7 +303,7 @@ mod tests {
     #[test]
     fn a_syncing_row_says_what_its_pass_is_doing() {
         let mut progress = PassProgress::default();
-        let local = LocationKind::Local;
+        let local = &LocationKind::Local;
         assert_eq!(doing(&progress), None);
         assert_eq!(
             doing_line(local, &progress, true),

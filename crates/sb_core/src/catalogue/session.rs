@@ -450,12 +450,12 @@ impl Catalogue {
         };
         let index = derived.as_ref().map_or(&nothing, |derived| derived.index);
         let main = derived.as_ref().and_then(|derived| derived.main);
-        /* The drive mount is the default one for every location until a location can say its
-        own (PLAN §6.3). */
+        /* Under the location's own drive mount, where it has one (PLAN §6.3). */
+        let mount = self.drive_mount(&id.location)?;
         let project = index
             .project_path
             .as_deref()
-            .and_then(|path| NormalPath::new(path, None));
+            .and_then(|path| NormalPath::new(path, mount.as_deref()));
         let (ending, unreadable) = match derived.as_ref().and_then(|derived| derived.ending) {
             None => (None, None),
             Some(Ending::Whole) => (Some("whole"), None),

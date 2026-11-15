@@ -6,7 +6,7 @@ use toolbox_store::Schema;
 
 pub(super) const SCHEMA: Schema = Schema {
     domain: "scrollback",
-    steps: &[SYNC, LIBRARY],
+    steps: &[SYNC, LIBRARY, LOCATIONS],
 };
 
 /// What sync writes (PLAN §2.2): locations, items, versions and segments. Times are Unix
@@ -203,3 +203,69 @@ CREATE TABLE session (
     UNIQUE (location_id, provider, session)
 ) STRICT;
 ";
+/// WSL and SSH locations (PLAN §6), and a location that can't be reached (PLAN §5).
+const LOCATIONS: &str = "
+-- What a location's kind connects to: the WSL distro's name or the host as ssh takes it. NULL
+-- for this machine.
+ALTER TABLE location ADD COLUMN detail TEXT;
+-- Set while the last sync could not connect: since which try, and the launcher's words.
+ALTER TABLE location ADD COLUMN unreachable_since INTEGER;
+ALTER TABLE location ADD COLUMN unreachable_reason TEXT;
+-- Where a WSL distro mounts the Windows drives, when it is not the usual place: as its
+-- /etc/wsl.conf says, with a slash at each end. NULL for the usual place.
+ALTER TABLE location ADD COLUMN drive_mount TEXT;
+";
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+    use toolbox_store::{Database, OpenOptions};
+
+    use super::*;
+    use crate::catalogue::{Catalogue, DATABASE};
+    use crate::location::LocationKind;
+
+    #[test]
+    fn a_catalogue_from_before_wsl_and_ssh_keeps_its_location() {
+        const BEFORE: Schema = Schema {
+            domain: SCHEMA.domain,
+            steps: &[SYNC, LIBRARY],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        Database::open(&dir.path().join(DATABASE), &OpenOptions::new(&BEFORE))
+            .unwrap()
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO location (id, kind, name, created_at, last_error)
+                     VALUES ('a1', 'local', 'This machine', 1, 'it failed')",
+                    [],
+                )?;
+                Ok::<_, toolbox_store::Error>(())
+            })
+            .unwrap();
+
+        let catalogue = Catalogue::open(dir.path()).unwrap();
+        let locations = catalogue.locations().unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(
+            (&locations[0].kind, locations[0].last_error.as_deref()),
+            (&LocationKind::Local, Some("it failed"))
+        );
+        assert_eq!(locations[0].unreachable, None);
+
+        /* And takes the new kinds, each with what it connects to. */
+        let added = [
+            LocationKind::Wsl {
+                distro: "Ubuntu-24.04".to_string(),
+            },
+            LocationKind::Ssh {
+                host: "user@macbook".to_string(),
+            },
+        ]
+        .map(|kind| catalogue.add_location(kind, "another").unwrap());
+        for added in added {
+            assert_eq!(catalogue.location(&added.id).unwrap(), Some(added));
+        }
+        assert_eq!(catalogue.locations().unwrap().len(), 3);
+    }
+}

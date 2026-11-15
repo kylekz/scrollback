@@ -508,3 +508,10 @@ fn a_provider_that_breaks_the_order_of_ranges_stops_the_pass<A: Agent + Default>
     assert_eq!(bench.sync().new_items, 3);
     bench.assert_mirrors(&keys);
 }
+
+/// Every test here once more, over the shell transport.
+#[cfg(unix)]
+#[test]
+fn the_same_with_the_locations_read_through_a_shell() {
+    common::again_through_a_shell();
+}
