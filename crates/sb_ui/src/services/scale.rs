@@ -4,8 +4,11 @@
 //! does itself: taking a load in, laying a page's rows out, and drawing frames while a page of
 //! every session scrolls.
 //!
+//! Optimised, with debug assertions on: without them gpui records no `debug_selector`, which
+//! the test finds the cards by.
+//!
 //! ```text
-//! cargo test --release -p sb_ui scale -- --ignored --nocapture
+//! CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo test --release -p sb_ui scale -- --ignored --nocapture
 //! ```
 
 use std::collections::HashSet;

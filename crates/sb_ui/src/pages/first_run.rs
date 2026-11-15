@@ -2,9 +2,9 @@
 //! location", shown while the archive has none. It offers what the providers found on this
 //! machine, checked, and its button adds the location and starts its first sync.
 //!
-//! This machine is the one location there is to offer so far: WSL distros and SSH hosts come
-//! with their transports (PLAN §13, phase 5). The fixed copy names no agent (PLAN §11); where
-//! the screen names one, the name is its provider's.
+//! This machine is the one location it offers so far: the WSL distros found here, and adding a
+//! host over SSH, come with the Add location flow (DESIGN §4.10–§4.12). The fixed copy names no
+//! agent (PLAN §11); where the screen names one, the name is its provider's.
 
 use gpui::{
     AnyElement, App, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
@@ -152,7 +152,11 @@ impl FirstRun {
                 cx.notify();
             }))
             .child(checkbox(checked, theme))
-            .child(icon(kind_icon(&LocationKind::Local), theme.sizes.icon, c.fg2))
+            .child(icon(
+                kind_icon(&LocationKind::Local),
+                theme.sizes.icon,
+                c.fg2,
+            ))
             .child(
                 div()
                     .flex_1()

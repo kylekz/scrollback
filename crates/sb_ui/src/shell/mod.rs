@@ -146,6 +146,11 @@ impl Shell {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn sidebar(&self) -> &Entity<Sidebar> {
+        &self.sidebar
+    }
+
     /// The material applied to the window.
     pub fn applied_material(&self) -> Material {
         self.appearance.applied().material

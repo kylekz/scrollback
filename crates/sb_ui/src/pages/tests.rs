@@ -428,6 +428,41 @@ fn a_failed_sync_is_a_banner_with_the_reason_and_a_way_to_try_again(cx: &mut Tes
 }
 
 #[gpui::test]
+fn an_arrow_from_a_session_in_a_closed_group_goes_on_from_where_it_is(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    library(cx).update(cx, |library, cx| library.show(Shelf::Unsorted, cx));
+    cx.run_until_parked();
+    let session = |group: usize, row: usize, cx: &mut VisualTestContext| {
+        library(cx).read_with(cx, |library, _| {
+            library.groups()[group].sessions[row].id.clone()
+        })
+    };
+    let selected_id = |cx: &mut VisualTestContext| {
+        library(cx).read_with(cx, |library, _| library.selected().cloned())
+    };
+    // The second group's session, then that group closed: its toggle is the third Tab stop.
+    cx.simulate_keystrokes("down down down");
+    assert_eq!(selected_id(cx), Some(session(1, 0, cx)));
+    cx.simulate_keystrokes("tab tab tab");
+    press(cx, "enter");
+    cx.simulate_keystrokes("f6 f6");
+    assert!(main_focused(&shell, cx));
+    // Up goes to the session above where it is, the first group's last, not to the top.
+    cx.simulate_keystrokes("up");
+    assert_eq!(selected_id(cx), Some(session(0, 1, cx)));
+}
+
+#[test]
+fn why_a_sync_failed_is_a_sentence_of_its_own() {
+    assert_eq!(
+        sentence("Agent: 1 item was not archived, because: Permission denied (os error 13)"),
+        "Agent: 1 item was not archived, because: Permission denied (os error 13)."
+    );
+    assert_eq!(sentence("the disk is full."), "The disk is full.");
+    assert_eq!(sentence(""), "");
+}
+
+#[gpui::test]
 fn picking_a_row_closes_a_narrow_windows_sidebar(cx: &mut TestAppContext) {
     let (shell, cx) = open_shell_sized(size(px(1000.), px(700.)), cx);
     let placement = |cx: &mut VisualTestContext| placement(&shell, cx);

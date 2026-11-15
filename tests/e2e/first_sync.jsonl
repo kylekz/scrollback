@@ -5,7 +5,7 @@
 {"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
 {"cmd": "screenshot", "name": "first-run-dark"}
 
-// The pass will wait once it has stored its first batch of 256 files. It runs in the background: the page is All sessions at once, with the First sync card, and the location's row is its taller, syncing one.
+// The pass will wait once it has stored its first batch of 256 files: the engine commits that many at once (`BATCH_ITEMS` in crates/sb_core/src/sync/store.rs), which every 256 below relies on. It runs in the background: the page is All sessions at once, with the First sync card, and the location's row is its taller, syncing one.
 {"cmd": "hold_sync", "after": 256, "expect_result": {"pointer": "/held", "equals": false}}
 {"cmd": "click", "target": "first-run/add"}
 {"cmd": "wait_for", "pointer": "/sync/held", "equals": true, "timeout_ms": 60000}

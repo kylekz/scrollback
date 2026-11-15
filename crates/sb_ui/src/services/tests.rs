@@ -10,6 +10,7 @@ use sb_core::sync::Progress;
 use sb_test_support::{Outline, ProjectsTree, break_segment_commits, mend_segment_commits};
 
 use super::library::LibraryEvent;
+use super::sync::SyncEvent;
 use super::sync::{SYNC_INTERVAL, local_name};
 use super::*;
 use crate::test_support::{
@@ -370,12 +371,40 @@ fn a_star_shows_at_once_and_is_kept(cx: &mut TestAppContext) {
     library.read_with(cx, |library, _| assert_eq!(library.counts().starred, 0));
 }
 
-#[gpui::test(iterations = 30)]
+/// What the owner sees of some stars: each on the page shown, and the count of starred sessions.
+type Stars = (Vec<bool>, usize);
+
+/// Every state the library passes through from now on, as [`Stars`] of `ids`.
+fn watch_stars(
+    library: &Entity<LibraryService>,
+    ids: Vec<SessionId>,
+    cx: &mut TestAppContext,
+) -> (Rc<RefCell<Vec<Stars>>>, gpui::Subscription) {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let subscription = cx.update(|cx| {
+        let seen = seen.clone();
+        cx.observe(library, move |library, cx| {
+            let library = library.read(cx);
+            let Some(page) = library.sessions() else {
+                return;
+            };
+            let stars = ids
+                .iter()
+                .map(|id| page.sessions.iter().any(|it| it.id == *id && it.starred))
+                .collect();
+            seen.borrow_mut().push((stars, library.counts().starred));
+        })
+    });
+    (seen, subscription)
+}
+
+#[gpui::test(iterations = 200)]
 fn a_star_made_while_the_page_loads_is_not_undone_by_the_load(cx: &mut TestAppContext) {
     init_library(cx);
     let (_, library) = services(cx);
     let first = id_at(&library, 0, cx);
-    // The load starts before the star is written, and may finish before or after it.
+    let (seen, _watching) = watch_stars(&library, vec![first.clone()], cx);
+    // The load starts before the star is made, and may finish before or after it is written.
     library.update(cx, |library, cx| {
         library.reload(cx);
         library.toggle_star(&first, 0, cx);
@@ -383,10 +412,108 @@ fn a_star_made_while_the_page_loads_is_not_undone_by_the_load(cx: &mut TestAppCo
     assert_eq!(starred(&library, &first, cx).0, true, "shown at once");
     cx.run_until_parked();
     assert_eq!(starred(&library, &first, cx), (true, true));
-    library.read_with(cx, |library, _| {
-        assert_eq!(library.counts().starred, 1);
-        assert!(library.is_settled());
+    let seen = seen.borrow();
+    assert!(
+        seen.iter().all(|state| *state == (vec![true], 1)),
+        "the star never went: {seen:?}"
+    );
+    library.read_with(cx, |library, _| assert!(library.is_settled()));
+}
+
+#[gpui::test(iterations = 200)]
+fn no_load_takes_a_star_away_while_it_waits_to_be_written(cx: &mut TestAppContext) {
+    init_library(cx);
+    let (_, library) = services(cx);
+    let (a, b) = (id_at(&library, 0, cx), id_at(&library, 1, cx));
+    let (seen, _watching) = watch_stars(&library, vec![a.clone(), b.clone()], cx);
+    // The second star waits while the first is written; a load asked for now must not start
+    // before both are, or it reads the catalogue without them.
+    library.update(cx, |library, cx| {
+        library.toggle_star(&a, 0, cx);
+        library.toggle_star(&b, 1, cx);
+        library.reload(cx);
     });
+    cx.run_until_parked();
+    let seen = seen.borrow();
+    assert!(
+        seen.iter().all(|state| *state == (vec![true, true], 2)),
+        "a star went while it was written: {seen:?}"
+    );
+    assert_eq!(starred(&library, &b, cx), (true, true));
+}
+
+#[gpui::test]
+fn sync_news_lets_the_load_in_hand_be_taken_in(cx: &mut TestAppContext) {
+    init_library(cx);
+    let (sync, library) = services(cx);
+    // Whether a load was taken in while the one that has the news was still to come.
+    let early = Rc::new(RefCell::new(false));
+    let _watching = cx.update(|cx| {
+        let early = early.clone();
+        cx.observe(&library, move |library, cx| {
+            let library = library.read(cx);
+            if library.page().is_some() && !library.is_settled() {
+                *early.borrow_mut() = true;
+            }
+        })
+    });
+    library.update(cx, |library, cx| library.show(Shelf::Starred, cx));
+    // News arrives while Starred is read: the load in hand is still a whole picture.
+    sync.update(cx, |_, cx| cx.emit(SyncEvent::Archived));
+    cx.run_until_parked();
+    assert!(*early.borrow(), "the load in hand was thrown away");
+    library.read_with(cx, |library, _| assert!(library.is_settled()));
+}
+
+#[gpui::test]
+fn all_sessions_kept_aside_is_read_again_after_sync_news(cx: &mut TestAppContext) {
+    init_library(cx);
+    let (sync, library) = services(cx);
+    library.update(cx, |library, cx| library.show(Shelf::Starred, cx));
+    cx.run_until_parked();
+    write_session(
+        &Outline {
+            project: "/home/user/notes",
+            title: "Synced while Starred showed",
+            prompt: "All sessions must not come back as it was.",
+            model: "model-a",
+            day: (2026, 11, 15),
+            calls: 0,
+        },
+        cx,
+    );
+    sync.update(cx, |sync, cx| sync.sync_all(cx));
+    cx.run_until_parked();
+    library.update(cx, |library, cx| library.show(Shelf::All, cx));
+    cx.run_until_parked();
+    assert_eq!(titles(&library, cx)[0], "Synced while Starred showed");
+}
+
+#[gpui::test]
+fn a_change_the_catalogue_refuses_is_said_and_the_page_shows_what_is_kept(cx: &mut TestAppContext) {
+    init_library(cx);
+    let (_, library) = services(cx);
+    library.update(cx, |library, cx| {
+        library.create_folder("work".into(), None, cx)
+    });
+    cx.run_until_parked();
+    let folder = library.read_with(cx, |library, _| library.folders()[0].id);
+    // A name of nothing but white space is no name.
+    library.update(cx, |library, cx| {
+        library.rename_folder(folder, "   ".into(), cx)
+    });
+    cx.run_until_parked();
+    library.read_with(cx, |library, _| {
+        assert_eq!(library.folders()[0].name, "work");
+        let why = library.write_failure().expect("the refusal is said");
+        assert!(
+            why.starts_with("The name “   ” couldn't be saved: "),
+            "{why}"
+        );
+        assert!(why.ends_with('.') && !why.ends_with(".."), "{why}");
+    });
+    library.update(cx, |library, cx| library.dismiss_write_failure(cx));
+    library.read_with(cx, |library, _| assert_eq!(library.write_failure(), None));
 }
 
 #[gpui::test(iterations = 30)]

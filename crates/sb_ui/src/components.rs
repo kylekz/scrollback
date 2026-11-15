@@ -198,11 +198,6 @@ pub fn location_tag(
     tag(name, tone, small, theme)
 }
 
-/// How wide [`warn_chip`] draws `label`.
-pub fn warn_chip_width(label: &str, theme: &SbTheme, window: &Window) -> Pixels {
-    text_width(label, &theme.text.small, window) + theme.spacing.sm * 2.
-}
-
 /// A chip that warns (`.chip.warn`), as low as a card's last line.
 pub fn warn_chip(label: &'static str, theme: &SbTheme) -> impl IntoElement {
     let (fill, text) = Tone::Warn.colors(theme);

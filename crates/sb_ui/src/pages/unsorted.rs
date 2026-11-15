@@ -219,30 +219,44 @@ impl UnsortedView {
             .find(|session| session.id == *id)
     }
 
-    /// Moves the selection over the sessions that show; with none selected, to the first.
+    /**
+     * Moves the selection down (`by` 1) or up (-1) to the next session that shows; with none
+     * selected, to the first. A selected session that doesn't show, its group closed, is
+     * stepped from where it is among the groups.
+     */
     pub fn step(&mut self, by: isize, cx: &mut Context<Self>) {
+        // A load since the last frame may have moved the groups.
+        let theme = cx.sb_theme().clone();
+        self.lay_out(&theme, cx);
         let groups = self.library.read(cx).groups();
-        let rows: Vec<(usize, &Session)> = self
+        // Each session that shows: its item, and its group and place in it.
+        let mut rows = self
             .items
             .iter()
             .enumerate()
             .filter_map(|(at, item)| match *item {
-                Item::Row(group, row) => Some((at, groups.get(group)?.sessions.get(row)?)),
+                Item::Row(group, row) => Some((at, (group, row))),
                 _ => None,
+            });
+        let place = self.library.read(cx).selected().and_then(|selected| {
+            groups.iter().enumerate().find_map(|(group, it)| {
+                let row = it
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == *selected)?;
+                Some((group, row))
             })
-            .collect();
-        let selected = self.library.read(cx).selected();
-        let at = selected
-            .and_then(|selected| rows.iter().position(|(_, session)| session.id == *selected));
-        let to = match at {
-            Some(at) => at.checked_add_signed(by),
-            None => Some(0),
+        });
+        let to = match place {
+            None => rows.next(),
+            Some(place) if by > 0 => rows.find(|(_, at)| *at > place),
+            Some(place) => rows.rfind(|(_, at)| *at < place),
         };
-        let Some((item, session)) = to.and_then(|to| rows.get(to)) else {
+        let Some((item, (group, row))) = to else {
             return;
         };
-        let id = session.id.clone();
-        self.scroll.scroll_to_item(*item, ScrollStrategy::Nearest);
+        let id = groups[group].sessions[row].id.clone();
+        self.scroll.scroll_to_item(item, ScrollStrategy::Nearest);
         self.library
             .update(cx, |library, cx| library.select(id, cx));
     }
@@ -392,7 +406,12 @@ impl UnsortedView {
                                 .iter()
                                 .filter_map(|location| sync.location(location))
                                 .map(|location| {
-                                    location_tag(location.name.clone(), &location.kind, false, theme)
+                                    location_tag(
+                                        location.name.clone(),
+                                        &location.kind,
+                                        false,
+                                        theme,
+                                    )
                                 }),
                         )
                         .child(

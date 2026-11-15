@@ -9,10 +9,10 @@
 //!
 //! **States** (DESIGN §4.1). The first run shows the mark alone: no search, Sync all or
 //! Settings (DESIGN §4.10). With a library, Sync all syncs every location, and while a pass
-//! runs its glyph turns, it reads "Syncing…" and a click does nothing. While the archive is
-//! opening or didn't open, it is drawn disabled (DESIGN §4.14). Search needs the index
-//! (PLAN §13 phase 6) and Settings its page (phase 7): until then each is drawn disabled and
-//! takes no clicks.
+//! runs its glyph turns, it reads "Syncing…", and neither a click nor `Tab` stops on it.
+//! While the archive is opening or didn't open, it is drawn disabled (DESIGN §4.14). Search
+//! needs the index (PLAN §13 phase 6) and Settings its page (phase 7): until then each is
+//! drawn disabled and takes no clicks.
 //!
 //! **Caption buttons** (Windows). Each is a 46px-wide box, the bar's height, marked with gpui's
 //! `WindowControlArea` (`Min`, `Max`, `Close`), so Windows itself answers the hit test and
@@ -269,7 +269,8 @@ fn sync_all_button(
             if !enabled {
                 this.opacity(DISABLED_OPACITY)
             } else if syncing {
-                tab_stop(this, theme)
+                // It does nothing while a pass runs, so `Tab` passes it by.
+                this
             } else {
                 tab_stop(this, theme)
                     .cursor_pointer()

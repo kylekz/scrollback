@@ -13,8 +13,9 @@
 //! (PLAN §13), so its row is drawn disabled and can't be picked.
 //!
 //! **Renaming** (`F2` wherever the keyboard is, and every new folder) happens in the folder's
-//! row: `Enter` keeps the name and so does taking the keyboard elsewhere, `Esc` leaves the
-//! folder as it was named, and the arrows are the text field's. The field takes as many characters as a folder's name may have.
+//! row: `Enter` keeps the name and so does taking the keyboard elsewhere or starting to rename
+//! another folder, `Esc` leaves the folder as it was named, and the arrows are the text
+//! field's. The field takes as many characters as a folder's name may have.
 //!
 //! The tree is a `uniform_list`, so a thousand folders cost what the visible rows do. Drag
 //! and drop arrives with the next task; [`tree::rows`] is where a drop finds its row.
@@ -360,6 +361,8 @@ impl Sidebar {
         else {
             return;
         };
+        // Another folder's rename ends as leaving its row does: what was typed is kept.
+        self.end_rename(true, window, cx);
         // A folder inside closed folders has no row to rename it in.
         self.reveal(folder, cx);
         let input = cx.new(|cx| {
@@ -777,9 +780,67 @@ impl Render for Sidebar {
 
 #[cfg(test)]
 mod tests {
+    use gpui::{TestAppContext, VisualTestContext};
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::test_support::open_shell;
+
+    fn folder_names(library: &Entity<LibraryService>, cx: &mut VisualTestContext) -> Vec<String> {
+        library.read_with(cx, |library, _| {
+            library
+                .folders()
+                .iter()
+                .map(|folder| folder.name.clone())
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn renaming_another_folder_keeps_what_was_typed_for_the_first(cx: &mut TestAppContext) {
+        let (_shell, cx) = open_shell(cx);
+        let library = cx.update(|_, cx| cx.services().library.clone());
+        library.update(cx, |library, cx| {
+            library.create_folder("one".into(), None, cx)
+        });
+        cx.run_until_parked();
+        // The new folder's row has the keyboard: type, then make another folder.
+        cx.simulate_input("kept");
+        cx.simulate_keystrokes("secondary-shift-n");
+        cx.run_until_parked();
+        assert_eq!(folder_names(&library, cx), ["kept", "New folder"]);
+        // The second is being named now.
+        cx.simulate_input("second");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(folder_names(&library, cx), ["kept", "second"]);
+    }
+
+    #[gpui::test]
+    fn a_rename_whose_row_goes_leaves_the_keyboard_in_the_sidebar(cx: &mut TestAppContext) {
+        let (shell, cx) = open_shell(cx);
+        let library = cx.update(|_, cx| cx.services().library.clone());
+        library.update(cx, |library, cx| {
+            library.create_folder("outer".into(), None, cx)
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        let outer = library.read_with(cx, |library, _| library.folders()[0].id);
+        library.update(cx, |library, cx| {
+            library.create_folder("inner".into(), Some(outer), cx)
+        });
+        cx.run_until_parked();
+        // The inner folder is being named in its row, inside the open outer one.
+        cx.simulate_input("kept");
+        let sidebar = shell.read_with(cx, |shell, _| shell.sidebar().clone());
+        sidebar.update(cx, |sidebar, cx| sidebar.toggle(outer, cx));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        // The field went with its row. The keyboard is on what was around it and is still
+        // drawn, the sidebar's rows, not back on the main area; and the name is kept.
+        assert!(cx.update(|window, cx| sidebar.focus_handle(cx).is_focused(window)));
+        assert_eq!(folder_names(&library, cx), ["outer", "kept"]);
+    }
 
     #[test]
     fn the_rows_and_the_notes_read_as_design_writes_them() {

@@ -143,35 +143,40 @@ pub fn card(first_sync: &FirstSync, theme: &SbTheme, cx: &Context<SessionsView>)
             div()
                 .flex()
                 .gap(theme.spacing.xl)
-                .children(first_sync.locations.iter().map(|(name, glyph, progress, _)| {
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap(theme.spacing.sm)
-                        .child(
+                .children(
+                    first_sync
+                        .locations
+                        .iter()
+                        .map(|(name, glyph, progress, _)| {
                             div()
+                                .flex_1()
+                                .min_w_0()
                                 .flex()
-                                .items_center()
-                                .gap(theme.spacing.md)
-                                .text_spec(&theme.text.secondary)
-                                .child(icon(*glyph, theme.sizes.icon_sm, c.fg3))
+                                .flex_col()
+                                .gap(theme.spacing.sm)
                                 .child(
                                     div()
-                                        .font_weight(theme.text.control.weight)
-                                        .child(name.clone()),
+                                        .flex()
+                                        .items_center()
+                                        .gap(theme.spacing.md)
+                                        .text_spec(&theme.text.secondary)
+                                        .child(icon(*glyph, theme.sizes.icon_sm, c.fg3))
+                                        .child(
+                                            div()
+                                                .font_weight(theme.text.control.weight)
+                                                .child(name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .ml_auto()
+                                                .text_color(c.fg3)
+                                                .text_spec(&theme.text.number)
+                                                .child(doing(progress)),
+                                        ),
                                 )
-                                .child(
-                                    div()
-                                        .ml_auto()
-                                        .text_color(c.fg3)
-                                        .text_spec(&theme.text.number)
-                                        .child(doing(progress)),
-                                ),
-                        )
-                        .child(progress_bar(progress.fraction(), theme))
-                })),
+                                .child(progress_bar(progress.fraction(), theme))
+                        }),
+                ),
         )
         .child(
             div()

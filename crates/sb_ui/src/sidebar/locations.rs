@@ -154,7 +154,12 @@ fn alerted(glyph: SbIcon, text: String, color: Hsla, theme: &SbTheme) -> Div {
 
 /// What an unreachable location's row says (DESIGN §4.1: "SSH · last sync 12 days ago"): when
 /// it last synced whole, or, never having done so, since when it can't be reached.
-fn unreachable_line(kind: &LocationKind, last_success: Option<i64>, since: i64, now: i64) -> String {
+fn unreachable_line(
+    kind: &LocationKind,
+    last_success: Option<i64>,
+    since: i64,
+    now: i64,
+) -> String {
     let kind = kind_name(kind);
     match last_success {
         Some(at) => format!("{kind} · last sync {}", format::ago(at, now)),
@@ -299,6 +304,43 @@ mod tests {
     use sb_core::sync::Progress;
 
     use super::*;
+
+    #[test]
+    fn each_kind_is_shown_by_its_own_name_and_glyph() {
+        let wsl = LocationKind::Wsl {
+            distro: "Ubuntu-24.04".to_string(),
+        };
+        let ssh = LocationKind::Ssh {
+            host: "user@macbook".to_string(),
+        };
+        // DESIGN §1.5, §4.1.
+        assert_eq!(
+            [&LocationKind::Local, &wsl, &ssh].map(|kind| (kind_name(kind), kind_icon(kind))),
+            [
+                ("Local", SbIcon::Monitor),
+                ("WSL", SbIcon::Box),
+                ("SSH", SbIcon::Laptop)
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unreachable_row_says_when_it_last_synced() {
+        let ssh = LocationKind::Ssh {
+            host: "user@macbook".to_string(),
+        };
+        let day = 24 * 60 * 60 * 1000;
+        let now = 40 * day;
+        // DESIGN §4.1: "SSH · last sync 12 days ago".
+        assert_eq!(
+            unreachable_line(&ssh, Some(now - 12 * day), now - day, now),
+            "SSH · last sync 12 days ago"
+        );
+        assert_eq!(
+            unreachable_line(&ssh, None, now - day, now),
+            format!("SSH · not reachable since {}", format::day(now - day, now))
+        );
+    }
 
     #[test]
     fn a_syncing_row_says_what_its_pass_is_doing() {

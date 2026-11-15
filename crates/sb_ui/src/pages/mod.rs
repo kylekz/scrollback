@@ -2,8 +2,9 @@
 //! ([`Showing`]). The first run while there is no location, then the library's pages (All
 //! sessions, Starred and a folder as cards; Unsorted as groups), the page of an opened
 //! session, and why the archive didn't open when it didn't. Over a library page, a banner for
-//! each thing that went wrong and can be tried again: a location whose last sync failed, the
-//! library when it couldn't be read.
+//! each thing that went wrong: a location whose last sync failed and the library when it
+//! couldn't be read, each with a way to try again, and a change of the owner's the catalogue
+//! refused. An unreachable location is not among them (PLAN §5): its row says so.
 //!
 //! The main area has one focus handle, where the keyboard rests (`crate::shell`), and the key
 //! context of the page shown, so a page's keys reach it without the page being clicked first.
@@ -33,7 +34,7 @@ use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{ButtonKind, bad_banner, button};
 use crate::keymap;
-use crate::services::{ActiveServices as _, ArchiveState, LocationStatus};
+use crate::services::{ActiveServices as _, ArchiveState, LibraryService, LocationStatus};
 use crate::theme::{ActiveTheme as _, SbTheme};
 use first_run::FirstRun;
 use sessions::SessionsView;
@@ -104,6 +105,17 @@ impl Showing {
     /// Whether a page of the library shows.
     pub fn is_library(self) -> bool {
         matches!(self, Self::Sessions | Self::Unsorted | Self::Session)
+    }
+}
+
+/// Why a sync failed, in the failing tool's words, as a sentence of its own: its first letter
+/// a capital and one full stop at its end.
+fn sentence(why: &str) -> String {
+    let why = why.trim().trim_end_matches('.');
+    let mut chars = why.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}.", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
     }
 }
 
@@ -210,22 +222,38 @@ impl MainArea {
                     .automation_target("main/library-failed"),
             );
         }
+        if let Some(why) = library.write_failure() {
+            banners.push(
+                bad_banner(theme)
+                    .child(text(why.to_string()))
+                    .child(
+                        button("write-failed-dismiss", ButtonKind::Plain, true, true, theme)
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                let library = cx.services().library.clone();
+                                library.update(cx, LibraryService::dismiss_write_failure);
+                            }))
+                            .child("Dismiss")
+                            .automation_target("main/write-failed/dismiss"),
+                    )
+                    .automation_target("main/write-failed"),
+            );
+        }
         for location in sync.locations().unwrap_or_default() {
             let LocationStatus::Failed(why) = sync.status(location) else {
                 continue;
             };
-            let why = agents::named(&why, cx);
+            let why = sentence(&agents::named(&why, cx));
             let (id, name) = (location.id.clone(), location.name.clone());
             banners.push(
                 bad_banner(theme)
                     .debug_selector(|| "sync-failed".into())
                     .child(text(if location.last_success.is_none() {
                         format!(
-                            "{name}'s first sync isn't complete: {why}. What it copied is \
-                             kept, and the next sync carries on from there."
+                            "{name}'s first sync isn't complete. {why} What it copied is kept, \
+                             and the next sync carries on from there."
                         )
                     } else {
-                        format!("{name} couldn't be synced in full: {why}.")
+                        format!("{name} couldn't be synced in full. {why}")
                     }))
                     .child(
                         button(

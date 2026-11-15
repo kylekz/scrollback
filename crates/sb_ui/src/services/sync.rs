@@ -29,9 +29,9 @@
 //! and index is told to stop.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, PoisonError};
 #[cfg(any(test, feature = "automation"))]
 use std::sync::{Condvar, MutexGuard};
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
@@ -143,7 +143,9 @@ pub enum LocationStatus {
     Failed(String),
     /// The last sync could not reach it, nor any since the time given, in Unix milliseconds.
     /// Not a failure: what the location's last good sync archived is all there.
-    Unreachable { since: i64 },
+    Unreachable {
+        since: i64,
+    },
     /// When the last sync finished, in Unix milliseconds.
     Synced(i64),
     NeverSynced,
@@ -210,8 +212,12 @@ impl Hold {
         }
     }
 
+    /// Clears the hold. A pass waiting at it is no longer held from here on, though its
+    /// thread may wake a little later.
     fn release(&self) {
-        self.state().after = None;
+        let mut state = self.state();
+        state.after = None;
+        state.waiting = false;
         self.0.1.notify_all();
     }
 }
@@ -338,7 +344,11 @@ impl SyncService {
             return LocationStatus::Failed(error.clone());
         }
         // The last sync's word: what one that could not reach it knew is from before.
-        match (&location.unreachable, &location.last_error, location.last_success) {
+        match (
+            &location.unreachable,
+            &location.last_error,
+            location.last_success,
+        ) {
             (Some(unreachable), ..) => LocationStatus::Unreachable {
                 since: unreachable.since,
             },

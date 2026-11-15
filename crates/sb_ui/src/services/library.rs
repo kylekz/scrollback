@@ -4,21 +4,28 @@
 //! **Reads.** Everything is read in one background job per load ([`load`]): the counts beside
 //! the sidebar's rows, the folders, and the shown page's sessions with what its header says of
 //! them. Views draw from what the last load left here and never query. A load runs when the
-//! archive opens, when another page is shown, after each of the owner's changes, and when sync
-//! says the archive changed; a load asked for while one runs follows it, so loads never pile
-//! up. All sessions is kept while another page shows, and shown again as it was when nothing
-//! changed meanwhile.
+//! archive opens, when another page is shown, once the owner's changes are written, and when
+//! sync says the archive changed; a load asked for while one runs follows it, so loads never
+//! pile up. A load is a consistent picture of the catalogue whenever it started, so sync's news
+//! never throws one away: the load that follows has the news. All sessions is kept while
+//! another page shows, and shown again as it was when nothing changed meanwhile.
 //!
-//! **The owner's changes** (a star, a new folder, a name, a path attached) go through one
-//! queue and are written one at a time, in the order they were made, each in a background
-//! job. The page is read again after every one, and a load that started before a change was
-//! made or written is not taken in: what it read may be from before the change. A star is also
-//! shown at once, in place. When the app quits, what is still queued is written within gpui's
-//! shutdown window.
+//! **The owner's changes** (a star, a new folder, a name, a path attached) wait in one queue
+//! on the UI thread and are written one at a time, in the order they were made, each in a
+//! background job. No load starts while any waits or is being written, and one that started
+//! before a change was made is not taken in: what it read is from before the change. The last
+//! write's end reads the page again. A star is also shown at once, in place. A change the
+//! catalogue refuses is said in a banner ([`LibraryService::write_failure`]), or for a folder
+//! made from Unsorted under its group, and the page read again shows what is kept.
+//!
+//! **At quit** what is still queued is written in one background job, for as long as gpui
+//! waits for it: [`gpui::SHUTDOWN_TIMEOUT`], 200 ms. A change queued behind a pass's last batch
+//! may need longer to reach the database; what was not written by then is lost, and logged.
 
 use std::cmp::Reverse;
 use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription};
@@ -258,11 +265,81 @@ pub enum LibraryEvent {
     FolderCreated(FolderId),
 }
 
-/// What the service does on the UI thread with what a change returned.
-type Applied = Box<dyn FnOnce(&mut LibraryService, &mut Context<LibraryService>) + Send>;
-/// One of the owner's changes, waiting its turn: what it does to the archive, off the UI
-/// thread.
-type Change = Box<dyn FnOnce(&Archive) -> Applied + Send>;
+/// One of the owner's changes, waiting its turn to be written.
+enum Change {
+    Star {
+        id: SessionId,
+        starred: bool,
+    },
+    NewFolder {
+        name: String,
+        parent: Option<FolderId>,
+    },
+    Rename {
+        folder: FolderId,
+        name: String,
+    },
+    /// A top-level folder with a path attached, made from the group of Unsorted whose
+    /// [`group_key`] is `group`.
+    FolderFrom {
+        group: String,
+        name: String,
+        typed: String,
+        location: Option<LocationId>,
+    },
+}
+
+impl Change {
+    /// Writes it, off the UI thread. A folder made is returned.
+    fn write(&self, archive: &Archive) -> Result<Option<FolderId>, CatalogueError> {
+        let catalogue = archive.catalogue();
+        match self {
+            Self::Star { id, starred } => catalogue.set_starred(id, *starred).map(|()| None),
+            Self::NewFolder { name, parent } => catalogue.create_folder(name, *parent).map(Some),
+            Self::Rename { folder, name } => catalogue.rename_folder(*folder, name).map(|()| None),
+            Self::FolderFrom {
+                name,
+                typed,
+                location,
+                ..
+            } => catalogue
+                .create_folder_with_path(name, None, typed, location.as_ref())
+                .map(Some),
+        }
+    }
+
+    /// What it is, for the owner and the log: "The name “work”" and the like.
+    fn what(&self) -> String {
+        match self {
+            Self::Star { starred: true, .. } => "The star".to_string(),
+            Self::Star { starred: false, .. } => "Removing the star".to_string(),
+            Self::NewFolder { name, .. } => format!("The new folder “{name}”"),
+            Self::Rename { name, .. } => format!("The name “{name}”"),
+            Self::FolderFrom { name, typed, .. } => format!("The folder “{name}” for {typed}"),
+        }
+    }
+}
+
+/// The changes a quit is writing, and how many of them are written: those that are not when
+/// gpui stops waiting, and this is dropped, are logged.
+struct Unwritten {
+    changes: Vec<String>,
+    written: Arc<AtomicUsize>,
+}
+
+impl Drop for Unwritten {
+    fn drop(&mut self) {
+        let written = self.written.load(Ordering::Acquire).min(self.changes.len());
+        let left = &self.changes[written..];
+        if !left.is_empty() {
+            log::error!(
+                "the app quit before {} of the owner's changes were written: {}",
+                left.len(),
+                left.join("; ")
+            );
+        }
+    }
+}
 
 pub struct LibraryService {
     archive: Entity<ArchiveService>,
@@ -273,31 +350,32 @@ pub struct LibraryService {
     agents: usize,
     /// The page last loaded, and the shelf it is of.
     page: Option<(Shelf, Page)>,
-    /// All sessions as it was last loaded, while another page shows, and what [`Self::state`]
-    /// was then.
-    all: Option<(Page, u64)>,
-    /// Counts what may have changed the archive: the owner's changes as they are made and as
-    /// they are written, and sync's news. A load is of the state it started in.
-    state: u64,
-    /// The state the shown page was loaded in.
-    page_state: u64,
+    /// All sessions as it was last loaded, while another page shows, and what its load saw.
+    all: Option<(Page, Seen)>,
+    /// What a load starting now would see.
+    seen: Seen,
+    /// What the load of the shown page saw.
+    page_seen: Seen,
     /// The selected session, and where it is among a sessions page's.
     selected: Option<(SessionId, Option<usize>)>,
     /// The session whose reader is open.
     open: Option<Session>,
     loading: bool,
-    /// A load was asked for while one ran.
+    /// A load was asked for while one ran or while changes were written.
     stale: bool,
     /// Why the last load failed.
     failure: Option<String>,
-    /// The owner's changes still to write, the next first. Whoever writes takes the first,
-    /// while holding `turn`: the job of each change, and at quit one job for all that is left.
-    queue: Arc<Mutex<VecDeque<Change>>>,
-    turn: Arc<Mutex<()>>,
-    /// How many changes are queued or being written.
-    queued: usize,
-    /// A job is writing the next change.
-    writing: bool,
+    /// The owner's changes still to write, the next first.
+    queue: VecDeque<Change>,
+    /// What the change being written is, while one is.
+    writing: Option<String>,
+    /// The change handed to a job to write, until the job takes it. Whoever writes holds the
+    /// lock while it does: the job, or at quit the one job for all that is left, which so
+    /// writes the change in hand before the rest, itself if the job has not started.
+    in_hand: Arc<Mutex<Option<Change>>>,
+    /// Why the last of the owner's changes the catalogue refused was refused, until the owner
+    /// has read it.
+    write_failure: Option<String>,
     /// A folder to announce once a load has it.
     created: Option<FolderId>,
     /// The groups of Unsorted a folder is being made from, by [`group_key`].
@@ -305,6 +383,14 @@ pub struct LibraryService {
     /// The group whose folder the catalogue refused to make, and why.
     refused: Option<(String, String)>,
     _observers: [Subscription; 3],
+}
+
+/// What a load saw when it started: how many of the owner's changes had been made, and how
+/// many times sync had said the archive changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Seen {
+    changes: u64,
+    news: u64,
 }
 
 impl EventEmitter<LibraryEvent> for LibraryService {}
@@ -323,7 +409,7 @@ impl LibraryService {
                     }
                 }),
                 cx.subscribe(&sync, |this, _, _: &SyncEvent, cx| {
-                    this.state += 1;
+                    this.seen.news += 1;
                     this.reload(cx);
                 }),
                 cx.on_app_quit(Self::write_what_is_queued),
@@ -335,17 +421,17 @@ impl LibraryService {
             agents: 0,
             page: None,
             all: None,
-            state: 0,
-            page_state: 0,
+            seen: Seen::default(),
+            page_seen: Seen::default(),
             selected: None,
             open: None,
             loading: false,
             stale: false,
             failure: None,
-            queue: Arc::default(),
-            turn: Arc::default(),
-            queued: 0,
-            writing: false,
+            queue: VecDeque::new(),
+            writing: None,
+            in_hand: Arc::default(),
+            write_failure: None,
             created: None,
             creating: HashSet::new(),
             refused: None,
@@ -439,9 +525,21 @@ impl LibraryService {
             .map(|(_, why)| why.as_str())
     }
 
+    /// Why the last of the owner's changes the catalogue refused was refused, until
+    /// [`Self::dismiss_write_failure`].
+    pub fn write_failure(&self) -> Option<&str> {
+        self.write_failure.as_deref()
+    }
+
+    pub fn dismiss_write_failure(&mut self, cx: &mut Context<Self>) {
+        if self.write_failure.take().is_some() {
+            cx.notify();
+        }
+    }
+
     /// Nothing is being read or written.
     pub fn is_settled(&self) -> bool {
-        !self.loading && self.queued == 0
+        !self.loading && self.writing.is_none() && self.queue.is_empty()
     }
 
     /// Shows the page of `shelf`.
@@ -452,15 +550,15 @@ impl LibraryService {
         self.open = None;
         if self.shelf != shelf {
             if let Some((Shelf::All, page)) = self.page.take_if(|(of, _)| *of == Shelf::All) {
-                self.all = Some((page, self.page_state));
+                self.all = Some((page, self.page_seen));
             }
             self.shelf = shelf;
             self.selected = None;
             self.refused = None;
             match self.all.take_if(|_| shelf == Shelf::All) {
                 // Nothing changed since it was loaded: it is shown as it was.
-                Some((page, state)) if state == self.state && !self.loading => {
-                    self.set_page(Shelf::All, page, state, cx);
+                Some((page, seen)) if seen == self.seen && !self.loading => {
+                    self.set_page(Shelf::All, page, seen, cx);
                 }
                 kept => {
                     self.discard(kept, cx);
@@ -536,15 +634,12 @@ impl LibraryService {
         } else {
             self.counts.starred = self.counts.starred.saturating_sub(1);
         }
-        let id = id.clone();
         self.write(
-            cx,
-            move |archive| archive.catalogue().set_starred(&id, starred),
-            |_, changed, _| {
-                if let Err(error) = changed {
-                    log::error!("a star was refused: {error}");
-                }
+            Change::Star {
+                id: id.clone(),
+                starred,
             },
+            cx,
         );
         cx.notify();
     }
@@ -556,26 +651,11 @@ impl LibraryService {
         parent: Option<FolderId>,
         cx: &mut Context<Self>,
     ) {
-        self.write(
-            cx,
-            move |archive| archive.catalogue().create_folder(&name, parent),
-            |this, created, _| match created {
-                Ok(folder) => this.created = Some(folder),
-                Err(error) => log::error!("a folder was refused: {error}"),
-            },
-        );
+        self.write(Change::NewFolder { name, parent }, cx);
     }
 
     pub fn rename_folder(&mut self, folder: FolderId, name: String, cx: &mut Context<Self>) {
-        self.write(
-            cx,
-            move |archive| archive.catalogue().rename_folder(folder, &name),
-            |_, renamed, _| {
-                if let Err(error) = renamed {
-                    log::error!("a folder's new name was refused: {error}");
-                }
-            },
-        );
+        self.write(Change::Rename { folder, name }, cx);
     }
 
     /**
@@ -607,44 +687,41 @@ impl LibraryService {
             [only] => Some(only.clone()),
             _ => None,
         };
-        let key = group.to_string();
-        self.creating.insert(key.clone());
+        self.creating.insert(group.to_string());
         self.refused = None;
         self.write(
+            Change::FolderFrom {
+                group: group.to_string(),
+                name,
+                typed,
+                location,
+            },
             cx,
-            move |archive| {
-                archive
-                    .catalogue()
-                    .create_folder_with_path(&name, None, &typed, location.as_ref())
-            },
-            move |this, created, _| match created {
-                Ok(folder) => this.created = Some(folder),
-                Err(error) => this.refused = Some((key, error.to_string())),
-            },
         );
         cx.notify();
     }
 
-    /// Reads the shown page and the sidebar's counts again.
+    /// Reads the shown page and the sidebar's counts again: now, or once the load running and
+    /// the owner's changes waiting are over (the module docs).
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return;
         };
-        if self.loading {
+        if self.loading || self.writing.is_some() || !self.queue.is_empty() {
             self.stale = true;
             return;
         }
         self.loading = true;
-        let (shelf, state) = (self.shelf, self.state);
+        let (shelf, seen) = (self.shelf, self.seen);
         let job = cx.background_spawn(async move { load(&archive, shelf) });
         cx.spawn(async move |this, cx| {
             let loaded = job.await;
             this.update(cx, |this, cx| {
                 this.loading = false;
-                let current = state == this.state && shelf == this.shelf;
+                // A change made since it started may be missing from it: one is still to come.
+                let current = seen.changes == this.seen.changes && shelf == this.shelf;
                 match loaded {
-                    // What it read may be from before a change: the load that follows is not.
-                    Ok(loaded) if current => this.loaded(loaded, state, cx),
+                    Ok(loaded) if current => this.loaded(loaded, seen, cx),
                     Ok(_) => {}
                     Err(error) => {
                         log::error!("the library could not be read: {error}");
@@ -661,7 +738,7 @@ impl LibraryService {
         .detach();
     }
 
-    fn loaded(&mut self, loaded: Loaded, state: u64, cx: &mut Context<Self>) {
+    fn loaded(&mut self, loaded: Loaded, seen: Seen, cx: &mut Context<Self>) {
         self.failure = None;
         self.counts = loaded.counts;
         self.folders = loaded.folders;
@@ -672,7 +749,7 @@ impl LibraryService {
             // The selected session may have moved: sessions arrive while a sync runs.
             *at = page.find(id, at.unwrap_or(0));
         }
-        self.set_page(loaded.shelf, loaded.page, state, cx);
+        self.set_page(loaded.shelf, loaded.page, seen, cx);
         // The folders being made are made, or refused, by now.
         self.creating.clear();
         if let Some(folder) = self.created
@@ -683,8 +760,8 @@ impl LibraryService {
         }
     }
 
-    fn set_page(&mut self, shelf: Shelf, page: Page, state: u64, cx: &mut Context<Self>) {
-        self.page_state = state;
+    fn set_page(&mut self, shelf: Shelf, page: Page, seen: Seen, cx: &mut Context<Self>) {
+        self.page_seen = seen;
         let before = self.page.replace((shelf, page));
         self.discard(before, cx);
     }
@@ -696,54 +773,44 @@ impl LibraryService {
         }
     }
 
-    /// Queues `change`, one of the owner's, to be written after those made before it, and
-    /// `done` to hear how it went. The page is read again once it is written.
-    fn write<T: Send + 'static>(
-        &mut self,
-        cx: &mut Context<Self>,
-        change: impl FnOnce(&Archive) -> Result<T, CatalogueError> + Send + 'static,
-        done: impl FnOnce(&mut Self, Result<T, CatalogueError>, &mut Context<Self>) + Send + 'static,
-    ) {
-        self.state += 1;
-        self.queued += 1;
-        self.queue
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push_back(Box::new(move |archive| {
-                let changed = change(archive);
-                Box::new(move |this, cx| done(this, changed, cx))
-            }));
+    /// Queues one of the owner's changes, to be written after those made before it.
+    fn write(&mut self, change: Change, cx: &mut Context<Self>) {
+        self.seen.changes += 1;
+        self.queue.push_back(change);
         self.write_next(cx);
     }
 
-    /// Starts the job that writes the next queued change, unless one is running.
+    /// Writes the next queued change, unless one is being written; with none left, reads the
+    /// page again.
     fn write_next(&mut self, cx: &mut Context<Self>) {
-        if self.writing || self.queued == 0 {
+        if self.writing.is_some() {
             return;
         }
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return;
         };
-        self.writing = true;
-        let (queue, turn) = (self.queue.clone(), self.turn.clone());
+        let Some(change) = self.queue.pop_front() else {
+            self.reload(cx);
+            return;
+        };
+        self.writing = Some(change.what());
+        // Free: the last job let go of it before its end reached here.
+        *self.in_hand.lock().unwrap_or_else(PoisonError::into_inner) = Some(change);
+        let in_hand = self.in_hand.clone();
         let job = cx.background_spawn(async move {
-            let _turn = turn.lock().unwrap_or_else(PoisonError::into_inner);
-            let next = queue
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .pop_front();
-            next.map(|change| change(&archive))
+            let mut in_hand = in_hand.lock().unwrap_or_else(PoisonError::into_inner);
+            // Gone when the app quit before the job started: the quit wrote it.
+            let change = in_hand.take()?;
+            let written = change.write(&archive);
+            Some((change, written))
         });
         cx.spawn(async move |this, cx| {
-            let applied = job.await;
+            let Some((change, written)) = job.await else {
+                return;
+            };
             this.update(cx, |this, cx| {
-                this.writing = false;
-                this.queued -= 1;
-                this.state += 1;
-                if let Some(applied) = applied {
-                    applied(this, cx);
-                }
-                this.reload(cx);
+                this.writing = None;
+                this.written(change, written);
                 this.write_next(cx);
                 cx.notify();
             })
@@ -752,24 +819,62 @@ impl LibraryService {
         .detach();
     }
 
-    /// At quit: writes what is still queued, in its order, for as long as gpui waits.
+    /// Takes in how a change's write went. A refusal is said to the owner: under the group of
+    /// Unsorted a folder was to be made from, or in [`Self::write_failure`].
+    fn written(&mut self, change: Change, written: Result<Option<FolderId>, CatalogueError>) {
+        match (change, written) {
+            (_, Ok(folder)) => self.created = folder.or(self.created),
+            (Change::FolderFrom { group, .. }, Err(error)) => {
+                self.refused = Some((group, error.to_string()));
+            }
+            (change, Err(error)) => {
+                log::warn!("{} was refused: {error}", change.what());
+                self.write_failure = Some(format!(
+                    "{} couldn't be saved: {}.",
+                    change.what(),
+                    error.to_string().trim_end_matches('.')
+                ));
+            }
+        }
+    }
+
+    /// At quit: writes what is still queued, in its order, after the change in hand, for as
+    /// long as gpui waits (the module docs).
     fn write_what_is_queued(&mut self, cx: &mut Context<Self>) -> impl Future<Output = ()> + use<> {
         let archive = self.archive.read(cx).archive().cloned();
-        let (queue, turn) = (self.queue.clone(), self.turn.clone());
-        cx.background_spawn(async move {
+        let changes: Vec<Change> = self.queue.drain(..).collect();
+        let written = Arc::new(AtomicUsize::new(0));
+        let unwritten = Unwritten {
+            changes: self
+                .writing
+                .iter()
+                .cloned()
+                .chain(changes.iter().map(Change::what))
+                .collect(),
+            written: written.clone(),
+        };
+        let writing = self.writing.is_some();
+        let in_hand = self.in_hand.clone();
+        let job = cx.background_spawn(async move {
             let Some(archive) = archive else {
                 return;
             };
-            let _turn = turn.lock().unwrap_or_else(PoisonError::into_inner);
-            let next = || {
-                queue
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .pop_front()
-            };
-            while let Some(change) = next() {
-                drop(change(&archive));
+            let mut in_hand = in_hand.lock().unwrap_or_else(PoisonError::into_inner);
+            let waiting = in_hand.take();
+            if writing && waiting.is_none() {
+                // Its job took it, and has written it by now.
+                written.fetch_add(1, Ordering::Release);
             }
-        })
+            for change in waiting.into_iter().chain(changes) {
+                if let Err(error) = change.write(&archive) {
+                    log::warn!("{} was refused: {error}", change.what());
+                }
+                written.fetch_add(1, Ordering::Release);
+            }
+        });
+        async move {
+            job.await;
+            drop(unwritten);
+        }
     }
 }

@@ -29,13 +29,13 @@ use super::header::{Under, header};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
-    Tone, icon, location_tag, overline, tag, tag_width, text_width, warn_chip, warn_chip_width,
+    Tone, icon, location_tag, overline, tag, tag_width, text_width, warn_chip,
 };
 use crate::format;
 use crate::icons::SbIcon;
 use crate::keymap;
 use crate::services::{
-    ActiveServices as _, LibraryService, Month, PathChip, SessionsPage, SyncService,
+    ActiveServices as _, LibraryService, Month, PathChip, SessionsPage, Stats, SyncService,
 };
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
@@ -54,28 +54,35 @@ const CARD_PADDING: Pixels = px(14.);
 /// What the chip of a session whose newer version is held back says.
 const HELD_BACK: &str = "held back";
 
-/// The narrowest a model's name is drawn, cut short; with less room it is left out.
+/// The least of a model's name a card's last line keeps room for when it decides whether the
+/// tool calls fit.
 const MODEL_MIN: Pixels = px(40.);
 
-/// What of a card's last line shows where the line is short (DESIGN §4.4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LastLine {
-    model: bool,
-    calls: bool,
+/**
+ * Whether the cards of a page show their tool calls (DESIGN §4.4), decided for the page and
+ * not card by card, so that neighbours read alike: whether a card `inner` wide inside its
+ * padding and border fits the agent's mark, [`MODEL_MIN`] of a model's name, the widest
+ * location's tag (`tag`), and a day with a call count as wide as the page's widest
+ * (`day_and_calls`), with the gaps between them. Whatever the answer, the location's tag and
+ * the day show whole and the model's name takes the rest of its card.
+ */
+fn calls_fit(inner: Pixels, tag: Pixels, day_and_calls: Pixels, theme: &SbTheme) -> bool {
+    theme.sizes.icon_xs + MODEL_MIN + tag + day_and_calls + theme.spacing.sm * 3. <= inner
 }
 
-/**
- * What a card's last line has room for. The agent's mark, the location's tag, a subfolder's
- * tag and the day always show, whole, and leave `room`. The model's name is `model` wide
- * and the tool calls `calls`. When they don't both fit, the name is cut short, down to
- * [`MODEL_MIN`]; then the calls are left out; then the name.
- */
-fn last_line(room: Pixels, model: Pixels, calls: Pixels) -> LastLine {
-    let least = model.min(MODEL_MIN);
-    LastLine {
-        model: least <= room,
-        calls: least + calls <= room,
-    }
+/// A day and a call count as wide as the widest a page of `stats` and `most_calls` shows:
+/// the day of its oldest session, with a two-digit day, and the most calls a session made.
+fn widest_day_and_calls(stats: &Stats, most_calls: u32, now: i64) -> String {
+    let day = stats
+        .span
+        .map(|(oldest, _)| format::day(oldest, now))
+        .unwrap_or_default();
+    // Geist Mono's digits are all as wide: the month and the year are what differ.
+    let month = day.find(' ').map_or("", |at| &day[at..]);
+    format!(
+        "28{month} · {}",
+        format::plural(most_calls as usize, "call")
+    )
 }
 
 /// One item of the list of cards.
@@ -208,6 +215,10 @@ pub struct SessionsView {
     columns: usize,
     /// How wide a card is, as far as the window's width says.
     card_width: Pixels,
+    /// The widest day and call count the page shows ([`widest_day_and_calls`]).
+    day_and_calls: String,
+    /// Whether the cards show their tool calls ([`calls_fit`]).
+    shows_calls: bool,
     /// The card under the pointer.
     hovered: Option<SessionId>,
     /// The rows are of what the library held before it last changed.
@@ -235,6 +246,8 @@ impl SessionsView {
             sizes: Rc::default(),
             columns: 0,
             card_width: px(0.),
+            day_and_calls: String::new(),
+            shows_calls: false,
             hovered: None,
             stale: true,
         }
@@ -257,17 +270,32 @@ impl SessionsView {
         let room = viewport - sidebar - theme.sizes.page_side * 2.;
         let columns = columns(room, theme);
         self.card_width = (room - theme.spacing.lg * (columns as f32 - 1.)) / columns as f32;
-        if !self.stale && columns == self.columns {
-            return;
+        if self.stale || columns != self.columns {
+            self.stale = false;
+            self.columns = columns;
+            let page = self.library.read(cx).sessions();
+            self.rows = page.map_or_else(Vec::new, |page| rows(&page.months, columns));
+            self.sizes = Rc::new(row_sizes(&self.rows, theme));
+            self.day_and_calls = page.map_or_else(String::new, |page| {
+                let most = page.sessions.iter().map(|it| it.all.calls).max();
+                widest_day_and_calls(&page.stats, most.unwrap_or(0), format::now())
+            });
         }
-        self.stale = false;
-        self.columns = columns;
-        self.rows = self
-            .library
+        // The locations may arrive, or be renamed, after the sessions.
+        let tag = self
+            .sync
             .read(cx)
-            .sessions()
-            .map_or_else(Vec::new, |page| rows(&page.months, columns));
-        self.sizes = Rc::new(row_sizes(&self.rows, theme));
+            .locations()
+            .unwrap_or_default()
+            .iter()
+            .map(|location| tag_width(&location.name, theme, window))
+            .fold(px(0.), Pixels::max);
+        self.shows_calls = calls_fit(
+            self.card_width - CARD_PADDING * 2. - px(2.),
+            tag,
+            text_width(&self.day_and_calls, &theme.text.count, window),
+            theme,
+        );
     }
 
     /// Moves the selection (see [`moved`]); with nothing selected, selects the first session.
@@ -312,7 +340,7 @@ impl SessionsView {
     fn render_rows(
         &mut self,
         range: Range<usize>,
-        window: &mut Window,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let theme = cx.sb_theme().clone();
@@ -331,9 +359,11 @@ impl SessionsView {
                     .w_full()
                     .flex()
                     .gap(theme.spacing.lg)
-                    .children(sessions.clone().map(|index| {
-                        self.card(index, &page.sessions[index], now, &theme, window, cx)
-                    }))
+                    .children(
+                        sessions
+                            .clone()
+                            .map(|index| self.card(index, &page.sessions[index], now, &theme, cx)),
+                    )
                     // A short row's cards stay as wide as a full one's: what fills the row
                     // takes a card's padding and border too.
                     .children((sessions.len()..self.columns).map(|_| {
@@ -358,7 +388,6 @@ impl SessionsView {
         session: &Session,
         now: i64,
         theme: &SbTheme,
-        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let c = &theme.colors;
@@ -391,42 +420,18 @@ impl SessionsView {
         };
         let location = self.sync.read(cx).location(&session.id.location);
         let by_hand = matches!(session.filed, Filed::ByHand(_));
-        let calls = format::plural(session.all.calls as usize, "call");
-        // The day always shows; a session that recorded no time has its calls in its place.
-        let (day, calls) = match session.ended.or(session.started) {
-            Some(ended) => (format::day(ended, now), format!(" · {calls}")),
-            None => (calls, String::new()),
-        };
-
-        /* What always shows on the last line, and the gaps between its pieces, leave this
-        much for the model's name and the tool calls ([`last_line`]). */
-        let gap = theme.spacing.sm;
-        let always = [
-            Some(theme.sizes.icon_xs),
-            Some(text_width(&day, &theme.text.count, window)),
-            location.map(|location| tag_width(&location.name, theme, window)),
-            subfolder.map(|folder| {
-                tag_width(&folder.name, theme, window).min(theme.sizes.tag_max_width)
-            }),
-            session
-                .held_back
-                .then(|| warn_chip_width(HELD_BACK, theme, window)),
-            by_hand.then_some(theme.sizes.icon_xs),
-        ];
-        let pieces = always.iter().flatten().count();
-        let room = self.card_width
-            - CARD_PADDING * 2.
-            - px(2.)
-            - always
-                .iter()
-                .flatten()
-                .fold(px(0.), |sum, width| sum + *width)
-            - gap * (pieces - 1) as f32;
-        let shows = last_line(
-            room,
-            text_width(&model, &theme.text.small, window) + gap,
-            text_width(&calls, &theme.text.count, window),
-        );
+        // The day always shows, and the calls on a page whose cards have room for them, but
+        // none where there were none.
+        let calls = (self.shows_calls && session.all.calls > 0)
+            .then(|| format::plural(session.all.calls as usize, "call"));
+        let when = session
+            .ended
+            .or(session.started)
+            .map(|ended| format::day(ended, now))
+            .into_iter()
+            .chain(calls)
+            .collect::<Vec<_>>()
+            .join(" · ");
 
         let id = session.id.clone();
         let star = div()
@@ -559,22 +564,20 @@ impl SessionsView {
                 div()
                     .flex()
                     .items_center()
-                    .gap(gap)
+                    .gap(theme.spacing.sm)
                     .h(theme.sizes.tag_small_height)
                     .text_color(c.fg3)
                     .text_spec(&theme.text.small)
                     .whitespace_nowrap()
                     .child(agents::mark(&session.id.provider, theme.sizes.icon_xs, cx))
-                    // Only the model's name gives way: everything else keeps its width.
-                    .when(shows.model, |this| {
-                        this.child(
-                            div()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .child(model),
-                        )
-                    })
+                    // Only the model's name gives way, to the room the rest leaves it.
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(model),
+                    )
                     .children(location.map(|location| {
                         location_tag(location.name.clone(), &location.kind, true, theme)
                     }))
@@ -590,11 +593,7 @@ impl SessionsView {
                             .flex_none()
                             .ml_auto()
                             .text_spec(&theme.text.count)
-                            .child(if shows.calls {
-                                format!("{day}{calls}")
-                            } else {
-                                day
-                            }),
+                            .child(when),
                     )
                     .when(by_hand, |this| {
                         this.child(icon(SbIcon::Hand, theme.sizes.icon_xs, c.fg3))
@@ -904,32 +903,43 @@ mod tests {
     }
 
     #[test]
-    fn a_short_last_line_cuts_the_model_then_drops_the_calls_then_the_model() {
-        let line = |room: f32| last_line(px(room), px(90.), px(50.));
-        let (both, model, neither) = (
-            LastLine {
-                model: true,
-                calls: true,
-            },
-            LastLine {
-                model: true,
-                calls: false,
-            },
-            LastLine {
-                model: false,
-                calls: false,
-            },
+    fn the_calls_show_on_every_card_of_a_page_or_on_none() {
+        let theme = SbTheme::new(Appearance::Dark, Material::Opaque);
+        // The mark (12), 40 of a model's name, a 70 tag, a 100 day and calls, three gaps of 6.
+        assert!(calls_fit(px(241.), px(70.), px(100.), &theme));
+        assert!(calls_fit(px(240.), px(70.), px(100.), &theme));
+        assert!(!calls_fit(px(239.), px(70.), px(100.), &theme));
+        // The widest location decides for every card, whichever location a card is from.
+        assert!(!calls_fit(px(240.), px(71.), px(100.), &theme));
+    }
+
+    #[test]
+    fn the_widest_day_has_two_digits_and_the_oldest_sessions_year() {
+        let at = |year, month, day| {
+            chrono::NaiveDate::from_ymd_opt(year, month, day)
+                .and_then(|date| date.and_hms_opt(12, 0, 0))
+                .map(|time| time.and_utc().timestamp_millis())
+                .expect("a day at noon")
+        };
+        let now = at(2026, 11, 16);
+        let stats = |oldest| Stats {
+            sessions: 2,
+            calls: 0,
+            span: Some((oldest, now)),
+            locations: 1,
+        };
+        assert_eq!(
+            widest_day_and_calls(&stats(at(2026, 11, 2)), 1, now),
+            "28 Nov · 1 call"
         );
-        assert_eq!(line(140.), both);
-        // The name is cut short for as long as 40 of it and the calls fit.
-        assert_eq!(line(139.), both);
-        assert_eq!(line(90.), both);
-        assert_eq!(line(89.), model);
-        assert_eq!(line(40.), model);
-        assert_eq!(line(39.), neither);
-        // A name shorter than that is never cut: it shows whole or not at all.
-        assert_eq!(last_line(px(30.), px(24.), px(50.)), model);
-        assert_eq!(last_line(px(20.), px(24.), px(50.)), neither);
+        assert_eq!(
+            widest_day_and_calls(&stats(at(2025, 12, 3)), 1234, now),
+            "28 Dec 2025 · 1,234 calls"
+        );
+        assert_eq!(
+            widest_day_and_calls(&Stats::default(), 0, now),
+            "28 · 0 calls"
+        );
     }
 
     #[test]

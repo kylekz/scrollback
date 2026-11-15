@@ -117,19 +117,20 @@ pub struct PassReport {
 }
 
 impl PassReport {
-    /// Why the pass did not archive everything the agent has, if it did not: how many items it
-    /// could not read and the first reason. Items that only changed under the pass are not a
-    /// reason, the next pass has them, until they have waited too long and are among `failed`.
+    /// Why the pass did not archive everything the agent has, if it did not, as a clause the
+    /// owner reads: how many items it could not read and the first reason. Items that only
+    /// changed under the pass are not a reason, the next pass has them, until they have waited
+    /// too long and are among `failed`.
     fn shortfall(&self) -> Option<String> {
         let first = self
             .failed
             .first()
             .map(|failure| &failure.reason)
             .or(self.unlisted.first().map(|unlisted| &unlisted.reason))?;
-        Some(format!(
-            "{} could not be archived; first: {first}",
-            self.failed.len() + self.unlisted.len()
-        ))
+        Some(match self.failed.len() + self.unlisted.len() {
+            1 => format!("1 item was not archived, because: {first}"),
+            items => format!("{items} items were not archived; the first because: {first}"),
+        })
     }
 }
 
