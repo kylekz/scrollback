@@ -25,7 +25,8 @@ pub enum SyncError {
     #[error("the sync was cancelled")]
     Cancelled,
     /// The location could not be connected to: a machine that is asleep or off the network.
-    /// Not a failure (PLAN §5); what was archived before the connection went stays.
+    /// Not a failure (PLAN §5); what was archived before the connection went stays. With what
+    /// the launcher said, its verdict on the first line.
     #[error("the location could not be reached: {0}")]
     Unreachable(String),
     #[error("location {0} is already being synced")]
@@ -134,8 +135,14 @@ pub struct Pass {
  *
  * The attempt is recorded with the location, and so is how it ended: as a success only when
  * every pass could read everything its agent has there, and otherwise with what went wrong.
- * A location that can't be connected to, at the start or from some point on, is recorded as
- * unreachable, which is not an error, and the sync ends with [`SyncError::Unreachable`].
+ *
+ * When the location itself fails, at the start or from some point on, the sync stops there:
+ * the provider after would only meet the same. The pass it stopped in is the last of those
+ * returned, after whatever the providers before it did, and its failure is recorded as the
+ * location's, once. A location that can't be connected to ends that pass with
+ * [`SyncError::Unreachable`] and is recorded as unreachable, which is not an error; a
+ * launcher or a shell that fails (a sign-in refused, a host key not accepted, a missing
+ * tool) is recorded as the location's error.
  */
 pub fn sync_location(
     archive: &Archive,
@@ -160,25 +167,43 @@ pub fn sync_location(
             Ok(Some(mut source)) => pass(archive, location, id, source.as_mut(), cancel, progress),
             Err(error) => Err(error.into()),
         };
-        match &outcome {
+        let outcome = match outcome {
+            Err(SyncError::Provider(ProviderError::Transport(TransportError::Unreachable(
+                reason,
+            )))) => Err(SyncError::Unreachable(reason)),
+            outcome => outcome,
+        };
+        /* Whether it is the location that failed, and not this provider's pass over it. */
+        let the_locations = match &outcome {
             Err(SyncError::Cancelled) => return Err(SyncError::Cancelled),
             /* A transport stopped by the cancel fails its call: that is the cancel, too. */
             Err(_) if cancel.is_cancelled() => return Err(SyncError::Cancelled),
-            Err(SyncError::Provider(ProviderError::Transport(TransportError::Unreachable(
-                reason,
-            )))) => {
+            Err(SyncError::Unreachable(reason)) => {
                 catalogue.record_unreachable(location, reason)?;
-                return Err(SyncError::Unreachable(reason.clone()));
+                true
             }
-            Err(error) => problems.push(format!("{id}: {error}")),
+            Err(SyncError::Provider(ProviderError::Transport(error)))
+                if error.is_the_locations() =>
+            {
+                catalogue.record_outcome(location, Some(&error.to_string()))?;
+                true
+            }
+            Err(error) => {
+                problems.push(format!("{id}: {error}"));
+                false
+            }
             Ok(report) => {
                 problems.extend(report.shortfall().map(|short| format!("{id}: {short}")));
+                false
             }
-        }
+        };
         passes.push(Pass {
             provider: id,
             outcome,
         });
+        if the_locations {
+            return Ok(passes);
+        }
     }
     if problems.is_empty() {
         catalogue.record_outcome(location, None)?;

@@ -37,11 +37,29 @@ pub const SHELL: &str = "SB_TEST_SHELL";
 /// dir mounted where it is on this machine.
 pub const SHELL_VIA: &str = "SB_TEST_SHELL_VIA";
 
-/// The shells to run the shell transport's scripts in: the one [`SHELL`] names, or else those
-/// of `sh`, `bash`, `dash`, `zsh` and `ksh` that this machine has.
+/**
+ * The environment variable that names a WSL distro to read every fixture location through,
+ * for tests run inside that distro: each call leaves the distro for `wsl.exe` on the
+ * Windows side and comes back in through it, as a WSL location's does, with the fixture's
+ * temp dir for a home. It needs the distro to be able to run Windows programs (the default).
+ * Without it nothing goes through `wsl.exe`.
+ */
+pub const WSL: &str = "SB_TEST_WSL";
+
+/// Whether every fixture location is read through the shell transport ([`SHELL`], [`WSL`]).
+pub fn through_a_shell() -> bool {
+    std::env::var_os(SHELL).is_some() || std::env::var_os(WSL).is_some()
+}
+
+/// The shells to run the shell transport's scripts in: the one [`SHELL`] names, `sh` alone
+/// through [`WSL`], or else those of `sh`, `bash`, `dash`, `zsh` and `ksh` that this machine
+/// has.
 pub fn shells() -> Vec<String> {
     if let Ok(shell) = std::env::var(SHELL) {
         return vec![shell];
+    }
+    if std::env::var_os(WSL).is_some() {
+        return vec!["sh".to_string()];
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     ["sh", "bash", "dash", "zsh", "ksh"]
@@ -55,9 +73,14 @@ pub fn shells() -> Vec<String> {
 /// and nothing else of this process's environment but its `PATH`.
 pub fn loopback(shell: &str, home: &Path, vars: &[(String, String)]) -> Launcher {
     let via = std::env::var(SHELL_VIA).unwrap_or_default();
+    /* As `Launcher::Wsl` starts a distro's shell, with `env` in the shell's place. */
+    let wsl = std::env::var(WSL)
+        .ok()
+        .map(|distro| ["wsl.exe", "-d", &distro, "--cd", "/", "--exec"].map(str::to_string));
     let mut words = via
         .split_whitespace()
         .map(str::to_string)
+        .chain(wsl.into_iter().flatten())
         .chain([
             "env".to_string(),
             "-i".to_string(),
@@ -83,10 +106,12 @@ pub struct HomeTransport {
 }
 
 impl HomeTransport {
-    /// The location, read with `std::fs`, or through the shell [`SHELL`] names.
+    /// The location, read with `std::fs`, or through the shell [`SHELL`] names, or through
+    /// `sh` in the distro [`WSL`] names.
     pub fn new(home: &Path, vars: Vec<(String, String)>) -> Self {
         match std::env::var(SHELL) {
             Ok(shell) => Self::through(&shell, home, vars),
+            Err(_) if std::env::var_os(WSL).is_some() => Self::through("sh", home, vars),
             Err(_) => Self {
                 home: home.to_str().unwrap().to_string(),
                 vars,

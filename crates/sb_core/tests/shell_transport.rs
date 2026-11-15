@@ -7,9 +7,11 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::fs::{self, File};
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{PermissionsExt as _, symlink};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,45 +20,15 @@ use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::hash::Hash;
 use sb_core::transport::{
-    FileEntry, FileStat, Halt, Hashed, Launcher, Listing, LocalTransport, PrefixRequest,
-    RangeFailure, RangeRequest, RangeSink, ShellTransport, Transport, TransportError, Unlisted,
+    FileEntry, FileStat, Halt, Hashed, Listing, LocalTransport, PrefixRequest, RangeFailure,
+    RangeRequest, RangeSink, ShellTransport, Transport, TransportError, Unlisted,
 };
 use sb_test_support::{loopback, shells};
 use tempfile::TempDir;
 
-/// What a sink was given: each range's bytes, and how each ended.
-#[derive(Default, Debug, PartialEq)]
-struct Collect {
-    bytes: Vec<Vec<u8>>,
-    ends: Vec<Result<(), String>>,
-}
-
-impl RangeSink for Collect {
-    fn data(&mut self, request: usize, bytes: &[u8]) -> Result<(), Halt> {
-        self.bytes.resize(request + 1, Vec::new());
-        self.bytes[request].extend_from_slice(bytes);
-        Ok(())
-    }
-
-    fn end(&mut self, request: usize, result: Result<(), RangeFailure>) -> Result<(), Halt> {
-        self.bytes.resize(request + 1, Vec::new());
-        self.ends.push(result.map_err(|failure| match failure {
-            /* A tool's words for it differ from this machine's. */
-            RangeFailure::Unreadable(_) => "unreadable".to_string(),
-            failure => failure.to_string(),
-        }));
-        Ok(())
-    }
-}
-
-fn text(path: &Path) -> String {
-    path.to_str().unwrap().to_string()
-}
-
-/// A transport over `shell` whose home folder is `home`.
-fn through(shell: &str, home: &Path) -> ShellTransport {
-    ShellTransport::new(loopback(shell, home, &[]))
-}
+use common::shell::{
+    Collect, Ends, megabytes, noise, set_mode, stand_in, text, through, tool, tools, with_tools,
+};
 
 /// A listing in an order that does not depend on how the folder was walked.
 fn sorted(mut listing: Listing) -> (Vec<FileEntry>, Vec<Unlisted>, Vec<Unlisted>) {
@@ -90,28 +62,6 @@ fn as_told(whole_seconds: bool, stat: FileStat) -> FileStat {
     } else {
         stat
     }
-}
-
-fn set_mode(path: &Path, mode: u32) {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-}
-
-/// Bytes that are not text: every value, zeros in runs, and no pattern a shell would keep.
-fn noise(length: usize) -> Vec<u8> {
-    let mut state = 0x2545_f491_4f6c_dd1d_u64;
-    (0..length)
-        .map(|at| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            if at % 97 < 5 { 0 } else { state as u8 }
-        })
-        .collect()
-}
-
-/// So many megabytes of [`noise`].
-fn megabytes(count: usize) -> Vec<u8> {
-    noise(1024 * 1024).repeat(count)
 }
 
 /// Names a shell script must not trip over.
@@ -597,14 +547,12 @@ fn a_file_that_shrinks_while_it_is_read_ends_short_and_the_stream_stays_in_step(
 }
 
 #[test]
-fn a_file_removed_while_it_is_read_is_missing_and_the_stream_stays_in_step() {
+fn a_file_removed_while_it_is_read_is_read_to_its_end_as_on_this_machine() {
     for shell in shells() {
-        let (read, _) = read_while(&shell, |large| fs::remove_file(large).unwrap());
-        assert_eq!(
-            read.ends,
-            [Err("it is no longer there".to_string()), Ok(())],
-            "{shell}"
-        );
+        /* The tool that reads it has it open, as `std::fs` would. */
+        let (read, content) = read_while(&shell, |large| fs::remove_file(large).unwrap());
+        assert_eq!(read.ends, [Ok(()), Ok(())], "{shell}");
+        assert!(read.bytes[0] == content, "{shell}");
         assert_eq!(read.bytes[1], b"next range", "{shell}");
     }
 }
@@ -658,204 +606,456 @@ fn a_halt_or_a_cancel_stops_the_shell_at_once() {
     }
 }
 
-/// A folder to be a `PATH`: links to the tools the transport needs, but `without`.
-fn tools(without: &[&str]) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let path = std::env::var_os("PATH").unwrap();
-    for tool in [
-        "sh",
-        "find",
-        "stat",
-        "head",
-        "tail",
-        "date",
-        "id",
-        "sha256sum",
-        "shasum",
-    ] {
-        if without.contains(&tool) {
-            continue;
-        }
-        if let Some(found) = std::env::split_paths(&path)
-            .map(|dir| dir.join(tool))
-            .find(|found| found.is_file())
-        {
-            symlink(found, dir.path().join(tool)).unwrap();
-        }
-    }
-    dir
-}
-
-/// A transport over `sh` that finds only the tools in `path`.
-fn with_tools(path: &Path) -> ShellTransport {
-    ShellTransport::new(Launcher::Command {
-        program: "env".into(),
-        args: vec![
-            "-i".to_string(),
-            format!("PATH={}", text(path)),
-            text(&path.join("sh")),
-            "-s".to_string(),
-        ],
-    })
+/// How each way of asking about the file at `path` ends when the file can't be had: `stat`,
+/// a range from its start, one from further in, one of no bytes, a prefix, a prefix of no
+/// bytes, and the small file whole.
+fn each_way(transport: &ShellTransport, path: &str) -> Vec<String> {
+    let range = |offset, length| RangeRequest {
+        path: path.to_string(),
+        offset,
+        length,
+    };
+    let prefix = |length| PrefixRequest {
+        path: path.to_string(),
+        length,
+    };
+    let source = |error: TransportError| match error {
+        TransportError::Io { source, .. } => source.to_string(),
+        other => panic!("{other}"),
+    };
+    let mut ends = Ends::default();
+    transport
+        .read_ranges(&[range(0, 4), range(2, 3), range(0, 0)], &mut ends)
+        .unwrap();
+    let hashed = transport.hash_prefixes(&[prefix(4), prefix(0)]).unwrap();
+    std::iter::once(source(transport.stat(&[path]).unwrap_err()))
+        .chain(ends.0)
+        .chain(
+            hashed
+                .into_iter()
+                .map(|hashed| hashed.unwrap_err().to_string()),
+        )
+        .chain([source(transport.read_small(path).unwrap_err())])
+        .collect()
 }
 
 #[test]
-fn a_missing_tool_is_named_and_what_does_not_need_it_still_works() {
+fn a_path_in_a_folder_that_may_not_be_searched_is_an_error_and_not_a_missing_file() {
     let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("file"), "0123456789").unwrap();
-    let file = text(&dir.path().join("file"));
-    let prefix = [PrefixRequest {
-        path: file.clone(),
-        length: 4,
-    }];
-    let missing = |result: Result<(), TransportError>| match result {
-        Err(TransportError::MissingTools(tools)) => tools,
-        other => panic!("{other:?}"),
-    };
+    let locked = dir.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    let inside = locked.join("inside.txt");
+    fs::write(&inside, "0123456789").unwrap();
+    set_mode(&locked, 0o000);
+    /* Whoever may read everything has no such folder. */
+    if fs::metadata(&inside).is_ok() {
+        return;
+    }
+    assert!(LocalTransport.stat(&[&text(&inside)]).is_err());
+    let ends: Vec<_> = shells()
+        .into_iter()
+        .map(|shell| {
+            (
+                each_way(&through(&shell, dir.path()), &text(&inside)),
+                shell,
+            )
+        })
+        .collect();
+    set_mode(&locked, 0o755);
+    for (ends, shell) in ends {
+        /* The same plain reason, whichever tool it was that could not look. */
+        assert_eq!(ends, ["it may not be read"; 7], "{shell}");
+    }
+}
 
-    /* Everything is there. */
-    let all = tools(&[]);
-    let whole = with_tools(all.path());
-    assert_eq!(whole.probe().unwrap().missing, Vec::<String>::new());
-    assert_eq!(
-        whole.hash_prefixes(&prefix).unwrap()[0]
-            .as_ref()
+#[test]
+fn a_file_stat_cannot_look_at_is_unlisted_and_an_error_and_never_missing() {
+    /* A file whose path is longer than the system takes, in a folder whose path is not: it
+    is there for `find`, and `stat` fails on it with something other than "no such file". */
+    let limit = if cfg!(target_os = "macos") {
+        1024
+    } else {
+        4096
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let mut folder = root.clone();
+    while folder.to_str().unwrap().len() + 101 < limit - 24 {
+        folder.push("e".repeat(100));
+    }
+    fs::create_dir_all(&folder).unwrap();
+    let long = format!("{}.txt", "f".repeat(120));
+    assert!(
+        Command::new("sh")
+            .current_dir(&folder)
+            .args(["-c", &format!("echo hello > {long}; echo ok > short.txt")])
+            .status()
             .unwrap()
-            .size,
-        10
+            .success()
     );
+    let path = format!("{}/{long}", text(&folder));
+    assert!(LocalTransport.stat(&[&path]).is_err());
 
-    /* Neither tool that hashes: said by the connection test, and by a call that needs one. */
-    let no_hash = tools(&["sha256sum", "shasum"]);
-    let unhashed = with_tools(no_hash.path());
-    assert_eq!(unhashed.probe().unwrap().missing, ["sha256sum or shasum"]);
-    assert_eq!(
-        missing(unhashed.hash_prefixes(&prefix).map(drop)),
-        ["sha256sum or shasum"]
-    );
-    assert_eq!(unhashed.list(&text(dir.path())).unwrap().files.len(), 1);
-    assert_eq!(unhashed.read_small(&file).unwrap().unwrap(), b"0123456789");
-
-    /* Several at once. */
-    let little = tools(&["find", "tail", "stat"]);
-    let lacking = with_tools(little.path());
-    assert_eq!(lacking.probe().unwrap().missing, ["find", "stat", "tail"]);
-    assert_eq!(
-        missing(lacking.list(&text(dir.path())).map(drop)),
-        ["find", "stat"]
-    );
-    assert_eq!(
-        missing(lacking.read_ranges(&[], &mut Collect::default())),
-        ["tail"]
-    );
-}
-
-#[test]
-fn the_connection_test_says_what_is_there_and_how_long_it_took() {
-    let home = tempfile::tempdir().unwrap();
     for shell in shells() {
-        let probe = through(&shell, home.path()).probe().unwrap();
-        assert_eq!(probe.home, text(home.path()), "{shell}");
-        assert_eq!(probe.missing, Vec::<String>::new(), "{shell}");
-        let clock = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        assert!(
-            (clock.as_nanos() as i64 - probe.clock_ns).abs() < 60_000_000_000,
-            "{shell}"
-        );
-        assert!(probe.took > Duration::ZERO && probe.took < Duration::from_secs(60));
-    }
-}
-
-/// A transport whose launcher is `sh -c <line>`.
-fn launched(line: &str) -> ShellTransport {
-    ShellTransport::new(Launcher::Command {
-        program: "sh".into(),
-        args: vec!["-c".to_string(), line.to_string()],
-    })
-}
-
-#[test]
-fn what_is_printed_before_the_answer_is_passed_over() {
-    /* As a login script's greeting is, on a host that runs one for every command. */
-    let noisy = launched("echo 'Welcome!'; printf 'K\\nZ\\n\\0\\377'; echo; exec sh -s");
-    assert!(noisy.env(&[]).unwrap().home.starts_with('/'));
-    assert!(noisy.probe().unwrap().missing.is_empty());
-}
-
-#[test]
-fn a_launcher_that_fails_says_why_in_its_own_words() {
-    let failed = |transport: ShellTransport| match transport.env(&[]) {
-        Err(TransportError::Failed(said)) => said,
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(
-        failed(launched("echo 'no such distro' >&2; exit 3")),
-        "no such distro"
-    );
-    assert!(failed(launched("exit 3")).contains("ended before it answered"));
-    assert!(failed(launched("echo 'not a shell at all'")).contains("ended before it answered"));
-
-    let nowhere = ShellTransport::new(Launcher::Command {
-        program: "/nonexistent/launcher".into(),
-        args: Vec::new(),
-    });
-    match nowhere.env(&[]) {
-        Err(TransportError::Launch { program, source }) => {
-            assert_eq!(program, "/nonexistent/launcher");
-            assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        let transport = through(&shell, dir.path());
+        /* Its batch is asked about again, name by name: the rest of it is listed, and the
+        file is reported, with what stat said of it. */
+        let listing = transport.list(&text(&root)).unwrap();
+        assert_eq!(listing.files.len(), 1, "{shell}");
+        assert!(listing.files[0].path.ends_with("/short.txt"), "{shell}");
+        let unlisted: Vec<_> = listing.unlisted.iter().map(|entry| &entry.path).collect();
+        assert_eq!(unlisted, [&path], "{shell}");
+        let said = "File name too long";
+        assert!(listing.unlisted[0].reason.contains(said), "{shell}");
+        for end in each_way(&transport, &path) {
+            assert!(end.contains(said), "{shell}: {end}");
         }
-        other => panic!("{other:?}"),
     }
 }
 
 #[test]
-fn an_answer_cut_off_fails_the_call_and_never_passes_for_a_whole_one() {
+fn a_file_that_goes_between_find_and_stat_is_left_out_and_the_rest_is_listed() {
     let dir = tempfile::tempdir().unwrap();
-    let files: Vec<_> = (0..40)
+    for name in ["a.txt", "b.txt", "victim.txt"] {
+        fs::write(dir.path().join(name), name).unwrap();
+    }
+    /* A stat that removes the file as it is asked about the folder's whole batch. */
+    let tools = tools(&[]);
+    stand_in(
+        tools.path(),
+        "stat",
+        &format!(
+            "[ \"$#\" -lt 6 ] || /bin/rm -f '{}'\nexec \"$real\" \"$@\"",
+            text(&dir.path().join("victim.txt"))
+        ),
+    );
+    let listing = with_tools(tools.path()).list(&text(dir.path())).unwrap();
+    let mut files: Vec<_> = listing
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    files.sort_unstable();
+    assert_eq!(files, ["a.txt", "b.txt"]);
+    assert_eq!(listing.unlisted, []);
+    assert!(!dir.path().join("victim.txt").exists());
+}
+
+#[test]
+fn a_small_file_that_shrinks_as_it_is_read_is_what_is_left_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (victim, flag) = (dir.path().join("victim"), dir.path().join("flag"));
+    fs::write(&victim, "0123456789").unwrap();
+    /* A stat that, the first time it has told the file's size, has the file rewritten. */
+    let tools = tools(&[]);
+    stand_in(
+        tools.path(),
+        "stat",
+        &format!(
+            "\"$real\" \"$@\"\nstatus=$?\ncase \"$*\" in *victim) [ -e '{flag}' ] || \
+             {{ : > '{flag}'; printf short > '{victim}'; }} ;; esac\nexit \"$status\"",
+            flag = text(&flag),
+            victim = text(&victim),
+        ),
+    );
+    let read = with_tools(tools.path()).read_small(&text(&victim)).unwrap();
+    assert_eq!(read.as_deref(), Some(&b"short"[..]));
+}
+
+#[test]
+fn either_tool_that_hashes_gives_the_same_hashes() {
+    let dir = tempfile::tempdir().unwrap();
+    let files: Vec<_> = (0..12)
         .map(|n| {
             let path = dir.path().join(format!("file {n}"));
-            fs::write(&path, noise(5000)).unwrap();
+            fs::write(&path, noise(1000 + n)).unwrap();
             text(&path)
         })
         .collect();
-    let requests: Vec<_> = files
-        .iter()
-        .map(|path| RangeRequest {
-            path: path.clone(),
-            offset: 0,
-            length: 5000,
+    /* A start of a file, and whole files, which are hashed as a group. */
+    let requests: Vec<_> = std::iter::once((files[0].clone(), 400))
+        .chain(
+            files
+                .iter()
+                .enumerate()
+                .map(|(n, file)| (file.clone(), 1000 + n as u64)),
+        )
+        .map(|(path, length)| PrefixRequest { path, length })
+        .collect();
+    let here = LocalTransport.hash_prefixes(&requests).unwrap();
+    for without in [&["shasum"][..], &["sha256sum"]] {
+        let tools = tools(without);
+        let there = with_tools(tools.path()).hash_prefixes(&requests);
+        /* Not every system has both. */
+        if matches!(there, Err(TransportError::MissingTools(_))) {
+            continue;
+        }
+        let there = there.unwrap();
+        for (there, here) in there.iter().zip(&here) {
+            assert_eq!(
+                there.as_ref().ok(),
+                here.as_ref().ok(),
+                "without {without:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_hash_that_comes_with_anything_else_is_not_taken() {
+    if tool("sha256sum").is_none() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let files: Vec<_> = (0..3)
+        .map(|n| {
+            let path = dir.path().join(format!("file {n}"));
+            fs::write(&path, "0123456789").unwrap();
+            text(&path)
         })
         .collect();
-    /* The connection goes after so many bytes of the answer, wherever in it that is. */
-    for cut in [1, 20, 47, 48, 60, 5000, 5060, 12_345, 150_000] {
-        let dropped = launched(&format!(
-            "sh -s | head -c {cut}; echo 'Connection lost' >&2; exit 255"
-        ));
-        let mut sink = Collect::default();
-        match dropped.read_ranges(&requests, &mut sink) {
-            Err(TransportError::Failed(said)) => assert_eq!(said, "Connection lost", "{cut}"),
-            other => panic!("cut at {cut}: {other:?}"),
-        }
-        /* No range ended well that had not arrived whole. */
-        for (range, end) in sink.ends.iter().enumerate() {
-            assert!(end.is_ok() && sink.bytes[range].len() == 5000, "{cut}");
-        }
-        assert!(sink.ends.len() < requests.len(), "{cut}");
-        /* The other answers are shorter: only an early cut is inside them. */
-        if cut < 2000 {
-            let prefixes: Vec<_> = files
-                .iter()
-                .map(|path| PrefixRequest {
-                    path: path.clone(),
-                    length: 5000,
+    let tools = tools(&["shasum"]);
+    stand_in(
+        tools.path(),
+        "sha256sum",
+        "echo 'sha256sum: WARNING: 1 listed file could not be read'\nexec \"$real\" \"$@\"",
+    );
+    /* Asked for by itself, and as one of a group. */
+    let requests: Vec<_> = [(0, 4), (1, 10), (2, 10)]
+        .map(|(file, length)| PrefixRequest {
+            path: files[file].clone(),
+            length,
+        })
+        .to_vec();
+    let hashed = with_tools(tools.path()).hash_prefixes(&requests).unwrap();
+    for hashed in hashed {
+        assert_eq!(
+            hashed.unwrap_err().to_string(),
+            "sha256sum: WARNING: 1 listed file could not be read"
+        );
+    }
+}
+
+/// A folder of many small files with every kind of name, and requests for them, as
+/// `(file, offset, length)`, that a transport may take in groups: with, among them, files
+/// that are not as long as they were asked for, one that is missing, one that may not be
+/// read, one too large for a group, and one asked for from further in.
+fn many_small_files() -> (TempDir, Vec<(PathBuf, u64, u64)>) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut requests = Vec::new();
+    for n in 0..320_u64 {
+        let name = format!("{} {n}", HOSTILE[n as usize % HOSTILE.len()]);
+        let path = dir.path().join(name);
+        let size = (n * 37) % 3000;
+        fs::write(&path, noise(size as usize)).unwrap();
+        /* Longer than was scanned, shorter than was scanned, and empty since. */
+        let length = match n % 50 {
+            7 => size / 2,
+            13 => size + 100,
+            _ => size,
+        };
+        requests.push((path, 0, length.max(1)));
+    }
+    let large = dir.path().join("large");
+    fs::write(&large, megabytes(3)).unwrap();
+    requests.insert(100, (large.clone(), 0, 3 * 1024 * 1024));
+    requests.insert(150, (large, 1_000_000, 5000));
+    requests.insert(200, (dir.path().join("missing"), 0, 10));
+    let locked = dir.path().join("locked");
+    fs::write(&locked, "secret").unwrap();
+    set_mode(&locked, 0o000);
+    requests.insert(250, (locked, 0, 6));
+    (dir, requests)
+}
+
+/// The ranges `requests` name, and the prefixes: each file's start as far as its range.
+fn asked(requests: &[(PathBuf, u64, u64)]) -> (Vec<RangeRequest>, Vec<PrefixRequest>) {
+    requests
+        .iter()
+        .map(|(path, offset, length)| {
+            (
+                RangeRequest {
+                    path: text(path),
+                    offset: *offset,
+                    length: *length,
+                },
+                PrefixRequest {
+                    path: text(path),
+                    length: offset + length,
+                },
+            )
+        })
+        .unzip()
+}
+
+/// Holds what `transport` reads and hashes of `requests` to what this machine does.
+fn assert_as_here(transport: &ShellTransport, requests: &[(PathBuf, u64, u64)], what: &str) {
+    let (ranges, prefixes) = asked(requests);
+    let (mut here, mut there) = (Collect::default(), Collect::default());
+    LocalTransport.read_ranges(&ranges, &mut here).unwrap();
+    transport.read_ranges(&ranges, &mut there).unwrap();
+    assert_eq!(there.ends, here.ends, "{what}");
+    for (range, (there, here)) in ranges.iter().zip(there.bytes.iter().zip(&here.bytes)) {
+        assert!(there == here, "{what}: {range:?}");
+    }
+    let plain = |hashes: Vec<Result<Hashed, RangeFailure>>| -> Vec<Result<Hashed, String>> {
+        hashes
+            .into_iter()
+            .map(|hashed| {
+                hashed.map_err(|failure| match failure {
+                    RangeFailure::Unreadable(_) => "unreadable".to_string(),
+                    failure => failure.to_string(),
                 })
-                .collect();
-            let failed = |result| matches!(result, Err(TransportError::Failed(_)));
-            assert!(failed(dropped.list(&text(dir.path())).map(drop)), "{cut}");
-            assert!(failed(dropped.hash_prefixes(&prefixes).map(drop)), "{cut}");
-            assert!(failed(dropped.stat(&[&files[0]]).map(drop)), "{cut}");
-            assert!(failed(dropped.read_small(&files[0]).map(drop)), "{cut}");
-            assert!(cut > 48 || failed(dropped.env(&[]).map(drop)), "{cut}");
+            })
+            .collect()
+    };
+    assert_eq!(
+        plain(transport.hash_prefixes(&prefixes).unwrap()),
+        plain(LocalTransport.hash_prefixes(&prefixes).unwrap()),
+        "{what}"
+    );
+}
+
+#[test]
+fn many_small_files_are_read_and_hashed_as_they_would_be_one_by_one() {
+    let (dir, requests) = many_small_files();
+    for shell in shells() {
+        assert_as_here(&through(&shell, dir.path()), &requests, &shell);
+    }
+}
+
+#[test]
+fn a_group_that_does_not_hold_together_is_asked_for_again_file_by_file() {
+    let (_dir, requests) = many_small_files();
+    /* A cat that gives more than the files hold: the bytes do not add up. */
+    let tools_cat = tools(&[]);
+    stand_in(tools_cat.path(), "cat", "\"$real\" \"$@\"\nprintf more");
+    assert_as_here(&with_tools(tools_cat.path()), &requests, "cat gives more");
+    /* And one that gives less. */
+    let tools_less = tools(&[]);
+    stand_in(tools_less.path(), "cat", "\"$real\" \"$@\" | head -c 1000");
+    assert_as_here(&with_tools(tools_less.path()), &requests, "cat gives less");
+    /* A file that grows between the look at its size and the reading of it. */
+    let grows = text(&requests[20].0);
+    let tools_grow = tools(&[]);
+    stand_in(
+        tools_grow.path(),
+        "cat",
+        &format!(
+            "[ -e \"$0.once\" ] || {{ : > \"$0.once\"; printf more >> '{grows}'; }}\n\
+             exec \"$real\" \"$@\""
+        ),
+    );
+    assert_as_here(&with_tools(tools_grow.path()), &requests, "a file grows");
+    /* A hashing tool that puts its lines for many files in another order, and a file that
+    grows as its group is about to be hashed. */
+    for name in ["sha256sum", "shasum"] {
+        if tool(name).is_none() {
+            continue;
         }
+        /* The second of them is used only where the first is not there. */
+        let tools_sum = tools(if name == "shasum" {
+            &["sha256sum"]
+        } else {
+            &[]
+        });
+        stand_in(
+            tools_sum.path(),
+            name,
+            "if [ \"$#\" -gt 4 ]; then \"$real\" \"$@\" | sort; else exec \"$real\" \"$@\"; fi",
+        );
+        assert_as_here(
+            &with_tools(tools_sum.path()),
+            &requests,
+            "lines out of order",
+        );
+        /* As the run it is in is hashed, and only then. */
+        let grows = text(&requests[if name == "shasum" { 60 } else { 40 }].0);
+        stand_in(
+            tools_sum.path(),
+            name,
+            &format!(
+                "[ \"$#\" -le 3 ] || case \"$* \" in *'{grows} '*) printf more >> '{grows}' ;; esac\n\
+                 exec \"$real\" \"$@\""
+            ),
+        );
+        assert_as_here(&with_tools(tools_sum.path()), &requests, "a file grows");
+    }
+}
+
+#[test]
+fn a_range_far_into_a_large_file_is_found_without_reading_up_to_it() {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    /* Three gibibytes that take no room, with something written past the second. */
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sparse");
+    let mut file = File::create(&path).unwrap();
+    file.set_len(3 << 30).unwrap();
+    let far = (1 << 31) + 12_345;
+    file.seek(SeekFrom::Start(far)).unwrap();
+    file.write_all(b"past two gibibytes").unwrap();
+    drop(file);
+    let requests: Vec<_> = [
+        (far, 18),
+        (far - 5, 30),
+        (far + 7, 1 << 20),
+        ((3 << 30) - 4, 9),
+    ]
+    .map(|(offset, length)| RangeRequest {
+        path: text(&path),
+        offset,
+        length,
+    })
+    .to_vec();
+    let mut here = Collect::default();
+    LocalTransport.read_ranges(&requests, &mut here).unwrap();
+    assert_eq!(here.bytes[0], b"past two gibibytes");
+    for shell in shells() {
+        let started = Instant::now();
+        let mut there = Collect::default();
+        through(&shell, dir.path())
+            .read_ranges(&requests, &mut there)
+            .unwrap();
+        assert!(there == here, "{shell}");
+        assert!(started.elapsed() < Duration::from_secs(30), "{shell}");
+    }
+}
+
+#[test]
+fn a_request_for_more_than_any_file_holds_ends_as_on_this_machine() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = text(&dir.path().join("file"));
+    fs::write(&path, "0123456789").unwrap();
+    let ranges = [(0, u64::MAX), (3, u64::MAX - 3), (0, u64::MAX / 2)].map(|(offset, length)| {
+        RangeRequest {
+            path: path.clone(),
+            offset,
+            length,
+        }
+    });
+    let prefixes = [u64::MAX, u64::MAX / 2, 1 << 62].map(|length| PrefixRequest {
+        path: path.clone(),
+        length,
+    });
+    let mut here = Collect::default();
+    LocalTransport.read_ranges(&ranges, &mut here).unwrap();
+    let hashed = |hashes: Vec<Result<Hashed, RangeFailure>>| -> Vec<String> {
+        hashes
+            .into_iter()
+            .map(|hashed| hashed.unwrap_err().to_string())
+            .collect()
+    };
+    let hashed_here = hashed(LocalTransport.hash_prefixes(&prefixes).unwrap());
+    for shell in shells() {
+        let transport = through(&shell, dir.path());
+        let mut there = Collect::default();
+        transport.read_ranges(&ranges, &mut there).unwrap();
+        assert!(there == here, "{shell}: {:?}", there.ends);
+        assert_eq!(
+            hashed(transport.hash_prefixes(&prefixes).unwrap()),
+            hashed_here,
+            "{shell}"
+        );
     }
 }

@@ -52,33 +52,35 @@ struct Place {
 
 impl Place {
     fn from(args: &[&str]) -> Result<Self, Box<dyn Error>> {
-        let command = |program: &str, args: &[&str]| {
+        /* A launcher that runs `words` and then a shell that reads its script on stdin. */
+        let command = |mut words: Vec<String>| {
+            words.extend(["sh", "-s"].map(str::to_string));
             Some(Launcher::Command {
-                program: program.into(),
-                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                program: words.remove(0).into(),
+                args: words,
             })
         };
         let (kind, name, launcher) = match *args {
             [] => (LocationKind::Local, "This machine".to_string(), None),
-            ["--wsl", distro] => (wsl_distro(distro), distro.to_string(), None),
-            ["--wsl", distro, "--home", home] => (
-                wsl_distro(distro),
-                format!("{distro} {home}"),
-                command(
-                    "wsl.exe",
-                    &[
-                        "-d",
-                        distro,
-                        "--cd",
-                        "/",
-                        "--exec",
-                        "env",
-                        &format!("HOME={home}"),
-                        "sh",
-                        "-s",
-                    ],
-                ),
-            ),
+            ["--wsl", distro] => {
+                let distro = spelled(distro)?;
+                (wsl_distro(&distro), distro, None)
+            }
+            ["--wsl", distro, "--home", home] => {
+                let distro = spelled(distro)?;
+                /* As the distro's shell is started, with `env` before the shell. */
+                let mut words = Launcher::Wsl {
+                    distro: distro.clone(),
+                }
+                .words();
+                words.truncate(words.len() - 2);
+                words.extend(["env".to_string(), format!("HOME={home}")]);
+                (
+                    wsl_distro(&distro),
+                    format!("{distro} {home}"),
+                    command(words),
+                )
+            }
             ["--ssh", host] => (
                 LocationKind::Ssh {
                     host: host.to_string(),
@@ -90,16 +92,12 @@ impl Place {
             ["--loopback", home] => (
                 LocationKind::Local,
                 format!("Loopback {home}"),
-                command(
-                    "env",
-                    &[
-                        "-i",
-                        &format!("PATH={}", std::env::var("PATH")?),
-                        &format!("HOME={home}"),
-                        "sh",
-                        "-s",
-                    ],
-                ),
+                command(vec![
+                    "env".to_string(),
+                    "-i".to_string(),
+                    format!("PATH={}", std::env::var("PATH")?),
+                    format!("HOME={home}"),
+                ]),
             ),
             _ => return Err(USAGE.into()),
         };
@@ -128,20 +126,31 @@ fn wsl_distro(distro: &str) -> LocationKind {
     }
 }
 
+/// The distro `name` as WSL spells it: `wsl.exe` takes a name in any case, and a location is
+/// kept under the one spelling. A name it does not list is left as it was given.
+fn spelled(name: &str) -> Result<String, Box<dyn Error>> {
+    let distros = wsl::distros(&CancelToken::new())?.unwrap_or_default();
+    Ok(wsl::find(&distros, name)
+        .map_or(name, |distro| &distro.name)
+        .to_string())
+}
+
 /// The connection test (DESIGN §4.12).
 fn test(place: &Place) -> Result<(), Box<dyn Error>> {
     let launcher = place
         .launcher()
         .ok_or("this machine is not reached through a shell: there is nothing to test")?;
+    println!("running: {}", launcher.command_line());
     let probe = ShellTransport::new(launcher)
         .probe()
         .map_err(|error| error.to_string())?;
     let ahead =
         probe.clock_ns as f64 / 1e9 - SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
     println!(
-        "connected in {:.2?}: its home is {}, its clock is {ahead:+.1} s from this machine's, \
-         modification times come in {}",
+        "connected in {:.2?}: {} answered, its home is {}, its clock is {ahead:+.1} s from \
+         this machine's, modification times come in {}",
         probe.took,
+        probe.shell,
         probe.home,
         if probe.whole_seconds {
             "whole seconds"
@@ -149,6 +158,10 @@ fn test(place: &Place) -> Result<(), Box<dyn Error>> {
             "nanoseconds"
         }
     );
+    match &probe.login_shell {
+        Some(shell) => println!("variables: as the login shell {shell} has them"),
+        None => println!("variables: the login shell did not answer; a bare command's"),
+    }
     if probe.missing.is_empty() {
         println!("tools: all there");
         Ok(())
@@ -166,14 +179,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Some(distros) => {
                     for distro in &distros {
                         println!(
-                            "{}: {}{}",
+                            "{}: {}{}{}",
                             distro.name,
                             if distro.running {
                                 "running"
                             } else {
                                 "not running"
                             },
-                            if distro.default { ", the default" } else { "" }
+                            if distro.default { ", the default" } else { "" },
+                            if distro.utility {
+                                ", a container tool's own"
+                            } else {
+                                ""
+                            }
                         );
                     }
                     println!("{} distros", distros.len());
@@ -241,7 +259,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let known = catalogue
         .locations()?
         .into_iter()
-        .find(|location| location.kind == place.kind && location.name == place.name);
+        .find(|location| location.kind.same_place(&place.kind) && location.name == place.name);
     let location = match known {
         Some(location) => location,
         None => catalogue.add_location(place.kind.clone(), &place.name)?,
@@ -276,20 +294,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 planned.0, planned.1
             ),
         },
-    );
-    let passes = match passes {
-        /* Not an error to the app; here it is why nothing was synced. */
-        Err(SyncError::Unreachable(reason)) => {
-            return Err(format!("unreachable, which is not counted as a failure: {reason}").into());
-        }
-        passes => passes?,
-    };
+    )?;
     if passes.is_empty() {
         println!("no agent was found there");
     }
     for pass in passes {
         let report = match pass.outcome {
             Ok(report) => report,
+            /* Not an error to the app; here it is why the sync stopped. */
+            Err(SyncError::Unreachable(reason)) => {
+                return Err(
+                    format!("unreachable, which is not counted as a failure: {reason}").into(),
+                );
+            }
             Err(error) => {
                 println!("{}: failed: {error}", pass.provider);
                 continue;

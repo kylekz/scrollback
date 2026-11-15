@@ -27,6 +27,8 @@ use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError, RwLock};
+use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -584,8 +586,20 @@ fn absolute(dir: &Path) -> Result<PathBuf> {
     std::path::absolute(dir).map_err(io_error("resolve", dir))
 }
 
-/// Takes the archive's lock, which lasts as long as the returned file is open.
+/**
+ * Takes the archive's lock, which lasts as long as the returned file is open.
+ *
+ * The file is not passed on to the programs this process starts (it is opened close-on-exec,
+ * and on Windows as a handle that is not inherited), so a long-lived `ssh` or `wsl.exe` never
+ * holds the lock. On Unix a child that is just being started still has the file open for the
+ * instant before its program runs, though, and with it a lock that an archive closed a
+ * moment ago held. So a lock that is taken is tried again for a moment before the archive is
+ * said to be open elsewhere.
+ */
 fn lock(dir: &Path) -> Result<File> {
+    /* How often, and how long apart, a lock that is taken is tried again. */
+    const TRIES: u32 = 25;
+    const APART: Duration = Duration::from_millis(10);
     let path = dir.join(layout::LOCK);
     let file = File::options()
         .create(true)
@@ -593,11 +607,15 @@ fn lock(dir: &Path) -> Result<File> {
         .write(true)
         .open(&path)
         .map_err(io_error("open", &path))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(ArchiveError::Locked(dir.to_path_buf())),
-        Err(TryLockError::Error(error)) => Err(io_error("lock", &path)(error)),
+    for tried in 0.. {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) if tried < TRIES => thread::sleep(APART),
+            Err(TryLockError::WouldBlock) => return Err(ArchiveError::Locked(dir.to_path_buf())),
+            Err(TryLockError::Error(error)) => return Err(io_error("lock", &path)(error)),
+        }
     }
+    Ok(file)
 }
 
 /// A location's sync in progress.

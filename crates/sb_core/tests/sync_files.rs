@@ -620,7 +620,7 @@ mod unreadable {
             set_mode(folder, 0o755);
             /* The folder as one; or, read with `std::fs`, which can still list the names
             in a folder it may not search, its two files each. */
-            let as_one = mode == 0o000 || std::env::var_os(sb_test_support::SHELL).is_some();
+            let as_one = mode == 0o000 || sb_test_support::through_a_shell();
             assert_eq!(report.unlisted.len(), if as_one { 1 } else { 2 });
             assert_eq!((report.scanned, report.gone), (1, 0));
             assert_eq!(bench.item(&subagent).gone_since, None);

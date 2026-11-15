@@ -4,22 +4,33 @@
 //!
 //! **One call, one process.** Each operation starts the [`Launcher`]'s `sh -s` and writes it
 //! a script: `shell.sh`, which defines a function per operation and documents the answer's
-//! records, then one line per request that calls one. A pass over a location where nothing
-//! changed is four processes (the environment, whether the agent is there, its settings, the
-//! listing); each batch it fetches adds one for the stream and one for the proofs.
+//! records, then the requests as calls of those ([`script`]). A pass over a location where
+//! nothing changed is four processes (the environment, whether the agent is there, its
+//! settings, the listing); each batch it fetches adds one for the stream and one for the
+//! proofs.
 //!
 //! **Requests are shell words.** A path is written between single quotes, where a POSIX shell
 //! reads every character as itself, a quote in it as `'\''`. So a name with spaces, newlines,
 //! quotes or a leading dash is one argument, whatever shell runs the script, and nothing but
 //! the launcher's fixed arguments ever crosses a command line.
 //!
-//! **The answer is read without trusting names or file contents** ([`reply`]): names end at a
-//! NUL, a file's bytes come in a block as long as was asked for, and the tools' own output is
-//! taken apart here, not in the shell.
+//! **The answer is read without trusting names or file contents** ([`reply`], [`parse`]):
+//! names end at a NUL, a file's bytes come in a block whose length is known before it, and the
+//! tools' own output is taken apart here, not in the shell. Whether a file is missing is read
+//! in what `stat` or the reading tool said of it: only "No such file or directory" is a file
+//! that is gone, and anything else is an error, as it is on this machine.
 //!
 //! **A file that shrinks or goes while it is read** fills its block with zeros after a mark,
-//! so the stream stays in step and the range is reported short ([`Block`]). What a range held
-//! is never taken on trust anyway: the engine has the source hash it afterwards (PLAN §4.2).
+//! so the stream stays in step and the range is reported short. What a range held is never
+//! taken on trust anyway: the engine has the source hash it afterwards (PLAN §4.2).
+//!
+//! **Many small files cost one process, not several each.** Whole files asked for one after
+//! another are read with one `cat`, cut apart by the sizes one `stat` gave just before, and
+//! whole files to be proven are hashed by one `sha256sum`, in the order asked. A group is
+//! taken only when it holds together (the bytes add up; every hash line names its file, which
+//! is still as long as its prefix); otherwise its files are asked for again one by one. The
+//! engine's proof is as it was: a range is stored only when the location's own hash of the
+//! file's start equals the hash of what was fetched.
 //!
 //! **Modification times** are in nanoseconds where the location's `stat` gives them (GNU
 //! coreutils, BSD, macOS) and whole seconds otherwise (busybox). Whole seconds are safe: a
@@ -27,43 +38,65 @@
 //! The listing's clock is the location's own, to the nanosecond where its `date` can tell,
 //! and otherwise in whole seconds, rounded down, which only makes a file look younger.
 //!
-//! **The environment** is the one a command run by `wsl.exe --exec` or `ssh host command`
-//! gets: no login script is read, so a variable the owner sets in a shell profile is not seen.
+//! **The environment** a command run by `wsl.exe --exec` or `ssh host command` gets is bare:
+//! no profile is read. So the variables a provider asks about are asked of the user's login
+//! shell (`$SHELL -lc`), which reads the profile, and of the bare environment only when the
+//! login shell does not answer in a few seconds. What only an interactive shell's startup
+//! file sets is still not seen.
+//!
+//! **A call that hears nothing** from its launcher for [`IDLE`] is given up on: a `find` on a
+//! network mount that hangs, a `wsl.exe` that stalls. `ssh` itself notices a host that stops
+//! answering much sooner ([`Launcher`]).
 
 mod launch;
+mod parse;
 mod reply;
+mod script;
 
 use std::collections::HashMap;
 use std::io;
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use toolbox_process::CancelToken;
 
 use super::{
-    Env, FileEntry, FileStat, Halt, Hashed, Listing, NOT_A_FILE, NOT_UNICODE, PrefixRequest,
-    RangeFailure, RangeRequest, RangeSink, SYMBOLIC_LINK, Transport, TransportError, Unlisted,
+    Env, FileStat, Halt, Hashed, Listing, MAY_NOT_BE_READ, PrefixRequest, RangeFailure,
+    RangeRequest, RangeSink, Transport, TransportError, Unlisted,
 };
-use crate::hash::Hash;
+use parse::{Trouble, clock, entry, not_unicode, number, parse_stat, range};
 use reply::{END, Reply, unexpected};
+use script::{Login, Script};
 
 pub use launch::Launcher;
 
-/// What runs at the location: a function per operation.
-const FUNCTIONS: &str = include_str!("shell.sh");
+/// How long a launcher may say nothing at all, on either stream, before its call is given
+/// up on. Output comes per file, so the longest silence a healthy location has is one file
+/// being hashed: ten minutes is a prefix of some tens of gigabytes on a slow disk.
+const IDLE: Duration = Duration::from_secs(600);
+
+/// How long the user's login shell may take to say what its profile sets, in seconds.
+const LOGIN_SECONDS: u32 = 5;
 
 /// How many names a listing asks about one by one in a single call, when `stat` answered for
 /// fewer files than `find` named.
 const ASK_AGAIN: usize = 256;
 
-/// What a tool says of a path it may not look at. To the shell's own tests such a path is not
-/// there, so where this was said, it is not taken for missing. (The tools run in the C locale.)
-const DENIED: &str = "Permission denied";
+/// The most files read or hashed as one group, and the most bytes of their paths: a group's
+/// paths are one command line at the location.
+const GROUP_FILES: usize = 256;
+const GROUP_PATHS: usize = 96 * 1024;
 
-/// What a file is, in the bits of its mode that say so.
-const KIND: u32 = 0o170_000;
-const REGULAR: u32 = 0o100_000;
-const FOLDER: u32 = 0o040_000;
-const LINK: u32 = 0o120_000;
+/// The largest file read in a group, and the most bytes a group asks for. A group's bytes are
+/// held here until they are seen to add up, with [`GROUP_SLACK`] more for files that grew
+/// since they were scanned.
+const GROUP_FILE: u64 = 2 * 1024 * 1024;
+const GROUP_BYTES: u64 = 16 * 1024 * 1024;
+const GROUP_SLACK: u64 = 1024 * 1024;
+
+/// The largest offset or length sent to the shell, whose arithmetic is signed: no file is as
+/// long, so a request for more reads and ends as it would have.
+const FAR: u64 = 1 << 62;
 
 /// What a connection test found at a location whose shell answered (DESIGN §4.12).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +109,11 @@ pub struct Probe {
     pub missing: Vec<String>,
     /// Whether files' modification times come in whole seconds only.
     pub whole_seconds: bool,
+    /// Where the `sh` that answered is found at the location (`/bin/sh`).
+    pub shell: String,
+    /// The user's login shell, when it answered: the variables its profile sets are seen.
+    /// `None` when it did not, and only the bare environment of a command is.
+    pub login_shell: Option<String>,
     /// How long the test took, from starting the launcher to the end of the answer.
     pub took: Duration,
 }
@@ -85,6 +123,7 @@ pub struct Probe {
 pub struct ShellTransport {
     launcher: Launcher,
     cancel: CancelToken,
+    idle: Duration,
 }
 
 impl ShellTransport {
@@ -92,6 +131,7 @@ impl ShellTransport {
         Self {
             launcher,
             cancel: CancelToken::new(),
+            idle: IDLE,
         }
     }
 
@@ -102,6 +142,11 @@ impl ShellTransport {
         self
     }
 
+    /// What starts the location's shell: to show the command that was run.
+    pub fn launcher(&self) -> &Launcher {
+        &self.launcher
+    }
+
     /**
      * The connection test: whether the launcher reaches a shell, and what the transport would
      * find there. A location that can't be reached, or whose launcher fails, is an error; one
@@ -109,17 +154,25 @@ impl ShellTransport {
      */
     pub fn probe(&self) -> Result<Probe, TransportError> {
         let started = Instant::now();
-        let (mut reply, missing) = self.start(&Script::new().line("probe"))?;
+        let login = Login::new();
+        let script = Script::new().line("probe").login(&login, &[]);
+        let (mut reply, missing) = self.start(&script)?;
         reply.field("H")?;
         let home = reply.words()?;
         let clock_ns = clock(&reply.field("C")?)?;
         let whole_seconds = reply.field("N")? == "0";
+        reply.field("L")?;
+        let shell = reply.words()?;
+        let login_shell = reply.words()?;
+        let answered = login.read(&mut reply)?.is_some();
         reply.end()?;
         Ok(Probe {
             home,
             clock_ns,
             missing,
             whole_seconds,
+            shell,
+            login_shell: answered.then_some(login_shell),
             took: started.elapsed(),
         })
     }
@@ -129,17 +182,15 @@ impl ShellTransport {
         Reply::start(
             &self.launcher,
             script.text().into_bytes(),
-            &script.marker,
+            script.marker(),
             &self.cancel,
+            self.idle,
         )
     }
 
     /// Runs `script`, which needs `tools`, and reads its answer up to the first record.
     fn ask(&self, tools: &str, script: Script) -> Result<Reply<'_>, TransportError> {
-        let (reply, missing) = self.start(&Script {
-            requests: format!("need {tools}\n{}", script.requests),
-            ..script
-        })?;
+        let (reply, missing) = self.start(&script.needing(tools))?;
         if missing.is_empty() {
             Ok(reply)
         } else {
@@ -147,12 +198,17 @@ impl ShellTransport {
         }
     }
 
-    /// Asks about each of `names` by itself, without following a symbolic link: for names a
-    /// listing could not match to what `stat` said of them.
+    /**
+     * Asks about each of `names` by itself, without following a symbolic link: for names a
+     * listing could not match to what `stat` said of them. One that is gone since `find` saw
+     * it is left out; one that `stat` can't look at is unlisted, unless it is in one of the
+     * `barred` folders, which the listing has reported.
+     */
     fn list_again(
         &self,
         names: &[String],
         root: &str,
+        barred: &[String],
         listing: &mut Listing,
     ) -> Result<(), TransportError> {
         for names in names.chunks(ASK_AGAIN) {
@@ -164,14 +220,20 @@ impl ShellTransport {
             for name in names {
                 let code = reply.field("S")?;
                 let said = reply.words()?;
-                match code.as_str() {
-                    "0" => entry(listing, root, name.clone().into_bytes(), &said)?,
-                    /* Gone since find saw it; or in a folder that may not be searched, which
-                    the listing has reported. */
-                    "1" => {}
-                    _ => listing.unlisted.push(Unlisted {
+                if code == "0" {
+                    entry(listing, root, name.clone().into_bytes(), &said)?;
+                    continue;
+                }
+                let covered = barred.iter().any(|folder| {
+                    name.strip_prefix(folder)
+                        .is_some_and(|rest| rest.starts_with('/'))
+                });
+                match Trouble::of(&said) {
+                    Trouble::Gone => {}
+                    _ if covered => {}
+                    trouble => listing.unlisted.push(Unlisted {
                         path: name.clone(),
-                        reason: said,
+                        reason: trouble.reason(),
                     }),
                 }
             }
@@ -179,13 +241,226 @@ impl ShellTransport {
         }
         Ok(())
     }
+
+    /**
+     * Reads the ranges of `requests` from `from` on, the small whole files among them in
+     * groups (the module docs), but those before `plain` one by one. `None` when all of them
+     * arrived; otherwise the group that did not hold together, from whose first request the
+     * caller starts again with its files asked for one by one. Nothing of that group was
+     * passed on.
+     */
+    fn read_from(
+        &self,
+        requests: &[RangeRequest],
+        from: usize,
+        plain: usize,
+        sink: &mut dyn RangeSink,
+    ) -> Result<Option<Range<usize>>, TransportError> {
+        let groups = groups(from..requests.len(), |run: &Range<usize>, next| {
+            let request = &requests[next];
+            let asked = |run: &Range<usize>| -> u64 {
+                requests[run.clone()]
+                    .iter()
+                    .map(|request| request.length)
+                    .sum()
+            };
+            next >= plain
+                && request.offset == 0
+                && (1..=GROUP_FILE).contains(&request.length)
+                && asked(run) + request.length <= GROUP_BYTES
+                && paths(requests[run.clone()].iter().map(|request| &request.path))
+                    + request.path.len()
+                    <= GROUP_PATHS
+        });
+        let mut script = Script::new();
+        for group in &groups {
+            let requests = &requests[group.clone()];
+            script = match requests {
+                [request] => script.call(
+                    "range",
+                    &[request.offset.min(FAR), request.length.min(FAR)],
+                    &request.path,
+                )?,
+                _ => {
+                    let asked: u64 = requests.iter().map(|request| request.length).sum();
+                    script.group(
+                        "bulk",
+                        &[
+                            (asked + GROUP_SLACK).to_string(),
+                            lengths(requests.iter().map(|request| request.length)),
+                        ],
+                        requests.iter().map(|request| request.path.as_str()),
+                    )?
+                }
+            };
+        }
+        let mut reply = self.ask("stat head tail dd cat /dev/zero", script)?;
+        let halted = |Halt| TransportError::Halted;
+        for group in groups {
+            let mut one_by_one = |reply: &mut Reply<'_>| -> Result<(), TransportError> {
+                for index in group.clone() {
+                    let result = range(reply, requests[index].length, &mut |bytes| {
+                        sink.data(index, bytes)
+                    })?;
+                    sink.end(index, result).map_err(halted)?;
+                }
+                Ok(())
+            };
+            if group.len() == 1 {
+                one_by_one(&mut reply)?;
+                continue;
+            }
+            let line = reply.line()?;
+            let ["G", count, total] = line.split(' ').collect::<Vec<_>>()[..] else {
+                return Err(unexpected("G", &line));
+            };
+            /* The location did not take them as a group: here they are one by one. */
+            if count == "0" {
+                one_by_one(&mut reply)?;
+                continue;
+            }
+            let total = number::<u64>(total)?;
+            let asked: u64 = requests[group.clone()]
+                .iter()
+                .map(|request| request.length)
+                .sum();
+            if number::<usize>(count)? != group.len() || total > asked + GROUP_SLACK {
+                return Err(unexpected("G for the group asked for", &line));
+            }
+            let before = group
+                .clone()
+                .map(|_| reply.line())
+                .collect::<Result<Vec<String>, TransportError>>()?;
+            let mut block = Vec::new();
+            reply.block(total + 1, &mut |bytes| {
+                block.extend_from_slice(bytes);
+                Ok(())
+            })?;
+            let mut later = Vec::new();
+            loop {
+                let line = reply.line()?;
+                if line == "." {
+                    break;
+                }
+                later.push(line);
+            }
+            let sizes = before
+                .iter()
+                .map(|line| Ok(parse_stat(line)?.1.size))
+                .collect::<Result<Vec<u64>, TransportError>>()?;
+            /* The files' bytes, the mark, and nothing more, from files that are afterwards
+            as they were before: only then are the sizes where one file ends and the next
+            begins. */
+            if sizes.iter().sum::<u64>() != total
+                || block.last() != Some(&parse::MARK)
+                || later != before
+            {
+                return Ok(Some(group));
+            }
+            let mut rest = &block[..block.len() - 1];
+            for (index, size) in group.zip(sizes) {
+                let (file, after) = rest.split_at(size as usize);
+                rest = after;
+                let length = requests[index].length;
+                /* A file that has grown since it was scanned gives the start asked for. */
+                let wanted = &file[..file
+                    .len()
+                    .min(usize::try_from(length).unwrap_or(usize::MAX))];
+                sink.data(index, wanted).map_err(halted)?;
+                let result = if size < length {
+                    Err(RangeFailure::Short {
+                        expected: length,
+                        got: size,
+                    })
+                } else {
+                    Ok(())
+                };
+                sink.end(index, result).map_err(halted)?;
+            }
+        }
+        reply.end()?;
+        Ok(None)
+    }
+
+    /**
+     * Hashes the prefixes of `requests` from the first that `hashes` lacks, whole files in
+     * groups where the location finds them whole (the module docs), but those before `plain`
+     * one by one. Returns the end of a group that did not hold together, from whose first
+     * request the caller starts again, or the number of requests when all are hashed.
+     */
+    fn hash_from(
+        &self,
+        requests: &[PrefixRequest],
+        hashes: &mut Vec<Result<Hashed, RangeFailure>>,
+        plain: usize,
+    ) -> Result<usize, TransportError> {
+        /* The hashing tool prints a name with a newline or a backslash in it another way. */
+        let plainly_named = |path: &str| !path.contains(['\n', '\\']);
+        let groups = groups(hashes.len()..requests.len(), |run: &Range<usize>, next| {
+            let request = &requests[next];
+            next >= plain
+                && request.length > 0
+                && plainly_named(&request.path)
+                && paths(requests[run.clone()].iter().map(|request| &request.path))
+                    + request.path.len()
+                    <= GROUP_PATHS
+        });
+        let mut script = Script::new();
+        for group in groups {
+            let requests = &requests[group];
+            script = match requests {
+                [request] => script.call("prefix", &[request.length.min(FAR)], &request.path)?,
+                _ => script.group(
+                    "wholes",
+                    &[lengths(
+                        requests.iter().map(|request| request.length.min(FAR)),
+                    )],
+                    requests.iter().map(|request| request.path.as_str()),
+                )?,
+            };
+        }
+        let mut reply = self.ask("head stat sha256", script)?;
+        while hashes.len() < requests.len() {
+            let line = reply.line()?;
+            match line.split(' ').collect::<Vec<_>>()[..] {
+                ["P", size] => {
+                    let said = reply.words()?;
+                    hashes.push(parse::prefix(&requests[hashes.len()], size, &said));
+                }
+                ["W", count] => {
+                    let run = hashes.len()..hashes.len() + number::<usize>(count)?;
+                    let sums = reply.words()?;
+                    let sizes = reply.words()?;
+                    if run.end > requests.len() {
+                        return Err(unexpected("W for the files asked for", &line));
+                    }
+                    match parse::wholes(&requests[run.clone()], &sums, &sizes) {
+                        Some(run) => hashes.extend(run.into_iter().map(Ok)),
+                        None => return Ok(run.end),
+                    }
+                }
+                _ => return Err(unexpected("P or W", &line)),
+            }
+        }
+        reply.end()?;
+        Ok(requests.len())
+    }
 }
 
 impl Transport for ShellTransport {
     fn env(&self, names: &[&str]) -> Result<Env, TransportError> {
-        let mut script = Script::new().line("home");
         /* Any other name is not a variable's, and is not set. */
-        for name in names.iter().filter(|name| is_identifier(name)) {
+        let names: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| script::is_identifier(name))
+            .collect();
+        let login = Login::new();
+        let mut script = Script::new().line("home");
+        if !names.is_empty() {
+            script = script.login(&login, &names);
+        }
+        for name in &names {
             script = script.line(&format!("var {name}"));
         }
         let mut reply = self.ask("", script)?;
@@ -194,19 +469,28 @@ impl Transport for ShellTransport {
             .ok()
             .filter(|home| home.starts_with('/'))
             .ok_or(TransportError::NoHome)?;
-        let mut vars = HashMap::new();
+        /* What the login shell has of them, when it answered; else what a command gets. */
+        let logged_in = if names.is_empty() {
+            None
+        } else {
+            login.read(&mut reply)?
+        };
+        let mut bare = HashMap::new();
         loop {
             let line = reply.line()?;
             let Some(name) = line.strip_prefix("V ") else {
                 return if line == END {
-                    Ok(Env { home, vars })
+                    Ok(Env {
+                        home,
+                        vars: logged_in.unwrap_or(bare),
+                    })
                 } else {
                     Err(unexpected("V", &line))
                 };
             };
             /* As on this machine, a value that is not Unicode counts as not set. */
             if let Ok(value) = String::from_utf8(reply.text()?) {
-                vars.insert(name.to_string(), value);
+                bare.insert(name.to_string(), value);
             }
         }
     }
@@ -221,10 +505,11 @@ impl Transport for ShellTransport {
         for path in paths {
             let code = reply.field("S")?;
             let said = reply.words()?;
-            stats.push(match code.as_str() {
-                "0" => Some(parse_stat(&said)?.1),
-                "1" if !said.contains(DENIED) => None,
-                _ => return Err(remote("stat", path, said)),
+            stats.push(match (code.as_str(), Trouble::of(&said)) {
+                ("0", _) => Some(parse_stat(&said)?.1),
+                /* A link to nothing; or stat said there is no such file. */
+                ("1", _) | (_, Trouble::Gone) => None,
+                (_, trouble) => return Err(remote("stat", path, trouble.reason())),
             });
         }
         reply.end()?;
@@ -246,8 +531,8 @@ impl Transport for ShellTransport {
         };
         /* Names of batches in which stat answered for fewer files than find named. */
         let mut again = Vec::new();
-        /* Whether a folder was reported as one this user may not read. */
-        let mut barred = false;
+        /* The folders reported as ones this user may not read. */
+        let mut barred = Vec::new();
         loop {
             let line = reply.line()?;
             let fields: Vec<&str> = line.split(' ').collect();
@@ -279,24 +564,23 @@ impl Transport for ShellTransport {
                     }
                 }
                 ["U"] => {
-                    let folder = reply.text()?;
-                    barred = true;
+                    let folder = String::from_utf8_lossy(&reply.text()?).into_owned();
                     listing.unlisted.push(Unlisted {
-                        path: String::from_utf8_lossy(&folder).into_owned(),
-                        reason: "it may not be read".to_string(),
+                        path: folder.clone(),
+                        reason: MAY_NOT_BE_READ.to_string(),
                     });
+                    barred.push(folder);
                 }
                 ["F", status] => {
                     let said = reply.words()?;
                     /* With folders that may not be read named already, find's complaint is
                     of them. */
-                    if status != "0" && !barred {
+                    if status != "0" && barred.is_empty() {
                         listing.unlisted.push(Unlisted {
                             path: root.to_string(),
-                            reason: if said.is_empty() {
-                                format!("find failed ({status})")
-                            } else {
-                                said
+                            reason: match Trouble::of(&said) {
+                                Trouble::Nothing => format!("find failed ({status})"),
+                                trouble => trouble.reason(),
                             },
                         });
                     }
@@ -306,7 +590,7 @@ impl Transport for ShellTransport {
             }
         }
         reply.end()?;
-        self.list_again(&again, root, &mut listing)?;
+        self.list_again(&again, root, &barred, &mut listing)?;
         Ok(listing)
     }
 
@@ -314,42 +598,11 @@ impl Transport for ShellTransport {
         &self,
         requests: &[PrefixRequest],
     ) -> Result<Vec<Result<Hashed, RangeFailure>>, TransportError> {
-        let mut script = Script::new();
-        for request in requests {
-            script = script.call("prefix", &[request.length], &request.path)?;
+        let mut hashes = Vec::with_capacity(requests.len());
+        let mut plain = 0;
+        while hashes.len() < requests.len() {
+            plain = self.hash_from(requests, &mut hashes, plain)?;
         }
-        let mut reply = self.ask("head stat sha256", script)?;
-        let mut hashes = Vec::new();
-        for request in requests {
-            let found = reply.line()?;
-            let said = reply.words()?;
-            let ["P", there, size] = found.split(' ').collect::<Vec<_>>()[..] else {
-                return Err(unexpected("P", &found));
-            };
-            /* The hashing tool prints the hash, a space, and a name for its input. Anything
-            else, or more, is a tool's complaint. Nothing is hashed for a prefix of no bytes. */
-            let hash = match said.split_once(' ') {
-                Some((hash, name)) if !name.contains('\n') => Hash::from_hex(hash),
-                None if said.is_empty() && request.length == 0 => Some(Hash::of(b"")),
-                _ => None,
-            };
-            hashes.push(match (hash, size.parse::<u64>()) {
-                (Some(_), Ok(size)) if size < request.length => Err(RangeFailure::Short {
-                    expected: request.length,
-                    got: size,
-                }),
-                (Some(hash), Ok(size)) => Ok(Hashed { hash, size }),
-                (Some(_), Err(_)) => Err(unread(there == "1", String::new())),
-                (None, _) => Err(unread(
-                    there == "1",
-                    said.lines()
-                        .filter(|line| Hash::from_hex(first(line)).is_none())
-                        .collect::<Vec<_>>()
-                        .join("; "),
-                )),
-            });
-        }
-        reply.end()?;
         Ok(hashes)
     }
 
@@ -358,23 +611,16 @@ impl Transport for ShellTransport {
         requests: &[RangeRequest],
         sink: &mut dyn RangeSink,
     ) -> Result<(), TransportError> {
-        let mut script = Script::new();
-        for request in requests {
-            script = script.call("range", &[request.offset, request.length], &request.path)?;
+        let (mut from, mut plain) = (0, 0);
+        while let Some(group) = self.read_from(requests, from, plain, sink)? {
+            (from, plain) = (group.start, group.end);
         }
-        let mut reply = self.ask("head tail", script)?;
-        for (index, request) in requests.iter().enumerate() {
-            let result = range(&mut reply, request.length, &mut |bytes| {
-                sink.data(index, bytes)
-            })?;
-            sink.end(index, result)
-                .map_err(|Halt| TransportError::Halted)?;
-        }
-        reply.end()
+        Ok(())
     }
 
     fn read_small(&self, path: &str) -> Result<Option<Vec<u8>>, TransportError> {
-        let mut reply = self.ask("stat head", Script::new().call("small", &[], path)?)?;
+        let script = Script::new().call("small", &[], path)?;
+        let mut reply = self.ask("stat head /dev/zero", script)?;
         let found = reply.line()?;
         let content = match found.split(' ').collect::<Vec<_>>()[..] {
             ["M", "0", size] => {
@@ -390,8 +636,10 @@ impl Transport for ShellTransport {
                     Err(RangeFailure::Unreadable(why)) => return Err(remote("read", path, why)),
                 }
             }
-            ["M", "1"] => None,
-            ["M", "2"] => return Err(remote("read", path, reply.words()?)),
+            ["M", "2"] => match Trouble::of(&reply.words()?) {
+                Trouble::Gone => None,
+                trouble => return Err(remote("read", path, trouble.reason())),
+            },
             _ => return Err(unexpected("M", &found)),
         };
         reply.end()?;
@@ -399,248 +647,40 @@ impl Transport for ShellTransport {
     }
 }
 
-/// The script of one call: the functions, then the requests between braces, so that the
-/// shell has read all of it before it runs any of it.
-struct Script {
-    /// The line the answer starts at: one that nothing else at the location can have printed.
-    marker: String,
-    requests: String,
-}
-
-impl Script {
-    fn new() -> Self {
-        Self {
-            marker: format!("scrollback {}", uuid::Uuid::new_v4().simple()),
-            requests: String::new(),
-        }
-    }
-
-    /// Adds a request that names no path.
-    fn line(mut self, request: &str) -> Self {
-        self.requests.push_str(request);
-        self.requests.push('\n');
-        self
-    }
-
-    /// Adds a call of `function` with `numbers` and then `path`, quoted so that any shell
-    /// reads it as one word. A path that is not absolute is made to start with `./`: no
-    /// tool then takes one that begins with a dash for an option.
-    fn call(self, function: &str, numbers: &[u64], path: &str) -> Result<Self, TransportError> {
-        if path.contains('\0') {
-            return Err(remote("name", path, "a path can't hold a NUL".to_string()));
-        }
-        let numbers: String = numbers.iter().map(|number| format!(" {number}")).collect();
-        let dot = if path.starts_with('/') { "" } else { "./" };
-        Ok(self.line(&format!(
-            "{function}{numbers} '{dot}{}'",
-            path.replace('\'', "'\\''")
-        )))
-    }
-
-    /// What goes to the shell's stdin.
-    fn text(&self) -> String {
-        format!(
-            "{FUNCTIONS}{{\nprintf '%s\\n' '{}'\n{}printf '{END}\\n'\n}} </dev/null\n",
-            self.marker, self.requests
-        )
-    }
-}
-
 /**
- * A range's block as `shell.sh` sends it: the range's bytes as far as the file had them, a
- * mark, and zeros up to one byte more than the range's length. The last byte in the block
- * that is not zero is the mark, so everything before it is the file's. Bytes are passed on as
- * soon as a later one that is not zero shows they are not the mark or the padding.
+ * Cuts `indexes` into runs of requests to ask the location for as one group: `joins` says
+ * whether the request at an index may join the run before it (empty for a run's first). A
+ * request that may not is a run of its own, as is one whose run found no second.
  */
-struct Block {
-    /// The last byte so far that is not zero, and how many zeros have followed it.
-    last: Option<u8>,
-    zeros: u64,
-    /// How many bytes were passed on.
-    passed: u64,
-}
-
-impl Block {
-    const MARK: u8 = b'x';
-
-    fn take(
-        &mut self,
-        bytes: &[u8],
-        pass: &mut dyn FnMut(&[u8]) -> Result<(), Halt>,
-    ) -> Result<(), Halt> {
-        const ZEROS: [u8; 4096] = [0; 4096];
-        let Some(last) = bytes.iter().rposition(|byte| *byte != 0) else {
-            self.zeros += bytes.len() as u64;
-            return Ok(());
-        };
-        if let Some(byte) = self.last {
-            pass(&[byte])?;
-            self.passed += 1;
+fn groups(
+    indexes: Range<usize>,
+    joins: impl Fn(&Range<usize>, usize) -> bool,
+) -> Vec<Range<usize>> {
+    let mut groups: Vec<Range<usize>> = Vec::new();
+    /* Whether the last group is one that others may join. */
+    let mut open = false;
+    for index in indexes {
+        match groups.last_mut() {
+            Some(last) if open && last.len() < GROUP_FILES && joins(last, index) => {
+                last.end += 1;
+            }
+            _ => {
+                open = joins(&(index..index), index);
+                groups.push(index..index + 1);
+            }
         }
-        self.passed += self.zeros + last as u64;
-        while self.zeros > 0 {
-            let now = usize::try_from(self.zeros).map_or(ZEROS.len(), |left| left.min(ZEROS.len()));
-            pass(&ZEROS[..now])?;
-            self.zeros -= now as u64;
-        }
-        pass(&bytes[..last])?;
-        self.last = Some(bytes[last]);
-        self.zeros = (bytes.len() - last - 1) as u64;
-        Ok(())
     }
+    groups
 }
 
-/// Reads one `range` record of `length` bytes, passing the file's bytes to `pass`, and says
-/// how the range ended.
-fn range(
-    reply: &mut Reply<'_>,
-    length: u64,
-    pass: &mut dyn FnMut(&[u8]) -> Result<(), Halt>,
-) -> Result<Result<(), RangeFailure>, TransportError> {
-    reply.field("R")?;
-    let mut block = Block {
-        last: None,
-        zeros: 0,
-        passed: 0,
-    };
-    reply.block(length + 1, &mut |bytes| block.take(bytes, pass))?;
-    if block.last != Some(Block::MARK) {
-        return Err(TransportError::Protocol(
-            "a range's block does not end as one does".to_string(),
-        ));
-    }
-    let there = reply.field("E")? == "1";
-    let said = reply.words()?;
-    /* A range of no bytes runs no tool: all that is said of it is whether it can be read. */
-    Ok(
-        if there && block.passed == length && (length > 0 || said.is_empty()) {
-            Ok(())
-        } else if there && said.is_empty() {
-            Err(RangeFailure::Short {
-                expected: length,
-                got: block.passed,
-            })
-        } else {
-            Err(unread(there, said))
-        },
-    )
+/// How many bytes `paths` are, as arguments of one command.
+fn paths<'a>(paths: impl Iterator<Item = &'a String>) -> usize {
+    paths.map(|path| path.len() + 1).sum()
 }
 
-/// Why a file gave no bytes, or not all: it is `there` or not, and the reading tool `said`
-/// this of it.
-fn unread(there: bool, said: String) -> RangeFailure {
-    if there || said.contains(DENIED) {
-        RangeFailure::Unreadable(if said.is_empty() {
-            "it could not be read".to_string()
-        } else {
-            said
-        })
-    } else {
-        RangeFailure::Missing
-    }
-}
-
-/// Files one entry of a listing of `root`: `name` as find gave it, and what stat said of it.
-fn entry(
-    listing: &mut Listing,
-    root: &str,
-    name: Vec<u8>,
-    stat: &str,
-) -> Result<(), TransportError> {
-    let (mode, stat) = parse_stat(stat)?;
-    let name = match String::from_utf8(name) {
-        Ok(name) => name,
-        Err(error) => {
-            not_unicode(listing, error.as_bytes());
-            return Ok(());
-        }
-    };
-    if name == root {
-        return Ok(());
-    }
-    let path = name
-        .strip_prefix(root.trim_end_matches('/'))
-        .and_then(|path| path.strip_prefix('/'))
-        .ok_or_else(|| TransportError::Protocol(format!("{name:?} is not under {root:?}")))?;
-    let skipped = |reason: &str| Unlisted {
-        path: name.clone(),
-        reason: reason.to_string(),
-    };
-    match mode & KIND {
-        REGULAR => listing.files.push(FileEntry {
-            path: path.to_string(),
-            stat,
-        }),
-        FOLDER => {}
-        LINK => listing.skipped.push(skipped(SYMBOLIC_LINK)),
-        _ => listing.skipped.push(skipped(NOT_A_FILE)),
-    }
-    Ok(())
-}
-
-/// Reports a name that is not Unicode, once: not again for what is inside a folder so named.
-fn not_unicode(listing: &mut Listing, name: &[u8]) {
-    let folder = name.iter().rposition(|byte| *byte == b'/').unwrap_or(0);
-    if std::str::from_utf8(&name[..folder]).is_ok() {
-        listing.unlisted.push(Unlisted {
-            path: String::from_utf8_lossy(name).into_owned(),
-            reason: NOT_UNICODE.to_string(),
-        });
-    }
-}
-
-/// A file's mode, size and modification time from stat's line for it: the mode in hex, the
-/// size, and the time as seconds, with or without a fraction of up to nine digits.
-fn parse_stat(line: &str) -> Result<(u32, FileStat), TransportError> {
-    let parsed = || {
-        let mut fields = line.split(' ');
-        let mode = u32::from_str_radix(fields.next()?, 16).ok()?;
-        let size = fields.next()?.parse().ok()?;
-        let mtime_ns = nanoseconds(fields.next().filter(|_| fields.next().is_none())?)?;
-        Some((mode, FileStat { size, mtime_ns }))
-    };
-    parsed().ok_or_else(|| TransportError::Protocol(format!("stat printed {line:?}")))
-}
-
-/// A time since the Unix epoch in nanoseconds, from seconds with or without a fraction of up
-/// to nine digits.
-fn nanoseconds(time: &str) -> Option<i64> {
-    let (seconds, fraction) = time.split_once('.').unwrap_or((time, ""));
-    let fraction: i64 = format!("{fraction:0<9}")
-        .get(..9)
-        .filter(|digits| digits.bytes().all(|digit| digit.is_ascii_digit()))?
-        .parse()
-        .ok()?;
-    seconds
-        .parse::<i64>()
-        .ok()?
-        .checked_mul(1_000_000_000)?
-        .checked_add(fraction)
-}
-
-/// What a clock record read.
-fn clock(time: &str) -> Result<i64, TransportError> {
-    nanoseconds(time).ok_or_else(|| TransportError::Protocol(format!("the clock read {time:?}")))
-}
-
-fn number<N: std::str::FromStr>(field: &str) -> Result<N, TransportError> {
-    field
-        .parse()
-        .map_err(|_| TransportError::Protocol(format!("{field:?} where a number belongs")))
-}
-
-/// The first word of `line`.
-fn first(line: &str) -> &str {
-    line.split(' ').next().unwrap_or(line)
-}
-
-/// Whether `name` can be an environment variable's name in a shell.
-fn is_identifier(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with(|first: char| first.is_ascii_digit())
-        && name
-            .chars()
-            .all(|letter| letter.is_ascii_alphanumeric() || letter == '_')
+/// `lengths` as one word of a request: each with a space after it.
+fn lengths(lengths: impl Iterator<Item = u64>) -> String {
+    lengths.map(|length| format!("{length} ")).collect()
 }
 
 /// A tool at the location could not do `action` to `path`, and `said` why.
@@ -659,101 +699,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_path_is_one_shell_word_whatever_is_in_it() {
-        let script = Script::new()
-            .call("range", &[3, 7], "/a b/it's \"here\"\n$HOME `x`")
-            .unwrap()
-            .call("file L", &[], "-rf")
-            .unwrap();
+    fn requests_are_grouped_in_order_and_a_group_has_its_limits() {
+        /* Even numbers may join; a run is at most so many files. */
+        let even = |_: &Range<usize>, next: usize| next.is_multiple_of(2) || next > 10;
         assert_eq!(
-            script.requests,
-            "range 3 7 '/a b/it'\\''s \"here\"\n$HOME `x`'\nfile L './-rf'\n"
+            groups(0..14, even),
+            [
+                0..1,
+                1..2,
+                2..3,
+                3..4,
+                4..5,
+                5..6,
+                6..7,
+                7..8,
+                8..9,
+                9..10,
+                10..14
+            ]
         );
-        assert!(Script::new().call("small", &[], "/a\0b").is_err());
+        assert_eq!(groups(3..3, even), []);
+        let all = groups(0..GROUP_FILES * 2 + 1, |_, _| true);
+        assert_eq!(
+            all,
+            [
+                0..GROUP_FILES,
+                GROUP_FILES..GROUP_FILES * 2,
+                GROUP_FILES * 2..GROUP_FILES * 2 + 1
+            ]
+        );
+        /* What may join depends on the run so far. */
+        let pairs = groups(0..5, |run, _| run.len() < 2);
+        assert_eq!(pairs, [0..2, 2..4, 4..5]);
     }
 
-    #[test]
-    fn stat_lines_of_each_flavour_are_read() {
-        let stat = |line| parse_stat(line).unwrap();
-        /* GNU coreutils and BSD: nanoseconds. busybox: whole seconds. */
-        assert_eq!(
-            stat("81a4 12 1700000000.123456789"),
-            (
-                0o100_644,
-                FileStat {
-                    size: 12,
-                    mtime_ns: 1_700_000_000_123_456_789
-                }
-            )
-        );
-        assert_eq!(
-            stat("41ed 96 1700000000").1.mtime_ns,
-            1_700_000_000_000_000_000
-        );
-        assert_eq!(
-            stat("a1ff 7 1700000000.5").1.mtime_ns,
-            1_700_000_000_500_000_000
-        );
-        for bad in [
-            "",
-            "81a4 12",
-            "81a4 12 soon",
-            "81a4 12 1 2",
-            "zz 1 1",
-            "81a4 -1 1",
-        ] {
-            assert!(parse_stat(bad).is_err(), "{bad}");
+    /// A transport whose shell is given a moment to answer in.
+    #[cfg(unix)]
+    fn impatient(line: &str, launcher: fn(String) -> Launcher) -> ShellTransport {
+        ShellTransport {
+            idle: Duration::from_millis(300),
+            ..ShellTransport::new(launcher(line.to_string()))
         }
     }
 
-    /// Takes `block` apart in pieces of `piece` bytes: what was passed on, and the mark.
-    fn unblocked(block: &[u8], piece: usize) -> (Vec<u8>, Option<u8>) {
-        let mut passed = Vec::new();
-        let mut taking = Block {
-            last: None,
-            zeros: 0,
-            passed: 0,
+    #[cfg(unix)]
+    #[test]
+    fn a_launcher_that_says_nothing_for_too_long_is_given_up_on() {
+        let command = |line: String| Launcher::Command {
+            program: "sh".into(),
+            args: vec!["-c".to_string(), line],
         };
-        for bytes in block.chunks(piece) {
-            taking
-                .take(bytes, &mut |bytes| {
-                    passed.extend_from_slice(bytes);
-                    Ok(())
-                })
-                .unwrap();
-        }
-        assert_eq!(taking.passed, passed.len() as u64);
-        (passed, taking.last)
-    }
-
-    #[test]
-    fn a_block_gives_the_files_bytes_however_it_is_cut_up() {
-        let mut long = vec![0; 10_000];
-        long.extend_from_slice(b"end\0\0");
-        for content in [
-            &b""[..],
-            b"x",
-            b"\0",
-            b"abc",
-            b"a\0\0b\0\0\0",
-            b"xx\0x",
-            &long,
-        ] {
-            /* The file gave all of the range, or half of it. */
-            for length in [content.len(), content.len() * 2 + 1] {
-                let mut block = content.to_vec();
-                block.push(Block::MARK);
-                block.resize(length + 1, 0);
-                for piece in [1, 2, 3, 7, 4096, block.len()] {
-                    assert_eq!(
-                        unblocked(&block, piece),
-                        (content.to_vec(), Some(Block::MARK)),
-                        "{content:?} in a block of {length} + 1, {piece} at a time"
-                    );
-                }
+        /* It never answers; or it answers, and then the tool it runs hangs. */
+        for line in ["sleep 30", "sh -s; sleep 30"] {
+            let started = Instant::now();
+            let hung = impatient(line, command).stat(&["/"]);
+            match line {
+                "sleep 30" => assert!(
+                    matches!(&hung, Err(TransportError::Failed(said)) if said.contains("no answer")),
+                    "{hung:?}"
+                ),
+                /* The answer was whole before the silence. */
+                _ => assert!(hung.is_ok(), "{hung:?}"),
             }
+            assert!(started.elapsed() < Duration::from_secs(10));
         }
-        /* A block without its mark is not one. */
-        assert_eq!(unblocked(b"\0\0\0", 2), (Vec::new(), None));
+        /* While it has things to say, on either stream, it is not given up on. */
+        let chatty = "for n in 1 2 3 4 5 6; do sleep 0.1; echo waiting >&2; done; exec sh -s";
+        assert!(impatient(chatty, command).stat(&["/"]).is_ok());
     }
 }

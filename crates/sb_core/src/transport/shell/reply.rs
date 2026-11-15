@@ -2,20 +2,28 @@
 //!
 //! The answer starts at a line only this call knows (whatever a login script printed before
 //! it is passed over) and is a sequence of records: a line of ASCII fields, then, by its first
-//! letter, text ended by a NUL or a block of as many bytes as the caller asked for
-//! (`shell.sh`). Its last line is `Z`. An answer that ends without it is not one: the launcher
-//! failed or the connection dropped, and the call fails with what was read thrown away.
+//! letter, text ended by a NUL or a block of as many bytes as the line says or the caller
+//! asked for (`shell.sh`). Its last line is `Z`. An answer that ends without it is not one:
+//! the launcher failed or the connection dropped, and the call fails with what was read
+//! thrown away.
+//!
+//! The script is written to the launcher from a thread of its own while this one already
+//! reads: a launcher that is slow to take it (`ssh` still connecting, `wsl.exe` starting a
+//! distro), or that has a lot to say on stderr first, holds nothing up, and a cancel is seen
+//! at once. Dropping the reply kills the launcher and everything it started, which also
+//! releases a write that was still waiting.
 
 use std::process::ExitStatus;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use toolbox_process::{CancelToken, Event, Handle, ProcessError, spawn_streaming};
+use toolbox_process::{CancelToken, Event, Handle, ProcessError, Stop, spawn_streaming};
 
 use super::Launcher;
 use crate::transport::{Halt, TransportError};
 
-/// How often a read that is waiting for the process looks at the cancel token.
+/// How often a read that is waiting for the process looks at the cancel token and the clock.
 const POLL: Duration = Duration::from_millis(50);
 
 /// How many chunks of output wait here for the caller before the process is made to wait.
@@ -27,8 +35,12 @@ const LINE_MAX: usize = 256;
 /// The longest text a record carries: every complaint of a `find` over a large tree.
 const TEXT_MAX: usize = 16 * 1024 * 1024;
 
-/// How much is kept of what the launcher wrote besides the answer, for an error message.
+/// How much is kept for an error message of what the launcher wrote besides the answer: the
+/// start of its stdout, and the end of its stderr, where a launcher gives its verdict.
 const KEPT: usize = 16 * 1024;
+
+/// How much a launcher may print before the answer begins: a greeting, however long, is less.
+const GREETING_MAX: usize = 1024 * 1024;
 
 /// The answer's last line.
 pub(super) const END: &str = "Z";
@@ -36,36 +48,48 @@ pub(super) const END: &str = "Z";
 pub(super) struct Reply<'a> {
     /// Dropped before `process`, whose own thread may be waiting to send here.
     events: Receiver<Event>,
-    /// Killed, with everything it started, when the reply is dropped.
-    _process: Handle,
+    /// Shared with the thread that writes the script. Killed when the reply is dropped.
+    process: Arc<Handle>,
     launcher: &'a Launcher,
     cancel: &'a CancelToken,
+    /// How long the process may say nothing at all before it is given up on.
+    idle: Duration,
     /// Output not yet read, from `at` on.
     buffer: Vec<u8>,
     at: usize,
+    /// The end of what it wrote to stderr.
     stderr: Vec<u8>,
-    /// What came before the answer began.
+    /// The start of what came before the answer began.
     before: Vec<u8>,
     /// Set once the process has ended: its exit status, if it could be waited for.
     exit: Option<Option<ExitStatus>>,
 }
 
+impl Drop for Reply<'_> {
+    fn drop(&mut self) {
+        /* The writing thread may still hold the process, waiting for it to read. */
+        self.process.stop(Stop::Kill);
+    }
+}
+
 impl<'a> Reply<'a> {
     /**
-     * Starts the launcher with `script` on its stdin and reads up to where the records begin:
-     * past the line `marker`, and the script's word on the tools it needs. Returns the tools
-     * that are missing with the reply.
+     * Starts the launcher, has `script` written to its stdin, and reads up to where the
+     * records begin: past the line `marker`, and the script's word on the tools it needs.
+     * Returns the tools that are missing with the reply.
      */
     pub(super) fn start(
         launcher: &'a Launcher,
         script: Vec<u8>,
         marker: &str,
         cancel: &'a CancelToken,
+        idle: Duration,
     ) -> Result<(Self, Vec<String>), TransportError> {
         let (tx, events) = sync_channel(QUEUE);
-        let process = spawn_streaming(&launcher.command().input(script), move |event| {
+        let process = spawn_streaming(&launcher.command(), move |event| {
             let _ = tx.send(event);
         })
+        .map(Arc::new)
         .map_err(|error| match error {
             ProcessError::Start { program, source } => TransportError::Launch {
                 program: program.display().to_string(),
@@ -73,34 +97,44 @@ impl<'a> Reply<'a> {
             },
             other => TransportError::Failed(other.to_string()),
         })?;
-        /* The script is all the shell is to read. */
-        process.close_stdin();
         let mut reply = Self {
             events,
-            _process: process,
+            process: Arc::clone(&process),
             launcher,
             cancel,
+            idle,
             buffer: Vec::new(),
             at: 0,
             stderr: Vec::new(),
             before: Vec::new(),
             exit: None,
         };
+        /* The script is all the shell is to read. A launcher that ends without reading it
+        says why through its exit. */
+        std::thread::Builder::new()
+            .name("sb-shell-in".into())
+            .spawn(move || {
+                let _ = process.write(&script);
+                process.close_stdin();
+            })
+            .map_err(|error| TransportError::Failed(error.to_string()))?;
+
         let marker = format!("{marker}\n");
         loop {
             if let Some(found) = find(&reply.buffer, marker.as_bytes()) {
-                reply.before.extend_from_slice(&reply.buffer[..found]);
+                reply.before = reply.buffer[..found.min(KEPT)].to_vec();
                 reply.at = found + marker.len();
                 break;
             }
-            if reply.buffer.len() > KEPT {
+            if reply.buffer.len() > GREETING_MAX {
                 return Err(TransportError::Protocol(format!(
-                    "it began with {:?}…",
+                    "it printed more than {GREETING_MAX} bytes without beginning its answer, \
+                     starting {:?}",
                     String::from_utf8_lossy(&reply.buffer[..64])
                 )));
             }
             if !reply.more()? {
-                reply.before = std::mem::take(&mut reply.buffer);
+                reply.before = reply.buffer[..reply.buffer.len().min(KEPT)].to_vec();
                 return Err(reply.broken());
             }
         }
@@ -118,6 +152,7 @@ impl<'a> Reply<'a> {
 
     /// Waits for more output and adds it to the buffer; `false` once the process has ended.
     fn more(&mut self) -> Result<bool, TransportError> {
+        let mut silent_since = Instant::now();
         while self.exit.is_none() {
             if self.cancel.is_cancelled() {
                 return Err(TransportError::Cancelled);
@@ -134,12 +169,17 @@ impl<'a> Reply<'a> {
                     return Ok(true);
                 }
                 Ok(Event::Stderr(line)) => {
-                    if self.stderr.len() < KEPT {
-                        self.stderr.extend_from_slice(&line);
-                        self.stderr.push(b'\n');
+                    silent_since = Instant::now();
+                    self.stderr.extend_from_slice(&line);
+                    self.stderr.push(b'\n');
+                    if self.stderr.len() > 2 * KEPT {
+                        self.stderr.drain(..self.stderr.len() - KEPT);
                     }
                 }
                 Ok(Event::Exit(exit)) => self.exit = Some(exit),
+                Err(RecvTimeoutError::Timeout) if silent_since.elapsed() >= self.idle => {
+                    return Err(self.launcher.silent(self.idle));
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => self.exit = Some(None),
             }
@@ -150,11 +190,8 @@ impl<'a> Reply<'a> {
     /// The process ended where there should have been more of the answer: why, by the
     /// launcher's account.
     fn broken(&self) -> TransportError {
-        self.launcher.failure(
-            self.exit.flatten(),
-            &String::from_utf8_lossy(&self.stderr),
-            &self.before,
-        )
+        self.launcher
+            .failure(self.exit.flatten(), &self.stderr, &self.before)
     }
 
     /// The bytes up to the next `end`, which is passed over; at most `limit` of them.
@@ -230,6 +267,32 @@ impl<'a> Reply<'a> {
             length -= now as u64;
         }
         Ok(())
+    }
+
+    /**
+     * Passes over whatever comes, up to and including the first of `lines` to appear, each a
+     * line only this call knows: what a login shell's profile prints is not the transport's
+     * to read. Returns which of them it was.
+     */
+    pub(super) fn skip_to(&mut self, lines: &[&str]) -> Result<usize, TransportError> {
+        let longest = lines.iter().map(|line| line.len()).max().unwrap_or(0);
+        loop {
+            let unread = &self.buffer[self.at..];
+            let first = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(which, line)| Some((find(unread, line.as_bytes())?, which)))
+                .min();
+            if let Some((found, which)) = first {
+                self.at += found + lines[which].len();
+                return Ok(which);
+            }
+            /* The end of what was searched may be the start of one of them. */
+            self.at = self.buffer.len() - unread.len().min(longest);
+            if !self.more()? {
+                return Err(self.broken());
+            }
+        }
     }
 
     /// Reads the answer's last line.

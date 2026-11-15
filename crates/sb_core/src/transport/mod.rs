@@ -33,6 +33,7 @@ pub use shell::{Launcher, Probe, ShellTransport};
 const SYMBOLIC_LINK: &str = "it is a symbolic link";
 const NOT_A_FILE: &str = "it is neither a file nor a folder";
 const NOT_UNICODE: &str = "its name is not Unicode";
+const MAY_NOT_BE_READ: &str = "it may not be read";
 
 /// A location's home directory and the environment variables that were asked for and are set.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,18 +156,20 @@ pub enum TransportError {
         source: io::Error,
     },
     /// The location could not be connected to: a machine that is asleep or off the network.
-    /// A normal state and not an error (PLAN §5). The launcher's own words.
+    /// A normal state and not an error (PLAN §5). With what the launcher said: its verdict
+    /// on the first line, and whatever else it said on the lines after, as in each of the
+    /// three that follow.
     #[error("it could not be reached: {0}")]
     Unreachable(String),
     /// The host turned the sign-in down: `ssh` had no key it accepts and may not ask for a
-    /// password. `ssh`'s own words.
+    /// password.
     #[error("the host refused the sign-in: {0}")]
     Refused(String),
     /// The host's key is not the one `ssh` has on record for it, or `ssh` has none. Nothing
-    /// here ever accepts a key in the owner's place. `ssh`'s own words.
+    /// here ever accepts a key in the owner's place.
     #[error("the host's key was not accepted, and is never accepted on your behalf: {0}")]
     HostKey(String),
-    /// The launcher or the shell at the location failed some other way, in its own words.
+    /// The launcher or the shell at the location failed some other way.
     #[error("{0}")]
     Failed(String),
     /// The location lacks tools the shell transport needs (PLAN §6.2).
@@ -175,6 +178,22 @@ pub enum TransportError {
     /// The shell at the location answered something the transport can't read.
     #[error("the location's shell gave an answer that can't be read: {0}")]
     Protocol(String),
+}
+
+impl TransportError {
+    /// Whether the error is the location's and not one file's or one agent's: it could not
+    /// be reached, or its launcher or its shell failed. Whoever asks next gets the same.
+    pub fn is_the_locations(&self) -> bool {
+        matches!(
+            self,
+            Self::Launch { .. }
+                | Self::Unreachable(_)
+                | Self::Refused(_)
+                | Self::HostKey(_)
+                | Self::Failed(_)
+                | Self::MissingTools(_)
+        )
+    }
 }
 
 /// A read-only view of a location's file system (the module docs).

@@ -4,7 +4,7 @@
 mod common;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 use pretty_assertions::assert_eq;
@@ -225,9 +225,10 @@ impl Transport for Sleepy {
     }
 }
 
-/// A sync of the bench's location through `transport`.
-fn sync_through(bench: &Bench<FileAgent>, transport: &Sleepy) -> Result<Vec<Pass>, SyncError> {
-    sync_location(
+/// A sync of the bench's location through `transport`, which goes to sleep on it: the reason
+/// the sync's last pass could not reach it.
+fn unreached(bench: &Bench<FileAgent>, transport: &dyn Transport) -> String {
+    let passes = sync_location(
         bench.archive(),
         &bench.location,
         transport,
@@ -235,6 +236,11 @@ fn sync_through(bench: &Bench<FileAgent>, transport: &Sleepy) -> Result<Vec<Pass
         &CancelToken::new(),
         &mut |_| {},
     )
+    .unwrap();
+    match passes.last().map(|pass| &pass.outcome) {
+        Some(Err(SyncError::Unreachable(reason))) => reason.clone(),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
@@ -249,11 +255,7 @@ fn a_location_that_cannot_be_reached_is_unreachable_and_that_is_no_error() {
     };
 
     /* Never reached yet: there is no success to show, and no error either. */
-    let tried = sync_through(&bench, &asleep);
-    assert!(
-        matches!(&tried, Err(SyncError::Unreachable(reason)) if reason == ASLEEP),
-        "{tried:?}"
-    );
+    assert_eq!(unreached(&bench, &asleep), ASLEEP);
     let location = bench.location();
     assert!(location.last_attempt.is_some());
     assert_eq!((location.last_success, location.last_error), (None, None));
@@ -269,10 +271,10 @@ fn a_location_that_cannot_be_reached_is_unreachable_and_that_is_no_error() {
     /* Asleep again, try after try: unreachable since the first of them, and what the last
     sync that reached it left stays as it was. */
     bench.agent.append(&key, 2);
-    sync_through(&bench, &asleep).unwrap_err();
+    unreached(&bench, &asleep);
     let first = bench.location();
     thread::sleep(std::time::Duration::from_millis(5));
-    sync_through(&bench, &asleep).unwrap_err();
+    unreached(&bench, &asleep);
     let second = bench.location();
     assert_eq!(second.unreachable, first.unreachable);
     assert!(first.unreachable.unwrap().since >= synced.last_success.unwrap());
@@ -284,7 +286,16 @@ fn a_location_that_cannot_be_reached_is_unreachable_and_that_is_no_error() {
 
     assert_eq!(bench.sync().appended, 1);
     assert_eq!(bench.location().unreachable, None);
-    bench.assert_mirrors(&[key]);
+    bench.assert_mirrors(std::slice::from_ref(&key));
+
+    /* A sync that reaches it and fails clears the state as well: it is failed, not asleep. */
+    unreached(&bench, &asleep);
+    assert!(bench.location().unreachable.is_some());
+    let failed = bench.pass_with(Box::new(Unreachable));
+    assert!(matches!(failed, Err(SyncError::Provider(_))), "{failed:?}");
+    let location = bench.location();
+    assert_eq!(location.unreachable, None);
+    assert!(location.last_error.is_some());
 }
 
 #[test]
@@ -299,11 +310,7 @@ fn a_location_that_drops_away_mid_pass_keeps_what_was_committed() {
         after_proofs: true,
     };
 
-    let dropped = sync_through(&bench, &dozing);
-    assert!(
-        matches!(dropped, Err(SyncError::Unreachable(_))),
-        "{dropped:?}"
-    );
+    assert_eq!(unreached(&bench, &dozing), ASLEEP);
     /* The batch that was proven is archived; the one in flight is not, and nothing of it is
     in the way. */
     let archived = bench.items().len();
@@ -321,6 +328,105 @@ fn a_location_that_drops_away_mid_pass_keeps_what_was_committed() {
     );
     assert_eq!(bench.location().unreachable, None);
     bench.assert_mirrors(&keys);
+}
+
+/// A location whose launcher fails every call the same way.
+struct Refusing {
+    calls: AtomicUsize,
+}
+
+impl Refusing {
+    fn refused<T>(&self) -> Result<T, TransportError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Err(TransportError::Refused(
+            "user@macbook: Permission denied (publickey).".to_string(),
+        ))
+    }
+}
+
+impl Transport for Refusing {
+    fn env(&self, _names: &[&str]) -> Result<Env, TransportError> {
+        self.refused()
+    }
+
+    fn stat(&self, _paths: &[&str]) -> Result<Vec<Option<FileStat>>, TransportError> {
+        self.refused()
+    }
+
+    fn list(&self, _root: &str) -> Result<Listing, TransportError> {
+        self.refused()
+    }
+
+    fn hash_prefixes(
+        &self,
+        _requests: &[PrefixRequest],
+    ) -> Result<Vec<Result<Hashed, RangeFailure>>, TransportError> {
+        self.refused()
+    }
+
+    fn read_ranges(
+        &self,
+        _requests: &[RangeRequest],
+        _sink: &mut dyn RangeSink,
+    ) -> Result<(), TransportError> {
+        self.refused()
+    }
+
+    fn read_small(&self, _path: &str) -> Result<Option<Vec<u8>>, TransportError> {
+        self.refused()
+    }
+}
+
+#[test]
+fn a_location_whose_launcher_fails_is_tried_once_and_fails_as_one() {
+    let (bench, database, _) = two_agents();
+    let refusing = Refusing {
+        calls: AtomicUsize::new(0),
+    };
+    let passes = sync_location(
+        bench.archive(),
+        &bench.location,
+        &refusing,
+        &[bench.agent.provider(), database.provider()],
+        &CancelToken::new(),
+        &mut |_| {},
+    )
+    .unwrap();
+    /* The second provider would only be refused as well: it is not put through it. */
+    assert_eq!(passes.len(), 1);
+    assert_eq!(refusing.calls.load(Ordering::Relaxed), 1);
+    /* The error is the location's, said once, and not one provider's. */
+    let location = bench.location();
+    assert_eq!(
+        location.last_error.as_deref(),
+        Some("the host refused the sign-in: user@macbook: Permission denied (publickey).")
+    );
+    assert_eq!((location.last_success, location.unreachable), (None, None));
+}
+
+#[test]
+fn what_the_providers_before_did_is_kept_when_the_location_goes() {
+    let (bench, database, _) = two_agents();
+    /* Awake for the first provider's pass, and asleep from its proofs on. */
+    let dozing = Sleepy {
+        inner: bench.agent.transport(),
+        asleep: AtomicBool::new(false),
+        after_proofs: true,
+    };
+    let passes = sync_location(
+        bench.archive(),
+        &bench.location,
+        &dozing,
+        &[bench.agent.provider(), database.provider()],
+        &CancelToken::new(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(passes.len(), 2);
+    assert_eq!(passes[0].outcome.as_ref().unwrap().new_items, 1);
+    assert!(matches!(passes[1].outcome, Err(SyncError::Unreachable(_))));
+    assert_eq!(bench.items().len(), 1);
+    assert!(bench.location().unreachable.is_some());
 }
 
 /// Every test here once more, over the shell transport.
