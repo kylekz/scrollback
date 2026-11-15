@@ -641,9 +641,15 @@ fn held_anywhere(dir: &Path, bytes: &[u8]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Whether the file `file` holds `bytes`; a segment, once it is decompressed too.
+/// Whether the file `file` holds `bytes`; a segment, once it is decompressed too. The archive's
+/// own lock is passed over where it can't be read: on Windows a file locked whole keeps every
+/// other reader out for as long as the archive is open, and nothing is ever written to it.
 fn holds(file: &Path, bytes: &[u8]) -> bool {
-    let read = fs::read(file).unwrap();
+    let read = match fs::read(file) {
+        Ok(read) => read,
+        Err(_) if file.file_name().is_some_and(|name| name == "lock") => return false,
+        Err(error) => panic!("{}: {error}", file.display()),
+    };
     let decompressed = file
         .extension()
         .is_some_and(|extension| extension == "zst")
