@@ -682,7 +682,10 @@ fn footer(call: &ToolCall, body: &CallBody, theme: &SbTheme) -> AnyElement {
         .text_color(c.fg3)
         .text_spec(&theme.text.small)
         .child(div().when(bad, |this| this.text_color(c.red)).child(status))
-        .child(format::plural(lines, "line"))
+        .when(
+            body.output.iter().any(|part| matches!(part, Part::Text(_))),
+            |this| this.child(format::plural(lines, "line")),
+        )
         .into_any_element()
 }
 
@@ -708,6 +711,10 @@ fn panel(
             this.read_alone(Some((item.clone(), call.clone())), cx)
         })
     };
+    let stem = {
+        let file = item.rsplit('/').next().unwrap_or(item);
+        file.split('.').next().unwrap_or(file).to_string()
+    };
     let alone_button = |id: SharedString| {
         div()
             .id(id)
@@ -717,6 +724,7 @@ fn panel(
             .cursor_pointer()
             .on_click(open_alone)
             .child("Open on its own")
+            .automation_target(format!("reader/alone/{stem}"))
     };
     let alone = view.alone.is_some();
     match part {

@@ -149,7 +149,9 @@ impl ReaderView {
                 rows::rows(
                     open,
                     reader.full_calls(),
-                    self.alone.as_ref().map(|(item, _)| item),
+                    self.alone
+                        .as_ref()
+                        .map(|(item, call)| (item, call.as_ref())),
                 ),
             ),
             ReaderState::Opening(id) | ReaderState::Failed { id, .. } => {
@@ -391,7 +393,9 @@ impl ReaderView {
             Some(open) => rows::rows(
                 open,
                 reader.read(cx).full_calls(),
-                self.alone.as_ref().map(|(item, _)| item),
+                self.alone
+                    .as_ref()
+                    .map(|(item, call)| (item, call.as_ref())),
             ),
             None => Vec::new(),
         };

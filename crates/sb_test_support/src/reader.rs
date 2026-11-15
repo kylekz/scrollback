@@ -928,7 +928,7 @@ impl Large {
     /// PLAN §14's: 500 calls in a main transcript of about 100 MB, with subagents bringing the
     /// session to a few hundred.
     pub const BUDGET: Large = Large {
-        turns: 120,
+        turns: 600,
         calls: 500,
         output_bytes: 200_000,
         subagents: 10,
@@ -940,7 +940,6 @@ impl Large {
 /// shell calls with long outputs, and subagents with transcripts of their own. Returns its key.
 pub fn large(tree: &mut ProjectsTree, spec: Large) -> String {
     let mut session = tree.session(FC, 0);
-    let per_turn = spec.calls.div_ceil(spec.turns);
     let every = spec.calls / spec.subagents.max(1);
     let mut agents = Vec::new();
     {
@@ -950,7 +949,8 @@ pub fn large(tree: &mut ProjectsTree, spec: Large) -> String {
             s.at(&format!("{:02}:{:02}:00", 8 + turn / 60, turn % 60))
                 .prompt(&markdown::reply(turn as u64, 300));
             s.reply(OPUS_55, &markdown::reply(turn as u64 + 1_000, 1_500));
-            for _ in 0..per_turn.min(spec.calls - made) {
+            /* The calls spread evenly over the turns, the last turn's among them. */
+            while made < spec.calls * (turn + 1) / spec.turns {
                 if spec.subagents > 0 && made % every == every - 1 && agents.len() < spec.subagents
                 {
                     let call = s.call(

@@ -32,6 +32,12 @@
 //!   `sessions`, in the catalogue's order), `sessions` and `groups` (how many the shown page
 //!   lists, `null` while it loads or is of the other kind), the titles of the `selected` and
 //!   the `open` session, and `error` (why the library couldn't be read, or `null`).
+//! - `reader`: `state` (`closed`, `opening`, `failed` with `error`, or `open`), `full_calls`,
+//!   `place` (`[n, of]`: the open session among its page's), `rows` (the column's), `top` (the
+//!   row at its top), `focused` (`row` and `kind` of the keyboard's row, or `null`),
+//!   `open_calls`, `markdown_states` (how many parsed bodies are kept), `alone` (a subagent read
+//!   on its own), `loads` (`bodies`, `subagents`, `summaries`, `images`: how many are `loading`
+//!   and `loaded`) and `fault` (a read that failed for a reason other than the stored bytes).
 //!
 //! Commands. An argument a command doesn't have is an error, so a misspelt one never passes
 //! for a change. These reply with `state.appearance` after the change:

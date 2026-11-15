@@ -30,6 +30,12 @@
 {"cmd": "settle"}
 {"cmd": "bounds", "target": "reader/panel/agent-a0000000000000001", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "screenshot", "name": "subagent-open-1440-dark"}
+// Open on its own: the subagent is the column's whole content, every call shown; back goes to the call that started it.
+{"cmd": "click", "target": "reader/alone/agent-a0000000000000001"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/alone", "equals": true}, {"pointer": "/reader/open_calls", "equals": 0}]}
+{"cmd": "screenshot", "name": "subagent-alone-1440-dark"}
+{"cmd": "click", "target": "reader/alone/back"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/alone", "equals": false}, {"pointer": "/reader/open_calls", "equals": 2}, {"pointer": "/reader/focused/kind", "equals": "call"}]}
 // Enter again closes it; the body stays open.
 {"cmd": "key", "keystroke": "enter", "expect": {"pointer": "/reader/open_calls", "equals": 1}}
 {"cmd": "key", "keystroke": "up"}

@@ -222,8 +222,12 @@ impl Row {
 }
 
 /// Lays out `open`, with Full calls on or off, or only the subagent `alone` when it is read on
-/// its own.
-pub fn rows(open: &OpenSession, full_calls: bool, alone: Option<&Arc<str>>) -> Vec<Row> {
+/// its own, with the call that started it.
+pub fn rows(
+    open: &OpenSession,
+    full_calls: bool,
+    alone: Option<(&Arc<str>, Option<&BlockRef>)>,
+) -> Vec<Row> {
     let mut out = Rows {
         open,
         full_calls,
@@ -231,9 +235,9 @@ pub fn rows(open: &OpenSession, full_calls: bool, alone: Option<&Arc<str>>) -> V
         depth: 0,
         task_from: None,
     };
-    if let Some(item) = alone {
+    if let Some((item, call)) = alone {
         out.push(RowKind::Alone(item.clone()), Space::Top);
-        out.panel(item, None, Space::Block, true);
+        out.panel(item, call, Space::Block, true);
         return out.finish();
     }
     match open.main() {
