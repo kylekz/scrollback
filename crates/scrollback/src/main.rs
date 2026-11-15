@@ -16,7 +16,7 @@ fn main() -> ExitCode {
         .target(env_logger::Target::Stderr)
         .init();
     match app::run(cli::Cli::parse()) {
-        Ok(code) => code,
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             log::error!("scrollback couldn't start: {error:#}");
             ExitCode::FAILURE

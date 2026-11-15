@@ -29,14 +29,14 @@ Colours are `sb.css`'s values. Views never hard-code a colour: every surface, te
 | `line-strong` | `#3a3f46` | dashed drop areas, lifted card outline, toggle track |
 | `fg` | `#eceae6` | text |
 | `fg2` | `#b0aea8` | secondary text |
-| `fg3` | `#8a8882` | lowest text tier (labels, counts, timestamps); ≥4.5:1 on every surface |
+| `fg3` | `#8a8882` | lowest text tier (labels, counts, timestamps); ≥4.5:1 on every surface except `s3` and `active`, where that tier is drawn in `fg2` |
 | `accent` | `#4fc4bd` | fills: primary button, progress, checkbox, current find match |
 | `accent-ink` | `#062120` | text on `accent` |
 | `accent-soft` | `rgba(79,196,189,.14)` | drop target, pending row, accent chip |
 | `accent-text` | `#8fe0d9` | accent as text: links, counts on a drop target |
 | `green` / `red` / `yellow` / `blue` | `#8fd694` / `#f08a7e` / `#f2c482` / `#8ab8f0` | status: ok / failed / warning and find / WSL tag |
 | `green-soft` / `red-soft` / `yellow-soft` / `blue-soft` | `rgba(143,214,148,.13)` / `rgba(240,138,126,.13)` / `rgba(242,196,130,.14)` / `rgba(138,184,240,.14)` | chip and banner fills |
-| `claude` / `claude-soft` | `#d97757` / `rgba(217,119,87,.16)` | the Claude model mark and its avatar fill |
+| `claude` / `claude-soft` | `#d97757` / `rgba(217,119,87,.16)` | the Claude model mark and its avatar fill. These two belong to the Claude Code provider's display data, not to the theme (PLAN §7.6) |
 | `scrim` | `rgba(5,6,8,.58)` | under sheets, dialogs, the palette |
 | `shadow-card` | `0 6px 20px rgba(0,0,0,.28)` | hovered card, hover bar |
 | `shadow-pop` | `0 28px 70px rgba(0,0,0,.55), 0 2px 10px rgba(0,0,0,.35)` | popovers, menus, sheets, dialogs |
@@ -57,7 +57,7 @@ The light danger fill is `#b42a2a` (white text).
 ### 1.3 Typography
 
 - **UI:** Geist (bundled, OFL), fallback Segoe UI Variable / system-ui. 13px/18px body; 12px/16px secondary; 11px/14px counts, tags, keycaps and overlines; 500 for controls and names, 600 for titles; only 400/500/600 are loaded.
-- **Overline** (`over`): 11px/14px, 500, letter-spacing .08em, uppercase, `fg3`. Section labels in the sidebar, facts margin and month groups.
+- **Overline** (`over`): 11px/14px, 500, letter-spacing .08em (not drawn yet, §6), uppercase, `fg3`. Section labels in the sidebar, facts margin and month groups.
 - **Reading:** transcript prose 15px/24px; markdown inside nested panels and tool results 13px/20px; `h2` 17px/24px 600; `h3` 14px/20px 600; inline code 12.5px on `s3`, radius 4.
 - **Code:** JetBrains Mono (bundled), 12px on 19–20px rows; line numbers `fg3`, tabular, right-aligned in a 30–36px gutter. Numbers in the UI (counts, dates, sizes) use Geist Mono with tabular figures.
 - **Headings:** page title (folder, Unsorted, Trash, All sessions) 24px/30px 600; first-run and edge-state titles 22px/28px 600; sheet and dialog titles 15–16px 600; settings section 17px/24px 600.
@@ -140,10 +140,10 @@ GPUI blurs only what is behind the window, so in-app overlays never frost app co
 
 ### 4.1 Shell: title bar and sidebar (every board)
 
-- **Search field** (title bar): `field` style, 460 wide, search glyph, "Search titles, prompts, replies and commands", `Ctrl K` keycap. A click or `Ctrl K` opens the palette (§4.9). On the first-run screen and while the archive is unavailable it is hidden.
+- **Search field** (title bar): `field` style, 460 wide, search glyph, "Search titles, prompts, replies and commands", `Ctrl K` keycap. A click or `Ctrl K` opens the palette (§4.9). On the first-run screen it is hidden (§4.10); while the archive is unavailable it is disabled (§4.14).
 - **Sync all** syncs every location (PLAN §5); while any pass runs its glyph spins and it reads "Syncing…", a second click does nothing. **Settings** (gear) opens Settings in the main area (§4.13).
 - **Sidebar, top to bottom:** library rows **All sessions**, **Starred**, **Unsorted** (its count in `accent-text` while it is above zero), **Trash**, each with a count right-aligned in Geist Mono 11px `fg3`; the **Folders** overline with a New folder `+` (22 square); the folder tree; a spacer; a hairline; the **Locations** overline with a Sync all glyph; one row per location.
-- **Rows:** 32 high, radius 8, icon `fg3`, name `fg2`. Hover: `s2`. Selected (the page shown, or the folder of the session being read): `s3`, name `fg` at 500, icon `fg2`. Folder rows indent 18 per level with a 1px `line` guide, a 12px chevron for a folder with children (a click on the chevron opens or closes it without selecting).
+- **Rows:** 32 high, radius 8, icon `fg3`, name `fg2`. Hover: `s2`. Selected (the page shown, or the folder of the session being read): `s3`, name `fg` at 500, icon and count `fg2` (`fg3` falls short of 4.5:1 on `s3`, §1.1). Folder rows indent 18 per level with a 1px `line` guide, a 12px chevron for a folder with children (a click on the chevron opens or closes it without selecting).
 - **Folder tree drag and drop** (folio's tree is the precedent, PLAN §11): drag a folder onto another to nest it, between rows to reorder (a 2px `accent` insertion line, indented to the level it lands at). Hovering a closed folder for 500 ms opens it. A row that would take the drop is the **drop target**: `accent-soft` fill, 1px inset `accent` ring, icon and count in `accent-text`. A folder can't be dropped into itself or its descendants (no target shows). The ghost is a pre-rendered row (GPUI can't rotate a div): `s2`, `line` border, radius 8, `shadow` `0 14px 30px rgba(0,0,0,.30)`, grip glyph, the dragged item's name, "→", the result in `accent-text`, and a `fg3` note on what it does ("files by hand", "attach to scrollback · files 3 sessions").
 - **What drops on a folder row:** a session (card, list row, reader header title): files it there by hand. A path chip from Unsorted or a folder page: attaches the path. A folder: nests it. Trash takes sessions (moves them to Trash). Unsorted takes a session filed by hand only through **File automatically** (§4.4), never by drop.
 - **Folder row menu** (right-click or `⋯` on hover): Open, New subfolder, Rename (`F2`, in place), Edit paths… (opens its folder page with the path editor open, §4.7), Delete folder… (a dialog: "Delete *fc*? Its 447 sessions go to Unsorted and are filed again by the rules; its subfolders move up to its parent. Nothing is deleted from the archive.").
@@ -377,8 +377,12 @@ macOS uses `Cmd` for every `Ctrl` above, keycaps in its menu symbols (`⌘K`, `�
 - **Restore into a deleted folder** (decision 10) and every toast are not drawn.
 - **Stale deadline** (decision 11) uses the cleanup period last read from the location; the boards' banner copy already does.
 - **Narrow windows** (§2): the boards are all 1440 × 900; the Facts toggle, the collapsible sidebar and the reduced card and list columns are not drawn.
-- **Materials** (§3): the boards draw the Opaque values only. The translucent title bar and sidebar alphas are proposals; `fg3` on the Acrylic sidebar over a contrasting desktop is unverified. **Open:** measure on Windows and either raise the alpha or accept it for the opt-in material.
+- **Materials** (§3): the boards draw the Opaque values only. The translucent title bar and sidebar alphas are proposals, now measured on Windows 11 over a dark desktop. Mica, light: fine, almost identical to Opaque. Mica, dark: the sidebar lands within one code value of the main area, so only the hairline separates them. Acrylic at 50%, light: the sidebar turns mid grey and `fg3` falls to about 2:1, `fg2` to about 3:1; dark is about 4.3:1 for `fg3` on average and worse over bright patches. **Open (owner):** raise the alphas, tint the dark Mica sidebar, or accept this for the opt-in material.
 - **Title bar:** the boards always show the search field, Sync all and Settings; the first run and the unavailable archive hide or disable them (§4.10, §4.14). `E-Edge-Archive-Missing` still shows them enabled. Build per this file.
+- **Overline letter-spacing** (§1.3) is not drawn: this gpui has no letter-spacing. Add it when gpui does.
+- **Caption buttons** on Windows use Windows' own 10px glyphs with its Close hover red, as dv does, not the boards' Lucide glyphs.
+- **The phase 0 shell** (PLAN §13) draws the search field, Sync all and Settings disabled, because the first-run screen that hides them (§4.10) arrives in phase 3.
+- **Dark danger fill:** white on `#f08a7e` is 2.4:1. **Open:** darken the fill or use `accent-ink`-style dark text before phase 6 draws it.
 - **macOS:** the boards draw Windows (caption buttons, `C:\` paths, WSL). macOS has the traffic lights, no WSL section, and its own data folder (§2, §4.10).
 - **History popover footer:** `E-Versions` mentions subagent and tool-result versions in a footer only; each call body with more than one version also shows its own (§4.3).
 - **Versions on cards:** the `held back` chip on cards and list rows (§4.3) is not drawn.

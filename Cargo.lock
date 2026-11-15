@@ -2773,6 +2773,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "raw-window-handle",
+ "serde",
  "windows-sys 0.61.2",
 ]
 
@@ -6023,6 +6024,7 @@ dependencies = [
  "log",
  "pretty_assertions",
  "sb_ui",
+ "serde",
  "serde_json",
 ]
 

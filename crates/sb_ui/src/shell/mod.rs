@@ -11,8 +11,9 @@
 //! `Ctrl B` show the sidebar over the main area ([`SidebarPlacement::Overlay`]); `Esc`, a click
 //! outside it, either of those two again, or the window growing back closes it.
 //!
-//! **Keyboard.** The shell has the keyboard itself until a view inside it takes it, so its keys
-//! work at once.
+//! **Keyboard.** It rests on the main area, inside the shell's key context, until a view there
+//! takes it, so the shell's keys work at once. The main area is the window's `Main` landmark,
+//! which is what assistive technology announces while nothing in it has the keyboard.
 
 pub mod title_bar;
 
@@ -22,9 +23,10 @@ mod tests;
 use anyhow::{Context as _, Result};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, Size,
-    Styled as _, Subscription, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
-    deferred, div, point, prelude::FluentBuilder as _, px, size,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, Role, Size,
+    StatefulInteractiveElement as _, Styled as _, Subscription, TitlebarOptions, Window,
+    WindowBounds, WindowHandle, WindowOptions, deferred, div, point, prelude::FluentBuilder as _,
+    px, size,
 };
 use gpui_appearance::Backing;
 use gpui_component::Root;
@@ -61,6 +63,7 @@ impl SidebarPlacement {
 pub struct Shell {
     /// Keeps the window's material and light/dark in step (module docs).
     appearance: gpui_appearance::WindowTracker,
+    /// The main area's, where the keyboard rests (module docs).
     focus_handle: FocusHandle,
     /// Whether a narrow window shows the sidebar over its main area.
     sidebar_open: bool,
@@ -115,6 +118,9 @@ impl Shell {
     /// reading never sits on a material (DESIGN §3).
     fn render_main(&self, theme: &SbTheme) -> AnyElement {
         div()
+            .id("main")
+            .role(Role::Main)
+            .track_focus(&self.focus_handle)
             .flex_1()
             .min_w_0()
             .h_full()
@@ -170,7 +176,6 @@ impl Render for Shell {
         div()
             .id("shell")
             .key_context(keymap::SHELL)
-            .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::dismiss))
             .relative()

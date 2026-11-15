@@ -355,7 +355,7 @@ Provider-neutral, what the reader renders:
 1. A module under `provider/` that implements the trait, on `FileTree` or `DbSnapshot` where one fits.
 2. One line in the provider list.
 3. Its tool names mapped to the common kinds.
-4. A display name and a mark for the UI.
+4. A display name, a mark and the mark's colour for the UI (the theme holds no agent's colour).
 5. A fixture builder for its storage in `sb_test_support`, and golden parser tests.
 
 Nothing else changes: no migration, and no change to the archive, sync, filing, search or the reader. If adding an agent needs one, the seam is wrong and is fixed first.

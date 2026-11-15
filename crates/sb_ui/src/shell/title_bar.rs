@@ -10,14 +10,18 @@
 //! Search needs the index (PLAN §13 phase 6), Sync all a location (phase 3) and Settings its
 //! page (phase 7): until then each is drawn disabled and takes no clicks.
 //!
-//! The caption buttons are gpui `WindowControlArea`s, so Windows itself handles their clicks,
-//! hover and Snap Layouts on Maximize (the pattern of Zed's `platform_title_bar`). macOS draws
-//! its traffic lights over the left edge, which the bar leaves room for.
+//! **Caption buttons** (Windows). Each is a 46px-wide box, the bar's height, marked with gpui's
+//! `WindowControlArea` (`Min`, `Max`, `Close`), so Windows itself answers the hit test and
+//! handles the click, the hover and Snap Layouts on Maximize; `occlude` keeps the bar's drag
+//! region from claiming the same pixels. The arrangement follows gpui-component 0.9.0's
+//! `TitleBar` (`src/title_bar.rs`, Apache-2.0), drawn in scrollback's tokens. macOS draws its
+//! traffic lights over the left edge, which the bar leaves room for except in fullscreen, where
+//! they are hidden.
 
 use gpui::{
-    AnyElement, Context, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
+    AnyElement, App, Context, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
     RenderOnce, Role, StatefulInteractiveElement as _, Styled as _, Window, WindowControlArea, div,
-    prelude::FluentBuilder as _, px,
+    prelude::FluentBuilder as _, px, svg,
 };
 
 use super::{Shell, SidebarPlacement};
@@ -26,12 +30,10 @@ use crate::automation::AutomationTargetExt as _;
 use crate::components::{DISABLED_OPACITY, icon, kbd};
 use crate::icons::SbIcon;
 use crate::keymap;
-use crate::theme::{SbTheme, StyledText as _};
+use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
-/// The gap between the bar's items, and its left padding where no traffic lights sit
-/// (`design/project/sb.css`, `.titlebar`).
+/// The gap between the bar's items (`design/project/sb.css`, `.titlebar`).
 const GAP: Pixels = px(10.);
-const EDGE: Pixels = px(12.);
 
 impl Shell {
     /// The title bar of the main window.
@@ -43,7 +45,6 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &theme.colors;
-        let caption_buttons = caption_buttons(window);
         div()
             .id("titlebar")
             .flex_none()
@@ -64,10 +65,10 @@ impl Shell {
                         .flex()
                         .items_center()
                         .gap(GAP)
-                        .pl(if cfg!(target_os = "macos") {
+                        .pl(if cfg!(target_os = "macos") && !window.is_fullscreen() {
                             theme.sizes.traffic_lights_inset
                         } else {
-                            EDGE
+                            theme.spacing.lg
                         })
                         .when(sidebar != SidebarPlacement::Docked, |this| {
                             this.child(sidebar_button(sidebar, theme, cx))
@@ -82,12 +83,12 @@ impl Shell {
                         .flex()
                         .items_center()
                         .gap(GAP)
-                        // The caption buttons sit flush with the window's edge.
-                        .when(caption_buttons.is_empty(), |this| this.pr(EDGE))
                         .child(sync_all_button(theme))
                         .child(settings_button(theme))
-                        .when(!caption_buttons.is_empty(), |this| {
-                            this.child(WindowControls::new(caption_buttons, theme))
+                        // The caption buttons sit side by side, flush with the window's edge.
+                        .map(|this| match CaptionButton::row(window) {
+                            Some(buttons) => this.child(div().flex().children(buttons)),
+                            None => this.pr(theme.spacing.lg),
                         }),
                 ),
             )
@@ -111,7 +112,7 @@ fn sidebar_button(
         .aria_label(format!(
             "{} sidebar ({})",
             if open { "Hide" } else { "Show" },
-            keymap::label("secondary-b")
+            keymap::TOGGLE_SIDEBAR.label()
         ))
         .flex_none()
         .flex()
@@ -151,6 +152,7 @@ fn mark(theme: &SbTheme) -> AnyElement {
         .flex()
         .items_center()
         .gap(theme.spacing.md)
+        .debug_selector(|| "titlebar-mark".into())
         .child(
             div()
                 .flex_none()
@@ -184,7 +186,7 @@ fn search_field(theme: &SbTheme) -> AnyElement {
         .role(Role::Button)
         .aria_label(format!(
             "Search the archive ({})",
-            keymap::label("secondary-k")
+            keymap::label(keymap::SEARCH_KEYS)
         ))
         .flex_none()
         .flex()
@@ -208,7 +210,7 @@ fn search_field(theme: &SbTheme) -> AnyElement {
                 .whitespace_nowrap()
                 .child("Search titles, prompts, replies and commands"),
         )
-        .child(kbd(keymap::label("secondary-k"), theme))
+        .child(kbd(keymap::label(keymap::SEARCH_KEYS), theme))
         .automation_target("titlebar/search")
 }
 
@@ -243,7 +245,10 @@ fn settings_button(theme: &SbTheme) -> AnyElement {
     div()
         .id("titlebar-settings")
         .role(Role::Button)
-        .aria_label(format!("Settings ({})", keymap::label("secondary-,")))
+        .aria_label(format!(
+            "Settings ({})",
+            keymap::label(keymap::SETTINGS_KEYS)
+        ))
         .flex_none()
         .flex()
         .items_center()
@@ -255,153 +260,95 @@ fn settings_button(theme: &SbTheme) -> AnyElement {
         .automation_target("titlebar/settings")
 }
 
-/// Minimize, maximize/restore and close: 46 wide and the title bar's height.
-#[derive(IntoElement)]
-struct WindowControls {
-    buttons: Vec<CaptionButton>,
-    glyph: Hsla,
-    hover: Hsla,
-    close_hover: Hsla,
-    close_glyph: Hsla,
-    width: Pixels,
-    height: Pixels,
-}
-
-impl WindowControls {
-    fn new(buttons: Vec<CaptionButton>, theme: &SbTheme) -> Self {
-        let c = &theme.colors;
-        Self {
-            buttons,
-            glyph: c.fg2,
-            hover: c.s2,
-            close_hover: c.caption_close_hover,
-            close_glyph: c.caption_close_fg,
-            width: theme.sizes.caption_button_width,
-            height: theme.sizes.title_bar_height,
-        }
-    }
-
-    fn button(&self, button: CaptionButton) -> AnyElement {
-        let (hover_bg, hover_glyph) = match button {
-            CaptionButton::Close => (self.close_hover, self.close_glyph),
-            _ => (self.hover, self.glyph),
-        };
-        let group = button.id();
-        div()
-            .id(button.id())
-            .role(Role::Button)
-            .aria_label(button.label())
-            .group(group)
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(self.width)
-            .h(self.height)
-            // Keep the drag region from claiming the hit test.
-            .occlude()
-            // Windows handles the click through the control area.
-            .window_control_area(button.control_area())
-            .hover(move |style| style.bg(hover_bg))
-            .active(move |style| style.bg(hover_bg.opacity(0.8)))
-            .child(
-                gpui::svg()
-                    .path(button.icon().path())
-                    .size(px(10.))
-                    .text_color(self.glyph)
-                    .group_hover(group, move |style| style.text_color(hover_glyph)),
-            )
-            .automation_target(button.target())
-    }
-}
-
-impl RenderOnce for WindowControls {
-    fn render(self, _window: &mut Window, _cx: &mut gpui::App) -> impl IntoElement {
-        div()
-            .id("window-controls")
-            .flex_none()
-            .flex()
-            .flex_row()
-            .children(self.buttons.iter().map(|button| self.button(*button)))
-    }
-}
-
-/// The caption buttons `window` shows ([`caption_buttons_for`] on this OS).
-fn caption_buttons(window: &Window) -> Vec<CaptionButton> {
-    caption_buttons_for(
-        std::env::consts::OS,
-        window.is_fullscreen(),
-        window.is_maximized(),
-    )
-}
-
-/// The caption buttons the title bar shows on `os` (`std::env::consts::OS`), left to right: on
-/// Windows all three, none in fullscreen; none on macOS, whose traffic lights are the system's.
-fn caption_buttons_for(os: &str, fullscreen: bool, maximized: bool) -> Vec<CaptionButton> {
-    if os != "windows" || fullscreen {
-        return Vec::new();
-    }
-    vec![
-        CaptionButton::Minimize,
-        if maximized {
-            CaptionButton::Restore
-        } else {
-            CaptionButton::Maximize
-        },
-        CaptionButton::Close,
-    ]
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One of Windows' caption buttons (module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, IntoElement)]
 enum CaptionButton {
     Minimize,
     Maximize,
+    /// What Maximize becomes while the window is maximized.
     Restore,
     Close,
 }
 
 impl CaptionButton {
-    fn id(self) -> &'static str {
-        match self {
-            Self::Minimize => "caption-minimize",
-            Self::Maximize => "caption-maximize",
-            Self::Restore => "caption-restore",
-            Self::Close => "caption-close",
-        }
+    /// The buttons `window` shows, left to right: all three on Windows outside fullscreen, none
+    /// elsewhere.
+    fn row(window: &Window) -> Option<[Self; 3]> {
+        (cfg!(windows) && !window.is_fullscreen()).then(|| Self::row_when(window.is_maximized()))
     }
 
-    fn icon(self) -> SbIcon {
-        match self {
-            Self::Minimize => SbIcon::WindowMinimize,
-            Self::Maximize => SbIcon::WindowMaximize,
-            Self::Restore => SbIcon::WindowRestore,
-            Self::Close => SbIcon::WindowClose,
-        }
+    fn row_when(maximized: bool) -> [Self; 3] {
+        let zoom = if maximized {
+            Self::Restore
+        } else {
+            Self::Maximize
+        };
+        [Self::Minimize, zoom, Self::Close]
     }
+}
 
-    /// The automation target. Maximize and Restore are one button in two states.
-    fn target(self) -> &'static str {
-        match self {
-            Self::Minimize => "titlebar/min",
-            Self::Maximize | Self::Restore => "titlebar/max",
-            Self::Close => "titlebar/close",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Minimize => "Minimize",
-            Self::Maximize => "Maximize",
-            Self::Restore => "Restore",
-            Self::Close => "Close",
-        }
-    }
-
-    fn control_area(self) -> WindowControlArea {
-        match self {
-            Self::Minimize => WindowControlArea::Min,
-            Self::Maximize | Self::Restore => WindowControlArea::Max,
-            Self::Close => WindowControlArea::Close,
-        }
+impl RenderOnce for CaptionButton {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = cx.sb_theme();
+        let c = &theme.colors;
+        // Maximize and Restore are one button in two states, so they share a target and an area.
+        let (label, target, glyph, area) = match self {
+            Self::Minimize => (
+                "Minimize",
+                "titlebar/min",
+                SbIcon::WindowMinimize,
+                WindowControlArea::Min,
+            ),
+            Self::Maximize => (
+                "Maximize",
+                "titlebar/max",
+                SbIcon::WindowMaximize,
+                WindowControlArea::Max,
+            ),
+            Self::Restore => (
+                "Restore",
+                "titlebar/max",
+                SbIcon::WindowRestore,
+                WindowControlArea::Max,
+            ),
+            Self::Close => (
+                "Close",
+                "titlebar/close",
+                SbIcon::WindowClose,
+                WindowControlArea::Close,
+            ),
+        };
+        // Close turns Windows' red under the pointer, with a white glyph; the others take `s2`.
+        let (hover_fill, hover_glyph) = if self == Self::Close {
+            (c.caption_close_hover, c.caption_close_fg)
+        } else {
+            (c.s2, c.fg2)
+        };
+        div()
+            .id(target)
+            .role(Role::Button)
+            .aria_label(label)
+            .group(target)
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(theme.sizes.caption_button_width)
+            .h(theme.sizes.title_bar_height)
+            .occlude()
+            .window_control_area(area)
+            .hover(move |style| style.bg(hover_fill))
+            .active(move |style| style.bg(hover_fill.opacity(0.8)))
+            .child(
+                // An svg takes its own text colour, not its parent's, so the hover reaches the
+                // glyph through the button's group.
+                svg()
+                    .path(glyph.path())
+                    .size(px(10.))
+                    .text_color(c.fg2)
+                    .group_hover(target, move |style| style.text_color(hover_glyph)),
+            )
+            .automation_target(target)
     }
 }
 
@@ -410,19 +357,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn caption_buttons_follow_the_platform() {
+    fn maximize_becomes_restore_while_the_window_is_maximized() {
         use CaptionButton::{Close, Maximize, Minimize, Restore};
 
-        assert_eq!(
-            caption_buttons_for("windows", false, false),
-            [Minimize, Maximize, Close]
-        );
-        assert_eq!(
-            caption_buttons_for("windows", false, true),
-            [Minimize, Restore, Close]
-        );
-        assert_eq!(caption_buttons_for("windows", true, false), []);
-        // macOS: the traffic lights are the system's.
-        assert_eq!(caption_buttons_for("macos", false, false), []);
+        assert_eq!(CaptionButton::row_when(false), [Minimize, Maximize, Close]);
+        assert_eq!(CaptionButton::row_when(true), [Minimize, Restore, Close]);
     }
 }

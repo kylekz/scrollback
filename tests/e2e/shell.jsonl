@@ -26,12 +26,15 @@
 {"cmd": "bounds", "target": "sidebar/all-sessions", "expect_result": [{"pointer": "/x", "equals": 8}, {"pointer": "/y", "equals": 50}, {"pointer": "/w", "equals": 231}, {"pointer": "/h", "equals": 32}]}
 // Three rows and three 1px gaps down: 149, or 148 where a fractional display scale (125%, 150%) rounds the gaps to whole device pixels.
 {"cmd": "bounds", "target": "sidebar/trash", "expect_result": [{"pointer": "/y", "gte": 148}, {"pointer": "/y", "lte": 149}, {"pointer": "/h", "equals": 32}]}
-{"cmd": "bounds", "target": "sidebar/new-folder", "expect_result": [{"pointer": "/w", "equals": 22}, {"pointer": "/h", "equals": 22}]}
-{"cmd": "bounds", "target": "sidebar/sync-all", "expect_result": [{"pointer": "/w", "equals": 22}, {"pointer": "/h", "equals": 22}]}
+// The section buttons are 22 square, or 21 wide where a fractional display scale (125%) rounds their edges to whole device pixels.
+{"cmd": "bounds", "target": "sidebar/new-folder", "expect_result": [{"pointer": "/w", "gte": 21}, {"pointer": "/w", "lte": 22}, {"pointer": "/h", "equals": 22}]}
+{"cmd": "bounds", "target": "sidebar/sync-all", "expect_result": [{"pointer": "/w", "gte": 21}, {"pointer": "/w", "lte": 22}, {"pointer": "/h", "equals": 22}]}
 
 // Dark and light, pinned so the captures don't depend on the machine's own setting, on the Opaque surfaces the boards draw.
 {"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
 {"cmd": "pin_appearance", "appearance": "dark", "expect_result": [{"pointer": "/pinned", "equals": "dark"}, {"pointer": "/resolved/appearance", "equals": "dark"}]}
+// A misspelt argument is refused, not read as "lift the pin".
+{"cmd": "pin_appearance", "apperance": "light", "expect_error": "unknown field", "expect": {"pointer": "/appearance/pinned", "equals": "dark"}}
 {"cmd": "settle", "expect": {"pointer": "/shell/window_material", "equals": "opaque"}}
 {"cmd": "screenshot", "name": "shell-dark"}
 {"cmd": "pin_appearance", "appearance": "light", "expect_result": [{"pointer": "/pinned", "equals": "light"}, {"pointer": "/resolved/appearance", "equals": "light"}]}

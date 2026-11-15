@@ -34,11 +34,31 @@ fn the_regions_sit_where_design_puts_them(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn the_mark_leaves_room_for_the_traffic_lights_only_while_they_show(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    let mark_left =
+        |cx: &mut VisualTestContext| bounds(cx, "titlebar-mark").map(|mark| mark.origin.x);
+    let windowed = if cfg!(target_os = "macos") {
+        px(84.)
+    } else {
+        px(12.)
+    };
+    assert_eq!(mark_left(cx), Some(windowed));
+    // macOS hides the traffic lights in fullscreen.
+    cx.update(|window, _| window.toggle_fullscreen());
+    assert_eq!(mark_left(cx), Some(px(12.)));
+}
+
+#[gpui::test]
 fn the_shell_has_the_keyboard(cx: &mut TestAppContext) {
     let (shell, cx) = open_shell(cx);
     cx.update(|window, cx| {
         assert!(shell.read(cx).focus_handle(cx).is_focused(window));
     });
+    // Its keys reach it from the main area, where the keyboard rests.
+    cx.simulate_resize(size(px(1000.), px(700.)));
+    cx.simulate_keystrokes("secondary-b");
+    assert_eq!(placement(&shell, cx), SidebarPlacement::Overlay);
 }
 
 #[gpui::test]

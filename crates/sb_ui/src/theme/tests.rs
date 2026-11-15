@@ -140,10 +140,11 @@ fn the_window_background_shows_the_material_except_when_opaque() {
 
 #[test]
 fn the_lowest_text_tier_meets_the_contrast_floor() {
-    /* DESIGN §1.1: `fg3` is at least 4.5:1 on a surface's Opaque value. Over a material the
-     * contrast also depends on the desktop behind the window (DESIGN §6), which no test
-     * controls. Dark `s3` (4.18) and dark `active` (3.75) fall short of DESIGN's "every
-     * surface" and are left out. */
+    /* DESIGN §1.1: `fg3` is at least 4.5:1 on every surface's Opaque value, except dark `s3`
+     * and dark `active`, where it reaches about 4.2 and 3.8 and that tier is drawn in `fg2`
+     * instead (a selected row's icon and count, DESIGN §4.1). Light has no exemption. Over a
+     * material the contrast also depends on the desktop behind the window (DESIGN §6), which no
+     * test controls. */
     for appearance in [Appearance::Dark, Appearance::Light] {
         let c = SbColors::new(appearance, Material::Opaque);
         for (name, surface) in [
@@ -153,11 +154,24 @@ fn the_lowest_text_tier_meets_the_contrast_floor() {
             ("chrome", c.chrome),
             ("s1", c.s1),
             ("s2", c.s2),
+            ("s3", c.s3),
+            ("active", c.active),
             ("code", c.code),
             ("codehead", c.codehead),
         ] {
-            let ratio = contrast_ratio(c.fg3, surface);
-            assert!(ratio >= 4.5, "{appearance:?} fg3 on {name}: {ratio:.2}");
+            let exempt = appearance == Appearance::Dark && matches!(name, "s3" | "active");
+            let (tier, text) = if exempt {
+                ("fg2", c.fg2)
+            } else {
+                ("fg3", c.fg3)
+            };
+            let ratio = contrast_ratio(text, surface);
+            assert!(ratio >= 4.5, "{appearance:?} {tier} on {name}: {ratio:.2}");
+            // An exemption that is no longer needed should go, here and in DESIGN.
+            assert!(
+                !exempt || contrast_ratio(c.fg3, surface) < 4.5,
+                "{appearance:?} fg3 on {name} now passes: drop its exemption"
+            );
         }
     }
 }
@@ -165,17 +179,15 @@ fn the_lowest_text_tier_meets_the_contrast_floor() {
 #[test]
 fn shadows_match_design() {
     let dark = Shadows::new(Appearance::Dark);
-    assert_eq!(dark.card.len(), 1);
-    assert_eq!(css(dark.card[0].color), (0x000000, 280));
-    assert_eq!(dark.card[0].offset.y, px(6.));
-    assert_eq!(dark.card[0].blur_radius, px(20.));
     assert_eq!(dark.pop.len(), 2);
     assert_eq!(css(dark.pop[0].color), (0x000000, 550));
+    assert_eq!(dark.pop[0].offset.y, px(28.));
     assert_eq!(dark.pop[0].blur_radius, px(70.));
+    assert_eq!(css(dark.pop[1].color), (0x000000, 350));
     let light = Shadows::new(Appearance::Light);
-    assert_eq!(css(light.card[0].color), (0x281e0a, 80));
     assert_eq!(css(light.pop[0].color), (0x281e0a, 160));
     assert_eq!(light.pop[0].blur_radius, px(56.));
+    assert_eq!(css(light.pop[1].color), (0x281e0a, 100));
 }
 
 #[gpui::test]

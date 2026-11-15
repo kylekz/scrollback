@@ -1,5 +1,9 @@
-//! The keymap (DESIGN §5). One table, [`SHORTCUTS`], drives both the gpui bindings and the
-//! keycaps views draw ([`label`]), so the two can't drift.
+//! The keymap (DESIGN §5). One table, [`SHORTCUTS`], holds the gpui bindings, and a view draws
+//! a bound action's keycap from its row ([`Shortcut::label`]), so the two can't drift.
+//!
+//! Two keycaps are ahead of the table: the title bar shows DESIGN §5's keys for the palette and
+//! for Settings, whose actions arrive with them in phases 6 and 7 (PLAN §13). Their keys are
+//! [`SEARCH_KEYS`] and [`SETTINGS_KEYS`] until then; each becomes a row with its action.
 //!
 //! `secondary` is gpui's platform modifier: `Ctrl` on Windows, `Cmd` on macOS (DESIGN §5:
 //! "macOS uses Cmd for every Ctrl").
@@ -44,6 +48,11 @@ impl Shortcut {
             cx,
         )?)
     }
+
+    /// The keycap text, e.g. `Ctrl B`.
+    pub fn label(&self) -> SharedString {
+        label(self.keys)
+    }
 }
 
 macro_rules! shortcut {
@@ -56,11 +65,16 @@ macro_rules! shortcut {
     };
 }
 
+/// `Ctrl B`: the sidebar of a narrow window (DESIGN §2). Named, because its button draws it.
+pub const TOGGLE_SIDEBAR: Shortcut = shortcut!("secondary-b", SHELL, shell::ToggleSidebar);
+
 /// Every binding scrollback defines.
-pub const SHORTCUTS: &[Shortcut] = &[
-    shortcut!("secondary-b", SHELL, shell::ToggleSidebar),
-    shortcut!("escape", SHELL, shell::Dismiss),
-];
+pub const SHORTCUTS: &[Shortcut] = &[TOGGLE_SIDEBAR, shortcut!("escape", SHELL, shell::Dismiss)];
+
+/// `Ctrl K`, the palette's key (module docs).
+pub const SEARCH_KEYS: &str = "secondary-k";
+/// `Ctrl ,`, Settings' key (module docs).
+pub const SETTINGS_KEYS: &str = "secondary-,";
 
 /// The keys every Mac app has (DESIGN §5, "macOS"), bound on macOS only, anywhere in the window:
 /// the app menu shows them (`crate::app_menu`).

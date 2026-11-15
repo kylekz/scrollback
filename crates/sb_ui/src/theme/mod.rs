@@ -8,8 +8,9 @@
 //! including `Root`'s background, which is the window background of DESIGN §3: transparent over
 //! a material so the OS material shows, `bg-app` solid over Opaque.
 //!
-//! The type scale and the sizes hold what the shell draws; each later view adds its own steps
-//! of DESIGN §1.3 and §1.4 with the phase that builds it.
+//! The colours are DESIGN §1.1 and §1.2 whole. The type scale, the sizes, the radii, the
+//! spacing scale and the shadows hold only what the shell draws; each later view adds its own
+//! steps of DESIGN §1.3 and §1.4 with the phase that builds it.
 
 pub mod tokens;
 
@@ -200,13 +201,11 @@ impl TextSpec {
 }
 
 /// The shell's steps of the type scale (DESIGN §1.3): 13/18 body, 12/16 secondary, 11/14
-/// counts, keycaps and overlines; 600 for titles, 500 for controls and names, 400 for text.
+/// counts, keycaps and overlines; 600 for titles, 500 for controls, 400 for text.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypeScale {
     /// 13/18 body text.
     pub body: TextSpec,
-    /// 13/18 controls and names.
-    pub control: TextSpec,
     /// 13/18 titles (the wordmark).
     pub title: TextSpec,
     /// 12/16 secondary text.
@@ -227,7 +226,6 @@ impl TypeScale {
             (FontWeight::NORMAL, FontWeight::MEDIUM, FontWeight::SEMIBOLD);
         Self {
             body: TextSpec::new(&fonts.ui, 13., 18., regular),
-            control: TextSpec::new(&fonts.ui, 13., 18., medium),
             title: TextSpec::new(&fonts.ui, 13., 18., semibold),
             secondary: TextSpec::new(&fonts.ui, 12., 16., regular),
             control_small: TextSpec::new(&fonts.ui, 12., 16., medium),
@@ -296,7 +294,7 @@ impl Default for Sizes {
     }
 }
 
-/// Corner radii (DESIGN §1.4).
+/// The shell's corner radii (DESIGN §1.4).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Radii {
     /// Tags, keycaps, inline code.
@@ -307,14 +305,8 @@ pub struct Radii {
     pub input: Pixels,
     /// Sidebar rows, menus, code blocks, banners, tables.
     pub row: Pixels,
-    /// Cards, popovers, path groups.
-    pub card: Pixels,
     /// Sheets, dialogs, the empty drop area.
     pub sheet: Pixels,
-    /// The page header's icon tile.
-    pub tile: Pixels,
-    /// Chips.
-    pub pill: Pixels,
 }
 
 impl Default for Radii {
@@ -324,15 +316,12 @@ impl Default for Radii {
             control: px(6.),
             input: px(7.),
             row: px(8.),
-            card: px(10.),
             sheet: px(12.),
-            tile: px(14.),
-            pill: px(999.),
         }
     }
 }
 
-/// The spacing scale 4 / 6 / 8 / 12 / 16 / 24 / 32 (DESIGN §1.4).
+/// The shell's steps of the spacing scale 4 / 6 / 8 / 12 / 16 / 24 / 32 (DESIGN §1.4).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Spacing {
     pub xs: Pixels,
@@ -340,8 +329,6 @@ pub struct Spacing {
     pub md: Pixels,
     pub lg: Pixels,
     pub xl: Pixels,
-    pub xxl: Pixels,
-    pub xxxl: Pixels,
 }
 
 impl Default for Spacing {
@@ -352,17 +339,13 @@ impl Default for Spacing {
             md: px(8.),
             lg: px(12.),
             xl: px(16.),
-            xxl: px(24.),
-            xxxl: px(32.),
         }
     }
 }
 
-/// Elevation (DESIGN §1.1 `shadow-card`, `shadow-pop`; §1.2 for light).
+/// Elevation (DESIGN §1.1 `shadow-pop`; §1.2 for light).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Shadows {
-    /// A hovered card, the hover bar.
-    pub card: Vec<BoxShadow>,
     /// Popovers, menus, sheets, dialogs.
     pub pop: Vec<BoxShadow>,
 }
@@ -373,11 +356,9 @@ impl Shadows {
         let ink = |alpha| tokens::rgba(40, 30, 10, alpha);
         match appearance {
             Appearance::Dark => Self {
-                card: vec![shadow(black(0.28), 6., 20.)],
                 pop: vec![shadow(black(0.55), 28., 70.), shadow(black(0.35), 2., 10.)],
             },
             Appearance::Light => Self {
-                card: vec![shadow(ink(0.08), 4., 14.)],
                 pop: vec![shadow(ink(0.16), 20., 56.), shadow(ink(0.10), 2., 10.)],
             },
         }
