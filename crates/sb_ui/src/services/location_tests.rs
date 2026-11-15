@@ -88,6 +88,9 @@ fn locations(cx: &mut TestAppContext) -> Vec<(Location, LocationStatus)> {
     })
 }
 
+/// The titles the library shows, in its order. Asked only by the tests that sync through a
+/// shell on this machine, which are Unix's.
+#[cfg(unix)]
 fn titles(cx: &mut TestAppContext) -> Vec<String> {
     cx.update(|cx| {
         let library = cx.services().library.read(cx);
