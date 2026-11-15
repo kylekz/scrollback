@@ -27,6 +27,7 @@ mod boards;
 mod fixture;
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -55,9 +56,11 @@ struct Header {
     fixture: Library,
 }
 
-/// What every launch of a scenario's app is started with.
+/// What every launch of a scenario's app is started with: the environment that points this
+/// machine at the scenario's home, and that home as the stand-in for a WSL distro.
 struct Home {
     env: Vec<(OsString, Option<OsString>)>,
+    home: PathBuf,
 }
 
 /// The year the fixtures' newest sessions are dated in. The app writes its dates as seen
@@ -70,7 +73,12 @@ impl Fixture<NoAction> for Home {
     }
 
     fn args(&self) -> Vec<String> {
-        vec!["--automation-calendar".to_string(), CALENDAR.to_string()]
+        vec![
+            "--automation-calendar".to_string(),
+            CALENDAR.to_string(),
+            "--automation-wsl-home".to_string(),
+            self.home.display().to_string(),
+        ]
     }
 
     fn run(&mut self, action: &NoAction) -> Result<Value> {
@@ -126,7 +134,7 @@ impl RunnerApp for Scrollback {
                 std::fs::create_dir_all(cx.data_dir.join("archive/files/location"))?;
             }
         }
-        Ok(Box::new(Home { env }))
+        Ok(Box::new(Home { env, home }))
     }
 }
 

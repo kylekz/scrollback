@@ -60,10 +60,9 @@ fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
     sb_ui::appearance::init(MaterialSupport::probe(), cli.theme.unwrap_or_default(), cx);
     // A scripted run reaches only what its scenario put there.
     #[cfg(feature = "automation")]
-    let connect: Connect = if cli.automation_enabled() {
-        Arc::new(crate::automation::connect)
-    } else {
-        Arc::new(LocationKind::transport)
+    let connect: Connect = match crate::automation::stand_ins(&cli) {
+        Some(stand_ins) => Arc::new(move |kind, cancel| stand_ins.connect(kind, cancel)),
+        None => Arc::new(LocationKind::transport),
     };
     #[cfg(not(feature = "automation"))]
     let connect: Connect = Arc::new(LocationKind::transport);

@@ -219,8 +219,15 @@ impl Archive {
     pub fn open(dir: &Path) -> Result<Self> {
         let dir = &absolute(dir)?;
         let manifest_path = dir.join(layout::MANIFEST);
-        if !manifest_path.is_file() {
-            return Err(ArchiveError::NotAnArchive(dir.to_path_buf()));
+        /* Only a folder that says it has no manifest has none: one that can't be read may
+        hold an archive, and is not taken for a place to make one. */
+        match fs::metadata(&manifest_path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Err(ArchiveError::NotAnArchive(dir.to_path_buf())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ArchiveError::NotAnArchive(dir.to_path_buf()));
+            }
+            Err(error) => return Err(io_error("read", &manifest_path)(error)),
         }
         let lock = lock(dir)?;
         if !dir.join(catalogue::DATABASE).is_file() {

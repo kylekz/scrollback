@@ -49,6 +49,26 @@ fn a_folder_without_an_archive_is_not_opened_as_one() {
     assert_eq!(Archive::open(dir.path()).unwrap().id(), id);
 }
 
+#[cfg(unix)]
+#[test]
+fn an_archive_that_cannot_be_read_is_not_taken_for_no_archive() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = scratch.path().join("archive");
+    drop(Archive::create(&dir).unwrap());
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+    let opened = Archive::open(&dir);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    match opened {
+        Err(ArchiveError::Io { action, .. }) => assert_eq!(action, "read"),
+        other => panic!(
+            "not said to be unreadable: {:?}",
+            other.map(|it| it.id().to_string())
+        ),
+    }
+}
+
 #[test]
 fn an_archive_named_by_a_relative_path_opens_again() {
     /* A folder under the working directory, named from there. */

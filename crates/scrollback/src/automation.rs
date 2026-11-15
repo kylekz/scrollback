@@ -4,8 +4,9 @@
 //! documents the protocol and the builtin commands; `gpui_automation` adds `window` and
 //! `windows` to `state` itself.
 //!
-//! A scripted run never reaches a real WSL distro or SSH host ([`connect`]): a distro is read
-//! as this machine, and a host is unreachable.
+//! A scripted run never reaches a real WSL distro or SSH host ([`StandIns`]): a distro is
+//! read from the home `--automation-wsl-home` names, or is unreachable without one, and a host
+//! is unreachable.
 //!
 //! `state`:
 //! - `app`: `"scrollback"`.
@@ -46,6 +47,7 @@
 //! - `release_sync {}` lets the waiting pass go on, and clears a hold no pass has reached.
 //!   Stopping the pass does too.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
@@ -63,6 +65,8 @@ use sb_ui::Shell;
 use sb_ui::services::{ActiveServices as _, ArchiveState, Held, LocationStatus, Page};
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+use crate::cli::Cli;
 
 /// The entity `gpui_automation` drives: the shell it describes.
 pub struct ScrollbackAutomation {
@@ -302,29 +306,92 @@ struct ReleaseSync {}
 
 /**
  * How a scripted run reaches its locations: never the distro or the host a location names,
- * which would be the machine's own and not the scenario's. This machine and a WSL distro are
- * read as this machine, which the runner points at the scenario's home; a host over SSH can't
- * be reached, which is how a scenario shows an unreachable location.
+ * which would be the machine's own and not the scenario's. This machine is read as it is, and
+ * the runner points it at the scenario's home. A WSL distro is read from the home
+ * `--automation-wsl-home` names, and from nowhere without one: read as this machine it would
+ * archive this machine's transcripts under the distro's name. A host over SSH can't be
+ * reached, which is how a scenario shows an unreachable location.
  */
-pub fn connect(kind: &LocationKind, _cancel: &CancelToken) -> Box<dyn Transport> {
-    match kind {
-        LocationKind::Local | LocationKind::Wsl { .. } => Box::new(LocalTransport),
-        LocationKind::Ssh { .. } => Box::new(NoHost),
+pub struct StandIns {
+    wsl_home: Option<PathBuf>,
+}
+
+/// The stand-ins of a run with the automation driver; `None` for any other run, which reaches
+/// its locations as their kinds say.
+pub fn stand_ins(cli: &Cli) -> Option<StandIns> {
+    cli.automation_enabled().then(|| StandIns {
+        wsl_home: cli.automation_wsl_home.clone(),
+    })
+}
+
+impl StandIns {
+    pub fn connect(&self, kind: &LocationKind, _cancel: &CancelToken) -> Box<dyn Transport> {
+        match (kind, &self.wsl_home) {
+            (LocationKind::Local, _) => Box::new(LocalTransport),
+            (LocationKind::Wsl { .. }, Some(home)) => Box::new(StandInDistro {
+                home: home.display().to_string(),
+            }),
+            (LocationKind::Wsl { .. }, None) => Box::new(Nowhere("no distro")),
+            (LocationKind::Ssh { .. }, _) => Box::new(Nowhere("no host")),
+        }
     }
 }
 
-/// A host that is never there.
-struct NoHost;
+/// A WSL distro played by a folder of this machine: its files are this machine's, its home
+/// that folder, and none of this machine's environment is its.
+struct StandInDistro {
+    home: String,
+}
 
-impl NoHost {
+impl Transport for StandInDistro {
+    fn env(&self, _: &[&str]) -> Result<Env, TransportError> {
+        Ok(Env {
+            home: self.home.clone(),
+            vars: HashMap::new(),
+        })
+    }
+
+    fn stat(&self, paths: &[&str]) -> Result<Vec<Option<FileStat>>, TransportError> {
+        LocalTransport.stat(paths)
+    }
+
+    fn list(&self, root: &str) -> Result<Listing, TransportError> {
+        LocalTransport.list(root)
+    }
+
+    fn hash_prefixes(
+        &self,
+        requests: &[PrefixRequest],
+    ) -> Result<Vec<Result<Hashed, RangeFailure>>, TransportError> {
+        LocalTransport.hash_prefixes(requests)
+    }
+
+    fn read_ranges(
+        &self,
+        requests: &[RangeRequest],
+        sink: &mut dyn RangeSink,
+    ) -> Result<(), TransportError> {
+        LocalTransport.read_ranges(requests, sink)
+    }
+
+    fn read_small(&self, path: &str) -> Result<Option<Vec<u8>>, TransportError> {
+        LocalTransport.read_small(path)
+    }
+}
+
+/// A location that is never there: what a scripted run reaches, named.
+struct Nowhere(&'static str);
+
+impl Nowhere {
     fn unreachable<T>(&self) -> Result<T, TransportError> {
-        Err(TransportError::Unreachable(
-            "a scripted run reaches no host".to_string(),
-        ))
+        Err(TransportError::Unreachable(format!(
+            "a scripted run reaches {}",
+            self.0
+        )))
     }
 }
 
-impl Transport for NoHost {
+impl Transport for Nowhere {
     fn env(&self, _: &[&str]) -> Result<Env, TransportError> {
         self.unreachable()
     }
@@ -402,6 +469,49 @@ mod tests {
         assert_eq!((neither.mode, neither.material), (None, None));
         assert!(parse(json!({"materail": "mica"})).is_err());
         assert!(parse(json!({"mode": "sepia"})).is_err());
+    }
+
+    fn cli(args: &[&str]) -> Cli {
+        use clap::Parser as _;
+        Cli::try_parse_from(std::iter::once("scrollback").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn only_a_run_with_the_driver_reaches_its_locations_through_the_stand_ins() {
+        assert!(stand_ins(&cli(&[])).is_none());
+        assert!(stand_ins(&cli(&["--automation"])).is_some());
+        assert!(stand_ins(&cli(&["--automation-pipe", "e2e"])).is_some());
+    }
+
+    #[test]
+    fn a_distro_is_read_from_the_home_named_for_it_and_from_nowhere_else() {
+        let distro = LocationKind::Wsl {
+            distro: "Ubuntu-24.04".to_string(),
+        };
+        let cancel = CancelToken::new();
+        let unnamed = stand_ins(&cli(&["--automation"])).unwrap();
+        assert!(matches!(
+            unnamed.connect(&distro, &cancel).env(&["HOME"]),
+            Err(TransportError::Unreachable(_))
+        ));
+        let home = std::env::temp_dir().join("stand-in-home");
+        let named = stand_ins(&cli(&[
+            "--automation",
+            "--automation-wsl-home",
+            home.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let env = named.connect(&distro, &cancel).env(&["HOME"]).unwrap();
+        assert_eq!(env.home, home.display().to_string());
+        assert!(env.vars.is_empty(), "none of this machine's environment");
+        // A host is never reached, home or not.
+        let host = LocationKind::Ssh {
+            host: "user@macbook".to_string(),
+        };
+        assert!(matches!(
+            named.connect(&host, &cancel).env(&[]),
+            Err(TransportError::Unreachable(_))
+        ));
     }
 
     #[test]
