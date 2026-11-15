@@ -3,7 +3,8 @@
 //! the archive if the folder has none, and indexes what the sync changed; or verifies that
 //! archive, listing what is under its `files/` that the catalogue doesn't record; or sets
 //! that aside; or brings the session index up to date as a start does; or empties it and
-//! builds it again from the archive, and says whether it came back the same. It prints
+//! builds it again from the archive, and says whether it came back the same; or searches it
+//! (PLAN §10) with the palette's syntax (DESIGN §4.9), printing the results. It prints
 //! totals, and of the archive's own files their paths in it.
 //!
 //! ```text
@@ -14,7 +15,11 @@
 //! cargo run --release -p sb_core --example sync -- distros
 //! cargo run --release -p sb_core --example sync -- <archive folder> index
 //! cargo run --release -p sb_core --example sync -- <archive folder> reindex
+//! cargo run --release -p sb_core --example sync -- <archive folder> search <query>
 //! ```
+//!
+//! A search prints how many matches it found in how many sessions and how long it took, on
+//! its first line, then each session it found and its first matches.
 //!
 //! `<location>` is this machine when left out, or one of:
 //!
@@ -39,12 +44,14 @@ use sb_core::archive::{Archive, ArchiveError};
 use sb_core::catalogue::{Catalogue, Session, Shelf};
 use sb_core::location::LocationKind;
 use sb_core::provider;
+use sb_core::search::{self, Limit, Names};
 use sb_core::sync::{IndexReport, Progress, SyncError, index, sync_location};
 use sb_core::transcript::Ending;
 use sb_core::transport::{Launcher, ShellTransport, Transport, wsl};
 
 const USAGE: &str = "usage: sync <archive folder> [<location>]
        sync <archive folder> verify | set-aside | index | reindex
+       sync <archive folder> search <query>
        sync test <location>
        sync distros
 <location>: --wsl <distro> [--home <folder>] | --ssh <host> | --loopback <home folder>";
@@ -217,6 +224,66 @@ fn print_index(catalogue: &Catalogue) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Searches the archive as the palette does, and prints what it found.
+fn find(catalogue: &Catalogue, input: &str) -> Result<(), Box<dyn Error>> {
+    let started = Instant::now();
+    let agents: Vec<_> = provider::builtin()
+        .iter()
+        .map(|provider| provider.id())
+        .collect();
+    let (query, unresolved) = search::query(
+        input,
+        &Names {
+            folders: &catalogue.folders()?,
+            locations: &catalogue.locations()?,
+            agents: &agents,
+        },
+    );
+    let results = catalogue.search(&query, Limit::default(), &CancelToken::new())?;
+    println!(
+        "{} matches in {} sessions in {:.1?}",
+        results.total_matches,
+        results.total_sessions,
+        started.elapsed()
+    );
+    for token in unresolved {
+        println!(
+            "{}:{} names nothing; it is left out",
+            token.key.as_str(),
+            token.value
+        );
+    }
+    for found in &results.sessions {
+        println!(
+            "{} ({} matches)",
+            found.session.title.as_deref().unwrap_or("untitled"),
+            found.matches
+        );
+        for found in &found.shown {
+            /* Each match between brackets. */
+            let mut text = found.snippet.text.clone();
+            for hit in found.snippet.hits.iter().rev() {
+                text.insert(hit.end, ']');
+                text.insert(hit.start, '[');
+            }
+            println!(
+                "  {:?}{} at {:?}: {}",
+                found.kind,
+                if found.subagent { " in a subagent" } else { "" },
+                found.at,
+                text.replace('\n', " ")
+            );
+        }
+        if found.matches > found.shown.len() {
+            println!(
+                "  +{} more in this session",
+                found.matches - found.shown.len()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (dir, action, place) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
@@ -249,6 +316,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         ["test", ref place @ ..] => return test(&Place::from(place)?),
         [dir, action @ ("verify" | "set-aside" | "index" | "reindex")] => {
             (dir, action, Place::from(&[])?)
+        }
+        [dir, "search", ref query @ ..] => {
+            let archive = Archive::open(Path::new(dir))?;
+            return find(archive.catalogue(), &query.join(" "));
         }
         [dir, ref place @ ..] => (dir, "sync", Place::from(place)?),
         [] => return Err(USAGE.into()),
@@ -407,8 +478,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         println!(
             "{}: {} items: {} unchanged, {} new, {} appended, {} touched, {} new versions \
-             ({} held back), {} gone, {} deferred, {} failed, {} unlisted, {} skipped; {} bytes \
-             fetched, {} stored",
+             ({} held back), {} gone, {} deferred, {} failed, {} unlisted, {} skipped, {} of \
+             sessions deleted for good; {} bytes fetched, {} stored",
             pass.provider,
             report.scanned,
             report.unchanged,
@@ -422,6 +493,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             report.failed.len(),
             report.unlisted.len(),
             report.skipped.len(),
+            report.deleted,
             report.bytes_fetched,
             report.bytes_stored
         );

@@ -186,23 +186,29 @@ turn 2
             .spans
             .iter()
             .find(|span| span.text == text)
-            .map(|span| span.at)
+            .map(|span| (span.at, span.subagent))
     };
     assert_eq!(
         at("Ninety lines."),
-        Some(At::Block {
-            turn: 1,
-            block: BlockId(3),
-        })
+        Some((
+            At::Block {
+                turn: 1,
+                block: BlockId(3),
+            },
+            true
+        ))
     );
     assert_eq!(
         at("Survey the crates."),
-        Some(At::Block {
-            turn: 1,
-            block: BlockId(2),
-        })
+        Some((
+            At::Block {
+                turn: 1,
+                block: BlockId(2),
+            },
+            false
+        ))
     );
-    assert_eq!(at("No mistakes."), Some(At::Unattached(0)));
+    assert_eq!(at("No mistakes."), Some((At::Unattached(0), true)));
 
     /* The session's own calls and tokens, and those of everything that ran for it. */
     let reply = Tokens {
@@ -366,23 +372,24 @@ fn search_text_is_prompts_replies_and_what_calls_were_aimed_at() {
     let span = |at, kind, text: &str| Span {
         at,
         kind,
+        subagent: false,
         text: text.to_string(),
     };
     assert_eq!(
         index(&transcript).spans,
         [
             span(at(0, 0), SpanKind::Prompt, "Find the parser."),
-            span(at(0, 2), SpanKind::ToolCall, "fn parse"),
-            span(at(0, 2), SpanKind::ToolCall, "crates"),
+            span(at(0, 2), SpanKind::Command, "fn parse"),
+            span(at(0, 2), SpanKind::Path, "crates"),
             span(
                 at(0, 3),
-                SpanKind::ToolCall,
+                SpanKind::Path,
                 "/home/user/code/app/crates/core/src/parse.rs"
             ),
             span(at(0, 4), SpanKind::Reply, "It is in the core crate."),
             span(at(1, 6), SpanKind::Prompt, "Run it."),
-            span(at(1, 7), SpanKind::ToolCall, "cargo run"),
-            span(at(1, 8), SpanKind::ToolCall, "https://example.com/doc"),
+            span(at(1, 7), SpanKind::Command, "cargo run"),
+            span(at(1, 8), SpanKind::Path, "https://example.com/doc"),
         ]
     );
 }

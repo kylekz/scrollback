@@ -513,6 +513,10 @@ impl Agent for DbAgent {
         HomeTransport::new(&self.home, Vec::new())
     }
 
+    fn home(&self) -> &Path {
+        &self.home
+    }
+
     fn add_session(&mut self, records: usize) -> String {
         self.sessions += 1;
         let key = format!("sessions/s{:04}", self.sessions);
@@ -583,5 +587,11 @@ impl Agent for DbAgent {
                 .into_bytes()
             })
             .collect()
+    }
+
+    fn exchange(&mut self, key: &str, prompt: &str, command: &str, output: &str, reply: &str) {
+        self.say(key, "user", prompt);
+        self.call(key, "exec", json!({ "cmd": command }), output, true);
+        self.say(key, "assistant", reply);
     }
 }

@@ -10,7 +10,7 @@ use super::{
 /// The version of what the index holds of a session: of [`index`], and of how the catalogue
 /// derives and keeps a session's row from it. Rows made by another version are made again
 /// (PLAN §7.5), so it goes up whenever either would give an archived session another row.
-pub const INDEX_VERSION: u32 = 1;
+pub const INDEX_VERSION: u32 = 2;
 
 /// How much of the first prompt stands in for a title the agent didn't store.
 const TITLE_CHARS: usize = 80;
@@ -63,6 +63,9 @@ pub struct Totals {
 pub struct Span {
     pub at: At,
     pub kind: SpanKind,
+    /// The text is a subagent's, which opens the session at the call that started it (or, for
+    /// one no call is known to have started, at [`At::Unattached`]).
+    pub subagent: bool,
     pub text: String,
 }
 
@@ -76,13 +79,17 @@ pub enum At {
     Unattached(usize),
 }
 
+/// What a span's text is. Of a tool call only what it was asked is indexed, never its output
+/// (PLAN D10).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpanKind {
     Prompt,
     Reply,
-    /// A tool call's command, path, pattern, query or address. Tool output is not indexed
-    /// (PLAN D10).
-    ToolCall,
+    /// What a call was asked to do: a shell command, a search pattern or query, a subagent's
+    /// task.
+    Command,
+    /// What a call was asked to work on: a file or folder path, or a web address.
+    Path,
 }
 
 /**
@@ -170,6 +177,7 @@ fn collect(conversation: &Conversation, within: Option<At>, index: &mut SessionI
                     index.spans.push(Span {
                         at,
                         kind,
+                        subagent: within.is_some(),
                         text: text.to_string(),
                     });
                 }
@@ -179,23 +187,23 @@ fn collect(conversation: &Conversation, within: Option<At>, index: &mut SessionI
                 Content::Reply { text } => span(SpanKind::Reply, text),
                 Content::ToolCall(call) => {
                     match &call.input {
-                        ToolInput::Shell { command, .. } => span(SpanKind::ToolCall, command),
+                        ToolInput::Shell { command, .. } => span(SpanKind::Command, command),
                         ToolInput::Read { path, .. }
                         | ToolInput::Edit { path, .. }
-                        | ToolInput::Write { path, .. } => span(SpanKind::ToolCall, path),
+                        | ToolInput::Write { path, .. } => span(SpanKind::Path, path),
                         ToolInput::ContentSearch { pattern, path }
                         | ToolInput::FileSearch { pattern, path } => {
-                            span(SpanKind::ToolCall, pattern);
-                            span(SpanKind::ToolCall, path.as_deref().unwrap_or_default());
+                            span(SpanKind::Command, pattern);
+                            span(SpanKind::Path, path.as_deref().unwrap_or_default());
                         }
                         ToolInput::Subagent { description, .. } => {
                             span(
-                                SpanKind::ToolCall,
+                                SpanKind::Command,
                                 description.as_deref().unwrap_or_default(),
                             );
                         }
-                        ToolInput::WebSearch { query } => span(SpanKind::ToolCall, query),
-                        ToolInput::WebFetch { url, .. } => span(SpanKind::ToolCall, url),
+                        ToolInput::WebSearch { query } => span(SpanKind::Command, query),
+                        ToolInput::WebFetch { url, .. } => span(SpanKind::Path, url),
                         ToolInput::Todos(_) | ToolInput::Mcp { .. } | ToolInput::Other => {}
                     }
                     for subagent in &call.subagents {

@@ -748,6 +748,10 @@ impl Agent for FileAgent {
         self.tree.transport()
     }
 
+    fn home(&self) -> &Path {
+        self.tree.home()
+    }
+
     fn add_session(&mut self, records: usize) -> String {
         let session = self.tree.session(PROJECT, records);
         let key = session.key.clone();
@@ -801,5 +805,13 @@ impl Agent for FileAgent {
 
     fn content(&self, key: &str) -> Vec<u8> {
         fs::read(self.tree.path(key)).unwrap()
+    }
+
+    fn exchange(&mut self, key: &str, prompt: &str, command: &str, output: &str, reply: &str) {
+        let records = &mut self.session(key).transcript;
+        records.prompt(prompt);
+        let call = records.call("Bash", json!({ "command": command }));
+        records.result(&call, json!(output));
+        records.reply(reply);
     }
 }

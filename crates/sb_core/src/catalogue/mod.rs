@@ -3,16 +3,19 @@
 //! folder, with `toolbox_store`'s checked backups beside it in `backups/`.
 //!
 //! Sync only ever adds rows and moves an item's or a version's own fields forward (PLAN §2.3):
-//! nothing here deletes what sync wrote.
+//! what sync wrote is deleted only when the owner deletes a session for good ([`trash`]).
 //!
 //! The library is here too (PLAN §2.2): the owner's folders, attached paths and what they
-//! decided about a session ([`folder`]), and the derived index of each session ([`session`]),
-//! which is read through [`library`].
+//! decided about a session ([`folder`]), Trash and the tombstones of sessions deleted for good
+//! ([`trash`]), and the derived index of each session ([`session`]), which is read through
+//! [`library`] and searched through [`search`].
 
 mod folder;
 mod library;
 mod schema;
+mod search;
 mod session;
+mod trash;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -33,6 +36,8 @@ pub use folder::{Folder, FolderPath};
 pub use library::{LibraryCounts, PathGroup, Shelf};
 pub(crate) use session::{Derived, Indexed, Reading, fingerprint};
 pub use session::{Filed, Session, SessionId, Usage};
+pub(crate) use trash::ItemFile;
+pub use trash::{Deletion, Tombstone};
 
 #[derive(Debug, Error)]
 pub enum CatalogueError {
@@ -72,6 +77,13 @@ pub enum CatalogueError {
     /// The path is not attached to the folder for those locations.
     #[error("{0} is not attached to the folder")]
     NotAttached(String),
+    /// Only a session in Trash is restored or deleted for good.
+    #[error("the session {} of {} at location {} is not in Trash", .0.key, .0.provider, .0.location)]
+    NotInTrash(SessionId),
+    #[error("no session {} of {} at location {} was deleted for good", .0.key, .0.provider, .0.location)]
+    NoTombstone(SessionId),
+    #[error("the search was cancelled")]
+    Cancelled,
 }
 
 /// The most characters a folder's name has.

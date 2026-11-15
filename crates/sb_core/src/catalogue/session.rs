@@ -18,7 +18,9 @@ use toolbox_store::rusqlite::{
     self, Connection, OptionalExtension as _, Row, ToSql, params, params_from_iter,
 };
 
-use super::{Catalogue, CatalogueError, Held, Result, VERSION, Version, folder, version_from};
+use super::{
+    Catalogue, CatalogueError, Held, Result, VERSION, Version, folder, search, version_from,
+};
 use crate::filing::{FolderId, NormalPath};
 use crate::hash::{Hash, Hasher};
 use crate::location::LocationId;
@@ -94,6 +96,8 @@ pub struct Session {
     pub index_version: u32,
     pub filed: Filed,
     pub starred: bool,
+    /// When the owner moved the session to Trash, while it is there (PLAN §4.5).
+    pub trashed: Option<i64>,
 }
 
 /// One item of a session with the version of it that is read (the module docs).
@@ -235,7 +239,8 @@ pub(super) const SESSION: &str = "
            s.own_calls, s.own_input, s.own_output, s.own_cache_read, s.own_cache_write,
            s.all_calls, s.all_input, s.all_output, s.all_cache_read, s.all_cache_write,
            s.ending, s.unreadable, s.unread, s.held_back, s.failure, s.parser_version,
-           s.index_version, st.folder_id, COALESCE(st.by_hand, 0), COALESCE(st.starred, 0)
+           s.index_version, st.folder_id, COALESCE(st.by_hand, 0), COALESCE(st.starred, 0),
+           st.trashed_at
     FROM session s
     LEFT JOIN session_state st
       ON st.location_id = s.location_id AND st.provider = s.provider AND st.session = s.session";
@@ -476,6 +481,11 @@ impl Catalogue {
             &MADE[..]
         };
         self.db.write(|tx| {
+            /* A session the owner deleted for good while it was parsed gets no row: there is
+            nothing of it left to make one from. */
+            if !has_items(tx, id)? {
+                return Ok(false);
+            }
             tx.execute(
                 &upsert("session", &columns, set),
                 params![
@@ -515,7 +525,21 @@ impl Catalogue {
                     from
                 ],
             )?;
-            Ok(derived.is_some() && folder::file_by_rule(tx, id, project.as_ref())?)
+            let Some(derived) = &derived else {
+                return Ok(false);
+            };
+            let row: i64 = tx.query_row(
+                "SELECT id FROM session WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+                params![id.location, id.provider, id.key],
+                |row| row.get(0),
+            )?;
+            search::record_spans(
+                tx,
+                row,
+                derived.index.title.as_deref(),
+                &derived.index.spans,
+            )?;
+            Ok(folder::file_by_rule(tx, id, project.as_ref())?)
         })
     }
 
@@ -654,7 +678,15 @@ impl Catalogue {
     /// Empties the derived tables (PLAN §2.2). The next index fills them again from the
     /// archive; what the owner decided about each session stays.
     pub fn drop_index(&self) -> Result<()> {
-        self.execute("DELETE FROM session", [])
+        self.db.write(|tx| {
+            /* The search text at once, rather than a session's spans at a time as the rows go. */
+            tx.execute_batch(
+                "INSERT INTO session_text (session_text) VALUES ('delete-all');
+                 DELETE FROM span;
+                 DELETE FROM session;",
+            )?;
+            Ok(())
+        })
     }
 
     /**
@@ -780,18 +812,22 @@ const OF_LOCATION: &str = "WHERE i.location_id = ?2 AND i.provider = ?1 AND i.se
 /// Fails unless something is archived of the session `id`: the owner decides nothing about
 /// a session that is not there.
 pub(super) fn archived(connection: &Connection, id: &SessionId) -> Result<()> {
-    let archived: bool = connection.query_row(
+    if has_items(connection, id)? {
+        Ok(())
+    } else {
+        Err(CatalogueError::NoSession(id.clone()))
+    }
+}
+
+/// Whether the catalogue has an item of the session `id`.
+fn has_items(connection: &Connection, id: &SessionId) -> rusqlite::Result<bool> {
+    connection.query_row(
         "SELECT EXISTS (
              SELECT 1 FROM item WHERE location_id = ?1 AND provider = ?2 AND session = ?3
          )",
         params![id.location, id.provider, id.key],
         |row| row.get(0),
-    )?;
-    if archived {
-        Ok(())
-    } else {
-        Err(CatalogueError::NoSession(id.clone()))
-    }
+    )
 }
 
 /// Sets `columns` of the owner's state of the session `id`, whose row is made by the first
@@ -916,6 +952,7 @@ pub(super) fn session_from(row: &Row<'_>) -> rusqlite::Result<Session> {
             (Some(folder), true) => Filed::ByHand(FolderId(folder)),
         },
         starred: row.get(34)?,
+        trashed: row.get(35)?,
     })
 }
 
@@ -940,6 +977,38 @@ mod tests {
         (1..=4).fold(sql.to_string(), |sql, at| {
             sql.replace(&format!("?{at}"), "'x'")
         })
+    }
+
+    /// An index that parsed a session the owner then deleted for good leaves no row of it.
+    #[test]
+    fn a_session_with_no_items_gets_no_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = Archive::create(dir.path()).unwrap();
+        let catalogue = archive.catalogue();
+        let id = SessionId {
+            location: catalogue
+                .add_location(crate::location::LocationKind::Local, "fixture")
+                .unwrap()
+                .id,
+            provider: "fixture".to_string(),
+            key: "deleted".to_string(),
+        };
+        let index = SessionIndex {
+            title: Some("Gone".to_string()),
+            ..SessionIndex::default()
+        };
+        let derived = Derived {
+            main: None,
+            index: &index,
+            ending: None,
+            held_back: false,
+        };
+        assert!(
+            !catalogue
+                .record_session(&id, 1, Hash::of(b""), Indexed::Parsed(derived))
+                .unwrap()
+        );
+        assert_eq!(catalogue.session(&id).unwrap(), None);
     }
 
     #[test]

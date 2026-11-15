@@ -11,7 +11,7 @@
 //! The modules are the homes PLAN §3 names. Syncing a location into the archive is built
 //! ([`archive`], [`catalogue`], [`transport`], [`provider`], [`sync`]), and so are parsing an
 //! archived session into the [`transcript`] model, indexing it and filing it in the owner's
-//! folders ([`filing`]). [`search`] is empty until the phase that builds it (PLAN §13).
+//! folders ([`filing`]), and searching it ([`search`]).
 
 pub mod archive;
 pub mod catalogue;

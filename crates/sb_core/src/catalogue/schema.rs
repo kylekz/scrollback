@@ -1,12 +1,12 @@
 //! The catalogue's schema (PLAN §4.3), as `toolbox_store` migrations: append-only, a shipped
-//! step is never edited. Tables that later phases own (tombstones, the search text, settings)
-//! arrive as further steps with those phases.
+//! step is never edited. Tables that later phases own (settings) arrive as further steps with
+//! those phases.
 
 use toolbox_store::Schema;
 
 pub(super) const SCHEMA: Schema = Schema {
     domain: "scrollback",
-    steps: &[SYNC, LIBRARY, LOCATIONS],
+    steps: &[SYNC, LIBRARY, LOCATIONS, SEARCH_AND_DELETING],
 };
 
 /// What sync writes (PLAN §2.2): locations, items, versions and segments. Times are Unix
@@ -216,6 +216,89 @@ ALTER TABLE location ADD COLUMN unreachable_reason TEXT;
 ALTER TABLE location ADD COLUMN drive_mount TEXT;
 ";
 
+/// Search (PLAN §10), Trash and deleting for good (PLAN §4.5).
+const SEARCH_AND_DELETING: &str = "
+-- When the owner moved the session to Trash, while it is there.
+ALTER TABLE session_state ADD COLUMN trashed_at INTEGER;
+
+-- The owner's: a session deleted for good, when, and what it was called then, for Settings to
+-- name it. Sync archives nothing of it again (tombstone_item) until the owner removes this.
+CREATE TABLE tombstone (
+    location_id TEXT NOT NULL REFERENCES location (id),
+    provider TEXT NOT NULL,
+    session TEXT NOT NULL,
+    deleted_at INTEGER NOT NULL,
+    title TEXT,
+    project_path TEXT,
+    PRIMARY KEY (location_id, provider, session)
+) STRICT, WITHOUT ROWID;
+
+-- The keys of the items a tombstoned session had when it was deleted. Sync skips an item by its
+-- key whatever session its provider now says it is of, and skips the new items of a session
+-- one of these keys is now of, unless the archive holds that session.
+CREATE TABLE tombstone_item (
+    location_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    key TEXT NOT NULL,
+    session TEXT NOT NULL,
+    PRIMARY KEY (location_id, provider, key),
+    FOREIGN KEY (location_id, provider, session) REFERENCES tombstone (location_id, provider, session)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX tombstone_item_session ON tombstone_item (location_id, provider, session);
+
+-- What the foreign keys of a deleted item and its versions are checked by: the session whose
+-- main transcript the item was, and the owner's choice of the version to read.
+CREATE INDEX session_main_item ON session (main_item);
+CREATE INDEX reading_choice_version ON reading_choice (version_id);
+
+-- A file of a session deleted for good whose removal from files/ is not done yet, in the folder
+-- of an item that is no longer in the catalogue: a segment, by its version's number and its
+-- offset, or with neither, the item's source.json.
+CREATE TABLE removal (
+    location_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    version INTEGER,
+    offset INTEGER,
+    CHECK ((version IS NULL) = (offset IS NULL))
+) STRICT;
+
+CREATE INDEX removal_item ON removal (location_id, provider, folder);
+
+-- Derived: the text search matches (PLAN §10), a row per span of a session's row. id is the
+-- session's row id times 2^24 plus the span's place among the session's, from 0, so a session's
+-- spans are a range of ids, in the order of its conversation. kind is title, prompt, reply,
+-- command or path; subagent: the text is a subagent's. A match opens the session at turn and
+-- block (for a subagent's text, the call it ran under), or at the subagent unattached that no
+-- call is known to have started; a title opens it at its start.
+CREATE TABLE span (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    subagent INTEGER NOT NULL,
+    turn INTEGER,
+    block INTEGER,
+    unattached INTEGER,
+    text TEXT NOT NULL
+) STRICT;
+
+-- The index of span's text. It holds no copy of the text, which is span's.
+CREATE VIRTUAL TABLE session_text USING fts5 (
+    text,
+    content = 'span',
+    content_rowid = 'id',
+    tokenize = 'trigram case_sensitive 0 remove_diacritics 1'
+);
+
+-- A session's row goes with its spans, however it goes.
+CREATE TRIGGER session_spans_go AFTER DELETE ON session BEGIN
+    INSERT INTO session_text (session_text, rowid, text)
+        SELECT 'delete', id, text FROM span
+        WHERE id BETWEEN old.id * 16777216 AND old.id * 16777216 + 16777215;
+    DELETE FROM span WHERE id BETWEEN old.id * 16777216 AND old.id * 16777216 + 16777215;
+END;
+";
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -267,5 +350,49 @@ mod tests {
             assert_eq!(catalogue.location(&added.id).unwrap(), Some(added));
         }
         assert_eq!(catalogue.locations().unwrap().len(), 3);
+    }
+
+    /**
+     * A catalogue from before search and Trash keeps its sessions: none is in Trash, and the
+     * row of each, made by an earlier index without its spans, is made again by the next
+     * index (its index version is older) and goes as any row does.
+     */
+    #[test]
+    fn a_catalogue_from_before_search_and_trash_keeps_its_sessions() {
+        const BEFORE: Schema = Schema {
+            domain: SCHEMA.domain,
+            steps: &[SYNC, LIBRARY, LOCATIONS],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        Database::open(&dir.path().join(DATABASE), &OpenOptions::new(&BEFORE))
+            .unwrap()
+            .write(|tx| {
+                tx.execute_batch(
+                    "INSERT INTO location (id, kind, name, created_at) VALUES ('a1', 'local', 'here', 1);
+                     INSERT INTO session (location_id, provider, session, models, own_calls,
+                         own_input, own_output, own_cache_read, own_cache_write, all_calls,
+                         all_input, all_output, all_cache_read, all_cache_write, unread,
+                         held_back, retry, parser_version, index_version, indexed_from)
+                     VALUES ('a1', 'fixture', 's', '[]', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             1, 1, '');
+                     INSERT INTO session_state (location_id, provider, session, starred)
+                     VALUES ('a1', 'fixture', 's', 1);",
+                )?;
+                Ok::<_, toolbox_store::Error>(())
+            })
+            .unwrap();
+
+        let catalogue = Catalogue::open(dir.path()).unwrap();
+        let sessions = catalogue.sessions(crate::catalogue::Shelf::All).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].starred && sessions[0].trashed.is_none());
+        assert_eq!(catalogue.library_counts().unwrap().trash, 0);
+        catalogue.drop_index().unwrap();
+        assert!(
+            catalogue
+                .sessions(crate::catalogue::Shelf::All)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
