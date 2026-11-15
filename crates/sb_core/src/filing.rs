@@ -1,1 +1,273 @@
 //! Filing (PLAN §8): path normalisation, and matching a session's project path to a folder.
+//!
+//! This is the logic alone: paths and attached paths in, a decision out. The catalogue holds
+//! the folders and says when the rules run.
+
+use crate::location::LocationId;
+
+/// Where a WSL distro mounts the Windows drives unless its `/etc/wsl.conf` says otherwise
+/// (PLAN §6.3).
+pub const WSL_DRIVE_MOUNT: &str = "/mnt/";
+
+/**
+ * A path in the form paths are compared in (PLAN §8): its components joined by `/`, with no
+ * trailing separator, and
+ *
+ * - a Windows path (`D:\Projects\app`, `D:/Projects/app`, `\\server\share\app`) in lower case,
+ *   as Windows compares names without regard to case: `d:/projects/app`, `\\server/share/app`;
+ * - a path under a WSL distro's drive mount (`/mnt/d/Projects/app`) as the drive's path, which
+ *   is the same directory: `d:/projects/app`;
+ * - any other path as it is, case kept: `/home/user/code/app`.
+ *
+ * The path as it was typed or recorded is kept beside it, for display.
+ */
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NormalPath(String);
+
+impl NormalPath {
+    /**
+     * Normalises `path`. `drive_mount` is where the location the path is from mounts the
+     * Windows drives, when it is a WSL distro; for any other location it is `None`, and a path
+     * like `/mnt/d/…` is only itself.
+     */
+    pub fn new(path: &str, drive_mount: Option<&str>) -> Self {
+        let bytes = path.as_bytes();
+        let has_drive = bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes.get(2).is_none_or(|byte| matches!(byte, b'\\' | b'/'));
+        if has_drive || path.starts_with(r"\\") {
+            let root = if has_drive { "" } else { r"\\" };
+            return Self(format!(
+                "{root}{}",
+                join(path.split(['\\', '/'])).to_lowercase()
+            ));
+        }
+        /* Under the drive mount, the first component is the drive's letter. */
+        let drive = drive_mount
+            .and_then(|mount| {
+                path.strip_prefix(mount.trim_end_matches('/'))?
+                    .strip_prefix('/')
+            })
+            .and_then(|rest| {
+                let mut components = rest.split('/');
+                let letter = components.next()?;
+                (letter.len() == 1 && letter.as_bytes()[0].is_ascii_alphabetic())
+                    .then(|| format!("{letter}:/{}", join(components)).to_lowercase())
+            });
+        match drive {
+            Some(drive) => Self(drive.trim_end_matches('/').to_string()),
+            None if path.starts_with('/') => Self(format!("/{}", join(path.split('/')))),
+            None => Self(join(path.split('/'))),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether `other` is this path or one under it. `/home/user/code/app` contains
+    /// `/home/user/code/app/crates` and not `/home/user/code/app2`.
+    pub fn contains(&self, other: &NormalPath) -> bool {
+        other
+            .0
+            .strip_prefix(self.0.trim_end_matches('/'))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    }
+}
+
+/// The components that name something, joined by `/`.
+fn join<'a>(components: impl Iterator<Item = &'a str>) -> String {
+    components
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// A folder's identity in the catalogue (PLAN §2.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FolderId(pub i64);
+
+/// A project path attached to a folder (PLAN §2.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachedPath {
+    pub folder: FolderId,
+    pub path: NormalPath,
+    /// The one location whose sessions it files; `None` files every location's.
+    pub location: Option<LocationId>,
+}
+
+/**
+ * The attached path that files a session started in `project` at `location`, if one does
+ * (PLAN §8). The candidates are the attached paths that contain the project path and are for
+ * this location or for all; the longest wins, so a subfolder's more specific path claims a
+ * session before its parent's. Of the same path attached twice, the one for this location wins.
+ */
+pub fn file<'a>(
+    project: &NormalPath,
+    location: &LocationId,
+    attached: &'a [AttachedPath],
+) -> Option<&'a AttachedPath> {
+    attached
+        .iter()
+        .filter(|candidate| {
+            candidate.path.contains(project)
+                && candidate
+                    .location
+                    .as_ref()
+                    .is_none_or(|only| only == location)
+        })
+        /* Every candidate is a prefix of the one project path, so the longest text has the
+        most components. */
+        .max_by_key(|candidate| (candidate.path.0.len(), candidate.location.is_some()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wsl(path: &str) -> NormalPath {
+        NormalPath::new(path, Some(WSL_DRIVE_MOUNT))
+    }
+
+    fn plain(path: &str) -> NormalPath {
+        NormalPath::new(path, None)
+    }
+
+    #[test]
+    fn paths_normalise_to_one_form() {
+        for (path, mount, normal) in [
+            /* POSIX paths keep their case and lose what names nothing. */
+            ("/home/user/code/app", None, "/home/user/code/app"),
+            ("/home/user/code/app/", None, "/home/user/code/app"),
+            ("/home/user//code/./app///", None, "/home/user/code/app"),
+            ("/Users/user/Code/App", None, "/Users/user/Code/App"),
+            ("/", None, "/"),
+            ("", None, ""),
+            ("code/app/", None, "code/app"),
+            (r"/home/user/odd\name", None, r"/home/user/odd\name"),
+            /* Windows paths fold case and take either separator. */
+            (r"D:\Projects\App", None, "d:/projects/app"),
+            (r"d:\projects\app\", None, "d:/projects/app"),
+            ("D:/Projects/App", None, "d:/projects/app"),
+            (r"D:\Projects/App\\crates", None, "d:/projects/app/crates"),
+            (r"C:\Users\user\Code", None, "c:/users/user/code"),
+            (r"D:\", None, "d:"),
+            ("D:", None, "d:"),
+            (r"\\Server\Share\App\", None, r"\\server/share/app"),
+            /* A name that only starts like a drive is not one. */
+            ("D:ata/app", None, "D:ata/app"),
+            ("/D:/app", None, "/D:/app"),
+            /* Under a WSL distro's drive mount, a path is the drive's. */
+            ("/mnt/d/Projects/App", Some("/mnt/"), "d:/projects/app"),
+            ("/mnt/D/Projects/App/", Some("/mnt/"), "d:/projects/app"),
+            ("/mnt/c", Some("/mnt/"), "c:"),
+            ("/mnt/c/", Some("/mnt"), "c:"),
+            ("/mnt/data/app", Some("/mnt/"), "/mnt/data/app"),
+            ("/mnt", Some("/mnt/"), "/mnt"),
+            ("/mntd/app", Some("/mnt/"), "/mntd/app"),
+            ("/home/user/Code/App", Some("/mnt/"), "/home/user/Code/App"),
+            /* The distro's own mount root, when it sets one. */
+            ("/d/Projects/App", Some("/"), "d:/projects/app"),
+            ("/windows/d/Projects", Some("/windows/"), "d:/projects"),
+            ("/mnt/d/Projects", Some("/windows/"), "/mnt/d/Projects"),
+            /* Anywhere but in a WSL distro, the mount is only a directory. */
+            ("/mnt/d/Projects/App", None, "/mnt/d/Projects/App"),
+        ] {
+            assert_eq!(
+                NormalPath::new(path, mount).as_str(),
+                normal,
+                "{path:?} with the drive mount {mount:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_directory_seen_from_windows_and_from_wsl_is_one_path() {
+        assert_eq!(wsl("/mnt/d/Projects/app"), plain(r"D:\Projects\app"));
+        assert_eq!(wsl("/mnt/d/Projects/app"), plain("d:/projects/APP/"));
+        assert_ne!(wsl("/home/user/app"), plain("/home/user/App"));
+    }
+
+    #[test]
+    fn a_path_contains_itself_and_what_is_under_it() {
+        for (outer, inner, contains) in [
+            ("/home/user/code/app", "/home/user/code/app", true),
+            (
+                "/home/user/code/app",
+                "/home/user/code/app/crates/core",
+                true,
+            ),
+            ("/home/user/code/app", "/home/user/code/app2", false),
+            ("/home/user/code/app", "/home/user/code", false),
+            ("/home/user/code/app", "/home/user/code/App", false),
+            ("/", "/home/user", true),
+            ("/", "/", true),
+            ("/", r"D:\Projects", false),
+            ("/", r"\\server\share", false),
+            (r"\\Server\share", r"\\server\Share\app", true),
+            (r"D:\Projects\app", r"d:\projects\APP\crates", true),
+            (r"D:\Projects\app", r"D:\Projects\application", false),
+            (r"D:\", r"D:\Projects", true),
+            (r"D:\", r"E:\Projects", false),
+            (r"D:\Projects", "/d:/projects", false),
+        ] {
+            assert_eq!(
+                plain(outer).contains(&plain(inner)),
+                contains,
+                "{outer:?} and {inner:?}"
+            );
+        }
+        assert!(plain(r"D:\Projects\app").contains(&wsl("/mnt/d/Projects/app/crates")));
+        assert!(wsl("/mnt/d/Projects").contains(&plain(r"D:\Projects\app")));
+    }
+
+    #[test]
+    fn the_longest_attached_path_files_a_session() {
+        let (pc, laptop) = (LocationId::new(), LocationId::new());
+        let attach = |folder, path, location: Option<&LocationId>| AttachedPath {
+            folder: FolderId(folder),
+            path: plain(path),
+            location: location.cloned(),
+        };
+        let attached = [
+            attach(1, "/home/user/code", None),
+            attach(2, "/home/user/code/app", None),
+            attach(3, "/home/user/code/app/crates/ui", None),
+            attach(4, "/home/user/code/app", Some(&laptop)),
+            attach(5, "/home/user/code/app/docs", Some(&laptop)),
+            attach(6, r"D:\Projects\app", None),
+            attach(7, "/home/user/code/application", None),
+        ];
+        for (project, location, folder) in [
+            /* Under a path counts, and the most specific path wins. */
+            (plain("/home/user/code/app"), &pc, Some(2)),
+            (plain("/home/user/code/app/crates/core"), &pc, Some(2)),
+            (plain("/home/user/code/app/crates/ui/src"), &pc, Some(3)),
+            (plain("/home/user/code/other"), &pc, Some(1)),
+            /* Components match, not text. */
+            (plain("/home/user/code/app2"), &pc, Some(1)),
+            (plain("/home/user/code/application/x"), &pc, Some(7)),
+            (plain("/home/user/codes"), &pc, None),
+            (plain("/home/user"), &pc, None),
+            /* A path limited to a location files only that location's sessions, and there it
+            wins over the same path attached for all. */
+            (plain("/home/user/code/app"), &laptop, Some(4)),
+            (plain("/home/user/code/app/docs/plan"), &laptop, Some(5)),
+            (plain("/home/user/code/app/docs/plan"), &pc, Some(2)),
+            (plain("/home/user/code/app/crates/ui"), &laptop, Some(3)),
+            /* Windows and WSL views of one directory, whatever the case. */
+            (plain(r"d:\projects\APP\crates"), &pc, Some(6)),
+            (wsl("/mnt/d/Projects/app"), &pc, Some(6)),
+            (plain("/mnt/d/Projects/app"), &laptop, None),
+            (plain(r"D:\Projects\apple"), &pc, None),
+        ] {
+            assert_eq!(
+                file(&project, location, &attached).map(|path| path.folder),
+                folder.map(FolderId),
+                "{project:?}"
+            );
+        }
+        assert_eq!(file(&plain("/home/user/code/app"), &pc, &[]), None);
+    }
+}
