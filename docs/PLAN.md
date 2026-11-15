@@ -67,11 +67,11 @@ A's sidebar (library rows, folder tree, locations at the foot) is always present
 ### D13. The theme is a module of the app for now
 toolbox-rs has no shared tokens or components yet (`gpui_theme_kit` is scaffolding only). scrollback carries its own theme module as the siblings do, with `gpui_appearance` for light/dark and window materials.
 
-### D14. Deleting is the owner's act, and stays in the archive *(owner; the mechanism is proposed)*
+### D14. Deleting is the owner's act, and stays in the archive *(owner)*
 A session can be deleted from the archive. It goes to Trash first and can be restored; deleting it for good removes its stored bytes and leaves a tombstone, so a later sync doesn't archive it again while it still exists at its location (§4.5). No delete ever reaches a location (D6: the transports have no write operation).
 
 ### D15. Licence: MIT; lift from the siblings, except what they took from GPL sources *(owner)*
-The sibling apps are the owner's, so their code can be lifted and relicensed here. dv and toolbox-rs are already MIT. fc and slide are GPL-3.0 because they carry copies of Zed's `sqlez`; that code, and anything else in a sibling that came from a GPL project, is not the owner's to relicense and stays out. `toolbox_store` exists to replace it. Check where a file came from before lifting it.
+The sibling apps are the owner's, so their code can be lifted and relicensed here. dv and toolbox-rs are already MIT. fc and slide are GPL-3.0 because they carry copies of Zed's `sqlez`; that code, and anything else in a sibling that came from a GPL project, is not the owner's to relicense and stays out. scrollback never needs `sqlez`: its database layer is `toolbox_store`, the MIT crate on rusqlite that toolbox-rs built to replace it (D3). The limit only matters when lifting other code from those apps, so check where a file came from before lifting it.
 
 ---
 
