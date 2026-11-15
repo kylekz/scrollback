@@ -11,7 +11,7 @@
 //!
 //! Filters, sort, the list view and the hover bar's other actions come with later tasks.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -79,19 +79,20 @@ struct LinePieces {
     by_hand: bool,
     /// The widest day.
     day: Pixels,
-    /// The widest call count, without its glyph.
-    calls: Pixels,
+    /// The widest call count, without its glyph; `None` for a line without counts.
+    calls: Option<Pixels>,
 }
 
 /**
- * Whether the cards of a page show their tool calls (DESIGN §4.4), decided for the page and
- * not card by card, so that neighbours read alike: whether a card `inner` wide inside its
- * padding and border fits a line holding every piece the page's lines can hold, each as wide
- * as the widest (`line`), the tags at their caps, [`MODEL_MIN`] of a model's name and the
- * gaps between them. Whatever the answer the day shows whole: the model's name gives way
- * first, then the tags.
+ * Whether a card `inner` wide inside its padding and border fits a line holding every piece
+ * the page's lines can hold, each as wide as the widest (`line`), the tags at their caps,
+ * [`MODEL_MIN`] of a model's name and the gaps between them. With the counts in `line`, this
+ * decides whether the page's cards show their tool calls (DESIGN §4.4): for the page and not
+ * card by card, so that neighbours read alike. A line gives way in that order: the model's
+ * name down to its least, then the tags down to their caps, then the counts; and a line that
+ * fits not even without counts lets its tags give way past their caps, so that the day shows.
  */
-fn calls_fit(inner: Pixels, line: &LinePieces, theme: &SbTheme) -> bool {
+fn line_fits(inner: Pixels, line: &LinePieces, theme: &SbTheme) -> bool {
     let sizes = &theme.sizes;
     let widest = |tags: &[Pixels], cap: Pixels| {
         tags.iter()
@@ -106,13 +107,20 @@ fn calls_fit(inner: Pixels, line: &LinePieces, theme: &SbTheme) -> bool {
         widest(&line.subfolders, sizes.tag_max_width),
         line.held,
         Some(line.day),
-        Some(sizes.icon_xs + theme.spacing.xs + line.calls),
+        line.calls
+            .map(|calls| sizes.icon_xs + theme.spacing.xs + calls),
         line.by_hand.then_some(sizes.icon_xs),
     ]
     .into_iter()
     .flatten()
     .collect();
-    pieces.iter().copied().sum::<Pixels>() + theme.spacing.sm * (pieces.len() - 1) as f32 <= inner
+    line_width(&pieces, theme) <= inner
+}
+
+/// How wide a card's last line of `pieces` is, with the gaps between them.
+fn line_width(pieces: &[Pixels], theme: &SbTheme) -> Pixels {
+    pieces.iter().copied().sum::<Pixels>()
+        + theme.spacing.sm * pieces.len().saturating_sub(1) as f32
 }
 
 /// What the last lines of a page's cards hold, from its sessions: what [`LinePieces`] measures.
@@ -312,11 +320,15 @@ pub struct SessionsView {
     card_width: Pixels,
     /// What the last lines of the page's cards hold.
     line: PageLine,
-    /// Whether the cards show their tool calls ([`calls_fit`]).
+    /// Whether the cards show their tool calls ([`line_fits`]).
     shows_calls: bool,
-    /// The names of the locations and folders whose tags on a card end in an ellipsis, which
-    /// say their name in full on hover.
-    cut_tags: HashSet<String>,
+    /// Whether a card's tags may give way past their caps: the page's lines fit not even
+    /// without counts ([`line_fits`]).
+    tags_past_caps: bool,
+    /// How wide the tag of each location and folder the cards name is, whole.
+    tag_widths: HashMap<String, Pixels>,
+    /// How wide the "held back" chip is.
+    held_width: Pixels,
     /// The card under the pointer.
     hovered: Option<SessionId>,
     /// The rows are of what the library held before it last changed.
@@ -349,7 +361,9 @@ impl SessionsView {
             card_width: px(0.),
             line: PageLine::default(),
             shows_calls: false,
-            cut_tags: HashSet::new(),
+            tags_past_caps: false,
+            tag_widths: HashMap::new(),
+            held_width: px(0.),
             hovered: None,
             stale: true,
             focus,
@@ -385,38 +399,43 @@ impl SessionsView {
         }
         // The locations may arrive, or be renamed, after the sessions; and so may the folders.
         let (sync, library) = (self.sync.read(cx), self.library.read(cx));
-        self.cut_tags.clear();
-        let mut measure = |name: &str, cap: Pixels| {
+        self.tag_widths.clear();
+        let mut measure = |name: &str| {
             let width = tag_width(name, theme, window);
-            if width > cap {
-                self.cut_tags.insert(name.to_string());
-            }
+            self.tag_widths.insert(name.to_string(), width);
             width
         };
         let locations = (self.line.locations.iter())
             .filter_map(|id| sync.location(id))
-            .map(|location| measure(&location.name, theme.sizes.location_tag_max_width))
+            .map(|location| measure(&location.name))
             .collect();
         let subfolders = (self.line.subfolders.iter())
             .filter_map(|id| library.folder(*id))
-            .map(|folder| measure(&folder.name, theme.sizes.tag_max_width))
+            .map(|folder| measure(&folder.name))
             .collect();
+        self.held_width = text_width(HELD_BACK, &theme.text.small, window) + theme.spacing.sm * 2.;
         let pieces = LinePieces {
             locations,
             subfolders,
-            held: self
-                .line
-                .held
-                .then(|| text_width(HELD_BACK, &theme.text.small, window) + theme.spacing.sm * 2.),
+            held: self.line.held.then_some(self.held_width),
             by_hand: self.line.by_hand,
             day: text_width(&self.line.day, &theme.text.count, window),
-            calls: text_width(
+            calls: Some(text_width(
                 &format::count(u64::from(self.line.most_calls)),
                 &theme.text.count,
                 window,
-            ),
+            )),
         };
-        self.shows_calls = calls_fit(self.card_width - CARD_PADDING * 2. - px(2.), &pieces, theme);
+        let inner = self.card_width - CARD_PADDING * 2. - px(2.);
+        self.shows_calls = line_fits(inner, &pieces, theme);
+        self.tags_past_caps = !line_fits(
+            inner,
+            &LinePieces {
+                calls: None,
+                ..pieces
+            },
+            theme,
+        );
     }
 
     /// Moves the selection (see [`moved`]); with nothing selected, selects the first session.
@@ -486,7 +505,14 @@ impl SessionsView {
                     .gap(theme.spacing.lg)
                     .pr(theme.sizes.page_side)
                     .children(sessions.clone().map(|index| {
-                        self.card(index, &page.sessions[index], now, keyboard, &theme, cx)
+                        self.card(
+                            index,
+                            &page.sessions[index],
+                            (now, keyboard),
+                            &theme,
+                            window,
+                            cx,
+                        )
                     }))
                     // A short row's cards stay as wide as a full one's: what fills the row
                     // takes a card's padding and border too.
@@ -503,11 +529,29 @@ impl SessionsView {
             .collect()
     }
 
-    /// A tag on a card's last line, no wider than `cap`; one that has to end in an ellipsis
-    /// says its name in full on hover.
-    fn line_tag(&self, id: ElementId, tag: Div, name: &str, cap: Pixels) -> AnyElement {
-        let tag = tag.flex_shrink(1.).min_w_0().max_w(cap);
-        if !self.cut_tags.contains(name) {
+    /// How narrow a tag `natural` wide may get when its line is tight: down to its cap, or
+    /// past it on a page whose lines fit not even then ([`line_fits`]).
+    fn least(&self, natural: Pixels, cap: Pixels) -> Pixels {
+        if self.tags_past_caps {
+            px(0.)
+        } else {
+            natural.min(cap)
+        }
+    }
+
+    /// A tag on a card's last line: whole while the line has room for it, else giving way down
+    /// to its least width ([`Self::least`]). `cut` says it does give way: then it ends in an
+    /// ellipsis and says its name in full on hover.
+    fn line_tag(
+        &self,
+        id: ElementId,
+        tag: Div,
+        name: &str,
+        least: Pixels,
+        cut: bool,
+    ) -> AnyElement {
+        let tag = tag.flex_shrink(1.).min_w(least);
+        if !cut {
             return tag.into_any_element();
         }
         let name = SharedString::from(name.to_string());
@@ -524,9 +568,9 @@ impl SessionsView {
         &self,
         index: usize,
         session: &Session,
-        now: i64,
-        keyboard: bool,
+        (now, keyboard): (i64, bool),
         theme: &SbTheme,
+        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let c = &theme.colors;
@@ -563,6 +607,39 @@ impl SessionsView {
             .ended
             .or(session.started)
             .map(|ended| format::day(ended, now));
+        // The tags are whole unless the line, with the model's name at its least, has no room
+        // for them; then they give way, down to their least.
+        let natural = |name: &str| self.tag_widths.get(name).copied().unwrap_or_default();
+        let tags: Vec<(Pixels, Pixels)> = (location.map(|it| {
+            let natural = natural(&it.name);
+            (
+                natural,
+                self.least(natural, theme.sizes.location_tag_max_width),
+            )
+        }))
+        .into_iter()
+        .chain(subfolder.map(|it| {
+            let natural = natural(&it.name);
+            (natural, self.least(natural, theme.sizes.tag_max_width))
+        }))
+        .collect();
+        let count_width = |text: &str| text_width(text, &theme.text.count, window);
+        let line: Vec<Pixels> = [
+            Some(theme.sizes.icon_xs),
+            Some(MODEL_MIN),
+            session.held_back.then_some(self.held_width),
+            day.as_deref().map(count_width),
+            calls
+                .as_deref()
+                .map(|calls| theme.sizes.icon_xs + theme.spacing.xs + count_width(calls)),
+            by_hand.then_some(theme.sizes.icon_xs),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(tags.iter().map(|(natural, _)| *natural))
+        .collect();
+        let tight = line_width(&line, theme) > self.card_width - CARD_PADDING * 2. - px(2.);
+        let cut = |(natural, least): (Pixels, Pixels)| tight && natural > least;
 
         let id = session.id.clone();
         let star = div()
@@ -719,15 +796,18 @@ impl SessionsView {
                             ("card-location", index).into(),
                             location_tag(location.name.clone(), &location.kind, true, theme),
                             &location.name,
-                            theme.sizes.location_tag_max_width,
+                            tags[0].1,
+                            cut(tags[0]),
                         )
                     }))
                     .children(subfolder.map(|folder| {
+                        let at = tags.len() - 1;
                         self.line_tag(
                             ("card-subfolder", index).into(),
                             tag(folder.name.clone(), Tone::Neutral, true, theme),
                             &folder.name,
-                            theme.sizes.tag_max_width,
+                            tags[at].1,
+                            cut(tags[at]),
                         )
                     }))
                     .when(session.held_back, |this| {
@@ -1076,19 +1156,19 @@ mod tests {
         let line = |locations: &[f32]| LinePieces {
             locations: locations.iter().copied().map(px).collect(),
             day: px(40.),
-            calls: px(20.),
+            calls: Some(px(20.)),
             ..LinePieces::default()
         };
         // The mark (12), 20 of a model's name, a 70 tag, a 40 day, the glyph (12), 4 and a
         // 20 count, and four gaps of 6.
-        assert!(calls_fit(px(202.), &line(&[70.]), &theme));
-        assert!(!calls_fit(px(201.), &line(&[70.]), &theme));
+        assert!(line_fits(px(202.), &line(&[70.]), &theme));
+        assert!(!line_fits(px(201.), &line(&[70.]), &theme));
         // The widest location decides for every card, whichever location a card is from...
-        assert!(!calls_fit(px(201.), &line(&[40., 70.]), &theme));
-        assert!(!calls_fit(px(201.), &line(&[70., 40.]), &theme));
+        assert!(!line_fits(px(201.), &line(&[40., 70.]), &theme));
+        assert!(!line_fits(px(201.), &line(&[70., 40.]), &theme));
         // ...at its cap of 80.
-        assert!(calls_fit(px(212.), &line(&[200., 70.]), &theme));
-        assert!(!calls_fit(px(211.), &line(&[200., 70.]), &theme));
+        assert!(line_fits(px(212.), &line(&[200., 70.]), &theme));
+        assert!(!line_fits(px(211.), &line(&[200., 70.]), &theme));
         // Every piece a line can hold is counted: a subfolder's tag at its cap of 96, the
         // held-back chip, and the hand glyph, each with its gap.
         let full = LinePieces {
@@ -1097,8 +1177,16 @@ mod tests {
             by_hand: true,
             ..line(&[70., 200.])
         };
-        assert!(calls_fit(px(393.), &full, &theme));
-        assert!(!calls_fit(px(392.), &full, &theme));
+        assert!(line_fits(px(393.), &full, &theme));
+        assert!(!line_fits(px(392.), &full, &theme));
+        // Without counts, the glyph, the count and their gap leave the line: whether the tags
+        // may give way past their caps is decided so.
+        let uncounted = LinePieces {
+            calls: None,
+            ..line(&[70.])
+        };
+        assert!(line_fits(px(160.), &uncounted, &theme));
+        assert!(!line_fits(px(159.), &uncounted, &theme));
     }
 
     #[test]
