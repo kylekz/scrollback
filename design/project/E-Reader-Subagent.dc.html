@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>E · Subagent, find, long session</title>
+<script src="./support.js"></script>
+<link rel="stylesheet" href="./sb.css">
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0}
+</style>
+</helmet>
+<div class="sb {{theme}}" style="width: 100%; height: 900px">
+<svg width="0" height="0" style="position: absolute" aria-hidden="true">
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"></path><path d="M12 9v4"></path><path d="M12 17h.01"></path></symbol>
+<symbol id="i-back" viewBox="0 0 24 24"><path d="m12 19-7-7 7-7"></path><path d="M19 12H5"></path></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><path d="M12 8V4H8"></path><rect width="16" height="12" x="4" y="8" rx="2"></rect><path d="M2 14h2"></path><path d="M20 14h2"></path><path d="M15 13v2"></path><path d="M9 13v2"></path></symbol>
+<symbol id="i-box" viewBox="0 0 24 24"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"></path><path d="m3.3 7 8.7 5 8.7-5"></path><path d="M12 22V12"></path></symbol>
+<symbol id="i-cd" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"></path></symbol>
+<symbol id="i-claude" viewBox="0 0 24 24"><path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4"></path></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2"></rect><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"></path></symbol>
+<symbol id="i-cr" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"></path></symbol>
+<symbol id="i-cu" viewBox="0 0 24 24"><path d="m18 15-6-6-6 6"></path></symbol>
+<symbol id="i-ext" viewBox="0 0 24 24"><path d="M15 3h6v6"></path><path d="M10 14 21 3"></path><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h3"></path></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"></path><path d="M14 2v4a2 2 0 0 0 2 2h4"></path><path d="M16 13H8"></path><path d="M16 17H8"></path></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path></symbol>
+<symbol id="i-gear" viewBox="0 0 24 24"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path><circle cx="12" cy="12" r="3"></circle></symbol>
+<symbol id="i-glob" viewBox="0 0 24 24"><path d="M14 2v4a2 2 0 0 0 2 2h4"></path><path d="M4.268 21a2 2 0 0 0 1.727 1H18a2 2 0 0 0 2-2V7l-5-5H6a2 2 0 0 0-2 2v3"></path><path d="m9 18-1.5-1.5"></path><circle cx="5" cy="14" r="3"></circle></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"></path><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"></path></symbol>
+<symbol id="i-laptop" viewBox="0 0 24 24"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"></path></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"></path><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"></path><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"></path></symbol>
+<symbol id="i-max" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="1"></rect></symbol>
+<symbol id="i-min" viewBox="0 0 24 24"><path d="M5 12h14"></path></symbol>
+<symbol id="i-monitor" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="3" rx="2"></rect><path d="M8 21h8"></path><path d="M12 17v4"></path></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"></path><path d="M12 5v14"></path></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"></path></symbol>
+<symbol id="i-sync" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path><path d="M8 16H3v5"></path></symbol>
+<symbol id="i-term" viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"></path><path d="M12 19h8"></path></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18"></path><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"></path><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"></path><path d="M10 11v6"></path><path d="M14 11v6"></path></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></symbol>
+</svg>
+
+<div class="win">
+  <div class="titlebar">
+    <div class="mark"><i><b></b><b></b><b></b></i><span>scrollback</span></div>
+    <div class="grow row" style="justify-content: center"><button class="field" style="width: 460px" aria-label="Search the archive" aria-keyshortcuts="Control+K"><svg class="ic s14" aria-hidden="true"><use href="#i-search"></use></svg><span class="grow">Search titles, prompts, replies and commands</span><span class="kbd">Ctrl K</span></button></div>
+    <button class="btn sm"><svg class="ic s14" aria-hidden="true"><use href="#i-sync"></use></svg>Sync all</button><button class="ibtn" aria-label="Settings" aria-keyshortcuts="Control+Comma"><svg class="ic" aria-hidden="true"><use href="#i-gear"></use></svg></button>
+    <div class="caps" style="margin-left: 0"><button aria-label="Minimize"><svg class="ic s14" aria-hidden="true"><use href="#i-min"></use></svg></button><button aria-label="Maximize"><svg class="ic s12" aria-hidden="true"><use href="#i-max"></use></svg></button><button aria-label="Close"><svg class="ic s14" aria-hidden="true"><use href="#i-x"></use></svg></button></div>
+  </div>
+  <div class="row grow" style="align-items: stretch; min-height: 0">
+    <nav class="side" style="width: 248px; padding: 10px 8px 8px" aria-label="Library">
+      <div class="col" style="gap: 1px">
+        <button class="srow" style="width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-layers"></use></svg>All sessions<span class="cnt">2,318</span></button>
+        <button class="srow" style="width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-star"></use></svg>Starred<span class="cnt">14</span></button>
+        <button class="srow" style="width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-inbox"></use></svg>Unsorted<span class="cnt acc">37</span></button>
+        <button class="srow" style="width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-trash"></use></svg>Trash<span class="cnt">3</span></button>
+      </div>
+      <div class="row" style="padding: 16px 8px 6px"><span class="over">Folders</span><button class="ibtn" style="margin-left: auto; width: 22px; height: 22px" aria-label="New folder"><svg class="ic s14" aria-hidden="true"><use href="#i-plus"></use></svg></button></div>
+      <div class="col" style="gap: 1px">
+        <button class="srow" style="width: 100%"><span class="chev"><svg class="ic s12" aria-hidden="true"><use href="#i-cr"></use></svg></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>dv<span class="cnt">612</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"><svg class="ic s12" aria-hidden="true"><use href="#i-cr"></use></svg></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>fc<span class="cnt">488</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>folio<span class="cnt">506</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>slide<span class="cnt">197</span></button>
+        <button class="srow sel" style="width: 100%" aria-current="page"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>toolbox-rs<span class="cnt">241</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>scrollback<span class="cnt">12</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>dotfiles<span class="cnt">64</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>Scratch<span class="cnt">161</span></button>
+      </div>
+      
+      <div class="grow"></div>
+      <div class="hair" style="margin: 0 -8px 8px"></div>
+      <div class="row" style="padding: 0 8px 4px"><span class="over">Locations</span><button class="ibtn" style="margin-left: auto; width: 22px; height: 22px" aria-label="Sync all locations"><svg class="ic s14" aria-hidden="true"><use href="#i-sync"></use></svg></button></div>
+      <div class="col" style="gap: 2px">
+        <button class="srow" style="height: 40px; width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-monitor"></use></svg><span class="col" style="min-width: 0"><span class="f2 t12 w5">This PC</span><span class="t11 f3">Local · synced 2 min ago</span></span><span class="dot ok" style="margin-left: auto"></span></button>
+        <button class="srow" style="height: 48px; width: 100%" aria-label="Ubuntu-24.04: syncing, open locations"><svg class="ic" aria-hidden="true"><use href="#i-box"></use></svg><span class="col grow" style="gap: 3px"><span class="row"><span class="f2 t12 w5">Ubuntu-24.04</span><span class="t11 acc nums" style="margin-left: auto">38 / 212 files</span></span><span class="bar"><i style="width: 18%"></i></span><span class="t11 f3">WSL · 41 of 96 MB</span></span></button>
+        <button class="srow" style="height: 40px; width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-laptop"></use></svg><span class="col" style="min-width: 0"><span class="f2 t12 w5">user@macbook</span><span class="t11 yl row gap4"><svg class="ic s12" aria-hidden="true"><use href="#i-alert"></use></svg>SSH · last sync 12 days ago</span></span><span class="dot off" style="margin-left: auto"></span></button>
+      </div>
+    </nav>
+    <main class="col grow" style="min-width: 0" aria-label="Transcript">
+      <div class="row gap8" style="height: 44px; padding: 0 14px 0 12px; border-bottom: 1px solid var(--line-subtle); flex: none">
+        <button class="ibtn" aria-label="Back to toolbox-rs"><svg class="ic" aria-hidden="true"><use href="#i-back"></use></svg></button>
+        <span class="f3">toolbox-rs</span><svg class="ic s14 f3" aria-hidden="true"><use href="#i-cr"></use></svg>
+        <span class="w6 ell">Audit fc and slide for code taken from Zed</span>
+        <button class="ibtn" style="width: 24px; height: 24px; color: var(--yellow)" aria-label="Unstar" aria-pressed="true"><svg class="ic s14" aria-hidden="true"><use href="#i-star"></use></svg></button>
+        <span class="row gap4" style="margin-left: 4px"><button class="ibtn" aria-label="Previous session"><svg class="ic" aria-hidden="true"><use href="#i-cu"></use></svg></button><button class="ibtn" aria-label="Next session"><svg class="ic" aria-hidden="true"><use href="#i-cd"></use></svg></button><span class="t11 f3 nums">18 of 241</span></span>
+        <div class="grow"></div>
+        <label class="field focus" style="width: 300px; height: 28px"><svg class="ic s14" aria-hidden="true"><use href="#i-search"></use></svg><input class="bare" value="sqlez" aria-label="Find in session"><span class="t11 f2 nums">3 of 14</span></label><button class="ibtn" aria-label="Previous match"><svg class="ic" aria-hidden="true"><use href="#i-cu"></use></svg></button><button class="ibtn" aria-label="Next match"><svg class="ic" aria-hidden="true"><use href="#i-cd"></use></svg></button><button class="ibtn" aria-label="Close find"><svg class="ic s14" aria-hidden="true"><use href="#i-x"></use></svg></button>
+        <div class="seg" role="group" aria-label="Tool calls"><button class="on" aria-pressed="true">Activity</button><button aria-pressed="false">Full calls</button></div>
+      </div>
+      <div class="row grow" style="align-items: stretch; min-height: 0">
+        <div class="grow" style="overflow: hidden; min-width: 0; position: relative">
+          <article class="col" style="max-width: 720px; margin: 0 auto; padding: 20px 32px 48px; gap: 14px">
+            <div class="row gap8 t11 f3"><span class="over">Turn 17 of 38</span><span class="hair grow"></span><span class="nums">11:48</span></div>
+            <div class="col gap8">
+              <div class="row gap8 t12 f3"><span class="w6" style="color: var(--fg)">You</span><span class="nums">11:48</span><button class="ibtn" style="width: 22px; height: 22px; margin-left: auto" aria-label="Copy message"><svg class="ic s12" aria-hidden="true"><use href="#i-copy"></use></svg></button></div>
+              <div class="md" style="font-size: 15px; line-height: 24px"><p style="margin: 0">Now check fc the same way. Anything that came from <span class="hl">sqlez</span> has to go before we can lift fc's code into an MIT crate.</p></div>
+            </div>
+            <div class="col gap8">
+              <div class="row gap8 t12 f3"><svg class="ic mm s14" aria-hidden="true"><use href="#i-claude"></use></svg><span class="w6" style="color: var(--fg)">Opus 5.5</span><span class="nums">11:48</span></div>
+              <div class="md" style="font-size: 15px; line-height: 24px"><p style="margin: 0">fc is big, so I'll hand the search to a subagent and keep this thread on toolbox-rs.</p></div>
+              <div class="col" style="gap: 1px; margin: 2px -8px">
+                <button class="act open" aria-expanded="true"><svg class="ic s14" aria-hidden="true"><use href="#i-bot"></use></svg><span class="a1">agent</span><span class="a2" style="font-family: inherit">general-purpose · Find code in fc copied from Zed</span><span class="a3">Haiku 4.5 · 23 calls · 2 min 41 s</span><svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+                <div class="nest" style="gap: 8px">
+                  <div class="row gap8 t11 f3"><span class="tag">subagent</span><span>started 11:49 · Haiku 4.5 · 23 calls · 2 min 41 s · 412k tokens</span><button class="ibtn" style="width: 22px; height: 22px; margin-left: auto" aria-label="Open the subagent's transcript on its own"><svg class="ic s12" aria-hidden="true"><use href="#i-ext"></use></svg></button></div>
+                  <div class="userbox" style="font-size: 12.5px; line-height: 19px; padding: 8px 10px; border-radius: 8px"><span class="t11 f3 w5" style="display: block">Task from Opus 5.5</span>List every file under <code class="mono">/home/user/code/fc</code> that was copied from Zed (<span class="hl">sqlez</span>, gpui helpers). For each: our path, the Zed path it came from, and whether we changed it.</div>
+                  <div class="col" style="gap: 1px">
+                    <button class="act open" aria-expanded="true" style="height: 24px"><svg class="ic s12" aria-hidden="true"><use href="#i-search"></use></svg><span class="a1">grep</span><span class="a2"><span class="hl cur">sqlez</span> in /home/user/code/fc</span><span class="a3">31 matches in 9 files</span><svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+                    <div class="callbody" style="margin-left: 26px"><pre><span class="cmd">crates/fc_db/Cargo.toml</span>
+   4  # vendored from zed: crates/<span class="hl">sqlez</span> @ 2f9a01c
+<span class="cmd">crates/fc_db/src/connection.rs</span>
+   1  // Copied from zed/crates/<span class="hl">sqlez</span>/src/connection.rs</pre></div>
+                    <button class="act" aria-expanded="false" style="height: 24px"><svg class="ic s12" aria-hidden="true"><use href="#i-glob"></use></svg><span class="a1">glob</span><span class="a2">crates/fc_db/src/**/*.rs</span><span class="a3">9 files</span><svg class="ic s12" aria-hidden="true"><use href="#i-cr"></use></svg></button>
+                    <button class="act" aria-expanded="false" style="height: 24px"><svg class="ic s12" aria-hidden="true"><use href="#i-file"></use></svg><span class="a1">read</span><span class="a2">crates/fc_db/src/connection.rs  1–40</span><span class="a3">40 lines</span><svg class="ic s12" aria-hidden="true"><use href="#i-cr"></use></svg></button>
+                    <button class="act" aria-expanded="false" style="height: 24px"><svg class="ic s12" aria-hidden="true"><use href="#i-term"></use></svg><span class="a1">bash</span><span class="a2">git log --follow --format='%h %s' -- crates/fc_db/src/connection.rs | tail -3</span><span class="a3">0.2s</span><svg class="ic s12" aria-hidden="true"><use href="#i-cr"></use></svg></button>
+                    <button class="acc t12" style="padding: 4px 8px">Show 19 more calls</button>
+                  </div>
+                  <div class="md" style="font-size: 13px; line-height: 20px">
+                    <p>Three files in <code>fc_db</code> come from Zed's <span class="hl">sqlez</span>; nothing else does.</p>
+                    <div class="tbl" style="font-size: 12px; margin: 0">
+                      <div class="tr"><span>fc path</span><span>From Zed</span><span>Changed</span></div>
+                      <div class="tr"><span class="mono">fc_db/src/connection.rs</span><span class="mono">sqlez/src/connection.rs</span><span>lightly</span></div>
+                      <div class="tr"><span class="mono">fc_db/src/statement.rs</span><span class="mono">sqlez/src/statement.rs</span><span>no</span></div>
+                      <div class="tr"><span class="mono">fc_db/src/migrations.rs</span><span class="mono">sqlez/src/migrations.rs</span><span>yes, +88 lines</span></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="md" style="font-size: 15px; line-height: 24px">
+                <p>fc carries three files from <strong><span class="hl">sqlez</span></strong>, all in <code>fc_db</code>. They're GPL-3.0, so none of fc's database layer can be lifted into toolbox-rs as is. The rest of fc is clean.</p>
+                <p style="margin: 0">The way out is the same as for slide: move fc onto <code>toolbox_store</code> and delete <code>fc_db</code>. Want me to start with the migrations?</p>
+              </div>
+            </div>
+          </article>
+        </div>
+        <aside class="col" style="width: 268px; flex: none; border-left: 1px solid var(--line-subtle); padding: 16px 12px 12px 16px; gap: 12px; background: var(--bg-panel); overflow: hidden" aria-label="Session facts">
+          <div class="col" style="gap: 6px">
+            <span class="over" style="margin-bottom: 2px">Session</span>
+            <div class="kv"><span>From</span><span><span class="tag wsl">Ubuntu-24.04</span></span></div>
+            <div class="kv"><span>Path</span><span class="mono" style="font-size: 11.5px">/home/user/code/toolbox-rs</span></div>
+            <div class="kv"><span>When</span><span class="nums">7 Oct 2026 · 4 h 51 min</span></div>
+            <div class="kv"><span>Size</span><span class="nums">412 calls · 41 MB</span></div>
+          </div>
+          <div class="hair"></div>
+          <div class="row gap6"><span class="over">Turns · 38</span><span class="t11 f3" style="margin-left: auto">14 matches in 5</span></div>
+          <div class="col grow" style="gap: 1px; overflow: hidden; margin-right: -4px">
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">1</span><span class="nums f3">09:04</span><span class="ell f2 grow">Read PLAN D15 and list what we can lift</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">2</span><span class="nums f3">09:11</span><span class="ell f2 grow">Which of these came from Zed?</span><span class="chip warn nums" style="height: 16px; padding: 0 5px; font-size: 10.5px" aria-label="1 matches">1</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">3</span><span class="nums f3">09:26</span><span class="ell f2 grow">Start with toolbox_store</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">4</span><span class="nums f3">09:40</span><span class="ell f2 grow">Diff its schema module against sqlez</span><span class="chip warn nums" style="height: 16px; padding: 0 5px; font-size: 10.5px" aria-label="3 matches">3</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">5</span><span class="nums f3">09:58</span><span class="ell f2 grow">Good. Write the provenance table</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">6</span><span class="nums f3">10:05</span><span class="ell f2 grow">Put it in docs/PROVENANCE.md</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">7</span><span class="nums f3">10:12</span><span class="ell f2 grow">Use the commit where it was copied</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">8</span><span class="nums f3">10:24</span><span class="ell f2 grow">Now gpui_appearance</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">9</span><span class="nums f3">10:31</span><span class="ell f2 grow">That one is ours, skip it</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">10</span><span class="nums f3">10:39</span><span class="ell f2 grow">toolbox_process?</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">11</span><span class="nums f3">10:52</span><span class="ell f2 grow">Check the job object code too</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">12</span><span class="nums f3">11:03</span><span class="ell f2 grow">Run the tests on Windows paths</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">13</span><span class="nums f3">11:15</span><span class="ell f2 grow">Fix the UNC case</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">14</span><span class="nums f3">11:22</span><span class="ell f2 grow">Rerun</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">15</span><span class="nums f3">11:30</span><span class="ell f2 grow">Commit as "provenance: toolbox"</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">16</span><span class="nums f3">11:41</span><span class="ell f2 grow">What about slide?</span><span class="chip warn nums" style="height: 16px; padding: 0 5px; font-size: 10.5px" aria-label="2 matches">2</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; border-radius: 6px; background: var(--s3); width: 100%; flex: none" aria-current="true"><span class="nums f3" style="width: 18px; text-align: right">17</span><span class="nums f3">11:48</span><span class="ell grow">Now check fc the same way</span><span class="chip warn nums" style="height: 16px; padding: 0 5px; font-size: 10.5px" aria-label="6 matches">6</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">18</span><span class="nums f3">12:20</span><span class="ell f2 grow">Replace fc_db with toolbox_store</span><span class="chip warn nums" style="height: 16px; padding: 0 5px; font-size: 10.5px" aria-label="2 matches">2</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">19</span><span class="nums f3">12:51</span><span class="ell f2 grow">Migrations first, then queries</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">20</span><span class="nums f3">13:07</span><span class="ell f2 grow">Keep the old file names</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">21</span><span class="nums f3">13:16</span><span class="ell f2 grow">The bench regressed, why?</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">22</span><span class="nums f3">13:34</span><span class="ell f2 grow">Prepared statements, yes</span></button>
+            <button class="row gap6 t12" style="height: 22px; padding: 0 6px; width: 100%; flex: none"><span class="nums f3" style="width: 18px; text-align: right">23</span><span class="nums f3">13:49</span><span class="ell f2 grow">Run the full suite</span></button>
+          </div>
+          <div class="row gap6 t11 f3" style="flex: none"><span class="kbd">[</span><span class="kbd">]</span>previous / next turn</div>
+        </aside>
+      </div>
+    </main>
+  </div>
+  
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["dark","light"],"default":"dark"},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { theme: this.props.theme === 'light' ? 'light' : 'dark' };
+  }
+}
+</script>
+</body>
+</html>

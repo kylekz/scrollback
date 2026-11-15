@@ -1,47 +1,684 @@
 {
-  "v": 3,
-  "createdOnFiles": { "v": 1, "at": "2026-11-15T12:00:00Z" },
-  "title": "Scrollback",
-  "launch": { "view": "canvas" },
-  "pages": [],
-  "boards": {
-    "E-Reader.dc.html": { "x": 0, "y": -1400, "w": 1440, "h": 900, "title": "E · Reading", "expand": "fill" },
-    "E-Folder.dc.html": { "x": 1520, "y": -1400, "w": 1440, "h": 900, "title": "E · Folder page + paths", "expand": "fill" },
-    "Main.dc.html": { "x": 0, "y": 0, "w": 1440, "h": 900, "title": "A · Ledger · Reading", "expand": "fill" },
-    "A-Ledger-Sync.dc.html": { "x": 1520, "y": 0, "w": 1440, "h": 900, "title": "A · Ledger · Locations sheet", "expand": "fill" },
-    "A-Ledger-Folders.dc.html": { "x": 3040, "y": 0, "w": 1440, "h": 900, "title": "A · Ledger · Unsorted, folder paths, versions", "expand": "fill" },
-    "B-Shelf-Reader.dc.html": { "x": 0, "y": 1400, "w": 1440, "h": 900, "title": "B · Shelf · Reading", "expand": "fill" },
-    "B-Shelf-Library.dc.html": { "x": 1520, "y": 1400, "w": 1440, "h": 900, "title": "B · Shelf · Folder page + paths", "expand": "fill" },
-    "B-Shelf-Locations.dc.html": { "x": 3040, "y": 1400, "w": 1440, "h": 900, "title": "B · Shelf · Locations page", "expand": "fill" },
-    "C-Inspector-Reader.dc.html": { "x": 0, "y": 2800, "w": 1440, "h": 900, "title": "C · Inspector · Reading", "expand": "fill" },
-    "C-Inspector-Sync.dc.html": { "x": 1520, "y": 2800, "w": 1440, "h": 900, "title": "C · Inspector · Sync popover + subagent", "expand": "fill" },
-    "C-Inspector-Folders.dc.html": { "x": 3040, "y": 2800, "w": 1440, "h": 900, "title": "C · Inspector · Library switcher + folder paths", "expand": "fill" },
-    "D-Tabs-Reader.dc.html": { "x": 0, "y": 4200, "w": 1440, "h": 900, "title": "D · Log · Reading", "expand": "fill" },
-    "D-Tabs-Triage.dc.html": { "x": 1520, "y": 4200, "w": 1440, "h": 900, "title": "D · Log · Triage board", "expand": "fill" },
-    "D-Tabs-Sync.dc.html": { "x": 3040, "y": 4200, "w": 1440, "h": 900, "title": "D · Log · Sync tab", "expand": "fill" },
-    "First-Run.dc.html": { "x": 0, "y": 5600, "w": 1440, "h": 900, "title": "Shared · First run: add your first location","expand": "fill" }
+ "v": 3,
+ "createdOnFiles": {
+  "v": 1,
+  "at": "2026-11-15T12:00:00Z"
+ },
+ "title": "Scrollback",
+ "launch": {
+  "view": "canvas",
+  "page": "e"
+ },
+ "pages": [
+  {
+   "id": "e",
+   "name": "Concept E"
   },
-  "order": [
-    "Main.dc.html", "A-Ledger-Sync.dc.html", "A-Ledger-Folders.dc.html",
-    "B-Shelf-Reader.dc.html", "B-Shelf-Library.dc.html", "B-Shelf-Locations.dc.html",
-    "C-Inspector-Reader.dc.html", "C-Inspector-Sync.dc.html", "C-Inspector-Folders.dc.html",
-    "D-Tabs-Reader.dc.html", "D-Tabs-Triage.dc.html", "D-Tabs-Sync.dc.html",
-    "First-Run.dc.html",
-    "E-Reader.dc.html", "E-Folder.dc.html"
-  ],
-  "notes": {
-    "titleE": { "x": 0, "y": -1700, "text": "E · A's sidebar, B's reader", "kind": "title1", "maxW": 2960 },
-    "noteE": { "x": -640, "y": -1400, "w": 560, "size": "m", "fill": "green", "text": "E · A'S SIDEBAR + B'S READER\n\nCore idea: A's sidebar stays on screen in every state: the folder tree with drag and drop, Unsorted, and locations with their sync state at the foot. The area to its right is B's: selecting a folder shows the folder page (stats, attached paths, session cards by month); opening a card swaps it for B's reader with one-line activity rows, Back and previous/next.\n\nDropped from B: the timeline gutter in the reader, and the kind-mix bar on session cards that used the same colour code. The Calls summary uses the tool icons instead.\n\nShell: A's 40 px title bar with global search; no status bar, because sync state is already in the sidebar foot.\n\nTrades away: no session list beside the reader (as in B), and nothing replaces the gutter for jumping around a 300-call session except the Turns list on the right.\n\nLocations sheet, folder-path editing from the sidebar, and versions carry over from A unchanged." },
-    "titleA": { "x": 0, "y": -300, "text": "A · Ledger — three panes, inline tool cards", "kind": "title1", "maxW": 4480 },
-    "noteA": { "x": -640, "y": 0, "w": 560, "size": "m", "fill": "teal", "text": "A · LEDGER\n\nCore idea: the classic library app. Folders | session list | reader, all visible at once. Tool calls stay inline in the transcript as cards; consecutive calls fold into one 'run' row (\"7 tools · 3 reads, 2 bash, 1 edit, 1 todo\") so a 300-call session reads at prose density. Locations (Local, WSL, SSH) and their sync state live in the sidebar foot; the full Locations sheet opens from there.\n\nTrades away: reading width. At 1440 the reader gets ~800 px, so split diffs are out (unified only) and wide Bash output clips. Least novel of the four.\n\nNew components: tool-run row (group of calls), version popover. Everything else exists in folio (tree with DnD) and dv (diff rows, status bar)." },
-    "titleB": { "x": 0, "y": 1100, "text": "B · Shelf — a library you open, a reader with a timeline gutter", "kind": "title1", "maxW": 4480 },
-    "noteB": { "x": -640, "y": 1400, "w": 560, "size": "m", "fill": "orange", "text": "B · SHELF\n\nCore idea: two modes, like fc and slide. The library is a page per folder (stats, attached paths, cards grouped by month); opening a session swaps the main area for a full-width reader. Tool calls become one-line activity rows; a timeline gutter on the left marks every event by kind and doubles as a scrubber across hundreds of calls. Locations is its own page in the sidebar nav.\n\nTrades away: the list beside the reader. Moving between sessions means Back (or J/K), and you can't skim titles while reading.\n\nNew components: timeline gutter (a custom-painted element: ticks + viewport bracket), activity row, session card with a kind-mix bar." },
-    "titleC": { "x": 0, "y": 2500, "text": "C · Inspector — dialogue in the middle, every call in a side pane", "kind": "title1", "maxW": 4480 },
-    "noteC": { "x": -640, "y": 2800, "w": 560, "size": "m", "fill": "purple", "text": "C · INSPECTOR\n\nCore idea: dv's shape. The centre column is only what people and models said; each turn's tool calls collapse to a strip of chips. Selecting a chip opens it in a 520 px inspector on the right: full Bash output, dv's diff renderer, a subagent's whole transcript. Sessions come from a title-bar switcher (Ctrl O) with folders inside it; each location's sync state sits in the status bar, always visible, with a popover for detail.\n\nTrades away: browsing. No permanent folder column, and drag-to-file only works inside the switcher overlay. Reading a call's detail means a glance sideways.\n\nNew components: chip strip, inspector pane with tabs, two-column switcher with DnD (dv's switcher has no tree)." },
-    "titleD": { "x": 0, "y": 3900, "text": "D · Log — search first, tabs, a dense event log", "kind": "title1", "maxW": 4480 },
-    "noteD": { "x": -640, "y": 4200, "w": 560, "size": "m", "fill": "blue", "text": "D · LOG\n\nCore idea: the archive as a searchable log. Home is a search box with tokens (model:, in:, branch:, from:). Sessions open in tabs. The reader is a 26 px-per-event log with kind filters (hide all Reads, show only Edits) and a minimap rail; prose expands to full markdown, calls expand in place. Folders are a triage board: Unsorted on the left, a column per folder, drag cards across. Sync is a tab with an ingest log.\n\nTrades away: calm reading. It looks like a log viewer; long assistant prose reads worse than in B. Tabs add state to keep.\n\nNew components: tab strip, token search field, log row, minimap rail, board columns (horizontal scroll + DnD between lists)." },
-    "titleShared": { "x": 0, "y": 5300, "text": "Shared across all four", "kind": "title1", "maxW": 1440 },
-    "noteShared": { "x": 1520, "y": 5600, "w": 560, "size": "m", "fill": "gray", "text": "ASSUMPTIONS\n\nLocations, no server: the app owns the archive on the machine it runs on and pulls transcripts from locations, as Claude's desktop app runs sessions on local, WSL and SSH targets. Local (C:\\Users\\user\\.claude), WSL distros (found automatically on Windows) and SSH hosts (user@macbook). An SSH host being asleep is a normal state: last good sync and how stale it is, not an error. Folders, paths and versions live in the local archive; every transcript shows the location it came from.\n\nLook: Geist UI 13/18, JetBrains Mono 12/20 for code, Lucide strokes, 32 px rows, 40 px title bar and 28 px status bar (dv). New accent: teal #4FC4BD dark / #0E7C78 light, chosen because violet (dv, fc), amber (folio) and blue (slide) are taken and Claude orange is the model mark. Every artboard has a Theme tweak (dark / light).\n\nGPUI: flex only, no blur, no transforms. Desktop app windows, not responsive pages." }
+  {
+   "id": "ad",
+   "name": "Concepts A–D"
+  }
+ ],
+ "boards": {
+  "E-Reader.dc.html": {
+   "x": 0,
+   "y": 0,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Reading, activity",
+   "expand": "fill",
+   "page": "e"
   },
-  "designSystems": []
+  "E-Reader-Calls-1.dc.html": {
+   "x": 1520,
+   "y": 0,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Full calls, part 1",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Reader-Calls-2.dc.html": {
+   "x": 3040,
+   "y": 0,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Full calls, part 2",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Reader-Subagent.dc.html": {
+   "x": 4560,
+   "y": 0,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Subagent, find, long session",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Versions.dc.html": {
+   "x": 6080,
+   "y": 0,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Versions",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Folder.dc.html": {
+   "x": 0,
+   "y": 1800,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Folder page, cards",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-All-Sessions.dc.html": {
+   "x": 1520,
+   "y": 1800,
+   "w": 1440,
+   "h": 900,
+   "title": "E · All sessions, list view",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Unsorted.dc.html": {
+   "x": 3040,
+   "y": 1800,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Unsorted",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Folder-Paths.dc.html": {
+   "x": 4560,
+   "y": 1800,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Folder paths",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Trash.dc.html": {
+   "x": 6080,
+   "y": 1800,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Trash",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Search.dc.html": {
+   "x": 7600,
+   "y": 1800,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Search",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-First-Run.dc.html": {
+   "x": 0,
+   "y": 3600,
+   "w": 1440,
+   "h": 900,
+   "title": "E · First run",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Locations.dc.html": {
+   "x": 1520,
+   "y": 3600,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Locations sheet",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Locations-Failed.dc.html": {
+   "x": 3040,
+   "y": 3600,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Locations sheet, failed",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Add-Location.dc.html": {
+   "x": 4560,
+   "y": 3600,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Add a location",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Settings-Archive.dc.html": {
+   "x": 0,
+   "y": 5400,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Settings, archive",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Settings.dc.html": {
+   "x": 1520,
+   "y": 5400,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Settings, sync and appearance",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Edge-First-Sync.dc.html": {
+   "x": 3040,
+   "y": 5400,
+   "w": 1440,
+   "h": 900,
+   "title": "E · First sync running",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Edge-Empty-Folder.dc.html": {
+   "x": 4560,
+   "y": 5400,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Empty folder",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Edge-Archive-Missing.dc.html": {
+   "x": 6080,
+   "y": 5400,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Archive unavailable",
+   "expand": "fill",
+   "page": "e"
+  },
+  "E-Edge-Source-Gone.dc.html": {
+   "x": 7600,
+   "y": 5400,
+   "w": 1440,
+   "h": 900,
+   "title": "E · Source gone",
+   "expand": "fill",
+   "page": "e"
+  },
+  "Main.dc.html": {
+   "x": 0,
+   "y": 0,
+   "w": 1440,
+   "h": 900,
+   "title": "A · Ledger · Reading",
+   "expand": "fill",
+   "page": "ad"
+  },
+  "A-Ledger-Sync.dc.html": {
+   "x": 1520,
+   "y": 0,
+   "w": 1440,
+   "h": 900,
+   "title": "A · Ledger · Locations sheet",
+   "expand": "fill",
+   "page": "ad"
+  },
+  "A-Ledger-Folders.dc.html": {
+   "x": 3040,
+   "y": 0,
+   "w": 1440,
+   "h": 900,
+   "title": "A · Ledger · Unsorted, folder paths, versions",
+   "expand": "fill",
+   "page": "ad"
+  },
+  "B-Shelf-Reader.dc.html": {
+   "x": 0,
+   "y": 1400,
+   "w": 1440,
+   "h": 900,
+   "title": "B · Shelf · Reading",
+   "expand": "fill",
+   "page": "ad"
+  },
+  "B-Shelf-Library.dc.html": {
+   "x": 1520,
+   "y": 1400,
+   "w": 1440,
+   "h": 900,
+   "title": "B · Shelf · Folder page + paths",
+   "expand": "fill",
+   "page": "ad"
+  },
+  "B-Shelf-Locations.dc.html": {
+   "x": 3040,
+   "y": 1400,
+   "w": 1440,
+   "h": 900,
+   "title": "B · Shelf · Locations page",
+   "expand": "fill",
+   "page": "ad"
+  },
+  "C-Inspector-Reader.dc.html": {
+   "x": 0,
+   "y": 2800,
+   "w": 1440,
+   "h": 900,
+   "title": "C · Inspector · Reading",
+   "expand": "fill",
+   "page": "ad"
+  },
+  "C-Inspector-Sync.dc.html": {
+   "x": 1520,
+   "y": 2800,
+   "w": 1440,
+   "h": 900,
+   "title": "C · Inspector · Sync popover + subagent",
+   "expand": "fill",
+   "page": "ad"
+  },
+  "C-Inspector-Folders.dc.html": {
+   "x": 3040,
+   "y": 2800,
+   "w": 1440,
+   "h": 900,
+   "title": "C · Inspector · Library switcher + folder paths",
+   "expand": "fill",
+   "page": "ad"
+  },
+  "D-Tabs-Reader.dc.html": {
+   "x": 0,
+   "y": 4200,
+   "w": 1440,
+   "h": 900,
+   "title": "D · Log · Reading",
+   "expand": "fill",
+   "page": "ad"
+  },
+  "D-Tabs-Triage.dc.html": {
+   "x": 1520,
+   "y": 4200,
+   "w": 1440,
+   "h": 900,
+   "title": "D · Log · Triage board",
+   "expand": "fill",
+   "page": "ad"
+  },
+  "D-Tabs-Sync.dc.html": {
+   "x": 3040,
+   "y": 4200,
+   "w": 1440,
+   "h": 900,
+   "title": "D · Log · Sync tab",
+   "expand": "fill",
+   "page": "ad"
+  },
+  "First-Run.dc.html": {
+   "x": 0,
+   "y": 5600,
+   "w": 1440,
+   "h": 900,
+   "title": "Shared · First run: add your first location",
+   "expand": "fill",
+   "page": "ad"
+  }
+ },
+ "order": [
+  "Main.dc.html",
+  "A-Ledger-Sync.dc.html",
+  "A-Ledger-Folders.dc.html",
+  "B-Shelf-Reader.dc.html",
+  "B-Shelf-Library.dc.html",
+  "B-Shelf-Locations.dc.html",
+  "C-Inspector-Reader.dc.html",
+  "C-Inspector-Sync.dc.html",
+  "C-Inspector-Folders.dc.html",
+  "D-Tabs-Reader.dc.html",
+  "D-Tabs-Triage.dc.html",
+  "D-Tabs-Sync.dc.html",
+  "First-Run.dc.html",
+  "E-Reader.dc.html",
+  "E-Reader-Calls-1.dc.html",
+  "E-Reader-Calls-2.dc.html",
+  "E-Reader-Subagent.dc.html",
+  "E-Versions.dc.html",
+  "E-Folder.dc.html",
+  "E-All-Sessions.dc.html",
+  "E-Unsorted.dc.html",
+  "E-Folder-Paths.dc.html",
+  "E-Trash.dc.html",
+  "E-Search.dc.html",
+  "E-First-Run.dc.html",
+  "E-Locations.dc.html",
+  "E-Locations-Failed.dc.html",
+  "E-Add-Location.dc.html",
+  "E-Settings-Archive.dc.html",
+  "E-Settings.dc.html",
+  "E-Edge-First-Sync.dc.html",
+  "E-Edge-Empty-Folder.dc.html",
+  "E-Edge-Archive-Missing.dc.html",
+  "E-Edge-Source-Gone.dc.html"
+ ],
+ "notes": {
+  "eTitle0": {
+   "x": 0,
+   "y": -300,
+   "text": "Reading",
+   "kind": "title1",
+   "maxW": 7520,
+   "page": "e"
+  },
+  "eNote_E_Reader": {
+   "x": 0,
+   "y": 940,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "Default reading state. Tool calls are one-line activity rows (kind, target, short result) that expand in place; Activity / Full calls switches them all. Facts margin: session facts, Turns outline (click jumps), Calls by kind with tool icons and no colour coding. Copy buttons on messages and code blocks. Changed from the first E board: Trash in the sidebar, search no longer claims tool output, Settings is the gear in the title bar, window controls are real buttons.",
+   "page": "e"
+  },
+  "eNote_E_Reader_Calls_1": {
+   "x": 1520,
+   "y": 940,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "Every renderer drawn open. Bash: command header, output, exit status and duration in a footer (a failing exit in red). Read: path, range of total, numbered lines, Show all. Edit: dv's diff rows with word marks. Write: an all-added diff marked new file. Grep: pattern, path, mode, matches by file with the hit highlighted. Glob: pattern and files. Todos: the list with done, doing and open states.",
+   "page": "e"
+  },
+  "eNote_E_Reader_Calls_2": {
+   "x": 3040,
+   "y": 940,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "Thinking expanded (duration on its row), web search results, web fetch with its prompt and answer, an MCP call (server, tool, JSON input and output side by side), an unknown tool shown as sent and received, the context-compaction boundary (tokens before and after, summary on demand), and an image a tool returned. New components: call body with header and footer, the boundary row.",
+   "page": "e"
+  },
+  "eNote_E_Reader_Subagent": {
+   "x": 4560,
+   "y": 940,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "A subagent call expanded: its transcript nested under the call with model, calls, duration and tokens, the task it was given, its own collapsible calls and its reply; a button opens it on its own. Find in session: 3 of 14, current match teal, others yellow, per-turn match counts in the outline. On a 38-turn session the Turns outline scrolls on its own and [ ] step through turns. This is what replaces the gutter.",
+   "page": "e"
+  },
+  "eNote_E_Versions": {
+   "x": 6080,
+   "y": 940,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "History popover from Version › History in the facts margin. v4 is held back (the source shrank), so v3 stays the reading copy until the owner chooses. Reading an older version shows a banner with the way back and the choice to make it the reading copy. Each version: date, size, why it started, how many syncs extended it.",
+   "page": "e"
+  },
+  "eTitle1": {
+   "x": 0,
+   "y": 1500,
+   "text": "Library",
+   "kind": "title1",
+   "maxW": 9040,
+   "page": "e"
+  },
+  "eNote_E_Folder": {
+   "x": 0,
+   "y": 2740,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "Cards view of fc. Paths are read-only chips with Edit paths (editing: Folder paths board). A card is being dragged onto player in the sidebar: the card goes dashed, the target row highlights, the ghost names the result; filing by drag is manual and sticks. One card shows its hover actions (star, move, Trash, more). Drawn together for review; they don't happen at once.",
+   "page": "e"
+  },
+  "eNote_E_All_Sessions": {
+   "x": 1520,
+   "y": 2740,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "The folder page's list view, as All sessions uses it: same header, filters and sort, plus a Folder column. Four filters applied as removable chips with the result count. Right-click menu with a Move to folder submenu that says how the session is filed now.",
+   "page": "e"
+  },
+  "eNote_E_Unsorted": {
+   "x": 3040,
+   "y": 2740,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "A full page, since E has no list column. Sessions grouped by project path; each group has its location tag, a draggable path chip, the count, Create folder from this path, and Attach to folder. Dragging the chip onto a sidebar folder attaches the path, limited to the chip's location, and files the group.",
+   "page": "e"
+  },
+  "eNote_E_Folder_Paths": {
+   "x": 4560,
+   "y": 2740,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "Decision: paths are edited in place on the folder page, not in a sidebar popover. FEATURES already puts the chips there, the page shows the counts and cards a change moves, and there is one editor to build. The sidebar folder menu's Edit paths… opens this. Rows: location scope (any or one), path, sessions matched; a pending add; a refused duplicate naming the folder that has it; suggestions from Unsorted; Save says what will re-file.",
+   "page": "e"
+  },
+  "eNote_E_Trash": {
+   "x": 6080,
+   "y": 2740,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "Trashed sessions with where they were, location, date and size; Restore or Delete for good. The confirmation names the session, says what is removed, that nothing is deleted at Ubuntu-24.04, that later syncs skip it, and where to undo that (Settings › Archive).",
+   "page": "e"
+  },
+  "eNote_E_Search": {
+   "x": 7600,
+   "y": 2740,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "Ctrl K palette over the current page: query, filter tokens (folder and location applied; model, branch, date offered), results grouped by session with the matching prompt, reply, command or path highlighted and its turn. Enter opens the reader at that turn. The footer says tool output isn't searched.",
+   "page": "e"
+  },
+  "eTitle2": {
+   "x": 0,
+   "y": 3300,
+   "text": "Locations and first run",
+   "kind": "title1",
+   "maxW": 6000,
+   "page": "e"
+  },
+  "eNote_E_First_Run": {
+   "x": 0,
+   "y": 4540,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "Add your first location, with no archive picker: the archive is made in the app's data folder and the footer says where. This PC and running distros are counted; a stopped distro is listed without being started. Add an SSH host opens the add flow.",
+   "page": "e"
+  },
+  "eNote_E_Locations": {
+   "x": 1520,
+   "y": 4540,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "Opens from the sidebar's locations. This PC synced, Ubuntu-24.04 syncing (files and bytes), user@macbook unreachable (outline dot, a normal state) and stale (chip plus a banner with the cleanup deadline). Debian found, not added, never started. SSH detail: name and host string only (no port, key or password), status in ssh's words, what the last test found; Remove keeps the archive.",
+   "page": "e"
+  },
+  "eNote_E_Locations_Failed": {
+   "x": 3040,
+   "y": 4540,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "The same sheet with user@macbook failed rather than unreachable: ssh's full message, why scrollback won't fix it itself, and staleness, which keeps counting. Split from the first board so the three placeholder locations can show all four states.",
+   "page": "e"
+  },
+  "eNote_E_Add_Location": {
+   "x": 4560,
+   "y": 4540,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "Three steps side by side. WSL: pick a discovered distro; a stopped one is added without starting it. SSH: a host string only; the connection test reports shell, tools, Claude Code root, sessions and cleanup period, or fails with ssh's words, the command run and what to check. Add anyway covers a host that is asleep.",
+   "page": "e"
+  },
+  "eTitle3": {
+   "x": 0,
+   "y": 5100,
+   "text": "Settings and edge states",
+   "kind": "title1",
+   "maxW": 9040,
+   "page": "e"
+  },
+  "eNote_E_Settings_Archive": {
+   "x": 0,
+   "y": 6340,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "Settings open in the main area with their own section list. Archive: where it is (default in app data), Use a different folder, size breakdown, Verify with its last result (it reports, never repairs), and sessions deleted for good with Allow archiving again.",
+   "page": "e"
+  },
+  "eNote_E_Settings": {
+   "x": 1520,
+   "y": 6340,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "Sync interval and staleness threshold, with the agent's cleanup period for context; Theme and window material as the siblings do; the read-only Shortcuts table.",
+   "page": "e"
+  },
+  "eNote_E_Edge_First_Sync": {
+   "x": 3040,
+   "y": 6340,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "Right after first run. Sessions appear in All sessions and Unsorted as they are archived and open at once; progress per location; Stop keeps what is copied. No folders yet, so a pointer to Unsorted.",
+   "page": "e"
+  },
+  "eNote_E_Edge_Empty_Folder": {
+   "x": 4560,
+   "y": 6340,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "A new folder: empty path editor with a matching suggestion from Unsorted, and a drop area that explains both ways in.",
+   "page": "e"
+  },
+  "eNote_E_Edge_Archive_Missing": {
+   "x": 6080,
+   "y": 6340,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "The archive folder (moved to E: in Settings) can't be reached. The app never makes a fresh archive in its place: Try again, Locate, or Use a different folder. Library greyed, sync paused.",
+   "page": "e"
+  },
+  "eNote_E_Edge_Source_Gone": {
+   "x": 7600,
+   "y": 6340,
+   "w": 640,
+   "size": "s",
+   "fill": "gray",
+   "text": "Claude Code deleted this session at its location. Reading is unchanged; a neutral banner and a Source row in the facts say the archive holds the only copy.",
+   "page": "e"
+  },
+  "eOverview": {
+   "x": -720,
+   "y": 0,
+   "w": 600,
+   "size": "m",
+   "fill": "green",
+   "page": "e",
+   "text": "CONCEPT E · A's sidebar, B's reader\n\nThe sidebar is always there: All sessions, Starred, Unsorted, Trash, the folder tree with drag and drop, and the locations with their sync state at the foot (click opens the locations sheet). The main area shows a folder page, Unsorted, Trash, Settings or the reader.\n\nReader: B's layout without the timeline gutter. One-line activity rows that expand in place; a facts margin with session facts, Turns and Calls by kind. No colour coding by tool kind anywhere.\n\nTitle bar: mark, Ctrl K search, Sync all, Settings, window controls. No status bar.\n\nFixed placeholder locations: This PC (Local), Ubuntu-24.04 (WSL), user@macbook (SSH). Every board has the Theme tweak."
+  },
+  "titleA": {
+   "x": 0,
+   "y": -300,
+   "text": "A · Ledger — three panes, inline tool cards",
+   "kind": "title1",
+   "maxW": 4480,
+   "page": "ad"
+  },
+  "noteA": {
+   "x": -640,
+   "y": 0,
+   "w": 560,
+   "size": "m",
+   "fill": "teal",
+   "text": "A · LEDGER\n\nCore idea: the classic library app. Folders | session list | reader, all visible at once. Tool calls stay inline in the transcript as cards; consecutive calls fold into one 'run' row (\"7 tools · 3 reads, 2 bash, 1 edit, 1 todo\") so a 300-call session reads at prose density. Locations (Local, WSL, SSH) and their sync state live in the sidebar foot; the full Locations sheet opens from there.\n\nTrades away: reading width. At 1440 the reader gets ~800 px, so split diffs are out (unified only) and wide Bash output clips. Least novel of the four.\n\nNew components: tool-run row (group of calls), version popover. Everything else exists in folio (tree with DnD) and dv (diff rows, status bar).",
+   "page": "ad"
+  },
+  "titleB": {
+   "x": 0,
+   "y": 1100,
+   "text": "B · Shelf — a library you open, a reader with a timeline gutter",
+   "kind": "title1",
+   "maxW": 4480,
+   "page": "ad"
+  },
+  "noteB": {
+   "x": -640,
+   "y": 1400,
+   "w": 560,
+   "size": "m",
+   "fill": "orange",
+   "text": "B · SHELF\n\nCore idea: two modes, like fc and slide. The library is a page per folder (stats, attached paths, cards grouped by month); opening a session swaps the main area for a full-width reader. Tool calls become one-line activity rows; a timeline gutter on the left marks every event by kind and doubles as a scrubber across hundreds of calls. Locations is its own page in the sidebar nav.\n\nTrades away: the list beside the reader. Moving between sessions means Back (or J/K), and you can't skim titles while reading.\n\nNew components: timeline gutter (a custom-painted element: ticks + viewport bracket), activity row, session card with a kind-mix bar.",
+   "page": "ad"
+  },
+  "titleC": {
+   "x": 0,
+   "y": 2500,
+   "text": "C · Inspector — dialogue in the middle, every call in a side pane",
+   "kind": "title1",
+   "maxW": 4480,
+   "page": "ad"
+  },
+  "noteC": {
+   "x": -640,
+   "y": 2800,
+   "w": 560,
+   "size": "m",
+   "fill": "purple",
+   "text": "C · INSPECTOR\n\nCore idea: dv's shape. The centre column is only what people and models said; each turn's tool calls collapse to a strip of chips. Selecting a chip opens it in a 520 px inspector on the right: full Bash output, dv's diff renderer, a subagent's whole transcript. Sessions come from a title-bar switcher (Ctrl O) with folders inside it; each location's sync state sits in the status bar, always visible, with a popover for detail.\n\nTrades away: browsing. No permanent folder column, and drag-to-file only works inside the switcher overlay. Reading a call's detail means a glance sideways.\n\nNew components: chip strip, inspector pane with tabs, two-column switcher with DnD (dv's switcher has no tree).",
+   "page": "ad"
+  },
+  "titleD": {
+   "x": 0,
+   "y": 3900,
+   "text": "D · Log — search first, tabs, a dense event log",
+   "kind": "title1",
+   "maxW": 4480,
+   "page": "ad"
+  },
+  "noteD": {
+   "x": -640,
+   "y": 4200,
+   "w": 560,
+   "size": "m",
+   "fill": "blue",
+   "text": "D · LOG\n\nCore idea: the archive as a searchable log. Home is a search box with tokens (model:, in:, branch:, from:). Sessions open in tabs. The reader is a 26 px-per-event log with kind filters (hide all Reads, show only Edits) and a minimap rail; prose expands to full markdown, calls expand in place. Folders are a triage board: Unsorted on the left, a column per folder, drag cards across. Sync is a tab with an ingest log.\n\nTrades away: calm reading. It looks like a log viewer; long assistant prose reads worse than in B. Tabs add state to keep.\n\nNew components: tab strip, token search field, log row, minimap rail, board columns (horizontal scroll + DnD between lists).",
+   "page": "ad"
+  },
+  "titleShared": {
+   "x": 0,
+   "y": 5300,
+   "text": "Shared across all four",
+   "kind": "title1",
+   "maxW": 1440,
+   "page": "ad"
+  },
+  "noteShared": {
+   "x": 1520,
+   "y": 5600,
+   "w": 560,
+   "size": "m",
+   "fill": "gray",
+   "text": "ASSUMPTIONS\n\nLocations, no server: the app owns the archive on the machine it runs on and pulls transcripts from locations, as Claude's desktop app runs sessions on local, WSL and SSH targets. Local (C:\\Users\\user\\.claude), WSL distros (found automatically on Windows) and SSH hosts (user@macbook). An SSH host being asleep is a normal state: last good sync and how stale it is, not an error. Folders, paths and versions live in the local archive; every transcript shows the location it came from.\n\nLook: Geist UI 13/18, JetBrains Mono 12/20 for code, Lucide strokes, 32 px rows, 40 px title bar and 28 px status bar (dv). New accent: teal #4FC4BD dark / #0E7C78 light, chosen because violet (dv, fc), amber (folio) and blue (slide) are taken and Claude orange is the model mark. Every artboard has a Theme tweak (dark / light).\n\nGPUI: flex only, no blur, no transforms. Desktop app windows, not responsive pages.",
+   "page": "ad"
+  }
+ },
+ "designSystems": []
 }

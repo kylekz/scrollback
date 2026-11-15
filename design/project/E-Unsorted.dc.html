@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>E · Unsorted</title>
+<script src="./support.js"></script>
+<link rel="stylesheet" href="./sb.css">
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0}
+</style>
+</helmet>
+<div class="sb {{theme}}" style="width: 100%; height: 900px">
+<svg width="0" height="0" style="position: absolute" aria-hidden="true">
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"></path><path d="M12 9v4"></path><path d="M12 17h.01"></path></symbol>
+<symbol id="i-box" viewBox="0 0 24 24"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"></path><path d="m3.3 7 8.7 5 8.7-5"></path><path d="M12 22V12"></path></symbol>
+<symbol id="i-cd" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"></path></symbol>
+<symbol id="i-claude" viewBox="0 0 24 24"><path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4"></path></symbol>
+<symbol id="i-cr" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"></path></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><path d="M22 3H2l8 9.46V19l4 2v-8.54L22 3z"></path></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path></symbol>
+<symbol id="i-folderplus" viewBox="0 0 24 24"><path d="M12 10v6"></path><path d="M9 13h6"></path><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path></symbol>
+<symbol id="i-gear" viewBox="0 0 24 24"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path><circle cx="12" cy="12" r="3"></circle></symbol>
+<symbol id="i-grip" viewBox="0 0 24 24"><circle cx="9" cy="12" r="1"></circle><circle cx="9" cy="5" r="1"></circle><circle cx="9" cy="19" r="1"></circle><circle cx="15" cy="12" r="1"></circle><circle cx="15" cy="5" r="1"></circle><circle cx="15" cy="19" r="1"></circle></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"></path><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"></path></symbol>
+<symbol id="i-laptop" viewBox="0 0 24 24"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"></path></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"></path><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"></path><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"></path></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></symbol>
+<symbol id="i-max" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="1"></rect></symbol>
+<symbol id="i-min" viewBox="0 0 24 24"><path d="M5 12h14"></path></symbol>
+<symbol id="i-monitor" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="3" rx="2"></rect><path d="M8 21h8"></path><path d="M12 17v4"></path></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"></path><path d="M12 5v14"></path></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"></path></symbol>
+<symbol id="i-sync" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path><path d="M8 16H3v5"></path></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18"></path><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"></path><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"></path><path d="M10 11v6"></path><path d="M14 11v6"></path></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></symbol>
+</svg>
+
+<div class="win">
+  <div class="titlebar">
+    <div class="mark"><i><b></b><b></b><b></b></i><span>scrollback</span></div>
+    <div class="grow row" style="justify-content: center"><button class="field" style="width: 460px" aria-label="Search the archive" aria-keyshortcuts="Control+K"><svg class="ic s14" aria-hidden="true"><use href="#i-search"></use></svg><span class="grow">Search titles, prompts, replies and commands</span><span class="kbd">Ctrl K</span></button></div>
+    <button class="btn sm"><svg class="ic s14" aria-hidden="true"><use href="#i-sync"></use></svg>Sync all</button><button class="ibtn" aria-label="Settings" aria-keyshortcuts="Control+Comma"><svg class="ic" aria-hidden="true"><use href="#i-gear"></use></svg></button>
+    <div class="caps" style="margin-left: 0"><button aria-label="Minimize"><svg class="ic s14" aria-hidden="true"><use href="#i-min"></use></svg></button><button aria-label="Maximize"><svg class="ic s12" aria-hidden="true"><use href="#i-max"></use></svg></button><button aria-label="Close"><svg class="ic s14" aria-hidden="true"><use href="#i-x"></use></svg></button></div>
+  </div>
+  <div class="row grow" style="align-items: stretch; min-height: 0">
+    <nav class="side" style="width: 248px; padding: 10px 8px 8px" aria-label="Library">
+      <div class="col" style="gap: 1px">
+        <button class="srow" style="width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-layers"></use></svg>All sessions<span class="cnt">2,318</span></button>
+        <button class="srow" style="width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-star"></use></svg>Starred<span class="cnt">14</span></button>
+        <button class="srow sel" style="width: 100%" aria-current="page"><svg class="ic" aria-hidden="true"><use href="#i-inbox"></use></svg>Unsorted<span class="cnt acc">37</span></button>
+        <button class="srow" style="width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-trash"></use></svg>Trash<span class="cnt">3</span></button>
+      </div>
+      <div class="row" style="padding: 16px 8px 6px"><span class="over">Folders</span><button class="ibtn" style="margin-left: auto; width: 22px; height: 22px" aria-label="New folder"><svg class="ic s14" aria-hidden="true"><use href="#i-plus"></use></svg></button></div>
+      <div class="col" style="gap: 1px">
+        <button class="srow" style="width: 100%"><span class="chev"><svg class="ic s12" aria-hidden="true"><use href="#i-cr"></use></svg></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>dv<span class="cnt">612</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"><svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>fc<span class="cnt">488</span></button>
+        <button class="srow" style="width: 100%"><span class="indent"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>player<span class="cnt">41</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>folio<span class="cnt">506</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>slide<span class="cnt">197</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>toolbox-rs<span class="cnt">241</span></button>
+        <button class="srow drop" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>scrollback<span class="cnt" style="color: var(--accent-text)">12</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>dotfiles<span class="cnt">64</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>Scratch<span class="cnt">161</span></button>
+      </div>
+      
+      <div class="grow"></div>
+      <div class="hair" style="margin: 0 -8px 8px"></div>
+      <div class="row" style="padding: 0 8px 4px"><span class="over">Locations</span><button class="ibtn" style="margin-left: auto; width: 22px; height: 22px" aria-label="Sync all locations"><svg class="ic s14" aria-hidden="true"><use href="#i-sync"></use></svg></button></div>
+      <div class="col" style="gap: 2px">
+        <button class="srow" style="height: 40px; width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-monitor"></use></svg><span class="col" style="min-width: 0"><span class="f2 t12 w5">This PC</span><span class="t11 f3">Local · synced 2 min ago</span></span><span class="dot ok" style="margin-left: auto"></span></button>
+        <button class="srow" style="height: 40px; width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-box"></use></svg><span class="col" style="min-width: 0"><span class="f2 t12 w5">Ubuntu-24.04</span><span class="t11 f3">WSL · synced 2 min ago</span></span><span class="dot ok" style="margin-left: auto"></span></button>
+        <button class="srow" style="height: 40px; width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-laptop"></use></svg><span class="col" style="min-width: 0"><span class="f2 t12 w5">user@macbook</span><span class="t11 yl row gap4"><svg class="ic s12" aria-hidden="true"><use href="#i-alert"></use></svg>SSH · last sync 12 days ago</span></span><span class="dot off" style="margin-left: auto"></span></button>
+      </div>
+    </nav>
+    <main class="col grow" style="overflow: hidden; padding: 20px 24px 0; gap: 14px; min-width: 0" aria-label="Unsorted">
+      <div class="row gap16" style="align-items: flex-start; flex: none">
+        <div class="av" style="width: 56px; height: 56px; border-radius: 14px; background: var(--s3); color: var(--fg2)"><svg class="ic" style="width: 26px; height: 26px; stroke-width: 1.4" aria-hidden="true"><use href="#i-inbox"></use></svg></div>
+        <div class="col gap8 grow">
+          <h1 style="margin: 0; font-size: 24px; line-height: 30px; font-weight: 600">Unsorted</h1>
+          <span class="f2" style="max-width: 760px">37 sessions whose project path no folder claims, grouped by that path. Attach a path to a folder and these sessions, and every later one from the same path, file themselves there.</span>
+        </div>
+      </div>
+      <div class="row gap6" style="flex: none">
+        <label class="field" style="height: 26px; width: 220px"><svg class="ic s14" aria-hidden="true"><use href="#i-filter"></use></svg><input class="bare" placeholder="Filter in Unsorted" aria-label="Filter in Unsorted"></label>
+        <span class="t12 f2 nums" style="margin: 0 4px">6 paths · 37 sessions</span>
+        <button class="chip">Location<svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+        <div class="grow"></div>
+        <button class="chip">Most sessions first<svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+      </div>
+      <div class="col gap12" style="overflow: hidden; min-height: 0">
+        <section class="col" style="border: 1px solid var(--line-subtle); border-radius: 10px; overflow: hidden; flex: none" aria-label="/home/user/code/advent-2025">
+          <div class="row gap8" style="height: 44px; padding: 0 10px 0 6px; background: var(--s1); border-bottom: 1px solid var(--line-subtle)">
+            <button class="ibtn" style="width: 24px; height: 24px" aria-expanded="true" aria-label="Show sessions"><svg class="ic s14" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+            <span class="chip" style="height: 28px; padding: 0 10px 0 4px; gap: 6px; cursor: grab; "><svg class="ic s12 f3" aria-hidden="true"><use href="#i-grip"></use></svg><span class="tag wsl">Ubuntu-24.04</span><span class="mono t12" style="color: var(--fg)">/home/user/code/advent-2025</span></span>
+            <span class="t12 f3 nums">14 sessions</span>
+            <div class="grow"></div>
+            <button class="btn sm"><svg class="ic s14" aria-hidden="true"><use href="#i-folderplus"></use></svg>Create folder from this path</button>
+            <button class="btn sm"><svg class="ic s14" aria-hidden="true"><use href="#i-link"></use></svg>Attach to folder<svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+          </div>
+          <div class="col"><button class="lrow"><span class="row gap8 grow" style="min-width: 0; flex: 1 1 0"><span class="w5" style="color: var(--fg)">Day 12: garden fences, part two</span><span class="f3 ell">Part one works but part two counts sides, not edges…</span></span><span class="row gap6 f2" style="width: 96px"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Opus 4.5</span><span class="nums f3" style="width: 84px">12 Dec 2025</span><span class="nums f2" style="width: 64px; text-align: right">19 calls</span></button><button class="lrow"><span class="row gap8 grow" style="min-width: 0; flex: 1 1 0"><span class="w5" style="color: var(--fg)">Day 9: disk compaction</span><span class="f3 ell">Defragment by whole files this time, right to left…</span></span><span class="row gap6 f2" style="width: 96px"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Opus 4.5</span><span class="nums f3" style="width: 84px">9 Dec 2025</span><span class="nums f2" style="width: 64px; text-align: right">27 calls</span></button><button class="lrow"><span class="row gap8 grow" style="min-width: 0; flex: 1 1 0"><span class="w5" style="color: var(--fg)">Day 6: guard patrol loops</span><span class="f3 ell">Brute force takes 40 s. Only try obstacles on the path…</span></span><span class="row gap6 f2" style="width: 96px"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Opus 4.5</span><span class="nums f3" style="width: 84px">6 Dec 2025</span><span class="nums f2" style="width: 64px; text-align: right">31 calls</span></button></div>
+        </section>
+        <section class="col" style="border: 1px solid var(--line-subtle); border-radius: 10px; overflow: hidden; flex: none" aria-label="/home/user">
+          <div class="row gap8" style="height: 44px; padding: 0 10px 0 6px; background: var(--s1); border-bottom: 1px solid var(--line-subtle)">
+            <button class="ibtn" style="width: 24px; height: 24px" aria-expanded="true" aria-label="Show sessions"><svg class="ic s14" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+            <span class="chip" style="height: 28px; padding: 0 10px 0 4px; gap: 6px; cursor: grab; "><svg class="ic s12 f3" aria-hidden="true"><use href="#i-grip"></use></svg><span class="tag wsl">Ubuntu-24.04</span><span class="mono t12" style="color: var(--fg)">/home/user</span></span>
+            <span class="t12 f3 nums">10 sessions</span>
+            <div class="grow"></div>
+            <button class="btn sm"><svg class="ic s14" aria-hidden="true"><use href="#i-folderplus"></use></svg>Create folder from this path</button>
+            <button class="btn sm"><svg class="ic s14" aria-hidden="true"><use href="#i-link"></use></svg>Attach to folder<svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+          </div>
+          <div class="col"><button class="lrow"><span class="row gap8 grow" style="min-width: 0; flex: 1 1 0"><span class="w5" style="color: var(--fg)">Why is WSL clock drifting?</span><span class="f3 ell">date in WSL is 40 s behind Windows after sleep…</span></span><span class="row gap6 f2" style="width: 96px"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Sonnet 5</span><span class="nums f3" style="width: 84px">24 Jul</span><span class="nums f2" style="width: 64px; text-align: right">12 calls</span></button><button class="lrow"><span class="row gap8 grow" style="min-width: 0; flex: 1 1 0"><span class="w5" style="color: var(--fg)">Clean up ~/.cache</span><span class="f3 ell">What in ~/.cache is safe to delete? It is 22 GB…</span></span><span class="row gap6 f2" style="width: 96px"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Sonnet 5</span><span class="nums f3" style="width: 84px">3 Jun</span><span class="nums f2" style="width: 64px; text-align: right">9 calls</span></button></div>
+        </section>
+        <section class="col" style="border: 1px solid var(--line-subtle); border-radius: 10px; overflow: hidden; flex: none" aria-label="/Users/user/code/blog">
+          <div class="row gap8" style="height: 44px; padding: 0 10px 0 6px; background: var(--s1); border-bottom: 1px solid var(--line-subtle)">
+            <button class="ibtn" style="width: 24px; height: 24px" aria-expanded="true" aria-label="Show sessions"><svg class="ic s14" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+            <span class="chip" style="height: 28px; padding: 0 10px 0 4px; gap: 6px; cursor: grab; "><svg class="ic s12 f3" aria-hidden="true"><use href="#i-grip"></use></svg><span class="tag mac">user@macbook</span><span class="mono t12" style="color: var(--fg)">/Users/user/code/blog</span></span>
+            <span class="t12 f3 nums">6 sessions</span>
+            <div class="grow"></div>
+            <button class="btn sm"><svg class="ic s14" aria-hidden="true"><use href="#i-folderplus"></use></svg>Create folder from this path</button>
+            <button class="btn sm"><svg class="ic s14" aria-hidden="true"><use href="#i-link"></use></svg>Attach to folder<svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+          </div>
+          <div class="col"><button class="lrow"><span class="row gap8 grow" style="min-width: 0; flex: 1 1 0"><span class="w5" style="color: var(--fg)">Astro 5 migration, image pipeline</span><span class="f3 ell">Move the blog to Astro 5 and switch images to the new…</span></span><span class="row gap6 f2" style="width: 96px"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Sonnet 5</span><span class="nums f3" style="width: 84px">30 Aug</span><span class="nums f2" style="width: 64px; text-align: right">112 calls</span></button></div>
+        </section>
+        <section class="col" style="border: 1px solid var(--line-subtle); border-radius: 10px; overflow: hidden; flex: none" aria-label="/home/user/code/scrollback-spike">
+          <div class="row gap8" style="height: 44px; padding: 0 10px 0 6px; background: var(--s1); border-bottom: 1px solid var(--line-subtle)">
+            <button class="ibtn" style="width: 24px; height: 24px" aria-expanded="true" aria-label="Show sessions"><svg class="ic s14" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+            <span class="chip" style="height: 28px; padding: 0 10px 0 4px; gap: 6px; cursor: grab; border-style: dashed; opacity: .5"><svg class="ic s12 f3" aria-hidden="true"><use href="#i-grip"></use></svg><span class="tag wsl">Ubuntu-24.04</span><span class="mono t12" style="color: var(--fg)">/home/user/code/scrollback-spike</span></span>
+            <span class="t12 f3 nums">3 sessions</span>
+            <div class="grow"></div>
+            <button class="btn sm"><svg class="ic s14" aria-hidden="true"><use href="#i-folderplus"></use></svg>Create folder from this path</button>
+            <button class="btn sm"><svg class="ic s14" aria-hidden="true"><use href="#i-link"></use></svg>Attach to folder<svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+          </div>
+          <div class="col"><button class="lrow" style="opacity: .45"><span class="row gap8 grow" style="min-width: 0; flex: 1 1 0"><span class="w5" style="color: var(--fg)">Parse Claude Code JSONL into turns</span><span class="f3 ell">Spike: read one transcript and print turns…</span></span><span class="row gap6 f2" style="width: 96px"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Opus 5.5</span><span class="nums f3" style="width: 84px">9 Nov</span><span class="nums f2" style="width: 64px; text-align: right">74 calls</span></button></div>
+        </section>
+        <section class="col" style="border: 1px solid var(--line-subtle); border-radius: 10px; overflow: hidden; flex: none" aria-label="/home/user/tmp/jq-playground">
+          <div class="row gap8" style="height: 44px; padding: 0 10px 0 6px; background: var(--s1); border-bottom: 1px solid var(--line-subtle)">
+            <button class="ibtn" style="width: 24px; height: 24px" aria-expanded="false" aria-label="Show sessions"><svg class="ic s14" aria-hidden="true"><use href="#i-cr"></use></svg></button>
+            <span class="chip" style="height: 28px; padding: 0 10px 0 4px; gap: 6px; cursor: grab; "><svg class="ic s12 f3" aria-hidden="true"><use href="#i-grip"></use></svg><span class="tag wsl">Ubuntu-24.04</span><span class="mono t12" style="color: var(--fg)">/home/user/tmp/jq-playground</span></span>
+            <span class="t12 f3 nums">3 sessions</span>
+            <div class="grow"></div>
+            <button class="btn sm"><svg class="ic s14" aria-hidden="true"><use href="#i-folderplus"></use></svg>Create folder from this path</button>
+            <button class="btn sm"><svg class="ic s14" aria-hidden="true"><use href="#i-link"></use></svg>Attach to folder<svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+          </div>
+          
+        </section>
+      </div>
+    </main>
+  </div>
+  <div class="drag-ghost" style="left: 120px; top: 428px; height: 34px"><svg class="ic s14 f3" aria-hidden="true"><use href="#i-link"></use></svg><span class="tag wsl">Ubuntu-24.04</span><span class="mono t12">/home/user/code/scrollback-spike</span><span class="f3">→</span><span class="acc w5">attach to scrollback</span><span class="t11 f3">files 3 sessions</span></div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["dark","light"],"default":"dark"},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { theme: this.props.theme === 'light' ? 'light' : 'dark' };
+  }
+}
+</script>
+</body>
+</html>

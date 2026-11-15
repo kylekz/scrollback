@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>E · Search</title>
+<script src="./support.js"></script>
+<link rel="stylesheet" href="./sb.css">
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0}
+</style>
+</helmet>
+<div class="sb {{theme}}" style="width: 100%; height: 900px">
+<svg width="0" height="0" style="position: absolute" aria-hidden="true">
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"></path><path d="M12 9v4"></path><path d="M12 17h.01"></path></symbol>
+<symbol id="i-box" viewBox="0 0 24 24"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"></path><path d="m3.3 7 8.7 5 8.7-5"></path><path d="M12 22V12"></path></symbol>
+<symbol id="i-cal" viewBox="0 0 24 24"><path d="M8 2v4"></path><path d="M16 2v4"></path><rect width="18" height="18" x="3" y="4" rx="2"></rect><path d="M3 10h18"></path></symbol>
+<symbol id="i-cd" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"></path></symbol>
+<symbol id="i-claude" viewBox="0 0 24 24"><path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4"></path></symbol>
+<symbol id="i-cr" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"></path></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"></path><path d="M14 2v4a2 2 0 0 0 2 2h4"></path><path d="M16 13H8"></path><path d="M16 17H8"></path></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><path d="M22 3H2l8 9.46V19l4 2v-8.54L22 3z"></path></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path></symbol>
+<symbol id="i-gear" viewBox="0 0 24 24"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path><circle cx="12" cy="12" r="3"></circle></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect width="7" height="7" x="3" y="3" rx="1"></rect><rect width="7" height="7" x="14" y="3" rx="1"></rect><rect width="7" height="7" x="14" y="14" rx="1"></rect><rect width="7" height="7" x="3" y="14" rx="1"></rect></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"></path><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"></path></symbol>
+<symbol id="i-laptop" viewBox="0 0 24 24"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"></path></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"></path><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"></path><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"></path></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h13"></path><path d="M8 12h13"></path><path d="M8 18h13"></path><path d="M3 6h.01"></path><path d="M3 12h.01"></path><path d="M3 18h.01"></path></symbol>
+<symbol id="i-max" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="1"></rect></symbol>
+<symbol id="i-min" viewBox="0 0 24 24"><path d="M5 12h14"></path></symbol>
+<symbol id="i-monitor" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="3" rx="2"></rect><path d="M8 21h8"></path><path d="M12 17v4"></path></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle><circle cx="5" cy="12" r="1"></circle></symbol>
+<symbol id="i-msg" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"></path><path d="M12 5v14"></path></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"></path></symbol>
+<symbol id="i-sync" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path><path d="M8 16H3v5"></path></symbol>
+<symbol id="i-term" viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"></path><path d="M12 19h8"></path></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18"></path><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"></path><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"></path><path d="M10 11v6"></path><path d="M14 11v6"></path></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="5"></circle><path d="M20 21a8 8 0 0 0-16 0"></path></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></symbol>
+</svg>
+
+<div class="win">
+  <div class="titlebar">
+    <div class="mark"><i><b></b><b></b><b></b></i><span>scrollback</span></div>
+    <div class="grow row" style="justify-content: center"><button class="field" style="width: 460px" aria-label="Search the archive" aria-keyshortcuts="Control+K"><svg class="ic s14" aria-hidden="true"><use href="#i-search"></use></svg><span class="grow">Search titles, prompts, replies and commands</span><span class="kbd">Ctrl K</span></button></div>
+    <button class="btn sm"><svg class="ic s14" aria-hidden="true"><use href="#i-sync"></use></svg>Sync all</button><button class="ibtn" aria-label="Settings" aria-keyshortcuts="Control+Comma"><svg class="ic" aria-hidden="true"><use href="#i-gear"></use></svg></button>
+    <div class="caps" style="margin-left: 0"><button aria-label="Minimize"><svg class="ic s14" aria-hidden="true"><use href="#i-min"></use></svg></button><button aria-label="Maximize"><svg class="ic s12" aria-hidden="true"><use href="#i-max"></use></svg></button><button aria-label="Close"><svg class="ic s14" aria-hidden="true"><use href="#i-x"></use></svg></button></div>
+  </div>
+  <div class="row grow" style="align-items: stretch; min-height: 0">
+    <nav class="side" style="width: 248px; padding: 10px 8px 8px" aria-label="Library">
+      <div class="col" style="gap: 1px">
+        <button class="srow" style="width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-layers"></use></svg>All sessions<span class="cnt">2,318</span></button>
+        <button class="srow" style="width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-star"></use></svg>Starred<span class="cnt">14</span></button>
+        <button class="srow" style="width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-inbox"></use></svg>Unsorted<span class="cnt acc">37</span></button>
+        <button class="srow" style="width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-trash"></use></svg>Trash<span class="cnt">3</span></button>
+      </div>
+      <div class="row" style="padding: 16px 8px 6px"><span class="over">Folders</span><button class="ibtn" style="margin-left: auto; width: 22px; height: 22px" aria-label="New folder"><svg class="ic s14" aria-hidden="true"><use href="#i-plus"></use></svg></button></div>
+      <div class="col" style="gap: 1px">
+        <button class="srow" style="width: 100%"><span class="chev"><svg class="ic s12" aria-hidden="true"><use href="#i-cr"></use></svg></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>dv<span class="cnt">612</span></button>
+        <button class="srow sel" style="width: 100%" aria-current="page"><span class="chev"><svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>fc<span class="cnt">488</span></button>
+        <button class="srow" style="width: 100%"><span class="indent"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>player<span class="cnt">41</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>folio<span class="cnt">506</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>slide<span class="cnt">197</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>toolbox-rs<span class="cnt">241</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>scrollback<span class="cnt">12</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>dotfiles<span class="cnt">64</span></button>
+        <button class="srow" style="width: 100%"><span class="chev"></span><svg class="ic" aria-hidden="true"><use href="#i-folder"></use></svg>Scratch<span class="cnt">161</span></button>
+      </div>
+      
+      <div class="grow"></div>
+      <div class="hair" style="margin: 0 -8px 8px"></div>
+      <div class="row" style="padding: 0 8px 4px"><span class="over">Locations</span><button class="ibtn" style="margin-left: auto; width: 22px; height: 22px" aria-label="Sync all locations"><svg class="ic s14" aria-hidden="true"><use href="#i-sync"></use></svg></button></div>
+      <div class="col" style="gap: 2px">
+        <button class="srow" style="height: 40px; width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-monitor"></use></svg><span class="col" style="min-width: 0"><span class="f2 t12 w5">This PC</span><span class="t11 f3">Local · synced 2 min ago</span></span><span class="dot ok" style="margin-left: auto"></span></button>
+        <button class="srow" style="height: 40px; width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-box"></use></svg><span class="col" style="min-width: 0"><span class="f2 t12 w5">Ubuntu-24.04</span><span class="t11 f3">WSL · synced 2 min ago</span></span><span class="dot ok" style="margin-left: auto"></span></button>
+        <button class="srow" style="height: 40px; width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-laptop"></use></svg><span class="col" style="min-width: 0"><span class="f2 t12 w5">user@macbook</span><span class="t11 yl row gap4"><svg class="ic s12" aria-hidden="true"><use href="#i-alert"></use></svg>SSH · last sync 12 days ago</span></span><span class="dot off" style="margin-left: auto"></span></button>
+      </div>
+    </nav>
+    <main class="col grow" style="overflow: hidden; padding: 20px 24px 0; gap: 16px; min-width: 0" aria-label="Sessions in fc">
+      <div class="row gap16" style="align-items: flex-start; flex: none">
+        <div class="av" style="width: 56px; height: 56px; border-radius: 14px; background: var(--accent-soft); color: var(--accent-text)"><svg class="ic" style="width: 26px; height: 26px; stroke-width: 1.4" aria-hidden="true"><use href="#i-folder"></use></svg></div>
+        <div class="col gap8 grow">
+          <h1 style="margin: 0; font-size: 24px; line-height: 30px; font-weight: 600">fc</h1>
+          <div class="row" style="gap: 28px"><div class="col"><span class="nums" style="font-size: 18px; font-weight: 500">488</span><span class="t12 f3">sessions</span></div><div class="col"><span class="nums" style="font-size: 18px; font-weight: 500">52,914</span><span class="t12 f3">tool calls</span></div><div class="col"><span class="nums" style="font-size: 18px; font-weight: 500">Nov 2025 – Nov 2026</span><span class="t12 f3">span</span></div><div class="col"><span class="nums" style="font-size: 18px; font-weight: 500">3</span><span class="t12 f3">locations</span></div></div>
+        </div>
+        
+        <button class="ibtn" style="border: 1px solid var(--line)" aria-label="Folder actions"><svg class="ic" aria-hidden="true"><use href="#i-more"></use></svg></button>
+      </div>
+      <div class="row gap6" style="flex: none; flex-wrap: wrap">
+        <label class="field" style="height: 26px; width: 220px"><svg class="ic s14" aria-hidden="true"><use href="#i-filter"></use></svg><input class="bare" placeholder="Filter in fc" aria-label="Filter in fc"></label>
+        <span class="t12 f2 nums" style="margin: 0 4px">All 488</span>
+        <button class="chip">Model<svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button><button class="chip">Branch<svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button><button class="chip">Location<svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button><button class="chip">Date<svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button><button class="chip" aria-pressed="false"><svg class="ic s12" aria-hidden="true"><use href="#i-star"></use></svg>Starred</button>
+        <div class="grow"></div>
+        <button class="chip">Newest first<svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+        <div class="seg" role="group" aria-label="View"><button class="on" aria-pressed="true" aria-label="Cards"><svg class="ic s14" aria-hidden="true"><use href="#i-grid"></use></svg></button><button aria-pressed="false" aria-label="List"><svg class="ic s14" aria-hidden="true"><use href="#i-list"></use></svg></button></div>
+      </div>
+      <div class="over">November 2026</div>
+      <div class="row" style="flex-wrap: wrap; gap: 12px">
+        <div class="scard">
+          <span class="row gap6"><a href="#" class="w6 ell grow" style="color: inherit; text-decoration: none">Downloads: paste a whole playlist</a><span class="yl" aria-label="Starred"><svg class="ic s12" aria-hidden="true"><use href="#i-star"></use></svg></span></span>
+          <span class="t12 f2" style="height: 36px; overflow: hidden">A playlist URL should expand into its videos before matching, with a count on the paste badge…</span>
+          <span class="row gap6 t11 f3"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Fable 5.2<span class="tag mac" style="height: 16px">user@macbook</span><span class="grow"></span><span class="nums">12 Nov · 68 calls</span></span>
+        </div>
+        <div class="scard">
+          <span class="row gap6"><a href="#" class="w6 ell grow" style="color: inherit; text-decoration: none">libmpv hwdec fallback on AV1</a></span>
+          <span class="t12 f2" style="height: 36px; overflow: hidden">On the Intel box AV1 4K drops to software decode and stutters. Fall back to…</span>
+          <span class="row gap6 t11 f3"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Sonnet 5<span class="tag wsl" style="height: 16px">Ubuntu-24.04</span><span class="grow"></span><span class="nums">9 Nov · 37 calls</span></span>
+        </div>
+        <div class="scard">
+          <span class="row gap6"><a href="#" class="w6 ell grow" style="color: inherit; text-decoration: none">Portrait layout for vertical cams</a></span>
+          <span class="t12 f2" style="height: 36px; overflow: hidden">Vertical fancams letterbox into a tiny strip. Detect 9:16 and lay the player out side by side…</span>
+          <span class="row gap6 t11 f3"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Opus 5.5<span class="tag win" style="height: 16px">This PC</span><span class="grow"></span><span class="nums">2 Nov · 118 calls</span></span>
+        </div>
+        <div class="scard">
+          <span class="row gap6"><a href="#" class="w6 ell grow" style="color: inherit; text-decoration: none">Frame-step keys in the player</a></span>
+          <span class="t12 f2" style="height: 36px; overflow: hidden">, and . should step one frame while paused, like mpv. Hold for repeat at 12 fps.</span>
+          <span class="row gap6 t11 f3"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Opus 5.5<span class="tag wsl" style="height: 16px">Ubuntu-24.04</span><span class="grow"></span><span class="nums">1 Nov · 44 calls</span></span>
+        </div>
+      </div>
+      <div class="over">October 2026</div>
+      <div class="row" style="flex-wrap: wrap; gap: 12px">
+        <div class="scard">
+          <span class="row gap6"><a href="#" class="w6 ell grow" style="color: inherit; text-decoration: none">Line up four cams by their sound</a><span class="yl" aria-label="Starred"><svg class="ic s12" aria-hidden="true"><use href="#i-star"></use></svg></span></span>
+          <span class="t12 f2" style="height: 36px; overflow: hidden">Cross-correlate the audio of up to four cams and offset each player so…</span>
+          <span class="row gap6 t11 f3"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Opus 5.5<span class="tag wsl" style="height: 16px">Ubuntu-24.04</span><span class="grow"></span><span class="nums">21 Oct · 241 calls</span></span>
+        </div>
+        <div class="scard">
+          <span class="row gap6"><a href="#" class="w6 ell grow" style="color: inherit; text-decoration: none">Stickers as baked SVG, not rotated divs</a></span>
+          <span class="t12 f2" style="height: 36px; overflow: hidden">gpui can't rotate a div. Bake the −4° tilt into the sticker SVGs and…</span>
+          <span class="row gap6 t11 f3"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Opus 5.5<span class="tag win" style="height: 16px">This PC</span><span class="grow"></span><span class="nums">17 Oct · 28 calls</span></span>
+        </div>
+        <div class="scard">
+          <span class="row gap6"><a href="#" class="w6 ell grow" style="color: inherit; text-decoration: none">Inbox auto-accept threshold</a></span>
+          <span class="t12 f2" style="height: 36px; overflow: hidden">Accept the agent's match automatically above 0.92 and show why in the…</span>
+          <span class="row gap6 t11 f3"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Sonnet 5<span class="tag wsl" style="height: 16px">Ubuntu-24.04</span><span class="grow"></span><span class="nums">6 Oct · 68 calls</span></span>
+        </div>
+        <div class="scard">
+          <span class="row gap6"><a href="#" class="w6 ell grow" style="color: inherit; text-decoration: none">Hangul in mono paths</a></span>
+          <span class="t12 f2" style="height: 36px; overflow: hidden">Paths with 카리나 render as tofu in Plex Mono. Add Nanum Gothic Coding as…</span>
+          <span class="row gap6 t11 f3"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Opus 5.5<span class="tag mac" style="height: 16px">user@macbook</span><span class="grow"></span><span class="nums">2 Oct · 16 calls</span></span>
+        </div>
+      </div>
+      <div class="over">September 2026</div>
+      <div class="row" style="flex-wrap: wrap; gap: 12px">
+        <div class="scard">
+          <span class="row gap6"><a href="#" class="w6 ell grow" style="color: inherit; text-decoration: none">Romanized search for Hangul names</a></span>
+          <span class="t12 f2" style="height: 36px; overflow: hidden">Typing "karina" should find 카리나. Build a romanization index that…</span>
+          <span class="row gap6 t11 f3"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Sonnet 5<span class="tag mac" style="height: 16px">user@macbook</span><span class="grow"></span><span class="nums">28 Sep · 88 calls</span></span>
+        </div>
+        <div class="scard">
+          <span class="row gap6"><a href="#" class="w6 ell grow" style="color: inherit; text-decoration: none">Library health panel</a></span>
+          <span class="t12 f2" style="height: 36px; overflow: hidden">One place for background work: backfill, thumbnails, orphaned files…</span>
+          <span class="row gap6 t11 f3"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Opus 4.6<span class="tag wsl" style="height: 16px">Ubuntu-24.04</span><span class="grow"></span><span class="nums">19 Sep · 132 calls</span></span>
+        </div>
+        <div class="scard">
+          <span class="row gap6"><a href="#" class="w6 ell grow" style="color: inherit; text-decoration: none">Drop the sqlez copy from fc_db</a></span>
+          <span class="t12 f2" style="height: 36px; overflow: hidden">fc_db carries three files from Zed's sqlez. Move to toolbox_store…</span>
+          <span class="row gap6 t11 f3"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Opus 5.5<span class="tag wsl" style="height: 16px">Ubuntu-24.04</span><span class="grow"></span><span class="nums">8 Sep · 196 calls</span></span>
+        </div>
+        <div class="scard">
+          <span class="row gap6"><a href="#" class="w6 ell grow" style="color: inherit; text-decoration: none">Thumbnail cache eviction</a></span>
+          <span class="t12 f2" style="height: 36px; overflow: hidden">The thumbnail cache grew to 9 GB. Evict by last-viewed, keep starred…</span>
+          <span class="row gap6 t11 f3"><svg class="ic mm s12" aria-hidden="true"><use href="#i-claude"></use></svg>Sonnet 5<span class="tag win" style="height: 16px">This PC</span><span class="grow"></span><span class="nums">3 Sep · 57 calls</span></span>
+        </div>
+      </div>
+    </main>
+  </div>
+  <div class="scrim"></div>
+  <section class="pop" style="left: 300px; top: 64px; width: 840px; max-height: 760px" role="dialog" aria-modal="true" aria-label="Search the archive">
+    <div class="col gap8" style="padding: 12px 14px 10px; border-bottom: 1px solid var(--line-subtle)">
+      <label class="row gap8" style="height: 32px"><svg class="ic s18 f3" aria-hidden="true"><use href="#i-search"></use></svg><input class="bare" style="font-size: 16px" value="backoff 429" aria-label="Search the archive"><span class="kbd">Esc</span></label>
+      <div class="row gap6" style="flex-wrap: wrap">
+        <button class="chip acc"><svg class="ic s12" aria-hidden="true"><use href="#i-folder"></use></svg>Folder: fc<svg class="ic s12" aria-hidden="true"><use href="#i-x"></use></svg></button>
+        <button class="chip acc"><svg class="ic s12" aria-hidden="true"><use href="#i-box"></use></svg>Location: Ubuntu-24.04<svg class="ic s12" aria-hidden="true"><use href="#i-x"></use></svg></button>
+        <button class="chip">Model<svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+        <button class="chip">Branch<svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+        <button class="chip"><svg class="ic s12" aria-hidden="true"><use href="#i-cal"></use></svg>Date<svg class="ic s12" aria-hidden="true"><use href="#i-cd"></use></svg></button>
+        <span class="t12 f3" style="margin-left: auto">11 matches in 4 sessions</span>
+      </div>
+    </div>
+    <div class="col" style="padding: 6px; overflow: hidden">
+      <div class="col" style="padding: 4px 0">
+          <div class="row gap8" style="height: 28px; padding: 0 10px; border-radius: 6px; background: var(--s3);"><svg class="ic s14 f3" aria-hidden="true"><use href="#i-msg"></use></svg><span class="w5 ell">Throttle yt-dlp metadata backfill</span><span class="row gap4 t12 f3"><svg class="ic s12" aria-hidden="true"><use href="#i-folder"></use></svg>fc</span><span class="tag wsl">Ubuntu-24.04</span><span class="t12 f3 nums">14 Mar 2026</span><span class="t11 f3 nums" style="margin-left: auto">5 matches</span></div>
+          <button class="row gap8" style="align-items: flex-start; padding: 5px 10px 5px 34px; border-radius: 6px; width: 100%; font-size: 12.5px; line-height: 19px">
+            <span class="row gap4 f3" style="width: 76px; flex: none; padding-top: 1px"><svg class="ic s12" aria-hidden="true"><use href="#i-user"></use></svg><span class="t11">prompt</span></span>
+            <span class="grow f2" style="min-width: 0">Throttle it: a few at a time, <span class="hl">back off</span> on <span class="hl">429</span>, and show progress in Library health…</span>
+            <span class="t11 f3 nums" style="flex: none">turn 1</span>
+          </button><button class="row gap8" style="align-items: flex-start; padding: 5px 10px 5px 34px; border-radius: 6px; width: 100%; font-size: 12.5px; line-height: 19px">
+            <span class="row gap4 f3" style="width: 76px; flex: none; padding-top: 1px"><svg class="ic s12" aria-hidden="true"><use href="#i-term"></use></svg><span class="t11">command</span></span>
+            <span class="grow f2" style="min-width: 0"><span class="mono t12">rg -n "<span class="hl">backoff</span>|<span class="hl">429</span>" crates/fc_tools</span></span>
+            <span class="t11 f3 nums" style="flex: none">turn 2</span>
+          </button><button class="row gap8" style="align-items: flex-start; padding: 5px 10px 5px 34px; border-radius: 6px; width: 100%; font-size: 12.5px; line-height: 19px">
+            <span class="row gap4 f3" style="width: 76px; flex: none; padding-top: 1px"><svg class="ic s12" aria-hidden="true"><use href="#i-claude"></use></svg><span class="t11">reply</span></span>
+            <span class="grow f2" style="min-width: 0"><span class="hl">HTTP Error 429</span> on stderr becomes <code class="mono t12">FetchError::RateLimited</code>; the loop waits with a doubling <span class="hl">backoff</span>.</span>
+            <span class="t11 f3 nums" style="flex: none">turn 2</span>
+          </button><button class="row gap8" style="align-items: flex-start; padding: 5px 10px 5px 34px; border-radius: 6px; width: 100%; font-size: 12.5px; line-height: 19px">
+            <span class="row gap4 f3" style="width: 76px; flex: none; padding-top: 1px"><svg class="ic s12" aria-hidden="true"><use href="#i-file"></use></svg><span class="t11">path</span></span>
+            <span class="grow f2" style="min-width: 0"><span class="mono t12">crates/fc_tools/src/<span class="hl">backoff</span>.rs</span></span>
+            <span class="t11 f3 nums" style="flex: none">turn 3</span>
+          </button>
+        </div>
+      <div class="col" style="padding: 4px 0">
+          <div class="row gap8" style="height: 28px; padding: 0 10px; border-radius: 6px;"><svg class="ic s14 f3" aria-hidden="true"><use href="#i-msg"></use></svg><span class="w5 ell">Back off on 429 only, not on 403</span><span class="row gap4 t12 f3"><svg class="ic s12" aria-hidden="true"><use href="#i-folder"></use></svg>fc</span><span class="tag wsl">Ubuntu-24.04</span><span class="t12 f3 nums">15 Mar 2026</span><span class="t11 f3 nums" style="margin-left: auto">3 matches</span></div>
+          <button class="row gap8" style="align-items: flex-start; padding: 5px 10px 5px 34px; border-radius: 6px; width: 100%; font-size: 12.5px; line-height: 19px">
+            <span class="row gap4 f3" style="width: 76px; flex: none; padding-top: 1px"><svg class="ic s12" aria-hidden="true"><use href="#i-user"></use></svg><span class="t11">prompt</span></span>
+            <span class="grow f2" style="min-width: 0">A 403 means the cookies expired; <span class="hl">backing off</span> just hides it. Only <span class="hl">429</span> should wait.</span>
+            <span class="t11 f3 nums" style="flex: none">turn 1</span>
+          </button><button class="row gap8" style="align-items: flex-start; padding: 5px 10px 5px 34px; border-radius: 6px; width: 100%; font-size: 12.5px; line-height: 19px">
+            <span class="row gap4 f3" style="width: 76px; flex: none; padding-top: 1px"><svg class="ic s12" aria-hidden="true"><use href="#i-claude"></use></svg><span class="t11">reply</span></span>
+            <span class="grow f2" style="min-width: 0"><code class="mono t12">Backoff::wait</code> now runs for <span class="hl">429</span> only; 403 surfaces as "Sign in again" in Library health.</span>
+            <span class="t11 f3 nums" style="flex: none">turn 1</span>
+          </button>
+        </div>
+      <div class="col" style="padding: 4px 0">
+          <div class="row gap8" style="height: 28px; padding: 0 10px; border-radius: 6px;"><svg class="ic s14 f3" aria-hidden="true"><use href="#i-msg"></use></svg><span class="w5 ell">Line up four cams by their sound</span><span class="row gap4 t12 f3"><svg class="ic s12" aria-hidden="true"><use href="#i-folder"></use></svg>fc</span><span class="tag wsl">Ubuntu-24.04</span><span class="t12 f3 nums">21 Oct 2026</span><span class="t11 f3 nums" style="margin-left: auto">2 matches</span></div>
+          <button class="row gap8" style="align-items: flex-start; padding: 5px 10px 5px 34px; border-radius: 6px; width: 100%; font-size: 12.5px; line-height: 19px">
+            <span class="row gap4 f3" style="width: 76px; flex: none; padding-top: 1px"><svg class="ic s12" aria-hidden="true"><use href="#i-term"></use></svg><span class="t11">command</span></span>
+            <span class="grow f2" style="min-width: 0"><span class="mono t12">yt-dlp --sleep-requests 2 --retry-sleep http:exp=1:120 …  # <span class="hl">backoff</span> on <span class="hl">429</span></span></span>
+            <span class="t11 f3 nums" style="flex: none">turn 14</span>
+          </button>
+        </div>
+      <div class="col" style="padding: 4px 0">
+          <div class="row gap8" style="height: 28px; padding: 0 10px; border-radius: 6px;"><svg class="ic s14 f3" aria-hidden="true"><use href="#i-msg"></use></svg><span class="w5 ell">Thumbnail cache eviction</span><span class="row gap4 t12 f3"><svg class="ic s12" aria-hidden="true"><use href="#i-folder"></use></svg>fc</span><span class="tag wsl">Ubuntu-24.04</span><span class="t12 f3 nums">3 Sep 2026</span><span class="t11 f3 nums" style="margin-left: auto">1 match</span></div>
+          <button class="row gap8" style="align-items: flex-start; padding: 5px 10px 5px 34px; border-radius: 6px; width: 100%; font-size: 12.5px; line-height: 19px">
+            <span class="row gap4 f3" style="width: 76px; flex: none; padding-top: 1px"><svg class="ic s12" aria-hidden="true"><use href="#i-claude"></use></svg><span class="t11">reply</span></span>
+            <span class="grow f2" style="min-width: 0">Thumbnail fetches share the metadata <span class="hl">backoff</span>, so a <span class="hl">429</span> pauses both.</span>
+            <span class="t11 f3 nums" style="flex: none">turn 6</span>
+          </button>
+        </div>
+    </div>
+    <div class="row gap12 t11 f3" style="padding: 8px 14px; border-top: 1px solid var(--line-subtle); background: var(--s1)">
+      <span class="row gap4"><span class="kbd">↑</span><span class="kbd">↓</span>move</span>
+      <span class="row gap4"><span class="kbd">Enter</span>open at the match</span>
+      <span class="row gap4"><span class="kbd">Tab</span>add a filter</span>
+      <span style="margin-left: auto">Searches titles, prompts, replies, and tool calls' commands and paths. Tool output isn't searched.</span>
+    </div>
+  </section>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["dark","light"],"default":"dark"},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { theme: this.props.theme === 'light' ? 'light' : 'dark' };
+  }
+}
+</script>
+</body>
+</html>

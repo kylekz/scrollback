@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>E · First sync running</title>
+<script src="./support.js"></script>
+<link rel="stylesheet" href="./sb.css">
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0}
+</style>
+</helmet>
+<div class="sb {{theme}}" style="width: 100%; height: 900px">
+<svg width="0" height="0" style="position: absolute" aria-hidden="true">
+<symbol id="i-box" viewBox="0 0 24 24"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"></path><path d="m3.3 7 8.7 5 8.7-5"></path><path d="M12 22V12"></path></symbol>
+<symbol id="i-gear" viewBox="0 0 24 24"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path><circle cx="12" cy="12" r="3"></circle></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"></path><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"></path></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"></path><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"></path><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"></path></symbol>
+<symbol id="i-max" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="1"></rect></symbol>
+<symbol id="i-min" viewBox="0 0 24 24"><path d="M5 12h14"></path></symbol>
+<symbol id="i-monitor" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="3" rx="2"></rect><path d="M8 21h8"></path><path d="M12 17v4"></path></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 4v16"></path><path d="M16 4v16"></path></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"></path><path d="M12 5v14"></path></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"></path></symbol>
+<symbol id="i-sync" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path><path d="M8 16H3v5"></path></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18"></path><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"></path><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"></path><path d="M10 11v6"></path><path d="M14 11v6"></path></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></symbol>
+</svg>
+
+<div class="win">
+  <div class="titlebar">
+    <div class="mark"><i><b></b><b></b><b></b></i><span>scrollback</span></div>
+    <div class="grow row" style="justify-content: center"><button class="field" style="width: 460px" aria-label="Search the archive" aria-keyshortcuts="Control+K"><svg class="ic s14" aria-hidden="true"><use href="#i-search"></use></svg><span class="grow">Search titles, prompts, replies and commands</span><span class="kbd">Ctrl K</span></button></div>
+    <button class="btn sm"><svg class="ic s14" aria-hidden="true"><use href="#i-sync"></use></svg>Sync all</button><button class="ibtn" aria-label="Settings" aria-keyshortcuts="Control+Comma"><svg class="ic" aria-hidden="true"><use href="#i-gear"></use></svg></button>
+    <div class="caps" style="margin-left: 0"><button aria-label="Minimize"><svg class="ic s14" aria-hidden="true"><use href="#i-min"></use></svg></button><button aria-label="Maximize"><svg class="ic s12" aria-hidden="true"><use href="#i-max"></use></svg></button><button aria-label="Close"><svg class="ic s14" aria-hidden="true"><use href="#i-x"></use></svg></button></div>
+  </div>
+  <div class="row grow" style="align-items: stretch; min-height: 0">
+    <nav class="side" style="width: 248px; padding: 10px 8px 8px" aria-label="Library">
+      <div class="col" style="gap: 1px">
+        <button class="srow sel" style="width: 100%" aria-current="page"><svg class="ic" aria-hidden="true"><use href="#i-layers"></use></svg>All sessions<span class="cnt">214</span></button>
+        <button class="srow" style="width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-star"></use></svg>Starred<span class="cnt">0</span></button>
+        <button class="srow" style="width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-inbox"></use></svg>Unsorted<span class="cnt acc">214</span></button>
+        <button class="srow" style="width: 100%"><svg class="ic" aria-hidden="true"><use href="#i-trash"></use></svg>Trash<span class="cnt">0</span></button>
+      </div>
+      <div class="row" style="padding: 16px 8px 6px"><span class="over">Folders</span><button class="ibtn" style="margin-left: auto; width: 22px; height: 22px" aria-label="New folder"><svg class="ic s14" aria-hidden="true"><use href="#i-plus"></use></svg></button></div>
+      <div class="col" style="gap: 1px">
+        
+      </div>
+      <span class="t12 f3" style="padding: 0 8px">None yet. Unsorted groups sessions by project path; make folders from there.</span>
+      <div class="grow"></div>
+      <div class="hair" style="margin: 0 -8px 8px"></div>
+      <div class="row" style="padding: 0 8px 4px"><span class="over">Locations</span><button class="ibtn" style="margin-left: auto; width: 22px; height: 22px" aria-label="Sync all locations"><svg class="ic s14" aria-hidden="true"><use href="#i-sync"></use></svg></button></div>
+      <div class="col" style="gap: 2px">
+        <button class="srow" style="height: 48px; width: 100%" aria-label="This PC: syncing, open locations"><svg class="ic" aria-hidden="true"><use href="#i-monitor"></use></svg><span class="col grow" style="gap: 3px"><span class="row"><span class="f2 t12 w5">This PC</span><span class="t11 acc nums" style="margin-left: auto">1.1 / 1.4 GB</span></span><span class="bar"><i style="width: 78%"></i></span><span class="t11 f3">Local · first sync</span></span></button>
+        <button class="srow" style="height: 48px; width: 100%" aria-label="Ubuntu-24.04: syncing, open locations"><svg class="ic" aria-hidden="true"><use href="#i-box"></use></svg><span class="col grow" style="gap: 3px"><span class="row"><span class="f2 t12 w5">Ubuntu-24.04</span><span class="t11 acc nums" style="margin-left: auto">7,412 / 31,882</span></span><span class="bar"><i style="width: 23%"></i></span><span class="t11 f3">WSL · first sync · 0.9 / 3.8 GB</span></span></button>
+      </div>
+    </nav>
+    <main class="col grow" style="overflow: hidden; padding: 20px 24px 0; gap: 14px; min-width: 0" aria-label="All sessions">
+      <div class="row gap16" style="align-items: flex-start; flex: none">
+        <div class="av" style="width: 56px; height: 56px; border-radius: 14px; background: var(--s3); color: var(--fg2)"><svg class="ic" style="width: 26px; height: 26px; stroke-width: 1.4" aria-hidden="true"><use href="#i-layers"></use></svg></div>
+        <div class="col gap8 grow">
+          <h1 style="margin: 0; font-size: 24px; line-height: 30px; font-weight: 600">All sessions</h1>
+          <span class="f2">214 archived so far. Each one appears as soon as it is copied, and you can open it right away.</span>
+        </div>
+      </div>
+      <section class="card col gap12" style="padding: 14px 16px; flex: none" aria-label="First sync">
+        <div class="row gap8"><span class="w6">First sync</span><span class="t12 f3">started 09:02 · about 20 min left</span><button class="btn sm" style="margin-left: auto"><svg class="ic s12" aria-hidden="true"><use href="#i-pause"></use></svg>Stop</button></div>
+        <div class="row gap16">
+          <div class="col gap6 grow"><div class="row gap8 t12"><svg class="ic s14 f3" aria-hidden="true"><use href="#i-monitor"></use></svg><span class="w5">This PC</span><span class="f3 nums" style="margin-left: auto">362 of 418 sessions · 1.1 of 1.4 GB</span></div><span class="bar"><i style="width: 78%"></i></span></div>
+          <div class="col gap6 grow"><div class="row gap8 t12"><svg class="ic s14 f3" aria-hidden="true"><use href="#i-box"></use></svg><span class="w5">Ubuntu-24.04</span><span class="f3 nums" style="margin-left: auto">7,412 of 31,882 files · 0.9 of 3.8 GB</span></div><span class="bar"><i style="width: 23%"></i></span></div>
+        </div>
+        <span class="t12 f3">Stopping keeps everything copied so far; the next sync carries on from there.</span>
+      </section>
+      <div class="banner info" style="flex: none"><svg class="ic s14" aria-hidden="true"><use href="#i-inbox"></use></svg><span class="grow f2">No folders yet, so everything lands in Unsorted, grouped by project path. Make folders from those paths there.</span><button class="btn sm">Open Unsorted</button></div>
+      <div class="col grow" style="border: 1px solid var(--line-subtle); border-radius: 10px 10px 0 0; border-bottom: 0; overflow: hidden; min-height: 0">
+        <div class="lrow head" style="background: var(--s1)"><span class="grow" style="flex: 1 1 0">Title</span><span style="width: 220px">Project path</span><span style="width: 104px">Location</span><span style="width: 72px">Date</span><span style="width: 44px; text-align: right">Calls</span></div>
+        <button class="lrow"><span class="row gap8 grow" style="min-width: 0; flex: 1 1 0"><span class="w5" style="color: var(--fg)">Locations sheet: stale warning</span><span class="f3 ell">A location that has not synced for 7 days should…</span></span><span class="t11 f3">indexing…</span><span class="mono t11 f3 ell" style="width: 220px">/home/user/code/scrollback</span><span style="width: 104px"><span class="tag wsl">Ubuntu-24.04</span></span><span class="nums f3" style="width: 72px">14 Nov</span><span class="nums f2" style="width: 44px; text-align: right">52</span></button>
+        <button class="lrow"><span class="row gap8 grow" style="min-width: 0; flex: 1 1 0"><span class="w5" style="color: var(--fg)">Word-level diff highlighting</span><span class="f3 ell">Changed lines in dv highlight the whole line…</span></span><span class="mono t11 f3 ell" style="width: 220px">/home/user/code/dv</span><span style="width: 104px"><span class="tag wsl">Ubuntu-24.04</span></span><span class="nums f3" style="width: 72px">9 Nov</span><span class="nums f2" style="width: 44px; text-align: right">120</span></button>
+        <button class="lrow"><span class="row gap8 grow" style="min-width: 0; flex: 1 1 0"><span class="w5" style="color: var(--fg)">Portrait layout for vertical cams</span><span class="f3 ell">Vertical fancams letterbox into a tiny strip…</span></span><span class="mono t11 f3 ell" style="width: 220px">D:\Projects\fc</span><span style="width: 104px"><span class="tag win">This PC</span></span><span class="nums f3" style="width: 72px">2 Nov</span><span class="nums f2" style="width: 44px; text-align: right">118</span></button>
+        <button class="lrow"><span class="row gap8 grow" style="min-width: 0; flex: 1 1 0"><span class="w5" style="color: var(--fg)">Stickers as baked SVG, not rotated divs</span><span class="f3 ell">gpui can't rotate a div. Bake the −4° tilt…</span></span><span class="mono t11 f3 ell" style="width: 220px">D:\Projects\fc</span><span style="width: 104px"><span class="tag win">This PC</span></span><span class="nums f3" style="width: 72px">17 Oct</span><span class="nums f2" style="width: 44px; text-align: right">28</span></button>
+        <button class="lrow"><span class="row gap8 grow" style="min-width: 0; flex: 1 1 0"><span class="w5" style="color: var(--fg)">Process tree kill on Windows</span><span class="f3 ell">Cancelling a sync leaves ssh.exe running…</span></span><span class="mono t11 f3 ell" style="width: 220px">D:\Projects\toolbox-rs</span><span style="width: 104px"><span class="tag win">This PC</span></span><span class="nums f3" style="width: 72px">2 Oct</span><span class="nums f2" style="width: 44px; text-align: right">96</span></button>
+        <button class="lrow"><span class="row gap8 grow" style="min-width: 0; flex: 1 1 0"><span class="w5" style="color: var(--fg)">Thumbnail cache eviction</span><span class="f3 ell">The thumbnail cache grew to 9 GB. Evict by…</span></span><span class="mono t11 f3 ell" style="width: 220px">D:\Projects\fc</span><span style="width: 104px"><span class="tag win">This PC</span></span><span class="nums f3" style="width: 72px">3 Sep</span><span class="nums f2" style="width: 44px; text-align: right">57</span></button>
+        <button class="lrow"><span class="row gap8 grow" style="min-width: 0; flex: 1 1 0"><span class="w5" style="color: var(--fg)">Mica behind the sidebar only</span><span class="f3 ell">The title bar should stay opaque when Mica is on…</span></span><span class="mono t11 f3 ell" style="width: 220px">D:\Projects\folio</span><span style="width: 104px"><span class="tag win">This PC</span></span><span class="nums f3" style="width: 72px">22 Aug</span><span class="nums f2" style="width: 44px; text-align: right">34</span></button>
+        <button class="lrow"><span class="row gap8 grow" style="min-width: 0; flex: 1 1 0"><span class="w5" style="color: var(--fg)">Day 12: garden fences, part two</span><span class="f3 ell">Part one works but part two counts sides…</span></span><span class="mono t11 f3 ell" style="width: 220px">/home/user/code/advent-2025</span><span style="width: 104px"><span class="tag wsl">Ubuntu-24.04</span></span><span class="nums f3" style="width: 72px">12 Dec 2025</span><span class="nums f2" style="width: 44px; text-align: right">19</span></button>
+      </div>
+    </main>
+  </div>
+  
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["dark","light"],"default":"dark"},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { theme: this.props.theme === 'light' ? 'light' : 'dark' };
+  }
+}
+</script>
+</body>
+</html>
