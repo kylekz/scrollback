@@ -11,3 +11,9 @@ description = "Fixture transcript trees and other helpers shared by scrollback's
 [lib]
 path = "src/lib.rs"
 doctest = false
+
+[dependencies]
+sb_core.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+toolbox_store.workspace = true
