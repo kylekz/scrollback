@@ -200,6 +200,9 @@ pub trait Agent {
     /// The location the data is at.
     fn transport(&self) -> HomeTransport;
 
+    /// The location's home folder, which holds everything the agent keeps there.
+    fn home(&self) -> &Path;
+
     /// A new session of `records` records. Returns its transcript's key.
     fn add_session(&mut self, records: usize) -> String;
 
@@ -227,6 +230,10 @@ pub trait Agent {
 
     /// The bytes the item `key` holds at the source now.
     fn content(&self, key: &str) -> Vec<u8>;
+
+    /// The agent goes on with the session: the owner asks `prompt`, and the agent runs the
+    /// shell command `command`, which says `output`, and answers `reply`.
+    fn exchange(&mut self, key: &str, prompt: &str, command: &str, output: &str, reply: &str);
 }
 
 /// One session's items, held in memory: what a parser reads in place of the archive.

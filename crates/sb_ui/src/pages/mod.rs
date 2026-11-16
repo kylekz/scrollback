@@ -73,7 +73,7 @@ impl Showing {
         match sync.locations() {
             None if sync.failure().is_some() => Self::LocationsFailed,
             None => Self::Starting,
-            Some([]) => Self::FirstRun,
+            Some(_) if sync.is_first_run() => Self::FirstRun,
             Some(_) if library.open_session().is_some() => Self::Session,
             Some(_) if library.shelf() == Shelf::Unsorted => Self::Unsorted,
             Some(_) => Self::Sessions,

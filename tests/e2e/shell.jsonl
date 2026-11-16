@@ -24,8 +24,8 @@
 {"cmd": "bounds", "target": "titlebar/min", "platforms": ["windows"], "expect_result": [{"pointer": "/x", "gte": 1302}, {"pointer": "/x", "lte": 1303}, {"pointer": "/w", "equals": 46}]}
 {"cmd": "bounds", "target": "titlebar/close", "platforms": ["macos"], "expect_error": "no target"}
 
-// The sidebar (DESIGN §4.1): four library rows 32 high inside its 8px padding and 1px right border, the section buttons, and the location's row at its foot.
-{"cmd": "query", "prefix": "sidebar/", "expect_result": {"pointer": "", "len": 7}}
+// The sidebar (DESIGN §4.1): four library rows 32 high inside its 8px padding and 1px right border, the section buttons, the Locations overline (it opens the locations sheet), and the location's row at its foot.
+{"cmd": "query", "prefix": "sidebar/", "expect_result": {"pointer": "", "len": 8}}
 {"cmd": "query", "prefix": "sidebar/location/", "expect_result": {"pointer": "", "len": 1}}
 {"cmd": "bounds", "target": "sidebar/all-sessions", "expect_result": [{"pointer": "/x", "equals": 8}, {"pointer": "/y", "equals": 50}, {"pointer": "/w", "equals": 231}, {"pointer": "/h", "equals": 32}]}
 // Three rows and three 1px gaps down: 149, or 148 where a fractional display scale (125%, 150%) rounds the gaps to whole device pixels.

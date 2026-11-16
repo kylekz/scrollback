@@ -3,19 +3,22 @@
 //! folder, with `toolbox_store`'s checked backups beside it in `backups/`.
 //!
 //! Sync only ever adds rows and moves an item's or a version's own fields forward (PLAN §2.3):
-//! nothing here deletes what sync wrote.
+//! what sync wrote is deleted only when the owner deletes a session for good ([`trash`]).
 //!
 //! The library is here too (PLAN §2.2): the owner's folders, attached paths and what they
-//! decided about a session ([`folder`]), and the derived index of each session ([`session`]),
-//! which is read through [`library`].
+//! decided about a session ([`folder`]), Trash and the tombstones of sessions deleted for good
+//! ([`trash`]), and the derived index of each session ([`session`]), which is read through
+//! [`library`].
 
 mod folder;
 mod library;
 mod schema;
 mod session;
+mod trash;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
@@ -28,16 +31,24 @@ use crate::filing::FolderId;
 use crate::hash::Hash;
 use crate::location::{Location, LocationId, LocationKind, Unreachable};
 use crate::provider::{ItemKind, ScannedItem};
+use crate::search::Log;
+use crate::transport::Probe;
 
 pub use folder::{Folder, FolderPath};
 pub use library::{LibraryCounts, PathGroup, Shelf};
 pub(crate) use session::{Derived, Indexed, Reading, fingerprint};
 pub use session::{Filed, Session, SessionId, Usage};
+pub use trash::{Deletion, Tombstone};
+pub(crate) use trash::{ItemFile, Removal};
 
 #[derive(Debug, Error)]
 pub enum CatalogueError {
     #[error(transparent)]
     Database(#[from] toolbox_store::Error),
+    /// A host that is not one to hand ssh ([`crate::location::host_problem`]): nothing was
+    /// added.
+    #[error("{0}")]
+    BadHost(String),
     /// A range was to be recorded as the continuation of a version that is not as long as the
     /// pass that fetched the range found it. Nothing was recorded.
     #[error("version {version} is no longer {length} bytes long, so nothing is appended to it")]
@@ -72,6 +83,15 @@ pub enum CatalogueError {
     /// The path is not attached to the folder for those locations.
     #[error("{0} is not attached to the folder")]
     NotAttached(String),
+    /// Only a session in Trash is restored or deleted for good.
+    #[error("the session {} of {} at location {} is not in Trash", .0.key, .0.provider, .0.location)]
+    NotInTrash(SessionId),
+    #[error("no session {} of {} at location {} was deleted for good", .0.key, .0.provider, .0.location)]
+    NoTombstone(SessionId),
+    /// What deleting the session for good removes is not what was shown to the owner: an
+    /// item was added to it, or a version, since. Nothing was deleted.
+    #[error("the session {} of {} at location {} changed since it was shown", .0.key, .0.provider, .0.location)]
+    DeletionChanged(SessionId),
 }
 
 /// The most characters a folder's name has.
@@ -229,6 +249,7 @@ pub(crate) struct Archived {
 }
 
 /// A version and where its segments are, for verify and for reading it back.
+#[derive(Clone)]
 pub(crate) struct Stored {
     pub location: LocationId,
     pub provider: String,
@@ -287,6 +308,61 @@ pub struct Waiting {
     pub reason: String,
 }
 
+/// A provider whose agent was found at a location (DESIGN §4.11), as its last pass there read
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderAt {
+    pub provider: String,
+    /// How long the agent keeps transcripts there, when it says.
+    pub retention_days: Option<u32>,
+    /// Where the agent keeps its data there ([`crate::provider::Source::root`]); `None` until
+    /// a pass records it.
+    pub root: Option<String>,
+}
+
+/// What a WSL or SSH location's shell said the last time it was tested (DESIGN §4.11).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastCheck {
+    /// When, in Unix milliseconds.
+    pub at: i64,
+    /// The `sh` that answered ([`Probe::shell`]).
+    pub shell: String,
+    /// The login shell, when it answered ([`Probe::login_shell`]).
+    pub login_shell: Option<String>,
+    /// The tools it lacks ([`Probe::missing`]).
+    pub missing: Vec<String>,
+    /// How long the test took, in milliseconds.
+    pub took_ms: u64,
+}
+
+impl LastCheck {
+    /// What `probe` says, taken now.
+    pub fn of(probe: &Probe) -> Self {
+        Self {
+            at: now_ms(),
+            shell: probe.shell.clone(),
+            login_shell: probe.login_shell.clone(),
+            missing: probe.missing.clone(),
+            took_ms: u64::try_from(probe.took.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+/// What the archive holds from one agent at one location.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Holding {
+    pub location: LocationId,
+    pub provider: String,
+    /// Its sessions in the index, those in Trash among them.
+    pub sessions: usize,
+    /// Of those, the sessions in Trash.
+    pub trashed: usize,
+    /// Its items' lengths, each item's newest version once.
+    pub bytes: u64,
+    /// When the first of its versions was archived, in Unix milliseconds.
+    pub since: Option<i64>,
+}
+
 /// The catalogue's file in the archive's folder.
 pub(crate) const DATABASE: &str = "scrollback.db";
 
@@ -294,25 +370,53 @@ const ITEM: &str = "i.id, i.key, i.kind, i.session, i.seen_length, i.seen_stamp,
 const VERSION: &str = "v.id, v.number, v.reason, v.started_at, v.length, v.hash, v.held_back, \
                        v.held_by_parse, v.damaged, v.export_version";
 const LOCATION: &str = "id, kind, detail, name, last_attempt_at, last_success_at, last_error, \
-                        unreachable_since, unreachable_reason, drive_mount";
+                        unreachable_since, unreachable_reason, drive_mount, removed_at";
 
 /// The open catalogue: a cheap-to-clone handle. Every method blocks on disk I/O.
 #[derive(Clone, Debug)]
 pub struct Catalogue {
     db: Database,
+    /// Its write-ahead log, emptied after a session is deleted for good.
+    log: Arc<Log>,
 }
 
 impl Catalogue {
-    /// Opens the catalogue in the archive folder `dir`, creating it if missing, with today's
-    /// backup and one before any migration.
+    /// Opens the catalogue in the archive folder `dir`, creating it if missing, with a backup
+    /// before any migration. Today's backup is [`Catalogue::daily_backup`]'s.
     pub(crate) fn open(dir: &Path) -> Result<Self> {
         let backups = backups(dir);
-        let options = OpenOptions::new(&schema::SCHEMA)
-            .backups(&backups)
-            .daily_backup(chrono::Local::now().date_naive());
+        let options = OpenOptions::new(&schema::SCHEMA).backups(&backups);
+        let db = Database::open(&dir.join(DATABASE), &options)?;
+        /* What a write frees is overwritten (PLAN §4.5), on the one connection that writes. */
+        db.write(|tx| Ok::<_, CatalogueError>(tx.pragma_update(None, "secure_delete", true)?))?;
         Ok(Self {
-            db: Database::open(&dir.join(DATABASE), &options)?,
+            db,
+            log: Arc::new(Log::new(dir.join(DATABASE))),
         })
+    }
+
+    /// Empties the catalogue's write-ahead log, so what a write took out is in no file.
+    pub(crate) fn empty_log(&self) {
+        self.log.empty();
+    }
+
+    /// Empties the log, if a read held it the last time it was to be emptied.
+    pub(crate) fn retry_empty_log(&self) {
+        self.log.retry();
+    }
+
+    /// Makes today's backup of the catalogue, unless there is one. One that can't be made is
+    /// said in the log and is no reason not to go on.
+    pub(crate) fn daily_backup(&self) {
+        let made = backups(self.dir()).daily(self.db.path(), chrono::Local::now().date_naive());
+        if let Err(error) = made {
+            log::warn!("couldn't make today's backup of the catalogue: {error}");
+        }
+    }
+
+    /// The archive folder the catalogue is in.
+    fn dir(&self) -> &Path {
+        self.db.path().parent().unwrap_or(Path::new("."))
     }
 
     /// Whether anything is archived.
@@ -328,6 +432,11 @@ impl Catalogue {
 
     /// Adds a location to pull from.
     pub fn add_location(&self, kind: LocationKind, name: &str) -> Result<Location> {
+        if let LocationKind::Ssh { host } = &kind
+            && let Some(problem) = crate::location::host_problem(host)
+        {
+            return Err(CatalogueError::BadHost(problem));
+        }
         let id = LocationId::new();
         let (kind_name, detail) = kind.columns();
         self.execute(
@@ -344,7 +453,38 @@ impl Catalogue {
             last_error: None,
             unreachable: None,
             drive_mount: None,
+            removed: None,
         })
+    }
+
+    /// Names a location `name`. Its id, and with it everything archived from it, stays.
+    pub fn rename_location(&self, location: &LocationId, name: &str) -> Result<()> {
+        self.execute(
+            "UPDATE location SET name = ?2 WHERE id = ?1",
+            params![location, name],
+        )
+    }
+
+    /**
+     * Removes a location (FEATURES: Locations): it is synced no more, and [`Self::locations`]
+     * gives it with when it was removed. Nothing archived from it is touched: its items,
+     * versions and sessions stay, filed as they were, and so does its row, which they name.
+     * Nothing reaches the location itself.
+     */
+    pub fn remove_location(&self, location: &LocationId) -> Result<()> {
+        self.execute(
+            "UPDATE location SET removed_at = COALESCE(removed_at, ?2) WHERE id = ?1",
+            params![location, now_ms()],
+        )
+    }
+
+    /// Makes a removed location one of the owner's again, named `name`: adding its place
+    /// again carries on from what was archived from it, rather than archiving it twice.
+    pub fn restore_location(&self, location: &LocationId, name: &str) -> Result<()> {
+        self.execute(
+            "UPDATE location SET removed_at = NULL, name = ?2 WHERE id = ?1",
+            params![location, name],
+        )
     }
 
     /**
@@ -389,11 +529,12 @@ impl Catalogue {
         })
     }
 
-    /// Every location, oldest first.
+    /// Every location, oldest first, those the owner removed among them. Two added in the same
+    /// millisecond keep the order they were added in (the rowid), not their ids'.
     pub fn locations(&self) -> Result<Vec<Location>> {
         self.db.read(|c| {
             Ok(c.prepare(&format!(
-                "SELECT {LOCATION} FROM location ORDER BY created_at, id"
+                "SELECT {LOCATION} FROM location ORDER BY created_at, rowid"
             ))?
             .query_map([], location_from)?
             .collect::<rusqlite::Result<_>>()?)
@@ -459,18 +600,141 @@ impl Catalogue {
         )
     }
 
+    /// Keeps `check` as what `location`'s shell last said, in place of what it said before.
+    pub fn record_check(&self, location: &LocationId, check: &LastCheck) -> Result<()> {
+        self.execute(
+            "INSERT INTO location_check
+                 (location_id, checked_at, shell, login_shell, missing, took_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (location_id) DO UPDATE SET checked_at = ?2, shell = ?3,
+                 login_shell = ?4, missing = ?5, took_ms = ?6",
+            params![
+                location,
+                check.at,
+                check.shell,
+                check.login_shell,
+                check.missing.join("\n"),
+                i64::try_from(check.took_ms).unwrap_or(i64::MAX)
+            ],
+        )
+    }
+
+    /// What `location`'s shell said the last time it was tested, if it ever was.
+    pub fn last_check(&self, location: &LocationId) -> Result<Option<LastCheck>> {
+        self.db.read(|c| {
+            Ok(c.query_row(
+                "SELECT checked_at, shell, login_shell, missing, took_ms FROM location_check
+                 WHERE location_id = ?1",
+                [location],
+                |row| {
+                    let missing: String = row.get(3)?;
+                    let took: i64 = row.get(4)?;
+                    Ok(LastCheck {
+                        at: row.get(0)?,
+                        shell: row.get(1)?,
+                        login_shell: row.get(2)?,
+                        missing: missing
+                            .lines()
+                            .filter(|tool| !tool.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                        took_ms: u64::try_from(took).unwrap_or_default(),
+                    })
+                },
+            )
+            .optional()?)
+        })
+    }
+
+    /// The providers whose agents were found at `location`, with where each keeps its data
+    /// there and for how long, as the last pass of each read them.
+    pub fn providers_at(&self, location: &LocationId) -> Result<Vec<ProviderAt>> {
+        self.db.read(|c| {
+            Ok(c.prepare(
+                "SELECT provider, retention_days, root FROM location_provider
+                 WHERE location_id = ?1 ORDER BY provider",
+            )?
+            .query_map([location], |row| {
+                Ok(ProviderAt {
+                    provider: row.get(0)?,
+                    retention_days: row.get(1)?,
+                    root: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /**
+     * What the archive holds from each agent at each location it holds anything from
+     * (DESIGN §4.11), by location and provider. Sessions in Trash are held, and counted, as
+     * well as among those in Trash; a session deleted for good is held no more, and neither
+     * its items nor its row are counted. Each item counts once, at the length of its newest
+     * version: what its source held when it was last archived.
+     */
+    pub fn holdings(&self) -> Result<Vec<Holding>> {
+        self.db.read(|c| {
+            let mut holdings: Vec<Holding> = c
+                .prepare(
+                    "SELECT i.location_id, i.provider,
+                         COALESCE(SUM((SELECT v.length FROM version v WHERE v.item_id = i.id
+                                       ORDER BY v.number DESC LIMIT 1)), 0),
+                         MIN((SELECT MIN(v.started_at) FROM version v WHERE v.item_id = i.id))
+                     FROM item i
+                     GROUP BY i.location_id, i.provider
+                     ORDER BY i.location_id, i.provider",
+                )?
+                .query_map([], |row| {
+                    Ok(Holding {
+                        location: row.get(0)?,
+                        provider: row.get(1)?,
+                        sessions: 0,
+                        trashed: 0,
+                        bytes: row.get(2)?,
+                        since: row.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut counts = c.prepare(
+                "SELECT s.location_id, s.provider, COUNT(*), COUNT(st.trashed_at) FROM session s
+                 LEFT JOIN session_state st ON st.location_id = s.location_id
+                     AND st.provider = s.provider AND st.session = s.session
+                 GROUP BY s.location_id, s.provider",
+            )?;
+            for counted in counts.query_map([], |row| {
+                Ok((
+                    row.get::<_, LocationId>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, usize>(2)?,
+                    row.get::<_, usize>(3)?,
+                ))
+            })? {
+                let (location, provider, sessions, trashed) = counted?;
+                if let Some(holding) = holdings
+                    .iter_mut()
+                    .find(|it| it.location == location && it.provider == provider)
+                {
+                    holding.sessions = sessions;
+                    holding.trashed = trashed;
+                }
+            }
+            Ok(holdings)
+        })
+    }
+
     pub(crate) fn record_provider(
         &self,
         location: &LocationId,
         provider: &str,
         retention_days: Option<u32>,
+        root: &str,
     ) -> Result<()> {
         self.execute(
-            "INSERT INTO location_provider (location_id, provider, retention_days)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO location_provider (location_id, provider, retention_days, root)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (location_id, provider)
-             DO UPDATE SET retention_days = excluded.retention_days",
-            params![location, provider, retention_days],
+             DO UPDATE SET retention_days = excluded.retention_days, root = excluded.root",
+            params![location, provider, retention_days, root],
         )
     }
 
@@ -808,6 +1072,40 @@ impl Catalogue {
         })
     }
 
+    /**
+     * Marks each of `versions` as damaged, or as damaged no more, if it is still the version
+     * that was read: its id is still of the version with that number of the item with that
+     * location, provider and key. One deleted since, whose id another version may have now,
+     * is left alone. Returns, for each, whether it was still there.
+     */
+    pub(crate) fn mark_as_read(&self, versions: &[(&Stored, bool)]) -> Result<Vec<bool>> {
+        self.db.write(|tx| {
+            let mut update = tx.prepare(
+                "UPDATE version SET damaged = ?2
+                 WHERE id = ?1 AND number = ?3 AND item_id = (
+                     SELECT id FROM item WHERE location_id = ?4 AND provider = ?5 AND key = ?6)",
+            )?;
+            let mut unchoose = tx.prepare("DELETE FROM reading_choice WHERE version_id = ?1")?;
+            let mut there = Vec::new();
+            for (stored, damaged) in versions {
+                let id = stored.version.id;
+                let marked = update.execute(params![
+                    id,
+                    damaged,
+                    stored.version.number,
+                    stored.location,
+                    stored.provider,
+                    stored.key
+                ])? > 0;
+                if marked && *damaged {
+                    unchoose.execute([id])?;
+                }
+                there.push(marked);
+            }
+            Ok(there)
+        })
+    }
+
     /// Marks `versions` as damaged, or as damaged no more. A damaged version is not read by
     /// the owner's choice: a choice of one ends here.
     pub(crate) fn set_damaged(&self, versions: &[i64], damaged: bool) -> Result<()> {
@@ -860,6 +1158,7 @@ fn location_from(row: &Row<'_>) -> rusqlite::Result<Location> {
             _ => None,
         },
         drive_mount: row.get(9)?,
+        removed: row.get(10)?,
     })
 }
 

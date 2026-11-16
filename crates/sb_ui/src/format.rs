@@ -129,8 +129,8 @@ pub fn tokens(count: u64) -> String {
     }
 }
 
-/// A file's size: `812 B`, `14 KB`, `2.4 MB`.
-pub fn size(bytes: u64) -> String {
+/// A file's size, as the reader writes one: `812 B`, `14 KB`, `2.4 MB`.
+pub fn file_size(bytes: u64) -> String {
     match bytes {
         0..1024 => format!("{bytes} B"),
         1024..1_048_576 => format!("{} KB", (bytes + 512) / 1024),
@@ -174,12 +174,24 @@ pub fn about(seconds: u64) -> String {
 
 /// `done` of `total` bytes in the unit that suits the total: `41 / 96 MB`, `1.1 / 1.4 GB`.
 pub fn bytes_of(done: u64, total: u64, separator: &str) -> String {
+    let (unit, amount) = scaled(total);
+    format!("{}{separator}{} {unit}", amount(done), amount(total))
+}
+
+/// `bytes` in the unit that suits it: `1.9 GB`, `96 MB`, `12 KB`.
+pub fn size(bytes: u64) -> String {
+    let (unit, amount) = scaled(bytes);
+    format!("{} {unit}", amount(bytes))
+}
+
+/// The unit that suits `total` bytes, and how an amount reads in it.
+fn scaled(total: u64) -> (&'static str, impl Fn(u64) -> String) {
     const UNITS: [(&str, u64); 3] = [("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)];
     let (unit, size) = UNITS
         .into_iter()
         .find(|(_, size)| total >= *size)
         .unwrap_or(("KB", 1 << 10));
-    let amount = |bytes: u64| {
+    let amount = move |bytes: u64| {
         let value = bytes as f64 / size as f64;
         if unit == "GB" {
             format!("{value:.1}")
@@ -187,7 +199,7 @@ pub fn bytes_of(done: u64, total: u64, separator: &str) -> String {
             format!("{value:.0}")
         }
     };
-    format!("{}{separator}{} {unit}", amount(done), amount(total))
+    (unit, amount)
 }
 
 /// A path as its machine writes it. A provider joins a location's home and its own folders
@@ -227,9 +239,9 @@ mod tests {
         assert_eq!(tokens(950), "950");
         assert_eq!(tokens(171_200), "171k");
         assert_eq!(tokens(1_234_567), "1.2M");
-        assert_eq!(size(812), "812 B");
-        assert_eq!(size(14_000), "14 KB");
-        assert_eq!(size(2_516_582), "2.4 MB");
+        assert_eq!(file_size(812), "812 B");
+        assert_eq!(file_size(14_000), "14 KB");
+        assert_eq!(file_size(2_516_582), "2.4 MB");
     }
 
     /// Noon, local time, on the day given.
@@ -290,6 +302,14 @@ mod tests {
             "1.1 / 1.4 GB"
         );
         assert_eq!(bytes_of(0, 300, " / "), "0 / 0 KB");
+    }
+
+    #[test]
+    fn a_size_is_in_the_unit_that_suits_it() {
+        assert_eq!(size(2_040_109_465), "1.9 GB");
+        assert_eq!(size(96 << 20), "96 MB");
+        assert_eq!(size(12 << 10), "12 KB");
+        assert_eq!(size(0), "0 KB");
     }
 
     #[test]

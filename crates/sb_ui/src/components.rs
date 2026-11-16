@@ -222,7 +222,7 @@ pub fn location_tag(
 }
 
 /// A chip that warns (`.chip.warn`), as low as a card's last line.
-pub fn warn_chip(label: &'static str, theme: &SbTheme) -> impl IntoElement {
+pub fn warn_chip(label: impl Into<SharedString>, theme: &SbTheme) -> Div {
     let (fill, text) = Tone::Warn.colors(theme);
     div()
         .flex_none()
@@ -235,31 +235,38 @@ pub fn warn_chip(label: &'static str, theme: &SbTheme) -> impl IntoElement {
         .text_color(text)
         .text_spec(&theme.text.small)
         .whitespace_nowrap()
-        .child(label)
+        .child(label.into())
 }
 
-/// The ring around what has the keyboard (`.inp.focus`: an `accent` edge and 3px of
-/// `accent-soft` around it). An element with a border takes the edge as its border colour and
-/// the ring alone (`edge` false); one without is given the edge inside it.
+/**
+ * The ring around what has the keyboard (`.inp.focus`: an `accent` edge and 3px of
+ * `accent-soft`), drawn inside the element's own bounds: a row or a card sits against the
+ * edge of what holds it, which would cut a ring drawn outside. An element with a border
+ * takes the edge as its border colour and the soft ring alone (`edge` false); one without
+ * is given the edge too.
+ */
 pub fn focus_ring(edge: bool, theme: &SbTheme) -> Vec<BoxShadow> {
-    let ring = |color, spread: f32, inset| BoxShadow {
+    let ring = |color, spread: f32| BoxShadow {
         color,
         offset: point(px(0.), px(0.)),
         blur_radius: px(0.),
         spread_radius: px(spread),
-        inset,
+        inset: true,
     };
     let c = &theme.colors;
-    let mut rings = vec![ring(c.accent_soft, 3., false)];
     if edge {
-        rings.push(ring(c.accent, 1., true));
+        vec![ring(c.accent_soft, 4.), ring(c.accent, 1.)]
+    } else {
+        vec![ring(c.accent_soft, 3.)]
     }
-    rings
 }
 
-/// `text` in `color` and `spec`'s face, with every number in it (a run of digits, with the
-/// `,` `.` `:` between them) in the face for numbers (DESIGN §1.3: Geist Mono, whose digits
-/// are all as wide).
+/**
+ * `text` in `color` and `spec`'s face, with the digits of every number in it in the face for
+ * numbers (DESIGN §1.3: Geist Mono, whose digits are all as wide). The `,` `.` `:` between
+ * them stay in `spec`'s face: a mono face gives each a digit's width, which among words reads
+ * as a gap ("5 ,369").
+ */
 pub fn with_numbers(
     text: impl Into<SharedString>,
     color: Hsla,
@@ -289,16 +296,11 @@ pub fn with_numbers(
     StyledText::new(text).with_runs(runs)
 }
 
-/// `text` cut into spans, each its length in bytes and whether it is a number.
+/// `text` cut into spans, each its length in bytes and whether it is a number's digits.
 fn number_spans(text: &str) -> Vec<(usize, bool)> {
-    let bytes = text.as_bytes();
     let mut spans: Vec<(usize, bool)> = Vec::new();
-    for (at, byte) in bytes.iter().enumerate() {
-        let between_digits = matches!(byte, b',' | b'.' | b':')
-            && at > 0
-            && bytes[at - 1].is_ascii_digit()
-            && bytes.get(at + 1).is_some_and(u8::is_ascii_digit);
-        let number = byte.is_ascii_digit() || between_digits;
+    for byte in text.bytes() {
+        let number = byte.is_ascii_digit();
         match spans.last_mut() {
             Some((len, of)) if *of == number => *len += 1,
             _ => spans.push((1, number)),
@@ -367,6 +369,10 @@ pub enum ButtonKind {
     Plain,
     /// `.btn.primary`: `accent` with `accent-ink` text.
     Primary,
+    /// `.btn.danger`: as plain, with `red` text.
+    Danger,
+    /// `.btn.ghost`: no fill and no border, `fg2` text; `s3` under the pointer.
+    Ghost,
 }
 
 /// A button (`.btn`: 28 high, radius 6, 500), or the small one (`.btn.sm`: 24 high, 12px).
@@ -380,14 +386,15 @@ pub fn button(
     theme: &SbTheme,
 ) -> Stateful<Div> {
     let c = &theme.colors;
+    let none = gpui::transparent_black();
     let (fill, hover, text, border) = match kind {
         ButtonKind::Plain => (c.s2, c.s3, c.fg, c.line),
-        ButtonKind::Primary => (
-            c.accent,
-            c.accent.opacity(0.9),
-            c.accent_ink,
-            gpui::transparent_black(),
-        ),
+        ButtonKind::Danger => (c.s2, c.s3, c.red, c.line),
+        ButtonKind::Ghost => (none, c.s3, c.fg2, none),
+        /* A primary button that can't be pressed loses its accent too, so that it reads as
+        off and not as a paler on. */
+        ButtonKind::Primary if !enabled => (c.s3, c.s3, c.fg3, none),
+        ButtonKind::Primary => (c.accent, c.accent.opacity(0.9), c.accent_ink, none),
     };
     div()
         .id(id)
@@ -484,11 +491,207 @@ pub fn page_tile(glyph: SbIcon, accent: bool, theme: &SbTheme) -> impl IntoEleme
         .child(icon(glyph, theme.sizes.tile_glyph, color))
 }
 
+/// `text` at most `most` characters long, cut in the middle where it is longer: for a path,
+/// whose two ends say the most.
+pub fn middle_cut(text: &str, most: usize) -> String {
+    let count = text.chars().count();
+    if count <= most {
+        return text.to_string();
+    }
+    let head = most.saturating_sub(1) / 2;
+    let tail = most.saturating_sub(1) - head;
+    let start: String = text.chars().take(head).collect();
+    let end: String = text.chars().skip(count - tail).collect();
+    format!("{start}\u{2026}{end}")
+}
+
+/// `text` at most `most` characters long, cut at its end where it is longer: for a name in
+/// a sentence.
+pub fn end_cut(text: &str, most: usize) -> String {
+    if text.chars().count() <= most {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(most.saturating_sub(1)).collect();
+    format!("{kept}\u{2026}")
+}
+
+/// What a build with the development override says wherever locations are listed or added
+/// (`scrollback`'s `--dev-location-home`): from where every distro and host is read.
+pub fn development_notice(home: &str, theme: &SbTheme) -> Div {
+    info_banner(theme).child(div().flex_1().min_w_0().child(format!(
+        "Development override: locations are read from {}",
+        middle_cut(home, 48)
+    )))
+}
+
+/// A chip that warns, led by the alert glyph (`.chip.warn` with its `.ic`).
+pub fn warn_chip_glyph(label: impl Into<SharedString>, theme: &SbTheme) -> Div {
+    let c = &theme.colors;
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(theme.spacing.xs)
+        .h(theme.sizes.tag_small_height)
+        .px(theme.spacing.sm)
+        .rounded(theme.radii.pill)
+        .bg(c.yellow_soft)
+        .text_color(c.yellow)
+        .text_spec(&theme.text.small)
+        .whitespace_nowrap()
+        .child(icon(SbIcon::TriangleAlert, theme.sizes.icon_xs, c.yellow))
+        .child(label.into())
+}
+
+/// A card (`.card`: `s1`, a `line-subtle` border, radius 10).
+pub fn card(theme: &SbTheme) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .rounded(theme.radii.card)
+        .border_1()
+        .border_color(theme.colors.line_subtle)
+        .bg(theme.colors.s1)
+}
+
+/// A key and its value (`.kv`: 12/18, the key in a 128 column in `fg3`, the value `fg2`).
+pub fn kv(key: impl Into<SharedString>, value: impl IntoElement, theme: &SbTheme) -> Div {
+    div()
+        .flex()
+        .items_start()
+        .gap(theme.spacing.lg)
+        .text_spec(&theme.text.secondary)
+        .line_height(px(18.))
+        .child(
+            div()
+                .flex_none()
+                .w(theme.sizes.kv_label_width)
+                .text_color(theme.colors.fg3)
+                .child(key.into()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_color(theme.colors.fg2)
+                .child(value),
+        )
+}
+
+/// A tool's own words, line for line, in a `code` box (DESIGN §4.11, §4.12).
+pub fn said(text: impl Into<SharedString>, theme: &SbTheme) -> Div {
+    div()
+        .px(theme.spacing.md)
+        .py(theme.spacing.sm)
+        .rounded(theme.radii.control)
+        .bg(theme.colors.code)
+        .text_color(theme.colors.fg2)
+        .text_spec(&theme.text.said)
+        .child(text.into())
+}
+
+/// A banner that warns (`.banner.warn`: `yellow-soft`, an alert glyph in `yellow`).
+pub fn warn_banner(theme: &SbTheme) -> Div {
+    let c = &theme.colors;
+    div()
+        .flex()
+        .items_start()
+        .gap(BANNER_GAP)
+        .py(theme.spacing.md)
+        .px(theme.spacing.lg)
+        .rounded(theme.radii.row)
+        .bg(c.yellow_soft)
+        .text_spec(&theme.text.secondary)
+        .child(icon(SbIcon::TriangleAlert, theme.sizes.icon, c.yellow))
+}
+
+/// A banner that tells (`.banner.info`: `s1` with a `line-subtle` border, its glyph `fg3`).
+pub fn info_banner(theme: &SbTheme) -> Div {
+    let c = &theme.colors;
+    div()
+        .flex()
+        .items_start()
+        .gap(BANNER_GAP)
+        .py(theme.spacing.md)
+        .px(theme.spacing.lg)
+        .rounded(theme.radii.row)
+        .border_1()
+        .border_color(c.line_subtle)
+        .bg(c.s1)
+        .text_color(c.fg2)
+        .text_spec(&theme.text.secondary)
+        .child(icon(SbIcon::Info, theme.sizes.icon, c.fg3))
+}
+
+/// A status dot (`.dot`): filled with `fill`, or an outline in `fg3` (`.dot.off`).
+pub fn dot(fill: Option<Hsla>, theme: &SbTheme) -> Div {
+    div()
+        .flex_none()
+        .size(theme.sizes.dot)
+        .rounded_full()
+        .map(|this| match fill {
+            Some(fill) => this.bg(fill),
+            None => this.border(px(1.5)).border_color(theme.colors.fg3),
+        })
+}
+
+/// A radio button (`.radio`: 14 round; chosen, a thick `accent` ring).
+pub fn radio(on: bool, theme: &SbTheme) -> impl IntoElement {
+    let c = &theme.colors;
+    div()
+        .flex_none()
+        .size(theme.sizes.radio)
+        .rounded_full()
+        .map(|this| {
+            if on {
+                this.border(px(4.)).border_color(c.accent)
+            } else {
+                this.border(px(1.5)).border_color(c.fg3)
+            }
+        })
+}
+
+/// A field's label (`.lbl`: 12/16 at 500 in `fg2`).
+pub fn label(text: impl Into<SharedString>, theme: &SbTheme) -> impl IntoElement {
+    div()
+        .text_color(theme.colors.fg2)
+        .text_spec(&theme.text.control_small)
+        .child(text.into())
+}
+
+/// The kind tile of a location (DESIGN §4.11: 32 square; `accent-soft` this machine,
+/// `blue-soft` a distro, `s1` a host), its glyph `size`.
+pub fn kind_tile(kind: &LocationKind, theme: &SbTheme) -> impl IntoElement {
+    let c = &theme.colors;
+    let (fill, color) = match kind {
+        LocationKind::Local => (c.accent_soft, c.accent_text),
+        LocationKind::Wsl { .. } => (c.blue_soft, c.blue),
+        LocationKind::Ssh { .. } => (c.s1, c.fg2),
+    };
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(theme.sizes.location_tile)
+        .rounded(theme.radii.input)
+        .bg(fill)
+        .child(icon(kind_icon(kind), theme.sizes.icon, color))
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn a_long_text_is_cut_where_it_says_least() {
+        assert_eq!(middle_cut("/home/user/fixture", 40), "/home/user/fixture");
+        assert_eq!(middle_cut("abcdefghij", 7), "abc\u{2026}hij");
+        assert_eq!(end_cut("Ubuntu development", 7), "Ubuntu\u{2026}");
+        assert_eq!(end_cut("short", 7), "short");
+    }
 
     #[test]
     fn numbers_are_cut_from_the_words_around_them() {
@@ -497,9 +700,19 @@ mod tests {
             number_spans("WSL · 3 of 28 MB"),
             [(7, false), (1, true), (4, false), (2, true), (3, false)]
         );
-        assert_eq!(number_spans("started 09:02"), [(8, false), (5, true)]);
-        assert_eq!(number_spans("1,414 sessions"), [(5, true), (9, false)]);
-        // A separator not between digits is a word's.
+        // The separators between digits are in the words' face, at their own width.
+        assert_eq!(
+            number_spans("started 09:02"),
+            [(8, false), (2, true), (1, false), (2, true)]
+        );
+        assert_eq!(
+            number_spans("1,414 sessions"),
+            [(1, true), (1, false), (3, true), (9, false)]
+        );
+        assert_eq!(
+            number_spans("stopped · 5,369 files left"),
+            [(11, false), (1, true), (1, false), (3, true), (11, false)]
+        );
         assert_eq!(number_spans("x, 1."), [(3, false), (1, true), (1, false)]);
         assert_eq!(number_spans(""), []);
     }

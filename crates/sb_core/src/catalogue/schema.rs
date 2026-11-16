@@ -1,12 +1,19 @@
 //! The catalogue's schema (PLAN §4.3), as `toolbox_store` migrations: append-only, a shipped
-//! step is never edited. Tables that later phases own (tombstones, the search text, settings)
-//! arrive as further steps with those phases.
+//! step is never edited. Tables that later phases own (settings) arrive as further steps with
+//! those phases.
 
 use toolbox_store::Schema;
 
 pub(super) const SCHEMA: Schema = Schema {
     domain: "scrollback",
-    steps: &[SYNC, LIBRARY, LOCATIONS],
+    steps: &[
+        SYNC,
+        LIBRARY,
+        LOCATIONS,
+        SEARCH_AND_DELETING,
+        REMOVED,
+        CHECKS,
+    ],
 };
 
 /// What sync writes (PLAN §2.2): locations, items, versions and segments. Times are Unix
@@ -216,6 +223,104 @@ ALTER TABLE location ADD COLUMN unreachable_reason TEXT;
 ALTER TABLE location ADD COLUMN drive_mount TEXT;
 ";
 
+/// Trash and deleting for good (PLAN §4.5). Search's text is not here but in a database of its
+/// own (`crate::search`), so the catalogue and its backups hold none of it.
+const SEARCH_AND_DELETING: &str = "
+-- When the owner moved the session to Trash, while it is there.
+ALTER TABLE session_state ADD COLUMN trashed_at INTEGER;
+
+-- The owner's: a session deleted for good, when, and where and when it ran, for Settings to
+-- name it: nothing of what was said in it. Sync archives nothing of it again (tombstone_item)
+-- until the owner removes this.
+CREATE TABLE tombstone (
+    location_id TEXT NOT NULL REFERENCES location (id),
+    provider TEXT NOT NULL,
+    session TEXT NOT NULL,
+    deleted_at INTEGER NOT NULL,
+    project_path TEXT,
+    started_at INTEGER,
+    ended_at INTEGER,
+    PRIMARY KEY (location_id, provider, session)
+) STRICT, WITHOUT ROWID;
+
+-- The keys of the items a tombstoned session had when it was deleted. Sync skips an item by its
+-- key whatever session its provider now says it is of, and skips the new items of a session
+-- one of these keys is now of, unless the archive holds that session.
+CREATE TABLE tombstone_item (
+    location_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    key TEXT NOT NULL,
+    session TEXT NOT NULL,
+    PRIMARY KEY (location_id, provider, key),
+    FOREIGN KEY (location_id, provider, session) REFERENCES tombstone (location_id, provider, session)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX tombstone_item_session ON tombstone_item (location_id, provider, session);
+
+-- What the foreign keys of a deleted item and its versions are checked by: the session whose
+-- main transcript the item was, and the owner's choice of the version to read.
+CREATE INDEX session_main_item ON session (main_item);
+CREATE INDEX reading_choice_version ON reading_choice (version_id);
+
+-- A file of a session deleted for good whose removal from files/ is not done yet, in the folder
+-- of an item that is no longer in the catalogue: a segment, by its version's number and its
+-- offset, with the length and SHA-256 of what it holds; or with none of those, the item's
+-- source.json. A file that no longer holds what it held when it was deleted is not removed.
+CREATE TABLE removal (
+    location_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    version INTEGER,
+    offset INTEGER,
+    length INTEGER,
+    hash TEXT,
+    CHECK ((version IS NULL) = (offset IS NULL) AND (version IS NULL) = (length IS NULL)
+           AND (version IS NULL) = (hash IS NULL))
+) STRICT;
+
+CREATE INDEX removal_item ON removal (location_id, provider, folder);
+
+-- searchable: the session's text in search.db (crate::search) is of the row as it is. A row
+-- made again is not, until the second step of an index says it is. Only those that are not are
+-- indexed, so an index with nothing to do reads none.
+ALTER TABLE session ADD COLUMN searchable INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX session_unsearchable ON session (location_id, provider) WHERE searchable = 0;
+
+-- Sessions whose text is to be taken out of search.db: their rows went (deleted for good, no
+-- session any more, or the index emptied), in the transaction that took them.
+CREATE TABLE text_gone (
+    location_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    session TEXT NOT NULL,
+    PRIMARY KEY (location_id, provider, session)
+) STRICT, WITHOUT ROWID;
+";
+
+/// Locations the owner removed (FEATURES: Locations), and where each agent keeps its data at a
+/// location (DESIGN §4.11).
+const REMOVED: &str = "
+-- When the owner removed the location: it is synced no more, and everything archived from it
+-- stays. NULL while it is one of the owner's locations.
+ALTER TABLE location ADD COLUMN removed_at INTEGER;
+-- Where the agent keeps its data there, as the provider names it, from the last pass.
+ALTER TABLE location_provider ADD COLUMN root TEXT;
+";
+
+/// The last connection test of each WSL and SSH location (DESIGN §4.11, §4.12).
+const CHECKS: &str = "
+-- What the location's shell said the last time it was tested: when, the sh that answered, the
+-- login shell when it answered (NULL when it didn't), the tools it lacks, one per line (empty
+-- for none), and how long the test took. Kept when the location is removed.
+CREATE TABLE location_check (
+    location_id TEXT PRIMARY KEY REFERENCES location (id),
+    checked_at INTEGER NOT NULL,
+    shell TEXT NOT NULL,
+    login_shell TEXT,
+    missing TEXT NOT NULL,
+    took_ms INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+";
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -267,5 +372,49 @@ mod tests {
             assert_eq!(catalogue.location(&added.id).unwrap(), Some(added));
         }
         assert_eq!(catalogue.locations().unwrap().len(), 3);
+    }
+
+    /**
+     * A catalogue from before search and Trash keeps its sessions: none is in Trash, and the
+     * row of each, made by an earlier index without its spans, is made again by the next
+     * index (its index version is older) and goes as any row does.
+     */
+    #[test]
+    fn a_catalogue_from_before_search_and_trash_keeps_its_sessions() {
+        const BEFORE: Schema = Schema {
+            domain: SCHEMA.domain,
+            steps: &[SYNC, LIBRARY, LOCATIONS],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        Database::open(&dir.path().join(DATABASE), &OpenOptions::new(&BEFORE))
+            .unwrap()
+            .write(|tx| {
+                tx.execute_batch(
+                    "INSERT INTO location (id, kind, name, created_at) VALUES ('a1', 'local', 'here', 1);
+                     INSERT INTO session (location_id, provider, session, models, own_calls,
+                         own_input, own_output, own_cache_read, own_cache_write, all_calls,
+                         all_input, all_output, all_cache_read, all_cache_write, unread,
+                         held_back, retry, parser_version, index_version, indexed_from)
+                     VALUES ('a1', 'fixture', 's', '[]', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             1, 1, '');
+                     INSERT INTO session_state (location_id, provider, session, starred)
+                     VALUES ('a1', 'fixture', 's', 1);",
+                )?;
+                Ok::<_, toolbox_store::Error>(())
+            })
+            .unwrap();
+
+        let catalogue = Catalogue::open(dir.path()).unwrap();
+        let sessions = catalogue.sessions(crate::catalogue::Shelf::All).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].starred && sessions[0].trashed.is_none());
+        assert_eq!(catalogue.library_counts().unwrap().trash, 0);
+        catalogue.drop_index().unwrap();
+        assert!(
+            catalogue
+                .sessions(crate::catalogue::Shelf::All)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

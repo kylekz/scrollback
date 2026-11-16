@@ -8,9 +8,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use gpui::{App, QuitMode, px, size};
 use sb_core::location::LocationKind;
+use sb_core::transport::wsl;
 use sb_ui::ActiveTheme as _;
 use sb_ui::appearance::MaterialSupport;
-use sb_ui::services::{Connect, ServicesConfig};
+use sb_ui::services::{Reach, ServicesConfig};
 
 use crate::cli::Cli;
 
@@ -26,6 +27,10 @@ pub fn run(cli: Cli) -> Result<()> {
     #[cfg(not(feature = "automation"))]
     let automation = false;
     let place = crate::data_dir::resolve(cli.data_dir.clone(), automation)?;
+    #[cfg(feature = "automation")]
+    if cli.dev_location_home.is_some() {
+        crate::data_dir::for_development(&place)?;
+    }
     log::info!(
         "data directory: {} ({})",
         place.dir.display(),
@@ -58,19 +63,26 @@ fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
     }
     // Light or dark and the material, before the first frame.
     sb_ui::appearance::init(MaterialSupport::probe(), cli.theme.unwrap_or_default(), cx);
-    // A scripted run reaches only what its scenario put there.
-    #[cfg(feature = "automation")]
-    let connect: Connect = match crate::automation::stand_ins(&cli) {
-        Some(stand_ins) => Arc::new(move |kind, cancel| stand_ins.connect(kind, cancel)),
-        None => Arc::new(LocationKind::transport),
+    let reach = Reach {
+        connect: Arc::new(LocationKind::transport),
+        tester: Arc::new(sb_ui::services::probe),
+        distros: Arc::new(wsl::distros),
+        launcher: Arc::new(LocationKind::launcher),
+        development_home: None,
     };
-    #[cfg(not(feature = "automation"))]
-    let connect: Connect = Arc::new(LocationKind::transport);
+    // A scripted run reaches only what its scenario put there; a development run with the
+    // override reads its distros and hosts from a folder of generated data.
+    #[cfg(feature = "automation")]
+    let reach = match (crate::automation::stand_ins(&cli), &cli.dev_location_home) {
+        (Some(stand_ins), _) => stand_ins,
+        (None, Some(home)) => crate::automation::development_override(home),
+        (None, None) => reach,
+    };
     sb_ui::services::init(
         ServicesConfig {
             archive_dir: data_dir.join(ARCHIVE),
             providers: sb_core::provider::builtin(),
-            connect,
+            reach,
         },
         cx,
     );

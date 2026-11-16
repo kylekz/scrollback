@@ -26,6 +26,9 @@
 //!   edge states.
 //! - `"reader-large"`: the same, with a session large enough to measure the reader's budgets
 //!   against (docs/PLAN.md §14).
+//! - `"locations"`: an archive in the data dir with one location of each kind, the host's
+//!   last good sync twelve days ago, and this machine's agent in the home
+//!   ([`fixture::locations`]): the locations sheet's states (docs/DESIGN.md §4.11).
 //! - `"archive-remains"`: what is left of an archive in the data dir, its files without its
 //!   `archive.json`: the app must say it can't open it, and make no new one in its place
 //!   (docs/PLAN.md §4.4).
@@ -56,6 +59,7 @@ enum Library {
     BoardsHeldBack,
     Reader,
     ReaderLarge,
+    Locations,
     ArchiveRemains,
 }
 
@@ -153,6 +157,11 @@ impl RunnerApp for Scrollback {
                         .then_some(sb_test_support::reader::Large::BUDGET),
                 )?;
             }
+            Library::Locations => fixture::locations(
+                &mut tree,
+                &cx.data_dir.join("archive"),
+                &cx.out_dir.join("locations"),
+            )?,
             Library::ArchiveRemains => {
                 std::fs::remove_dir_all(&home)?;
                 std::fs::create_dir_all(cx.data_dir.join("archive/files/location"))?;

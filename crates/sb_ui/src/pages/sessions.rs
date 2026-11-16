@@ -59,8 +59,16 @@ const CARD_PADDING: Pixels = px(14.);
 const HELD_BACK: &str = "held back";
 
 /// The least of a model's name a card's last line keeps room for when it decides whether the
-/// tool calls fit.
-const MODEL_MIN: Pixels = px(20.);
+/// tool calls fit: a letter and the ellipsis.
+const MODEL_MIN: Pixels = px(12.);
+
+/// The narrowest a tag gets on a page whose lines fit not even with the tags at their caps:
+/// its padding, a letter and the ellipsis, so that it never shows the ellipsis alone.
+const TAG_LEAST: Pixels = px(28.);
+
+/// What a card's last line keeps spare when it decides whether the tool calls fit, so that
+/// text measured a hair wider at a fractional display scale doesn't take them off.
+const LINE_SPARE: Pixels = px(4.);
 
 /**
  * The widest of each piece the last line of a page's cards can hold (DESIGN §4.4), but for
@@ -427,7 +435,19 @@ impl SessionsView {
             )),
         };
         let inner = self.card_width - CARD_PADDING * 2. - px(2.);
-        self.shows_calls = line_fits(inner, &pieces, theme);
+        /* The page's cards show their counts when an ordinary card's line has room for them:
+        a subfolder's tag, the held-back chip and the hand are a card's own, and a card that
+        carries one drops its own count when its line is short of room (`card`). */
+        self.shows_calls = line_fits(
+            inner - LINE_SPARE,
+            &LinePieces {
+                subfolders: Vec::new(),
+                held: None,
+                by_hand: false,
+                ..pieces.clone()
+            },
+            theme,
+        );
         self.tags_past_caps = !line_fits(
             inner,
             &LinePieces {
@@ -532,11 +552,7 @@ impl SessionsView {
     /// How narrow a tag `natural` wide may get when its line is tight: down to its cap, or
     /// past it on a page whose lines fit not even then ([`line_fits`]).
     fn least(&self, natural: Pixels, cap: Pixels) -> Pixels {
-        if self.tags_past_caps {
-            px(0.)
-        } else {
-            natural.min(cap)
-        }
+        natural.min(if self.tags_past_caps { TAG_LEAST } else { cap })
     }
 
     /// A tag on a card's last line: whole while the line has room for it, else giving way down
@@ -554,6 +570,8 @@ impl SessionsView {
         if !cut {
             return tag.into_any_element();
         }
+        // On a tight line a tag keeps to its cap and leaves the rest to the model's name.
+        let tag = tag.max_w(least);
         let name = SharedString::from(name.to_string());
         tag.id(id)
             .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx))
@@ -602,7 +620,37 @@ impl SessionsView {
         // The day always shows, and the calls on a page whose cards have room for them, but
         // none where there were none.
         let calls = (self.shows_calls && session.all.calls > 0)
-            .then(|| format::count(u64::from(session.all.calls)));
+            .then(|| format::count(u64::from(session.all.calls)))
+            .filter(|calls| {
+                let extras = subfolder.is_some() || session.held_back || by_hand;
+                let capped = |name: &str, cap: Pixels| {
+                    self.tag_widths
+                        .get(name)
+                        .copied()
+                        .unwrap_or_default()
+                        .min(cap)
+                };
+                let own: Vec<Pixels> = [
+                    Some(theme.sizes.icon_xs),
+                    Some(MODEL_MIN),
+                    location.map(|it| capped(&it.name, theme.sizes.location_tag_max_width)),
+                    subfolder.map(|it| capped(&it.name, theme.sizes.tag_max_width)),
+                    session.held_back.then_some(self.held_width),
+                    Some(text_width(&self.line.day, &theme.text.count, window)),
+                    Some(
+                        theme.sizes.icon_xs
+                            + theme.spacing.xs
+                            + text_width(calls, &theme.text.count, window),
+                    ),
+                    by_hand.then_some(theme.sizes.icon_xs),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                !extras
+                    || line_width(&own, theme)
+                        <= self.card_width - CARD_PADDING * 2. - px(2.) - LINE_SPARE
+            });
         let day = session
             .ended
             .or(session.started)
@@ -638,7 +686,18 @@ impl SessionsView {
         .flatten()
         .chain(tags.iter().map(|(natural, _)| *natural))
         .collect();
-        let tight = line_width(&line, theme) > self.card_width - CARD_PADDING * 2. - px(2.);
+        let inner = self.card_width - CARD_PADDING * 2. - px(2.);
+        /* With the model's name whole, the count and the tags whole: does it fit? If not, the
+        tags keep to their caps, so that the name and the count keep their room; and the name,
+        which gives way first, says itself in full on hover, as a cut tag does. */
+        let whole =
+            line_width(&line, theme) - MODEL_MIN + text_width(&model, &theme.text.small, window);
+        let tight = whole > inner;
+        let given: Pixels = tags
+            .iter()
+            .map(|(natural, least)| (*natural - *least).max(px(0.)))
+            .sum();
+        let model_cut = tight && whole - given > inner;
         let cut = |(natural, least): (Pixels, Pixels)| tight && natural > least;
 
         let id = session.id.clone();
@@ -784,15 +843,22 @@ impl SessionsView {
                     .child(agents::mark(&session.id.provider, theme.sizes.icon_xs, cx))
                     // The model's name takes the room the rest leave it, and gives way first,
                     // down to its least: then the tags give way.
-                    .child(
+                    .child({
+                        let name = SharedString::from(model);
                         div()
+                            .id(("card-model", index))
                             .flex_1()
                             .flex_basis(px(0.))
                             .min_w(MODEL_MIN)
                             .overflow_hidden()
                             .text_ellipsis()
-                            .child(model),
-                    )
+                            .child(name.clone())
+                            .when(model_cut, |this| {
+                                this.tooltip(move |window, cx| {
+                                    Tooltip::new(name.clone()).build(window, cx)
+                                })
+                            })
+                    })
                     .children(location.map(|location| {
                         self.line_tag(
                             ("card-location", index).into(),
@@ -820,6 +886,7 @@ impl SessionsView {
                     )
                     .children(calls.map(|calls| {
                         div()
+                            .debug_selector(move || format!("card-calls-{index}"))
                             .flex_none()
                             .flex()
                             .items_center()
@@ -1017,6 +1084,7 @@ impl Render for SessionsView {
                     .folder(folder)
                     .map_or_else(SharedString::default, |it| it.name.clone().into()),
             ),
+            Shelf::Trash => (SbIcon::Trash, "Trash".into()),
             Shelf::All | Shelf::Unsorted => (SbIcon::Layers, "All sessions".into()),
         };
         let page: Option<&SessionsPage> = library.sessions();
@@ -1161,16 +1229,16 @@ mod tests {
             calls: Some(px(20.)),
             ..LinePieces::default()
         };
-        // The mark (12), 20 of a model's name, a 70 tag, a 40 day, the glyph (12), 4 and a
+        // The mark (12), 12 of a model's name, a 70 tag, a 40 day, the glyph (12), 4 and a
         // 20 count, and four gaps of 6.
-        assert!(line_fits(px(202.), &line(&[70.]), &theme));
-        assert!(!line_fits(px(201.), &line(&[70.]), &theme));
+        assert!(line_fits(px(194.), &line(&[70.]), &theme));
+        assert!(!line_fits(px(193.), &line(&[70.]), &theme));
         // The widest location decides for every card, whichever location a card is from...
-        assert!(!line_fits(px(201.), &line(&[40., 70.]), &theme));
-        assert!(!line_fits(px(201.), &line(&[70., 40.]), &theme));
+        assert!(!line_fits(px(193.), &line(&[40., 70.]), &theme));
+        assert!(!line_fits(px(193.), &line(&[70., 40.]), &theme));
         // ...at its cap of 80.
-        assert!(line_fits(px(212.), &line(&[200., 70.]), &theme));
-        assert!(!line_fits(px(211.), &line(&[200., 70.]), &theme));
+        assert!(line_fits(px(204.), &line(&[200., 70.]), &theme));
+        assert!(!line_fits(px(203.), &line(&[200., 70.]), &theme));
         // Every piece a line can hold is counted: a subfolder's tag at its cap of 96, the
         // held-back chip, and the hand glyph, each with its gap.
         let full = LinePieces {
@@ -1179,16 +1247,16 @@ mod tests {
             by_hand: true,
             ..line(&[70., 200.])
         };
-        assert!(line_fits(px(393.), &full, &theme));
-        assert!(!line_fits(px(392.), &full, &theme));
+        assert!(line_fits(px(385.), &full, &theme));
+        assert!(!line_fits(px(384.), &full, &theme));
         // Without counts, the glyph, the count and their gap leave the line: whether the tags
         // may give way past their caps is decided so.
         let uncounted = LinePieces {
             calls: None,
             ..line(&[70.])
         };
-        assert!(line_fits(px(160.), &uncounted, &theme));
-        assert!(!line_fits(px(159.), &uncounted, &theme));
+        assert!(line_fits(px(152.), &uncounted, &theme));
+        assert!(!line_fits(px(151.), &uncounted, &theme));
     }
 
     #[test]

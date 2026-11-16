@@ -20,6 +20,10 @@ const ALIVE_COUNT: u32 = 3;
 /// The exit status `ssh` keeps for its own failures; any other is the remote command's.
 const SSH_FAILED: i32 = 255;
 
+/// What the far side's shell searches for its tools when [`Launcher::reading_home`] has
+/// cleared its environment.
+const CLEAN_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
 /// What starts a POSIX shell that reads its script on stdin. Only a fixed argument list ever
 /// crosses a command line: the script, with everything a request names, goes in on stdin.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,23 +103,78 @@ impl Launcher {
     /// The command the launcher runs, as one would type it: to show what was run (DESIGN
     /// §4.12). A word a shell would take apart is in single quotes.
     pub fn command_line(&self) -> String {
-        let plain = |word: &str| {
-            !word.is_empty()
-                && word
-                    .chars()
-                    .all(|letter| letter.is_ascii_alphanumeric() || "-_=.,:/@%+".contains(letter))
-        };
         self.words()
             .iter()
-            .map(|word| {
-                if plain(word) {
-                    word.clone()
-                } else {
-                    format!("'{}'", word.replace('\'', "'\\''"))
-                }
-            })
+            .map(|word| quoted(word))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /**
+     * This launcher with the far side's shell started in an environment of nothing but a
+     * plain `PATH` and `home` for its `HOME`: `… env -i PATH=… HOME=<home> sh -s`. For trying
+     * a real distro or host on a generated tree in place of its user's own data (the app's
+     * development override, the dev example's `--home`); never for the owner's own syncs.
+     * `ssh` hands its command to the far side's shell as one line, so there the home is
+     * quoted for that shell. A failure reads as the launcher's own would.
+     */
+    pub fn reading_home(&self, home: &str) -> Launcher {
+        let mut words = self.words();
+        let shell = words.split_off(words.len().saturating_sub(2));
+        let home = match self {
+            Self::Ssh { .. } => quoted(home),
+            Self::Wsl { .. } | Self::Command { .. } => home.to_string(),
+        };
+        words.extend([
+            "env".to_string(),
+            "-i".to_string(),
+            format!("PATH={CLEAN_PATH}"),
+            format!("HOME={home}"),
+        ]);
+        words.extend(shell);
+        let mut words = words.into_iter();
+        Launcher::Command {
+            program: words.next().unwrap_or_default().into(),
+            args: words.collect(),
+        }
+    }
+
+    /// The host the launcher hands `ssh`: its own, or the word after `--` of a command that
+    /// runs `ssh` ([`Self::reading_home`]).
+    fn host(&self) -> Option<&str> {
+        match self {
+            Self::Ssh { host } => Some(host),
+            Self::Wsl { .. } => None,
+            Self::Command { args, .. } if self.is_ssh() => args
+                .iter()
+                .position(|arg| arg == "--")
+                .and_then(|at| args.get(at + 1))
+                .map(String::as_str),
+            Self::Command { .. } => None,
+        }
+    }
+
+    /**
+     * Whether the launcher may run: a host that is not one ssh should be handed
+     * ([`crate::location::host_problem`]) is refused before anything starts, whichever way it
+     * came: typed, or from a catalogue that holds it from before the check.
+     */
+    pub(super) fn check(&self) -> Result<(), TransportError> {
+        match self.host().and_then(crate::location::host_problem) {
+            Some(problem) => Err(TransportError::Failed(problem)),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the launcher's program is `ssh`, whose failures say what they are.
+    fn is_ssh(&self) -> bool {
+        match self {
+            Self::Ssh { .. } => true,
+            Self::Wsl { .. } => false,
+            Self::Command { program, .. } => Path::new(program)
+                .file_stem()
+                .is_some_and(|name| name.eq_ignore_ascii_case("ssh")),
+        }
     }
 
     /// Whether the launcher's program is `wsl.exe`, whose own words need decoding.
@@ -175,12 +234,26 @@ impl Launcher {
         }
         let said = said.join("\n");
         match self {
-            Self::Ssh { .. } if exit.and_then(|exit| exit.code()) == Some(SSH_FAILED) => {
+            _ if self.is_ssh() && exit.and_then(|exit| exit.code()) == Some(SSH_FAILED) => {
                 ssh_failure(said)
             }
             _ if said.is_empty() => TransportError::Failed(ended()),
             _ => TransportError::Failed(said),
         }
+    }
+}
+
+/// `word` as a POSIX shell takes it whole: as it is when it holds nothing a shell would take
+/// apart, and in single quotes otherwise. For a command the owner is shown and may paste.
+pub fn quoted(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|letter| letter.is_ascii_alphanumeric() || "-_=.,:/@%+".contains(letter));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
     }
 }
 
@@ -245,6 +318,44 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn a_launcher_reading_another_home_clears_the_far_sides_environment() {
+        let wsl = Launcher::Wsl {
+            distro: "Ubuntu-24.04".to_string(),
+        };
+        assert_eq!(
+            wsl.reading_home("/home/user/fixture").command_line(),
+            format!(
+                "wsl.exe -d Ubuntu-24.04 --cd / --exec env -i PATH={CLEAN_PATH} \
+                 HOME=/home/user/fixture sh -s"
+            )
+        );
+        /* ssh's far side reads its command as one line: a home with a space stays whole. */
+        let ssh = Launcher::Ssh {
+            host: "user@macbook".to_string(),
+        };
+        let words = ssh.reading_home("/Users/user/a fixture").words();
+        assert_eq!(
+            words[words.len() - 6..],
+            [
+                "env",
+                "-i",
+                &format!("PATH={CLEAN_PATH}"),
+                "HOME='/Users/user/a fixture'",
+                "sh",
+                "-s"
+            ]
+        );
+        assert!(
+            ssh.reading_home("/Users/user/fixture")
+                .command_line()
+                .starts_with("ssh -T -o BatchMode=yes")
+        );
+        /* Its failures still read as ssh's and wsl.exe's own. */
+        assert!(ssh.reading_home("/h").is_ssh() && wsl.reading_home("/h").is_wsl());
+        assert!(!wsl.reading_home("/h").is_ssh());
+    }
 
     /// What `launcher` runs: the program, its arguments, and what it adds to the environment.
     fn run(launcher: &Launcher) -> (Vec<String>, Vec<(String, String)>) {

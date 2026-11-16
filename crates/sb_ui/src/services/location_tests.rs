@@ -23,7 +23,7 @@ use crate::test_support::{SESSIONS, init, init_with, machine};
 const ASLEEP: &str = "ssh: connect to host macbook port 22: Operation timed out";
 
 /// A host that is asleep: every call says it can't be reached.
-struct Asleep;
+pub(super) struct Asleep;
 
 impl Asleep {
     fn asleep<T>(&self) -> Result<T, TransportError> {

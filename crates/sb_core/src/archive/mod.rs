@@ -7,8 +7,10 @@
 //! - a segment is a new file, written whole before the catalogue records it, and it is moved
 //!   into place with a move that fails if a file is already there ([`Archive::store`]), so the
 //!   file system itself refuses to replace one;
-//! - nothing here deletes a file under `files/`, and none is ever moved without being looked
-//!   at. A file the catalogue doesn't record (a store that was interrupted between the move
+//! - nothing here deletes a file under `files/` but [`Archive::delete_for_good`], which
+//!   removes, by name, the files the catalogue recorded for the items of a session the owner
+//!   deleted, and none is ever moved without being looked at. A file the catalogue doesn't
+//!   record (a store that was interrupted between the move
 //!   and the commit, or a catalogue restored from an older backup) stays where it is until a
 //!   segment is to be placed there. If it holds the very bytes being placed, it is kept and
 //!   recorded; if not, it is set aside in `orphans/`. [`Archive::verify`] reports all there
@@ -17,6 +19,7 @@
 //!   `archive.json` and in the catalogue, an archive whose catalogue is missing or another's
 //!   is not opened, and one is not created over a folder that holds a catalogue or files.
 
+mod delete;
 mod disk;
 mod items;
 mod layout;
@@ -37,7 +40,9 @@ use thiserror::Error;
 use crate::catalogue::{self, Catalogue, CatalogueError, Commit, Recorded, Stored, Target};
 use crate::hash::Hash;
 use crate::location::LocationId;
+use crate::search::{SearchError, SearchIndex};
 
+pub use delete::Deleted;
 pub use items::{ArchivedSession, Pinned};
 pub(crate) use layout::item_folder;
 pub use segment::{Problem, SEGMENT_BYTES, SegmentCache, VersionReader};
@@ -122,8 +127,13 @@ pub enum ArchiveError {
     UnknownVersion(i64),
     #[error("verify was cancelled")]
     Cancelled,
+    /// A session is not deleted for good while its location is being synced.
+    #[error("location {0} is being synced")]
+    Syncing(LocationId),
     #[error(transparent)]
     Catalogue(#[from] CatalogueError),
+    #[error(transparent)]
+    Search(#[from] SearchError),
 }
 
 type Result<T, E = ArchiveError> = std::result::Result<T, E>;
@@ -161,12 +171,27 @@ pub struct Archive {
     dir: PathBuf,
     id: String,
     catalogue: Catalogue,
+    /// The search text, in a database of its own (`crate::search`), once it is first wanted
+    /// and could be opened: a derived file never stops, nor slows, the archive opening
+    /// ([`Archive::search_index`]).
+    search: Arc<Mutex<Option<Arc<SearchIndex>>>>,
     /// The locations a sync is running on.
     syncing: Mutex<HashSet<LocationId>>,
     /// Held shared from a segment's move into place until its commit, and exclusively by
-    /// whoever has to tell the files the catalogue doesn't record from those it is about to.
-    placing: RwLock<()>,
+    /// whoever has to tell the files the catalogue doesn't record from those it is about to,
+    /// or removes a deleted item's.
+    placing: Arc<RwLock<()>>,
+    /// The background removal of deleted items' files ([`delete`]).
+    removals: Arc<delete::Removals>,
     _lock: File,
+}
+
+impl Drop for Archive {
+    /// Stops the background removal before its next item, and waits for it: what is left
+    /// is the next start's.
+    fn drop(&mut self) {
+        self.removals.stop();
+    }
 }
 
 impl Archive {
@@ -211,7 +236,7 @@ impl Archive {
             .and_then(|()| disk::push_dir(dir))
             .and_then(|()| disk::settle(dir))
             .map_err(io_error("write", &manifest_path))?;
-        Ok(Self::opened(dir, lock, id, catalogue))
+        Self::opened(dir, lock, id, catalogue)
     }
 
     /// Opens the archive in `dir`. A folder without one is [`ArchiveError::NotAnArchive`]; an
@@ -257,7 +282,15 @@ impl Archive {
                 catalogue: owner,
             });
         }
-        Ok(Self::opened(dir, lock, manifest.id, catalogue))
+        let archive = Self::opened(dir, lock, manifest.id, catalogue)?;
+        /* A search index that is gone holds no session's text. */
+        if !dir.join(crate::search::SEARCH_DATABASE).exists() {
+            archive.catalogue.none_searchable()?;
+        }
+        /* What a delete for good left to remove, and then today's backup, which so holds no
+        removal still to do; in the background, as nothing else waits for them. */
+        archive.start_removals(true);
+        Ok(archive)
     }
 
     /// What every start does, once the lock is held: makes sure the archive's folders are
@@ -282,15 +315,30 @@ impl Archive {
         Ok((Catalogue::open(dir)?, tmp))
     }
 
-    fn opened(dir: &Path, lock: File, id: String, catalogue: Catalogue) -> Self {
-        Self {
+    fn opened(dir: &Path, lock: File, id: String, catalogue: Catalogue) -> Result<Self> {
+        Ok(Self {
             dir: dir.to_path_buf(),
             id,
             catalogue,
+            search: Arc::default(),
             syncing: Mutex::default(),
-            placing: RwLock::default(),
+            placing: Arc::default(),
+            removals: Arc::default(),
             _lock: lock,
-        }
+        })
+    }
+
+    /// The search text (`crate::search`), opened now if it was not before ([`open_search`]).
+    pub(crate) fn search_index(&self) -> Result<Arc<SearchIndex>, SearchError> {
+        open_search(&self.dir, &self.search, &self.catalogue)
+    }
+
+    /// The search text, if it was opened already: opening it costs a check of the whole file.
+    pub(crate) fn search_index_if_open(&self) -> Option<Arc<SearchIndex>> {
+        self.search
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub fn dir(&self) -> &Path {
@@ -575,7 +623,10 @@ impl Archive {
     pub fn set_aside_uncatalogued(&self) -> Result<Vec<PathBuf>> {
         /* No segment is between its place and its commit while this looks and moves. */
         let _quiet = self.placing.write().unwrap_or_else(PoisonError::into_inner);
-        let uncatalogued = self.uncatalogued(&accounted(&self.catalogue.stored()?))?;
+        let uncatalogued = self.uncatalogued(
+            &self.accounted(&self.catalogue.stored()?)?,
+            &self.removing()?,
+        )?;
         if !uncatalogued.is_empty() && !self.catalogue.has_items()? {
             return Err(ArchiveError::NothingRecorded(self.dir.clone()));
         }
@@ -590,8 +641,13 @@ impl Archive {
     }
 
     /// Every path under `files/`, relative to the archive, that is not among `accounted`
-    /// ([`accounted`]). A folder that is not is one path, whatever it holds.
-    fn uncatalogued(&self, accounted: &HashSet<PathBuf>) -> Result<Vec<PathBuf>> {
+    /// ([`accounted`]), but what is in the folders of deleted items still to be removed,
+    /// `removing`. A folder that is not is one path, whatever it holds.
+    fn uncatalogued(
+        &self,
+        accounted: &HashSet<PathBuf>,
+        removing: &HashSet<PathBuf>,
+    ) -> Result<Vec<PathBuf>> {
         let mut uncatalogued = Vec::new();
         let mut folders = vec![PathBuf::from(layout::FILES)];
         while let Some(folder) = folders.pop() {
@@ -599,15 +655,47 @@ impl Archive {
             for entry in fs::read_dir(&dir).map_err(io_error("list", &dir))? {
                 let entry = entry.map_err(io_error("list", &dir))?;
                 let path = folder.join(entry.file_name());
-                if !accounted.contains(&path) {
+                let is_dir = entry.file_type().map_err(io_error("list", &dir))?.is_dir();
+                if accounted.contains(&path) {
+                    if is_dir && !removing.contains(&path) {
+                        folders.push(path);
+                    }
+                } else if !is_dir || holds_files(&self.dir.join(&path)) {
                     uncatalogued.push(path);
-                } else if entry.file_type().map_err(io_error("list", &dir))?.is_dir() {
-                    folders.push(path);
                 }
             }
         }
         Ok(uncatalogued)
     }
+}
+
+/**
+ * The search text of the archive in `dir` (`crate::search`), from `slot` once it is open, and
+ * opened into it if it is not; or why it can't be, which is also said in the log. One opened
+ * anew holds no session's text, which the catalogue is told.
+ */
+fn open_search(
+    dir: &Path,
+    slot: &Mutex<Option<Arc<SearchIndex>>>,
+    catalogue: &Catalogue,
+) -> Result<Arc<SearchIndex>, SearchError> {
+    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(search) = &*slot {
+        return Ok(Arc::clone(search));
+    }
+    let (search, anew) = SearchIndex::open(dir).map_err(|error| {
+        log::warn!("search is not available: {error}");
+        match error {
+            SearchError::Unavailable(_) => error,
+            error => SearchError::Unavailable(error.to_string()),
+        }
+    })?;
+    if anew {
+        catalogue.none_searchable()?;
+    }
+    let search = Arc::new(search);
+    *slot = Some(Arc::clone(&search));
+    Ok(search)
 }
 
 /// The paths under `files/`, relative to the archive, that `stored` accounts for: the folders
@@ -633,6 +721,17 @@ fn accounted(stored: &[Stored]) -> HashSet<PathBuf> {
         }
     }
     accounted
+}
+
+/// Whether the folder `dir` holds a file, however deep: an empty folder is nothing to report.
+fn holds_files(dir: &Path) -> bool {
+    fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry
+                .file_type()
+                .is_ok_and(|kind| !kind.is_dir() || holds_files(&entry.path()))
+        })
+    })
 }
 
 /// `dir` as an absolute path: the archive stays the folder it was opened on wherever the
@@ -693,7 +792,7 @@ impl Drop for SyncGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalogue::Target;
+    use crate::catalogue::{SessionId, Target};
     use crate::hash::Hash;
     use crate::location::LocationKind;
     use crate::provider::{ItemKind, ScannedItem};
@@ -1130,5 +1229,200 @@ mod tests {
         let version = archive.catalogue().versions(item.id).unwrap().remove(0);
         assert_eq!(version.length, 5);
         assert_eq!(archive.catalogue().segments(version.id).unwrap().len(), 1);
+    }
+
+    /**
+     * Deleting for good commits and then removes the files; a crash between the two leaves
+     * the removal pending, and the next start finishes it, before it makes the day's backup.
+     * The deleted item's files and folders go, and its neighbour's in the same folder of
+     * `files/` stay. A deleted item archived again before that start keeps the files it has
+     * again; one the catalogue records nothing in goes whole, whatever its bytes.
+     */
+    #[test]
+    fn a_delete_for_good_cut_short_is_finished_at_the_next_start() {
+        let (dir, archive, location) = archive();
+        let transcript = |key: &str, session: &str| ScannedItem {
+            kind: ItemKind::Transcript,
+            session: Some(session.to_string()),
+            ..scanned(key)
+        };
+        /* Two items whose folders are in one folder of files/. */
+        let mut by_start = std::collections::HashMap::new();
+        let (doomed, kept) = (0..)
+            .map(|n| format!("items/{n}"))
+            .find_map(|key| {
+                let start = item_folder(&key)[..2].to_string();
+                by_start
+                    .insert(start, key.clone())
+                    .map(|other| (key, other))
+            })
+            .unwrap();
+        let items = [
+            transcript(&doomed, "doomed"),
+            transcript(&kept, "kept"),
+            transcript("items/again", "again"),
+            transcript("items/other", "other"),
+        ];
+        archive
+            .store(
+                items
+                    .iter()
+                    .map(|item| first(&archive, &location, item, b"bytes"))
+                    .collect(),
+            )
+            .unwrap();
+        let session = |key: &str| SessionId {
+            location: location.clone(),
+            provider: "fixture".to_string(),
+            key: key.to_string(),
+        };
+        let catalogue = archive.catalogue();
+        for key in ["doomed", "again", "other"] {
+            catalogue.trash(&session(key)).unwrap();
+            let shown = catalogue.deletion(&session(key)).unwrap();
+            catalogue.delete_for_good(&shown).unwrap();
+        }
+        let file = |item: &ScannedItem| archive.dir().join(first_segment(&location, item));
+        assert!(items.iter().all(|item| file(item).is_file()));
+        assert_eq!(catalogue.removals().unwrap().len(), 3);
+        /* The third is archived again before the crash, and the fourth's file holds other
+        bytes by then. */
+        archive
+            .store(vec![first(&archive, &location, &items[2], b"bytes")])
+            .unwrap();
+        let [doomed_file, kept_file, again_file, other_file] = items.each_ref().map(file);
+        fs::copy(
+            &first(&archive, &location, &items[3], b"other").1[0].file,
+            &other_file,
+        )
+        .unwrap();
+        drop(archive);
+
+        let archive = Archive::open(dir.path()).unwrap();
+        archive.wait_for_removals();
+        assert!(!doomed_file.exists());
+        assert!(!doomed_file.parent().unwrap().parent().unwrap().exists());
+        assert!(kept_file.is_file() && again_file.is_file() && !other_file.exists());
+        assert!(archive.catalogue().removals().unwrap().is_empty());
+        let report = archive
+            .verify(&toolbox_process::CancelToken::new())
+            .unwrap();
+        assert_eq!((report.versions, report.damaged.len()), (2, 0));
+        assert!(report.uncatalogued.is_empty(), "{:?}", report.uncatalogued);
+        /* Today's backup was made once nothing was pending. */
+        let backups = archive.dir().join("backups");
+        let backup = fs::read_dir(&backups)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let pending: i64 = toolbox_store::rusqlite::Connection::open(backup)
+            .unwrap()
+            .query_row("SELECT count(*) FROM removal", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    /**
+     * Verify reads what is stored and then marks what it found: a version deleted for good
+     * meanwhile, whose id a new version may have taken, is neither reported nor marked.
+     */
+    #[test]
+    fn verify_marks_only_the_versions_it_read() {
+        let (_dir, archive, location) = archive();
+        let item = ScannedItem {
+            kind: ItemKind::Transcript,
+            session: Some("gone".to_string()),
+            ..scanned("items/gone")
+        };
+        archive
+            .store(vec![first(&archive, &location, &item, b"bytes")])
+            .unwrap();
+        let read = archive.catalogue().stored().unwrap();
+        let id = SessionId {
+            location: location.clone(),
+            provider: "fixture".to_string(),
+            key: "gone".to_string(),
+        };
+        let catalogue = archive.catalogue();
+        catalogue.trash(&id).unwrap();
+        catalogue
+            .delete_for_good(&catalogue.deletion(&id).unwrap())
+            .unwrap();
+        /* Another item, which takes the ids the deleted one had. */
+        let other = scanned("items/other");
+        archive
+            .store(vec![first(&archive, &location, &other, b"bytes")])
+            .unwrap();
+        let stored = archive.catalogue().stored().unwrap();
+        assert_eq!(stored[0].version.id, read[0].version.id);
+        assert_eq!(
+            catalogue.mark_as_read(&[(&read[0], true)]).unwrap(),
+            [false]
+        );
+        assert!(!archive.catalogue().stored().unwrap()[0].version.damaged);
+        assert_eq!(
+            catalogue.mark_as_read(&[(&stored[0], false)]).unwrap(),
+            [true]
+        );
+    }
+
+    /**
+     * A delete for good that stopped between its commit and taking the session's text out of
+     * the search index: the next start takes it out, and no other session's.
+     */
+    #[test]
+    fn the_text_of_a_session_deleted_before_a_crash_is_taken_out_at_the_next_start() {
+        use crate::catalogue::Indexed;
+        use crate::search::Text;
+        let (dir, archive, location) = archive();
+        let catalogue = archive.catalogue();
+        let sessions = ["doomed", "kept"].map(|key| SessionId {
+            location: location.clone(),
+            provider: "fixture".to_string(),
+            key: key.to_string(),
+        });
+        let items = sessions.each_ref().map(|id| ScannedItem {
+            kind: ItemKind::Transcript,
+            session: Some(id.key.clone()),
+            ..scanned(&format!("items/{}", id.key))
+        });
+        archive
+            .store(
+                items
+                    .iter()
+                    .map(|item| first(&archive, &location, item, b"bytes"))
+                    .collect(),
+            )
+            .unwrap();
+        for id in &sessions {
+            catalogue
+                .record_session(id, 1, Hash::of(b""), Indexed::Faulted("no parser"))
+                .unwrap();
+        }
+        let texts: Vec<Text> = catalogue
+            .unsearchable(None, None)
+            .unwrap()
+            .into_iter()
+            .map(|(id, made)| Text {
+                id,
+                made,
+                title: Some("a title".to_string()),
+                spans: Vec::new(),
+            })
+            .collect();
+        let search = archive.search_index().unwrap();
+        assert_eq!(search.record(&texts, |_| Ok(true)).unwrap().len(), 2);
+        catalogue.trash(&sessions[0]).unwrap();
+        catalogue
+            .delete_for_good(&catalogue.deletion(&sessions[0]).unwrap())
+            .unwrap();
+        drop((search, archive));
+
+        let archive = Archive::open(dir.path()).unwrap();
+        archive.wait_for_removals();
+        let docs = archive.search_index().unwrap().docs().unwrap();
+        assert_eq!(docs.into_keys().collect::<Vec<_>>(), [sessions[1].clone()]);
     }
 }

@@ -60,6 +60,14 @@ pub struct Cli {
     #[arg(long, value_name = "DIR", requires = "automation_mode")]
     pub automation_wsl_home: Option<PathBuf>,
 
+    #[cfg(feature = "automation")]
+    /// DEVELOPMENT OVERRIDE: read every WSL and SSH location with this folder, on the far
+    /// side, for its home, in an environment of nothing else: for trying a real distro or
+    /// host on generated transcripts instead of its user's own. Not for scripted runs, which
+    /// reach no real distro or host. Not in a shipped build.
+    #[arg(long, value_name = "DIR", conflicts_with = "automation_mode")]
+    pub dev_location_home: Option<String>,
+
     /// Window size in logical pixels, e.g. 1440x900 (minimum 960x600) [default: 1440x900].
     #[arg(long, value_name = "WxH")]
     pub window_size: Option<WindowSize>,
@@ -125,6 +133,27 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("scrollback").chain(args.iter().copied()))
+    }
+
+    #[cfg(feature = "automation")]
+    #[test]
+    fn the_development_override_takes_a_folder_and_never_a_scripted_run() {
+        let cli = parse(&["--dev-location-home", "/home/user/fixture"]).unwrap();
+        assert_eq!(cli.dev_location_home.as_deref(), Some("/home/user/fixture"));
+        assert!(parse(&["--dev-location-home"]).is_err(), "needs a folder");
+        for driver in [&["--automation"][..], &["--automation-pipe", "e2e"]] {
+            let mut args = vec!["--dev-location-home", "/home/user/fixture"];
+            args.extend(driver);
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
+
+    /// The shipped app has no development override (`cargo test -p scrollback
+    /// --no-default-features`).
+    #[cfg(not(feature = "automation"))]
+    #[test]
+    fn a_shipped_build_has_no_development_override() {
+        assert!(parse(&["--dev-location-home", "/home/user/fixture"]).is_err());
     }
 
     #[cfg(feature = "automation")]

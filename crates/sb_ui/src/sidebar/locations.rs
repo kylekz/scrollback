@@ -2,21 +2,22 @@
 //! state, and the glyph that syncs them all. A location whose sessions are being indexed
 //! outside a pass says so as a syncing one does, and so does the index of every location
 //! that runs when the app starts, in a row of its own. Why a sync failed is the main area's
-//! to say in full (`crate::pages`); the row says that it did. The rows open the locations
-//! sheet once there is one (PLAN §13).
+//! to say in full (`crate::pages`); the row says that it did. A row opens the locations
+//! sheet with its location selected (DESIGN §4.1).
 
 use gpui::{
     AnyElement, Context, Div, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Role,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div,
-    prelude::FluentBuilder as _, px,
+    prelude::FluentBuilder as _, px, relative,
 };
-use sb_core::location::{Location, LocationKind};
+use sb_core::location::{Location, LocationId, LocationKind};
 
-use super::{NO_LOCATIONS, Sidebar, note};
+use super::{NO_LOCATIONS, NONE_SYNCED, Sidebar, SidebarEvent, note};
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{icon, kind_icon, kind_name, progress_bar, with_numbers};
+use crate::components::{focus_ring, icon, kind_icon, kind_name, progress_bar, with_numbers};
 use crate::format;
 use crate::icons::SbIcon;
+use crate::services::sync::stale;
 use crate::services::{LocationStatus, PassProgress};
 use crate::theme::{SbTheme, StyledText as _};
 
@@ -63,30 +64,56 @@ fn doing_line(kind: &LocationKind, progress: &PassProgress, first: bool) -> Stri
 
 impl Sidebar {
     /// The locations' rows, or "None yet" (DESIGN §4.10).
-    pub(super) fn render_locations(&self, theme: &SbTheme, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_locations(
+        &self,
+        cursor: Option<&LocationId>,
+        theme: &SbTheme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let sync = self.sync.read(cx);
         let locations = sync.locations().unwrap_or_default();
         if locations.is_empty() {
+            // Removed locations' sessions are still in the archive: say what is true.
+            let none = if sync.removed().is_empty() {
+                NO_LOCATIONS
+            } else {
+                NONE_SYNCED
+            };
             return div()
                 .flex_none()
                 .pt(theme.spacing.xs)
                 .pb(theme.spacing.md)
-                .children(sync.locations().map(|_| note(NO_LOCATIONS, theme)))
+                .children(sync.locations().map(|_| note(none, theme)))
                 .into_any_element();
         }
         let now = format::now();
         div()
+            .id("sidebar-location-rows")
             .flex_none()
+            // Many locations scroll in their own part of the sidebar.
+            .max_h(relative(0.4))
+            .overflow_y_scroll()
+            .track_scroll(&self.location_scroll)
             .flex()
             .flex_col()
             .gap(px(2.))
             .children(locations.iter().map(|location| {
+                let id = location.id.clone();
+                let stale = stale(
+                    location.last_success,
+                    sync.details().found(&location.id),
+                    now,
+                )
+                .is_some();
                 location_row(
                     location,
                     sync.status(location),
                     sync.indexing(Some(&location.id)),
-                    now,
+                    (now, stale, cursor == Some(&location.id)),
                     theme,
+                    cx.listener(move |_, _, _, cx| {
+                        cx.emit(SidebarEvent::Locations(Some(id.clone())));
+                    }),
                 )
             }))
             // The index of every location, while it has sessions to index.
@@ -123,9 +150,13 @@ fn row(id: impl Into<SharedString>, glyph: SbIcon, theme: &SbTheme) -> Stateful<
         .child(icon(glyph, theme.sizes.icon, theme.colors.fg3))
 }
 
-/// A row's name (DESIGN §4.1: 12px at 500, `fg2`).
+/// A row's name (DESIGN §4.1: 12px at 500, `fg2`), cut before what follows it.
 fn name(name: &str, theme: &SbTheme) -> Div {
     div()
+        .min_w_0()
+        .overflow_hidden()
+        .text_ellipsis()
+        .whitespace_nowrap()
         .text_color(theme.colors.fg2)
         .text_spec(&theme.text.control_small)
         .child(name.to_string())
@@ -152,18 +183,22 @@ fn alerted(glyph: SbIcon, text: String, color: Hsla, theme: &SbTheme) -> Div {
         .child(line(text, color, theme))
 }
 
-/// What an unreachable location's row says (DESIGN §4.1: "SSH · last sync 12 days ago"): when
-/// it last synced whole, or, never having done so, since when it can't be reached.
+/**
+ * What an unreachable location's row says (DESIGN §4.1). Stale, how long since it last
+ * synced ("SSH · last sync 12 days ago"); otherwise since when it can't be reached, in the
+ * short words the row has room for ("SSH · not reachable · 16 Nov").
+ */
 fn unreachable_line(
     kind: &LocationKind,
     last_success: Option<i64>,
+    stale: bool,
     since: i64,
     now: i64,
 ) -> String {
     let kind = kind_name(kind);
-    match last_success {
+    match last_success.filter(|_| stale) {
         Some(at) => format!("{kind} · last sync {}", format::ago(at, now)),
-        None => format!("{kind} · not reachable since {}", format::day(since, now)),
+        None => format!("{kind} · not reachable · {}", format::day(since, now)),
     }
 }
 
@@ -208,8 +243,9 @@ fn location_row(
     location: &Location,
     status: LocationStatus,
     indexing: Option<PassProgress>,
-    now: i64,
+    (now, stale, keyboard): (i64, bool, bool),
     theme: &SbTheme,
+    open: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
     let c = &theme.colors;
     let kind = kind_name(&location.kind);
@@ -224,15 +260,24 @@ fn location_row(
                 None => this.border(px(1.5)).border_color(c.fg3),
             })
     };
+    let hover = c.s2;
     let row = row(
         format!("location-{}", location.id),
         kind_icon(&location.kind),
         theme,
-    );
+    )
+    .cursor_pointer()
+    .hover(move |style| style.bg(hover))
+    // The arrows' row, from the keyboard (DESIGN §5).
+    .when(keyboard, |this| {
+        this.bg(c.s3).shadow(focus_ring(true, theme))
+    })
+    .on_click(open);
     // A state that is one line under the name.
     let resting = |row: Stateful<Div>, state: Div| {
         row.h(theme.sizes.location_row_height).child(
             div()
+                .flex_1()
                 .flex()
                 .flex_col()
                 .min_w_0()
@@ -263,7 +308,7 @@ fn location_row(
             theme,
         ),
         (LocationStatus::Synced(at), None) => resting(
-            row,
+            row.aria_label(format!("{}: synced", location.name)),
             line(
                 format!("{kind} · synced {}", format::ago(at, now)),
                 c.fg3,
@@ -271,11 +316,13 @@ fn location_row(
             ),
         )
         .child(dot(Some(c.green))),
-        (LocationStatus::NeverSynced, None) => {
-            resting(row, line(format!("{kind} · not synced yet"), c.fg3, theme)).child(dot(None))
-        }
+        (LocationStatus::NeverSynced, None) => resting(
+            row.aria_label(format!("{}: not synced yet", location.name)),
+            line(format!("{kind} · not synced yet"), c.fg3, theme),
+        )
+        .child(dot(None)),
         (LocationStatus::Failed(_), None) => resting(
-            row,
+            row.aria_label(format!("{}: last sync failed", location.name)),
             alerted(
                 SbIcon::CircleAlert,
                 format!("{kind} · last sync failed"),
@@ -283,13 +330,34 @@ fn location_row(
                 theme,
             ),
         ),
-        // Not a failure: since when it is out of reach, by its last good sync.
-        (LocationStatus::Unreachable { since }, None) => resting(
-            row.aria_label(format!("{}: not reachable", location.name)),
-            alerted(
-                SbIcon::TriangleAlert,
-                unreachable_line(&location.kind, location.last_success, since, now),
-                c.yellow,
+        /* Not a failure: since when it is out of reach, neutral; with the alert only when it is
+        stale as well (DESIGN §4.1, PLAN §5). */
+        (LocationStatus::Unreachable { since }, None) => {
+            let says = unreachable_line(&location.kind, location.last_success, stale, since, now);
+            resting(
+                row.aria_label(format!("{}: not reachable", location.name)),
+                if stale {
+                    alerted(SbIcon::TriangleAlert, says, c.yellow, theme)
+                } else {
+                    line(says, c.fg3, theme)
+                },
+            )
+            .child(dot(None))
+        }
+        (
+            LocationStatus::Stopped {
+                items_left,
+                bytes_left: _,
+            },
+            None,
+        ) => resting(
+            row.aria_label(format!("{}: stopped", location.name)),
+            line(
+                format!(
+                    "{kind} · stopped · {} left",
+                    format::plural(items_left, "file")
+                ),
+                c.fg3,
                 theme,
             ),
         )
@@ -331,15 +399,18 @@ mod tests {
         };
         let day = 24 * 60 * 60 * 1000;
         let now = 40 * day;
-        // DESIGN §4.1: "SSH · last sync 12 days ago".
+        // DESIGN §4.1: stale, "SSH · last sync 12 days ago".
         assert_eq!(
-            unreachable_line(&ssh, Some(now - 12 * day), now - day, now),
+            unreachable_line(&ssh, Some(now - 12 * day), true, now - day, now),
             "SSH · last sync 12 days ago"
         );
+        // Not stale, or never synced: since when, in words short enough for the row.
+        let since = format!("SSH · not reachable · {}", format::day(now - day, now));
         assert_eq!(
-            unreachable_line(&ssh, None, now - day, now),
-            format!("SSH · not reachable since {}", format::day(now - day, now))
+            unreachable_line(&ssh, Some(now - 2 * day), false, now - day, now),
+            since
         );
+        assert_eq!(unreachable_line(&ssh, None, false, now - day, now), since);
     }
 
     #[test]

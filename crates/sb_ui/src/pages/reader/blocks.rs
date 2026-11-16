@@ -581,7 +581,7 @@ pub fn more_lines(
             this.child(match text {
                 Some(Text {
                     rest: Some(rest), ..
-                }) => format!("+{} more", format::size(*rest)),
+                }) => format!("+{} more", format::file_size(*rest)),
                 _ => format!(
                     "+{} more lines",
                     format::count(
@@ -657,7 +657,7 @@ fn shot(image: Option<Load<Picture>>, theme: &SbTheme) -> AnyElement {
             "{} × {} · {}",
             picture.width,
             picture.height,
-            format::size(picture.bytes as u64)
+            format::file_size(picture.bytes as u64)
         ),
         Some(Load::Failed(why)) => hostile::label(why),
         None | Some(Load::Loading) => "Loading…".to_string(),

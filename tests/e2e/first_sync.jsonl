@@ -20,10 +20,10 @@
 {"cmd": "screenshot", "name": "first-sync-light"}
 {"cmd": "pin_appearance", "appearance": "dark"}
 
-// Stop ends the pass at its next step, and lets it go from the hold. The batch it stored stays and is indexed, so its sessions show; the location has not synced whole yet, which is not a failure.
+// Stop ends the pass at its next step, and lets it go from the hold. The batch it stored stays and is indexed, so its sessions show; the location says it was stopped, with what it left, which is not a failure.
 {"cmd": "click", "target": "first-sync/stop"}
 {"cmd": "wait_for", "pointer": "/sync/syncing", "equals": false, "timeout_ms": 30000}
-{"cmd": "settle", "timeout_ms": 60000, "expect": [{"pointer": "/sync/held", "equals": false}, {"pointer": "/sync/indexing", "equals": false}, {"pointer": "/sync/locations/0/state", "equals": "never"}, {"pointer": "/sync/locations/0/error", "equals": null}, {"pointer": "/page", "equals": "sessions"}, {"pointer": "/library/counts", "equals": {"all": 256, "starred": 0, "unsorted": 256}}, {"pointer": "/library/sessions", "equals": 256}]}
+{"cmd": "settle", "timeout_ms": 60000, "expect": [{"pointer": "/sync/held", "equals": false}, {"pointer": "/sync/indexing", "equals": false}, {"pointer": "/sync/locations/0/state", "equals": "stopped"}, {"pointer": "/sync/locations/0/error", "equals": null}, {"pointer": "/page", "equals": "sessions"}, {"pointer": "/library/counts", "equals": {"all": 256, "starred": 0, "unsorted": 256}}, {"pointer": "/library/sessions", "equals": 256}]}
 {"cmd": "bounds", "target": "first-sync", "expect_error": "no target"}
 {"cmd": "bounds", "target": "page/empty", "expect_error": "no target"}
 {"cmd": "query", "prefix": "main/sync-failed/", "expect_result": {"pointer": "", "len": 0}}

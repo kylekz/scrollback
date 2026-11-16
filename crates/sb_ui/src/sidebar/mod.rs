@@ -30,12 +30,14 @@ use std::time::Duration;
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle,
     Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Render, Role,
-    ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
-    UniformListScrollHandle, Window, div, prelude::FluentBuilder as _, px, uniform_list,
+    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, UniformListScrollHandle, Window, div, prelude::FluentBuilder as _, px,
+    uniform_list,
 };
 use gpui_component::input::{Input, InputState};
 use sb_core::catalogue::{FOLDER_NAME_CHARS, Shelf};
 use sb_core::filing::FolderId;
+use sb_core::location::LocationId;
 
 use crate::actions::sidebar::{Collapse, DropName, Expand, KeepName, Next, Open, Previous};
 use crate::automation::AutomationTargetExt as _;
@@ -89,6 +91,8 @@ const NO_FOLDERS_FIRST_RUN: &str = "Folders come after the first sync.";
 const NO_FOLDERS: &str =
     "None yet. Unsorted groups sessions by project path; make folders from there.";
 const NO_LOCATIONS: &str = "None yet";
+/// What the Locations section says when every location was removed: their sessions stay.
+const NONE_SYNCED: &str = "None synced now. The locations sheet lists those removed.";
 
 /// What a folder is called until the owner names it.
 const NEW_FOLDER_NAME: &str = "New folder";
@@ -104,6 +108,8 @@ pub enum SidebarEvent {
     /// A folder is being renamed in its row, which has the keyboard: a narrow window shows
     /// the sidebar for it.
     Renaming,
+    /// The locations sheet opens, with this location selected (DESIGN §4.1).
+    Locations(Option<LocationId>),
 }
 
 /// A folder being renamed in its row.
@@ -121,7 +127,12 @@ pub struct Sidebar {
     /// The tree's rows, as of the library's folders and `open`.
     tree: Vec<TreeRow>,
     renaming: Option<Renaming>,
+    /// The location whose row the arrows moved to, below the last page's row; `Enter` there
+    /// opens the locations sheet with it selected (DESIGN §4.1, §5). It goes with its location.
+    location_cursor: Option<LocationId>,
     scroll: UniformListScrollHandle,
+    /// The location rows' own scroll, which the arrows' row is kept in view of.
+    location_scroll: ScrollHandle,
     _observers: [Subscription; 3],
     _clock: Task<()>,
 }
@@ -144,7 +155,20 @@ impl Sidebar {
                     this.rebuild(cx);
                     cx.notify();
                 }),
-                cx.observe(&sync, |_, _, cx| cx.notify()),
+                cx.observe(&sync, |this: &mut Self, sync, cx| {
+                    // A location removed takes the arrows' row with it.
+                    if let Some(id) = &this.location_cursor
+                        && !sync
+                            .read(cx)
+                            .locations()
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|location| location.id == *id)
+                    {
+                        this.location_cursor = None;
+                    }
+                    cx.notify();
+                }),
                 cx.subscribe_in(&library, window, |this, _, event, window, cx| match event {
                     LibraryEvent::FolderCreated(folder) => this.rename(*folder, window, cx),
                 }),
@@ -163,16 +187,16 @@ impl Sidebar {
             open: HashSet::new(),
             tree: Vec::new(),
             renaming: None,
+            location_cursor: None,
             scroll: UniformListScrollHandle::new(),
+            location_scroll: ScrollHandle::new(),
         }
     }
 
-    /// Whether there is a location, and so a library to show (DESIGN §4.10).
+    /// Whether there is a location, or was, and so a library to show (DESIGN §4.10).
     fn has_library(&self, cx: &App) -> bool {
-        self.sync
-            .read(cx)
-            .locations()
-            .is_some_and(|locations| !locations.is_empty())
+        let sync = self.sync.read(cx);
+        sync.locations().is_some() && !sync.is_first_run()
     }
 
     fn rebuild(&mut self, cx: &App) {
@@ -194,6 +218,7 @@ impl Sidebar {
     }
 
     fn show(&mut self, shelf: Shelf, cx: &mut Context<Self>) {
+        self.location_cursor = None;
         self.library
             .update(cx, |library, cx| library.show(shelf, cx));
         if let Shelf::Folder(folder) = shelf
@@ -217,6 +242,38 @@ impl Sidebar {
         }
         let shelves = self.shelves(cx);
         let shown = self.library.read(cx).shelf();
+        let locations: Vec<LocationId> = self
+            .sync
+            .read(cx)
+            .locations()
+            .unwrap_or_default()
+            .iter()
+            .map(|location| location.id.clone())
+            .collect();
+        /* The location rows follow the last page's row: the arrows go on into them. */
+        let at = self
+            .location_cursor
+            .as_ref()
+            .and_then(|id| locations.iter().position(|it| it == id));
+        let next = match at {
+            Some(at) => Some(match at.checked_add_signed(by) {
+                Some(next) if next < locations.len() => Some(next),
+                Some(_) => Some(at),
+                None => None,
+            }),
+            None if by > 0 && shelves.last() == Some(&shown) && !locations.is_empty() => {
+                Some(Some(0))
+            }
+            None => None,
+        };
+        if let Some(next) = next {
+            self.location_cursor = next.map(|at| locations[at].clone());
+            if let Some(at) = next {
+                self.location_scroll.scroll_to_item(at);
+            }
+            cx.notify();
+            return;
+        }
         let next = match shelves.iter().position(|shelf| *shelf == shown) {
             Some(at) => at
                 .checked_add_signed(by)
@@ -309,7 +366,11 @@ impl Sidebar {
     /// `Enter` on the rows hands the keyboard to the page; on one of the sidebar's buttons it
     /// is left to press the button.
     fn open(&mut self, _: &Open, window: &mut Window, cx: &mut Context<Self>) {
-        if self.focus_handle.is_focused(window) {
+        if self.focus_handle.is_focused(window)
+            && let Some(id) = self.location_cursor.clone()
+        {
+            cx.emit(SidebarEvent::Locations(Some(id)));
+        } else if self.focus_handle.is_focused(window) {
             cx.emit(SidebarEvent::Open);
         } else {
             cx.propagate();
@@ -442,6 +503,9 @@ impl Sidebar {
             Some(Shelf::All) => counts.all,
             Some(Shelf::Starred) => counts.starred,
             Some(Shelf::Unsorted) => counts.unsorted,
+            // Trash's row counts what is there, though it has no page yet.
+            Some(Shelf::Trash) => counts.trash,
+            None if target == "sidebar/trash" => counts.trash,
             Some(Shelf::Folder(_)) | None => 0,
         };
         let selected = enabled && shelf == Some(library.highlighted());
@@ -640,7 +704,10 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let theme = cx.sb_theme().clone();
-        let marked = (self.marked(cx), self.keyboard(window));
+        let marked = (
+            self.marked(cx),
+            self.keyboard(window) && self.location_cursor.is_none(),
+        );
         range
             .filter_map(|at| self.tree.get(at).copied())
             .map(|row| self.folder_row(row, marked, &theme, cx))
@@ -733,12 +800,20 @@ impl Render for Sidebar {
         let theme = cx.sb_theme().clone();
         let c = &theme.colors;
         let has_library = self.has_library(cx);
-        let first_run = self.sync.read(cx).locations().is_some_and(<[_]>::is_empty);
+        let first_run = self.sync.read(cx).is_first_run();
         let syncing = self.sync.read(cx).is_syncing();
         // While the archive can't be opened the counts aren't known and the section buttons
         // are drawn disabled (DESIGN §4.14).
         let unavailable = Showing::now(cx) == Showing::ArchiveFailed;
-        let rows = (has_library, !unavailable, self.keyboard(window));
+        let rows = (
+            has_library,
+            !unavailable,
+            self.keyboard(window) && self.location_cursor.is_none(),
+        );
+        let cursor = self
+            .location_cursor
+            .clone()
+            .filter(|_| self.keyboard(window));
         let disabled_button = |glyph: AnyElement, label: String, target: &'static str| {
             div()
                 .id(target)
@@ -844,23 +919,30 @@ impl Render for Sidebar {
             )
             .child(
                 section_header(&theme)
+                    .id("sidebar-locations")
                     .flex_none()
                     .pb(theme.spacing.xs)
                     .min_h(theme.spacing.xs + theme.sizes.section_button)
                     .child(overline("Locations", &theme))
                     .when(has_library, |this| {
-                        this.child(
-                            header_button(
-                                sync_glyph(syncing, c.fg2, &theme),
-                                format!("Sync all locations ({})", keymap::SYNC_ALL.label()),
-                                "sidebar/sync-all",
-                                &theme,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.sync.update(cx, |sync, cx| sync.sync_all(cx));
+                        // The overline's area opens the sheet (DESIGN §4.1).
+                        this.cursor_pointer()
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(SidebarEvent::Locations(None));
                             }))
-                            .automation_target("sidebar/sync-all"),
-                        )
+                            .child(
+                                header_button(
+                                    sync_glyph(syncing, c.fg2, &theme),
+                                    format!("Sync all locations ({})", keymap::SYNC_ALL.label()),
+                                    "sidebar/sync-all",
+                                    &theme,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.sync.update(cx, |sync, cx| sync.sync_all(cx));
+                                }))
+                                .automation_target("sidebar/sync-all"),
+                            )
                     })
                     .when(unavailable, |this| {
                         this.child(disabled_button(
@@ -868,9 +950,16 @@ impl Render for Sidebar {
                             "Sync all locations".to_string(),
                             "sidebar/sync-all",
                         ))
+                    })
+                    .map(|this| {
+                        if has_library {
+                            this.automation_target("sidebar/locations")
+                        } else {
+                            this.into_any_element()
+                        }
                     }),
             )
-            .child(self.render_locations(&theme, cx))
+            .child(self.render_locations(cursor.as_ref(), &theme, cx))
     }
 }
 

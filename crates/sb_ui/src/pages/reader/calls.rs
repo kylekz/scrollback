@@ -658,7 +658,7 @@ fn tool_image(
                         "returned by {tool} · {} × {} · {}",
                         picture.width,
                         picture.height,
-                        format::size(picture.bytes as u64)
+                        format::file_size(picture.bytes as u64)
                     ),
                     false,
                 ))
@@ -757,7 +757,7 @@ fn footer(call: &ToolCall, body: &CallBody, theme: &SbTheme) -> AnyElement {
     /* Of an output read only in part, the lines aren't known: its size is. */
     let size = if texts().any(|text| text.rest.is_some()) {
         let bytes = texts().map(|text| text.text.len() as u64 + text.rest.unwrap_or(0));
-        format::size(bytes.sum())
+        format::file_size(bytes.sum())
     } else {
         format::plural(texts().map(|text| text.line_count()).sum(), "line")
     };

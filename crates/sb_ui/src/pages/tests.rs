@@ -144,9 +144,11 @@ fn f6_moves_the_keyboard_to_the_sidebar_where_the_arrows_show_pages(cx: &mut Tes
     cx.run_until_parked();
     assert_eq!(shelf(cx), Shelf::Unsorted);
     assert_eq!(showing(cx), Showing::Unsorted);
-    // Trash has no page yet, and there are no folders: Unsorted is the last row.
+    // Trash has no page yet, and there are no folders: Unsorted is the last page's row, and
+    // the arrows go on to the location rows; up comes back.
     cx.simulate_keystrokes("down");
     assert_eq!(shelf(cx), Shelf::Unsorted);
+    cx.simulate_keystrokes("up");
 
     // Enter hands the keyboard to the page: its sessions, top to bottom.
     cx.simulate_keystrokes("enter");
@@ -500,4 +502,58 @@ fn the_readers_keys_do_nothing_while_a_session_opens_or_after_it_failed(cx: &mut
     assert_eq!(reader(cx), "failed");
     cx.simulate_keystrokes(READER_KEYS);
     assert_eq!(showing(cx), Showing::Session);
+}
+
+/**
+ * A location with a long name: its tag keeps to its cap on the cards (DESIGN §4.4), and the
+ * counts keep their room, in a wide window and in a narrow one.
+ */
+fn a_long_location_name_leaves_the_counts(
+    window_size: gpui::Size<gpui::Pixels>,
+    cx: &mut TestAppContext,
+) {
+    let (_shell, cx) = open_shell_sized(window_size, cx);
+    let sync = cx.update(|_, cx| cx.services().sync.clone());
+    let here = sync.read_with(cx, |sync, _| sync.locations().unwrap()[0].id.clone());
+    sync.update(cx, |sync, cx| {
+        sync.rename(&here, "Distro for Long Running Builds and Experiments", cx)
+            .unwrap();
+    });
+    cx.run_until_parked();
+    let card = bounds(cx, "card-0").expect("the first card");
+    let calls = bounds(cx, "card-calls-0").expect("its count shows");
+    assert!(calls.right() <= card.right(), "{calls:?} inside {card:?}");
+}
+
+#[gpui::test]
+fn a_long_location_name_leaves_the_counts_in_a_wide_window(cx: &mut TestAppContext) {
+    a_long_location_name_leaves_the_counts(size(px(1440.), px(900.)), cx);
+}
+
+#[gpui::test]
+fn a_long_location_name_leaves_the_counts_in_a_narrow_window(cx: &mut TestAppContext) {
+    a_long_location_name_leaves_the_counts(size(px(960.), px(600.)), cx);
+}
+
+#[gpui::test]
+fn the_arrows_row_goes_with_a_location_that_is_removed(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    let sync = cx.update(|_, cx| cx.services().sync.clone());
+    let distro = sb_core::location::LocationKind::Wsl {
+        distro: "Ubuntu-24.04".to_string(),
+    };
+    sync.update(cx, |sync, cx| {
+        sync.add(distro, "Ubuntu-24.04".to_string(), false, cx)
+    });
+    cx.run_until_parked();
+    // Past Unsorted, the last page's row, to this machine's row.
+    cx.simulate_keystrokes("f6 down down down");
+    let here = sync.read_with(cx, |sync, _| sync.locations().unwrap()[0].id.clone());
+    sync.update(cx, |sync, cx| sync.remove(&here, cx));
+    cx.run_until_parked();
+    // Its row is gone, and the arrows' with it: Enter doesn't open the next location.
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| shell.read(cx).locations_sheet().is_none()));
+    assert!(main_focused(&shell, cx));
 }

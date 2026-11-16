@@ -94,6 +94,8 @@ pub struct Session {
     pub index_version: u32,
     pub filed: Filed,
     pub starred: bool,
+    /// When the owner moved the session to Trash, while it is there (PLAN §4.5).
+    pub trashed: Option<i64>,
 }
 
 /// One item of a session with the version of it that is read (the module docs).
@@ -235,10 +237,14 @@ pub(super) const SESSION: &str = "
            s.own_calls, s.own_input, s.own_output, s.own_cache_read, s.own_cache_write,
            s.all_calls, s.all_input, s.all_output, s.all_cache_read, s.all_cache_write,
            s.ending, s.unreadable, s.unread, s.held_back, s.failure, s.parser_version,
-           s.index_version, st.folder_id, COALESCE(st.by_hand, 0), COALESCE(st.starred, 0)
+           s.index_version, st.folder_id, COALESCE(st.by_hand, 0), COALESCE(st.starred, 0),
+           st.trashed_at
     FROM session s
     LEFT JOIN session_state st
       ON st.location_id = s.location_id AND st.provider = s.provider AND st.session = s.session";
+
+/// What a row was made from, in one word ([`Catalogue::made`]).
+const MADE_FROM: &str = "s.indexed_from || ' ' || s.parser_version || ' ' || s.index_version";
 
 /// The session that did something last comes first; those with no time come last.
 pub(super) const BY_ACTIVITY: &str =
@@ -276,12 +282,13 @@ const DERIVED: [&str; 26] = [
 
 /// What a row says of the index that made it, after [`DERIVED`]. These are all that an index
 /// that could not parse the session sets of a row that is there.
-const MADE: [&str; 5] = [
+const MADE: [&str; 6] = [
     "failure",
     "retry",
     "parser_version",
     "index_version",
     "indexed_from",
+    "searchable",
 ];
 
 impl Catalogue {
@@ -411,6 +418,121 @@ impl Catalogue {
         })
     }
 
+    /**
+     * The sessions of `provider` (or of every provider) at `location` (or at every location)
+     * whose text in the search index is not of their rows as they are now
+     * (`session.searchable`), the one that did something last first, each with what its row
+     * was made from: its items' fingerprint, the parser's version and the index's.
+     */
+    pub(crate) fn unsearchable(
+        &self,
+        location: Option<&LocationId>,
+        provider: Option<&str>,
+    ) -> Result<Vec<(SessionId, String)>> {
+        self.db.read(|c| {
+            Ok(c.prepare(&format!(
+                "SELECT s.location_id, s.provider, s.session, {MADE_FROM} FROM session s
+                 WHERE s.searchable = 0
+                   AND (?1 IS NULL OR s.location_id = ?1) AND (?2 IS NULL OR s.provider = ?2)
+                 {BY_ACTIVITY}"
+            ))?
+            .query_map(params![location, provider], |row| {
+                let id = SessionId {
+                    location: row.get(0)?,
+                    provider: row.get(1)?,
+                    key: row.get(2)?,
+                };
+                Ok((id, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// How many sessions' text is not of their rows as they are ([`Catalogue::unsearchable`]).
+    pub(crate) fn count_unsearchable(&self) -> Result<usize> {
+        self.db.read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM session INDEXED BY session_unsearchable
+                 WHERE searchable = 0",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
+    /// Says the text of each of `made` is of its session's row, where that row is still made
+    /// from what is given with it.
+    pub(crate) fn set_searchable(&self, made: &[(SessionId, String)]) -> Result<()> {
+        if made.is_empty() {
+            return Ok(());
+        }
+        self.db.write(|tx| {
+            let mut set = tx.prepare(&format!(
+                "UPDATE session AS s SET searchable = 1
+                 WHERE s.location_id = ?1 AND s.provider = ?2 AND s.session = ?3
+                   AND {MADE_FROM} = ?4"
+            ))?;
+            for (id, made) in made {
+                set.execute(params![id.location, id.provider, id.key, made])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Says no session's text is of its row: the search index is new.
+    pub(crate) fn none_searchable(&self) -> Result<()> {
+        self.db.write(|tx| {
+            tx.execute_batch("UPDATE session SET searchable = 0; DELETE FROM text_gone;")?;
+            Ok(())
+        })
+    }
+
+    /// The sessions whose text is to be taken out of the search index: their rows went, and
+    /// have not come back (a row made again takes its session off the list).
+    pub(crate) fn text_gone(&self) -> Result<Vec<SessionId>> {
+        self.db.read(|c| {
+            Ok(
+                c.prepare("SELECT location_id, provider, session FROM text_gone")?
+                    .query_map([], |row| {
+                        Ok(SessionId {
+                            location: row.get(0)?,
+                            provider: row.get(1)?,
+                            key: row.get(2)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<_>>()?,
+            )
+        })
+    }
+
+    /// The text of `sessions` is out of the search index.
+    pub(crate) fn text_forgotten(&self, sessions: &[SessionId]) -> Result<()> {
+        self.db.write(|tx| {
+            let mut done = tx.prepare(
+                "DELETE FROM text_gone WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+            )?;
+            for id in sessions {
+                done.execute(params![id.location, id.provider, id.key])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// What the row of the session `id` was made from ([`Catalogue::made`]), if it has one.
+    pub(crate) fn made_of(&self, id: &SessionId) -> Result<Option<String>> {
+        self.db.read(|c| {
+            Ok(c.query_row(
+                &format!(
+                    "SELECT {MADE_FROM} FROM session s
+                     WHERE s.location_id = ?1 AND s.provider = ?2 AND s.session = ?3"
+                ),
+                params![id.location, id.provider, id.key],
+                |row| row.get(0),
+            )
+            .optional()?)
+        })
+    }
+
     /// Removes the rows of `sessions`, which are sessions no more ([`Catalogue::stale`]). What
     /// the owner decided about them stays, for the day they are sessions again.
     pub(crate) fn forget_sessions(&self, sessions: &[SessionId]) -> Result<()> {
@@ -418,8 +540,13 @@ impl Catalogue {
             let mut forget = tx.prepare(
                 "DELETE FROM session WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
             )?;
+            let mut text = tx.prepare(
+                "INSERT OR IGNORE INTO text_gone (location_id, provider, session)
+                 VALUES (?1, ?2, ?3)",
+            )?;
             for id in sessions {
                 forget.execute(params![id.location, id.provider, id.key])?;
+                text.execute(params![id.location, id.provider, id.key])?;
             }
             Ok(())
         })
@@ -476,6 +603,11 @@ impl Catalogue {
             &MADE[..]
         };
         self.db.write(|tx| {
+            /* A session the owner deleted for good while it was parsed gets no row: there is
+            nothing of it left to make one from. */
+            if !has_items(tx, id)? {
+                return Ok(false);
+            }
             tx.execute(
                 &upsert("session", &columns, set),
                 params![
@@ -512,8 +644,14 @@ impl Catalogue {
                     retry,
                     parser_version,
                     INDEX_VERSION,
-                    from
+                    from,
+                    false
                 ],
+            )?;
+            /* Its text is to be made again, not taken out. */
+            tx.execute(
+                "DELETE FROM text_gone WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+                params![id.location, id.provider, id.key],
             )?;
             Ok(derived.is_some() && folder::file_by_rule(tx, id, project.as_ref())?)
         })
@@ -654,7 +792,15 @@ impl Catalogue {
     /// Empties the derived tables (PLAN §2.2). The next index fills them again from the
     /// archive; what the owner decided about each session stays.
     pub fn drop_index(&self) -> Result<()> {
-        self.execute("DELETE FROM session", [])
+        self.db.write(|tx| {
+            /* Their text goes from the search index too, unless their rows come back. */
+            tx.execute_batch(
+                "INSERT OR IGNORE INTO text_gone (location_id, provider, session)
+                     SELECT location_id, provider, session FROM session;
+                 DELETE FROM session;",
+            )?;
+            Ok(())
+        })
     }
 
     /**
@@ -720,7 +866,8 @@ impl Catalogue {
  *   with that item;
  * - either way only to a session about which nothing is decided yet. What is then left under
  *   an id that no item has is dropped: two sessions that become one keep the decisions of
- *   the first to arrive, and those about a session whose items belong to none are gone.
+ *   the first to arrive, and those about a session whose items belong to none are gone;
+ *   but the one kept is in Trash if either was.
  */
 pub(super) fn classify(
     connection: &Connection,
@@ -753,6 +900,16 @@ pub(super) fn classify(
     )?;
     let own = (was_kind, kind) == (ItemKind::Transcript, ItemKind::Transcript);
     if let Some(session) = session.filter(|_| own || left) {
+        /* Where the session it goes to has state already, which this state does not replace,
+        it is in Trash if either was: of the two, keeping a session out of sight until the
+        owner says otherwise is the side that loses nothing. */
+        connection.execute(
+            "UPDATE session_state SET trashed_at = COALESCE(trashed_at, (
+                 SELECT trashed_at FROM session_state
+                 WHERE location_id = ?1 AND provider = ?2 AND session = ?3))
+             WHERE location_id = ?1 AND provider = ?2 AND session = ?4",
+            params![location, provider, was, session],
+        )?;
         connection.execute(
             "UPDATE OR IGNORE session_state SET session = ?4
              WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
@@ -780,18 +937,22 @@ const OF_LOCATION: &str = "WHERE i.location_id = ?2 AND i.provider = ?1 AND i.se
 /// Fails unless something is archived of the session `id`: the owner decides nothing about
 /// a session that is not there.
 pub(super) fn archived(connection: &Connection, id: &SessionId) -> Result<()> {
-    let archived: bool = connection.query_row(
+    if has_items(connection, id)? {
+        Ok(())
+    } else {
+        Err(CatalogueError::NoSession(id.clone()))
+    }
+}
+
+/// Whether the catalogue has an item of the session `id`.
+fn has_items(connection: &Connection, id: &SessionId) -> rusqlite::Result<bool> {
+    connection.query_row(
         "SELECT EXISTS (
              SELECT 1 FROM item WHERE location_id = ?1 AND provider = ?2 AND session = ?3
          )",
         params![id.location, id.provider, id.key],
         |row| row.get(0),
-    )?;
-    if archived {
-        Ok(())
-    } else {
-        Err(CatalogueError::NoSession(id.clone()))
-    }
+    )
 }
 
 /// Sets `columns` of the owner's state of the session `id`, whose row is made by the first
@@ -916,6 +1077,7 @@ pub(super) fn session_from(row: &Row<'_>) -> rusqlite::Result<Session> {
             (Some(folder), true) => Filed::ByHand(FolderId(folder)),
         },
         starred: row.get(34)?,
+        trashed: row.get(35)?,
     })
 }
 
@@ -940,6 +1102,38 @@ mod tests {
         (1..=4).fold(sql.to_string(), |sql, at| {
             sql.replace(&format!("?{at}"), "'x'")
         })
+    }
+
+    /// An index that parsed a session the owner then deleted for good leaves no row of it.
+    #[test]
+    fn a_session_with_no_items_gets_no_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = Archive::create(dir.path()).unwrap();
+        let catalogue = archive.catalogue();
+        let id = SessionId {
+            location: catalogue
+                .add_location(crate::location::LocationKind::Local, "fixture")
+                .unwrap()
+                .id,
+            provider: "fixture".to_string(),
+            key: "deleted".to_string(),
+        };
+        let index = SessionIndex {
+            title: Some("Gone".to_string()),
+            ..SessionIndex::default()
+        };
+        let derived = Derived {
+            main: None,
+            index: &index,
+            ending: None,
+            held_back: false,
+        };
+        assert!(
+            !catalogue
+                .record_session(&id, 1, Hash::of(b""), Indexed::Parsed(derived))
+                .unwrap()
+        );
+        assert_eq!(catalogue.session(&id).unwrap(), None);
     }
 
     #[test]

@@ -39,6 +39,8 @@ pub mod shell {
             FocusOther,
             /// Close the top overlay (`Esc`, DESIGN §5).
             Dismiss,
+            /// Open the locations sheet (`Ctrl L`, DESIGN §4.11).
+            OpenLocations,
         ]
     );
 }
@@ -163,6 +165,28 @@ pub mod first_run {
         [
             /// Add the checked locations and sync them (`Enter`).
             Add,
+        ]
+    );
+}
+
+/// The locations sheet's and the add-location dialog's actions (DESIGN §4.11, §4.12).
+pub mod locations {
+    use gpui::actions;
+
+    actions!(
+        locations,
+        [
+            /// Close the dialog, or the sheet when no dialog is over it (`Esc`).
+            Close,
+            /// Select the location above (`↑`).
+            Previous,
+            /// Select the location below (`↓`).
+            Next,
+            /// Move the keyboard into the selected location's pane (`Enter`).
+            Open,
+            /// In a dialog: test the host typed, or do what the dialog is for when nothing
+            /// can go wrong by it (`Enter`).
+            Confirm,
         ]
     );
 }

@@ -29,7 +29,11 @@
 //!
 //! The library's own keys work wherever the keyboard is: `Ctrl Shift N` makes a folder, `F2`
 //! renames the folder whose page is shown, `F5` syncs every location, `Alt ←` goes back from
-//! an opened session (DESIGN §5).
+//! an opened session, `Ctrl L` opens the locations sheet (DESIGN §5).
+//!
+//! **The locations sheet** ([`LocationsSheet`], DESIGN §4.11) opens over the scrim from a
+//! sidebar location row, the Locations overline or `Ctrl L`, while a library page shows. It
+//! keeps the keyboard while it is open, and gives it back to where it was when it closes.
 
 pub mod title_bar;
 
@@ -47,10 +51,12 @@ use gpui_appearance::Backing;
 use gpui_component::Root;
 
 use crate::actions::library::{Back, NewFolder, SyncAll};
-use crate::actions::shell::{Dismiss, FocusOther, ToggleSidebar};
+use crate::actions::shell::{Dismiss, FocusOther, OpenLocations, ToggleSidebar};
 use crate::actions::sidebar::Rename;
 use crate::automation::AutomationTargetExt as _;
 use crate::keymap;
+use crate::locations_sheet::{LocationsSheet, LocationsSheetEvent};
+use crate::overlay::{self, Layer};
 use crate::pages::{MainArea, Showing};
 use crate::services::ActiveServices as _;
 use crate::sidebar::{Sidebar, SidebarEvent};
@@ -87,6 +93,12 @@ pub struct Shell {
     main: Entity<MainArea>,
     /// Whether a narrow window shows the sidebar over its main area.
     sidebar_open: bool,
+    /// The locations sheet while it is open, with where the keyboard was before it.
+    locations: Option<(
+        Entity<LocationsSheet>,
+        Option<FocusHandle>,
+        [Subscription; 2],
+    )>,
     _observers: [Subscription; 6],
 }
 
@@ -105,6 +117,7 @@ impl Shell {
             // gpui opened the window light or dark as the OS is; the theme may say otherwise.
             appearance: gpui_appearance::track_window(Backing::Solid, window, cx),
             sidebar_open: false,
+            locations: None,
             _observers: [
                 cx.observe_global_in::<SbTheme>(window, |_, _, cx| cx.notify()),
                 // The title bar follows the archive, the locations and the passes.
@@ -129,6 +142,10 @@ impl Shell {
                             this.sidebar_open = this
                                 .sidebar_placement(window.viewport_size().width, cx)
                                 != SidebarPlacement::Docked;
+                        }
+                        SidebarEvent::Locations(selected) => {
+                            this.sidebar_open = false;
+                            this.open_locations(selected.clone(), window, cx);
                         }
                     }
                     cx.notify();
@@ -213,6 +230,44 @@ impl Shell {
             self.main.focus_handle(cx).focus(window, cx);
             cx.notify();
         }
+    }
+
+    /// Opens the locations sheet with `selected` selected, while a library page shows.
+    pub fn open_locations(
+        &mut self,
+        selected: Option<sb_core::location::LocationId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.locations.is_some() || !Showing::now(cx).is_library() {
+            return;
+        }
+        let back = window.focused(cx);
+        let sheet = cx.new(|cx| LocationsSheet::new(selected, window, cx));
+        let heard = [
+            cx.subscribe_in(&sheet, window, |this, _, event, window, cx| match event {
+                LocationsSheetEvent::Close => this.close_locations(window, cx),
+            }),
+            // The shell draws the sheet's dialogs, so it redraws with the sheet.
+            cx.observe(&sheet, |_, _, cx| cx.notify()),
+        ];
+        self.locations = Some((sheet, back, heard));
+        cx.notify();
+    }
+
+    /// Closes the locations sheet, and gives the keyboard back to where it was.
+    fn close_locations(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((sheet, back, _)) = self.locations.take() {
+            sheet.update(cx, |sheet, cx| sheet.closing(window, cx));
+            back.unwrap_or_else(|| self.main.focus_handle(cx))
+                .focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// The locations sheet, while it is open.
+    pub fn locations_sheet(&self) -> Option<&Entity<LocationsSheet>> {
+        self.locations.as_ref().map(|(sheet, ..)| sheet)
     }
 
     fn new_folder(&mut self, _: &NewFolder, _: &mut Window, cx: &mut Context<Self>) {
@@ -328,6 +383,9 @@ impl Render for Shell {
             .on_action(cx.listener(Self::rename))
             .on_action(cx.listener(Self::sync_all))
             .on_action(cx.listener(Self::back))
+            .on_action(cx.listener(|this, _: &OpenLocations, window, cx| {
+                this.open_locations(None, window, cx);
+            }))
             .relative()
             .size_full()
             .flex()
@@ -353,6 +411,27 @@ impl Render for Shell {
             .when(placement == SidebarPlacement::Overlay, |this| {
                 this.child(self.render_sidebar_overlay(&theme, cx))
             })
+            .children(self.locations.as_ref().map(|(sheet, ..)| {
+                let shell = cx.entity().downgrade();
+                overlay::modal(
+                    sheet.clone(),
+                    Layer::Sheet,
+                    window,
+                    &theme,
+                    move |window, cx| {
+                        shell
+                            .update(cx, |shell, cx| shell.close_locations(window, cx))
+                            .ok();
+                    },
+                )
+            }))
+            // A dialog over the sheet, on its own layer above it (DESIGN §3).
+            .children(
+                self.locations
+                    .as_ref()
+                    .map(|(sheet, ..)| sheet.clone())
+                    .and_then(|sheet| sheet.update(cx, |sheet, cx| sheet.dialog_layer(window, cx))),
+            )
     }
 }
 

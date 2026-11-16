@@ -130,9 +130,15 @@ fn a_launcher_that_fails_says_why_in_its_own_words() {
         Err(TransportError::Failed(said)) => said,
         other => panic!("{other:?}"),
     };
-    assert_eq!(
-        failed(launched("echo 'no such distro' >&2; exit 3")),
-        "no such distro"
+    /* Its verdict first, and last how far the script was written to it: whole into the pipe,
+    or not at all when it ended first. */
+    let said = failed(launched("echo 'no such distro' >&2; exit 3"));
+    let said: Vec<&str> = said.lines().collect();
+    assert_eq!(said[0], "no such distro");
+    assert!(
+        said[1].starts_with("the script was written whole (")
+            || said[1].starts_with("the script could not be written: "),
+        "{said:?}"
     );
     assert!(failed(launched("exit 3")).contains("ended before it answered"));
     assert!(failed(launched("echo 'not a shell at all'")).contains("ended before it answered"));
@@ -175,7 +181,9 @@ fn an_answer_cut_off_fails_the_call_and_never_passes_for_a_whole_one() {
         ));
         let mut sink = Collect::default();
         match dropped.read_ranges(&requests, &mut sink) {
-            Err(TransportError::Failed(said)) => assert_eq!(said, "Connection lost", "{cut}"),
+            Err(TransportError::Failed(said)) => {
+                assert_eq!(said.lines().next(), Some("Connection lost"), "{cut}");
+            }
             other => panic!("cut at {cut}: {other:?}"),
         }
         /* No range ended well that had not arrived whole. */
@@ -331,7 +339,7 @@ fn a_login_shell_that_hangs_fails_the_call_and_is_killed_with_what_it_started() 
         let started = Instant::now();
         /* Not the bare environment, which may name another place than the profile would. */
         match transport.env(&["SB_BOTH"]) {
-            Err(TransportError::Failed(said)) => assert!(said.contains("login shell"), "{said}"),
+            Err(TransportError::LoginShellHung(seconds)) => assert_eq!(seconds, 5, "{shell}"),
             other => panic!("{shell}: {other:?}"),
         }
         assert!(started.elapsed() < Duration::from_secs(30), "{shell}");
@@ -362,7 +370,10 @@ fn a_login_shell_that_hangs_fails_the_call_and_is_killed_with_what_it_started() 
         }
         /* It is asked again by the next call, and what does not need it works. */
         if shell == "sh" {
-            assert!(matches!(transport.probe(), Err(TransportError::Failed(_))));
+            assert!(matches!(
+                transport.probe(),
+                Err(TransportError::LoginShellHung(_))
+            ));
             assert_eq!(transport.env(&[]).unwrap().home, text(home.path()));
         }
     }

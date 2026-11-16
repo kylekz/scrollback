@@ -206,7 +206,7 @@ pub(super) fn load(archive: &Archive, shelf: Shelf) -> Result<Loaded, CatalogueE
             groups.sort_by_key(|group| Reverse(group.sessions.len()));
             Page::Unsorted(groups)
         }
-        Shelf::All | Shelf::Starred | Shelf::Folder(_) => {
+        Shelf::All | Shelf::Starred | Shelf::Folder(_) | Shelf::Trash => {
             let sessions = catalogue.sessions(shelf)?;
             let paths = match shelf {
                 Shelf::Folder(folder) => {

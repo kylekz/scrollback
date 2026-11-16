@@ -273,6 +273,10 @@ pub struct TypeScale {
     /// 12.5/20 a collapsed thought, and 13/20 an open one, both drawn italic.
     pub thought: TextSpec,
     pub thought_open: TextSpec,
+    /// 15/20 a sheet's or a dialog's title.
+    pub sheet_title: TextSpec,
+    /// 11/16 JetBrains Mono: a tool's own words in a box of their own (DESIGN §4.11).
+    pub said: TextSpec,
 }
 
 impl TypeScale {
@@ -313,6 +317,8 @@ impl TypeScale {
             activity_name: TextSpec::new(&fonts.mono, 12., 16., medium),
             thought: TextSpec::new(&fonts.ui, 12.5, 20., regular),
             thought_open: TextSpec::new(&fonts.ui, 13., 20., regular),
+            sheet_title: TextSpec::new(&fonts.ui, 15., 20., semibold),
+            said: TextSpec::new(&fonts.mono, 11., 16., regular),
         }
     }
 }
@@ -439,8 +445,34 @@ pub struct Sizes {
     pub shot_caption: Pixels,
     /// The highest an image a tool returned is drawn (DESIGN §4.2.4).
     pub tool_image_max_height: Pixels,
-    /// A segment of a segmented control.
+    /// The locations sheet, and its list (DESIGN §1.4).
+    pub sheet_width: Pixels,
+    pub sheet_height: Pixels,
+    pub sheet_list_width: Pixels,
+    /// How far a sheet or a dialog keeps from the window's edges and the title bar.
+    pub overlay_margin: Pixels,
+    /// A dialog's width and greatest height (DESIGN §4.12: 440 × up to 760).
+    pub dialog_width: Pixels,
+    pub dialog_max_height: Pixels,
+    /// A segment of a segmented control (DESIGN §1.4).
     pub segment_height: Pixels,
+    /// A radio button (`.radio`).
+    pub radio: Pixels,
+    /// A location's kind tile in the locations sheet (DESIGN §4.11).
+    pub location_tile: Pixels,
+    /// The label column of a key/value row (`.kv`).
+    pub kv_label_width: Pixels,
+    /// A segment's padding at its sides (`.seg button`).
+    pub segment_padding: Pixels,
+    /// The padding above a dialog's header and around its body (`E-Add-Location`).
+    pub dialog_padding: Pixels,
+    /// The sheet's padding at its sides, and its pane's (`E-Locations`).
+    pub sheet_padding: Pixels,
+    pub pane_padding: Pixels,
+    /// The padding of a row of the locations list (`E-Locations`).
+    pub list_row_padding: Pixels,
+    /// The label column of a connection test's result (`E-Add-Location`).
+    pub result_label_width: Pixels,
 }
 
 impl Default for Sizes {
@@ -508,7 +540,22 @@ impl Default for Sizes {
             shot_height: px(116.),
             shot_caption: px(24.),
             tool_image_max_height: px(320.),
+            sheet_width: px(1200.),
+            sheet_height: px(790.),
+            sheet_list_width: px(540.),
+            overlay_margin: px(24.),
+            dialog_width: px(440.),
+            dialog_max_height: px(760.),
             segment_height: px(22.),
+            radio: px(14.),
+            location_tile: px(32.),
+            kv_label_width: px(128.),
+            segment_padding: px(9.),
+            dialog_padding: px(14.),
+            sheet_padding: px(18.),
+            pane_padding: px(20.),
+            list_row_padding: px(10.),
+            result_label_width: px(110.),
         }
     }
 }
@@ -528,6 +575,8 @@ pub struct Radii {
     pub card: Pixels,
     /// Sheets, dialogs, the empty drop area.
     pub sheet: Pixels,
+    /// A segment of a segmented control (`.seg button`).
+    pub segment: Pixels,
     /// The icon tile of a page's header.
     pub tile: Pixels,
     /// Chips.
@@ -543,6 +592,7 @@ impl Default for Radii {
             row: px(8.),
             card: px(10.),
             sheet: px(12.),
+            segment: px(5.),
             tile: px(14.),
             pill: px(999.),
         }

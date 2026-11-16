@@ -23,6 +23,22 @@ use super::disk;
 use crate::catalogue::Segment;
 use crate::hash::{Hash, Hasher};
 
+/**
+ * Whether the segment file at `path` holds exactly the `length` bytes of SHA-256 `hash`. A
+ * file that is not a frame, or holds other bytes, does not; one that can't be read is an error.
+ */
+pub(super) fn holds(path: &Path, length: u64, hash: Hash) -> io::Result<bool> {
+    let mut bytes = Vec::with_capacity(length.min(SEGMENT_BYTES) as usize + 1);
+    let read = Decoder::new(File::open(path)?)?
+        .take(length + 1)
+        .read_to_end(&mut bytes);
+    match read {
+        Ok(_) => Ok(bytes.len() as u64 == length && Hash::of(&bytes) == hash),
+        Err(error) if error.raw_os_error().is_some() => Err(error),
+        Err(_) => Ok(false),
+    }
+}
+
 /// zstd's default level: transcripts are mostly JSON and compress several times over at it,
 /// faster than a location can be read.
 const LEVEL: i32 = 3;

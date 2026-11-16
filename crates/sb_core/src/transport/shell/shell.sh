@@ -1,8 +1,9 @@
 # What the shell transport runs at a location (docs/PLAN.md §6.2). The whole of this file goes
 # to `sh -s` on its stdin, followed by the requests of one call: lines that call the functions
-# below, between a `{` and a `} </dev/null`, so the shell has read everything before it starts
-# anything and no tool can take the script for its input. Nothing is installed and nothing is
-# written at the location.
+# below, between a `{` and a `} </dev/null`, so no tool can take the script for its input; and
+# all of it between braces, so the shell has read everything before it starts anything, and a
+# script cut short on its way runs nothing. Nothing is installed and nothing is written at the
+# location.
 #
 # It has to run in any POSIX sh (dash, bash, zsh, busybox) with GNU, BSD or busybox tools:
 # - every expansion is quoted, so nothing depends on how a shell splits words; a tool's lines

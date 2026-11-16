@@ -4,7 +4,7 @@ Native desktop app (Rust + GPUI) that backs up, archives and reads coding-agent 
 
 - Spec: `docs/FEATURES.md` (what it does) and `docs/PLAN.md` (decisions D1–D15, the archive, sync, transports, phases; cited as `PLAN §N` / `D<n>`). Read the relevant sections before changing anything; when code and spec disagree, fix one of them in the same change.
 - Design: `docs/DESIGN.md` (tokens, layout, materials, screens, keyboard map; cited as `DESIGN §N`), written from concept E on the design canvas. The boards' sources are in `design/project/` (the `E-*.dc.html` files; A–D are the concepts E was chosen from). Where a board and DESIGN.md disagree, DESIGN.md wins.
-- Status: phases 0, 1, 2 and 5 of PLAN §13 are built. `sb_core` archives, syncs, parses and indexes from this machine, a WSL distro or an SSH host: the archive and catalogue, the local and shell transports, the provider seam with the first provider's scan, fetch and parser, the transcript model, the session index, folders with attached paths and filing rules. Dev examples drive it (`sync`, `check`); the app still opens the empty concept E shell (the library UI, phase 3, is in progress on a branch).
+- Status: phases 0, 1, 2 and 5 of PLAN §13 are built, and the library half of phase 6. `sb_core` archives, syncs, parses, indexes and searches from this machine, a WSL distro or an SSH host: the archive and catalogue, the local and shell transports, the provider seam with the first provider's scan, fetch and parser, the transcript model, the session index, folders with attached paths and filing rules, search in its own derived database, Trash and deleting for good. Dev examples drive it (`sync`, `check`). The app has most of phase 3: the first run, the sidebar with folders and locations, folder pages, All sessions, Starred and Unsorted as cards, the locations sheet and adding a location (this machine, a WSL distro, an SSH host). Still to come in phase 3: drag and drop, the folder paths editor, the list view and filters. The reader (phase 4) is in progress on a branch.
 - Agent-agnostic (PLAN D8, §7): everything specific to a coding agent lives in its provider. Sync, the archive, filing, search and the reader never name an agent. Adding an agent must not need a change outside its provider; if it does, fix the seam first.
 - Sibling apps on the same stack, all the owner's: dv (`kylekz/diff`), fc, slide, folio, and the shared crates in `kylekz/toolbox-rs`. Lift from them per PLAN D15.
 - Machine-specific notes live in the git-ignored `CLAUDE.local.md` beside this file, never in the repository:
@@ -39,6 +39,7 @@ cargo test --workspace
 cargo run --release -p sb_core --example sync -- <archive folder> [--wsl <distro> | --ssh <host>]
                              # a dev trigger: syncs and indexes this machine, a WSL distro or an SSH host into an archive
 cargo run --release -p sb_core --example sync -- <archive folder> verify | set-aside | index | reindex
+cargo run --release -p sb_core --example sync -- <archive folder> search <query…>
 cargo run --release -p sb_core --example sync -- test --wsl <distro> | --ssh <host>
                              # the connection test; `sync -- distros` lists WSL distros
 cargo run --release -p sb_core --example check [-- <home folder>]

@@ -11,8 +11,9 @@ use crate::transport::TransportError;
 /// What runs at the location: a function per operation.
 const FUNCTIONS: &str = include_str!("shell.sh");
 
-/// The script of one call: the functions, then the requests between braces, so that the
-/// shell has read all of it before it runs any of it.
+/// The script of one call: the functions, then the requests between braces of their own, all
+/// of it between braces, so that the shell has read the whole script before it runs any of
+/// it. One that reaches the shell cut short then runs nothing: the shell finds it unfinished.
 pub(super) struct Script {
     /// The line the answer starts at: one that nothing else at the location can have printed.
     marker: String,
@@ -99,7 +100,7 @@ impl Script {
     /// What goes to the shell's stdin.
     pub(super) fn text(&self) -> String {
         format!(
-            "{FUNCTIONS}{{\nprintf '%s\\n' '{}'\n{}printf '{END}\\n'\n}} </dev/null\n",
+            "{{\n{FUNCTIONS}{{\nprintf '%s\\n' '{}'\n{}printf '{END}\\n'\n}} </dev/null\n}}\n",
             self.marker, self.requests
         )
     }
