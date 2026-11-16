@@ -1107,6 +1107,31 @@ pub fn tangled(tree: &mut ProjectsTree) -> String {
             s.result(&orphan, json!("Lost."), json!({ "agentId": twice_id }));
         }
         s.at("08:00:03").reply(HAIKU, "Done.");
+        if starts.is_some() {
+            /* A call with no input, which the parse doesn't take for one, answered; and a
+            result in a record that isn't a user's: neither starts anything. */
+            let id = format!("toolu_noinput_{prefix}");
+            records.assistant(
+                900,
+                HAIKU,
+                json!([{ "type": "tool_use", "id": id, "name": "Agent" }]),
+                json!({}),
+            );
+            records.user(
+                json!([{ "type": "tool_result", "tool_use_id": id, "content": "Done." }]),
+                json!({ "toolUseResult": { "agentId": twice_id } }),
+            );
+            let call = Call {
+                id: format!("toolu_system_{prefix}"),
+                uuid: format!("system_{prefix}"),
+            };
+            records.record(
+                "system",
+                json!({ "message": { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": call.id, "content": "Done." }
+                ] }, "toolUseResult": { "agentId": twice_id } }),
+            );
+        }
     }
     session.session_key().to_string()
 }

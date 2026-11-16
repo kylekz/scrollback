@@ -671,7 +671,7 @@ impl Stored {
             }
             _ => head.into_owned(),
         };
-        Ok((text, self.length - used as u64))
+        Ok((text, self.length.saturating_sub(used as u64)))
     }
 }
 

@@ -17,6 +17,15 @@ use clap::Parser as _;
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Hands back to the system what mimalloc holds free: run after a session closes and a sync
+/// pass ends (`sb_ui::system::GiveBack`).
+#[cfg(target_os = "macos")]
+fn give_back() {
+    // SAFETY: `mi_collect` takes no pointers; forced, it frees what the calling thread's
+    // heap holds free and purges what the process does.
+    unsafe { libmimalloc_sys::mi_collect(true) }
+}
+
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Stderr)

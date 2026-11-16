@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use super::parse::{file_name, meta_key, sidecar};
-use super::record::{Launched, SubagentMeta, Text, typed};
+use super::record::{Block, Launched, SubagentMeta, Text, typed};
 use super::tools::{self, WORKFLOW};
 use crate::provider::{ItemKind, SessionItems};
 use crate::transcript::{Outline, ToolKind};
@@ -27,6 +27,10 @@ use crate::transcript::{Outline, ToolKind};
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Scanned<'a> {
+    #[serde(rename = "type")]
+    kind: String,
+    uuid: Option<String>,
+    is_compact_summary: Option<bool>,
     #[serde(borrow)]
     tool_use_result: Option<&'a RawValue>,
     #[serde(borrow)]
@@ -37,16 +41,6 @@ struct Scanned<'a> {
 struct Message<'a> {
     #[serde(borrow)]
     content: Option<&'a RawValue>,
-}
-
-/// A content block, as far as the scan reads it.
-#[derive(Deserialize)]
-struct Block {
-    #[serde(rename = "type")]
-    kind: String,
-    id: Option<String>,
-    name: Option<String>,
-    tool_use_id: Option<String>,
 }
 
 /// A call in the transcript: whether it starts subagents, and the line it is on.
@@ -109,6 +103,8 @@ fn started(items: &dyn SessionItems, key: &str, transcripts: &[Transcript]) -> V
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     let mut at = 0;
+    /* A record written again with a uuid already read is passed over, as the parse does. */
+    let mut seen: HashSet<String> = HashSet::new();
     while reader
         .read_until(b'\n', &mut line)
         .is_ok_and(|read| read > 0)
@@ -117,7 +113,9 @@ fn started(items: &dyn SessionItems, key: &str, transcripts: &[Transcript]) -> V
         let marker = b"\"tool_use";
         if line.windows(marker.len()).any(|it| it == marker) {
             let text = String::from_utf8_lossy(&line);
-            if let Ok(record) = serde_json::from_str::<Scanned>(&text) {
+            if let Ok(record) = serde_json::from_str::<Scanned>(&text)
+                && record.uuid.clone().is_none_or(|uuid| seen.insert(uuid))
+            {
                 let launched: Vec<String> = record
                     .tool_use_result
                     .and_then(typed::<Launched>)
@@ -129,20 +127,19 @@ fn started(items: &dyn SessionItems, key: &str, transcripts: &[Transcript]) -> V
                     .and_then(|message| message.content)
                     .and_then(typed::<Vec<&RawValue>>)
                     .unwrap_or_default();
+                /* Calls from a reply's blocks, results from a user's (not a summary's), as the
+                parse takes them (`Block::call`, `Block::answers`). */
+                let user = record.kind == "user" && record.is_compact_summary != Some(true);
                 for block in blocks.into_iter().filter_map(typed::<Block>) {
-                    match (block.kind.as_str(), block.id, block.tool_use_id) {
-                        ("tool_use", Some(id), _) => {
-                            let name = block.name.unwrap_or_default();
-                            calls.entry(id).or_insert(Call {
-                                starts: tools::kind(&name) == ToolKind::Subagent
-                                    || name == WORKFLOW,
-                                line: at,
-                            });
-                        }
-                        ("tool_result", _, Some(call)) => {
-                            results.push((call, launched.clone(), at));
-                        }
-                        _ => {}
+                    if record.kind == "assistant"
+                        && let Some((id, name)) = block.call()
+                    {
+                        calls.entry(id.to_string()).or_insert(Call {
+                            starts: tools::kind(name) == ToolKind::Subagent || name == WORKFLOW,
+                            line: at,
+                        });
+                    } else if user && let Some(call) = block.answers() {
+                        results.push((call.to_string(), launched.clone(), at));
                     }
                 }
             }

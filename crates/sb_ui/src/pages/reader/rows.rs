@@ -89,6 +89,8 @@ pub enum ProsePart {
     Failed(String),
     /// A piece laid out as Markdown.
     Markdown(usize),
+    /// A piece of fenced code, in the reader's code view.
+    Code(usize),
     /// Over a piece shown as plain text for its size: says so.
     Note(usize),
     /// The `chunk`th row of a piece's lines.
@@ -621,6 +623,7 @@ impl Rows<'_> {
         for (index, piece) in prose.pieces.iter().enumerate() {
             match piece {
                 Piece::Markdown(_) => parts.push(ProsePart::Markdown(index)),
+                Piece::Code { .. } => parts.push(ProsePart::Code(index)),
                 Piece::Plain { text, oversized } => {
                     if *oversized {
                         parts.push(ProsePart::Note(index));

@@ -215,6 +215,12 @@ pub struct OpenSession {
     gone: Option<Gone>,
     prose: HashMap<BlockRef, Load<Arc<Prose>>>,
     subagents: HashMap<Arc<str>, Load<Arc<SubagentRead>>>,
+    /**
+     * The subagents read with the session's own conversation, whose records are in its
+     * transcript: kept for as long as the session is open, as reading one again would read the
+     * session again.
+     */
+    read_with_session: HashSet<Arc<str>>,
     bodies: HashMap<BlockRef, Load<Arc<CallBody>>>,
     raws: HashMap<BlockRef, Load<Arc<Text>>>,
     /// The whole of a call's input or output part, when its body has only its head.
@@ -534,7 +540,10 @@ impl ReaderService {
                 },
                 Held::Raw(at) => open.raws.remove(&at).is_some(),
                 Held::Whole(at, part) => open.wholes.remove(&(at, part)).is_some(),
-                Held::Subagent(item) => open.subagents.remove(&item).is_some(),
+                Held::Subagent(item) => {
+                    !open.read_with_session.contains(&item)
+                        && open.subagents.remove(&item).is_some()
+                }
             };
         }
         if released {
@@ -578,7 +587,12 @@ impl ReaderService {
                 }
             }
         }
-        cx.background_spawn(async move { drop(before) }).detach();
+        let dropped = cx.background_spawn(async move { drop(before) });
+        cx.spawn(async move |_, cx| {
+            dropped.await;
+            cx.update(|cx| crate::system::give_back_memory(cx));
+        })
+        .detach();
         cx.notify();
     }
 
@@ -592,9 +606,17 @@ impl ReaderService {
         self.state = ReaderState::Opening(id.clone());
         let generation = self.generation;
         let providers = self.providers.clone();
+        /* Only the newest session asked for is parsed: one passed over (J held down) is
+        closed, its flag cleared, before its turn on the background comes. */
+        let alive = self.alive.clone();
         let job = cx.background_spawn({
             let id = id.clone();
-            async move { parse(&archive, &providers, &id) }
+            async move {
+                if !alive.load(Ordering::Relaxed) {
+                    return Err("passed over".to_string());
+                }
+                parse(&archive, &providers, &id)
+            }
         });
         cx.spawn(async move |this, cx| {
             let parsed = job.await;
@@ -654,6 +676,9 @@ impl ReaderService {
             let value = job.await;
             this.update(cx, |this, cx| {
                 if this.generation != generation {
+                    /* Dropped; but its end may free a decode's place, which a row of the
+                    session open now waits for (`want_image`). */
+                    cx.notify();
                     return;
                 }
                 this.loading -= 1;
@@ -691,15 +716,20 @@ impl ReaderService {
             _ => return,
         };
         let key = at.clone();
+        let alive = self.alive.clone();
         self.load(
             |open| claim(&mut open.prose, &key),
-            move |_, items| match source {
-                Source::Markdown(text) => Ok(Arc::new(Prose::markdown(&text))),
-                Source::Plain(text) => Ok(Arc::new(Prose::plain(&text))),
-                Source::Stored(stored) => stored
-                    .load_text(items)
-                    .map(|text| Arc::new(Prose::markdown(&text)))
-                    .map_err(|error| error.to_string()),
+            move |_, items| {
+                /* A body of a session closed meanwhile goes no further than its next parse. */
+                let wanted = || alive.load(Ordering::Relaxed);
+                match source {
+                    Source::Markdown(text) => Ok(Arc::new(Prose::markdown_while(&text, &wanted))),
+                    Source::Plain(text) => Ok(Arc::new(Prose::plain(&text))),
+                    Source::Stored(stored) => stored
+                        .load_text(items)
+                        .map(|text| Arc::new(Prose::markdown_while(&text, &wanted)))
+                        .map_err(|error| error.to_string()),
+                }
             },
             {
                 let at = at.clone();
@@ -1192,6 +1222,7 @@ fn parse(archive: &Archive, providers: &Providers, id: &SessionId) -> Result<Ope
         gone,
         prose: HashMap::new(),
         subagents: HashMap::new(),
+        read_with_session: HashSet::new(),
         bodies: HashMap::new(),
         raws: HashMap::new(),
         wholes: HashMap::new(),
@@ -1239,6 +1270,7 @@ fn parse(archive: &Archive, providers: &Providers, id: &SessionId) -> Result<Ope
         }
     }
     for (item, read) in found {
+        open.read_with_session.insert(item.clone());
         open.subagents.insert(item, Load::Loaded(read));
     }
     Ok(open)

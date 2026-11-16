@@ -129,6 +129,21 @@ fn a_subagent_kept_in_the_sessions_own_transcript_is_not_the_sessions_conversati
     and read again by that name. */
     let own_item = &conversation.item;
     assert!(listed.item != *own_item && counted.item != *own_item && listed.item != counted.item);
+    /* Named by where their first record is in the session's transcript: only a name of that
+    shape, after the transcript's own key, is one. */
+    for (key, inline) in [
+        (format!("{own_item}#120"), true),
+        (format!("{own_item}#"), false),
+        (format!("{own_item}#a#1"), false),
+        (own_item.to_string(), false),
+    ] {
+        assert_eq!(
+            super::super::parse::is_inline(&key, own_item),
+            inline,
+            "{key}"
+        );
+    }
+    assert!(listed.item.starts_with(&format!("{own_item}#")));
     for read in [listed, counted] {
         let Subagent::Read {
             conversation: again,

@@ -56,6 +56,8 @@ const ARCHIVE: &str = "archive";
 #[cfg_attr(not(feature = "automation"), expect(unused_variables))]
 fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
     sb_ui::init(cx)?;
+    #[cfg(target_os = "macos")]
+    cx.set_global(sb_ui::system::GiveBack(crate::give_back));
     // Before anything writes a date.
     #[cfg(feature = "automation")]
     if let Some(year) = cli.automation_calendar {

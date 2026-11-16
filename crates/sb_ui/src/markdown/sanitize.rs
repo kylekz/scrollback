@@ -62,14 +62,17 @@ fn edit(source: &str, options: &ParseOptions) -> Option<String> {
         return Some(source.to_string());
     }
     let root = markdown::to_mdast(source, options).ok()?;
-    /* Where a reference link goes: its definition's, the first one of its name. */
+    /* Where a reference link goes: its definition's, the first one of its name, wherever it is
+    (a definition in a quote or a list item holds for the whole body). */
     let mut definitions: HashMap<&str, &str> = HashMap::new();
-    for node in root.children().into_iter().flatten() {
+    let mut walk = vec![&root];
+    while let Some(node) = walk.pop() {
         if let Node::Definition(definition) = node {
             definitions
                 .entry(definition.identifier.as_str())
                 .or_insert(definition.url.as_str());
         }
+        walk.extend(node.children().into_iter().flatten().rev());
     }
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     /* Each node with whether its parent is the document itself, where HTML is a block. */
@@ -245,30 +248,36 @@ pub fn literal(text: &str) -> String {
 }
 
 /**
- * The site a link to `url` goes to, when its text `text` names a web address of another site:
- * the host as a browser reads it from `url` (after any user name, an international name in its
+ * The site a link to `url` goes to, when its text `text` is an address of another site: the
+ * host as a browser reads it from `url` (after any user name, an international name in its
  * ASCII form), or "another site" when it has none a browser would show.
+ *
+ * Text is an address only when it says so: with a scheme (`https://`, `ftp://`, any), or
+ * starting `www.`. A name with a dot and no scheme (`main.rs`, `README.md`, `e.g.`)
+ * can't be told from a file's, as `.rs`, `.md` and `.io` are names of the web too: it isn't
+ * checked. A relative `url` stays on the site the transcript is read on: no note.
  */
 fn spoofed(text: &str, url: &str) -> Option<String> {
-    /* The host of `address`, without `www.`, if it parses as a web address. */
-    fn host(address: &str) -> Option<String> {
-        let parsed = url::Url::parse(address).ok()?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            return None;
-        }
-        let host = parsed.host_str()?;
-        Some(host.strip_prefix("www.").unwrap_or(host).to_string())
+    /* The host of `address`, without `www.`. */
+    fn host(address: &url::Url) -> Option<String> {
+        let host = address.host_str()?;
+        Some(
+            host.strip_prefix("www.")
+                .unwrap_or(host)
+                .to_ascii_lowercase(),
+        )
     }
     let text = text.trim();
-    /* Text that reads as an address: one written whole, or a name with a dot and no spaces. */
     let shown = if text.contains("://") {
-        host(text)
-    } else if text.contains('.') && !text.contains(char::is_whitespace) {
-        host(&format!("http://{text}"))
+        url::Url::parse(text).ok()
+    } else if text.starts_with("www.") {
+        url::Url::parse(&format!("http://{text}")).ok()
     } else {
         None
-    }?;
-    match host(url) {
+    }
+    .and_then(|it| host(&it))?;
+    let real = url::Url::parse(url).ok()?;
+    match host(&real) {
         Some(real) if real == shown => None,
         Some(real) => Some(real),
         None => Some("another site".to_string()),
@@ -426,6 +435,24 @@ mod tests {
                 "[https://bank.example](javascript:alert(1))",
                 "(to another site)",
             ),
+            /* Any scheme, or `www.`, makes the text an address. */
+            (
+                "[ftp://bank.example](https://evil.example)",
+                "(to evil.example)",
+            ),
+            (
+                "[www.bank.example](https://evil.example)",
+                "(to evil.example)",
+            ),
+            /* A definition in a quote or a list item holds for the whole body. */
+            (
+                "[https://bank.example][r]\n\n> [r]: https://evil.example/x",
+                "(to evil.example)",
+            ),
+            (
+                "[https://bank.example][r]\n\n- [r]: https://evil.example/x",
+                "(to evil.example)",
+            ),
         ] {
             let out = sanitize(source);
             assert!(out.contains(note), "{source:?}: {out:?}");
@@ -435,6 +462,12 @@ mod tests {
             "[https://example.com](https://www.example.com/docs)",
             "[the docs](https://evil.example/x)",
             "<https://example.com/x>",
+            /* Names that read as files, and relative links: no note. */
+            "[main.rs](src/main.rs)",
+            "[src/main.rs:12](src/main.rs#L12)",
+            "[README.md](https://github.com/user/repo/blob/main/README.md)",
+            "[e.g.](https://example.com)",
+            "[docs](./docs/README.md)",
         ] {
             assert_eq!(sanitize(source), source);
         }

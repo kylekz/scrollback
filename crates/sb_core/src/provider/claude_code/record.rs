@@ -170,6 +170,24 @@ pub(super) struct Block<'a> {
     pub source: Option<&'a RawValue>,
 }
 
+impl Block<'_> {
+    /// The call the block makes, its id and its tool's name: a `tool_use` with an id, a name
+    /// and an input. What the parse keeps as a call, and the outline counts.
+    pub fn call(&self) -> Option<(&str, &str)> {
+        match (self.kind.as_str(), &self.id, &self.name, self.input) {
+            ("tool_use", Some(id), Some(name), Some(_)) => Some((id, name)),
+            _ => None,
+        }
+    }
+
+    /// The call a `tool_result` block answers.
+    pub fn answers(&self) -> Option<&str> {
+        (self.kind == "tool_result")
+            .then_some(self.tool_use_id.as_deref())
+            .flatten()
+    }
+}
+
 /// An image block's `source`.
 #[derive(Deserialize)]
 pub(super) struct Source<'a> {

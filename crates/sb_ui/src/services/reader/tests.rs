@@ -432,7 +432,7 @@ fn hostile_prose_reaches_the_view_inert_and_what_it_cant_lay_out_as_plain_text(
             for piece in &prose.pieces {
                 match piece {
                     Piece::Markdown(sanitized) => markdown.push(sanitized.as_str().to_string()),
-                    Piece::Plain { .. } => plain += 1,
+                    Piece::Plain { .. } | Piece::Code { .. } => plain += 1,
                 }
             }
         }
@@ -581,6 +581,11 @@ fn subagents_kept_in_the_sessions_transcript_are_each_their_own(cx: &mut TestApp
         let unattached = open.unattached().expect("placed");
         assert_eq!(unattached.len(), 2, "{unattached:?}");
         assert_ne!(unattached[0], unattached[1]);
+        /* Named apart in automation and in their controls too. */
+        assert_ne!(
+            crate::pages::reader::blocks::file_stem(&unattached[0]),
+            crate::pages::reader::blocks::file_stem(&unattached[1])
+        );
         let rows = rows(open, true, None);
         let mut keys = HashSet::new();
         for row in &rows {
@@ -595,7 +600,8 @@ fn subagents_kept_in_the_sessions_transcript_are_each_their_own(cx: &mut TestApp
         }
         unattached
     });
-    /* Let go of and read again, each is still its own conversation. */
+    /* Let go of, each is kept: it was read with the session, and reading it again would read
+    the session again. Asked for again, each is still its own conversation. */
     for (item, prompt) in items.iter().zip(["First look.", "Second look."]) {
         reader.update(cx, |reader, cx| {
             reader.release(vec![Held::Subagent(item.clone())], cx);

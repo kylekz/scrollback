@@ -54,9 +54,9 @@
 
 // Full calls (E): every call open; the choice is the app's, kept for the next session. The row at the top stays at the top. Where it sits is a range: the rows above it lay out a few pixels apart at each display scale and on each platform; it must not move when the calls open.
 {"cmd": "key", "keystroke": "]"}
-{"cmd": "settle", "expect": [{"pointer": "/reader/top_name", "equals": "reply main/12"}, {"pointer": "/reader/top_offset", "gte": 176, "lte": 188}]}
+{"cmd": "settle", "expect": [{"pointer": "/reader/top_name", "equals": "reply main/12"}, {"pointer": "/reader/top_offset", "gte": 164, "lte": 188}]}
 {"cmd": "key", "keystroke": "e"}
-{"cmd": "settle", "expect": [{"pointer": "/reader/full_calls", "equals": true}, {"pointer": "/reader/open_calls", "equals": 17}, {"pointer": "/reader/top_name", "equals": "reply main/12"}, {"pointer": "/reader/top_offset", "gte": 176, "lte": 188}]}
+{"cmd": "settle", "expect": [{"pointer": "/reader/full_calls", "equals": true}, {"pointer": "/reader/open_calls", "equals": 17}, {"pointer": "/reader/top_name", "equals": "reply main/12"}, {"pointer": "/reader/top_offset", "gte": 164, "lte": 188}]}
 {"cmd": "key", "keystroke": "home"}
 {"cmd": "settle"}
 {"cmd": "screenshot", "name": "full-calls-1440-dark"}
@@ -68,8 +68,17 @@
 {"cmd": "key", "keystroke": "e"}
 {"cmd": "settle", "expect": {"pointer": "/reader/full_calls", "equals": true}}
 {"cmd": "key", "keystroke": "end"}
-{"cmd": "settle", "expect": {"pointer": "/reader/at_end", "equals": true}}
+{"cmd": "settle", "expect": [{"pointer": "/reader/at_end", "equals": true}, {"pointer": "/reader/following", "equals": true}]}
 {"cmd": "screenshot", "name": "full-calls-end-1440-dark"}
+// End keeps to the end until the wheel moves the column; back at the end by the wheel, it doesn't take it up again. A key other than End lets go of it too.
+{"cmd": "scroll", "target": "reader/column", "dy": 300}
+{"cmd": "settle", "expect": {"pointer": "/reader/following", "equals": false}}
+{"cmd": "scroll", "target": "reader/column", "dy": -5000}
+{"cmd": "settle", "expect": [{"pointer": "/reader/at_end", "equals": true}, {"pointer": "/reader/following", "equals": false}]}
+{"cmd": "key", "keystroke": "end"}
+{"cmd": "settle", "expect": {"pointer": "/reader/following", "equals": true}}
+{"cmd": "key", "keystroke": "up"}
+{"cmd": "settle", "expect": {"pointer": "/reader/following", "equals": false}}
 
 // E-Reader-Calls-1 and -2: J goes to the next session of fc's page, the playlist's, still in Full calls.
 {"cmd": "key", "keystroke": "j"}

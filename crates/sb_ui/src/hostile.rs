@@ -5,7 +5,8 @@
 //!   U+2066–2069, and the marks, U+200E, U+200F and U+061C) reorder what is around them, so a
 //!   path or a command could read reversed. They are shown as what they are, `⟦U+202E⟧`, all
 //!   alike. Right-to-left text reads right without them.
-//! - **Text with nothing to show** (only controls, invisible formatting and spaces) says so
+//! - **Text with nothing to show** (only controls, invisible formatting, spaces and the
+//!   characters that draw as nothing) says so
 //!   ([`nothing_shown`]) rather than drawing as a blank.
 //! - **A one-line label** ([`label`]: a title, a row's target, a tool's name, a model's, a
 //!   note's kind, a caption) is one line: every line break Unicode has (U+2028, U+2029, NEL,
@@ -35,8 +36,14 @@ fn is_bidi_control(c: char) -> bool {
  * formatting and spaces, and isn't empty): how many characters it is.
  */
 pub fn nothing_shown(text: &str) -> Option<String> {
+    /* Spaces, controls and formatting, and the letters and symbols that draw as nothing
+    (the Hangul fillers, the blank Braille pattern). */
     let invisible = |c: char| {
         c.is_whitespace()
+            || matches!(
+                c,
+                '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' | '\u{2800}'
+            )
             || matches!(
                 c.general_category(),
                 GeneralCategory::Control | GeneralCategory::Format
@@ -45,7 +52,7 @@ pub fn nothing_shown(text: &str) -> Option<String> {
     (!text.is_empty() && text.chars().all(invisible)).then(|| {
         let count = text.chars().count();
         format!(
-            "({count} control {})",
+            "({count} blank {})",
             if count == 1 {
                 "character"
             } else {
@@ -94,6 +101,11 @@ pub fn label(text: &str) -> String {
             if marks > COMBINING_MARKS {
                 continue;
             }
+        } else if c.general_category() == GeneralCategory::Format {
+            /* A joiner between marks doesn't end their stack; past the cap it goes with them. */
+            if marks >= COMBINING_MARKS {
+                continue;
+            }
         } else {
             marks = 0;
         }
@@ -126,9 +138,13 @@ mod tests {
         );
         assert_eq!(
             nothing_shown("\u{0}\u{1}\u{200B} \n").as_deref(),
-            Some("(5 control characters)")
+            Some("(5 blank characters)")
         );
         assert_eq!(nothing_shown(""), None);
+        assert_eq!(
+            nothing_shown("\u{3164}\u{2800}").as_deref(),
+            Some("(2 blank characters)")
+        );
         assert_eq!(nothing_shown("\u{0}a"), None);
     }
 
@@ -142,6 +158,11 @@ mod tests {
         assert_eq!(
             label("a\u{2028}b\u{2029}c\u{85}d\u{b}e\u{c}f\u{0}g"),
             "a b c d e f g"
+        );
+        let joined = label(&format!("Z{}a", "\u{0336}\u{200D}".repeat(100)));
+        assert_eq!(
+            joined.chars().filter(|c| *c == '\u{0336}').count(),
+            COMBINING_MARKS
         );
         for mark in ['\u{0336}', '\u{0489}', '\u{20DD}'] {
             let stacked = label(&format!("Z{}a", mark.to_string().repeat(200)));

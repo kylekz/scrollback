@@ -24,6 +24,7 @@ use crate::hostile;
 use crate::icons::SbIcon;
 use crate::markdown::{self, Size};
 use crate::services::ActiveServices as _;
+use crate::services::reader::text::expand_tabs;
 use crate::services::reader::{
     BlockRef, Held, ImageKey, Load, OpenSession, Picture, Piece as ProsePiece, Slot, Text,
 };
@@ -132,8 +133,24 @@ pub fn conversation_name<'a>(item: &'a str, open: &OpenSession) -> &'a str {
     if open.main().is_some_and(|main| *main.item == *item) {
         return "main";
     }
+    file_stem(item)
+}
+
+/**
+ * The name a conversation's item goes by in automation and in the controls built for it: the
+ * last part of its path less an extension it ends with (`.jsonl`). Whatever else the name
+ * holds stays, so that conversations kept in one file are named apart.
+ */
+pub fn file_stem(item: &str) -> &str {
     let file = item.rsplit('/').next().unwrap_or(item);
-    file.split('.').next().unwrap_or(file)
+    match file.rsplit_once('.') {
+        Some((stem, extension))
+            if !stem.is_empty() && extension.bytes().all(|it| it.is_ascii_alphanumeric()) =>
+        {
+            stem
+        }
+        _ => file,
+    }
 }
 
 /// A click on a row: the keyboard goes to it, and what it opens opens or closes.
@@ -453,6 +470,22 @@ fn prose(
             .map(|state| markdown::view(&state, size, cx).w_full().into_any_element())
             .unwrap_or_else(|| div().into_any_element())
         }
+        ProsePart::Code(index) => match piece(*index) {
+            Some(ProsePiece::Code { language, text }) => {
+                let code = expand_tabs(&text.lines(0..text.line_count())).into_owned();
+                let highlights = view.highlights(
+                    Piece {
+                        at: at.clone(),
+                        piece: *index,
+                    },
+                    ix,
+                    language.as_deref(),
+                    &code,
+                );
+                code_view(ix, language.as_deref(), code, &highlights, theme)
+            }
+            _ => div().into_any_element(),
+        },
         ProsePart::Note(index) => {
             let lines = match piece(*index) {
                 Some(ProsePiece::Plain { text, .. }) => text.line_count(),
@@ -484,7 +517,7 @@ fn prose(
                             reader.read(cx).full_calls(),
                         )
                     });
-                let lines = text_rows(text, *chunk, all);
+                let lines = expand_tabs(&text_rows(text, *chunk, all)).into_owned();
                 let spec = if thinking {
                     &theme.text.thought_open
                 } else {
@@ -546,6 +579,83 @@ fn prose(
             )),
     )
     .automation_target(name)
+}
+
+/**
+ * A piece of fenced code as the reader draws it, not the Markdown view: a code box (DESIGN
+ * §4.2.2 `codeblock`) with its language and Copy over its lines, coloured by `highlights`.
+ */
+fn code_view(
+    ix: usize,
+    language: Option<&str>,
+    code: String,
+    highlights: &[(std::ops::Range<usize>, crate::syntax::TokenKind)],
+    theme: &SbTheme,
+) -> AnyElement {
+    let c = &theme.colors;
+    let runs: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> = highlights
+        .iter()
+        .filter(|(range, _)| {
+            code.is_char_boundary(range.start)
+                && code.is_char_boundary(range.end)
+                && range.end <= code.len()
+        })
+        .filter_map(|(range, kind)| {
+            Some((
+                range.clone(),
+                gpui::HighlightStyle {
+                    color: Some(kind.color(&theme.colors.syntax)?),
+                    ..Default::default()
+                },
+            ))
+        })
+        .collect();
+    let copied = code.clone();
+    div()
+        .flex()
+        .flex_col()
+        .my(theme.spacing.sm)
+        .rounded(theme.radii.control)
+        .border_1()
+        .border_color(c.line)
+        .bg(c.code)
+        .overflow_hidden()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap(px(8.))
+                .h(theme.sizes.call_header)
+                .px(px(10.))
+                .bg(c.codehead)
+                .border_b_1()
+                .border_color(c.line_subtle)
+                .text_color(c.fg3)
+                .text_spec(&theme.text.small)
+                .children(language.map(|language| {
+                    div()
+                        .font_family(theme.fonts.mono.clone())
+                        .child(hostile::label(language))
+                }))
+                .child(
+                    div()
+                        .id(("code-copy", ix))
+                        .cursor_pointer()
+                        .hover(|this| this.text_color(c.fg2))
+                        .on_click(move |_, _, cx| crate::system::copy_text(copied.clone(), cx))
+                        .child("Copy"),
+                ),
+        )
+        .child(
+            div()
+                .px(theme.spacing.lg)
+                .py(theme.spacing.md)
+                .text_color(c.fg)
+                .text_spec(&theme.text.code_block)
+                .child(gpui::StyledText::new(code).with_highlights(runs)),
+        )
+        .into_any_element()
 }
 
 /// The lines of the `chunk`th row of `text`: its first [`FIRST_LINES`] until all are shown,
@@ -1035,7 +1145,7 @@ fn raw(at: &BlockRef, theme: &SbTheme, cx: &mut Context<ReaderView>) -> AnyEleme
                     div()
                         .text_color(c.fg2)
                         .text_spec(&theme.text.code)
-                        .child(hostile::bidi(&text.lines(0..RAW_LINES)).into_owned()),
+                        .child(expand_tabs(&hostile::bidi(&text.lines(0..RAW_LINES))).into_owned()),
                 )
                 .when(more > 0, |this| {
                     this.child(

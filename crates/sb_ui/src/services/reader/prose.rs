@@ -3,14 +3,28 @@
 //! session, and so that nothing the stack's Markdown view can't lay out quickly, or at all,
 //! reaches it.
 //!
-//! A body is first scanned without parsing ([`regions`]): the Markdown parser recurses once per
-//! level of nesting and takes time at least quadratic in nesting and in a paragraph's
-//! delimiters, so a paragraph nested past [`MAX_NESTING`] or longer than a block may be, and
-//! what follows once [`DELIMITER_COST`] is spent, is never parsed and is shown as plain text,
-//! as is a body past [`MARKDOWN_BYTES`]. The rest is parsed on a thread of its own with a stack
-//! of [`PARSE_STACK`], and its tree taken apart without recursing.
+//! What keeps the Markdown parser's time bounded is size and time, not knowing Markdown: the
+//! parser is at least quadratic in many things (blocks, list markers, table cells, entities,
+//! delimiters, nesting), and a scan that tried to tell them all apart would be bypassed by the
+//! next one. So:
 //!
-//! The parsed body is cut between its top-level blocks into pieces, each sanitised on its own:
+//! - **No parse is larger than [`REGION_BYTES`].** A body is scanned line by line ([`scan`]) and
+//!   cut at blank lines into regions of at most that, each parsed on its own; a paragraph
+//!   larger than that alone is plain text. Reference definitions found anywhere in the body
+//!   are carried into the regions that refer to them.
+//! - **Fenced code is never parsed.** What the scan takes for a fenced block is a piece of its
+//!   own ([`Piece::Code`]), drawn by the reader's code view. Where the scan is wrong, the result
+//!   looks wrong, and costs nothing.
+//! - **A body's parses stop after [`PARSE_BUDGET`].** The time is checked between regions; once
+//!   spent, the rest is plain text. So is a body whose session closed meanwhile.
+//! - The parser recurses once per level of nesting, so it runs on a thread with a stack of
+//!   [`PARSE_STACK`], and its tree is taken apart without recursing.
+//!
+//! The scan also picks plain text early for a paragraph nested past [`MAX_NESTING`] or with
+//! more delimiters than [`DELIMITER_COST`] allows: those only spare the parser work that would
+//! end in plain text anyway, and nothing depends on them.
+//!
+//! A parsed region is cut between its top-level blocks into pieces, each sanitised on its own:
 //! blocks are grouped up to [`PIECE_BYTES`], a single block may be up to [`BLOCK_BYTES`]
 //! ([`CODE_BYTES`] for code), and a reference link's definitions go with each piece that uses
 //! them, up to [`DEFINITION_BYTES`]. What is past these is shown as its plain text instead, a
@@ -24,6 +38,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use markdown::mdast::Node;
 
@@ -38,20 +53,29 @@ pub const CODE_BYTES: usize = 64 * 1024;
 /// Any other block longer than this, or with a line longer than [`LINE_BYTES`], likewise.
 pub const BLOCK_BYTES: usize = 16 * 1024;
 pub const LINE_BYTES: usize = 8 * 1024;
-/// The most of reference definitions carried into one piece.
+/// The most of reference definitions carried into one piece, or into one region.
 pub const DEFINITION_BYTES: usize = 8 * 1024;
+/**
+ * The most of a body handed to the parser at once (the module docs). At this size the slowest
+ * inputs found (ordered lists or quotes nested to the region's end, entities after an
+ * autolink) cost the parse and the sanitiser under 200 ms on a release build, the rest well
+ * under 100 ms (the tests' table); at 16 KiB the nested ones took over 700 ms. A paragraph or a
+ * table larger than this is plain text.
+ */
+pub const REGION_BYTES: usize = 8 * 1024;
+/// The most time a body's parses may take, all told; past it, the rest is plain text.
+pub const PARSE_BUDGET: Duration = Duration::from_millis(100);
 /**
  * The deepest a body may nest (quotes in quotes, lists in lists, emphasis in emphasis): a tenth
  * of where the view's parser was seen to overflow a worker thread's stack (200 nested lists,
- * 300 nested quotes), and where the parser's time, quadratic in it, is still well under a
- * millisecond.
+ * 300 nested quotes). The scan's use of it only saves work.
  */
 pub const MAX_NESTING: usize = 32;
 /**
- * The most a body's paragraphs may cost the parser: the sum over its paragraphs of the square
- * of their delimiters, each `*`, `_`, `~`, `[` and `<` and each run of backticks or `$`.
- * Matching delimiters is at least quadratic in their number. At the bound, the slowest bodies
- * tried (links, emphasis, brackets) parsed in 15 ms or less on a release build.
+ * A paragraph's delimiters, squared, past which the scan shows it as plain text without asking
+ * the parser: each `*`, `_`, `~`, `[` and `<` and each run of backticks or `$`. Not what bounds
+ * the parser's time ([`REGION_BYTES`] and [`PARSE_BUDGET`] do); it spares parses of paragraphs
+ * that would come out too deep to draw anyway.
  */
 pub const DELIMITER_COST: u64 = 4_000_000;
 /// A body longer than this is shown as plain text without being parsed.
@@ -63,6 +87,11 @@ pub const PARSE_STACK: usize = 16 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Piece {
     Markdown(Sanitized),
+    /// Fenced code, drawn by the reader's code view: its language as its fence names it.
+    Code {
+        language: Option<String>,
+        text: Arc<Text>,
+    },
     /// Shown as plain text, a bounded number of lines a row; `oversized` when that is because
     /// the Markdown view can't be handed it, which the row says.
     Plain {
@@ -99,6 +128,14 @@ impl Prose {
 
     /// `text`, a body of Markdown, prepared (the module docs).
     pub fn markdown(text: &str) -> Self {
+        Self::markdown_while(text, &|| true)
+    }
+
+    /**
+     * `text` prepared while `wanted` says it still is: asked between parses, so that a body of
+     * a session closed meanwhile goes no further (the rest of it is plain text, and dropped).
+     */
+    pub fn markdown_while(text: &str, wanted: &(dyn Fn() -> bool + Sync)) -> Self {
         if let Some(note) = crate::hostile::nothing_shown(text) {
             return Self::plain(&note);
         }
@@ -109,18 +146,7 @@ impl Prose {
                 std::thread::Builder::new()
                     .name("prose".to_string())
                     .stack_size(PARSE_STACK)
-                    .spawn_scoped(scope, || {
-                        let mut pieces = Vec::new();
-                        for (range, parse) in regions(text) {
-                            let source = &text[range];
-                            if !parse {
-                                pieces.push(oversized(source.trim_end()));
-                            } else {
-                                pieces.extend(markdown_pieces(source)?);
-                            }
-                        }
-                        Some(pieces)
-                    })
+                    .spawn_scoped(scope, || prepare(text, wanted))
                     .ok()?
                     .join()
                     .ok()?
@@ -132,21 +158,88 @@ impl Prose {
     }
 }
 
-/// `text` parsed and cut into pieces; `None` if it doesn't parse.
-fn markdown_pieces(text: &str) -> Option<Vec<Piece>> {
-    let root = markdown::to_mdast(text, &options()).ok()?;
-    let blocks: Vec<&Node> = root.children().into_iter().flatten().collect();
-    /* Of definitions of the same name, the first is the one Markdown follows. */
+/// The pieces of `text` (the module docs); `None` if a region doesn't parse.
+fn prepare(text: &str, wanted: &(dyn Fn() -> bool + Sync)) -> Option<Vec<Piece>> {
+    let started = Instant::now();
+    let definitions = definitions(text);
+    let mut pieces = Vec::new();
+    let mut plain: Option<Range<usize>> = None;
+    let flush_plain = |plain: &mut Option<Range<usize>>, pieces: &mut Vec<Piece>| {
+        if let Some(range) = plain.take() {
+            let source = text[range].trim_end();
+            if !source.is_empty() {
+                pieces.push(oversized(source));
+            }
+        }
+    };
+    for span in regions(scan(text)) {
+        let range = match span {
+            Span::Code { language, body, .. } => {
+                flush_plain(&mut plain, &mut pieces);
+                pieces.push(code(language, body));
+                continue;
+            }
+            Span::Prose(range) if started.elapsed() < PARSE_BUDGET && wanted() => {
+                flush_plain(&mut plain, &mut pieces);
+                let source = &text[range];
+                let carried = carried(source, &definitions);
+                pieces.extend(markdown_pieces(source, &carried)?);
+                continue;
+            }
+            Span::Prose(range) | Span::Plain(range) => range,
+        };
+        plain = Some(match plain {
+            Some(open) => open.start..range.end,
+            None => range,
+        });
+    }
+    flush_plain(&mut plain, &mut pieces);
+    Some(pieces)
+}
+
+/// A piece of fenced code; plain text when it is longer than a code block may be.
+fn code(language: Option<String>, body: String) -> Piece {
+    if body.len() > CODE_BYTES || body.lines().count() > CODE_LINES {
+        return oversized(&body);
+    }
+    Piece::Code {
+        language,
+        text: Arc::new(Text::new(crate::hostile::bidi(&body).into_owned())),
+    }
+}
+
+/**
+ * `text`, a region, parsed with the definitions `carried` from elsewhere in the body after it,
+ * and cut into pieces; `None` if it doesn't parse.
+ */
+fn markdown_pieces(text: &str, carried: &str) -> Option<Vec<Piece>> {
+    let source = format!("{text}\n\n{carried}");
+    let root = markdown::to_mdast(&source, &options()).ok()?;
+    /* Every definition, wherever it is (in a quote, in a list item): the first of a name is
+    the one Markdown follows. */
     let mut definitions: HashMap<&str, &str> = HashMap::new();
-    for node in &blocks {
+    let mut stack = vec![&root];
+    while let Some(node) = stack.pop() {
         if let Node::Definition(definition) = node
-            && let Some(source) = span(node, text)
+            && let Some(source) = span(node, &source)
         {
             definitions
                 .entry(definition.identifier.as_str())
                 .or_insert(source);
         }
+        /* Children in order: the first definition is found first. */
+        stack.extend(node.children().into_iter().flatten().rev());
     }
+    /* The region's own blocks; those of the definitions carried after it make no piece. */
+    let blocks: Vec<&Node> = root
+        .children()
+        .into_iter()
+        .flatten()
+        .filter(|node| {
+            node.position()
+                .is_some_and(|at| at.start.offset < text.len())
+        })
+        .collect();
     let mut pieces = Vec::new();
     let flush = |group: &mut Option<Group>, pieces: &mut Vec<Piece>| {
         let Some(group) = group.take() else {
@@ -175,7 +268,7 @@ fn markdown_pieces(text: &str) -> Option<Vec<Piece>> {
         let Some(position) = node.position() else {
             continue;
         };
-        let (start, end) = (position.start.offset, position.end.offset);
+        let (start, end) = (position.start.offset, position.end.offset.min(text.len()));
         let Some(source) = text.get(start..end) else {
             continue;
         };
@@ -229,79 +322,182 @@ fn dismantle(root: Node) {
     }
 }
 
+/// A label as Markdown matches it: case folded, its whitespace collapsed.
+fn label(raw: &str) -> String {
+    raw.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 /**
- * `text` cut into the runs to parse and the runs not to, in order, by a scan line by line that
- * never parses. A paragraph is the lines up to a blank one; a fenced block is never cut. One is
- * not parsed if a line of it nests past [`MAX_NESTING`] (its quote and list markers, and
- * outside a fence its indentation before them at two columns a level), if it is longer than
- * [`BLOCK_BYTES`] ([`CODE_BYTES`] with a fence in it), which the view couldn't be handed
- * anyway; and once the paragraphs parsed would cost past [`DELIMITER_COST`], nothing after is.
+ * The reference definitions of `text`, found without parsing, by label: each line that, past
+ * its quote and list markers, reads `[label]: destination`, outside what the scan takes for
+ * fenced code. The first of a label is the one Markdown follows. A definition the scan misses
+ * only leaves a reference in another region as text.
+ */
+fn definitions(text: &str) -> HashMap<String, &str> {
+    let mut found = HashMap::new();
+    let mut fence: Option<Fence> = None;
+    for line in text.lines() {
+        let prefix = Prefix::of(line);
+        if let Some(open) = &fence {
+            if open.closes(&prefix) || !open.carries(&prefix) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(open) = Fence::opens(&prefix) {
+            fence = Some(open);
+            continue;
+        }
+        let rest = prefix.rest.trim_end();
+        if let Some(inner) = rest.strip_prefix('[')
+            && let Some((name, after)) = inner.split_once("]:")
+            && !name.is_empty()
+            && name.len() <= 999
+            && !name.contains(['[', ']'])
+            && !after.trim().is_empty()
+        {
+            found.entry(label(name)).or_insert(rest);
+        }
+    }
+    found
+}
+
+/**
+ * The definitions of `definitions` the region `text` may refer to, and doesn't hold: those
+ * whose label is in brackets in it. At most [`DEFINITION_BYTES`] of them.
+ */
+fn carried(text: &str, definitions: &HashMap<String, &str>) -> String {
+    let mut out = String::new();
+    let mut seen = BTreeSet::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find(']') else {
+            break;
+        };
+        let name = &rest[..close];
+        if name.is_empty() || name.len() > 999 || name.contains('[') {
+            continue;
+        }
+        let key = label(name);
+        if let Some(definition) = definitions.get(&key)
+            && !text.contains(definition)
+            && seen.insert(key)
+        {
+            if out.len() + definition.len() + 2 > DEFINITION_BYTES {
+                break;
+            }
+            out.push_str(definition);
+            out.push_str("\n\n");
+        }
+    }
+    out
+}
+
+/// What the scan finds a run of a body to be.
+enum Span {
+    /// Paragraphs to parse.
+    Prose(Range<usize>),
+    /// Fenced code: its language, and its lines with the fence and its containers left out.
+    Code {
+        language: Option<String>,
+        body: String,
+    },
+    /// Paragraphs shown as plain text.
+    Plain(Range<usize>),
+}
+
+/**
+ * `spans` with each run of paragraphs to parse cut, at the paragraphs' ends, into regions of at
+ * most [`REGION_BYTES`].
+ */
+fn regions(spans: Vec<Span>) -> Vec<Span> {
+    let mut out: Vec<Span> = Vec::new();
+    for span in spans {
+        match (out.last_mut(), span) {
+            (Some(Span::Prose(open)), Span::Prose(next))
+                if next.end - open.start <= REGION_BYTES =>
+            {
+                open.end = next.end;
+            }
+            (Some(Span::Plain(open)), Span::Plain(next)) => open.end = next.end,
+            (_, span) => out.push(span),
+        }
+    }
+    out
+}
+
+/**
+ * `text` as runs of paragraphs, by a scan line by line that never parses. A paragraph is the
+ * lines up to a blank one, to parse unless it is longer than [`REGION_BYTES`], a line of it
+ * nests past [`MAX_NESTING`] (its quote and list markers, and its indentation before them at
+ * two columns a level), or its delimiters cost past [`DELIMITER_COST`].
  *
  * A fence opens only as CommonMark opens one, and as narrowly: three or more backticks or
  * tildes at most three columns in from the line's last container marker, a backtick fence's
  * info string holding no backtick. It closes at a closing fence, or at the first line that no
  * longer carries the containers it opened in (fewer quote markers, or a list item's content
- * left). A line read as a fence that isn't one is only scanned less: the scan errs that way.
+ * left). What it holds is a [`Span::Code`], never parsed: where the scan takes for a fence what
+ * isn't one, that is only drawn wrong.
  */
-fn regions(text: &str) -> Vec<(Range<usize>, bool)> {
-    let mut regions: Vec<(Range<usize>, bool)> = Vec::new();
-    let mut spent = false;
-    let mut cost: u64 = 0;
-    let mut finish = |range: Range<usize>, paragraph: &Paragraph| {
-        let own = paragraph.delimiters * paragraph.delimiters;
-        let limit = if paragraph.fenced {
-            CODE_BYTES
+fn scan(text: &str) -> Vec<Span> {
+    let mut spans = Vec::new();
+    let finish = |range: Range<usize>, paragraph: &Paragraph, spans: &mut Vec<Span>| {
+        if range.is_empty() {
+            return;
+        }
+        let parse = !paragraph.deep
+            && range.len() <= REGION_BYTES
+            && paragraph.delimiters * paragraph.delimiters <= DELIMITER_COST;
+        spans.push(if parse {
+            Span::Prose(range)
         } else {
-            BLOCK_BYTES
-        };
-        let fits = !paragraph.deep && range.len() <= limit;
-        let parse = fits && !spent && cost + own <= DELIMITER_COST;
-        if parse {
-            cost += own;
-        } else if fits {
-            spent = true;
-        }
-        match regions.last_mut() {
-            Some((last, was)) if *was == parse => last.end = range.end,
-            _ => regions.push((range, parse)),
-        }
+            Span::Plain(range)
+        });
     };
-    let mut fence: Option<Fence> = None;
+    let mut fence: Option<(Fence, Option<String>, String)> = None;
     let mut paragraph = Paragraph::default();
     let (mut start, mut at) = (0, 0);
     for line in text.split_inclusive('\n') {
+        let line_start = at;
         at += line.len();
-        let prefix = Prefix::of(line.trim_end_matches(['\n', '\r']));
-        if let Some(open) = &fence {
-            let carried = prefix.quotes >= open.quotes
-                && (open.content == 0 || prefix.blank || prefix.indent >= open.content);
-            if carried {
-                paragraph.deep |= prefix.quotes + prefix.lists > MAX_NESTING;
-                let run = prefix.rest.chars().take_while(|c| *c == open.mark).count();
-                if run >= open.length && prefix.rest[run * open.mark.len_utf8()..].trim().is_empty()
-                {
-                    fence = None;
-                }
+        let content = line.trim_end_matches(['\n', '\r']);
+        let prefix = Prefix::of(content);
+        if let Some((open, language, mut body)) = fence.take() {
+            if open.closes(&prefix) {
+                spans.push(Span::Code { language, body });
+                start = at;
                 continue;
             }
-            fence = None;
+            if open.carries(&prefix) {
+                body.push_str(open.strip(content));
+                body.push('\n');
+                fence = Some((open, language, body));
+                continue;
+            }
+            spans.push(Span::Code { language, body });
+            start = line_start;
         }
         paragraph.deep |= prefix.indent / 2 + prefix.quotes + prefix.lists > MAX_NESTING;
         if let Some(open) = Fence::opens(&prefix) {
-            fence = Some(open);
-            paragraph.fenced = true;
+            finish(start..line_start, &paragraph, &mut spans);
+            paragraph = Paragraph::default();
+            let info = &prefix.rest[open.length * open.mark.len_utf8()..];
+            let language = info.split_whitespace().next().map(str::to_string);
+            fence = Some((open, language, String::new()));
             continue;
         }
         if prefix.blank {
-            finish(start..at, &paragraph);
+            finish(start..at, &paragraph, &mut spans);
             (start, paragraph) = (at, Paragraph::default());
             continue;
         }
         let mut previous = '\0';
         for c in prefix.rest.chars() {
             match c {
-                /* Each mark of emphasis counts: the parser's time grows faster than the
-                square of a run's length. */
                 '[' | '<' | '*' | '_' | '~' => paragraph.delimiters += 1,
                 '`' | '$' if c != previous => paragraph.delimiters += 1,
                 _ => {}
@@ -309,17 +505,17 @@ fn regions(text: &str) -> Vec<(Range<usize>, bool)> {
             previous = c;
         }
     }
-    if start < text.len() {
-        finish(start..text.len(), &paragraph);
+    match fence {
+        Some((_, language, body)) => spans.push(Span::Code { language, body }),
+        None => finish(start..text.len(), &paragraph, &mut spans),
     }
-    regions
+    spans
 }
 
 /// What the scan knows of a paragraph so far.
 #[derive(Default)]
 struct Paragraph {
     deep: bool,
-    fenced: bool,
     delimiters: u64,
 }
 
@@ -387,6 +583,7 @@ struct Fence {
     mark: char,
     length: usize,
     quotes: usize,
+    /// The column its lines' content starts at: a list item's, or the fence's own indent.
     content: usize,
 }
 
@@ -410,9 +607,44 @@ impl Fence {
                 mark,
                 length,
                 quotes: prefix.quotes,
-                content: prefix.content,
+                content: if prefix.lists > 0 {
+                    prefix.content
+                } else {
+                    indent
+                },
             })
         })
+    }
+
+    /// Whether the line `prefix` still carries the containers the fence opened in.
+    fn carries(&self, prefix: &Prefix) -> bool {
+        prefix.quotes >= self.quotes
+            && (self.content == 0
+                || prefix.blank
+                || prefix.quotes > 0
+                || prefix.indent >= self.content)
+    }
+
+    /// Whether the line `prefix` closes the fence.
+    fn closes(&self, prefix: &Prefix) -> bool {
+        let run = prefix.rest.chars().take_while(|c| *c == self.mark).count();
+        self.carries(prefix)
+            && run >= self.length
+            && prefix.rest[run * self.mark.len_utf8()..].trim().is_empty()
+    }
+
+    /// `line`, of the fence's code, without its containers' markers and indentation.
+    fn strip<'a>(&self, line: &'a str) -> &'a str {
+        let mut rest = line;
+        for _ in 0..self.quotes {
+            let trimmed = rest.trim_start_matches(' ');
+            match trimmed.strip_prefix('>') {
+                Some(after) => rest = after.strip_prefix(' ').unwrap_or(after),
+                None => break,
+            }
+        }
+        let spaces = rest.len() - rest.trim_start_matches(' ').len();
+        &rest[spaces.min(self.content)..]
     }
 }
 
@@ -494,6 +726,7 @@ mod tests {
                     oversized: true, ..
                 } => "plain",
                 Piece::Plain { .. } => "text",
+                Piece::Code { .. } => "code",
             })
             .collect()
     }
@@ -561,7 +794,7 @@ mod tests {
             .iter()
             .filter_map(|piece| match piece {
                 Piece::Markdown(markdown) => Some(markdown.as_str()),
-                Piece::Plain { .. } => None,
+                Piece::Plain { .. } | Piece::Code { .. } => None,
             })
             .collect();
         assert!(markdown.len() > 1);
@@ -630,12 +863,170 @@ mod tests {
         }
     }
 
+    /// `unit` repeated to `size` bytes, its last whole repeat in.
+    fn repeated(unit: &str, size: usize) -> String {
+        unit.repeat((size / unit.len()).max(1))
+    }
+
+    /**
+     * The inputs the parser was found slowest on, each a family whose cost grows with its size:
+     * by name, made to `size` bytes. What a fence could be mistaken for comes before a payload
+     * the scan would otherwise have counted.
+     */
+    fn families(size: usize) -> Vec<(&'static str, String)> {
+        let table = |size: usize| {
+            let row = format!("|{}\n", "a|".repeat(50));
+            let head = format!("{row}|{}\n", "-|".repeat(50));
+            format!("{head}{}", repeated(&row, size.saturating_sub(head.len())))
+        };
+        let mut families = vec![
+            ("blocks", repeated("a\n\n", size)),
+            ("list markers", repeated("*\n1.\n", size)),
+            ("tables", table(size)),
+            (
+                "entities after an autolink",
+                format!("www.a.b{}&am", repeated("&amp;", size - 10)),
+            ),
+            ("setext lines", repeated("a\n=\n", size)),
+            ("hard breaks", repeated("a  \n", size)),
+            ("emphasis runs", repeated("*a ", size)),
+            (
+                "emphasis, open and closed",
+                repeated("*a ", size / 2) + &repeated("a*", size / 2),
+            ),
+            ("brackets", repeated("[a", size)),
+            ("angles", repeated("<a ", size)),
+            ("links", repeated("[a](", size)),
+            ("quotes", repeated(">", size)),
+            ("lists", repeated("- ", size)),
+            ("ordered lists", repeated("1. ", size)),
+            (
+                "nested lists",
+                (0..)
+                    .map(|n| format!("{}- level\n", "  ".repeat(n)))
+                    .scan(0, |total, line| {
+                        *total += line.len();
+                        (*total <= size).then_some(line)
+                    })
+                    .collect(),
+            ),
+        ];
+        for opener in [
+            "```x`\n",
+            "para\n    ```\n",
+            "- ```\nX\n\n",
+            "<div>\n```\n\n",
+            "<div>\n~~~\n",
+            "$$\n```\n$$\n",
+            "<!--\n```\n-->\n",
+            "para\n2. ```\n",
+            "para\n    - ```\n",
+            "para\n    > ```\n",
+        ] {
+            for (name, payload) in [("quotes", ">"), ("emphasis", "*a")] {
+                let body = format!("{opener}{}", repeated(payload, size - opener.len()));
+                families.push((
+                    if name == "quotes" {
+                        "a fence's opener, then quotes"
+                    } else {
+                        "a fence's opener, then emphasis"
+                    },
+                    body,
+                ));
+            }
+        }
+        families
+    }
+
+    /**
+     * Every family, at [`REGION_BYTES`], parsed and prepared as one region: the worst a parse
+     * can cost. On a release build each is bounded at 250 ms; unoptimised, as tests run, ten
+     * times that. `cargo test --release -p sb_ui --lib worst -- --nocapture` prints the table.
+     */
+    #[test]
+    fn the_worst_a_region_can_cost_is_bounded() {
+        let bound = if cfg!(debug_assertions) { 2.5 } else { 0.25 };
+        let mut worst = (0.0, "");
+        for (name, body) in families(REGION_BYTES) {
+            assert!(body.len() <= REGION_BYTES, "{name}: {}", body.len());
+            let start = std::time::Instant::now();
+            let pieces = std::thread::Builder::new()
+                .stack_size(PARSE_STACK)
+                .spawn(move || markdown_pieces(&body, "").map(|it| it.len()))
+                .unwrap()
+                .join()
+                .unwrap();
+            let took = start.elapsed().as_secs_f64();
+            eprintln!("{name:<36} {:>8.1} ms  {pieces:?} pieces", took * 1000.);
+            if took > worst.0 {
+                worst = (took, name);
+            }
+        }
+        eprintln!("worst: {} at {:.1} ms", worst.1, worst.0 * 1000.);
+        assert!(
+            worst.0 < bound,
+            "{} took {:.0} ms",
+            worst.1,
+            worst.0 * 1000.
+        );
+    }
+
+    /**
+     * Every family at a whole body's [`MARKDOWN_BYTES`], prepared as the reader prepares a
+     * body: bounded by [`PARSE_BUDGET`] and one region past it, on a worker thread's stack.
+     */
+    #[test]
+    fn a_whole_body_of_any_family_is_prepared_in_bounded_time() {
+        let bound = if cfg!(debug_assertions) { 4.0 } else { 0.5 };
+        for (name, body) in families(MARKDOWN_BYTES) {
+            let (prose, took) = on_a_worker_stack(body);
+            eprintln!("{name:<36} {:>8.1} ms", took.as_secs_f64() * 1000.);
+            assert!(!prose.pieces.is_empty(), "{name}");
+            assert!(took.as_secs_f64() < bound, "{name} took {took:?}");
+        }
+    }
+
+    #[test]
+    fn a_body_of_a_closed_session_goes_no_further_than_its_next_parse() {
+        let body = repeated("Paragraph.\n\n", MARKDOWN_BYTES);
+        let prose = Prose::markdown_while(&body, &|| false);
+        assert!(prose.pieces.iter().all(|piece| matches!(
+            piece,
+            Piece::Plain {
+                oversized: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn fenced_code_is_a_piece_of_its_own_and_never_parsed() {
+        let body = "Before.\n\n```rust\nfn main() {}\n```\n\n> quoted\n> ```\n> <img src=x>\n> ```\n\nAfter.";
+        let prose = Prose::markdown(body);
+        let codes: Vec<(Option<&str>, &str)> = prose
+            .pieces
+            .iter()
+            .filter_map(|piece| match piece {
+                Piece::Code { language, text } => Some((language.as_deref(), text.text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            [(Some("rust"), "fn main() {}\n"), (None, "<img src=x>\n")]
+        );
+        assert_eq!(
+            kinds(&prose),
+            ["markdown", "code", "markdown", "code", "markdown"]
+        );
+    }
+
     #[test]
     fn carried_definitions_are_bounded_and_found_in_one_pass() {
         let sizes = |prose: &Prose| -> (usize, usize) {
             let markdown = prose.pieces.iter().filter_map(|piece| match piece {
                 Piece::Markdown(markdown) => Some(markdown.as_str().len()),
-                Piece::Plain { .. } => None,
+                Piece::Plain { .. } | Piece::Code { .. } => None,
             });
             markdown.fold((0, 0), |(most, all), len| (most.max(len), all + len))
         };

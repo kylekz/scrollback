@@ -26,7 +26,7 @@
 //! is held by what it is, not where, so it stays on that row when rows open or load above it,
 //! and goes to the row before when its own goes away. Its ring shows once a key is used.
 
-mod blocks;
+pub(crate) mod blocks;
 mod calls;
 pub mod rows;
 #[cfg(test)]
@@ -70,6 +70,9 @@ const KEEP_DATA: usize = 160;
 /// How many skeleton rows stand in for the column while a session is parsed.
 const SKELETON_ROWS: usize = 6;
 
+/// The highlights of a piece of fenced code: where each kind of token is.
+type Highlights = Rc<[(std::ops::Range<usize>, crate::syntax::TokenKind)]>;
+
 /// A Markdown state: of a piece of a block's prose.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Piece {
@@ -90,6 +93,8 @@ pub struct ReaderSnapshot {
     pub top_offset: f32,
     /// Whether the column's last row is drawn, its bottom within the column.
     pub at_end: bool,
+    /// Whether the column keeps to its end (End) as the rows there change.
+    pub following: bool,
     /// The open activity rows.
     pub open_calls: usize,
     /// How many Markdown states, and how many prepared things of the service's, are kept.
@@ -112,7 +117,12 @@ pub struct ReaderView {
     focused: Option<(usize, Row)>,
     /// Whether a key has moved the keyboard in this session: until then no ring is drawn.
     keyboard: bool,
+    /// Set when the wheel scrolls the column: the next frame lets go of its end (End keeps to
+    /// it until then). Scrolling back down to the end doesn't take it up again.
+    wheeled: Rc<Cell<bool>>,
     states: HashMap<Piece, (Entity<TextViewState>, usize)>,
+    /// The highlights of the pieces of fenced code drawn, kept as the Markdown states are.
+    highlights: HashMap<Piece, (Highlights, usize)>,
     /// What of the service's the rows drawn hold, by the row last drawn with it.
     held: HashMap<Held, usize>,
     /// The first and last rows drawn in the last frame.
@@ -136,13 +146,19 @@ impl ReaderView {
             alone: None,
             focused: None,
             keyboard: false,
+            wheeled: Rc::default(),
             states: HashMap::new(),
+            highlights: HashMap::new(),
             held: HashMap::new(),
             drawn: Rc::default(),
             label_width: label,
             label_width_next: Cell::new(label),
             _observers: [cx.observe(&reader, |this, _, cx| this.refresh(cx))],
         };
+        this.list.set_scroll_handler({
+            let wheeled = this.wheeled.clone();
+            move |_, _, _| wheeled.set(true)
+        });
         this.refresh(cx);
         this
     }
@@ -171,6 +187,7 @@ impl ReaderView {
                 _ => String::new(),
             },
             top_offset: scroll_top.offset_in_item.into(),
+            following: self.list.is_following_tail(),
             at_end: self
                 .rows
                 .len()
@@ -363,6 +380,8 @@ impl ReaderView {
     }
 
     fn toggle(&mut self, row: &Row, cx: &mut Context<Self>) {
+        /* A row opened or closed stays where it is: the column no longer keeps to its end. */
+        self.list.set_follow_mode(gpui::FollowMode::Normal);
         if let Some(toggle) = row.toggle() {
             let reader = cx.services().reader.clone();
             reader.update(cx, |reader, cx| reader.toggle(toggle, cx));
@@ -488,6 +507,29 @@ impl ReaderView {
         Some(state)
     }
 
+    /// Keeps the highlights of the piece of code `piece` drawn at row `at`, found in `code`
+    /// the first time.
+    fn highlights(
+        &mut self,
+        piece: Piece,
+        at: usize,
+        language: Option<&str>,
+        code: &str,
+    ) -> Highlights {
+        if let Some((highlights, row)) = self.highlights.get_mut(&piece) {
+            *row = at;
+            return highlights.clone();
+        }
+        let highlights: Highlights = match language {
+            Some(language) if code.len() <= crate::syntax::MAX_HIGHLIGHT_BYTES => {
+                crate::syntax::highlight(language, code).into()
+            }
+            _ => Rc::default(),
+        };
+        self.highlights.insert(piece, (highlights.clone(), at));
+        highlights
+    }
+
     /// Notes that the row `at` drew with `held`, so it is kept while the row is near.
     fn hold(&mut self, held: Held, at: usize) {
         self.held.insert(held, at);
@@ -502,6 +544,7 @@ impl ReaderView {
         let near = |keep: usize| first.saturating_sub(keep)..last + keep + 1;
         let states = near(KEEP_STATES);
         self.states.retain(|_, (_, row)| states.contains(row));
+        self.highlights.retain(|_, (_, row)| states.contains(row));
         let data = near(KEEP_DATA);
         let far: Vec<Held> = self
             .held
@@ -601,9 +644,13 @@ impl ReaderView {
                 .text_color(if on { c.fg } else { c.fg2 })
                 .when(on, |this| this.bg(c.active))
                 .cursor_pointer()
-                .on_click(move |_, _, cx| {
-                    let reader = cx.services().reader.clone();
-                    reader.update(cx, |reader, cx| reader.set_full_calls(full, cx));
+                .on_click({
+                    let list = self.list.clone();
+                    move |_, _, cx| {
+                        list.set_follow_mode(gpui::FollowMode::Normal);
+                        let reader = cx.services().reader.clone();
+                        reader.update(cx, |reader, cx| reader.set_full_calls(full, cx));
+                    }
                 })
                 .child(label)
                 .automation_target_with(move || format!("reader/calls/{id}").into())
@@ -954,6 +1001,9 @@ fn frame(row: &Row, content: AnyElement, theme: &SbTheme) -> AnyElement {
 impl Render for ReaderView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.sb_theme().clone();
+        if self.wheeled.take() {
+            self.list.set_follow_mode(gpui::FollowMode::Normal);
+        }
         self.let_go_of_far(cx);
         self.drawn.set(None);
         let widest = self
@@ -1095,24 +1145,24 @@ pub fn bind_keys(
         loading land, until a key or the wheel moves it. */
         this.list.set_follow_mode(gpui::FollowMode::Tail);
     });
-    element
-        .on_action(|_: &act::SwitchCalls, _, cx| {
-            let reader = cx.services().reader.clone();
-            reader.update(cx, |reader, cx| {
-                let full = !reader.full_calls();
-                reader.set_full_calls(full, cx);
-            });
-        })
-        .on_action(|_: &act::Star, _, cx| {
-            let library = cx.services().library.clone();
-            library.update(cx, LibraryService::toggle_open_star);
-        })
-        .on_action(|_: &act::NextSession, _, cx| {
-            let library = cx.services().library.clone();
-            library.update(cx, |library, cx| library.open_step(1, cx));
-        })
-        .on_action(|_: &act::PreviousSession, _, cx| {
-            let library = cx.services().library.clone();
-            library.update(cx, |library, cx| library.open_step(-1, cx));
-        })
+    /* Through `on`, as every key but End: each lets go of the column's end. */
+    let element = on::<act::SwitchCalls>(element, view, |_, _, cx| {
+        let reader = cx.services().reader.clone();
+        reader.update(cx, |reader, cx| {
+            let full = !reader.full_calls();
+            reader.set_full_calls(full, cx);
+        });
+    });
+    let element = on::<act::Star>(element, view, |_, _, cx| {
+        let library = cx.services().library.clone();
+        library.update(cx, LibraryService::toggle_open_star);
+    });
+    let element = on::<act::NextSession>(element, view, |_, _, cx| {
+        let library = cx.services().library.clone();
+        library.update(cx, |library, cx| library.open_step(1, cx));
+    });
+    on::<act::PreviousSession>(element, view, |_, _, cx| {
+        let library = cx.services().library.clone();
+        library.update(cx, |library, cx| library.open_step(-1, cx));
+    })
 }

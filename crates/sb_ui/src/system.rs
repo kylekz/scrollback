@@ -1,4 +1,5 @@
-//! What a view asks of the system: opening a link and writing to the clipboard.
+//! What the app asks of the system: opening a link, writing to the clipboard, and handing back
+//! memory ([`GiveBack`]).
 //!
 //! Every view goes through here, so a run that must not reach the person's browser or
 //! clipboard (automation, tests) can [`record`] instead: with a [`Recorded`] global installed
@@ -34,12 +35,38 @@ pub fn open_url(url: &str, cx: &mut App) {
     }
 }
 
-/// Puts `text` on the clipboard.
+/**
+ * Puts `text` on the clipboard, less every zero-width space in it: the sanitiser puts them in
+ * tags and addresses to keep them from being read as markup, and one pasted into a shell or a
+ * browser breaks the command or the address it is in. A transcript's own aren't worth keeping
+ * on a clipboard either.
+ */
 pub fn copy_text(text: String, cx: &mut App) {
+    let text = if text.contains('\u{200B}') {
+        text.replace('\u{200B}', "")
+    } else {
+        text
+    };
     if cx.has_global::<Recorded>() {
         cx.global_mut::<Recorded>().copied.push(text);
     } else {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+}
+
+/**
+ * What hands the memory the allocator holds free back to the system: set by the app when its
+ * allocator keeps it otherwise (macOS's build, with mimalloc), and run after something large
+ * was dropped (a closed session, a sync pass).
+ */
+pub struct GiveBack(pub fn());
+
+impl Global for GiveBack {}
+
+/// Runs [`GiveBack`], if the app set one.
+pub fn give_back_memory(cx: &App) {
+    if let Some(GiveBack(give_back)) = cx.try_global::<GiveBack>() {
+        give_back();
     }
 }
 
@@ -56,11 +83,18 @@ mod tests {
             record(cx);
             open_url("https://example.com/docs", cx);
             copy_text("copied".to_string(), cx);
+            copy_text(
+                "git log <\u{200B}branch> https:\u{200B}//example.com".to_string(),
+                cx,
+            );
             assert_eq!(
                 cx.global::<Recorded>(),
                 &Recorded {
                     opened: vec!["https://example.com/docs".to_string()],
-                    copied: vec!["copied".to_string()],
+                    copied: vec![
+                        "copied".to_string(),
+                        "git log <branch> https://example.com".to_string()
+                    ],
                 }
             );
         });

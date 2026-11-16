@@ -30,6 +30,7 @@ use crate::format;
 use crate::hostile;
 use crate::icons::SbIcon;
 use crate::services::ActiveServices as _;
+use crate::services::reader::text::expand_tabs;
 use crate::services::reader::{BlockRef, CallBody, Held, ImageKey, Load, Part, Slot, Text, Toggle};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
@@ -530,7 +531,7 @@ fn body(
                 )
                 .text_color(c.fg2)
                 .text_spec(&theme.text.code)
-                .child(hostile::bidi(&text_rows(text, *chunk, all)).into_owned())
+                .child(expand_tabs(&hostile::bidi(&text_rows(text, *chunk, all))).into_owned())
                 .into_any_element(),
             None => div().into_any_element(),
         },
@@ -809,10 +810,7 @@ fn panel(
             this.read_alone(Some((item.clone(), call.clone())), cx)
         })
     };
-    let stem = {
-        let file = item.rsplit('/').next().unwrap_or(item);
-        file.split('.').next().unwrap_or(file).to_string()
-    };
+    let stem = super::blocks::file_stem(item).to_string();
     let alone_button = |id: SharedString| {
         div()
             .id(id)
