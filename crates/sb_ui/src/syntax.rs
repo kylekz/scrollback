@@ -14,9 +14,10 @@
 //! its steps, and one step can take far longer than the budget, so it is handed the code a
 //! little at a time and none past the deadline ([`parse`]), and parses it [`SEGMENT_BYTES`] of
 //! whole lines at a time, which bounds its longest step; a construct that runs across two
-//! segments (a long block comment) may be coloured wrong past the cut. What it gives up on is
-//! drawn plain. It never runs on the UI thread: the reader asks for it in the background
-//! ([`crate::services::reader`]) and draws the code plain until it lands.
+//! segments (a long block comment) may be coloured wrong past the cut, which is always between
+//! two characters. What it gives up on is drawn plain. It never runs on the UI thread: the
+//! reader asks for it in the background ([`crate::services::reader`]) and draws the code plain
+//! until it lands, `TextView`'s fenced code included ([`crate::services::reader::highlights`]).
 //!
 //! A grammar whose C code aborts the process on some input (an `assert`, which nothing can
 //! catch) can't be bounded at all, so it is not built in: Bash (nested heredocs), Kotlin
@@ -33,7 +34,7 @@ use std::ops::{ControlFlow, Range};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use gpui::Hsla;
+use gpui::{HighlightStyle, Hsla};
 use gpui_component::highlighter::LanguageRegistry;
 use tree_sitter::{
     Language, ParseOptions, Parser, Query, QueryCursor, QueryCursorOptions, StreamingIterator as _,
@@ -152,26 +153,30 @@ struct Grammar {
     injections: Option<Query>,
 }
 
+/// The grammars asked for, by the names they were asked for by ([`grammar`]).
+static GRAMMARS: LazyLock<Mutex<HashMap<String, Option<Arc<Grammar>>>>> =
+    LazyLock::new(Mutex::default);
+
 /**
  * The grammar of `name`, a name or alias gpui-component's registry knows (`rust`, `ts`, `sh`,
- * …); `None` for a language without one, or whose queries don't compile.
+ * …); `None` for a language without one, or whose queries don't compile. Only the names the
+ * registry knows are kept: the code names the rest, and there is no end to them.
  */
 fn grammar(name: &str) -> Option<Arc<Grammar>> {
-    static GRAMMARS: LazyLock<Mutex<HashMap<String, Option<Arc<Grammar>>>>> =
-        LazyLock::new(Mutex::default);
     let mut grammars = GRAMMARS.lock().unwrap_or_else(PoisonError::into_inner);
-    grammars
-        .entry(name.to_string())
-        .or_insert_with(|| {
-            let config = LanguageRegistry::singleton().language(name)?;
-            let language = config.language?;
-            Some(Arc::new(Grammar {
-                highlights: Query::new(&language, &config.highlights).ok()?,
-                injections: Query::new(&language, &config.injections).ok(),
-                language,
-            }))
-        })
-        .clone()
+    if let Some(grammar) = grammars.get(name) {
+        return grammar.clone();
+    }
+    let config = LanguageRegistry::singleton().language(name)?;
+    let grammar = config.language.and_then(|language| {
+        Some(Arc::new(Grammar {
+            highlights: Query::new(&language, &config.highlights).ok()?,
+            injections: Query::new(&language, &config.injections).ok(),
+            language,
+        }))
+    });
+    grammars.insert(name.to_string(), grammar.clone());
+    grammar
 }
 
 /**
@@ -186,16 +191,31 @@ fn grammar(name: &str) -> Option<Arc<Grammar>> {
  * layers injected into the code (a script in HTML) paint over it.
  */
 pub fn highlight(language: &str, code: &str) -> Option<Vec<(Range<usize>, TokenKind)>> {
-    highlight_within(language, code, HIGHLIGHT_BUDGET)
+    highlight_within(language, code, HIGHLIGHT_BUDGET, &|| true)
 }
 
-/// [`highlight`] with `budget` for the budget.
+/**
+ * [`highlight`] while `wanted` says the code still is: asked before it starts, and then
+ * wherever the deadline is, so that the code of a row let go of, or of a session closed, goes
+ * no further than tree-sitter's next check. `None` once it isn't, and what was made is to be
+ * dropped.
+ */
+pub fn highlight_while(
+    language: &str,
+    code: &str,
+    wanted: &dyn Fn() -> bool,
+) -> Option<Vec<(Range<usize>, TokenKind)>> {
+    highlight_within(language, code, HIGHLIGHT_BUDGET, wanted)
+}
+
+/// [`highlight_while`] with `budget` for the budget.
 fn highlight_within(
     language: &str,
     code: &str,
     budget: Duration,
+    wanted: &dyn Fn() -> bool,
 ) -> Option<Vec<(Range<usize>, TokenKind)>> {
-    if code.len() > MAX_HIGHLIGHT_BYTES {
+    if code.len() > MAX_HIGHLIGHT_BYTES || !wanted() {
         return None;
     }
     if let Some(dialect) = shell::dialect(language) {
@@ -204,10 +224,13 @@ fn highlight_within(
     let Some(host) = grammar(language) else {
         return Some(Vec::new());
     };
-    let mut deadline = Instant::now() + budget;
+    let mut until = Until {
+        deadline: Instant::now() + budget,
+        wanted,
+    };
     let mut tokens = Vec::new();
     for (start, segment) in segments(code) {
-        let painted = highlight_segment(&host, segment.as_bytes(), &mut deadline)?;
+        let painted = highlight_segment(&host, segment.as_bytes(), &mut until)?;
         tokens.extend(
             painted
                 .into_iter()
@@ -218,23 +241,38 @@ fn highlight_within(
 }
 
 /**
+ * When to give up on highlighting a piece of code: at its deadline, or once it is no longer
+ * wanted, as tree-sitter checks the time.
+ */
+#[derive(Clone, Copy)]
+struct Until<'a> {
+    deadline: Instant,
+    wanted: &'a dyn Fn() -> bool,
+}
+
+impl Until<'_> {
+    fn going(&self) -> bool {
+        Instant::now() < self.deadline && (self.wanted)()
+    }
+}
+
+/**
  * `code` cut into runs of whole lines of at most [`SEGMENT_BYTES`], each with where it starts;
- * a line longer than that is cut where a character ends.
+ * a line longer than that is cut where a character ends. Each cut is moved back out of the
+ * character it falls in before anything is sliced at it.
  */
 fn segments(code: &str) -> Vec<(usize, &str)> {
     let mut segments = Vec::new();
     let mut start = 0;
     while start < code.len() {
         let mut end = code.len().min(start + SEGMENT_BYTES);
-        if end < code.len() {
-            match code[start..end].rfind('\n') {
-                Some(at) => end = start + at + 1,
-                None => {
-                    while !code.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                }
-            }
+        while !code.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end < code.len()
+            && let Some(at) = code[start..end].rfind('\n')
+        {
+            end = start + at + 1;
         }
         segments.push((start, &code[start..end]));
         start = end;
@@ -243,34 +281,28 @@ fn segments(code: &str) -> Vec<(usize, &str)> {
 }
 
 /**
- * The tokens of `code`, a segment, by `host`'s grammar and those it injects, by `deadline`;
+ * The tokens of `code`, a segment, by `host`'s grammar and those it injects, by `until`;
  * moved on by the time taken to compile an injected grammar the first time.
  */
 fn highlight_segment(
     host: &Grammar,
     code: &[u8],
-    deadline: &mut Instant,
+    until: &mut Until,
 ) -> Option<Vec<(Range<usize>, TokenKind)>> {
-    let tree = parse(&host.language, code, &[], *deadline)?;
+    let tree = parse(&host.language, code, &[], *until)?;
     let mut captures = Vec::new();
     let mut last: Option<Range<usize>> = None;
-    for_each_capture(
-        &host.highlights,
-        &tree,
-        code,
-        *deadline,
-        |range, name, _| {
-            let kind = match &last {
-                Some(previous) if *previous == range => captures
-                    .last()
-                    .and_then(|(_, kind): &(Range<usize>, Option<TokenKind>)| *kind),
-                _ => kind_for_capture(name),
-            };
-            last = Some(range.clone());
-            captures.push((range, kind));
-        },
-    )?;
-    let injected = injections(host, &tree, code, *deadline)?;
+    for_each_capture(&host.highlights, &tree, code, *until, |range, name, _| {
+        let kind = match &last {
+            Some(previous) if *previous == range => captures
+                .last()
+                .and_then(|(_, kind): &(Range<usize>, Option<TokenKind>)| *kind),
+            _ => kind_for_capture(name),
+        };
+        last = Some(range.clone());
+        captures.push((range, kind));
+    })?;
+    let injected = injections(host, &tree, code, *until)?;
     /* A grammar compiled the first time it is asked for doesn't count against the code. */
     let compiling = Instant::now();
     let layers: Vec<(Arc<Grammar>, Vec<tree_sitter::Range>)> = injected
@@ -278,16 +310,16 @@ fn highlight_segment(
         .filter_map(|(name, ranges)| Some((grammar(&name)?, ranges)))
         .take(MAX_LAYERS)
         .collect();
-    *deadline += compiling.elapsed();
-    let deadline = *deadline;
+    until.deadline += compiling.elapsed();
+    let until = *until;
     for (layer, ranges) in layers {
-        let tree = parse(&layer.language, code, &ranges, deadline)?;
+        let tree = parse(&layer.language, code, &ranges, until)?;
         let mut end = 0;
         for_each_capture(
             &layer.highlights,
             &tree,
             code,
-            deadline,
+            until,
             |range, name, overlap| {
                 if overlap || range.start >= end {
                     if !overlap {
@@ -298,23 +330,47 @@ fn highlight_segment(
             },
         )?;
     }
-    paint(captures, deadline)
+    paint(captures, until)
+}
+
+/**
+ * How `tokens`, highlights of `code`, paint in `syntax`'s colours: those that start or end
+ * inside a character, or past the code, are left out.
+ */
+pub fn styles(
+    code: &str,
+    tokens: &[(Range<usize>, TokenKind)],
+    syntax: &SyntaxColors,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    tokens
+        .iter()
+        .filter(|(range, _)| code.get(range.clone()).is_some())
+        .filter_map(|(range, kind)| {
+            Some((
+                range.clone(),
+                HighlightStyle {
+                    color: Some(kind.color(syntax)?),
+                    ..Default::default()
+                },
+            ))
+        })
+        .collect()
 }
 
 /// `code` parsed with `language`, only within `ranges` when there are any; `None` past
-/// `deadline`.
+/// `until`.
 fn parse(
     language: &Language,
     code: &[u8],
     ranges: &[tree_sitter::Range],
-    deadline: Instant,
+    until: Until,
 ) -> Option<Tree> {
     let mut parser = Parser::new();
     parser.set_language(language).ok()?;
     if !ranges.is_empty() {
         parser.set_included_ranges(ranges).ok()?;
     }
-    let mut progress = |_: &tree_sitter::ParseState| in_time(deadline);
+    let mut progress = |_: &tree_sitter::ParseState| in_time(until);
     parser
         .parse_with_options(
             /* The code a little at a time, and none past the deadline: tree-sitter asks for
@@ -325,30 +381,30 @@ fn parse(
             &mut |offset, _| {
                 let end = code.len().min(offset.saturating_add(READ_BYTES));
                 match code.get(offset..end) {
-                    Some(chunk) if Instant::now() < deadline => chunk,
+                    Some(chunk) if until.going() => chunk,
                     _ => &[],
                 }
             },
             None,
             Some(ParseOptions::new().progress_callback(&mut progress)),
         )
-        .filter(|_| Instant::now() < deadline)
+        .filter(|_| until.going())
 }
 
 /**
  * Calls `capture` with each capture of `query` over `tree`, in the order of its matches: its
  * byte range, its name, and whether its pattern lets it overlap others. `None` past
- * `deadline`.
+ * `until`.
  */
 fn for_each_capture(
     query: &Query,
     tree: &Tree,
     code: &[u8],
-    deadline: Instant,
+    until: Until,
     mut capture: impl FnMut(Range<usize>, &str, bool),
 ) -> Option<()> {
     let mut cursor = QueryCursor::new();
-    let mut progress = |_: &tree_sitter::QueryCursorState| in_time(deadline);
+    let mut progress = |_: &tree_sitter::QueryCursorState| in_time(until);
     let mut matches = cursor.matches_with_options(
         query,
         tree.root_node(),
@@ -357,7 +413,7 @@ fn for_each_capture(
     );
     while let Some(found) = matches.next() {
         /* A match's predicates are checked outside tree-sitter's own checks. */
-        if Instant::now() >= deadline {
+        if !until.going() {
             return None;
         }
         let overlap = query
@@ -370,11 +426,11 @@ fn for_each_capture(
             }
         }
     }
-    (Instant::now() < deadline).then_some(())
+    until.going().then_some(())
 }
 
-fn in_time(deadline: Instant) -> ControlFlow<()> {
-    if Instant::now() < deadline {
+fn in_time(until: Until) -> ControlFlow<()> {
+    if until.going() {
         ControlFlow::Continue(())
     } else {
         ControlFlow::Break(())
@@ -384,13 +440,13 @@ fn in_time(deadline: Instant) -> ControlFlow<()> {
 /**
  * The names of the languages injected into `code` by `host`'s injection query, with the ranges
  * of `code` each is parsed over, in the order they start: one layer per match, or one per
- * language for the patterns that combine their matches. `None` past `deadline`.
+ * language for the patterns that combine their matches. `None` past `until`.
  */
 fn injections(
     host: &Grammar,
     tree: &Tree,
     code: &[u8],
-    deadline: Instant,
+    until: Until,
 ) -> Option<Vec<(String, Vec<tree_sitter::Range>)>> {
     let Some(query) = &host.injections else {
         return Some(Vec::new());
@@ -400,7 +456,7 @@ fn injections(
     let mut layers: Vec<(String, Vec<tree_sitter::Range>)> = Vec::new();
     let mut combined: HashMap<String, Vec<tree_sitter::Range>> = HashMap::new();
     let mut cursor = QueryCursor::new();
-    let mut progress = |_: &tree_sitter::QueryCursorState| in_time(deadline);
+    let mut progress = |_: &tree_sitter::QueryCursorState| in_time(until);
     let mut matches = cursor.matches_with_options(
         query,
         tree.root_node(),
@@ -408,7 +464,7 @@ fn injections(
         QueryCursorOptions::new().progress_callback(&mut progress),
     );
     while let Some(found) = matches.next() {
-        if Instant::now() >= deadline {
+        if !until.going() {
             return None;
         }
         let settings = query.property_settings(found.pattern_index);
@@ -438,7 +494,7 @@ fn injections(
             layers.push((name, ranges.collect()));
         }
     }
-    if Instant::now() >= deadline {
+    if !until.going() {
         return None;
     }
     layers.extend(combined);
@@ -455,11 +511,11 @@ fn injections(
 /**
  * The tokens `captures` paint, in order, merged where alike and without plain ones: at each
  * byte, of the captures over it with a kind, the one that starts last, and of those the last.
- * `None` past `deadline`.
+ * `None` past `until`.
  */
 fn paint(
     captures: Vec<(Range<usize>, Option<TokenKind>)>,
-    deadline: Instant,
+    until: Until,
 ) -> Option<Vec<(Range<usize>, TokenKind)>> {
     use std::collections::BinaryHeap;
 
@@ -483,7 +539,7 @@ fn paint(
     let mut opened = 0;
     let mut tokens: Vec<(Range<usize>, TokenKind)> = Vec::new();
     for (step, pair) in edges.windows(2).enumerate() {
-        if step % 1024 == 0 && Instant::now() >= deadline {
+        if step % 1024 == 0 && !until.going() {
             return None;
         }
         let (start, end) = (pair[0], pair[1]);
@@ -549,6 +605,41 @@ mod tests {
     fn an_unknown_language_and_no_code_are_plain() {
         assert_eq!(highlight("brainfudge", "++++[>++<-]"), Some(Vec::new()));
         assert_eq!(highlight("rust", ""), Some(Vec::new()));
+    }
+
+    /**
+     * Code no longer wanted is given up on before it starts, or at tree-sitter's next check of
+     * the time: well within the budget, on the code it takes all of the budget on.
+     */
+    #[test]
+    fn code_no_longer_wanted_is_given_up_on_at_the_next_check() {
+        assert_eq!(highlight_while("rust", "fn main() {}", &|| false), None);
+        let (_, code) = hostile(MAX_HIGHLIGHT_BYTES)
+            .into_iter()
+            .find(|(name, _)| name == "comment /*")
+            .expect("the slowest code");
+        grammar("swift");
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let start = Instant::now();
+        let wanted = || asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8;
+        assert_eq!(highlight_while("swift", &code, &wanted), None);
+        assert!(
+            start.elapsed() < HIGHLIGHT_BUDGET / 2,
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn only_the_languages_the_registry_knows_are_kept() {
+        let names: Vec<String> = (0..100).map(|n| format!("made-up-{n}")).collect();
+        for name in &names {
+            assert!(grammar(name).is_none());
+        }
+        assert!(grammar("rust").is_some());
+        let grammars = GRAMMARS.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(names.iter().all(|name| !grammars.contains_key(name)));
+        assert!(grammars.contains_key("rust"));
     }
 
     #[test]
@@ -632,19 +723,31 @@ mod tests {
             state
         };
         const SHELL: &[u8] = b"$(){}[]'\"`\\<>|&;#=-+ \t\n\r!?*@0123ab_EOF<<-";
-        for case in 0..4_000 {
+        /* Characters of two, three and four bytes, and CRLF, after what a shell reads. */
+        const WIDE: &[&str] = &[
+            "é", "€", "𝄞", "\r\n", "\\é", "$€", "'𝄞", "\"é", "#€\n", "<<é\n",
+        ];
+        for case in 0..6_000 {
             let len = (next() % 2_048) as usize;
-            let bytes: Vec<u8> = (0..len)
-                .map(|_| {
-                    let random = next();
-                    if case % 2 == 0 {
-                        random as u8
-                    } else {
-                        SHELL[(random % SHELL.len() as u64) as usize]
-                    }
-                })
-                .collect();
-            let code = String::from_utf8_lossy(&bytes);
+            let code: String = match case % 3 {
+                0 => {
+                    let bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+                    String::from_utf8_lossy(&bytes).into_owned()
+                }
+                1 => (0..len)
+                    .map(|_| char::from(SHELL[(next() % SHELL.len() as u64) as usize]))
+                    .collect(),
+                _ => (0..len / 2)
+                    .map(|_| match next() {
+                        random if random % 2 == 0 => {
+                            WIDE[(random / 2 % WIDE.len() as u64) as usize].to_string()
+                        }
+                        random => {
+                            char::from(SHELL[(random % SHELL.len() as u64) as usize]).to_string()
+                        }
+                    })
+                    .collect(),
+            };
             for language in ["sh", "console"] {
                 let tokens = highlight(language, &code).expect("a shell's code is lexed");
                 assert!(drawable(&code, &tokens), "{language} on {code:?}");
@@ -780,7 +883,56 @@ mod tests {
         ] {
             inputs.push((name.to_string(), repeated(unit, size)));
         }
+        /* A character of each width across every place a segment's cut can fall in it: on one
+        long line, after a comment's opener, and on short lines that end with CRLF. */
+        for c in ["é", "€", "𝄞"] {
+            for shift in 0..c.len() {
+                let lead = "x".repeat(shift);
+                inputs.push((
+                    format!("{c} run, {shift} in"),
+                    lead.clone() + &repeated(c, size - shift),
+                ));
+                inputs.push((
+                    format!("{c} comment, {shift} in"),
+                    format!("// {lead}{}", repeated(c, size - shift - 3)),
+                ));
+                inputs.push((
+                    format!("{c} lines, {shift} in"),
+                    lead + &repeated(&format!("a{c}\r\n"), size - shift),
+                ));
+            }
+        }
         inputs
+    }
+
+    /**
+     * A segment's cut inside a character of each width, at each byte of it: moved back to the
+     * character's start, so the segments are the code, and the code is highlighted like any.
+     */
+    #[test]
+    fn a_cut_inside_a_character_moves_back_to_where_it_starts() {
+        let cases: Vec<(String, String)> = hostile(4 * 1024)
+            .into_iter()
+            .filter(|(name, _)| name.ends_with(" in"))
+            .collect();
+        assert_eq!(cases.len(), 27);
+        for (name, code) in cases {
+            let cut = segments(&code);
+            assert_eq!(
+                cut.iter().map(|(_, it)| *it).collect::<String>(),
+                code,
+                "{name}"
+            );
+            assert!(
+                cut.iter().all(|(start, it)| code[*start..].starts_with(it)),
+                "{name}"
+            );
+            for language in ["rust", "python", "markdown", "bash"] {
+                let tokens = highlight_within(language, &code, Duration::from_secs(5), &|| true)
+                    .unwrap_or_else(|| panic!("{language} on {name} in time"));
+                assert!(drawable(&code, &tokens), "{language} on {name}");
+            }
+        }
     }
 
     /**
@@ -851,7 +1003,7 @@ mod tests {
             for size in [512, 4 * 1024, MAX_HIGHLIGHT_BYTES] {
                 for (name, code) in hostile(size) {
                     eprintln!("case {name} at {size}");
-                    highlight_within(&language, &code, Duration::from_secs(2));
+                    highlight_within(&language, &code, Duration::from_secs(2), &|| true);
                 }
             }
             return;
@@ -895,7 +1047,10 @@ mod tests {
 
     #[test]
     fn the_capture_that_starts_last_paints() {
-        let deadline = Instant::now() + HIGHLIGHT_BUDGET;
+        let until = Until {
+            deadline: Instant::now() + HIGHLIGHT_BUDGET,
+            wanted: &|| true,
+        };
         let painted = paint(
             vec![
                 (0..10, Some(TokenKind::String)),
@@ -904,7 +1059,7 @@ mod tests {
                 (6..8, Some(TokenKind::Keyword)),
                 (6..8, Some(TokenKind::Number)),
             ],
-            deadline,
+            until,
         );
         assert_eq!(
             painted,
