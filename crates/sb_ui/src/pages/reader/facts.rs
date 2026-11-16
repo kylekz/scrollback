@@ -393,24 +393,27 @@ impl ReaderView {
                 *calls.entry(at).or_default() += count;
             }
         }
-        let calls = calls.into_iter().map(|(at, count)| {
-            let (label, kinds) = CALL_KINDS[at];
-            div()
-                .flex()
-                .items_center()
-                .gap(theme.spacing.md)
-                .text_color(c.fg2)
-                .text_spec(&theme.text.secondary)
-                .child(icon(kind_icon(kinds[0]), theme.sizes.icon_xs, c.fg3))
-                .child(label)
-                .child(
-                    div()
-                        .ml_auto()
-                        .text_color(c.fg3)
-                        .text_spec(&theme.text.count)
-                        .child(format::count(count as u64)),
-                )
-        });
+        let calls: Vec<_> = calls
+            .into_iter()
+            .map(|(at, count)| {
+                let (label, kinds) = CALL_KINDS[at];
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(theme.spacing.md)
+                    .text_color(c.fg2)
+                    .text_spec(&theme.text.secondary)
+                    .child(icon(kind_icon(kinds[0]), theme.sizes.icon_xs, c.fg3))
+                    .child(label)
+                    .child(
+                        div()
+                            .ml_auto()
+                            .text_color(c.fg3)
+                            .text_spec(&theme.text.count)
+                            .child(format::count(count as u64)),
+                    )
+            })
+            .collect();
         let hair = || div().flex_none().h(px(1.)).bg(c.line_subtle);
         /* In a short window the margin scrolls as a whole, the turns keeping a few rows. */
         div()
@@ -459,16 +462,19 @@ impl ReaderView {
                     })),
             )
             .child(turn_list)
-            .child(hair())
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .child(overline("Calls", &theme))
-                    .children(calls),
-            )
+            /* A session without calls has no Calls block. */
+            .when(!calls.is_empty(), |this| {
+                this.child(hair()).child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .debug_selector(|| "facts-calls".into())
+                        .child(overline("Calls", &theme))
+                        .children(calls),
+                )
+            })
             .automation_target("reader/facts")
     }
 

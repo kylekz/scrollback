@@ -5,8 +5,9 @@
 //! Until there is a location it draws its first-run state (DESIGN §4.10): the library rows
 //! disabled with counts of 0, no folders, no locations and no section buttons.
 //!
-//! **The selected row** is the page shown: `↑` and `↓` show the page of the row above or
-//! below, `←` and `→` close and open a folder, and `Enter` hands the keyboard to the page.
+//! **The selected row** is the page shown, and none while Settings shows: `↑` and `↓` show
+//! the page of the row above or below, `←` and `→` close and open a folder, and `Enter`
+//! hands the keyboard to the page.
 //! A folder whose page is shown may have no row, when a folder it is in was closed: then `↑`,
 //! `↓` and `←` go to the row that hides it, and `→` opens the folders it is in. `Tab` goes on
 //! from the rows to the sections' buttons.
@@ -139,7 +140,7 @@ pub struct Sidebar {
     location_scroll: ScrollHandle,
     /// The closed folder a drag rests on, until it opens.
     opening: Option<(FolderId, Task<()>)>,
-    _observers: [Subscription; 3],
+    _observers: [Subscription; 4],
     _clock: Task<()>,
 }
 
@@ -154,9 +155,15 @@ impl Focusable for Sidebar {
 impl Sidebar {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let services = cx.services();
-        let (library, sync) = (services.library.clone(), services.sync.clone());
+        let (library, sync, settings) = (
+            services.library.clone(),
+            services.sync.clone(),
+            services.settings.clone(),
+        );
         Self {
             _observers: [
+                /* Settings shown selects no row. */
+                cx.observe(&settings, |_, _, cx| cx.notify()),
                 cx.observe(&library, |this, _, cx| {
                     this.rebuild(cx);
                     this.follow_drag(cx);
@@ -543,7 +550,7 @@ impl Sidebar {
             Shelf::Trash => counts.trash,
             Shelf::Folder(_) => 0,
         };
-        let selected = enabled && shelf == library.highlighted();
+        let selected = enabled && self.highlighted(cx) == Some(shelf);
         // Trash takes sessions dropped on it (DESIGN §4.1).
         let trash = shelf == Shelf::Trash && enabled;
         let targeted = trash
@@ -991,16 +998,22 @@ impl Sidebar {
         self.opening = Some((folder, timer));
     }
 
+    /// The page whose row is drawn selected: none while Settings shows in the main area, as
+    /// on the boards (DESIGN §4.13).
+    pub(crate) fn highlighted(&self, cx: &App) -> Option<Shelf> {
+        (!cx.services().settings.read(cx).is_shown()).then(|| self.library.read(cx).highlighted())
+    }
+
     /**
      * The folder whose row is drawn selected (DESIGN §4.1): the one whose page is shown, or
      * whose session is read; when a closed folder hides its row, the nearest folder around it
      * that has one, so that the sidebar still says where the page is.
      */
     fn marked(&self, cx: &App) -> Option<FolderId> {
-        let library = self.library.read(cx);
-        let Shelf::Folder(folder) = library.highlighted() else {
+        let Some(Shelf::Folder(folder)) = self.highlighted(cx) else {
             return None;
         };
+        let library = self.library.read(cx);
         std::iter::once(folder)
             .chain(tree::ancestors(library.folders(), folder))
             .find(|folder| self.row_of(*folder, cx).is_some())

@@ -2151,13 +2151,13 @@ impl LibraryService {
             Written::DeletedForGood(deleted) => Some(Toast {
                 text: match (&change, deleted.pending) {
                     (Change::DeleteForGood { session, .. }, 0) => {
-                        format!("Deleted “{}” for good", toast_title(session))
+                        format!("Deleted “{}” for good.", toast_title(session))
                     }
                     (Change::DeleteForGood { session, .. }, _) => format!(
-                        "Deleted “{}” for good. Its files are being removed in the background",
+                        "Deleted “{}” for good. Its files are being removed in the background.",
                         toast_title(session)
                     ),
-                    _ => "Deleted for good".to_string(),
+                    _ => "Deleted for good.".to_string(),
                 },
                 undo: None,
             }),

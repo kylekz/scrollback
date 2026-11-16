@@ -240,7 +240,8 @@ fn deleting_for_good_asks_with_cancel_first_and_enter_never_confirms(cx: &mut Te
     assert_eq!(in_trash(cx), Vec::<String>::new());
     let (text, undo) = toast(cx).expect("a toast");
     assert!(
-        text.starts_with(&format!("Deleted “{}” for good", SESSIONS[2].title)),
+        text.starts_with(&format!("Deleted “{}” for good.", SESSIONS[2].title))
+            && text.ends_with('.'),
         "{text}"
     );
     assert!(!undo, "deleting for good can't be undone");

@@ -42,16 +42,22 @@ fn open_settings(cx: &mut TestAppContext) -> (Entity<Shell>, &mut VisualTestCont
 #[gpui::test]
 fn settings_open_over_the_page_and_every_way_back_leads_to_it(cx: &mut TestAppContext) {
     cx.update(|cx| system::install(SystemShell::scripted(), cx));
-    let (_shell, cx) = open_shell(cx);
+    let (shell, cx) = open_shell(cx);
     let library = cx.update(|_, cx| cx.services().library.clone());
     library.update(cx, |library, cx| library.show(Shelf::Unsorted, cx));
     cx.run_until_parked();
+    let selected_row = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| shell.read(cx).sidebar().read(cx).highlighted(cx))
+    };
 
-    /* The gear, then Back; Ctrl , then Esc; Ctrl , then Alt ←. */
+    /* The gear, then Back; Ctrl , then Esc; Ctrl , then Alt ←. No sidebar row is selected
+     * while Settings shows (the boards). */
     click(cx, "titlebar-settings");
     assert_eq!(showing(cx), Showing::Settings);
+    assert_eq!(selected_row(cx), None);
     click(cx, "settings-back");
     assert_eq!(showing(cx), Showing::Unsorted);
+    assert_eq!(selected_row(cx), Some(Shelf::Unsorted));
     for back in ["escape", "alt-left"] {
         cx.simulate_keystrokes("secondary-,");
         cx.run_until_parked();

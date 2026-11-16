@@ -316,6 +316,18 @@ fn a_find_that_matches_everything_stops_at_its_bound(cx: &mut TestAppContext) {
     assert_eq!(count, "1 of 10,000+");
 }
 
+/// A session without calls has no Calls block in its facts; one with calls has.
+#[gpui::test]
+fn the_facts_count_calls_only_for_a_session_that_made_some(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    open(crate::test_support::SESSIONS[0].title, cx);
+    assert!(snapshot(&shell, cx).facts);
+    assert!(bounds(cx, "facts-calls").is_some());
+    open(crate::test_support::SESSIONS[2].title, cx);
+    assert!(snapshot(&shell, cx).facts);
+    assert_eq!(bounds(cx, "facts-calls"), None);
+}
+
 #[gpui::test]
 fn the_facts_show_beside_a_wide_column_and_over_a_narrow_one(cx: &mut TestAppContext) {
     let (shell, cx) = open_shell_sized(size(px(1100.), px(700.)), cx);
