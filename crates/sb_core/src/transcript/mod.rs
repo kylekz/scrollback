@@ -22,8 +22,9 @@
 
 mod build;
 mod index;
+mod placement;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read as _};
 use std::ops::Index;
 use std::sync::Arc;
@@ -39,6 +40,7 @@ pub use build::Builder;
 pub use index::{
     At, INDEX_VERSION, InSubagent, SessionIndex, Span, SpanKind, Totals, index, searchable,
 };
+pub use placement::{Placed, place};
 
 /// A session as its provider parsed it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,61 +58,113 @@ pub struct Transcript {
 impl Transcript {
     /**
      * Reads every subagent's conversation that isn't read yet, and those of the subagents
-     * they started in turn. Under each call its subagents end in the order they started, and
-     * a subagent found under a call leaves [`Transcript::unattached`].
+     * they started in turn, and places each under the call that started it by the rule the
+     * reader places them by too ([`place`]). Under each call its subagents end in the order
+     * they started, and a subagent placed under a call leaves [`Transcript::unattached`]. A
+     * subagent the provider's parse read with the session (one whose records are in the
+     * session's own transcript) is where the parse put it.
      */
     pub fn read_subagents(&mut self, provider: &dyn Provider, items: &dyn SessionItems) {
-        let mut placed = HashSet::new();
-        if let Some(conversation) = &mut self.conversation {
-            read_under(conversation, provider, items, &mut placed, &mut Vec::new());
+        /* What the subagents the parse read already claim, then each other one read once. */
+        let mut claims: HashMap<Arc<str>, Vec<Arc<str>>> = HashMap::new();
+        if let Some(conversation) = &self.conversation {
+            claims_within(conversation, &mut claims);
         }
-        for index in 0..self.unattached.len() {
-            let item = self.unattached[index].item().clone();
-            if placed.contains(&item) {
-                continue;
+        for subagent in &self.unattached {
+            if let Subagent::Read { conversation, .. } = subagent {
+                claims.insert(
+                    subagent.item().clone(),
+                    conversation.claims().cloned().collect(),
+                );
+                claims_within(conversation, &mut claims);
             }
-            if matches!(self.unattached[index], Subagent::Unread { .. }) {
-                self.unattached[index] = provider.subagent(items, &item);
+        }
+        let first: Vec<Arc<str>> = (self.conversation.iter())
+            .flat_map(|conversation| conversation.claims().cloned())
+            .collect();
+        let roots: Vec<Arc<str>> = (self.unattached.iter())
+            .map(|subagent| subagent.item().clone())
+            .collect();
+        let mut read: HashMap<Arc<str>, Subagent> = HashMap::new();
+        let placed = place(&first, &roots, |item| {
+            if let Some(claims) = claims.get(item) {
+                return claims.clone();
             }
-            if let Subagent::Read { conversation, .. } = &mut self.unattached[index] {
-                read_under(conversation, provider, items, &mut placed, &mut vec![item]);
-            }
+            let subagent = provider.subagent(items, item);
+            let claimed = (subagent.conversation())
+                .map(|conversation| conversation.claims().cloned().collect())
+                .unwrap_or_default();
+            read.insert(item.clone(), subagent);
+            claimed
+        });
+        let mut taken = HashSet::new();
+        if let Some(conversation) = &mut self.conversation {
+            attach(conversation, None, &placed.parents, &mut read, &mut taken);
         }
         self.unattached
-            .retain(|subagent| !placed.contains(subagent.item()));
+            .retain(|subagent| placed.unattached.contains(subagent.item()));
+        for subagent in &mut self.unattached {
+            let item = subagent.item().clone();
+            if let Some(found) = read.remove(&item) {
+                *subagent = found;
+            }
+            if let Subagent::Read { conversation, .. } = subagent {
+                attach(
+                    conversation,
+                    Some(&item),
+                    &placed.parents,
+                    &mut read,
+                    &mut taken,
+                );
+            }
+        }
+    }
+}
+
+/// What the subagents read within `conversation` claim, by their items.
+fn claims_within(conversation: &Conversation, claims: &mut HashMap<Arc<str>, Vec<Arc<str>>>) {
+    let mut within = vec![conversation];
+    while let Some(conversation) = within.pop() {
+        for subagent in conversation.calls_all().flat_map(|call| &call.subagents) {
+            if let Subagent::Read { conversation, .. } = subagent {
+                claims.insert(
+                    subagent.item().clone(),
+                    conversation.claims().cloned().collect(),
+                );
+                within.push(conversation);
+            }
+        }
     }
 }
 
 /**
- * Reads the subagents the calls of `conversation` started, and theirs. `placed` gains every
- * item that is read under a call; an item already there stays unread under a second call that
- * claims it, as does one of `above`, the subagents this conversation is itself under. A
- * subagent its provider's parse read with the session (one whose records are in the
- * session's own transcript) is where the parse put it.
+ * Puts under the calls of `conversation`, the item `item` (`None` for the session's own), the
+ * subagents placed under it, as `read` holds them, and theirs; the first call that claims one
+ * takes it. One a call claims that is placed elsewhere stays unread there.
  */
-fn read_under(
+fn attach(
     conversation: &mut Conversation,
-    provider: &dyn Provider,
-    items: &dyn SessionItems,
-    placed: &mut HashSet<Arc<str>>,
-    above: &mut Vec<Arc<str>>,
+    item: Option<&Arc<str>>,
+    parents: &HashMap<Arc<str>, Arc<str>>,
+    read: &mut HashMap<Arc<str>, Subagent>,
+    taken: &mut HashSet<Arc<str>>,
 ) {
     for block in &mut conversation.blocks {
         let Content::ToolCall(call) = &mut block.content else {
             continue;
         };
         for subagent in &mut call.subagents {
-            let item = subagent.item().clone();
+            let claimed = subagent.item().clone();
             if matches!(subagent, Subagent::Unread { .. }) {
-                if above.contains(&item) || !placed.insert(item.clone()) {
+                if parents.get(&claimed) != item || !taken.insert(claimed.clone()) {
                     continue;
                 }
-                *subagent = provider.subagent(items, &item);
+                if let Some(found) = read.remove(&claimed) {
+                    *subagent = found;
+                }
             }
             if let Subagent::Read { conversation, .. } = subagent {
-                above.push(item);
-                read_under(conversation, provider, items, placed, above);
-                above.pop();
+                attach(conversation, Some(&claimed), parents, read, taken);
             }
         }
         call.subagents.sort_by_key(|subagent| {
@@ -204,6 +258,23 @@ impl Conversation {
         Some(times.fold((first, first), |(start, end), at| {
             (start.min(at), end.max(at))
         }))
+    }
+
+    /// Every tool call, on any branch, in the order recorded.
+    fn calls_all(&self) -> impl Iterator<Item = &ToolCall> {
+        self.blocks.iter().filter_map(|block| match &block.content {
+            Content::ToolCall(call) => Some(&**call),
+            _ => None,
+        })
+    }
+
+    /**
+     * The subagents its calls, on any branch, say they started, in the order recorded: what
+     * it claims when subagents are placed ([`place`]).
+     */
+    pub fn claims(&self) -> impl Iterator<Item = &Arc<str>> {
+        self.calls_all()
+            .flat_map(|call| call.subagents.iter().map(Subagent::item))
     }
 
     /// The tool calls on the shown branch, in order, each with its block.

@@ -59,7 +59,7 @@ mod tests;
 pub mod text;
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -70,7 +70,7 @@ use sb_core::archive::{Archive, ArchivedSession, Pinned, SegmentCache};
 use sb_core::catalogue::SessionId;
 use sb_core::provider::{ItemKind, Provider, SessionItems};
 use sb_core::transcript::{
-    BlockId, Content, Conversation, Outline, Output, Stored, Subagent, ToolCall,
+    BlockId, Content, Conversation, Outline, Output, Stored, Subagent, ToolCall, place,
 };
 
 use super::{ArchiveService, LibraryService, Providers};
@@ -1285,21 +1285,18 @@ impl ReaderService {
 
     /**
      * Works out which subagent started which (the module docs), from the provider's outlines
-     * of them: wanted once those no call of the session's own started come into view. Each is
-     * placed under the first subagent found to start it, walking from those the session's own
-     * calls started and then from the rest in turn, so that a subagent claimed by one it
-     * started, or by itself, is still reached: such a claim is passed over.
+     * of them: wanted once those no call of the session's own started come into view, or when a
+     * search match in a subagent is gone to. They are placed by the rule the index places them
+     * by ([`sb_core::transcript::place`]), so the subagents left unattached are the index's,
+     * in its order.
      */
     pub fn want_placement(&mut self, cx: &mut Context<Self>) {
         let Some(open) = self.open_session() else {
             return;
         };
         let roots = open.unattached.clone();
-        let first: Vec<Arc<str>> = open
-            .main
-            .iter()
-            .flat_map(|main| main.calls())
-            .flat_map(|(_, call)| call.subagents.iter().map(|it| it.item().clone()))
+        let first: Vec<Arc<str>> = (open.main.iter())
+            .flat_map(|main| main.claims().cloned())
             .collect();
         self.load(
             |open| {
@@ -1315,25 +1312,13 @@ impl ReaderService {
                     .into_iter()
                     .map(|outline| (outline.item.clone(), outline))
                     .collect();
-                let mut placement = Placement::default();
-                let mut seen: HashSet<Arc<str>> = first.iter().cloned().collect();
-                let mut queue: VecDeque<Arc<str>> = first.into();
-                let mut roots = roots.into_iter();
-                while let Some(item) = queue.pop_front().or_else(|| {
-                    let root = roots.find(|root| !seen.contains(root))?;
-                    seen.insert(root.clone());
-                    Some(root)
-                }) {
-                    let Some(outline) = outlines.get(&item) else {
-                        continue;
-                    };
-                    for child in &outline.started {
-                        if seen.insert(child.clone()) {
-                            placement.parents.insert(child.clone(), item.clone());
-                            queue.push_back(child.clone());
-                        }
-                    }
-                }
+                let placed = place(&first, &roots, |item| {
+                    (outlines.get(item)).map_or_else(Vec::new, |outline| outline.started.clone())
+                });
+                let mut placement = Placement {
+                    parents: placed.parents,
+                    names: HashMap::new(),
+                };
                 placement.names = outlines
                     .into_iter()
                     .map(|(item, outline)| {
