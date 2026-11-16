@@ -624,6 +624,8 @@ impl Drop for Unwritten {
 
 pub struct LibraryService {
     archive: Entity<ArchiveService>,
+    /// Whether a location syncs, for a confirmation refused while one did.
+    sync: Entity<SyncService>,
     shelf: Shelf,
     counts: LibraryCounts,
     folders: Vec<Folder>,
@@ -746,6 +748,7 @@ impl LibraryService {
                 cx.on_app_quit(Self::write_what_is_queued),
             ],
             archive,
+            sync,
             shelf: Shelf::All,
             counts: LibraryCounts::default(),
             folders: Vec::new(),
@@ -1994,13 +1997,17 @@ impl LibraryService {
                 .as_ref()
                 .is_none_or(|open| open.session.id == session.id) =>
             {
+                /* Refused as its location synced, the confirmation says so only while a sync
+                runs: one that has ended since isn't waited for. */
+                let syncing = self.sync.read(cx).is_syncing();
                 self.for_good = Some(ForGood {
                     session: (**session).clone(),
                     deletion: None,
-                    refused: Some(match error {
-                        ArchiveError::Syncing(_) => Refusal::Syncing,
-                        _ => Refusal::Changed,
-                    }),
+                    refused: match error {
+                        ArchiveError::Syncing(_) if syncing => Some(Refusal::Syncing),
+                        ArchiveError::Syncing(_) => None,
+                        _ => Some(Refusal::Changed),
+                    },
                 });
                 self.read_deletion(cx);
                 return;

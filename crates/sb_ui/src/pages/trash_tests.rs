@@ -357,20 +357,33 @@ fn a_refusal_while_its_location_syncs_shows_again_or_says_so_over_another(cx: &m
     let deletion = asked(cx).and_then(|(_, deletion, _)| deletion).unwrap();
     let syncing = || ArchiveError::Syncing(deletion.session.location.clone());
 
-    // Its own confirmation shows again, with why.
+    // Refused as a sync ran that has ended since: its own confirmation shows again, with no
+    // sync to wait for.
     let first = session(SESSIONS[0].title, cx).unwrap();
-    library(cx).update(cx, |library, cx| {
-        library.answer_delete_for_good(false, cx);
-        library.refused_for_good(deletion.clone(), first.clone(), syncing(), cx);
-    });
+    let refuse = |cx: &mut VisualTestContext| {
+        library(cx).update(cx, |library, cx| {
+            library.answer_delete_for_good(false, cx);
+            library.refused_for_good(deletion.clone(), first.clone(), syncing(), cx);
+        });
+    };
+    refuse(cx);
     cx.run_until_parked();
-    let (title, _, refused) = asked(cx).expect("asked again");
+    let (title, read, refused) = asked(cx).expect("asked again");
     assert_eq!(title, SESSIONS[0].title);
+    assert_eq!((read.is_some(), refused), (true, None));
+
+    // Refused while a sync runs: it says so for as long as one does, whatever the sync says
+    // meanwhile.
+    let sync = cx.update(|_, cx| cx.services().sync.clone());
+    sync.update(cx, |sync, cx| sync.sync_all(cx));
+    assert!(sync.read_with(cx, |sync, _| sync.is_syncing()));
+    refuse(cx);
+    sync.update(cx, |_, cx| cx.notify());
+    let (_, _, refused) = asked(cx).expect("asked again");
     assert_eq!(refused, Some(Refusal::Syncing));
     // Once no sync runs, it forgets why and reads what it removes again.
-    let sync = cx.update(|_, cx| cx.services().sync.clone());
-    sync.update(cx, |_, cx| cx.notify());
     cx.run_until_parked();
+    assert!(!sync.read_with(cx, |sync, _| sync.is_syncing()));
     let (_, read, refused) = asked(cx).expect("still asked");
     assert_eq!((read.is_some(), refused), (true, None));
 
@@ -379,7 +392,7 @@ fn a_refusal_while_its_location_syncs_shows_again_or_says_so_over_another(cx: &m
     ask(SESSIONS[1].title, cx);
     cx.run_until_parked();
     library(cx).update(cx, |library, cx| {
-        library.refused_for_good(deletion.clone(), first, syncing(), cx);
+        library.refused_for_good(deletion.clone(), first.clone(), syncing(), cx);
     });
     cx.run_until_parked();
     assert_eq!(
