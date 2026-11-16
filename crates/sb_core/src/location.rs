@@ -198,6 +198,18 @@ pub const NAME_CHARS: usize = 80;
  * and no longer than [`NAME_CHARS`]. `None` when nothing is left.
  */
 pub fn clean_name(name: &str) -> Option<String> {
+    let kept = visible(name);
+    let kept: String = kept.trim().chars().take(NAME_CHARS).collect();
+    let kept = kept.trim_end().to_string();
+    (!kept.is_empty()).then_some(kept)
+}
+
+/**
+ * `text` without its control characters and the invisible ones that format text (a
+ * right-to-left override, a zero-width space): what a name the owner sees is kept as, which
+ * may come from a transcript or a remote machine.
+ */
+pub fn visible(text: &str) -> String {
     let invisible = |c: char| {
         matches!(
             u32::from(c),
@@ -205,13 +217,9 @@ pub fn clean_name(name: &str) -> Option<String> {
                 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB
         )
     };
-    let kept: String = name
-        .chars()
+    text.chars()
         .filter(|c| !c.is_control() && !invisible(*c))
-        .collect();
-    let kept: String = kept.trim().chars().take(NAME_CHARS).collect();
-    let kept = kept.trim_end().to_string();
-    (!kept.is_empty()).then_some(kept)
+        .collect()
 }
 
 /// A location that could not be connected to when it was last tried (PLAN §5): a machine that

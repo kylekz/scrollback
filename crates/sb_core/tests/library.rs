@@ -1131,7 +1131,19 @@ fn what_is_not_there_is_said_not_passed_over() {
             Err(CatalogueError::FolderName)
         ));
     }
-    let twin = catalogue.create_folder("work", Some(folder)).unwrap();
+    /* Controls and the invisible characters that format text are no part of a name: one of
+    nothing else is no name. A folder may be named after a transcript's project path. */
+    for name in ["\u{202E}\u{200B}", "\n\t"] {
+        assert!(matches!(
+            catalogue.create_folder(name, None),
+            Err(CatalogueError::FolderName)
+        ));
+    }
+    let twin = catalogue
+        .create_folder("wo\u{202E}rk\u{7}", Some(folder))
+        .unwrap();
+    let named = (catalogue.folders().unwrap().into_iter()).find(|it| it.id == twin);
+    assert_eq!(named.map(|it| it.name).as_deref(), Some("work"));
     catalogue.rename_folder(twin, &"n".repeat(200)).unwrap();
     catalogue.rename_folder(twin, " work ").unwrap();
     assert_eq!(

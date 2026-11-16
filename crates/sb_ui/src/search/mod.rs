@@ -1064,7 +1064,7 @@ impl Palette {
                 SbIcon::Folder,
                 library
                     .folder(folder)
-                    .map_or_else(String::new, |it| hostile::label(&it.name)),
+                    .map_or_else(String::new, |it| it.name.clone()),
             ),
             Filed::Unsorted => (SbIcon::Inbox, "Unsorted".to_string()),
         };

@@ -69,8 +69,8 @@ impl Catalogue {
     pub fn create_folder(&self, name: &str, parent: Option<FolderId>) -> Result<FolderId> {
         let name = named(name)?;
         self.db.write(|tx| {
-            refuse_taken(tx, name, parent, None)?;
-            create(tx, name, parent)
+            refuse_taken(tx, &name, parent, None)?;
+            create(tx, &name, parent)
         })
     }
 
@@ -90,7 +90,7 @@ impl Catalogue {
         let name = named(name)?;
         let (typed, path) = self.typed_path(typed, location)?;
         self.db.write(|tx| {
-            let folder = create(tx, &free_name(tx, name, parent, None)?, parent)?;
+            let folder = create(tx, &free_name(tx, &name, parent, None)?, parent)?;
             attach(tx, folder, typed, &path, location)?;
             refile(tx)?;
             Ok(folder)
@@ -102,7 +102,7 @@ impl Catalogue {
         let name = named(name)?;
         self.db.write(|tx| {
             let parent = parent_of(tx, folder)?.map(FolderId);
-            refuse_taken(tx, name, parent, Some(folder))?;
+            refuse_taken(tx, &name, parent, Some(folder))?;
             tx.execute(
                 "UPDATE folder SET name = ?2 WHERE id = ?1",
                 params![folder.0, name],
@@ -616,9 +616,13 @@ pub(super) fn folder_exists(connection: &Connection, folder: FolderId) -> Result
     }
 }
 
-/// A folder's name as it is kept: without the white space around it.
-pub(super) fn named(name: &str) -> Result<&str> {
-    let name = name.trim();
+/**
+ * A folder's name as it is kept: without control characters or the invisible ones that format
+ * text ([`crate::location::visible`]: a folder may be named after a transcript's project
+ * path), and without the white space around it.
+ */
+pub(super) fn named(name: &str) -> Result<String> {
+    let name = crate::location::visible(name).trim().to_string();
     if name.is_empty() || name.chars().count() > FOLDER_NAME_CHARS {
         return Err(CatalogueError::FolderName);
     }

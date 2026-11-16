@@ -259,7 +259,14 @@ pub(super) fn load(archive: &Archive, shelf: Shelf) -> Result<Loaded, CatalogueE
     Ok(Loaded {
         shelf,
         counts: catalogue.library_counts()?,
-        folders: catalogue.folders()?,
+        /* A folder may be named after a transcript's project path, and one named before names
+        were cleaned may hold anything: each is drawn as it is read here. */
+        folders: (catalogue.folders()?.into_iter())
+            .map(|folder| Folder {
+                name: crate::hostile::label(&folder.name),
+                ..folder
+            })
+            .collect(),
         attached: catalogue.attached_paths()?,
         agents: agents.len(),
         page,
@@ -802,7 +809,8 @@ impl LibraryService {
         &self.counts
     }
 
-    /// Every folder, those with the same parent together and in their order.
+    /// Every folder, those with the same parent together and in their order, each name a label
+    /// ([`crate::hostile::label`]) wherever it is drawn.
     pub fn folders(&self) -> &[Folder] {
         &self.folders
     }
