@@ -93,6 +93,19 @@ impl Sanitized {
     }
 
     /**
+     * [`Sanitized::measured`] without the clock: kept when the view parses it, however long that
+     * took. For the tests of what a body is made into, which a busy machine mustn't change.
+     */
+    #[cfg(test)]
+    pub(crate) fn untimed(text: &str) -> Option<Self> {
+        Self::gated(text, |sanitized| {
+            gpui_base::text::editor_host::parse_markdown(sanitized, Default::default())
+                .ok()
+                .map(|_| Duration::ZERO)
+        })
+    }
+
+    /**
      * [`Sanitized::measured`]'s gate, with `parse` for the timed parse of the sanitised text:
      * how long it took, or `None` when it failed. The tests hand it the times to decide on.
      */

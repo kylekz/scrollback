@@ -145,6 +145,16 @@ impl Prose {
      * rest of it is plain text, and dropped).
      */
     pub fn markdown_while(text: &str, wanted: &(dyn Fn() -> bool + Sync)) -> Self {
+        Self::prepared(text, wanted, Timing::Clock)
+    }
+
+    /// [`Prose::markdown_while`] without its limits in time ([`Timing::Untimed`]).
+    #[cfg(test)]
+    pub(crate) fn untimed(text: &str, wanted: &(dyn Fn() -> bool + Sync)) -> Self {
+        Self::prepared(text, wanted, Timing::Untimed)
+    }
+
+    fn prepared(text: &str, wanted: &(dyn Fn() -> bool + Sync), timing: Timing) -> Self {
         if let Some(note) = crate::hostile::nothing_shown(text) {
             return Self::plain(&note);
         }
@@ -155,7 +165,7 @@ impl Prose {
                 std::thread::Builder::new()
                     .name("prose".to_string())
                     .stack_size(PARSE_STACK)
-                    .spawn_scoped(scope, || prepare(text, wanted))
+                    .spawn_scoped(scope, || prepare(text, wanted, timing))
                     .ok()?
                     .join()
                     .ok()?
@@ -167,10 +177,33 @@ impl Prose {
     }
 }
 
+/**
+ * Whether a body's preparation keeps to its limits in time: [`PARSE_BUDGET`], a region's parse
+ * against the view's limit, and each piece's timed parse ([`Sanitized::measured`]). The app's
+ * always does. The tests of what a body is made into don't, so that a busy machine can't change
+ * what they see; the tests of how long it takes do.
+ */
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Timing {
+    Clock,
+    #[cfg(test)]
+    Untimed,
+}
+
+impl Timing {
+    fn timed(self) -> bool {
+        match self {
+            Self::Clock => true,
+            #[cfg(test)]
+            Self::Untimed => false,
+        }
+    }
+}
+
 /// The pieces of `text` (the module docs); `None` if a region doesn't parse.
-fn prepare(text: &str, wanted: &(dyn Fn() -> bool + Sync)) -> Option<Vec<Piece>> {
+fn prepare(text: &str, wanted: &(dyn Fn() -> bool + Sync), timing: Timing) -> Option<Vec<Piece>> {
     let started = Instant::now();
-    let going = || started.elapsed() < PARSE_BUDGET && wanted();
+    let going = || (!timing.timed() || started.elapsed() < PARSE_BUDGET) && wanted();
     /* Each region parsed on its own, and the definitions the body makes: the first of a label
     is the one Markdown follows. */
     let mut definitions: HashMap<String, String> = HashMap::new();
@@ -179,7 +212,7 @@ fn prepare(text: &str, wanted: &(dyn Fn() -> bool + Sync)) -> Option<Vec<Piece>>
         spans.push(match span {
             Span::Code { language, body } => Prepared::Piece(code(language, body)),
             Span::Prose(range) if going() => {
-                let region = markdown_pieces(&text[range.clone()], "", &going)?;
+                let region = markdown_pieces(&text[range.clone()], "", &going, timing)?;
                 for (label, definition) in &region.definitions {
                     definitions
                         .entry(label.clone())
@@ -198,7 +231,7 @@ fn prepare(text: &str, wanted: &(dyn Fn() -> bool + Sync)) -> Option<Vec<Piece>>
         let source = &text[range.clone()];
         let carried = carried(source, &region.definitions, &definitions);
         if !carried.is_empty() && going() {
-            *region = markdown_pieces(source, &carried, &going)?;
+            *region = markdown_pieces(source, &carried, &going, timing)?;
         }
     }
     let mut pieces = Vec::new();
@@ -267,11 +300,17 @@ fn code(language: Option<String>, body: String) -> Piece {
  * ([`crate::markdown::view_parse_limit`]) is plain text without them: a piece is most often the
  * whole of its region, parsed by the same parser, and would take as long again three times.
  */
-fn markdown_pieces(text: &str, carried: &str, going: &dyn Fn() -> bool) -> Option<Region> {
+fn markdown_pieces(
+    text: &str,
+    carried: &str,
+    going: &dyn Fn() -> bool,
+    timing: Timing,
+) -> Option<Region> {
     let source = format!("{text}\n\n{carried}");
     let started = Instant::now();
     let root = markdown::to_mdast(&source, &options()).ok()?;
-    let slow = started.elapsed() > crate::markdown::view_parse_limit(source.len());
+    let slow =
+        timing.timed() && started.elapsed() > crate::markdown::view_parse_limit(source.len());
     /* Every definition, wherever it is (in a quote, in a list item), where it starts and
     written out once: the first of a label is the one Markdown follows. */
     let mut definitions: HashMap<&str, (usize, String)> = HashMap::new();
@@ -324,9 +363,12 @@ fn markdown_pieces(text: &str, carried: &str, going: &dyn Fn() -> bool) -> Optio
             markdown.push_str("\n\n");
             markdown.push_str(definition);
         }
-        pieces.push(
-            Sanitized::measured(&markdown).map_or_else(|| oversized(source), Piece::Markdown),
-        );
+        let sanitized = match timing {
+            Timing::Clock => Sanitized::measured(&markdown),
+            #[cfg(test)]
+            Timing::Untimed => Sanitized::untimed(&markdown),
+        };
+        pieces.push(sanitized.map_or_else(|| oversized(source), Piece::Markdown));
     };
     let mut group: Option<Group> = None;
     for node in &blocks {
@@ -863,6 +905,14 @@ mod tests {
 
     use super::*;
 
+    /**
+     * `body` prepared as the reader prepares it, without the limits in time: what it is made
+     * into, whatever else the machine is doing. The tests of how long it takes use the clock.
+     */
+    fn prepared(body: &str) -> Prose {
+        Prose::untimed(body, &|| true)
+    }
+
     fn kinds(prose: &Prose) -> Vec<&'static str> {
         prose
             .pieces
@@ -884,7 +934,7 @@ mod tests {
             .map(|n| format!("Paragraph {n} of many."))
             .collect();
         let body = paragraphs.join("\n\n");
-        let prose = Prose::markdown(&body);
+        let prose = prepared(&body);
         assert!(prose.pieces.len() > 1);
         let mut rejoined = String::new();
         for piece in &prose.pieces {
@@ -916,9 +966,9 @@ mod tests {
             (line.clone(), vec!["plain"]),
             ("x".repeat(MARKDOWN_BYTES + 1), vec!["plain"]),
         ] {
-            assert_eq!(kinds(&Prose::markdown(&body)), expected);
+            assert_eq!(kinds(&prepared(&body)), expected);
         }
-        let Piece::Plain { text, .. } = &Prose::markdown(&line).pieces[0] else {
+        let Piece::Plain { text, .. } = &prepared(&line).pieces[0] else {
             panic!("a long line is plain");
         };
         assert_eq!(text.text, line);
@@ -926,7 +976,7 @@ mod tests {
         let nested: String = (0..8)
             .map(|n| format!("{}- level\n", "  ".repeat(n)))
             .collect();
-        assert_eq!(kinds(&Prose::markdown(&nested)), ["markdown"]);
+        assert_eq!(kinds(&prepared(&nested)), ["markdown"]);
     }
 
     #[test]
@@ -935,7 +985,7 @@ mod tests {
         let body = format!(
             "See [the docs][docs].\n\n{filler}\n\nAgain [the docs][docs].\n\n[docs]: https://example.com/docs"
         );
-        let prose = Prose::markdown(&body);
+        let prose = prepared(&body);
         let markdown: Vec<&str> = prose
             .pieces
             .iter()
@@ -1146,7 +1196,10 @@ mod tests {
                 let start = std::time::Instant::now();
                 let pieces = std::thread::Builder::new()
                     .stack_size(PARSE_STACK)
-                    .spawn(move || markdown_pieces(&body, "", &|| true).map(|it| it.pieces.len()))
+                    .spawn(move || {
+                        markdown_pieces(&body, "", &|| true, Timing::Clock)
+                            .map(|it| it.pieces.len())
+                    })
                     .unwrap()
                     .join()
                     .unwrap();
@@ -1223,7 +1276,9 @@ mod tests {
     fn splitter() -> String {
         let splitter = format!("{}a", "- ".repeat(MAX_NESTING / 2));
         assert!(matches!(scan(&splitter).as_slice(), [Span::Prose(_)]));
-        let pieces = markdown_pieces(&splitter, "", &|| true).unwrap().pieces;
+        let pieces = markdown_pieces(&splitter, "", &|| true, Timing::Untimed)
+            .unwrap()
+            .pieces;
         assert!(matches!(
             pieces.as_slice(),
             [Piece::Plain {
@@ -1278,7 +1333,7 @@ mod tests {
             "[a]\n\n{splitter}\n\n[a]\n\n{}\n\n> [a]:\n> {trail}\n\n[b]: x {trail}\n\n[b]",
             "x".repeat(REGION_BYTES)
         );
-        let prose = Prose::markdown(&body);
+        let prose = prepared(&body);
         let markdown: Vec<&str> = prose
             .pieces
             .iter()
@@ -1294,9 +1349,16 @@ mod tests {
             2,
             "{markdown:?}"
         );
-        /* A line like a definition that isn't one is carried nowhere. */
+        /* A line like a definition that isn't one is carried nowhere: it is only where it was
+        written, never after a piece's own text. */
+        let line = format!("[b]: x {trail}");
         assert!(
-            markdown.iter().all(|it| !it.contains("[b]: x")),
+            markdown
+                .iter()
+                .map(|it| it.matches(&line).count())
+                .sum::<usize>()
+                <= 1
+                && markdown.iter().all(|it| !it.ends_with(&line)),
             "{markdown:?}"
         );
     }
@@ -1411,7 +1473,7 @@ mod tests {
         assert_eq!(regions(scan(&body)).len(), 1);
         /* Wanted for the region and its first piece. */
         let asked = std::sync::atomic::AtomicUsize::new(0);
-        let prose = Prose::markdown_while(&body, &|| {
+        let prose = Prose::untimed(&body, &|| {
             asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2
         });
         let paragraphs: Vec<&Piece> = prose
@@ -1435,7 +1497,7 @@ mod tests {
     #[test]
     fn a_body_of_a_closed_session_goes_no_further_than_its_next_parse() {
         let body = repeated("Paragraph.\n\n", MARKDOWN_BYTES);
-        let prose = Prose::markdown_while(&body, &|| false);
+        let prose = Prose::untimed(&body, &|| false);
         assert!(prose.pieces.iter().all(|piece| matches!(
             piece,
             Piece::Plain {
@@ -1448,7 +1510,7 @@ mod tests {
     #[test]
     fn fenced_code_is_a_piece_of_its_own_and_never_parsed() {
         let body = "Before.\n\n```rust\nfn main() {}\n```\n\n> quoted\n> ```\n> <img src=x>\n> ```\n\nAfter.";
-        let prose = Prose::markdown(body);
+        let prose = prepared(body);
         let codes: Vec<(Option<&str>, &str)> = prose
             .pieces
             .iter()
@@ -1475,7 +1537,7 @@ mod tests {
     #[test]
     fn a_fence_in_a_list_items_content_is_a_piece_of_its_own() {
         let codes = |body: &str| -> Vec<(Option<String>, String)> {
-            Prose::markdown(body)
+            prepared(body)
                 .pieces
                 .into_iter()
                 .filter_map(|piece| match piece {
@@ -1570,7 +1632,7 @@ mod tests {
         let body = format!(
             "{filler}\n\nSee [the bank][b].\n\n[b]: https://bank.example\n\n{filler}\n\n[b]: https://evil.example"
         );
-        let prose = Prose::markdown(&body);
+        let prose = prepared(&body);
         let carried: Vec<&str> = prose
             .pieces
             .iter()
@@ -1587,7 +1649,7 @@ mod tests {
 
     #[test]
     fn a_body_is_sanitised_and_its_controls_shown() {
-        let prose = Prose::markdown("![x](https://example.com/p.png) \u{202E}txt.exe");
+        let prose = prepared("![x](https://example.com/p.png) \u{202E}txt.exe");
         let Piece::Markdown(markdown) = &prose.pieces[0] else {
             panic!("Markdown");
         };
