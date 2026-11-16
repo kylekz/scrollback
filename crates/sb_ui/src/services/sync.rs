@@ -114,6 +114,8 @@ pub struct PassProgress {
     /// The sessions to index and those indexed, once the fetching is over.
     pub sessions: usize,
     pub sessions_done: usize,
+    /// The sessions whose text the index has made searchable, as it goes.
+    pub searchable_done: usize,
     /// What the agents before the one being synced added to the counts above.
     items_before: usize,
     bytes_before: u64,
@@ -140,6 +142,7 @@ impl PassProgress {
             Progress::Indexed { sessions, .. } => {
                 self.sessions_done = self.sessions_before + sessions;
             }
+            Progress::Searchable { sessions } => self.searchable_done = sessions,
         }
     }
 
@@ -912,7 +915,8 @@ impl SyncService {
         cx.notify();
     }
 
-    /// Logs what an index could not do. Returns whether it indexed anything.
+    /// Logs what an index could not do. Returns whether it indexed anything, or made anything
+    /// searchable: either is news for the library and search.
     fn indexed(&self, indexed: Result<IndexReport, SyncError>) -> bool {
         match indexed {
             Ok(report) => {
@@ -923,7 +927,7 @@ impl SyncService {
                         session.provider
                     );
                 }
-                report.sessions > 0
+                report.sessions > 0 || report.searchable > 0
             }
             Err(SyncError::Cancelled) => false,
             Err(error) => {
@@ -933,8 +937,8 @@ impl SyncService {
         }
     }
 
-    /// Reads what `work` reports while it runs, and tells the library, at most once a second,
-    /// when it has indexed more sessions.
+    /// Reads what `work` reports while it runs, and tells the library and search, at most once
+    /// a second, when it has indexed more sessions or made more searchable.
     fn poll(&self, work: Work, reported: Reported, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             let mut told = format::now();
@@ -949,7 +953,8 @@ impl SyncService {
                     let Some(shown) = shown.filter(|shown| **shown != progress) else {
                         return;
                     };
-                    let indexed = shown.sessions_done != progress.sessions_done;
+                    let indexed = shown.sessions_done != progress.sessions_done
+                        || shown.searchable_done != progress.searchable_done;
                     *shown = progress;
                     if indexed && format::now() - told >= ARCHIVED_EVERY_MS {
                         told = format::now();

@@ -933,6 +933,10 @@ fn a_locations_progress_runs_over_each_of_its_agents() {
     });
     assert!(progress.is_indexing());
     assert_eq!(progress.fraction(), 0.25);
+    // Their text made searchable is news of its own, which the fraction doesn't count.
+    progress.apply(&Progress::Searchable { sessions: 2 });
+    assert_eq!(progress.searchable_done, 2);
+    assert_eq!(progress.fraction(), 0.25);
     // A pass with nothing to fetch is done once it is planned.
     let mut nothing = PassProgress::default();
     nothing.apply(&Progress::Planned { items: 0, bytes: 0 });

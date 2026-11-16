@@ -477,7 +477,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 indexing = Some(Instant::now());
                 println!("indexing {sessions} sessions, {bytes} bytes");
             }
-            Progress::Indexed { .. } => {}
+            Progress::Indexed { .. } | Progress::Searchable { .. } => {}
         },
     )?;
     if passes.is_empty() {

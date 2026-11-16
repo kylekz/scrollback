@@ -170,7 +170,7 @@ fn run(
             bytes,
         });
     }
-    searchable(archive, location, providers, cancel, &mut report)?;
+    searchable(archive, location, providers, cancel, progress, &mut report)?;
     /* A log a read held when a delete for good was to empty it is emptied now. */
     catalogue.retry_empty_log();
     if let Some(search) = archive.search_index_if_open() {
@@ -199,6 +199,7 @@ fn searchable(
     location: Option<&LocationId>,
     providers: &[&dyn Provider],
     cancel: &CancelToken,
+    progress: &mut dyn FnMut(&Progress),
     report: &mut IndexReport,
 ) -> Result<(), SyncError> {
     let catalogue = archive.catalogue();
@@ -241,9 +242,15 @@ fn searchable(
         batch.extend(text(archive, provider, id, made)?);
         if batch.len() >= TEXTS || batch.iter().map(Text::bytes).sum::<usize>() >= TEXT_BYTES {
             report.searchable += record(archive, &std::mem::take(&mut batch))?;
+            progress(&Progress::Searchable {
+                sessions: report.searchable,
+            });
         }
     }
     report.searchable += record(archive, &batch)?;
+    progress(&Progress::Searchable {
+        sessions: report.searchable,
+    });
     Ok(())
 }
 

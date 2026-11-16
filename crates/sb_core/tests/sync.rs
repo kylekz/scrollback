@@ -270,14 +270,16 @@ fn a_pass_cancelled_at_each_step_resumes<A: Agent + Default>() {
             (bench, keys)
         };
         /* Scanned, planned, each of the three ranges fetched, and the batch stored; then what
-        there is to index, and each of the three sessions indexed. */
+        there is to index, each of the three sessions indexed, and their text made
+        searchable. */
         let all = steps(&prepare().0);
         assert_eq!(all[0], Progress::Scanned { items: 3 });
         assert!(matches!(all[1], Progress::Planned { items: 3, .. }));
         assert_eq!(all[5], Progress::Stored { items: 3 });
         assert!(matches!(all[6], Progress::Indexing { sessions: 3, .. }));
         assert!(matches!(all[9], Progress::Indexed { sessions: 3, .. }));
-        assert_eq!(all.len(), 10);
+        assert_eq!(all[10], Progress::Searchable { sessions: 3 });
+        assert_eq!(all.len(), 11);
 
         for stop_at in 0..all.len() {
             let (bench, keys) = prepare();
@@ -289,7 +291,7 @@ fn a_pass_cancelled_at_each_step_resumes<A: Agent + Default>() {
                 }
                 seen += 1;
             });
-            /* Once the last session is indexed there is nothing left to cancel. */
+            /* Once the last text is made searchable there is nothing left to cancel. */
             let stored = stop_at >= 5;
             if stop_at + 1 < all.len() {
                 assert!(
@@ -312,7 +314,7 @@ fn a_pass_cancelled_at_each_step_resumes<A: Agent + Default>() {
             /* The sessions the stopped pass did not index are indexed by the next. */
             assert_eq!(
                 resumed.index.sessions,
-                3 - stop_at.saturating_sub(6),
+                3 - stop_at.saturating_sub(6).min(3),
                 "resumed after step {stop_at}"
             );
             assert_eq!(bench.sessions().len(), 3);

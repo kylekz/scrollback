@@ -85,6 +85,8 @@ pub enum Progress {
     Indexing { sessions: usize, bytes: u64 },
     /// So many of those sessions are indexed, and so many of those bytes read.
     Indexed { sessions: usize, bytes: u64 },
+    /// So many sessions' text is made searchable, at the end of an index: search finds more.
+    Searchable { sessions: usize },
 }
 
 /// An item a pass did not archive, and why.
