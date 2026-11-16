@@ -33,28 +33,42 @@
 //!
 //! **The locations sheet** ([`LocationsSheet`], DESIGN §4.11) opens over the scrim from a
 //! sidebar location row, the Locations overline or `Ctrl L`, while a library page shows. It
-//! keeps the keyboard while it is open, and gives it back to where it was when it closes.
+//! keeps the keyboard while it is open, and gives it back to where it was when it closes. So
+//! do the library's dialogs ([`dialogs`]).
 //!
 //! **Settings** (DESIGN §4.13) open in the main area from the title bar's gear or `Ctrl ,`,
 //! while a library page shows; `Esc`, `Alt ←` and Back go back to the page they were opened
-//! from.
+//! from. While a library dialog, or Settings' own confirmation, is open, `Esc` answers it and
+//! the shell's other keys do nothing.
 //!
 //! **Another archive.** When the app moves onto another archive (Settings › Use a different
 //! folder…, `crate::services::reopen`), the shell makes its sidebar and main area anew over
-//! the new services, and closes the locations sheet: the window is the same, its contents are
-//! the other archive's.
+//! the new services, and closes the locations sheet and any dialog: the window is the same,
+//! its contents are the other archive's.
+//!
+//! **While a drag is held** (`crate::drag`) no key but `Esc` does anything, so that nothing
+//! changes under it: `Esc` gives the drag up. Resting on the sidebar's button in a narrow
+//! window shows the sidebar over the main area until the drag ends, so that its folders can
+//! be dropped on.
+//!
+//! **Closing the window, or quitting,** while the paths editor has changes to save asks first
+//! (DESIGN §4.7), as leaving its page does; the window closes, or the app quits, once the owner
+//! has answered.
 
+mod dialogs;
 pub mod title_bar;
 
 #[cfg(test)]
 mod tests;
 
+use std::time::Duration;
+
 use anyhow::{Context as _, Result};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, Size, Styled as _,
-    Subscription, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions, deferred,
-    div, point, prelude::FluentBuilder as _, px, size,
+    Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
+    deferred, div, point, prelude::FluentBuilder as _, px, size,
 };
 use gpui_appearance::Backing;
 use gpui_component::Root;
@@ -67,7 +81,8 @@ use crate::keymap;
 use crate::locations_sheet::{LocationsSheet, LocationsSheetEvent};
 use crate::overlay::{self, Layer};
 use crate::pages::{MainArea, Showing};
-use crate::services::{ActiveServices as _, Services};
+use crate::services::library::LibraryEvent;
+use crate::services::{ActiveServices as _, DropTarget, Leave, Services};
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::theme::{ActiveTheme as _, Material, SbTheme, StyledText as _};
 
@@ -108,22 +123,55 @@ pub struct Shell {
         Option<FocusHandle>,
         [Subscription; 2],
     )>,
+    /// The library's dialog while one is open, and where the keyboard rests in it.
+    dialog: Option<dialogs::Dialog>,
+    dialog_focus: FocusHandle,
+    /// Showing the sidebar for a drag resting on its button, and whether it shows for one.
+    springing: Option<Task<()>>,
+    sprung: bool,
     /// What the shell hears from the services and the sidebar, made anew with them.
-    attached: [Subscription; 5],
-    _observers: [Subscription; 3],
+    attached: [Subscription; 6],
+    _observers: [Subscription; 4],
 }
+
+/**
+ * How long a drag rests on the sidebar's button before the sidebar shows (DESIGN §4.1's closed
+ * folders open after as long).
+ */
+const SPRING: Duration = Duration::from_millis(500);
 
 impl Shell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (main, sidebar, attached) = Self::attach(window, cx);
+        // Closing the window asks first while the paths editor has changes to save.
+        window.on_window_should_close(cx, |_, cx| {
+            let library = cx.services().library.clone();
+            let holding = library.read(cx).held().is_some();
+            if holding {
+                library.update(cx, |library, cx| library.ask_before(Leave::Close, cx));
+            }
+            !holding
+        });
         Self {
             // gpui opened the window light or dark as the OS is; the theme may say otherwise.
             appearance: gpui_appearance::track_window(Backing::Solid, window, cx),
             sidebar_open: false,
             locations: None,
+            dialog: None,
+            dialog_focus: cx.focus_handle(),
+            springing: None,
+            sprung: false,
             attached,
             _observers: [
                 cx.observe_global_in::<SbTheme>(window, |_, _, cx| cx.notify()),
+                // No key but `Esc` acts while a drag is held (module docs).
+                cx.intercept_keystrokes(|event, _, cx| {
+                    if event.keystroke.key != "escape"
+                        && cx.services().library.read(cx).drag().is_some()
+                    {
+                        cx.stop_propagation();
+                    }
+                }),
                 // What had the keyboard is gone from the window (module docs).
                 cx.on_focus_lost(window, |this, window, cx| {
                     window
@@ -134,7 +182,10 @@ impl Shell {
                 // Another archive's services (module docs).
                 cx.observe_global_in::<Services>(window, |this, window, cx| {
                     this.locations = None;
+                    this.dialog = None;
                     this.sidebar_open = false;
+                    this.springing = None;
+                    this.sprung = false;
                     (this.main, this.sidebar, this.attached) = Self::attach(window, cx);
                     cx.notify();
                 }),
@@ -149,7 +200,7 @@ impl Shell {
     fn attach(
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> (Entity<MainArea>, Entity<Sidebar>, [Subscription; 5]) {
+    ) -> (Entity<MainArea>, Entity<Sidebar>, [Subscription; 6]) {
         let main = cx.new(|cx| MainArea::new(window, cx));
         main.focus_handle(cx).focus(window, cx);
         let sidebar = cx.new(|cx| Sidebar::new(window, cx));
@@ -161,15 +212,27 @@ impl Shell {
             services.settings.clone(),
         );
         let attached = [
-            // The title bar follows the archive, the locations and the passes.
+            // The title bar follows the archive, the locations, the passes and Settings.
             cx.observe(&archive, |_, _, cx| cx.notify()),
             cx.observe(&sync, |_, _, cx| cx.notify()),
-            cx.observe(&library, |_, _, cx| cx.notify()),
             cx.observe(&settings, |_, _, cx| cx.notify()),
+            cx.observe(&library, |this, _, cx| {
+                this.follow_drag(cx);
+                cx.notify();
+            }),
+            cx.subscribe_in(&library, window, |_, _, event, window, cx| {
+                if let LibraryEvent::Leave(leave) = event {
+                    match leave {
+                        Leave::Close => window.remove_window(),
+                        Leave::Quit => cx.quit(),
+                        Leave::Show(_) | Leave::Open(_) | Leave::Edit(_) => {}
+                    }
+                }
+            }),
             cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
                 match event {
-                    // Picking a row closes a narrow window's overlay (DESIGN §2), and
-                    // the keyboard goes to the page with it.
+                    /* Picking a row closes a narrow window's overlay (DESIGN §2), and the
+                    keyboard goes to the page with it. */
                     SidebarEvent::Picked => {
                         if std::mem::take(&mut this.sidebar_open) {
                             this.main.focus_handle(cx).focus(window, cx);
@@ -201,14 +264,19 @@ impl Shell {
         &self.sidebar
     }
 
-    #[cfg(test)]
-    pub(crate) fn main(&self) -> &Entity<MainArea> {
+    /// The main area.
+    pub fn main(&self) -> &Entity<MainArea> {
         &self.main
     }
 
     /// The section picked in Settings' list (DESIGN §4.13), whether or not they show.
     pub fn settings_section(&self, cx: &App) -> crate::pages::settings::Section {
         self.main.read(cx).settings_page().read(cx).current()
+    }
+
+    /// Whether a dialog is open over the window: the library's, or Settings' confirmation.
+    fn asking(&self, cx: &App) -> bool {
+        self.dialog.is_some() || self.main.read(cx).settings_page().read(cx).is_confirming()
     }
 
     /// The material applied to the window.
@@ -263,7 +331,22 @@ impl Shell {
     }
 
     fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sidebar_open {
+        let library = cx.services().library.clone();
+        let (dragging, deleting, asked) = {
+            let library = library.read(cx);
+            (
+                library.drag().is_some(),
+                library.deleting().is_some(),
+                library.asked().is_some(),
+            )
+        };
+        if dragging {
+            crate::drag::end(window, cx);
+        } else if deleting {
+            library.update(cx, |library, cx| library.answer_delete(false, cx));
+        } else if asked {
+            library.update(cx, |library, cx| library.answer(false, cx));
+        } else if self.sidebar_open {
             self.sidebar_open = false;
             self.main.focus_handle(cx).focus(window, cx);
             cx.notify();
@@ -282,6 +365,36 @@ impl Shell {
             .update(cx, |main, cx| main.open_settings(window, cx));
         self.main.focus_handle(cx).focus(window, cx);
         cx.notify();
+    }
+
+    /**
+     * Shows a narrow window's sidebar once a drag has rested on its button for [`SPRING`], and
+     * hides it again when the drag ends (module docs).
+     */
+    fn follow_drag(&mut self, cx: &mut Context<Self>) {
+        let drag = cx.services().library.read(cx).drag();
+        let resting = drag.is_some_and(|drag| drag.moved && drag.over == Some(DropTarget::Sidebar));
+        if drag.is_none() && std::mem::take(&mut self.sprung) {
+            self.sidebar_open = false;
+        }
+        if !resting {
+            self.springing = None;
+        } else if self.springing.is_none() && !self.sidebar_open {
+            self.springing = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(SPRING).await;
+                this.update(cx, |this, cx| {
+                    this.springing = None;
+                    if cx.services().library.read(cx).drag().and_then(|it| it.over)
+                        == Some(DropTarget::Sidebar)
+                    {
+                        this.sidebar_open = true;
+                        this.sprung = true;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+        }
     }
 
     /// Opens the locations sheet with `selected` selected, while a library page shows.
@@ -423,6 +536,7 @@ impl Render for Shell {
         }
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.keep_name_left_behind(window, cx));
+        self.follow_dialogs(window, cx);
         // A sidebar that isn't shown can't keep the keyboard.
         if placement == SidebarPlacement::Collapsed
             && self.sidebar.focus_handle(cx).contains_focused(window, cx)
@@ -432,19 +546,28 @@ impl Render for Shell {
         div()
             .id("shell")
             .key_context(keymap::SHELL)
-            .on_action(cx.listener(Self::toggle_sidebar))
-            .on_action(cx.listener(Self::focus_other))
             .on_action(cx.listener(Self::dismiss))
-            .on_action(cx.listener(Self::new_folder))
-            .on_action(cx.listener(Self::rename))
-            .on_action(cx.listener(Self::sync_all))
-            .on_action(cx.listener(Self::back))
-            .on_action(cx.listener(|this, _: &OpenLocations, window, cx| {
-                this.open_locations(None, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
-                this.open_settings(window, cx);
-            }))
+            /* The shell's other keys are for the window under a dialog: while one is open they
+            do nothing, so that nothing changes behind it nor takes the keyboard from it. */
+            .when(!self.asking(cx), |this| {
+                this.on_action(cx.listener(Self::toggle_sidebar))
+                    .on_action(cx.listener(Self::focus_other))
+                    .on_action(cx.listener(Self::new_folder))
+                    .on_action(cx.listener(Self::rename))
+                    .on_action(cx.listener(Self::sync_all))
+                    .on_action(cx.listener(Self::back))
+                    .on_action(cx.listener(|this, _: &OpenLocations, window, cx| {
+                        this.open_locations(None, window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                        this.open_settings(window, cx);
+                    }))
+            })
+            // A drag is measured from its press, and ends wherever it is let go (`crate::drag`).
+            .capture_any_mouse_down(|event, _, cx| crate::drag::pressed(event.position, cx))
+            .on_drag_move::<crate::drag::Drag>(|event, _, cx| {
+                crate::drag::moved(event.event.position, cx);
+            })
             .relative()
             .size_full()
             .flex()
@@ -455,6 +578,7 @@ impl Render for Shell {
             .text_spec(&theme.text.body)
             // First, so its capture listener runs before any other.
             .child(crate::automation::pointer_guard())
+            .child(crate::drag::layer())
             .child(self.render_title_bar(placement, window, &theme, cx))
             .child(
                 div()
@@ -491,6 +615,8 @@ impl Render for Shell {
                     .map(|(sheet, ..)| sheet.clone())
                     .and_then(|sheet| sheet.update(cx, |sheet, cx| sheet.dialog_layer(window, cx))),
             )
+            .children(self.dialog(window, &theme, cx))
+            .children(crate::menu::layer(window, cx))
     }
 }
 
@@ -500,8 +626,8 @@ pub fn window_options(window_size: Size<gpui::Pixels>, cx: &App) -> WindowOption
     let sizes = &cx.sb_theme().sizes;
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
-            // Centred, on whole pixels: from a half pixel the platform rounds the window's edges
-            // outwards and it opens a pixel larger than asked.
+            /* Centred, on whole pixels: from a half pixel the platform rounds the window's edges
+            outwards and it opens a pixel larger than asked. */
             origin: Bounds::centered(None, window_size, cx)
                 .origin
                 .map(|coordinate| coordinate.floor()),

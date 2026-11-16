@@ -7,6 +7,7 @@ use sb_core::catalogue::Shelf;
 use sb_test_support::{break_segment_commits, mend_segment_commits};
 
 use super::*;
+use crate::pages::sessions::LineMeasure;
 use crate::services::LibraryService;
 use crate::shell::{Shell, SidebarPlacement};
 use crate::test_support::{
@@ -144,8 +145,8 @@ fn f6_moves_the_keyboard_to_the_sidebar_where_the_arrows_show_pages(cx: &mut Tes
     cx.run_until_parked();
     assert_eq!(shelf(cx), Shelf::Unsorted);
     assert_eq!(showing(cx), Showing::Unsorted);
-    // Trash has no page yet, and there are no folders: Unsorted is the last page's row, and
-    // the arrows go on to the location rows; up comes back.
+    /* Trash has no page yet, and there are no folders: Unsorted is the last page's row, and
+    the arrows go on to the location rows; up comes back. */
     cx.simulate_keystrokes("down");
     assert_eq!(shelf(cx), Shelf::Unsorted);
     cx.simulate_keystrokes("up");
@@ -230,8 +231,8 @@ fn a_folder_made_in_a_narrow_window_is_named_in_the_sidebar_over_the_page(cx: &m
     assert_eq!(placement(&shell, cx), SidebarPlacement::Collapsed);
     assert!(main_focused(&shell, cx));
 
-    // F2 on the folder's page, with the sidebar hidden, shows it too; Esc leaves the name,
-    // and a second one hides the sidebar.
+    /* F2 on the folder's page, with the sidebar hidden, shows it too; Esc leaves the name,
+    and a second one hides the sidebar. */
     let work = library(cx).read_with(cx, |library, _| library.folders()[0].id);
     library(cx).update(cx, |library, cx| library.show(Shelf::Folder(work), cx));
     cx.run_until_parked();
@@ -284,8 +285,8 @@ fn the_arrows_are_the_text_fields_while_a_folder_is_renamed(cx: &mut TestAppCont
     cx.run_until_parked();
     cx.simulate_keystrokes("f2");
     cx.run_until_parked();
-    // Typing replaces the selected name; Left moves the caret, so the next letter goes
-    // before the last. No arrow, at either end of the text, shows another page.
+    /* Typing replaces the selected name; Left moves the caret, so the next letter goes
+    before the last. No arrow, at either end of the text, shows another page. */
     cx.simulate_input("abc");
     cx.simulate_keystrokes("left");
     cx.simulate_input("Z");
@@ -326,8 +327,8 @@ fn a_folder_hidden_in_a_closed_one_gives_the_arrows_the_row_that_hides_it(cx: &m
     let inner = library(cx).read_with(cx, |library, _| library.folders()[1].id);
     library(cx).update(cx, |library, cx| library.show(Shelf::Folder(inner), cx));
     cx.run_until_parked();
-    // Left on the inner goes to the outer, and again closes it; back on the inner's page,
-    // its row is hidden.
+    /* Left on the inner goes to the outer, and again closes it; back on the inner's page,
+    its row is hidden. */
     cx.simulate_keystrokes("left left");
     assert_eq!(shelf(cx), Shelf::Folder(outer));
     library(cx).update(cx, |library, cx| library.show(Shelf::Folder(inner), cx));
@@ -362,9 +363,9 @@ fn tab_walks_the_buttons_and_never_strands_the_keyboard(cx: &mut TestAppContext)
             break;
         }
     }
-    // The title bar's Sync all and Settings, the sidebar's rows and its two buttons, the main
-    // area.
-    assert_eq!(stops, 6);
+    /* The page's filter field, the title bar's Sync all and Settings, the sidebar's rows and
+    its two buttons, the main area. */
+    assert_eq!(stops, 7);
     // Shift Tab goes the other way: to the sidebar's buttons, where the page's keys still work.
     cx.simulate_keystrokes("shift-tab");
     assert!(!main_focused(&shell, cx));
@@ -380,8 +381,8 @@ fn tab_reaches_a_groups_buttons_and_enter_presses_them(cx: &mut TestAppContext) 
     library(cx).update(cx, |library, cx| library.show(Shelf::Unsorted, cx));
     cx.run_until_parked();
     assert!(main_focused(&shell, cx));
-    // The first group's toggle, then its Create folder from this path.
-    cx.simulate_keystrokes("tab");
+    // The filter field, the first group's toggle, then its Create folder from this path.
+    cx.simulate_keystrokes("tab tab");
     press(cx, "enter");
     cx.simulate_keystrokes("down");
     let first = library(cx).read_with(cx, |library, _| {
@@ -393,8 +394,8 @@ fn tab_reaches_a_groups_buttons_and_enter_presses_them(cx: &mut TestAppContext) 
     cx.simulate_keystrokes("tab");
     press(cx, "enter");
     assert_eq!(folder_names(cx), ["app"]);
-    // The button went with its group: the keyboard is back on the page, where the new
-    // folder's row took it for its name.
+    /* The button went with its group: the keyboard is back on the page, where the new
+    folder's row took it for its name. */
     assert!(keyboard_is_somewhere(cx));
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
@@ -443,10 +444,11 @@ fn an_arrow_from_a_session_in_a_closed_group_goes_on_from_where_it_is(cx: &mut T
     let selected_id = |cx: &mut VisualTestContext| {
         library(cx).read_with(cx, |library, _| library.selected().cloned())
     };
-    // The second group's session, then that group closed: its toggle is the third Tab stop.
+    /* The second group's session, then that group closed: its toggle is the fourth Tab stop,
+    after the filter field and the first group's toggle and button. */
     cx.simulate_keystrokes("down down down");
     assert_eq!(selected_id(cx), Some(session(1, 0, cx)));
-    cx.simulate_keystrokes("tab tab tab");
+    cx.simulate_keystrokes("tab tab tab tab");
     press(cx, "enter");
     cx.simulate_keystrokes("f6 f6");
     assert!(main_focused(&shell, cx));
@@ -511,6 +513,67 @@ fn a_long_location_name_leaves_the_counts_in_a_wide_window(cx: &mut TestAppConte
 #[gpui::test]
 fn a_long_location_name_leaves_the_counts_in_a_narrow_window(cx: &mut TestAppContext) {
     a_long_location_name_leaves_the_counts(size(px(960.), px(600.)), cx);
+}
+
+/**
+ * A page whose oldest session is of another year, and a location whose tag reaches its cap:
+ * the page's decision on counts measures the widest day with its year ("28 Dec 2025") and its
+ * largest count, and reports what it measured (DESIGN §4.4).
+ */
+fn cards_of_a_page_spanning_two_years(window_width: f32, cx: &mut TestAppContext) -> LineMeasure {
+    let (shell, cx) = open_shell_sized(size(px(window_width), px(900.)), cx);
+    crate::test_support::write_session(
+        &sb_test_support::Outline {
+            project: "/home/user/notes",
+            title: "Last year's notes",
+            prompt: "Tidy last year's notes.",
+            model: "model-a",
+            day: (2025, 12, 3),
+            calls: 412,
+        },
+        cx,
+    );
+    let sync = cx.update(|_, cx| cx.services().sync.clone());
+    sync.update(cx, |sync, cx| sync.sync_all(cx));
+    cx.run_until_parked();
+    let here = sync.read_with(cx, |sync, _| sync.locations().unwrap()[0].id.clone());
+    sync.update(cx, |sync, cx| {
+        sync.rename(&here, &"a".repeat(80), cx).unwrap();
+    });
+    cx.run_until_parked();
+    bounds(cx, "card-0");
+    let measure = cx.update(|_, cx| {
+        let main = shell.read(cx).main().read(cx);
+        main.sessions().read(cx).line_measure().clone()
+    });
+    assert_eq!(measure.day.0, "28 Dec 2025");
+    assert_eq!(measure.tags[0].2, px(80.));
+    measure
+}
+
+/**
+ * The line such a card must hold: the mark (12), a model's least (12), the tag at its cap (80),
+ * the day (72.6 in Geist Mono at 11px), the glyph, 4 and a three-digit count (35.8), and four
+ * gaps of 6: 236.4. A card of 277 (1440 wide) and one of 276 (Windows at 1440 and a fractional
+ * scale) both hold it, with their 4 spare, by 5.6 or more.
+ */
+#[gpui::test]
+fn a_card_of_277_holds_a_capped_tag_a_day_with_its_year_and_the_count(cx: &mut TestAppContext) {
+    let measure = cards_of_a_page_spanning_two_years(1440., cx);
+    assert_eq!(measure.inner, px(247.));
+    assert_eq!(
+        (measure.calls.0.as_str(), measure.day.1.round()),
+        ("412", px(73.))
+    );
+    assert!(measure.shows_calls);
+}
+
+#[gpui::test]
+fn a_card_of_276_holds_them_too(cx: &mut TestAppContext) {
+    let measure = cards_of_a_page_spanning_two_years(1436., cx);
+    assert_eq!(measure.inner, px(246.));
+    assert!(measure.shows_calls);
+    assert!(!measure.tags_past_caps);
 }
 
 #[gpui::test]

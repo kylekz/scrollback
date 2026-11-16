@@ -23,16 +23,18 @@
 mod locations;
 pub mod tree;
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::ops::Range;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Render, Role,
-    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Task, UniformListScrollHandle, Window, div, prelude::FluentBuilder as _, px,
-    uniform_list,
+    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Div, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
+    Pixels, Render, Role, ScrollHandle, ScrollStrategy, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, UniformListScrollHandle,
+    Window, anchored, canvas, deferred, div, point, prelude::FluentBuilder as _, px, uniform_list,
 };
 use gpui_component::input::{Input, InputState};
 use sb_core::catalogue::{FOLDER_NAME_CHARS, Shelf};
@@ -46,9 +48,12 @@ use crate::components::{
 };
 use crate::icons::SbIcon;
 use crate::keymap;
+use crate::menu;
 use crate::pages::Showing;
-use crate::services::library::LibraryEvent;
+use crate::pages::menus::{self, FOLDER_MENU_WIDTH};
+use crate::services::library::{LibraryEvent, NEW_FOLDER};
 use crate::services::{ActiveServices as _, LibraryService, SyncService};
+use crate::services::{Dragged, DropTarget};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 use tree::TreeRow;
 
@@ -94,11 +99,14 @@ const NO_LOCATIONS: &str = "None yet";
 /// What the Locations section says when every location was removed: their sessions stay.
 const NONE_SYNCED: &str = "None synced now. The locations sheet lists those removed.";
 
-/// What a folder is called until the owner names it.
-const NEW_FOLDER_NAME: &str = "New folder";
-
 /// How often the locations' "synced 2 min ago" is drawn again.
 const CLOCK_TICK: Duration = Duration::from_secs(30);
+
+/// How long a drag rests on a closed folder before it opens (DESIGN §4.1).
+const HOVER_OPEN: Duration = Duration::from_millis(500);
+
+/// How a folder's row that is dragged stays in place (`.srow.ghost`).
+const LIFTED_ROW_OPACITY: f32 = 0.45;
 
 pub enum SidebarEvent {
     /// A row was picked: a narrow window's overlay closes (DESIGN §2).
@@ -116,6 +124,8 @@ pub enum SidebarEvent {
 struct Renaming {
     folder: FolderId,
     input: Entity<InputState>,
+    /// Where its row was last drawn: a name refused is said under it.
+    row: Rc<Cell<Bounds<Pixels>>>,
 }
 
 pub struct Sidebar {
@@ -133,6 +143,8 @@ pub struct Sidebar {
     scroll: UniformListScrollHandle,
     /// The location rows' own scroll, which the arrows' row is kept in view of.
     location_scroll: ScrollHandle,
+    /// The closed folder a drag rests on, until it opens.
+    opening: Option<(FolderId, Task<()>)>,
     _observers: [Subscription; 3],
     _clock: Task<()>,
 }
@@ -153,6 +165,7 @@ impl Sidebar {
             _observers: [
                 cx.observe(&library, |this, _, cx| {
                     this.rebuild(cx);
+                    this.follow_drag(cx);
                     cx.notify();
                 }),
                 cx.observe(&sync, |this: &mut Self, sync, cx| {
@@ -170,7 +183,10 @@ impl Sidebar {
                     cx.notify();
                 }),
                 cx.subscribe_in(&library, window, |this, _, event, window, cx| match event {
-                    LibraryEvent::FolderCreated(folder) => this.rename(*folder, window, cx),
+                    LibraryEvent::FolderCreated(folder) | LibraryEvent::Rename(folder) => {
+                        this.rename(*folder, window, cx);
+                    }
+                    LibraryEvent::EditPaths(_) | LibraryEvent::Leave(_) => {}
                 }),
             ],
             _clock: cx.spawn(async move |this, cx| {
@@ -190,6 +206,7 @@ impl Sidebar {
             location_cursor: None,
             scroll: UniformListScrollHandle::new(),
             location_scroll: ScrollHandle::new(),
+            opening: None,
         }
     }
 
@@ -400,7 +417,7 @@ impl Sidebar {
             _ => None,
         };
         self.library.update(cx, |library, cx| {
-            library.create_folder(NEW_FOLDER_NAME.to_string(), parent, cx);
+            library.create_folder(NEW_FOLDER.to_string(), parent, cx);
         });
     }
 
@@ -442,7 +459,11 @@ impl Sidebar {
             input.focus(window, cx);
             input.select_all(window, cx);
         });
-        self.renaming = Some(Renaming { folder, input });
+        self.renaming = Some(Renaming {
+            folder,
+            input,
+            row: Rc::default(),
+        });
         cx.emit(SidebarEvent::Renaming);
         cx.notify();
     }
@@ -462,9 +483,26 @@ impl Sidebar {
         }
     }
 
-    /// Ends a rename: with `keep`, the folder takes what was typed, unless that is nothing
-    /// or its name already. The keyboard goes back to the sidebar if the input had it.
+    /// Whether the name typed for the folder renamed is another's in its place.
+    fn name_taken(&self, cx: &App) -> bool {
+        self.renaming.as_ref().is_some_and(|renaming| {
+            let library = self.library.read(cx);
+            let parent = library.folder(renaming.folder).and_then(|it| it.parent);
+            library.name_taken(
+                &renaming.input.read(cx).value(),
+                parent,
+                Some(renaming.folder),
+            )
+        })
+    }
+
+    /**
+     * Ends a rename: with `keep`, the folder takes what was typed, unless that is nothing, its
+     * name already, or another folder's in its place (then it keeps its name). The keyboard goes
+     * back to the sidebar if the input had it.
+     */
     fn end_rename(&mut self, keep: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let keep = keep && !self.name_taken(cx);
         let Some(renaming) = self.renaming.take() else {
             return;
         };
@@ -512,6 +550,12 @@ impl Sidebar {
             Some(Shelf::Folder(_)) | None => 0,
         };
         let selected = enabled && shelf == Some(library.highlighted());
+        // Trash takes sessions dropped on it (DESIGN §4.1), though it has no page yet.
+        let trash = target == "sidebar/trash" && enabled;
+        let targeted = trash
+            && library
+                .drag()
+                .is_some_and(|drag| drag.targets(DropTarget::Trash, library));
         // Unsorted's count is an accent while there is something to file, selected or not.
         let count_color = if known && shelf == Some(Shelf::Unsorted) && value > 0 {
             c.accent_text
@@ -525,10 +569,23 @@ impl Sidebar {
                 this.shadow(focus_ring(true, theme))
             })
             .id(target)
+            .debug_selector(move || target.replace('/', "-"))
             .role(Role::ListItem)
             // A row with no page yet is drawn as the rows that can't be opened are.
-            .when(enabled && shelf.is_none(), |this| {
+            .when(enabled && shelf.is_none() && !targeted, |this| {
                 this.opacity(DISABLED_ROWS_OPACITY)
+            })
+            .when(targeted, |this| {
+                this.bg(c.accent_soft)
+                    .text_color(c.accent_text)
+                    .shadow(vec![drop_ring(theme)])
+            })
+            .map(|this| {
+                if trash {
+                    crate::drag::target(this, DropTarget::Trash)
+                } else {
+                    this
+                }
             })
             .when_some(shelf.filter(|_| enabled), |this, shelf| {
                 this.cursor_pointer()
@@ -562,7 +619,7 @@ impl Sidebar {
     /// the keyboard is on the rows.
     fn folder_row(
         &self,
-        row: TreeRow,
+        (at, row): (usize, TreeRow),
         (marked, keyboard): (Option<FolderId>, bool),
         theme: &SbTheme,
         cx: &mut Context<Self>,
@@ -572,13 +629,64 @@ impl Sidebar {
         let folder = &library.folders()[row.folder];
         let id = folder.id;
         let name: SharedString = folder.name.clone().into();
+        // Automation's name for the row: the folder's, or its path where another has its name.
+        let target = if (library.folders().iter()).any(|it| it.id != id && it.name == folder.name) {
+            menus::folder_key(library, id)
+        } else {
+            folder.name.clone()
+        };
         let selected = marked == Some(id);
+        let drag = library.drag();
+        let targeted = drag.is_some_and(|drag| drag.targets(DropTarget::Folder(id), library));
+        // Where a folder dropped above or below this row would go, drawn as a line there.
+        let line = drag.and_then(|drag| match drag.over {
+            Some(
+                over @ DropTarget::Between {
+                    row, below, depth, ..
+                },
+            ) if row == at && drag.targets(over, library) => Some((below, depth)),
+            _ => None,
+        });
+        let lifted = crate::drag::lifts(library, |what| *what == Dragged::Folder(id));
+        let parent = folder.parent;
+        let sibling = (library.folders().iter())
+            .filter(|it| it.parent == parent)
+            .position(|it| it.id == id)
+            .unwrap_or(0);
+        let depth = row.depth;
+        let has_open_children = row.open && row.has_children;
+        let pick = move |what: &Dragged,
+                         bounds: gpui::Bounds<gpui::Pixels>,
+                         pointer: gpui::Point<gpui::Pixels>| {
+            let quarter = bounds.size.height / 4.;
+            let y = pointer.y - bounds.top();
+            match what {
+                Dragged::Folder(_) if y < quarter => DropTarget::Between {
+                    parent,
+                    index: sibling,
+                    row: at,
+                    below: false,
+                    depth,
+                },
+                Dragged::Folder(_) if y > quarter * 3. && !has_open_children => {
+                    DropTarget::Between {
+                        parent,
+                        index: sibling + 1,
+                        row: at,
+                        below: true,
+                        depth,
+                    }
+                }
+                _ => DropTarget::Folder(id),
+            }
+        };
         let sessions = library.counts().folders.get(&id).copied().unwrap_or(0);
         let renaming = self
             .renaming
             .as_ref()
             .filter(|renaming| renaming.folder == id)
-            .map(|renaming| renaming.input.clone());
+            .map(|renaming| (renaming.input.clone(), renaming.row.clone()));
+        let taken = renaming.is_some() && self.name_taken(cx);
         let chevron = row.has_children.then(|| {
             div()
                 .id(("folder-chevron", row.folder))
@@ -611,31 +719,99 @@ impl Sidebar {
                     move || format!("sidebar/folder-chevron/{name}").into()
                 })
         });
+        let group: SharedString = format!("folder-row-{}", id.0).into();
+        let is_renaming = renaming.is_some();
         // The list gives every row the same height: the row and the 1px gap under it.
         div()
+            .relative()
             .h(theme.sizes.sidebar_row_height + px(1.))
+            .children(line.map(|(below, depth)| {
+                // The insertion line (DESIGN §4.1): 2px of `accent`, in as far as its level.
+                div()
+                    .absolute()
+                    .left(
+                        theme.spacing.md
+                            + theme.sizes.folder_indent * depth.min(INDENTED_LEVELS) as f32,
+                    )
+                    .right_0()
+                    .h(px(2.))
+                    .rounded(px(1.))
+                    .bg(c.accent)
+                    .map(|this| {
+                        if below {
+                            this.bottom(px(-1.))
+                        } else {
+                            this.top(px(-1.))
+                        }
+                    })
+                    .automation_target("sidebar/insertion")
+            }))
             .child(
                 row_base(selected, theme)
                     .id(("folder", row.folder))
+                    .debug_selector({
+                        let name = name.clone();
+                        move || format!("sidebar-folder-{name}")
+                    })
+                    .group(group.clone())
+                    .relative()
                     .role(Role::ListItem)
                     .cursor_pointer()
                     .map(|this| {
                         if renaming.is_some() {
                             // The row is an input while its folder is named (`.inp.focus`).
-                            this.bg(c.s1).border_1().border_color(c.accent)
+                            this.bg(c.s1).border_1().border_color(if taken {
+                                c.red
+                            } else {
+                                c.accent
+                            })
+                        } else if targeted {
+                            this.bg(c.accent_soft)
+                                .text_color(c.accent_text)
+                                .shadow(vec![drop_ring(theme)])
                         } else if selected {
                             this.when(keyboard, |this| this.shadow(focus_ring(true, theme)))
                         } else {
                             this.hover(|style| style.bg(c.s2))
                         }
                     })
+                    .when(lifted, |this| this.opacity(LIFTED_ROW_OPACITY))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.show(Shelf::Folder(id), cx);
                         cx.emit(SidebarEvent::Picked);
                     }))
-                    // The levels' guides and the chevron's place, with no gap between them,
-                    // so that each level moves the row's glyph in by the indent alone. A
-                    // level's guide runs under the middle of its folder's chevron.
+                    .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                        menu::open(
+                            menus::folder_menu(id, true),
+                            event.position,
+                            FOLDER_MENU_WIDTH,
+                            window,
+                            cx,
+                        );
+                    })
+                    .map(|this| crate::drag::target_by(this, pick))
+                    .map(|this| {
+                        if is_renaming {
+                            this
+                        } else {
+                            // Let go before it moved, it was a click: the folder shows.
+                            let view = cx.entity().downgrade();
+                            crate::drag::source(
+                                this,
+                                move |_| Dragged::Folder(id),
+                                move |_, _, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.show(Shelf::Folder(id), cx);
+                                        cx.emit(SidebarEvent::Picked);
+                                    })
+                                    .ok();
+                                },
+                            )
+                        }
+                    })
+                    /* The levels' guides and the chevron's place, with no gap between them,
+                    so that each level moves the row's glyph in by the indent alone. A
+                    level's guide runs under the middle of its folder's chevron. */
                     .child(
                         div()
                             .flex_none()
@@ -660,18 +836,27 @@ impl Sidebar {
                     .child(icon(
                         SbIcon::Folder,
                         theme.sizes.icon,
-                        if selected { c.fg2 } else { c.fg3 },
+                        if targeted {
+                            c.accent_text
+                        } else if selected {
+                            c.fg2
+                        } else {
+                            c.fg3
+                        },
                     ))
                     .map(|this| match renaming {
-                        Some(input) => this.child(
+                        Some((input, row)) => this.child(
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                // The input passes Enter and Esc on. They end here, so
-                                // that Enter isn't also the sidebar's key for the page.
+                                /* The input passes Enter and Esc on. They end here, so
+                                that Enter isn't also the sidebar's key for the page. */
                                 .key_context(keymap::FOLDER_RENAME)
                                 .on_action(cx.listener(|this, _: &KeepName, window, cx| {
-                                    this.end_rename(true, window, cx);
+                                    // A name another folder here has is refused in place.
+                                    if !this.name_taken(cx) {
+                                        this.end_rename(true, window, cx);
+                                    }
                                 }))
                                 .on_action(cx.listener(|this, _: &DropName, window, cx| {
                                     this.end_rename(false, window, cx);
@@ -682,6 +867,14 @@ impl Sidebar {
                                         .aria_label("Folder name")
                                         .px_0(),
                                 )
+                                .child({
+                                    let row = row.clone();
+                                    canvas(move |bounds, _, _| row.set(bounds), |_, _, _, _| {})
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .size_full()
+                                })
                                 .automation_target("sidebar/folder-rename"),
                         ),
                         None => this
@@ -693,9 +886,52 @@ impl Sidebar {
                                     .text_ellipsis()
                                     .child(name.clone()),
                             )
-                            .child(count(sessions, if selected { c.fg2 } else { c.fg3 }, theme)),
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .ml_auto()
+                                    .group_hover(group.clone(), |style| style.opacity(0.))
+                                    .child(count(
+                                        sessions,
+                                        if targeted {
+                                            c.accent_text
+                                        } else if selected {
+                                            c.fg2
+                                        } else {
+                                            c.fg3
+                                        },
+                                        theme,
+                                    )),
+                            )
+                            // `⋯` in the count's place under the pointer: the folder's menu.
+                            .child(
+                                icon_button(
+                                    ("folder-more", row.folder),
+                                    theme.sizes.section_button,
+                                    theme,
+                                )
+                                .absolute()
+                                .right(theme.spacing.sm)
+                                .opacity(0.)
+                                .group_hover(group, |style| style.opacity(1.))
+                                .aria_label("Folder actions")
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    menu::open(
+                                        menus::folder_menu(id, true),
+                                        window.mouse_position(),
+                                        FOLDER_MENU_WIDTH,
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .child(icon(SbIcon::Ellipsis, theme.sizes.icon_sm, c.fg2))
+                                .automation_target_with(
+                                    move || format!("sidebar/folder-more/{}", id.0).into(),
+                                ),
+                            ),
                     })
-                    .automation_target_with(move || format!("sidebar/folder/{name}").into()),
+                    .automation_target_with(move || format!("sidebar/folder/{target}").into()),
             )
             .into_any_element()
     }
@@ -712,9 +948,57 @@ impl Sidebar {
             self.keyboard(window) && self.location_cursor.is_none(),
         );
         range
-            .filter_map(|at| self.tree.get(at).copied())
-            .map(|row| self.folder_row(row, marked, &theme, cx))
+            .filter_map(|at| Some((at, self.tree.get(at).copied()?)))
+            .map(|(at, row)| self.folder_row((at, row), marked, &theme, cx))
             .collect()
+    }
+
+    /**
+     * Opens a closed folder that a drag has been over for 500 ms (DESIGN §4.1); the library
+     * says where the drag is.
+     */
+    fn follow_drag(&mut self, cx: &mut Context<Self>) {
+        let library = self.library.read(cx);
+        let over = library
+            .drag()
+            .filter(|drag| drag.moved)
+            .and_then(|drag| match drag.over {
+                Some(DropTarget::Folder(folder)) => Some(folder),
+                _ => None,
+            });
+        let closed = over.filter(|folder| {
+            !self.open.contains(folder)
+                && library
+                    .folders()
+                    .iter()
+                    .any(|it| it.parent == Some(*folder))
+        });
+        let Some(folder) = closed else {
+            self.opening = None;
+            return;
+        };
+        if self
+            .opening
+            .as_ref()
+            .is_some_and(|(opening, _)| *opening == folder)
+        {
+            return;
+        }
+        let timer = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HOVER_OPEN).await;
+            this.update(cx, |this, cx| {
+                this.opening = None;
+                let still = this.library.read(cx).drag().and_then(|drag| drag.over)
+                    == Some(DropTarget::Folder(folder));
+                if still {
+                    this.open.insert(folder);
+                    this.rebuild(cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        self.opening = Some((folder, timer));
     }
 
     /**
@@ -761,6 +1045,17 @@ fn row_base(selected: bool, theme: &SbTheme) -> Div {
         })
 }
 
+/// The 1px inset `accent` ring of a drop target (`.srow.drop`).
+fn drop_ring(theme: &SbTheme) -> gpui::BoxShadow {
+    gpui::BoxShadow {
+        color: theme.colors.accent,
+        offset: gpui::point(px(0.), px(0.)),
+        blur_radius: px(0.),
+        spread_radius: px(1.),
+        inset: true,
+    }
+}
+
 /// What a row says for its count while the archive can't be opened (DESIGN §4.14).
 fn unknown_count(theme: &SbTheme) -> impl IntoElement {
     div()
@@ -805,8 +1100,8 @@ impl Render for Sidebar {
         let has_library = self.has_library(cx);
         let first_run = self.sync.read(cx).is_first_run();
         let syncing = self.sync.read(cx).is_syncing();
-        // While the archive can't be opened the counts aren't known and the section buttons
-        // are drawn disabled (DESIGN §4.14).
+        /* While the archive can't be opened the counts aren't known and the section buttons
+        are drawn disabled (DESIGN §4.14). */
         let unavailable = Showing::now(cx) == Showing::ArchiveFailed;
         let rows = (
             has_library,
@@ -843,6 +1138,12 @@ impl Render for Sidebar {
             .on_action(cx.listener(Self::collapse))
             .on_action(cx.listener(Self::expand))
             .on_action(cx.listener(Self::open))
+            // A name refused in a rename is said under its row, over the rows below.
+            .children(
+                (self.renaming.as_ref())
+                    .filter(|_| self.name_taken(cx))
+                    .map(|renaming| name_taken_note(renaming.row.get(), &theme)),
+            )
             .flex()
             .flex_col()
             .size_full()
@@ -966,6 +1267,37 @@ impl Render for Sidebar {
     }
 }
 
+/// What a rename says under its row while the name typed is another folder's in its place,
+/// over the rows below it.
+fn name_taken_note(row: Bounds<Pixels>, theme: &SbTheme) -> AnyElement {
+    let c = &theme.colors;
+    deferred(
+        anchored()
+            .position(row.bottom_left() + point(px(0.), px(4.)))
+            .child(
+                div()
+                    .id("folder-rename-taken")
+                    .flex()
+                    .items_center()
+                    .gap(theme.spacing.sm)
+                    .py(theme.spacing.xs)
+                    .px(theme.spacing.md)
+                    .rounded(theme.radii.control)
+                    .border_1()
+                    .border_color(c.line)
+                    .bg(c.s2)
+                    .shadow(theme.shadows.pop.clone())
+                    .text_color(c.red)
+                    .text_spec(&theme.text.secondary)
+                    .child(icon(SbIcon::CircleAlert, theme.sizes.icon_sm, c.red))
+                    .child("A folder here has this name already")
+                    .automation_target("sidebar/folder-rename/taken"),
+            ),
+    )
+    .with_priority(1)
+    .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use gpui::{TestAppContext, VisualTestContext};
@@ -1024,8 +1356,8 @@ mod tests {
         sidebar.update(cx, |sidebar, cx| sidebar.toggle(outer, cx));
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
-        // The field went with its row. The keyboard is on what was around it and is still
-        // drawn, the sidebar's rows, not back on the main area; and the name is kept.
+        /* The field went with its row. The keyboard is on what was around it and is still
+        drawn, the sidebar's rows, not back on the main area; and the name is kept. */
         assert!(cx.update(|window, cx| sidebar.focus_handle(cx).is_focused(window)));
         assert_eq!(folder_names(&library, cx), ["outer", "kept"]);
     }

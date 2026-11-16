@@ -174,17 +174,16 @@ impl Catalogue {
     }
 
     /**
-     * Takes a session out of Trash, back to where it is filed. That is the folder it was in;
-     * if that folder was deleted meanwhile, deleting it already handed the session to the
-     * rules (PLAN §8), so it is where they file it, or in Unsorted.
+     * Takes a session out of Trash, back to where it is filed. That is the folder it was in,
+     * by hand or by the rules, which left it alone while it was in Trash and file it now; if
+     * that folder was deleted meanwhile, it is where they file it, or in Unsorted (PLAN §8).
      */
     pub fn restore(&self, id: &SessionId) -> Result<()> {
         self.db.write(|tx| {
             if trashed_at(tx, id)?.is_none() {
                 return Err(CatalogueError::NotInTrash(id.clone()));
             }
-            set_state(tx, id, &[("trashed_at", &None::<i64>)])?;
-            Ok(())
+            super::batch::restore(tx, id)
         })
     }
 
@@ -538,7 +537,7 @@ impl Catalogue {
 }
 
 /// When the session went to Trash, if it is there.
-fn trashed_at(connection: &rusqlite::Connection, id: &SessionId) -> Result<Option<i64>> {
+pub(super) fn trashed_at(connection: &rusqlite::Connection, id: &SessionId) -> Result<Option<i64>> {
     Ok(connection
         .query_row(
             "SELECT trashed_at FROM session_state

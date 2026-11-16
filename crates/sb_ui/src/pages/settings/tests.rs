@@ -304,3 +304,59 @@ fn settings_fit_a_narrow_window(cx: &mut TestAppContext) {
     assert!(back.origin.x < px(60.), "the sidebar is hidden: {back:?}");
     assert!(nav.right() <= px(960.));
 }
+
+/// A dialog over Settings, the library's or Settings' own, keeps the keyboard: the shell's keys
+/// do nothing behind it, and `Esc` answers it before it leaves Settings.
+#[gpui::test]
+fn a_dialog_over_settings_keeps_the_keyboard(cx: &mut TestAppContext) {
+    let (shell, cx) = open_settings(cx);
+    let sheet_open = |shell: &Entity<Shell>, cx: &mut VisualTestContext| {
+        cx.update(|_, cx| shell.read(cx).locations_sheet().is_some())
+    };
+
+    /* Settings' confirmation of another folder. */
+    let elsewhere = tempfile::tempdir().unwrap();
+    cx.update(|_, cx| system::queue_answer(Some(elsewhere.path().join("archive")), cx).unwrap());
+    click(cx, "settings-use-folder");
+    let page = page(&shell, cx);
+    cx.update(|window, cx| {
+        assert!(
+            page.read(cx).confirm_focus.is_focused(window),
+            "the dialog has the keyboard"
+        );
+    });
+    cx.simulate_keystrokes("secondary-l");
+    cx.run_until_parked();
+    assert!(!sheet_open(&shell, cx));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(page.read_with(cx, |page, _| page.chosen.is_none()));
+    assert_eq!(showing(cx), Showing::Settings);
+
+    /* The library's Delete folder… over Settings. */
+    let library = cx.update(|_, cx| cx.services().library.clone());
+    library.update(cx, |library, cx| {
+        library.create_folder("work".into(), None, cx);
+    });
+    cx.run_until_parked();
+    let folder = library.read_with(cx, |library, _| library.folders()[0].id);
+    library.update(cx, |library, cx| library.ask_delete(folder, cx));
+    cx.run_until_parked();
+    for key in ["secondary-l", "alt-left", "secondary-,"] {
+        cx.simulate_keystrokes(key);
+        cx.run_until_parked();
+        assert!(!sheet_open(&shell, cx), "{key}");
+        assert_eq!(showing(cx), Showing::Settings, "{key}");
+    }
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    library.read_with(cx, |library, _| assert_eq!(library.deleting(), None));
+    assert_eq!(
+        showing(cx),
+        Showing::Settings,
+        "Esc answered the dialog only"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_ne!(showing(cx), Showing::Settings);
+}

@@ -192,6 +192,8 @@ fn sidebar_button(
             theme.sizes.icon,
             if open { c.fg } else { c.fg2 },
         ))
+        // Resting on it mid-drag shows the sidebar (`crate::shell`'s spring-loading).
+        .map(|this| crate::drag::target(this, crate::services::DropTarget::Sidebar))
         .automation_target("titlebar/sidebar")
 }
 

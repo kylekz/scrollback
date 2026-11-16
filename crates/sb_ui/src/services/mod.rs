@@ -19,6 +19,7 @@
 //! changes when a job's result comes back.
 
 pub mod archive;
+pub mod drag;
 pub mod library;
 #[cfg(test)]
 mod location_tests;
@@ -33,6 +34,7 @@ pub mod sync;
 #[cfg(test)]
 mod tests;
 pub mod upkeep;
+pub mod view;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,14 +48,17 @@ use sb_core::transport::wsl::Distro;
 use sb_core::transport::{Launcher, Probe, ShellTransport, Transport, TransportError};
 
 pub use archive::{ArchiveService, ArchiveState};
+pub use drag::{DragState, Dragged, DropTarget, Verdict};
 pub use library::{
-    LibraryService, Month, Page, PathChip, SessionsPage, Stats, can_attach, group_key, group_path,
+    Leave, LibraryService, Month, Page, PathChip, SessionsPage, Stats, Toast, TypedPath,
+    can_attach, group_key, group_path,
 };
 pub use settings::{SettingsService, SyncEvery};
 #[cfg(any(test, feature = "automation"))]
 pub use sync::Held;
 pub use sync::{LocationStatus, PassProgress, Reach, SyncEvent, SyncService};
 pub use upkeep::UpkeepService;
+pub use view::{DateRange, Facets, GroupSort, PageView, UnsortedView};
 
 /// The providers of the agents scrollback archives, as the services and the views share them.
 pub type Providers = Arc<Vec<Box<dyn Provider>>>;

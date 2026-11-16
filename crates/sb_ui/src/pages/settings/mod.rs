@@ -102,6 +102,8 @@ pub struct SettingsPage {
     chosen: Option<Chosen>,
     /// Where the keyboard rests in the confirmation, and where it was before.
     confirm_focus: FocusHandle,
+    /// While the confirmation is open: where the keyboard was before it.
+    confirm_back: Option<Option<FocusHandle>>,
     _subscriptions: [Subscription; 1],
 }
 
@@ -130,6 +132,7 @@ impl SettingsPage {
             stale_after,
             chosen: None,
             confirm_focus: cx.focus_handle(),
+            confirm_back: None,
         }
     }
 
@@ -146,6 +149,32 @@ impl SettingsPage {
         let upkeep = cx.services().upkeep.clone();
         upkeep.update(cx, |upkeep, cx| upkeep.shown(cx));
         cx.notify();
+    }
+
+    /// Whether the confirmation of another folder is open: a dialog over the window, which
+    /// keeps the keyboard while it is (`crate::overlay`).
+    pub fn is_confirming(&self) -> bool {
+        self.chosen.is_some()
+    }
+
+    /**
+     * Gives the keyboard to the confirmation as it opens, and back to where it was as it
+     * closes. Called as the page draws, so that what has the keyboard is drawn in the same
+     * frame.
+     */
+    fn follow_confirmation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match (self.chosen.is_some(), self.confirm_back.is_some()) {
+            (true, false) => {
+                self.confirm_back = Some(window.focused(cx));
+                self.confirm_focus.focus(window, cx);
+            }
+            (false, true) => {
+                if let Some(Some(back)) = self.confirm_back.take() {
+                    back.focus(window, cx);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// `Esc`: closes what is open on the page, the confirmation first; `false` when nothing
@@ -450,6 +479,7 @@ fn segments<T: Copy + PartialEq + 'static>(
 
 impl Render for SettingsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.follow_confirmation(window, cx);
         let theme = cx.sb_theme().clone();
         let column = theme.sizes.settings_column_width - px(64.);
         let sections = [

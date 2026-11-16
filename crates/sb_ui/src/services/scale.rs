@@ -206,9 +206,7 @@ fn what_the_library_costs_at_fifty_thousand_sessions(cx: &mut TestAppContext) {
             .clone()
     });
     let (_, ms) = timed(|| {
-        library.update(cx, |library, cx| {
-            library.toggle_star(&middle, SESSIONS / 2, cx)
-        });
+        library.update(cx, |library, cx| library.toggle_star(&middle, cx));
     });
     eprintln!("UI thread: starring a session in the middle of the page: {ms:.3} ms");
     cx.executor().advance_clock(Duration::from_secs(1));

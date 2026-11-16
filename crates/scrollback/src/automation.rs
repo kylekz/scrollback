@@ -53,6 +53,34 @@
 //!   `sessions`, in the catalogue's order), `sessions` and `groups` (how many the shown page
 //!   lists, `null` while it loads or is of the other kind), the titles of the `selected` and
 //!   the `open` session, and `error` (why the library couldn't be read, or `null`).
+//!   It also has the titles of the `selection` (the sessions selected together, or the
+//!   selected one); the `drag` under way (`null`, or `what` is dragged: `{"sessions": n}`,
+//!   `{"path": typed}` or `{"folder": name}`; whether it has `moved` past the 4px threshold;
+//!   what it is `over`: `{"folder": name}`, `{"empty_folder": name}` (a folder's empty page),
+//!   `"trash"`, `{"between": {parent, index}}` or `"sidebar"` (a narrow window's sidebar
+//!   button, which shows the sidebar after 500 ms); and the `verdict` there: `takes`, with the
+//!   ghost's `result` and `note`, or the `note` saying why not); the `toast` (`text` and
+//!   whether it can `undo`); whether leaving, closing the window or quitting `asked` to save
+//!   the paths editor's changes, and the folder `held` by them; and the folder whose deletion
+//!   is being asked about (`deleting`).
+//!
+//!   A drag is driven with `drag` (`release: false` to hold it), `mouse_up`, and keys between:
+//!   no key but `Esc` acts while one is held. Where it is over is read from what the last frame
+//!   drew, so a press that jumps straight to a target drops there; a drag that never moved 4px
+//!   is a click on what was pressed.
+//! - `page_view`: how the page of sessions shows: `list`, `oldest_first`, the `filter` text,
+//!   whether it is `filtered` at all, how many
+//!   sessions are `shown`, and its paths `editor` (`null`, or whether it is the `short` form
+//!   and the paths `added` and `removed`, as typed).
+//! - `menu`: the open menu (`null`, or the names of its `items` and of its open `submenu`'s;
+//!   each item is the target `menu/<name>`, a submenu's `menu/<submenu>/<name>`).
+//! - `cards`: what the page of cards last decided its cards' last lines from (DESIGN §4.4):
+//!   `shows_calls`, `tags_past_caps`, the window's `viewport` width and `scale` factor, `inner`
+//!   (a card's width inside its padding and border), `line` (the width of the line the counts
+//!   were decided on, `with_calls`, which shows them while it is no wider than `inner` less
+//!   `spare`; and `without_calls`, past `inner` the tags give way past their caps), `tags`
+//!   (each location's and subfolder's tag: `name`, `whole` and `capped` widths), the widest
+//!   `day` and the largest `calls` (each `text` and `width`), in logical pixels.
 //!
 //! Commands. An argument a command doesn't have is an error, so a misspelt one never passes
 //! for a change. These reply with `state.appearance` after the change:
@@ -96,10 +124,14 @@ use sb_core::transport::{
     RangeRequest, RangeSink, ShellTransport, Transport, TransportError,
 };
 use sb_ui::Shell;
+use sb_ui::pages::sessions::LineMeasure;
 use sb_ui::services::settings::Switch;
 use sb_ui::services::sync::{Refetch, TestFailure, TestState};
 use sb_ui::services::upkeep::Fix;
-use sb_ui::services::{ActiveServices as _, ArchiveState, Held, LocationStatus, Page, Reach};
+use sb_ui::services::{
+    ActiveServices as _, ArchiveState, Dragged, DropTarget, Held, LocationStatus, Page, Reach,
+    Verdict,
+};
 use sb_ui::system::{self, SystemRequest};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -140,6 +172,12 @@ impl AutomationHost for ScrollbackAutomation {
                     SystemRequest::PickFolder { .. } => None,
                 },
             })).collect::<Vec<_>>(),
+            "cards": cards(shell.main().read(cx).sessions().read(cx).line_measure()),
+            "page_view": page_view(shell, cx),
+            "menu": sb_ui::menu::items(cx).map(|(items, submenu)| json!({
+                "items": items,
+                "submenu": submenu,
+            })),
             "sheet": shell.locations_sheet().map(|sheet| {
                 let sheet = sheet.read(cx);
                 let sync = cx.services().sync.read(cx);
@@ -342,17 +380,40 @@ fn library(cx: &App) -> Value {
         Some(Page::Unsorted(groups)) => (None, Some(groups.len())),
         None => (None, None),
     };
-    // The selected session's title: on a page of sessions by its place, in Unsorted by its id.
-    let title_of = |id: &SessionId| match library.page()? {
-        Page::Sessions(page) => page.sessions.get(library.selected_index()?)?.title.clone(),
-        Page::Unsorted(groups) => groups
-            .iter()
-            .flat_map(|group| &group.sessions)
-            .find(|session| session.id == *id)?
-            .title
-            .clone(),
-    };
+    let title = |id: &SessionId| library.session(id).and_then(|it| it.title.clone());
+    let drag = library.drag().map(|drag| {
+        let over = drag.over.map(|over| match over {
+            DropTarget::Folder(folder) => json!({ "folder": name(folder) }),
+            DropTarget::EmptyFolder(folder) => json!({ "empty_folder": name(folder) }),
+            DropTarget::Trash => json!("trash"),
+            DropTarget::Sidebar => json!("sidebar"),
+            DropTarget::Between { parent, index, .. } => {
+                json!({ "between": { "parent": parent.and_then(name), "index": index } })
+            }
+        });
+        let verdict = drag.verdict(library).map(|verdict| match verdict {
+            Verdict::Takes { result, note } => {
+                json!({ "takes": true, "result": result, "note": note })
+            }
+            Verdict::Refuses(why) => json!({ "takes": false, "note": why }),
+        });
+        json!({
+            "what": match &drag.what {
+                Dragged::Sessions { ids, .. } => json!({ "sessions": ids.len() }),
+                Dragged::Path { path, .. } => json!({ "path": path.0 }),
+                Dragged::Folder(folder) => json!({ "folder": name(*folder) }),
+            },
+            "moved": drag.moved,
+            "over": over,
+            "verdict": verdict,
+        })
+    });
     json!({
+        "selection": library.selection().iter().map(title).collect::<Vec<_>>(),
+        "drag": drag,
+        "toast": library.toast().map(|toast| json!({ "text": toast.text, "undo": toast.can_undo() })),
+        "asked": library.asked().is_some(),
+        "deleting": library.deleting().and_then(name),
         "shelf": match library.shelf() {
             Shelf::All => json!("all"),
             Shelf::Starred => json!("starred"),
@@ -368,7 +429,8 @@ fn library(cx: &App) -> Value {
         "folders": folders,
         "sessions": sessions,
         "groups": groups,
-        "selected": library.selected().and_then(title_of),
+        "selected": library.selected().and_then(title),
+        "held": library.held().and_then(name),
         "open": library.open_session().and_then(|session| session.title.clone()),
         "error": library.failure(),
     })
@@ -432,6 +494,51 @@ fn settings(shell: &Shell, cx: &App) -> Value {
             "allowed": deleted.allowed.is_some(),
         })).collect::<Vec<_>>(),
         "saved": settings.save_failure(),
+    })
+}
+
+/// `state.page_view`: how the page of sessions shows, and its paths editor.
+fn page_view(shell: &Shell, cx: &App) -> Value {
+    let page = shell.main().read(cx).sessions().read(cx);
+    let view = cx.services().library.read(cx).view();
+    json!({
+        "list": view.list,
+        "oldest_first": view.oldest_first,
+        "filter": view.filter,
+        "filtered": view.is_filtered(),
+        "shown": page.shown(),
+        "editor": page.editor().map(|editor| {
+            let editor = editor.read(cx);
+            json!({
+                "short": editor.is_short(),
+                "added": editor.added().collect::<Vec<_>>(),
+                "removed": editor.removed().collect::<Vec<_>>(),
+            })
+        }),
+    })
+}
+
+/// `state.cards`: what the page of cards last decided its cards' last lines from.
+fn cards(measure: &LineMeasure) -> Value {
+    let px = |width: gpui::Pixels| (f32::from(width) * 100.).round() / 100.;
+    json!({
+        "shows_calls": measure.shows_calls,
+        "tags_past_caps": measure.tags_past_caps,
+        "viewport": px(measure.viewport),
+        "scale": measure.scale,
+        "inner": px(measure.inner),
+        "line": {
+            "with_calls": px(measure.with_calls),
+            "without_calls": px(measure.without_calls),
+            "spare": px(measure.spare),
+        },
+        "tags": measure.tags.iter().map(|(name, whole, capped)| json!({
+            "name": name,
+            "whole": px(*whole),
+            "capped": px(*capped),
+        })).collect::<Vec<_>>(),
+        "day": { "text": measure.day.0, "width": px(measure.day.1) },
+        "calls": { "text": measure.calls.0, "width": px(measure.calls.1) },
     })
 }
 

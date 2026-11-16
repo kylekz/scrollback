@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
-use sb_core::catalogue::{Catalogue, CatalogueError, Filed, Folder, SessionId, Shelf};
+use sb_core::catalogue::{Catalogue, CatalogueError, Filed, Folder, SessionId, Shelf, Undone};
 use sb_core::filing::{AttachedPath, FolderId, NormalPath};
 use sb_core::location::{LocationId, LocationKind};
 use sb_core::provider::{Hashed, RangeFailure};
@@ -350,6 +350,143 @@ fn a_path_is_attached_once_for_each_scope() {
             Err(CatalogueError::NoPath(_))
         ));
     }
+}
+
+#[test]
+fn one_folder_has_a_path_for_two_locations_but_not_for_one_and_for_any() {
+    let bench = Bench::new(DbAgent::new());
+    let elsewhere = Elsewhere::new(&bench);
+    let catalogue = bench.archive().catalogue();
+    let refused_by =
+        |folder, typed: &str, location| match catalogue.attach_path(folder, typed, location) {
+            Err(CatalogueError::PathAttached { folder, .. }) => folder,
+            other => panic!("{typed} was not refused: {other:?}"),
+        };
+
+    /* The same project on two machines: one folder holds its path for each. */
+    let fc = catalogue.create_folder("fc", None).unwrap();
+    let path = "/home/user/code/fc";
+    catalogue
+        .attach_path(fc, path, Some(&bench.location))
+        .unwrap();
+    catalogue
+        .attach_path(fc, path, Some(&elsewhere.location))
+        .unwrap();
+    /* For any location it would overlap both. */
+    assert_eq!(refused_by(fc, path, None), fc);
+
+    /* Held for any, it is not held again for one location by the same folder... */
+    let app = catalogue.create_folder("app", None).unwrap();
+    catalogue
+        .attach_path(app, "/home/user/code/app", None)
+        .unwrap();
+    assert_eq!(
+        refused_by(app, "/home/user/code/app", Some(&bench.location)),
+        app
+    );
+    /* ...but another folder may hold it for one location, which then wins there. */
+    let other = catalogue.create_folder("other", None).unwrap();
+    catalogue
+        .attach_path(other, "/home/user/code/app", Some(&bench.location))
+        .unwrap();
+
+    /* A change of paths is refused so too, and leaves the folder as it was. */
+    assert!(matches!(
+        catalogue.change_paths(fc, &[], &[(path.to_string(), None)]),
+        Err(CatalogueError::PathAttached { .. })
+    ));
+    assert_eq!(catalogue.folder_paths(fc).unwrap().len(), 2);
+}
+
+#[test]
+fn two_folders_in_one_place_have_different_names_whatever_their_case() {
+    fn taken<T: std::fmt::Debug>(result: Result<T, CatalogueError>) -> bool {
+        matches!(result, Err(CatalogueError::NameTaken(_)))
+    }
+    let bench = Bench::new(DbAgent::new());
+    let catalogue = bench.archive().catalogue();
+    let work = catalogue.create_folder("work", None).unwrap();
+    assert!(taken(catalogue.create_folder(" Work ", None)));
+
+    /* In another place the name is free, and a folder keeps its own in another case. */
+    let inner = catalogue.create_folder("work", Some(work)).unwrap();
+    let notes = catalogue.create_folder("notes", Some(work)).unwrap();
+    assert!(taken(catalogue.rename_folder(notes, "Work")));
+    catalogue.rename_folder(inner, "Work").unwrap();
+    assert_eq!(
+        outline(&catalogue.folders().unwrap(), None),
+        "work(Work notes)"
+    );
+    assert!(catalogue.attached_paths().unwrap().is_empty());
+    /* A folder keeps its name as it is, too. */
+    catalogue.rename_folder(notes, "notes").unwrap();
+
+    /* A move into a place with the name is refused; reordering where it is isn't. */
+    assert!(taken(catalogue.move_folder(inner, None, 0)));
+    catalogue.move_folder(inner, Some(work), 5).unwrap();
+    assert_eq!(
+        outline(&catalogue.folders().unwrap(), None),
+        "work(notes Work)"
+    );
+
+    /* New folder, twice before anything reads the folders, and with sessions: each takes the
+    next free name in its own change. */
+    let first = catalogue
+        .create_folder_with("New folder", None, &[])
+        .unwrap();
+    let second = catalogue
+        .create_folder_with("New folder", None, &[])
+        .unwrap();
+    let names = |catalogue: &Catalogue| {
+        catalogue
+            .folders()
+            .unwrap()
+            .into_iter()
+            .map(|it| it.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(catalogue),
+        ["work", "New folder", "New folder 2", "notes", "Work"]
+    );
+    /* Made from a path whose name a folder at the top has: it is "work 2". */
+    catalogue
+        .create_folder_with_path("work", None, "/home/user/code/work", None)
+        .unwrap();
+    assert!(names(catalogue).contains(&"work 2".to_string()));
+
+    /* Deleting a folder whose subfolder's name is its new siblings' renames the subfolder. */
+    catalogue.move_folder(second, Some(first), 0).unwrap();
+    catalogue.rename_folder(second, "work").unwrap();
+    assert_eq!(
+        catalogue.delete_folder(first).unwrap(),
+        [("work".to_string(), "work 3".to_string())]
+    );
+    assert!(names(catalogue).contains(&"work 3".to_string()));
+}
+
+#[test]
+fn new_folder_files_its_sessions_in_the_same_change() {
+    let mut bench = Bench::new(DbAgent::new());
+    let key = started(&mut bench.agent, "/home/user/notes");
+    bench.sync();
+    let id = bench.session_id(&key);
+    let catalogue = bench.archive().catalogue();
+    let gone = SessionId {
+        key: "deleted-for-good".to_string(),
+        ..id.clone()
+    };
+    /* With a session that isn't archived there is no folder. */
+    assert!(
+        catalogue
+            .create_folder_with("New folder", None, &[id.clone(), gone])
+            .is_err()
+    );
+    assert!(catalogue.folders().unwrap().is_empty());
+    let folder = catalogue
+        .create_folder_with("New folder", None, std::slice::from_ref(&id))
+        .unwrap();
+    assert_eq!(filed(catalogue, &id), Filed::ByHand(folder));
 }
 
 #[test]
@@ -923,7 +1060,7 @@ fn what_is_not_there_is_said_not_passed_over() {
     assert!(no_folder(catalogue.rename_folder(missing, "x")));
     assert!(no_folder(catalogue.move_folder(missing, None, 0)));
     assert!(no_folder(catalogue.move_folder(folder, Some(missing), 0)));
-    assert!(no_folder(catalogue.delete_folder(missing)));
+    assert!(no_folder(catalogue.delete_folder(missing).map(drop)));
     assert!(no_folder(catalogue.attach_path(
         missing,
         "/home/user/code",
@@ -934,7 +1071,8 @@ fn what_is_not_there_is_said_not_passed_over() {
     ));
     assert_eq!(outline(&catalogue.folders().unwrap(), None), "work b c");
 
-    /* A name is some text, of no great length, and two folders may share one. */
+    /* A name is some text, of no great length, and two folders in different places may share
+    one. */
     for name in ["", "   ", &"n".repeat(201)] {
         assert!(matches!(
             catalogue.create_folder(name, None),
@@ -963,10 +1101,11 @@ fn what_is_not_there_is_said_not_passed_over() {
     );
     assert_eq!(read_catalogue(bench.dir(), top), ["0", "1"]);
     catalogue.move_folder(b, None, 1).unwrap();
+    catalogue.rename_folder(twin, "twin").unwrap();
     catalogue.move_folder(twin, None, 1).unwrap();
     assert_eq!(read_catalogue(bench.dir(), top), ["0", "1", "2", "3"]);
     catalogue.delete_folder(folder).unwrap();
-    assert_eq!(outline(&catalogue.folders().unwrap(), None), "work b c");
+    assert_eq!(outline(&catalogue.folders().unwrap(), None), "twin b c");
     assert_eq!(read_catalogue(bench.dir(), top), ["0", "1", "2"]);
 
     /* Paths of a folder that is not there, and a path that is not attached. */
@@ -1050,4 +1189,318 @@ fn a_session_the_parser_stops_on_stays_filed_and_is_filed_by_what_was_known() {
         .attach_path(code, "/home/user/code", None)
         .unwrap();
     assert_eq!(filed(catalogue, &id), Filed::ByRule(code));
+}
+
+#[test]
+fn a_folders_paths_change_in_one_step_or_not_at_all() {
+    let mut bench = Bench::new(DbAgent::new());
+    let app = started(&mut bench.agent, "/home/user/code/app");
+    let notes = started(&mut bench.agent, "/home/user/notes");
+    let by_hand = started(&mut bench.agent, "/home/user/notes/hand");
+    let trashed = started(&mut bench.agent, "/home/user/notes/bin");
+    bench.sync();
+    let (app, notes) = (bench.session_id(&app), bench.session_id(&notes));
+    let (by_hand, trashed) = (bench.session_id(&by_hand), bench.session_id(&trashed));
+    let catalogue = bench.archive().catalogue();
+    let both = || (filed(catalogue, &app), filed(catalogue, &notes));
+    let work = catalogue.create_folder("work", None).unwrap();
+    let other = catalogue.create_folder("other", None).unwrap();
+    catalogue
+        .attach_path(work, "/home/user/code/app", None)
+        .unwrap();
+    catalogue.attach_path(other, "/srv/taken", None).unwrap();
+    catalogue.file_by_hand(&by_hand, other).unwrap();
+    catalogue.trash(&trashed).unwrap();
+    let attached = |folder| -> Vec<AttachedPath> {
+        let paths = catalogue.folder_paths(folder).unwrap();
+        paths.into_iter().map(|path| path.attached).collect()
+    };
+    let typed = |folder| -> Vec<String> {
+        let paths = catalogue.folder_paths(folder).unwrap();
+        paths.into_iter().map(|path| path.typed).collect()
+    };
+
+    /* One path taken off, another put on in its place: the sessions follow at once, but not
+    the one filed by hand nor the one in Trash. */
+    let location = bench.location.clone();
+    catalogue
+        .change_paths(
+            work,
+            &[("/home/user/code/app".to_string(), None)],
+            &[(" /home/user/notes ".to_string(), Some(location.clone()))],
+        )
+        .unwrap();
+    assert_eq!(typed(work), ["/home/user/notes"]);
+    assert_eq!(attached(work)[0].location, Some(location.clone()));
+    assert_eq!(both(), (Filed::Unsorted, Filed::ByRule(work)));
+    assert_eq!(filed(catalogue, &by_hand), Filed::ByHand(other));
+    assert_eq!(filed(catalogue, &trashed), Filed::Unsorted);
+
+    /* Restored, the one in Trash is filed by the paths there are now. */
+    catalogue.restore(&trashed).unwrap();
+    assert_eq!(filed(catalogue, &trashed), Filed::ByRule(work));
+
+    /* One refused path of several leaves every path as it was, and so do the sessions. */
+    let before = attached(work);
+    let this = ("/home/user/notes".to_string(), Some(location));
+    let refused = catalogue.change_paths(
+        work,
+        std::slice::from_ref(&this),
+        &[
+            ("/home/user/code/app".to_string(), None),
+            ("/srv/taken".to_string(), None),
+        ],
+    );
+    assert!(matches!(
+        refused,
+        Err(CatalogueError::PathAttached { folder, .. }) if folder == other
+    ));
+    assert_eq!(attached(work), before);
+    assert_eq!(both(), (Filed::Unsorted, Filed::ByRule(work)));
+    /* A path the folder doesn't have, even one another folder has, is not taken off. */
+    let missing = catalogue.change_paths(work, &[("/srv/taken".to_string(), None)], &[]);
+    assert!(matches!(missing, Err(CatalogueError::NotAttached(_))));
+    assert_eq!(typed(other), ["/srv/taken"]);
+    let nowhere = catalogue.change_paths(work, &[], &[("code/app".to_string(), None)]);
+    assert!(matches!(nowhere, Err(CatalogueError::NoPath(_))));
+    assert_eq!(attached(work), before);
+}
+
+#[test]
+fn a_path_moves_to_another_folder_with_the_sessions_it_files() {
+    let mut bench = Bench::new(DbAgent::new());
+    let key = started(&mut bench.agent, "/home/user/code/app");
+    let by_hand = started(&mut bench.agent, "/home/user/code/app/docs");
+    let trashed = started(&mut bench.agent, "/home/user/code/app/bin");
+    bench.sync();
+    let id = bench.session_id(&key);
+    let (by_hand, trashed) = (bench.session_id(&by_hand), bench.session_id(&trashed));
+    let catalogue = bench.archive().catalogue();
+    let from = catalogue.create_folder("from", None).unwrap();
+    let to = catalogue.create_folder("to", None).unwrap();
+    let location = Some(&bench.location);
+    catalogue
+        .attach_path(from, "/home/user/code/app/", location)
+        .unwrap();
+    catalogue.file_by_hand(&by_hand, from).unwrap();
+    catalogue.trash(&trashed).unwrap();
+    assert_eq!(filed(catalogue, &id), Filed::ByRule(from));
+
+    /* It goes as it was typed and for the location it was for; what was filed by hand stays,
+    and what is in Trash is left alone. */
+    catalogue
+        .move_path(from, ("/home/user/code/app/", location), to)
+        .unwrap();
+    assert!(catalogue.folder_paths(from).unwrap().is_empty());
+    let moved = catalogue.folder_paths(to).unwrap().remove(0);
+    assert_eq!(moved.typed, "/home/user/code/app/");
+    assert_eq!(moved.attached.location.as_ref(), location);
+    assert_eq!(filed(catalogue, &id), Filed::ByRule(to));
+    assert_eq!(filed(catalogue, &by_hand), Filed::ByHand(from));
+    assert_eq!(filed(catalogue, &trashed), Filed::ByRule(from));
+
+    /* A path that is not there, for those locations, or a folder that is not, moves nothing. */
+    assert!(matches!(
+        catalogue.move_path(from, ("/home/user/code/app/", location), to),
+        Err(CatalogueError::NotAttached(_))
+    ));
+    assert!(matches!(
+        catalogue.move_path(to, ("/home/user/code/app/", None), from),
+        Err(CatalogueError::NotAttached(_))
+    ));
+    assert!(matches!(
+        catalogue.move_path(to, ("/home/user/code/app/", location), FolderId(9999)),
+        Err(CatalogueError::NoFolder(_))
+    ));
+    assert_eq!(filed(catalogue, &id), Filed::ByRule(to));
+}
+
+#[test]
+fn a_selection_is_filed_starred_and_trashed_in_one_step_and_undone_as_far_as_it_can_be() {
+    let mut bench = Bench::new(DbAgent::new());
+    let one = started(&mut bench.agent, "/home/user/code/app");
+    let two = started(&mut bench.agent, "/home/user/notes");
+    bench.sync();
+    let (one, two) = (bench.session_id(&one), bench.session_id(&two));
+    let catalogue = bench.archive().catalogue();
+    let app = catalogue.create_folder("app", None).unwrap();
+    let kept = catalogue.create_folder("kept", None).unwrap();
+    catalogue
+        .attach_path(app, "/home/user/code/app", None)
+        .unwrap();
+    let gone = SessionId {
+        key: "deleted-for-good".to_string(),
+        ..one.clone()
+    };
+
+    /* Filed by hand together, saying how each was before; with one that isn't archived, none
+    is. */
+    let both = [one.clone(), two.clone()];
+    assert!(matches!(
+        catalogue.file_by_hand_all(&[one.clone(), gone.clone()], kept),
+        Err(CatalogueError::NoSession(_))
+    ));
+    assert_eq!(filed(catalogue, &one), Filed::ByRule(app));
+    let before = catalogue.file_by_hand_all(&both, kept).unwrap();
+    assert_eq!(
+        before,
+        [
+            (one.clone(), Filed::ByRule(app)),
+            (two.clone(), Filed::Unsorted)
+        ]
+    );
+    assert_eq!(filed(catalogue, &two), Filed::ByHand(kept));
+
+    /* Handed back to the rules: where each was, and where it is now. */
+    let handed = catalogue.file_automatically_all(&both).unwrap();
+    assert_eq!(
+        handed,
+        [
+            ((one.clone(), Filed::ByHand(kept)), Some(app)),
+            ((two.clone(), Filed::ByHand(kept)), None)
+        ]
+    );
+
+    /* The Undo puts each back; a session deleted for good since is left out, and one whose
+    folder went is filed by its path. Each is counted apart. */
+    let undone = catalogue
+        .refile_as(&[
+            (one.clone(), Filed::ByHand(kept)),
+            (gone.clone(), Filed::ByHand(kept)),
+        ])
+        .unwrap();
+    assert_eq!(
+        undone,
+        Undone {
+            gone: 1,
+            refiled: 0
+        }
+    );
+    assert_eq!(filed(catalogue, &one), Filed::ByHand(kept));
+    catalogue.delete_folder(kept).unwrap();
+    let undone = catalogue
+        .refile_as(&[(one.clone(), Filed::ByHand(kept))])
+        .unwrap();
+    assert_eq!(
+        undone,
+        Undone {
+            gone: 0,
+            refiled: 1
+        }
+    );
+    assert_eq!(filed(catalogue, &one), Filed::ByRule(app));
+
+    /* Starred together, or not at all: with one that isn't archived, the other keeps no star. */
+    assert!(
+        catalogue
+            .set_starred_all(&[one.clone(), gone.clone()], true)
+            .is_err()
+    );
+    assert_eq!(catalogue.library_counts().unwrap().starred, 0);
+    catalogue.set_starred_all(&both, true).unwrap();
+    assert_eq!(catalogue.library_counts().unwrap().starred, 2);
+
+    /* To Trash together, or not at all; only those not there already are moved; the Undo
+    takes out those still there, and one taken out already is where it puts it. */
+    assert!(catalogue.trash_all(&[one.clone(), gone.clone()]).is_err());
+    assert_eq!(catalogue.library_counts().unwrap().trash, 0);
+    catalogue.trash(&two).unwrap();
+    assert_eq!(
+        catalogue.trash_all(&both).unwrap(),
+        std::slice::from_ref(&one)
+    );
+    assert_eq!(catalogue.library_counts().unwrap().trash, 2);
+    catalogue.restore(&two).unwrap();
+    assert!(catalogue.restore_all(&both).unwrap().is_whole());
+    assert_eq!(
+        catalogue.restore_all(std::slice::from_ref(&gone)).unwrap(),
+        Undone {
+            gone: 1,
+            refiled: 0
+        }
+    );
+    assert_eq!(catalogue.library_counts().unwrap().trash, 0);
+}
+
+#[test]
+fn the_paths_editor_reads_every_path_and_the_sessions_a_change_would_move() {
+    let mut bench = Bench::new(DbAgent::new());
+    let mut elsewhere = Elsewhere::new(&bench);
+    for project in ["/home/user/code/app", "/home/user/code/app", "code/app"] {
+        started(&mut bench.agent, project);
+    }
+    let by_hand = started(&mut bench.agent, "/home/user/notes");
+    let trashed = started(&mut bench.agent, "/home/user/notes");
+    started(&mut elsewhere.agent, "/home/user/code/app");
+    bench.sync();
+    elsewhere.sync(&bench);
+    let catalogue = bench.archive().catalogue();
+    let app = catalogue.create_folder("app", None).unwrap();
+    let kept = catalogue.create_folder("kept", None).unwrap();
+    catalogue
+        .attach_path(app, "/home/user/code/app", Some(&bench.location))
+        .unwrap();
+    catalogue
+        .attach_path(kept, "/srv/kept", Some(&elsewhere.location))
+        .unwrap();
+    catalogue
+        .file_by_hand(&bench.session_id(&by_hand), kept)
+        .unwrap();
+    catalogue.trash(&bench.session_id(&trashed)).unwrap();
+
+    /* Every folder's paths, each folder's in the order they were attached. */
+    let paths: Vec<(FolderId, String)> = catalogue
+        .attached_paths()
+        .unwrap()
+        .into_iter()
+        .map(|path| (path.attached.folder, path.typed))
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            (app, "/home/user/code/app".to_string()),
+            (kept, "/srv/kept".to_string()),
+        ]
+    );
+
+    /* What the rules may move: not what was filed by hand or is in Trash. */
+    let mut fileable: Vec<(String, bool, Option<FolderId>)> = catalogue
+        .fileable()
+        .unwrap()
+        .into_iter()
+        .map(|it| {
+            let here = it.location == bench.location;
+            (it.project.as_str().to_string(), here, it.folder)
+        })
+        .collect();
+    fileable.sort_by_key(|(path, here, _)| (path.clone(), *here));
+    assert_eq!(
+        fileable,
+        [
+            ("/home/user/code/app".to_string(), false, None),
+            ("/home/user/code/app".to_string(), true, Some(app)),
+            ("/home/user/code/app".to_string(), true, Some(app)),
+            ("code/app".to_string(), true, None),
+        ]
+    );
+
+    /* The paths the locations have seen, the most sessions first, out of Trash, and only
+    those a folder can take. */
+    let seen: Vec<(bool, String, usize, usize)> = catalogue
+        .project_paths()
+        .unwrap()
+        .into_iter()
+        .map(|path| {
+            let here = path.location == bench.location;
+            (here, path.recorded, path.sessions, path.unsorted)
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (true, "/home/user/code/app".to_string(), 2, 0),
+            (false, "/home/user/code/app".to_string(), 1, 1),
+            (true, "/home/user/notes".to_string(), 1, 0),
+        ]
+    );
 }

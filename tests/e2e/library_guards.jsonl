@@ -1,0 +1,93 @@
+{"scenario": {"window_size": "1440x900", "fixture": "boards", "description": "What the library keeps to when a press wiggles, a filter hides the selection, a key comes mid-drag, a dialog is open or Undo's folder is gone; the paths line and the editor with many paths, at 1440 and at 960"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "click", "target": "sidebar/folder/fc"}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 488}}
+
+// A press on a card's title that moves 3px is a click: gpui starts its drag after 2px, the drag never moves the 4px it takes, and letting go opens the session.
+{"cmd": "drag", "from": {"target": "card/0/title"}, "to": {"target": "card/0/title", "dx": 3, "dy": 0}}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "session"}, {"pointer": "/library/drag", "equals": null}]}
+{"cmd": "key", "keystroke": "alt-left"}
+{"cmd": "settle", "expect": {"pointer": "/page", "equals": "sessions"}}
+
+// Two cards selected, then a filter that hides both: the selection goes with them, and Delete moves nothing to Trash.
+{"cmd": "click", "target": "card/0"}
+{"cmd": "click", "target": "card/1", "modifiers": "secondary"}
+{"cmd": "settle", "expect": {"pointer": "/library/selection/1", "not_equals": null}}
+{"cmd": "click", "target": "filter/field"}
+{"cmd": "type", "text": "Hangul"}
+{"cmd": "settle", "expect": {"pointer": "/library/selection", "equals": []}}
+{"cmd": "click", "target": "page/title"}
+{"cmd": "key", "keystroke": "delete"}
+{"cmd": "settle", "expect": {"pointer": "/library/counts/all", "equals": 2318}}
+{"cmd": "click", "target": "filter/clear"}
+{"cmd": "settle", "expect": {"pointer": "/page_view/filtered", "equals": false}}
+
+// A key pressed while a card is held over a folder does nothing, Delete included, and letting go still drops it there.
+{"cmd": "click", "target": "sidebar/folder/dv"}
+{"cmd": "settle"}
+{"cmd": "drag", "from": {"target": "card/2"}, "to": {"target": "sidebar/folder/fc"}, "release": false}
+{"cmd": "settle", "expect": {"pointer": "/library/drag/verdict/takes", "equals": true}}
+{"cmd": "key", "keystroke": "delete"}
+{"cmd": "key", "keystroke": "shift"}
+{"cmd": "settle", "expect": [{"pointer": "/library/counts/all", "equals": 2318}, {"pointer": "/library/drag/moved", "equals": true}]}
+{"cmd": "mouse_up"}
+{"cmd": "settle", "expect": [{"pointer": "/library/drag", "equals": null}, {"pointer": "/library/toast/text", "equals": "Filed in fc by hand"}]}
+
+// Delete folder… keeps the keyboard: Delete and Enter don't reach the page behind it. Deleting the folder a toast's Undo names takes the toast away.
+{"cmd": "click", "target": "sidebar/unsorted"}
+{"cmd": "settle"}
+{"cmd": "drag", "from": {"target": "unsorted/group/0/chip"}, "to": {"target": "sidebar/folder/Scratch"}}
+{"cmd": "settle", "expect": {"pointer": "/library/toast/undo", "equals": true}}
+{"cmd": "click", "target": "sidebar/folder/Scratch", "button": "right"}
+{"cmd": "click", "target": "menu/delete"}
+{"cmd": "settle", "expect": {"pointer": "/library/deleting", "equals": "Scratch"}}
+{"cmd": "key", "keystroke": "delete"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": [{"pointer": "/library/deleting", "equals": "Scratch"}, {"pointer": "/page", "equals": "unsorted"}, {"pointer": "/library/counts/all", "equals": 2318}]}
+{"cmd": "screenshot", "name": "delete-folder-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "delete-folder-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "click", "target": "delete-folder/confirm"}
+{"cmd": "settle", "expect": [{"pointer": "/library/deleting", "equals": null}, {"pointer": "/library/toast", "equals": null}]}
+
+// Eight paths on slide: the chips give way in their paths, then wrap onto a second line; none is narrower than its tag and count, and Edit paths keeps its place.
+{"cmd": "click", "target": "sidebar/folder/slide"}
+{"cmd": "settle"}
+{"cmd": "click", "target": "page/edit-paths"}
+{"cmd": "type", "text": "/home/user/tmp/a\n"}
+{"cmd": "type", "text": "/home/user/tmp/b\n"}
+{"cmd": "type", "text": "/home/user/tmp/c\n"}
+{"cmd": "type", "text": "/home/user/tmp/d\n"}
+{"cmd": "type", "text": "/home/user/tmp/e\n"}
+{"cmd": "type", "text": "/home/user/tmp/f\n"}
+{"cmd": "type", "text": "/home/user/tmp/g\n"}
+{"cmd": "key", "keystroke": "secondary-enter"}
+{"cmd": "settle", "expect": {"pointer": "/page_view/editor", "equals": null}}
+{"cmd": "click", "target": "toast/dismiss"}
+{"cmd": "settle", "expect": {"pointer": "/library/toast", "equals": null}}
+{"cmd": "bounds", "target": "page/path/7", "expect_result": [{"pointer": "/w", "gte": 120}]}
+{"cmd": "bounds", "target": "page/paths", "expect_result": [{"pointer": "/h", "gte": 56}]}
+{"cmd": "screenshot", "name": "many-paths-1440-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "many-paths-1440-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// At 960x600 the editor with nine paths keeps its footer in sight: its table scrolls, and Save paths is there to press.
+{"cmd": "resize", "w": 960, "h": 600}
+{"cmd": "settle"}
+{"cmd": "click", "target": "page/edit-paths"}
+{"cmd": "type", "text": "/home/user/tmp/h\n"}
+{"cmd": "settle", "expect": {"pointer": "/page_view/editor/added/0", "equals": "/home/user/tmp/h"}}
+{"cmd": "bounds", "target": "paths/save", "expect_result": [{"pointer": "/visible", "not_equals": null}]}
+{"cmd": "screenshot", "name": "many-paths-editor-960-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "many-paths-editor-960-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "click", "target": "paths/save"}
+{"cmd": "settle", "expect": {"pointer": "/page_view/editor", "equals": null}}
