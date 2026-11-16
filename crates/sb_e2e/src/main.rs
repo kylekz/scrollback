@@ -48,6 +48,10 @@
 //! - `"settings-unreadable"`: a settings file that isn't JSON, naming an archive
 //!   ([`fixture::settings_unreadable`]): nothing is opened or made until the owner chooses.
 //!
+//! **A time is held to a budget by a runner step**, `{"budget": {"ms": "${saved}", "within":
+//! 500}}` ([`Action::Budget`]), never by an expectation's bound: a CI runner's budget is half as
+//! long again.
+//!
 //! **No scenario starts `ssh` or `wsl.exe`.** The app reaches every distro and host through its
 //! stand-ins and refuses any launcher under automation, logging the attempt as an error; a
 //! scenario whose app logged one fails ([`Home::finish`]). On Unix, a tripwire for each comes
@@ -62,12 +66,12 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Result, bail};
-use gpui_automation_runner::{Fixture, FixtureCx, NoAction, Profile, RunnerApp};
+use anyhow::{Context as _, Result, bail, ensure};
+use gpui_automation_runner::{Fixture, FixtureCx, Profile, RunnerApp};
 use sb_core::transport::LAUNCH_REFUSED;
 use sb_test_support::ProjectsTree;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use extras::Extra;
 
@@ -153,7 +157,23 @@ fn tripwires(_: &Path) -> Result<Vec<(OsString, Option<OsString>)>> {
 /// from it, in UTC, so that a capture is the same in any year and on any machine.
 const CALENDAR: &str = "2026";
 
-impl Fixture<NoAction> for Home {
+/// scrollback's runner steps, run here and never sent to the app.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum Action {
+    /**
+     * A time an earlier step measured, saved from its result, held to a budget:
+     * `{"budget": {"ms": "${opened_ms}", "within": 500}}`. The runner's expectations take only a
+     * fixed bound, and the same work takes longer on a CI runner (a few shared cores, a software
+     * renderer on Windows), so there the budget is [`CI_BUDGET`] times as long.
+     */
+    Budget { ms: String, within: f64 },
+}
+
+/// How much longer a budget is on a CI runner: when the runner's environment sets `CI`.
+const CI_BUDGET: f64 = 1.5;
+
+impl Fixture<Action> for Home {
     fn env(&self) -> Vec<(OsString, Option<OsString>)> {
         self.env.clone()
     }
@@ -167,8 +187,22 @@ impl Fixture<NoAction> for Home {
         ]
     }
 
-    fn run(&mut self, action: &NoAction) -> Result<Value> {
-        match *action {}
+    fn run(&mut self, action: &Action) -> Result<Value> {
+        match action {
+            Action::Budget { ms, within } => {
+                let took: f64 = ms
+                    .parse()
+                    .with_context(|| format!("budget: {ms:?} is not a time in milliseconds"))?;
+                let ci = std::env::var_os("CI").is_some();
+                let budget = if ci { within * CI_BUDGET } else { *within };
+                ensure!(
+                    took <= budget,
+                    "{took} ms, past the budget of {budget} ms{}",
+                    if ci { " (a CI runner's)" } else { "" }
+                );
+                Ok(json!({"ms": took, "budget": budget, "ci": ci}))
+            }
+        }
     }
 
     /// Fails the scenario when its app tried to start a launcher, or started one.
@@ -198,8 +232,9 @@ struct Scrollback;
 
 impl RunnerApp for Scrollback {
     type Header = Header;
-    type Action = NoAction;
+    type Action = Action;
     const HEADER_KEYS: &'static [&'static str] = &["fixture"];
+    const ACTIONS: &'static [&'static str] = &["budget"];
     /// Where the agent's provider looks for its transcripts: the fixture's, so that no
     /// scenario reads the machine it runs on.
     const RESERVED_ENV: &'static [&'static str] = &["CLAUDE_CONFIG_DIR"];
@@ -219,7 +254,7 @@ impl RunnerApp for Scrollback {
         }
     }
 
-    fn fixture(&self, header: &Header, cx: &FixtureCx) -> Result<Box<dyn Fixture<NoAction>>> {
+    fn fixture(&self, header: &Header, cx: &FixtureCx) -> Result<Box<dyn Fixture<Action>>> {
         let home = cx.out_dir.join("home");
         let mut tree = ProjectsTree::in_home(&home);
         let env: Vec<(OsString, Option<OsString>)> = tree

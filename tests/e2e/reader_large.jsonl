@@ -6,9 +6,10 @@
 {"cmd": "click", "target": "sidebar/folder/fc"}
 {"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 6}}
 
-// Opening: the header at once, then the column once the main transcript is parsed, within the budget of first paint (500 ms).
+// Opening: the header at once, then the column once the main transcript is parsed, within the budget of first paint (500 ms; a CI runner's is half as long again).
 {"cmd": "click", "target": "card/0/title"}
-{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/reader/state", "equals": "open"}, {"pointer": "/library/open", "equals": "A long session to measure the reader"}], "expect_result": {"pointer": "/elapsed_ms", "lte": 500}}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/reader/state", "equals": "open"}, {"pointer": "/library/open", "equals": "A long session to measure the reader"}], "save": {"opened_ms": "/elapsed_ms"}}
+{"budget": {"ms": "${opened_ms}", "within": 500}}
 {"cmd": "screenshot", "name": "large-top-1440-dark"}
 
 // A screen at a time, twenty times: each step waits for its frame.
