@@ -230,6 +230,12 @@ impl MainArea {
             .update(cx, |reader, cx| reader.dismiss(window, cx))
     }
 
+    /// The reader, for tests that look inside it.
+    #[cfg(test)]
+    pub fn reader_view(&self) -> Entity<ReaderView> {
+        self.reader.clone()
+    }
+
     /// What the reader shows, for automation.
     pub fn reader(&self, cx: &App) -> reader::ReaderSnapshot {
         self.reader.read(cx).snapshot(cx)

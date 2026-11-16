@@ -14,7 +14,7 @@ use gpui::{
     prelude::FluentBuilder as _, px, uniform_list,
 };
 use sb_core::catalogue::{Held, History, Reason};
-use sb_core::transcript::{Content, ToolKind};
+use sb_core::transcript::ToolKind;
 
 use super::ReaderView;
 use super::calls::kind_icon;
@@ -34,6 +34,9 @@ use crate::theme::{ActiveTheme as _, StyledText as _};
 /// The facts margin's width (DESIGN §1.4) and the History popover's.
 pub const FACTS_WIDTH: f32 = 268.;
 pub const HISTORY_WIDTH: f32 = 440.;
+/// How many versions History lays out at first, and more each time more are asked for: a
+/// file's versions are as many as its syncs that rewrote it.
+pub const HISTORY_SHOWN: usize = 50;
 /// A turn's row in the facts.
 const TURN_ROW: f32 = 22.;
 
@@ -54,7 +57,7 @@ const CALL_KINDS: &[(&str, &[ToolKind])] = &[
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryOf {
     pub key: Arc<str>,
-    pub history: History,
+    pub history: Arc<History>,
     pub main: bool,
 }
 
@@ -76,9 +79,8 @@ impl ReaderView {
             .iter()
             .rev()
             .find_map(|row| row.block().filter(|at| at.conversation == main.item))?;
-        main.turns()
-            .iter()
-            .position(|turn| turn.blocks.contains(&block.block))
+        let turn = (*open.margin().turn_of.get(block.block.0)?)?;
+        usize::try_from(turn).ok()
     }
 
     /// Scrolls the column to the turn `turn`'s first row.
@@ -252,6 +254,7 @@ impl ReaderView {
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.history = Some(opened.clone());
+                                    this.history_shown = HISTORY_SHOWN;
                                     cx.notify();
                                 }))
                                 .child(icon(SbIcon::History, theme.sizes.icon_xs, c.accent_text))
@@ -277,27 +280,8 @@ impl ReaderView {
             );
         }
 
-        /* Turns: each prompt's time and start. */
-        let turns: Vec<(Option<i64>, String)> = open
-            .main()
-            .map(|main| {
-                main.turns()
-                    .iter()
-                    .map(|turn| {
-                        let first = &main[turn.blocks[0]];
-                        let said = match &first.content {
-                            Content::Prompt { text, .. } => hostile::label(
-                                text.lines()
-                                    .find(|line| !line.trim().is_empty())
-                                    .unwrap_or(""),
-                            ),
-                            _ => "(no prompt)".to_string(),
-                        };
-                        (first.at, said)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        /* Turns: each prompt's time and start, labelled as the session was parsed. */
+        let turns = open.margin().turns.clone();
         let current = self.current_turn(open);
         if current != self.facts_turn {
             self.facts_turn = current;
@@ -310,22 +294,22 @@ impl ReaderView {
             .find
             .as_ref()
             .filter(|find| find.is_active() && find.findings.is_some());
-        let found: BTreeMap<usize, usize> =
+        let found: Arc<BTreeMap<usize, usize>> =
             finding.map(|find| find.turns.clone()).unwrap_or_default();
         let matches_in = finding
             .and_then(|find| find.findings.as_ref())
             .map(|findings| {
+                let count = findings.matches.len();
                 format!(
-                    "{}{} in {}",
-                    format::plural(findings.matches.len(), "match").replace("matchs", "matches"),
+                    "{}{} {} in {}",
+                    format::count(count as u64),
                     if findings.capped { "+" } else { "" },
+                    if count == 1 { "match" } else { "matches" },
                     format::count(found.len() as u64)
                 )
             });
         let numbered = turns.len() > 9;
         let count = turns.len();
-        let turns = Arc::new(turns);
-        let found = Arc::new(found);
         let turn_list = uniform_list("facts-turns", count, {
             let turns = turns.clone();
             let found = found.clone();
@@ -395,14 +379,14 @@ impl ReaderView {
         .min_h_0()
         .mr(px(-4.));
 
-        /* Calls by kind, of the session's own conversation. */
+        /* Calls by kind, of the session's own conversation, counted as it was parsed. */
         let mut calls: BTreeMap<usize, usize> = BTreeMap::new();
-        for (_, call) in open.main().into_iter().flat_map(|main| main.calls()) {
+        for (kind, count) in &open.margin().calls {
             if let Some(at) = CALL_KINDS
                 .iter()
-                .position(|(_, kinds)| kinds.contains(&call.kind))
+                .position(|(_, kinds)| kinds.contains(kind))
             {
-                *calls.entry(at).or_default() += 1;
+                *calls.entry(at).or_default() += count;
             }
         }
         let calls = calls.into_iter().map(|(at, count)| {
@@ -512,7 +496,8 @@ impl ReaderView {
         } else {
             hostile::label(super::blocks::file_stem(&of.key))
         };
-        let blocks = history.versions.iter().rev().map(|(version, extended)| {
+        let older = history.versions.len().saturating_sub(self.history_shown);
+        let blocks = history.versions.iter().rev().take(self.history_shown).map(|(version, extended)| {
             let n = version.number;
             let is_reading = version.id == history.reading;
             let is_shown = version.id == shown && !is_reading;
@@ -530,6 +515,9 @@ impl ReaderView {
                     " · extended by {}",
                     format::plural(*extended, "sync")
                 ));
+            }
+            if is_reading && history.chosen {
+                said.push_str(" · chosen by you");
             }
             if let Some(held) = held {
                 said = match held {
@@ -752,7 +740,27 @@ impl ReaderView {
                     .flex_col()
                     .gap(px(2.))
                     .p(px(6.))
-                    .children(blocks),
+                    .children(blocks)
+                    .when(older > 0, |this| {
+                        this.child(
+                            div()
+                                .id("history-older")
+                                .p(theme.spacing.md)
+                                .text_color(c.accent_text)
+                                .text_spec(&theme.text.secondary)
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.history_shown += HISTORY_SHOWN;
+                                    cx.notify();
+                                }))
+                                .child(format!(
+                                    "{} older not shown · Show {} more",
+                                    format::plural(older, "version"),
+                                    format::count(older.min(HISTORY_SHOWN) as u64)
+                                ))
+                                .automation_target("reader/history/older"),
+                        )
+                    }),
             )
             .when(of.main, |this| {
                 this.child(

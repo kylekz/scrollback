@@ -773,6 +773,7 @@ impl<'a> Reading<'a> {
             brief: call.and_then(|(kind, _)| {
                 tools::brief(kind, first_text, failed, record.tool_use_result)
             }),
+            numbered: call.and_then(|(kind, _)| tools::numbered(kind, first_text)),
             output: match content {
                 None => Vec::new(),
                 Some(Shape::Text(text)) => vec![Output::Text(self.output_text(text, line))],

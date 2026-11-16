@@ -247,6 +247,7 @@ impl DbProvider {
                 },
                 output: vec![Output::Text(part(call.output, Encoding::JsonString))],
                 brief: None,
+                numbered: None,
             }),
             subagents: Vec::new(),
         }

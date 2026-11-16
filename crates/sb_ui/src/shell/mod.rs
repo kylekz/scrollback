@@ -312,6 +312,12 @@ impl Shell {
         Showing::now(cx)
     }
 
+    /// The reader, for tests that look inside it.
+    #[cfg(test)]
+    pub fn reader_view(&self, cx: &App) -> gpui::Entity<crate::pages::reader::ReaderView> {
+        self.main.read(cx).reader_view()
+    }
+
     /// What the reader shows, for automation.
     pub fn reader(&self, cx: &App) -> crate::pages::reader::ReaderSnapshot {
         self.main.read(cx).reader(cx)

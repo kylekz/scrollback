@@ -19,6 +19,7 @@ use sb_core::transcript::{
     BlockId, Content, Conversation, Ending, ToolInput, ToolKind, ToolStatus, Turn,
 };
 
+use crate::services::reader::shape::diff::Diff;
 use crate::services::reader::shape::{Renderer, renderer};
 use crate::services::reader::{
     BlockRef, CallBody, Load, OpenSession, Part, Piece, Prose, Text, Toggle,
@@ -106,8 +107,12 @@ pub enum BodyPart {
     ResultsMore {
         all: bool,
     },
-    /// A piece of a web fetch's result, as Markdown.
-    Fetched(usize),
+    /// A piece of a web fetch's result: Markdown, or the `chunk`th row of a piece shown as
+    /// text, [`CHUNK_LINES`] lines a row.
+    Fetched {
+        piece: usize,
+        chunk: usize,
+    },
     /// The `chunk`th row of an MCP call's input and output, side by side.
     Pair {
         chunk: usize,
@@ -794,7 +799,7 @@ impl Rows<'_> {
             (Renderer::Files, _) => self.outputs(at, body, &mut parts),
             (Renderer::Diff, _) => {
                 match &body.diff {
-                    Some(Ok(diff)) => self.diff(at, call.kind, diff.lines.len(), &mut parts),
+                    Some(Ok(diff)) => self.diff(at, call.kind, diff, &mut parts),
                     _ => parts.push(BodyPart::PartFailed { part: None }),
                 }
                 if failed {
@@ -820,8 +825,20 @@ impl Rows<'_> {
             }
             (Renderer::WebFetch, _) if body.fetched.is_some() => {
                 parts.push(BodyPart::Head);
-                let pieces = body.fetched.as_ref().map_or(0, |prose| prose.pieces.len());
-                parts.extend((0..pieces).map(BodyPart::Fetched));
+                for (piece, prose) in body
+                    .fetched
+                    .iter()
+                    .flat_map(|prose| prose.pieces.iter())
+                    .enumerate()
+                {
+                    let chunks = match prose {
+                        Piece::Markdown(_) => 1,
+                        Piece::Code { text, .. } | Piece::Plain { text, .. } => {
+                            text.line_count().div_ceil(CHUNK_LINES).max(1)
+                        }
+                    };
+                    parts.extend((0..chunks).map(|chunk| BodyPart::Fetched { piece, chunk }));
+                }
             }
             (Renderer::Mcp, _) => {
                 parts.push(BodyPart::Head);
@@ -879,23 +896,21 @@ impl Rows<'_> {
         }
     }
 
-    /// The rows of an edit's diff of `count` lines: its first, or all a chunk a row.
-    fn diff(&self, at: &BlockRef, kind: ToolKind, count: usize, parts: &mut Vec<BodyPart>) {
-        let first = if kind == ToolKind::Write {
-            FIRST_WRITTEN_LINES
-        } else {
-            FIRST_DIFF_LINES
-        };
+    /// The rows of an edit's diff: its first lines, or all, a bounded number of lines drawn a
+    /// row ([`super::kinds::diff_chunk`]).
+    fn diff(&self, at: &BlockRef, kind: ToolKind, diff: &Diff, parts: &mut Vec<BodyPart>) {
+        let written = kind == ToolKind::Write;
         let all = self
             .open
             .is_open(&Toggle::AllLines(at.clone(), None), self.full_calls);
         let chunks = if all {
-            count.div_ceil(CHUNK_LINES)
+            diff.drawn.div_ceil(CHUNK_LINES)
         } else {
-            count.min(1)
+            diff.drawn.min(1)
         };
         parts.extend((0..chunks).map(|chunk| BodyPart::Diff { chunk }));
-        if count > first {
+        let (lines, drawn) = super::kinds::diff_rest(diff, written);
+        if lines > 0 || drawn {
             parts.push(BodyPart::DiffMore { all });
         }
     }

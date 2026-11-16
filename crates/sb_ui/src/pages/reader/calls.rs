@@ -607,7 +607,10 @@ fn body(
         },
         (BodyPart::Result(index), Some(body), _) => body.results.get(*index).map_or_else(
             || div().into_any_element(),
-            |found| kinds::result(&found.title, &found.url, theme),
+            |found| {
+                let finds = view.finds(&Spot::Result(at.clone(), *index));
+                kinds::result(&found.title, &found.url, &finds, theme)
+            },
         ),
         (BodyPart::ResultsMore { all }, Some(body), _) => kinds::results_more(
             ix,
@@ -617,8 +620,9 @@ fn body(
             theme,
             cx,
         ),
-        (BodyPart::Fetched(index), Some(body), _) => {
-            kinds::fetched(view, ix, at, body, *index, theme, cx)
+        (BodyPart::Fetched { piece, chunk }, Some(body), _) => {
+            let finds = view.fetched_piece_finds(at, body, *piece);
+            kinds::fetched(view, ix, at, body, *piece, *chunk, &finds, theme, cx)
         }
         (BodyPart::Pair { chunk }, Some(body), _) => {
             let output = body
@@ -849,6 +853,7 @@ fn footer(
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.history = Some(of.clone());
+                        this.history_shown = super::facts::HISTORY_SHOWN;
                         cx.notify();
                     }))
                     .child("History")

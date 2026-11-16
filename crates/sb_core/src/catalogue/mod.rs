@@ -81,6 +81,9 @@ pub enum CatalogueError {
     NoSession(SessionId),
     #[error("item {0} is not one of the session's items")]
     NotOfSession(i64),
+    /// No item of the session has this key.
+    #[error("the session has no item {0}")]
+    NotAnItem(String),
     #[error("version {version} is not a version of item {item}")]
     NotOfItem { version: i64, item: i64 },
     /// A version whose stored bytes are damaged is not chosen to be read.

@@ -3,8 +3,9 @@
 //!
 //! It is a transcript's, so hostile. Printing it again parses it, which holds several copies:
 //! only up to [`PRETTY_BYTES`], and serde's own bound on nesting stops a parse that goes too
-//! deep, after which the text is shown as it was sent. Colouring is one pass that never looks
-//! back and needs no nesting, whatever the text is, JSON or not.
+//! deep. Indentation grows with depth, so what is printed is bounded too: past
+//! [`PRINTED_BYTES`] the printing stops and the text is shown as it was sent. Colouring is one
+//! pass that never looks back and needs no nesting, whatever the text is, JSON or not.
 
 use std::ops::Range;
 
@@ -12,7 +13,36 @@ use crate::services::reader::text::Mark;
 use crate::syntax::TokenKind;
 
 /// The most of a text printed again as JSON: past it, it is shown as it was sent.
-pub const PRETTY_BYTES: usize = 1024 * 1024;
+pub const PRETTY_BYTES: usize = 64 * 1024;
+/// The most a text printed again may come to: past it, it is shown as it was sent.
+pub const PRINTED_BYTES: usize = 3 * PRETTY_BYTES;
+
+/// Bytes written up to [`PRINTED_BYTES`]; a write past them fails, which ends the printing.
+struct Bounded(Vec<u8>);
+
+impl std::io::Write for Bounded {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.0.len() + buf.len() > PRINTED_BYTES {
+            return Err(std::io::Error::other("printed past its bound"));
+        }
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `value` printed by `print` within [`PRINTED_BYTES`].
+fn printed(
+    value: &serde_json::Value,
+    print: impl FnOnce(&mut Bounded, &serde_json::Value) -> serde_json::Result<()>,
+) -> Option<String> {
+    let mut out = Bounded(Vec::new());
+    print(&mut out, value).ok()?;
+    String::from_utf8(out.0).ok()
+}
 /// The most marks one text keeps; past them the rest is drawn plain.
 pub const MARKS: usize = 64 * 1024;
 
@@ -22,17 +52,22 @@ fn value(text: &str) -> Option<serde_json::Value> {
         .flatten()
 }
 
-/// `text` pretty-printed when it is JSON of at most [`PRETTY_BYTES`], else as it is.
+/// `text` pretty-printed when it is JSON of at most [`PRETTY_BYTES`] whose printing comes to
+/// at most [`PRINTED_BYTES`], else as it is.
 pub fn pretty(text: String) -> String {
     value(&text)
-        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .and_then(|value| {
+            printed(&value, |out, value| {
+                serde_json::to_writer_pretty(out, value)
+            })
+        })
         .unwrap_or(text)
 }
 
 /// `text` on one line when it is JSON of at most [`PRETTY_BYTES`], else as it is.
 pub fn one_line(text: String) -> String {
     value(&text)
-        .and_then(|value| serde_json::to_string(&value).ok())
+        .and_then(|value| printed(&value, |out, value| serde_json::to_writer(out, value)))
         .unwrap_or(text)
 }
 
@@ -159,6 +194,21 @@ mod tests {
         /* Past the bound: not parsed at all. */
         let large = format!("[{}0]", "0,".repeat(PRETTY_BYTES));
         assert_eq!(pretty(large.clone()).len(), large.len());
+        /* Within it, nested deep enough that its indentation would come to megabytes: shown as
+        sent (the reviewer's 1 MiB at 120 deep printed 127 MB). */
+        for depth in [32usize, 64, 120] {
+            let n = (PRETTY_BYTES - 2 * depth - 2) / 2;
+            let deep = format!(
+                "{}{}0{}",
+                "[".repeat(depth),
+                "0,".repeat(n),
+                "]".repeat(depth)
+            );
+            let printed = pretty(deep.clone());
+            assert!(printed.len() <= PRINTED_BYTES, "{depth}: {}", printed.len());
+            assert_eq!(printed, deep);
+        }
+        assert!(pretty(r#"{"a":[1,2]}"#.to_string()).contains('\n'));
         /* A text of nothing but tokens: the marks stop at their bound. */
         let numbers = "1,".repeat(1_000_000);
         assert_eq!(marks(&numbers).len(), MARKS);

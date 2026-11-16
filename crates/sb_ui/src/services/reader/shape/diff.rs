@@ -13,7 +13,7 @@ use std::ops::Range;
 
 use imara_diff::{Algorithm, Diff as Lines, InternedInput, TokenSource};
 
-use crate::services::reader::text::Mark;
+use crate::services::reader::text::{Mark, Text};
 
 /// The most lines on a side diffed by lines (the module docs).
 pub const DIFF_LINES: usize = 20_000;
@@ -49,18 +49,41 @@ pub struct DiffLine {
     pub range: Range<usize>,
     /// What differs from the line it pairs with, ranges of [`Diff::text`].
     pub words: Vec<Range<usize>>,
+    /**
+     * The lines of [`Diff::text`] drawn of it (a long line is drawn as several, each of at
+     * most [`crate::services::reader::text::SEGMENT_BYTES`]), and where those are among all
+     * the diff draws, counted from its first line: a row draws a bounded number of them.
+     */
+    pub segments: Range<usize>,
+    pub drawn: Range<usize>,
 }
 
 /// An edit's text before and after, and its lines.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diff {
-    /// The text before, a line break, and the text after: what the lines are ranges of.
-    pub text: String,
+    /// The text before, a line break, and the text after ([`text`]): what the lines are
+    /// ranges of.
+    pub text: Text,
     pub lines: Vec<DiffLine>,
     /// Syntax marks over [`Diff::text`], when its file's language is known.
     pub marks: Vec<(Range<usize>, Mark)>,
     /// The lines before and after it starts at.
     pub start: (u32, u32),
+    /// How many lines of the text its lines draw, all told.
+    pub drawn: usize,
+}
+
+/// The text a diff's lines are ranges of: `old`, a line break, and `new`. Find searches it.
+pub fn text(old: &str, new: &str) -> String {
+    format!("{old}\n{new}")
+}
+
+/// How many lines `old` and `new` start with alike: an edit's context before what it changed.
+pub fn leading(old: &str, new: &str) -> usize {
+    old.lines()
+        .zip(new.lines())
+        .take_while(|(old, new)| old == new)
+        .count()
 }
 
 impl Diff {
@@ -88,7 +111,7 @@ fn lines_of(text: &str, offset: usize) -> Vec<Range<usize>> {
 
 /// The diff from `old` to `new`, numbered from the lines `start` (the module docs).
 pub fn diff(old: &str, new: &str, start: (u32, u32)) -> Diff {
-    let text = format!("{old}\n{new}");
+    let text = self::text(old, new);
     let before = lines_of(old, 0);
     let after = lines_of(new, old.len() + 1);
     let mut lines = Vec::with_capacity(before.len() + after.len());
@@ -98,6 +121,8 @@ pub fn diff(old: &str, new: &str, start: (u32, u32)) -> Diff {
         new: new.map(|at| start.1.saturating_add(at as u32)),
         range: range.clone(),
         words: Vec::new(),
+        segments: 0..0,
+        drawn: 0..0,
     };
     if before.len() > DIFF_LINES || after.len() > DIFF_LINES {
         lines.extend(
@@ -150,11 +175,24 @@ pub fn diff(old: &str, new: &str, start: (u32, u32)) -> Diff {
         }
         mark_words(&text, &mut lines);
     }
+    let text = Text::new(text);
+    let mut drawn = 0;
+    for line in &mut lines {
+        let first = text.line_at(line.range.start);
+        let last = match line.range.end.checked_sub(1) {
+            Some(end) if !line.range.is_empty() => text.line_at(end),
+            _ => first,
+        };
+        line.segments = first..last + 1;
+        line.drawn = drawn..drawn + line.segments.len();
+        drawn = line.drawn.end;
+    }
     Diff {
         text,
         lines,
         marks: Vec::new(),
         start,
+        drawn,
     }
 }
 
@@ -331,7 +369,7 @@ mod tests {
         diff.lines
             .iter()
             .map(|line| {
-                let mut text = diff.text[line.range.clone()].to_string();
+                let mut text = diff.text.text[line.range.clone()].to_string();
                 for word in line.words.iter().rev() {
                     text.insert(word.end - line.range.start, ']');
                     text.insert(word.start - line.range.start, '[');

@@ -199,6 +199,28 @@ pub(super) fn input(name: &str, raw: &RawValue, line: &Line) -> ToolInput {
 }
 
 /**
+ * How a `Read`'s text numbers its lines, from its first line (`text`, the result's first text
+ * as recorded): leading spaces, the number, then a tab, or an arrow in earlier releases.
+ */
+pub(super) fn numbered(kind: ToolKind, text: Option<&RawValue>) -> Option<char> {
+    if kind != ToolKind::Read {
+        return None;
+    }
+    let written = text?.get().strip_prefix('"')?.trim_start_matches(' ');
+    let after = written.trim_start_matches(|c: char| c.is_ascii_digit());
+    if after.len() == written.len() {
+        return None;
+    }
+    if after.starts_with("\\t") {
+        Some('\t')
+    } else if after.starts_with('→') || after.starts_with("\\u2192") {
+        Some('→')
+    } else {
+        None
+    }
+}
+
+/**
  * The short form of the result of a call of a tool of the kind `kind`, where the record has
  * one. `text` is the result's first text, `failed` whether the result is marked an error, and
  * `detail` its `toolUseResult`.
@@ -250,7 +272,10 @@ pub(super) fn brief(
                     .iter()
                     .take_while(|line| mark(line) == Some(b' '))
                     .count() as u64;
-                Some((hunk.old_start? + context, hunk.new_start? + context))
+                Some((
+                    hunk.old_start?.saturating_add(context),
+                    hunk.new_start?.saturating_add(context),
+                ))
             });
             Brief::Changed {
                 added: starting(b'+'),

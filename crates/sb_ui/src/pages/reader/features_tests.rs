@@ -130,7 +130,7 @@ fn each_kind_of_tool_draws_its_own_body(cx: &mut TestAppContext) {
     assert_eq!(of("WebSearch"), [BodyPart::Result(0), BodyPart::Result(1)]);
     assert!(matches!(
         of("WebFetch")[..],
-        [BodyPart::Head, BodyPart::Fetched(0), ..]
+        [BodyPart::Head, BodyPart::Fetched { piece: 0, chunk: 0 }, ..]
     ));
     assert_eq!(
         of("mcp__github__search_issues"),

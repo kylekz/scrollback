@@ -615,3 +615,40 @@ fn content_that_cannot_be_loaded_says_why() {
         })
     ));
 }
+
+#[test]
+fn a_reads_numbering_is_named_and_an_edits_start_never_overflows() {
+    let mut tree = ProjectsTree::new();
+    let mut session = session(&mut tree);
+    let t = &mut session.transcript;
+    t.prompt("Read and edit.");
+    for text in ["    10\tfn main() {", "    10→fn main() {", "fn main() {"] {
+        let call = t.call(
+            "Read",
+            json!({ "file_path": "/home/user/code/app/main.rs" }),
+        );
+        t.result(&call, json!(text));
+    }
+    let call = t.call(
+        "Edit",
+        json!({ "file_path": "a.rs", "old_string": "a\nb", "new_string": "a\nc" }),
+    );
+    let patch = json!({ "structuredPatch": [{ "oldStart": u64::MAX, "newStart": u64::MAX,
+                                              "lines": [" a", "-b", "+c"] }] });
+    t.result_with(&call, json!("ok"), false, patch);
+    let (transcript, _) = parse(&tree, &session);
+    let conversation = own(&transcript);
+    let result = |id: usize| call_in(conversation, id).result.clone().unwrap();
+    assert_eq!(
+        (1..4).map(|id| result(id).numbered).collect::<Vec<_>>(),
+        [Some('\t'), Some('→'), None]
+    );
+    assert_eq!(
+        result(4).brief,
+        Some(Brief::Changed {
+            added: 1,
+            removed: 1,
+            start: Some((u64::MAX, u64::MAX))
+        })
+    );
+}

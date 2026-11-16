@@ -157,23 +157,25 @@ pub fn head(ix: usize, at: &BlockRef, call: &ToolCall, first: bool, theme: &SbTh
                 _ => None,
             };
             let first = first_line.unwrap_or(1);
+            /* The numbers are the transcript's: added without overflowing. */
+            let last = |lines: u64| first.saturating_add(lines.saturating_sub(1));
             let range = match (lines, total) {
                 (Some(lines), Some((total, _))) => Some(format!(
                     "lines {}–{} of {}",
                     format::count(first),
-                    format::count((first + lines.saturating_sub(1)).min(total)),
+                    format::count(last(*lines).min(total)),
                     format::count(total)
                 )),
                 (None, Some((total, read))) => Some(format!(
                     "lines {}–{} of {}",
                     format::count(first),
-                    format::count(first + read.saturating_sub(1)),
+                    format::count(last(read)),
                     format::count(total)
                 )),
                 (Some(lines), None) => Some(format!(
                     "lines {}–{}",
                     format::count(first),
-                    format::count(first + lines.saturating_sub(1))
+                    format::count(last(*lines))
                 )),
                 (None, None) => None,
             };
@@ -238,9 +240,56 @@ pub fn head(ix: usize, at: &BlockRef, call: &ToolCall, first: bool, theme: &SbTh
         })
 }
 
+/**
+ * What the `chunk`th row of an edit's diff draws, as lines of its text drawn
+ * ([`DiffLine::drawn`]): its first lines, at most [`FIRST_DIFF_LINES`] (a write's
+ * [`FIRST_WRITTEN_LINES`]) and [`CHUNK_LINES`] drawn, until all are shown; then
+ * [`CHUNK_LINES`] drawn a row, so that a line of a megabyte is drawn over many rows.
+ */
+pub fn diff_chunk(diff: &Diff, chunk: usize, all: bool, written: bool) -> Range<usize> {
+    if all {
+        return chunk * CHUNK_LINES..((chunk + 1) * CHUNK_LINES).min(diff.drawn);
+    }
+    let first = if written {
+        FIRST_WRITTEN_LINES
+    } else {
+        FIRST_DIFF_LINES
+    };
+    let end = first
+        .min(diff.lines.len())
+        .checked_sub(1)
+        .map_or(0, |last| diff.lines[last].drawn.end);
+    0..end.min(CHUNK_LINES)
+}
+
+/// The rows of a diff past its first: how many lines it has past them, and how many drawn.
+pub fn diff_rest(diff: &Diff, written: bool) -> (usize, bool) {
+    let first = diff_chunk(diff, 0, false, written);
+    let lines = diff
+        .lines
+        .partition_point(|line| line.drawn.end <= first.end);
+    (diff.lines.len() - lines, first.end < diff.drawn)
+}
+
+/// `marks` of a text in order and apart, as highlights of the drawn lines `lines` of `text`.
+fn drawn<M: Clone>(
+    text: &Text,
+    lines: Range<usize>,
+    marks: &[(Range<usize>, M)],
+    style: impl Fn(M) -> HighlightStyle,
+) -> (String, Vec<(Range<usize>, HighlightStyle)>) {
+    let (drawn, marks) = text.draw(lines, marks);
+    let styled = marks
+        .into_iter()
+        .map(|(range, mark)| (range, style(mark)))
+        .collect();
+    (drawn, styled)
+}
+
 /// The `chunk`th row of an edit's diff (DESIGN §4.2.4 "Edit", dv's diff rows): an edit's hunk
 /// header first, then each line, 20 high, its number in a 36 gutter, a 16 `+` / `−` marker on
 /// the gutter's fill, the line's fill, the words that changed marked, and its syntax over it.
+/// A line drawn over several rows has its number and marker on its first.
 pub fn diff_rows(
     diff: &Diff,
     chunk_index: usize,
@@ -250,12 +299,7 @@ pub fn diff_rows(
     theme: &SbTheme,
 ) -> AnyElement {
     let c = &theme.colors;
-    let first = if written {
-        FIRST_WRITTEN_LINES
-    } else {
-        FIRST_DIFF_LINES
-    };
-    let lines = chunk(chunk_index, all, first, diff.lines.len());
+    let shown = diff_chunk(diff, chunk_index, all, written);
     let (removed, added) = diff.counts();
     let hunk = (chunk_index == 0 && !written).then(|| {
         hunk_row(
@@ -269,121 +313,86 @@ pub fn diff_rows(
             theme,
         )
     });
+    let from = diff
+        .lines
+        .partition_point(|line| line.drawn.end <= shown.start);
+    let to = diff
+        .lines
+        .partition_point(|line| line.drawn.start < shown.end);
+    let rows = diff.lines[from..to.max(from)].iter().map(|line| {
+        let (fill, gutter, marker, word) = match line.kind {
+            LineKind::Added => (Some(c.add_bg), Some(c.add_gut), "+", c.add_word),
+            LineKind::Removed => (Some(c.del_bg), Some(c.del_gut), "−", c.del_word),
+            LineKind::Context => (None, None, "", c.add_word),
+        };
+        let opens = line.drawn.start >= shown.start;
+        let number = match line.kind {
+            LineKind::Removed => line.old,
+            _ => line.new,
+        }
+        .filter(|_| opens);
+        /* The lines of the text this row draws of the line. */
+        let lines = line.segments.start + shown.start.saturating_sub(line.drawn.start)
+            ..line.segments.end - line.drawn.end.saturating_sub(shown.end);
+        let words: Vec<(Range<usize>, ())> =
+            line.words.iter().map(|word| (word.clone(), ())).collect();
+        let (text, syntax) = drawn(&diff.text, lines.clone(), &diff.marks, |mark| {
+            mark_style(mark, theme)
+        });
+        let (_, words) = drawn(&diff.text, lines.clone(), &words, |()| HighlightStyle {
+            background_color: Some(word),
+            ..HighlightStyle::default()
+        });
+        let (_, found) = drawn(&diff.text, lines, finds, |current| {
+            found_style(current, theme)
+        });
+        let marked: Vec<_> = gpui::combine_highlights(syntax, words).collect();
+        let highlights: Vec<_> = gpui::combine_highlights(marked, found).collect();
+        div()
+            .flex()
+            .items_stretch()
+            .min_h(px(20.))
+            .when_some(fill, |this, fill| this.bg(fill))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(36.))
+                    .pr(theme.spacing.sm)
+                    .flex()
+                    .justify_end()
+                    .text_color(c.fg3)
+                    .text_spec(&theme.text.code)
+                    .when_some(gutter, |this, gutter| this.bg(gutter))
+                    .children(number.map(|number| number.to_string())),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(16.))
+                    .flex()
+                    .justify_center()
+                    .text_color(c.fg2)
+                    .text_spec(&theme.text.code)
+                    .when_some(gutter, |this, gutter| this.bg(gutter))
+                    .children(opens.then_some(marker)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .pl(px(4.))
+                    .text_color(c.fg)
+                    .text_spec(&theme.text.code)
+                    .child(StyledText::new(text).with_highlights(highlights)),
+            )
+    });
     div()
         .flex()
         .flex_col()
         .font_family(theme.fonts.mono.clone())
         .children(hunk)
-        .children(diff.lines[lines].iter().map(|line| {
-            let (fill, gutter, marker, word) = match line.kind {
-                LineKind::Added => (Some(c.add_bg), Some(c.add_gut), "+", c.add_word),
-                LineKind::Removed => (Some(c.del_bg), Some(c.del_gut), "−", c.del_word),
-                LineKind::Context => (None, None, "", c.add_word),
-            };
-            let number = match line.kind {
-                LineKind::Removed => line.old,
-                _ => line.new,
-            };
-            let range = line.range.clone();
-            let shown = &diff.text[range.clone()];
-            let syntax = diff
-                .marks
-                .iter()
-                .filter(|(it, _)| it.start < range.end && it.end > range.start)
-                .map(|(it, mark)| {
-                    (
-                        it.start.max(range.start) - range.start
-                            ..it.end.min(range.end) - range.start,
-                        mark_style(*mark, theme),
-                    )
-                });
-            let words = line.words.iter().map(|it| {
-                (
-                    it.start - range.start..it.end - range.start,
-                    HighlightStyle {
-                        background_color: Some(word),
-                        ..HighlightStyle::default()
-                    },
-                )
-            });
-            let marked: Vec<_> = gpui::combine_highlights(syntax, words).collect();
-            let found: Vec<(Range<usize>, HighlightStyle)> = finds
-                .iter()
-                .filter(|(it, _)| it.start >= range.start && it.end <= range.end)
-                .map(|(it, current)| {
-                    (
-                        it.start - range.start..it.end - range.start,
-                        found_style(*current, theme),
-                    )
-                })
-                .collect();
-            let highlights: Vec<_> = gpui::combine_highlights(marked, found).collect();
-            div()
-                .flex()
-                .items_stretch()
-                .min_h(px(20.))
-                .when_some(fill, |this, fill| this.bg(fill))
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(36.))
-                        .pr(theme.spacing.sm)
-                        .flex()
-                        .justify_end()
-                        .text_color(c.fg3)
-                        .text_spec(&theme.text.code)
-                        .when_some(gutter, |this, gutter| this.bg(gutter))
-                        .children(number.map(|number| number.to_string())),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(16.))
-                        .flex()
-                        .justify_center()
-                        .text_color(c.fg2)
-                        .text_spec(&theme.text.code)
-                        .when_some(gutter, |this, gutter| this.bg(gutter))
-                        .child(marker),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .pl(px(4.))
-                        .text_color(c.fg)
-                        .text_spec(&theme.text.code)
-                        .child(
-                            StyledText::new(clean(shown).into_owned()).with_highlights(
-                                highlights
-                                    .into_iter()
-                                    .filter(|(it, _)| shown.get(it.clone()).is_some())
-                                    .collect::<Vec<_>>(),
-                            ),
-                        ),
-                )
-        }))
+        .children(rows)
         .into_any_element()
-}
-
-/**
- * A line of a diff as drawn: a tab as four spaces and a bidirectional control as `?`, each the
- * width of what it stands for in the line's bytes, so the marks found in the line still fall
- * where they were.
- */
-fn clean(line: &str) -> std::borrow::Cow<'_, str> {
-    if !line.contains(|c: char| c == '\t' || crate::hostile::is_bidi_control(c)) {
-        return std::borrow::Cow::Borrowed(line);
-    }
-    std::borrow::Cow::Owned(
-        line.chars()
-            .map(|c| match c {
-                '\t' => ' '.to_string(),
-                c if crate::hostile::is_bidi_control(c) => "?".repeat(c.len_utf8()),
-                c => c.to_string(),
-            })
-            .collect(),
-    )
 }
 
 /// A hunk row (`hunk` fill, its text in `blue`).
@@ -412,12 +421,10 @@ pub fn diff_more(
     cx: &mut Context<ReaderView>,
 ) -> AnyElement {
     let c = &theme.colors;
-    let first = if written {
-        FIRST_WRITTEN_LINES
-    } else {
-        FIRST_DIFF_LINES
+    let more = match diff_rest(diff, written) {
+        (0, _) => "+ the rest of a long line".to_string(),
+        (lines, _) => format!("+{} more lines", format::count(lines as u64)),
     };
-    let more = diff.lines.len().saturating_sub(first);
     let toggle = Toggle::AllLines(at.clone(), None);
     let click = cx.listener(move |_, _: &ClickEvent, _, cx| {
         let reader = cx.services().reader.clone();
@@ -433,7 +440,7 @@ pub fn diff_more(
                 if all {
                     "Show fewer".to_string()
                 } else {
-                    format!("··· {} more lines", format::count(more as u64))
+                    format!("··· {}", more.trim_start_matches('+'))
                 },
                 theme,
             ))
@@ -449,9 +456,7 @@ pub fn diff_more(
         .border_color(c.line_subtle)
         .text_color(c.fg3)
         .text_spec(&theme.text.small)
-        .when(!all, |this| {
-            this.child(format!("+{} more lines", format::count(more as u64)))
-        })
+        .when(!all, |this| this.child(more))
         .child(
             div()
                 .id(("diff-more", ix))
@@ -516,9 +521,14 @@ pub fn todo(text: &str, state: TodoState, first: bool, last: bool, theme: &SbThe
         .into_any_element()
 }
 
-/// One of a web search's results (DESIGN §4.2.4): its title in `accent-text`, where it is in
-/// mono 11 `fg3`.
-pub fn result(title: &str, url: &str, theme: &SbTheme) -> AnyElement {
+/// One of a web search's results (DESIGN §4.2.4): its title in `accent-text` with Find's
+/// matches in it, where it is in mono 11 `fg3`.
+pub fn result(
+    title: &str,
+    url: &str,
+    finds: &[(Range<usize>, bool)],
+    theme: &SbTheme,
+) -> AnyElement {
     let c = &theme.colors;
     let place = url
         .split_once("://")
@@ -537,7 +547,18 @@ pub fn result(title: &str, url: &str, theme: &SbTheme) -> AnyElement {
                 .whitespace_nowrap()
                 .text_color(c.accent_text)
                 .text_spec(&theme.text.secondary)
-                .child(hostile::label(title)),
+                .child({
+                    let ranges: Vec<Range<usize>> =
+                        finds.iter().map(|(range, _)| range.clone()).collect();
+                    let (label, ranges) = hostile::label_ranges(title, &ranges);
+                    let highlights: Vec<_> = ranges
+                        .into_iter()
+                        .zip(finds)
+                        .filter(|(range, _)| !range.is_empty())
+                        .map(|(range, (_, current))| (range, found_style(*current, theme)))
+                        .collect();
+                    StyledText::new(label).with_highlights(highlights)
+                }),
         )
         .child(
             div()
@@ -589,13 +610,19 @@ pub fn results_more(
         .into_any_element()
 }
 
-/// A piece of a web fetch's result (DESIGN §4.2.4): Markdown at 13/20, or its text as it is.
+/**
+ * A row of a web fetch's result (DESIGN §4.2.4): a piece of Markdown at 13/20, or the `chunk`th
+ * row of a piece shown as text, [`CHUNK_LINES`] lines a row, with Find's matches `finds`.
+ */
+#[allow(clippy::too_many_arguments)]
 pub fn fetched(
     view: &mut ReaderView,
     ix: usize,
     at: &BlockRef,
     body: &CallBody,
     index: usize,
+    chunk_index: usize,
+    finds: &[(Range<usize>, bool)],
     theme: &SbTheme,
     cx: &mut Context<ReaderView>,
 ) -> AnyElement {
@@ -625,7 +652,12 @@ pub fn fetched(
         Some(ProsePiece::Code { text, .. } | ProsePiece::Plain { text, .. }) => div()
             .text_color(theme.colors.fg2)
             .text_spec(&theme.text.code)
-            .child(styled(text, 0..text.line_count(), &[], theme))
+            .child(styled(
+                text,
+                chunk(chunk_index, true, CHUNK_LINES, text.line_count()),
+                finds,
+                theme,
+            ))
             .into_any_element(),
         None => div().into_any_element(),
     };
@@ -641,7 +673,6 @@ pub fn fetched(
  * labelled on the first; below 560 of the column's width they stack, as each column is at
  * least half that.
  */
-#[allow(clippy::too_many_arguments)]
 pub fn pair(
     body: &CallBody,
     chunk_index: usize,

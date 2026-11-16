@@ -62,7 +62,7 @@ impl Archive {
         let item = readings
             .iter()
             .find(|reading| reading.key == key)
-            .ok_or_else(|| CatalogueError::NoSession(id.clone()))?
+            .ok_or_else(|| CatalogueError::NotAnItem(key.to_string()))?
             .item;
         let length = self
             .catalogue

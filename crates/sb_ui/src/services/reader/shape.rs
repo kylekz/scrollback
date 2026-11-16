@@ -94,7 +94,7 @@ pub fn target(call: &ToolCall, root: Option<&str>) -> String {
                 format!(
                     "{}  {first}–{}",
                     path(file),
-                    first + lines.saturating_sub(1)
+                    first.saturating_add(lines.saturating_sub(1))
                 )
             }
             (Some(first), None) => format!("{}  {first}–", path(file)),
@@ -164,7 +164,7 @@ pub fn edit(call: &ToolCall, items: &dyn SessionItems) -> Option<Result<diff::Di
         ToolInput::Write { path, content } => (None, content, path),
         _ => return None,
     };
-    let start = match call
+    let changed = match call
         .result
         .as_ref()
         .and_then(|result| result.brief.as_ref())
@@ -172,22 +172,12 @@ pub fn edit(call: &ToolCall, items: &dyn SessionItems) -> Option<Result<diff::Di
         Some(Brief::Changed {
             start: Some((old, new)),
             ..
-        }) => (
-            u32::try_from(*old).unwrap_or(1),
-            u32::try_from(*new).unwrap_or(1),
-        ),
-        _ => (1, 1),
-    };
-    let load = |stored: &Stored| {
-        stored
-            .load_head(items, DIFF_BYTES)
-            .map(|(text, _)| text)
-            .map_err(|error| error.to_string())
+        }) => Some((*old, *new)),
+        _ => None,
     };
     let made = (|| {
-        let old = old.map(load).transpose()?.unwrap_or_default();
-        let new = load(new)?;
-        let mut made = diff::diff(&old, &new, start);
+        let (old, new) = edit_texts(old, new, items)?;
+        let mut made = diff::diff(&old, &new, edit_start(changed, &old, &new));
         let language = extension(path);
         let shift = old.len() + 1;
         made.marks = highlighted(&old, language, &|| true);
@@ -201,6 +191,43 @@ pub fn edit(call: &ToolCall, items: &dyn SessionItems) -> Option<Result<diff::Di
     Some(made)
 }
 
+/**
+ * The lines, before and after, an edit's diff of `old` and `new` starts at: the agent says
+ * where its first changed line is (`changed`), and the diff starts at the lines the edit kept
+ * before it. The numbers are the transcript's, so taken without overflowing.
+ */
+pub fn edit_start(changed: Option<(u64, u64)>, old: &str, new: &str) -> (u32, u32) {
+    let lead = diff::leading(old, new) as u64;
+    let at = |line: u64| u32::try_from(line.saturating_sub(lead).max(1)).unwrap_or(u32::MAX);
+    changed.map_or((1, 1), |(old, new)| (at(old), at(new)))
+}
+
+/// An edit's text before and after, each up to [`DIFF_BYTES`]; a write's after alone.
+fn edit_texts(
+    old: Option<&Stored>,
+    new: &Stored,
+    items: &dyn SessionItems,
+) -> Result<(String, String), String> {
+    let load = |stored: &Stored| {
+        stored
+            .load_head(items, DIFF_BYTES)
+            .map(|(text, _)| text)
+            .map_err(|error| error.to_string())
+    };
+    Ok((old.map(load).transpose()?.unwrap_or_default(), load(new)?))
+}
+
+/// The text of an edit's or a write's diff, as Find searches it; `None` for another call.
+pub fn edit_text(call: &ToolCall, items: &dyn SessionItems) -> Option<String> {
+    let (old, new) = match &call.input {
+        ToolInput::Edit { old, new, .. } => (Some(old), new),
+        ToolInput::Write { content, .. } => (None, content),
+        _ => return None,
+    };
+    let (old, new) = edit_texts(old, new, items).ok()?;
+    Some(diff::text(&old, &new))
+}
+
 /// What a call's body shows its input as: printed again as JSON, MCP's coloured, a tool's that
 /// no provider knows on one line (DESIGN §4.2.4).
 pub fn input(call: &ToolCall, text: String) -> Text {
@@ -208,6 +235,24 @@ pub fn input(call: &ToolCall, text: String) -> Text {
         ToolKind::Mcp => coloured(json::pretty(text)),
         ToolKind::Other => coloured(json::one_line(text)),
         _ => Text::new(json::pretty(text)),
+    }
+}
+
+/// The text of what [`input`] shows, without its marks: what Find searches.
+pub fn input_text(call: &ToolCall, text: String) -> String {
+    match call.kind {
+        ToolKind::Other => json::one_line(text),
+        _ => json::pretty(text),
+    }
+}
+
+/// The text of what [`output`] shows, without its marks: what Find searches.
+pub fn output_text(call: &ToolCall, text: String) -> String {
+    match call.kind {
+        ToolKind::Shell => ansi::strip_text(&text),
+        ToolKind::Mcp => json::pretty(text),
+        ToolKind::Other => json::one_line(text),
+        _ => text,
     }
 }
 
@@ -219,7 +264,8 @@ pub fn output(call: &ToolCall, text: String) -> Text {
             Text::marked(text, marks)
         }
         (ToolInput::Read { path, .. }, _) => {
-            let marks = numbered(&text, extension(path), &|| true);
+            let separator = call.result.as_ref().and_then(|result| result.numbered);
+            let marks = numbered(&text, separator, extension(path), &|| true);
             Text::marked(text, marks)
         }
         (ToolInput::ContentSearch { pattern, .. }, _) => {
@@ -247,38 +293,40 @@ pub fn extension(path: &str) -> Option<&str> {
 }
 
 /**
- * The start of a line numbered as `cat -n` numbers it (`   36→` or `   36\t`, spaces, digits, a
- * tab or an arrow): the end of its number and where its content starts.
+ * The start of a line that gives its number as its provider said the read's lines do
+ * ([`sb_core::transcript::ToolResult::numbered`]): spaces, digits, then `separator`. The end
+ * of its number and where its content starts.
  */
-fn number_of(line: &str) -> Option<(usize, usize)> {
+fn number_of(line: &str, separator: char) -> Option<(usize, usize)> {
     let digits = line.trim_start_matches(' ');
     let start = line.len() - digits.len();
     let count = digits.bytes().take_while(u8::is_ascii_digit).count();
-    if count == 0 {
+    if count == 0 || !digits[count..].starts_with(separator) {
         return None;
     }
-    let after = &digits[count..];
-    let separator = ['\t', '→']
-        .into_iter()
-        .find(|separator| after.starts_with(*separator))?;
     Some((start + count, start + count + separator.len_utf8()))
 }
 
 /**
- * The marks of a file's lines as read: each line's number when every line is numbered as
- * `cat -n` numbers it, and the content's syntax by `language` (an extension), within the
- * highlighter's bounds ([`crate::syntax`]) and while `wanted` says.
+ * The marks of a file's lines as read: each line's number when its provider said they are
+ * numbered (with `separator` after each) and every line is, and the content's syntax by
+ * `language` (an extension), within the highlighter's bounds ([`crate::syntax`]) and while
+ * `wanted` says.
  */
 pub fn numbered(
     text: &str,
+    separator: Option<char>,
     language: Option<&str>,
     wanted: &dyn Fn() -> bool,
 ) -> Vec<(Range<usize>, Mark)> {
+    let Some(separator) = separator else {
+        return highlighted(text, language, wanted);
+    };
     let mut starts = Vec::new();
     let mut offset = 0;
     for line in text.split_inclusive('\n') {
         let shown = line.trim_end_matches(['\n', '\r']);
-        match number_of(shown) {
+        match number_of(shown, separator) {
             Some((number, content)) => starts.push((offset, number, content, shown.len())),
             None if shown.is_empty() => {}
             None => return highlighted(text, language, wanted),
@@ -464,7 +512,7 @@ mod tests {
     #[test]
     fn a_file_read_is_numbered_and_highlighted_by_its_extension() {
         let text = "    28\tfn main() {\n    29\t    let x = 1;\n";
-        let marks = numbered(text, Some("rs"), &|| true);
+        let marks = numbered(text, Some('\t'), Some("rs"), &|| true);
         let shown = shown(text, &marks);
         assert_eq!(shown[0], ("    28".to_string(), Mark::Number));
         assert!(shown.contains(&("fn".to_string(), Mark::Token(TokenKind::Keyword))));
@@ -474,8 +522,9 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].0.end <= pair[1].0.start)
         );
-        /* Not numbered: highlighted as it is. */
-        assert!(numbered("let x = 1;", Some("rs"), &|| true).len() > 1);
+        /* Not numbered, or not said to be: highlighted as it is. */
+        assert!(numbered("let x = 1;", Some('\t'), Some("rs"), &|| true).len() > 1);
+        assert!(!numbered(text, None, Some("rs"), &|| true).contains(&(4..6, Mark::Number)));
         assert_eq!(extension("/home/user/a.b/Makefile"), None);
         assert_eq!(extension("C:\\code\\main.rs"), Some("rs"));
     }
@@ -528,7 +577,7 @@ mod tests {
         found(&"a".repeat(100_000), "(a*)*b");
         /* Numbered lines by the hundred thousand, of a language highlighted. */
         let lines: String = (1..100_000).map(|n| format!("{n:>6}\tx = {n}\n")).collect();
-        numbered(&lines, Some("py"), &|| true);
+        numbered(&lines, Some('\t'), Some("py"), &|| true);
         /* Brackets and quotes that open lists everywhere. */
         results(&"[{\"title\":".repeat(100_000));
         assert!(

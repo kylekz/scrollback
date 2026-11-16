@@ -30,15 +30,19 @@ use gpui_component::input::{InputEvent, InputState};
 use sb_core::search::find_all;
 use sb_core::transcript::{At, InSubagent};
 
-use super::rows::{
-    BodyPart, CHUNK_LINES, FIRST_DIFF_LINES, FIRST_LINES, FIRST_WRITTEN_LINES, RowKind,
-};
+use super::rows::{BodyPart, CHUNK_LINES, FIRST_LINES, FIRST_RESULTS, RowKind};
 use super::{Piece, ReaderView};
-use crate::services::reader::find::{Findings, Found, Spot};
+use crate::services::reader::find::{Findings, Found, SUBAGENTS, Spot};
+use crate::services::reader::shape::diff::Diff;
 use crate::services::reader::shape::{Renderer, renderer};
-use crate::services::reader::{BlockRef, Load, OpenSession, Part, Toggle};
+use crate::services::reader::{
+    BlockRef, CallBody, Load, OpenSession, Part, Piece as ProsePiece, ReaderService, Toggle,
+};
 use crate::services::{ActiveServices as _, ReadAt};
 use crate::theme::ActiveTheme as _;
+
+/// Where the matches are in each piece of a web fetch's result.
+type PieceFinds = Arc<Vec<Vec<Range<usize>>>>;
 
 /// The most matches lit in one piece of prose.
 pub const PIECE_MATCHES: usize = 1_000;
@@ -53,8 +57,14 @@ pub(super) struct Find {
     /// What the last search that landed found, with its matches by where they are and by turn.
     pub(super) findings: Option<Arc<Findings>>,
     by_spot: HashMap<Spot, Range<usize>>,
-    pub(super) turns: BTreeMap<usize, usize>,
+    /// How many matches each turn of the session's own conversation has.
+    pub(super) turns: Arc<BTreeMap<usize, usize>>,
     pub(super) current: Option<usize>,
+    /// A search was asked for while no session was open: it runs once one is.
+    waiting: bool,
+    /// Where in each piece of a web fetch's result its matches are, worked out once a count
+    /// ([`ReaderView::fetched_finds`]).
+    fetched: HashMap<BlockRef, (u64, PieceFinds)>,
     /// Going to the current match, until its row is laid out.
     revealing: bool,
     /// When the search lands, the match to make current: where a search match opened the
@@ -89,8 +99,10 @@ impl Find {
             going: None,
             findings: None,
             by_spot: HashMap::new(),
-            turns: BTreeMap::new(),
+            turns: Arc::default(),
             current: None,
+            waiting: false,
+            fetched: HashMap::new(),
             revealing: false,
             at_flash: None,
             generation: 0,
@@ -110,8 +122,16 @@ impl Find {
             return Some("No matches".to_string());
         }
         let more = if findings.capped { "+" } else { "" };
+        let left = if findings.subagents_left {
+            format!(
+                " · first {} subagents",
+                crate::format::count(SUBAGENTS as u64)
+            )
+        } else {
+            String::new()
+        };
         Some(format!(
-            "{} of {}{more}",
+            "{} of {}{more}{left}",
             crate::format::count(self.current.map_or(0, |at| at + 1) as u64),
             crate::format::count(findings.matches.len() as u64)
         ))
@@ -138,6 +158,7 @@ pub fn spot_kind(spot: &Spot) -> String {
         Spot::Part(_, Some(part)) => format!("output/{part}"),
         Spot::Diff(_) => "diff".to_string(),
         Spot::Fetched(_) => "fetched".to_string(),
+        Spot::Result(_, index) => format!("result/{index}"),
     }
 }
 
@@ -195,8 +216,12 @@ impl ReaderView {
         let Some(task) =
             reader.update(cx, |reader, cx| reader.find(query, root, going.clone(), cx))
         else {
+            /* Nothing open to search: it runs once the session is ([`Self::reopened`]). */
+            find.waiting = true;
+            self.clear_found(cx);
             return;
         };
+        find.waiting = false;
         let wait = cx.spawn(async move |this, cx| {
             let findings = task.await;
             this.update(cx, |this, cx| {
@@ -219,16 +244,18 @@ impl ReaderView {
         };
         find.going = None;
         find.by_spot.clear();
-        find.turns.clear();
+        find.fetched.clear();
+        let mut turns = BTreeMap::new();
         for (index, found) in findings.matches.iter().enumerate() {
             find.by_spot
                 .entry(found.spot.clone())
                 .and_modify(|range| range.end = index + 1)
                 .or_insert(index..index + 1);
             if let Some(turn) = found.turn {
-                *find.turns.entry(turn).or_default() += 1;
+                *turns.entry(turn).or_default() += 1;
             }
         }
+        find.turns = Arc::new(turns);
         let flashed = find.at_flash.take().and_then(|(at, _)| {
             findings
                 .matches
@@ -260,7 +287,8 @@ impl ReaderView {
         };
         find.findings = None;
         find.by_spot.clear();
-        find.turns.clear();
+        find.turns = Arc::default();
+        find.fetched.clear();
         find.current = None;
         find.generation += 1;
         for piece in std::mem::take(&mut find.lit).into_keys() {
@@ -269,6 +297,30 @@ impl ReaderView {
             }
         }
         cx.notify();
+    }
+
+    /**
+     * The open session was parsed again (another version read, the reading copy changed), or
+     * opened while a search waited for it: what was found is of another text, so it goes, and
+     * an active Find searches again.
+     */
+    pub(super) fn reopened(&mut self, cx: &mut Context<Self>) {
+        let Some(find) = self.find.as_mut() else {
+            return;
+        };
+        if let Some((going, _)) = find.going.take() {
+            going.store(false, Ordering::Relaxed);
+        }
+        let query = find.query.clone();
+        self.clear_found(cx);
+        if !query.trim().is_empty() {
+            self.search(query, None, cx);
+        }
+    }
+
+    /// Whether a search waits for a session to open.
+    pub(super) fn find_waits(&self) -> bool {
+        self.find.as_ref().is_some_and(|find| find.waiting)
     }
 
     /// Fills Find with `query` and searches, without going to a match (a search match the
@@ -394,6 +446,27 @@ impl ReaderView {
                 inside(open, found.spot.block()),
             )
         };
+        /* Inside a subagent whose way down isn't known yet: its placement is worked out, and
+        this goes on once it lands. */
+        if chain.is_none()
+            && self
+                .rows
+                .iter()
+                .all(|row| row.block() != Some(found.spot.block()))
+            && cx
+                .services()
+                .reader
+                .read(cx)
+                .open_session()
+                .is_some_and(|open| {
+                    open.main()
+                        .is_none_or(|main| main.item != found.spot.block().conversation)
+                        && open.placement().is_none()
+                })
+        {
+            reader.update(cx, ReaderService::want_placement);
+            return;
+        }
         /* Inside a subagent: the way down to it is opened as opening at a match opens it. */
         if let Some(read_at) = chain
             && self
@@ -466,6 +539,23 @@ impl ReaderView {
             };
             Some(text.line_at(found.range.start))
         };
+        /* A web fetch's match: the piece it is in, and its line there when it is text. */
+        let fetched = match &found.spot {
+            Spot::Fetched(_) => {
+                let body = body.as_ref()?;
+                let ordinal = self.ordinal(found)?;
+                let (piece, index) = locate(&self.fetched_finds(at, body)?, ordinal)?;
+                let line = match body.fetched.as_ref()?.pieces.get(piece)? {
+                    ProsePiece::Code { text, .. } | ProsePiece::Plain { text, .. } => {
+                        let ranges = &self.fetched_finds(at, body)?[piece];
+                        text.line_at(ranges.get(index)?.start)
+                    }
+                    ProsePiece::Markdown(_) => 0,
+                };
+                Some((piece, line))
+            }
+            _ => None,
+        };
         let wanted = |row: &RowKind| -> Option<usize> {
             match (&found.spot, row) {
                 (Spot::Prose(it), RowKind::Prose { at, .. })
@@ -473,14 +563,29 @@ impl ReaderView {
                 | (Spot::Prose(it), RowKind::Compaction { at, .. })
                 | (Spot::Prose(it), RowKind::Prompt(at))
                 | (Spot::Target(it), RowKind::Call { at, .. })
-                | (
+                    if it == at =>
+                {
+                    Some(0)
+                }
+                (
+                    Spot::Result(it, index),
+                    RowKind::Body {
+                        at,
+                        part: BodyPart::Result(row),
+                        ..
+                    },
+                ) if it == at && index == row => Some(0),
+                (
                     Spot::Fetched(it),
                     RowKind::Body {
                         at,
-                        part: BodyPart::Fetched(0),
+                        part: BodyPart::Fetched { piece, chunk },
                         ..
                     },
-                ) if it == at => Some(0),
+                ) if it == at => {
+                    let (want, line) = fetched?;
+                    (want == *piece && line / CHUNK_LINES == *chunk).then_some(line % CHUNK_LINES)
+                }
                 (
                     Spot::Part(it, part),
                     RowKind::Body {
@@ -520,11 +625,11 @@ impl ReaderView {
                         Some(Ok(diff)) => diff.clone(),
                         _ => return None,
                     };
-                    let line = diff
-                        .lines
-                        .iter()
-                        .position(|line| line.range.end >= found.range.start)?;
-                    (line / CHUNK_LINES == *chunk).then_some(line % CHUNK_LINES + 1)
+                    let line = &diff.lines[diff_line(&diff, found)?];
+                    let drawn = line.drawn.start
+                        + (diff.text.line_at(found.range.start))
+                            .saturating_sub(line.segments.start);
+                    (drawn / CHUNK_LINES == *chunk).then_some(drawn % CHUNK_LINES + 1)
                 }
                 _ => None,
             }
@@ -546,7 +651,7 @@ impl ReaderView {
         cx: &mut App,
     ) {
         let colors = cx.sb_theme().colors;
-        let Some(find) = self.find.as_mut().filter(|find| find.is_active()) else {
+        let Some(find) = self.find.as_ref().filter(|find| find.is_active()) else {
             return;
         };
         if find
@@ -556,10 +661,25 @@ impl ReaderView {
         {
             return;
         }
-        let spots = [
-            Spot::Prose(piece.at.clone()),
-            Spot::Fetched(piece.at.clone()),
-        ];
+        let fetched = Spot::Fetched(piece.at.clone());
+        /* In a web fetch's result, the matches of the pieces before this one. */
+        let earlier = find.by_spot.contains_key(&fetched).then(|| {
+            let reader = cx.services().reader.read(cx);
+            let body = match reader.open_session()?.body(&piece.at)? {
+                Load::Loaded(body) => body.clone(),
+                _ => return None,
+            };
+            Some(
+                self.fetched_finds(&piece.at, &body)?[..piece.piece]
+                    .iter()
+                    .map(Vec::len)
+                    .sum::<usize>(),
+            )
+        });
+        let Some(find) = self.find.as_mut() else {
+            return;
+        };
+        let spots = [Spot::Prose(piece.at.clone()), fetched];
         let current = find
             .current()
             .filter(|found| spots.contains(&found.spot))
@@ -575,12 +695,13 @@ impl ReaderView {
         }
         /* The current match's place among its block's: this piece's start is how many the
         pieces before it have. */
-        let before: usize = find
-            .lit
-            .iter()
-            .filter(|(lit, _)| lit.at == piece.at && lit.piece < piece.piece)
-            .map(|(_, (_, count))| count)
-            .sum();
+        let before: usize = earlier.flatten().unwrap_or_else(|| {
+            find.lit
+                .iter()
+                .filter(|(lit, _)| lit.at == piece.at && lit.piece < piece.piece)
+                .map(|(_, (_, count))| count)
+                .sum()
+        });
         let rendered = state.read(cx).rendered_text();
         let ranges = find_all(rendered.as_str(), &find.query, PIECE_MATCHES);
         let highlights = ranges.iter().enumerate().map(|(index, range)| {
@@ -596,6 +717,96 @@ impl ReaderView {
             find.lit
                 .insert(piece.clone(), (find.generation, ranges.len()));
         }
+    }
+}
+
+/// The line of `diff` that holds the match `found`.
+fn diff_line(diff: &Diff, found: &Found) -> Option<usize> {
+    let line = diff
+        .lines
+        .partition_point(|line| line.range.end < found.range.start);
+    (line < diff.lines.len()).then_some(line)
+}
+
+/// Which piece's matches the `ordinal`th of a block's is, and its place among them.
+fn locate(pieces: &[Vec<Range<usize>>], mut ordinal: usize) -> Option<(usize, usize)> {
+    for (piece, ranges) in pieces.iter().enumerate() {
+        if ordinal < ranges.len() {
+            return Some((piece, ordinal));
+        }
+        ordinal -= ranges.len();
+    }
+    None
+}
+
+impl ReaderView {
+    /// The place of `found` among the matches of its spot.
+    fn ordinal(&self, found: &Found) -> Option<usize> {
+        let find = self.find.as_ref()?;
+        let range = find.by_spot.get(&found.spot)?;
+        let at = find.current?;
+        range.contains(&at).then(|| at - range.start)
+    }
+
+    /**
+     * Where Find's matches are in each piece of the web fetch's result at `at`, found again in
+     * each piece's text (a Markdown piece's as written), once for what Find found.
+     */
+    fn fetched_finds(&self, at: &BlockRef, body: &CallBody) -> Option<PieceFinds> {
+        let find = self.find.as_ref().filter(|find| find.is_active())?;
+        if let Some((generation, found)) = find.fetched.get(at)
+            && *generation == find.generation
+        {
+            return Some(found.clone());
+        }
+        let found = Arc::new(
+            body.fetched
+                .iter()
+                .flat_map(|prose| prose.pieces.iter())
+                .map(|piece| {
+                    let text = match piece {
+                        ProsePiece::Markdown(sanitized) => sanitized.as_str(),
+                        ProsePiece::Code { text, .. } | ProsePiece::Plain { text, .. } => {
+                            text.text.as_str()
+                        }
+                    };
+                    find_all(text, &find.query, PIECE_MATCHES)
+                })
+                .collect::<Vec<_>>(),
+        );
+        Some(found)
+    }
+
+    /// Find's matches in the `piece`th piece of the web fetch's result at `at`, when it is
+    /// shown as text, with whether each is the current one.
+    pub(super) fn fetched_piece_finds(
+        &mut self,
+        at: &BlockRef,
+        body: &CallBody,
+        piece: usize,
+    ) -> Vec<(Range<usize>, bool)> {
+        let Some(found) = self.fetched_finds(at, body) else {
+            return Vec::new();
+        };
+        if let Some(find) = self.find.as_mut() {
+            find.fetched
+                .insert(at.clone(), (find.generation, found.clone()));
+        }
+        let current = self
+            .find
+            .as_ref()
+            .and_then(Find::current)
+            .filter(|it| it.spot == Spot::Fetched(at.clone()))
+            .cloned()
+            .and_then(|it| self.ordinal(&it))
+            .and_then(|ordinal| locate(&found, ordinal));
+        found
+            .get(piece)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, range)| (range.clone(), current == Some((piece, index))))
+            .collect()
     }
 }
 
@@ -653,22 +864,21 @@ fn opening(
             if let Some(Load::Loaded(body)) = open.body(at)
                 && let Some(Ok(diff)) = &body.diff
             {
-                let first = if call.kind == sb_core::transcript::ToolKind::Write {
-                    FIRST_WRITTEN_LINES
-                } else {
-                    FIRST_DIFF_LINES
-                };
-                let line = diff
-                    .lines
-                    .iter()
-                    .position(|line| line.range.end >= found.range.start)
-                    .unwrap_or(0);
-                if line >= first {
+                let written = call.kind == sb_core::transcript::ToolKind::Write;
+                let shown = super::kinds::diff_chunk(diff, 0, false, written);
+                let drawn = diff_line(diff, found).map_or(0, |line| diff.lines[line].drawn.start);
+                if drawn >= shown.end {
                     toggles.push(Toggle::AllLines(at.clone(), None));
                 }
             }
         }
         (Spot::Fetched(_), _) => toggles.push(Toggle::Call(at.clone())),
+        (Spot::Result(_, index), _) => {
+            toggles.push(Toggle::Call(at.clone()));
+            if *index >= FIRST_RESULTS {
+                toggles.push(Toggle::AllLines(at.clone(), None));
+            }
+        }
         _ => {}
     }
     toggles.retain(|toggle| !open.is_open(toggle, full_calls));
@@ -706,7 +916,15 @@ fn inside(open: &OpenSession, at: &BlockRef) -> Option<ReadAt> {
                 return Some((key, block));
             }
         }
-        None
+        /* A subagent Find read for itself is under one the reader hasn't: its placement
+        says which (its call is found as the way down is opened). */
+        match open.placement() {
+            Some(Load::Loaded(placement)) => placement
+                .parents
+                .get(item)
+                .map(|parent| (parent.clone(), sb_core::transcript::BlockId(0))),
+            _ => None,
+        }
     };
     let place = loop {
         if !seen.insert(item.clone()) {

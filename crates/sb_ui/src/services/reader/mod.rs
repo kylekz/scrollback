@@ -352,7 +352,7 @@ pub struct CallBody {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Versioned {
     pub key: Arc<str>,
-    pub history: History,
+    pub history: Arc<History>,
 }
 
 /// What a subagent says it is, from its own record of itself.
@@ -379,6 +379,55 @@ pub struct Gone {
     pub since: i64,
 }
 
+/**
+ * What the facts margin shows of the session's own conversation (DESIGN §4.2.8), worked out
+ * once, as the session is parsed: a frame draws it without walking the session.
+ */
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Margin {
+    /// Each turn's time and the start of its prompt, as a label.
+    pub turns: Arc<[(Option<i64>, String)]>,
+    /// The turn each block is in, by the block's place; `None` for one on no turn shown.
+    pub turn_of: Vec<Option<u32>>,
+    /// How many calls of each kind.
+    pub calls: Vec<(ToolKind, usize)>,
+}
+
+impl Margin {
+    fn of(main: &Conversation) -> Self {
+        let mut turn_of = vec![None; main.blocks().len()];
+        let turns = main
+            .turns()
+            .iter()
+            .enumerate()
+            .map(|(index, turn)| {
+                for block in &turn.blocks {
+                    turn_of[block.0] = u32::try_from(index).ok();
+                }
+                let first = &main[turn.blocks[0]];
+                let said = match &first.content {
+                    Content::Prompt { text, .. } => crate::hostile::label(
+                        text.lines()
+                            .find(|line| !line.trim().is_empty())
+                            .unwrap_or(""),
+                    ),
+                    _ => "(no prompt)".to_string(),
+                };
+                (first.at, said)
+            })
+            .collect();
+        let mut calls: std::collections::BTreeMap<ToolKind, usize> = Default::default();
+        for (_, call) in main.calls() {
+            *calls.entry(call.kind).or_default() += 1;
+        }
+        Self {
+            turns,
+            turn_of,
+            calls: calls.into_iter().collect(),
+        }
+    }
+}
+
 /// An open session: what was parsed, and what has been loaded since.
 pub struct OpenSession {
     pub id: SessionId,
@@ -397,9 +446,14 @@ pub struct OpenSession {
     fault: Option<String>,
     gone: Option<Gone>,
     /// The versions of the session's own transcript, and which is read (DESIGN §4.3).
-    history: Option<History>,
+    history: Option<Arc<History>>,
+    /// When verify found the version of it that is read damaged, if it did and said when.
+    damaged_on: Option<i64>,
     /// Those of the item read for a look, when it is another.
-    viewed_history: Option<History>,
+    viewed_history: Option<Arc<History>>,
+    /// The subagents Find read for itself, kept while the session is open ([`find`]).
+    found: find::Read,
+    margin: Margin,
     /// The version of one of the session's items read in place of its reading copy, for a
     /// look ([`ReaderService::view_version`]): the item's key, and the version's id.
     viewing: Option<(Arc<str>, i64)>,
@@ -483,9 +537,28 @@ impl OpenSession {
         self.gone.as_ref()
     }
 
+    /// How many subagents Find has read for itself.
+    #[cfg(test)]
+    pub fn found_count(&self) -> usize {
+        self.found
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// What the facts margin shows of the session's own conversation.
+    pub fn margin(&self) -> &Margin {
+        &self.margin
+    }
+
     /// The versions of the session's own transcript, when it has one.
-    pub fn history(&self) -> Option<&History> {
+    pub fn history(&self) -> Option<&Arc<History>> {
         self.history.as_ref()
+    }
+
+    /// When verify found the version read of the session's own transcript damaged, if it is.
+    pub fn damaged_on(&self) -> Option<i64> {
+        self.damaged_on
     }
 
     /// The version read for a look in place of an item's reading copy, if one is.
@@ -494,7 +567,7 @@ impl OpenSession {
     }
 
     /// The versions of the item read for a look, when it isn't the session's own transcript.
-    pub fn viewed_history(&self) -> Option<&History> {
+    pub fn viewed_history(&self) -> Option<&Arc<History>> {
         self.viewed_history.as_ref()
     }
 
@@ -653,6 +726,8 @@ pub struct ReaderService {
     /// The version of an item of the open session read for a look (DESIGN §4.3): its key and
     /// the version's id. It goes when another session opens.
     viewing: Option<(Arc<str>, i64)>,
+    /// Why making a version the reading copy failed, until the owner dismisses it.
+    copy_failure: Option<String>,
     /// Counts the opens, so that what an earlier one asked for is dropped when it lands.
     generation: u64,
     /// The loads of this generation not landed yet.
@@ -712,6 +787,7 @@ impl ReaderService {
             state: ReaderState::Closed,
             full_calls: false,
             viewing: None,
+            copy_failure: None,
             generation: 0,
             loading: 0,
             reads: 0,
@@ -738,6 +814,22 @@ impl ReaderService {
 
     pub fn full_calls(&self) -> bool {
         self.full_calls
+    }
+
+    /// Why making a version the reading copy failed, until dismissed.
+    pub fn copy_failure(&self) -> Option<&str> {
+        self.copy_failure.as_deref()
+    }
+
+    pub fn dismiss_copy_failure(&mut self, cx: &mut Context<Self>) {
+        self.copy_failure = None;
+        cx.notify();
+    }
+
+    /// Counts the opens: a session open now under another count than before was parsed again
+    /// (another version read, the reading copy changed), and what was found in it is stale.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /**
@@ -890,6 +982,9 @@ impl ReaderService {
             this.update(cx, |this, cx| {
                 if let Err(why) = made {
                     log::warn!("a version could not be made the reading copy: {why}");
+                    this.copy_failure = Some(why);
+                    cx.notify();
+                    return;
                 }
                 this.viewing = None;
                 this.reopen(cx);
@@ -1303,7 +1398,10 @@ impl ReaderService {
                         .into_iter()
                         .filter_map(|key| {
                             let history = archive.catalogue().history(&id, &key).ok()??;
-                            (history.versions.len() > 1).then_some(Versioned { key, history })
+                            (history.versions.len() > 1).then(|| Versioned {
+                                key,
+                                history: Arc::new(history),
+                            })
                         })
                         .collect(),
                 })
@@ -1559,6 +1657,7 @@ impl ReaderService {
                 })
                 .collect(),
             unattached: open.unattached.clone(),
+            read: open.found.clone(),
             root,
         };
         let (pinned, cache, provider) = (open.pinned.clone(), open.cache.clone(), open.provider);
@@ -1577,6 +1676,39 @@ impl ReaderService {
             .ok()
             .flatten()
         }))
+    }
+
+    /// What Find finds of `query` in the open session, here and now, while `going` says.
+    #[cfg(test)]
+    pub fn find_now(
+        &self,
+        query: &str,
+        going: &dyn Fn() -> bool,
+        cx: &gpui::App,
+    ) -> find::Findings {
+        let open = self.open_session().expect("a session is open");
+        let archive = self
+            .archive
+            .read(cx)
+            .archive()
+            .expect("the archive is open")
+            .clone();
+        let source = find::Source {
+            main: open.main.clone(),
+            subagents: HashMap::new(),
+            unattached: open.unattached.clone(),
+            read: find::Read::default(),
+            root: None,
+        };
+        let items = archive.pinned_session(&open.pinned, open.cache.clone());
+        find::search(
+            query,
+            &source,
+            self.providers[open.provider].as_ref(),
+            &items,
+            going,
+        )
+        .expect("the search is wanted")
     }
 
     /// Loads an unrecognised record as it was recorded.
@@ -1846,16 +1978,42 @@ fn parse(
         .map(|main| main.key.clone());
     let history = main_key
         .as_ref()
-        .and_then(|key| catalogue.history(id, key).ok().flatten());
+        .and_then(|key| catalogue.history(id, key).ok().flatten())
+        .map(Arc::new);
     let viewed_history = viewing
         .as_ref()
         .filter(|(key, _)| main_key.as_deref() != Some(&**key))
-        .and_then(|(key, _)| catalogue.history(id, key).ok().flatten());
+        .and_then(|(key, _)| catalogue.history(id, key).ok().flatten())
+        .map(Arc::new);
+    /* The last verify's record says when it found the version read damaged. */
+    let damaged_on = history
+        .as_ref()
+        .zip(main_key.as_ref())
+        .and_then(|(history, key)| {
+            let (read, _) = history
+                .versions
+                .iter()
+                .find(|(version, _)| version.id == history.reading && version.damaged)?;
+            let verify = catalogue.last_verify().ok().flatten()?;
+            verify
+                .damaged
+                .iter()
+                .any(|damage| {
+                    damage.location == id.location
+                        && damage.provider == id.provider
+                        && damage.key == *key
+                        && damage.version == read.number
+                })
+                .then_some(verify.at)
+        });
     let mut open = OpenSession {
         id: id.clone(),
         provider,
         history,
+        damaged_on,
         viewed_history,
+        found: find::Read::default(),
+        margin: Margin::default(),
         viewing,
         pinned: items.pinned().clone(),
         cache,
@@ -1883,6 +2041,7 @@ fn parse(
         settle(&mut main, &mut found);
         Arc::new(main)
     });
+    open.margin = open.main.as_deref().map(Margin::of).unwrap_or_default();
     if let Some(main) = &open.main {
         let item = main.item.clone();
         let started = Instant::now();

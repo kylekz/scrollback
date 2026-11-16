@@ -37,6 +37,8 @@ mod facts;
 #[cfg(test)]
 mod features_tests;
 mod find;
+#[cfg(test)]
+mod hostile_tests;
 mod kinds;
 mod place;
 #[cfg(test)]
@@ -175,8 +177,9 @@ pub struct ReaderView {
     /// fill it with when the view is next drawn.
     find: Option<find::Find>,
     filling: Option<(String, Option<(BlockRef, String)>)>,
-    /// The History popover open ([`facts`]).
+    /// The History popover open ([`facts`]), and how many of its versions it lays out.
     history: Option<facts::HistoryOf>,
+    history_shown: usize,
     /// The facts' turns, and the turn they last showed current.
     turns_scroll: UniformListScrollHandle,
     facts_turn: Option<usize>,
@@ -186,6 +189,8 @@ pub struct ReaderView {
     full_image: Option<ImageKey>,
     /// Whether the margin showed last frame: the window was wide enough.
     wide: bool,
+    /// The reader service's count of opens when the rows were last laid out of an open session.
+    generation: u64,
     _observers: [Subscription; 3],
 }
 
@@ -216,11 +221,13 @@ impl ReaderView {
             find: None,
             filling: None,
             history: None,
+            history_shown: facts::HISTORY_SHOWN,
             turns_scroll: UniformListScrollHandle::new(),
             facts_turn: None,
             facts_open: false,
             full_image: None,
             wide: true,
+            generation: 0,
             _observers: [
                 cx.observe(&reader, |this, _, cx| this.refresh(cx)),
                 cx.subscribe(&reader, |this, _, changed, cx| this.changed(changed, cx)),
@@ -337,6 +344,12 @@ impl ReaderView {
             }
             ReaderState::Closed => (None, Vec::new()),
         };
+        let generation = reader.generation();
+        let reopened = open_now(reader) && generation != self.generation && id == self.session;
+        if open_now(reader) {
+            self.generation = generation;
+        }
+        let waited = open_now(reader) && self.find_waits();
         if id != self.session {
             self.session = id;
             self.alone = None;
@@ -360,6 +373,9 @@ impl ReaderView {
             self.focus_first();
         } else {
             self.replace(0..self.rows.len(), rows);
+        }
+        if reopened || waited {
+            self.reopened(cx);
         }
         self.take_read_at(cx);
         self.place(cx);
@@ -1128,7 +1144,7 @@ impl ReaderView {
      * What stands over the column: an older version read for a look (DESIGN §4.3), a source
      * gone at its location, a version that failed verification, a read that failed (§4.14).
      */
-    fn render_banners(&self, open: &OpenSession, theme: &SbTheme) -> Vec<AnyElement> {
+    fn render_banners(&self, open: &OpenSession, theme: &SbTheme, cx: &App) -> Vec<AnyElement> {
         let c = &theme.colors;
         let mut banners = Vec::new();
         if let Some((key, version)) = open.viewing() {
@@ -1211,20 +1227,52 @@ impl ReaderView {
                 .iter()
                 .any(|(version, _)| version.id == history.reading && version.damaged)
         });
-        if damaged && open.viewing().is_none() {
+        if let Some(why) = cx.services().reader.read(cx).copy_failure() {
             banners.push(
                 bad_banner(theme)
                     .text_spec(&theme.text.row)
-                    .child(div().flex_1().min_w_0().child(
-                        "Part of this session failed verification. What follows the damage may                          be wrong.",
-                    ))
+                    .child(div().flex_1().min_w_0().child(format!(
+                        "That version couldn't be made the reading copy: {}.",
+                        crate::hostile::label(why.trim_end_matches('.'))
+                    )))
                     .child(
-                        button("reader-damage-details", ButtonKind::Plain, true, true, theme)
+                        button("reader-copy-dismiss", ButtonKind::Plain, true, true, theme)
                             .on_click(|_, _, cx| {
-                                let settings = cx.services().settings.clone();
-                                settings.update(cx, |settings, cx| settings.show(true, cx));
+                                let reader = cx.services().reader.clone();
+                                reader.update(cx, ReaderService::dismiss_copy_failure);
                             })
-                            .child("Details"),
+                            .child("Dismiss"),
+                    )
+                    .automation_target("reader/copy-failed")
+                    .into_any_element(),
+            );
+        }
+        if damaged && open.viewing().is_none() {
+            /* DESIGN §4.14, as far as the archive knows: when verify found it; the turn the
+            damage starts at isn't known. */
+            let found = open.damaged_on().map_or_else(String::new, |on| {
+                format!(" on {}", format::day(on, format::now()))
+            });
+            banners.push(
+                bad_banner(theme)
+                    .text_spec(&theme.text.row)
+                    .child(div().flex_1().min_w_0().child(format!(
+                        "Part of this session failed verification{found}. What follows the \
+                         damage may be wrong."
+                    )))
+                    .child(
+                        button(
+                            "reader-damage-details",
+                            ButtonKind::Plain,
+                            true,
+                            true,
+                            theme,
+                        )
+                        .on_click(|_, _, cx| {
+                            let settings = cx.services().settings.clone();
+                            settings.update(cx, |settings, cx| settings.show(true, cx));
+                        })
+                        .child("Details"),
                     )
                     .automation_target("reader/damaged")
                     .into_any_element(),
@@ -1385,6 +1433,11 @@ fn message_text(open: &OpenSession, at: &BlockRef) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Whether `reader` has a session open.
+fn open_now(reader: &ReaderService) -> bool {
+    matches!(reader.state(), ReaderState::Open(_))
 }
 
 /// The places of `len` rows from `from` outwards: `from`, the one after it, the one before, …
@@ -1563,7 +1616,7 @@ impl Render for ReaderView {
             ReaderState::Opening(_) => Self::render_skeleton(&theme),
             ReaderState::Failed { why, .. } => Self::render_failed(why, &theme),
             ReaderState::Open(open) => {
-                let banners = self.render_banners(open, &theme);
+                let banners = self.render_banners(open, &theme, cx);
                 div()
                     .size_full()
                     .flex()

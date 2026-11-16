@@ -491,6 +491,12 @@ pub struct ToolResult {
     pub output: Vec<Output>,
     /// What can be said of the result without loading its output, where the agent recorded it.
     pub brief: Option<Brief>,
+    /**
+     * A file read whose text output gives each line's number in the file, as its provider
+     * writes them: leading spaces, the number, then this character (`cat -n` writes a tab).
+     * The reader shows the numbers apart from the file's lines.
+     */
+    pub numbered: Option<char>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -509,7 +515,7 @@ pub enum Brief {
     /// How many lines were read, and how many the file has, where the agent said.
     Lines { lines: u64, total: Option<u64> },
     /// How many lines an edit added and removed, and the lines of the file, before and after
-    /// it, where what it replaced starts, where the agent said.
+    /// it, where its first changed line is, where the agent said.
     Changed {
         added: u64,
         removed: u64,
