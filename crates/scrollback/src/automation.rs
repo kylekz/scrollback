@@ -34,7 +34,8 @@
 //!   `deleted`, and `refetch`: `null`, `running`, `done`, `skipped: …` or the failure's words;
 //!   and `fetch_all`, Fetch all again's `done` and `total` while it runs, or `null`), `deleted`
 //!   (each session deleted for good's `location`, whether it is `allowed` again, and its
-//!   `standing`: `deleted`, `allowed` or `archived_again`), and `saved` (why the settings
+//!   `standing`: `deleted`, `allowed` or `archived_again`; `null` before the archive is read),
+//!   and `saved` (why the settings
 //!   aren't being saved, or `null`).
 //! - `system`: what the app asked of the operating system (`sb_ui::system`), never done in a
 //!   scripted run, oldest first: each request's `kind` (`reveal` with its `path`,
@@ -656,7 +657,7 @@ fn settings(shell: &Shell, cx: &App) -> Value {
                 "total": total,
             })),
         },
-        "deleted": upkeep.deleted().iter().map(|deleted| json!({
+        "deleted": upkeep.deleted().map(|deleted| deleted.iter().map(|deleted| json!({
             "location": deleted.location.as_ref().map(|location| &location.name),
             "allowed": matches!(deleted.standing, Standing::Allowed(_)),
             "standing": match deleted.standing {
@@ -664,7 +665,7 @@ fn settings(shell: &Shell, cx: &App) -> Value {
                 Standing::Allowed(_) => "allowed",
                 Standing::ArchivedAgain { .. } => "archived_again",
             },
-        })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>()),
         "saved": settings.save_failure(),
     })
 }

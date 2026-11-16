@@ -324,8 +324,13 @@ impl UpkeepService {
         })
     }
 
-    pub fn deleted(&self) -> &[Deleted] {
-        &self.deleted
+    /**
+     * The sessions deleted for good, once the archive has been read: before that there is
+     * nothing to say of them, not even that there are none. They are read with the stats,
+     * which are there from the first read that lands.
+     */
+    pub fn deleted(&self) -> Option<&[Deleted]> {
+        self.stats.as_ref().map(|_| self.deleted.as_slice())
     }
 
     /// Whether a change to one of the location `id`'s sessions deleted for good is being

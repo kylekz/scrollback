@@ -792,11 +792,31 @@ fn deleted_for_good(cx: &mut TestAppContext) -> (Arc<Archive>, SessionId, Entity
     (archive, id, upkeep)
 }
 
+/**
+ * Until Settings › Archive has been read, nothing is said of the sessions deleted for good, not
+ * even that there are none: the card would state a wrong fact while the read runs.
+ */
+#[gpui::test]
+fn sessions_deleted_for_good_are_unknown_until_the_archive_is_read(cx: &mut TestAppContext) {
+    init_library(cx);
+    let upkeep = cx.update(|cx| cx.services().upkeep.clone());
+    upkeep.read_with(cx, |upkeep, _| assert!(upkeep.deleted().is_none()));
+    upkeep.update(cx, |upkeep, cx| {
+        upkeep.shown(cx);
+        assert!(upkeep.deleted().is_none(), "read in the background");
+    });
+    settle(cx);
+    upkeep.read_with(cx, |upkeep, _| {
+        assert_eq!(upkeep.deleted().map(<[_]>::len), Some(0));
+    });
+}
+
 /// Where each row deleted for good stands, and the count the section's head shows.
 fn standing(upkeep: &Entity<UpkeepService>, cx: &mut TestAppContext) -> (Vec<&'static str>, usize) {
     upkeep.read_with(cx, |upkeep, _| {
         let rows = upkeep
             .deleted()
+            .expect("Settings › Archive is read")
             .iter()
             .map(|deleted| match deleted.standing {
                 Standing::Deleted => "deleted",
@@ -841,7 +861,7 @@ fn a_session_allowed_again_can_be_undone_from_settings(cx: &mut TestAppContext) 
     settle(cx);
     assert_eq!(standing(&upkeep, cx), (vec!["archived again"], 0));
     upkeep.read_with(cx, |upkeep, _| {
-        assert!(upkeep.deleted()[0].refused.is_some());
+        assert!(upkeep.deleted().expect("read")[0].refused.is_some());
     });
     assert_eq!(archive.catalogue().tombstones().unwrap(), []);
     /* Shown again, Settings lists none: the session is archived. */
@@ -861,7 +881,7 @@ fn a_sync_archiving_an_allowed_session_says_so_in_its_row(cx: &mut TestAppContex
     sync_all(cx);
     assert_eq!(standing(&upkeep, cx), (vec!["archived again"], 0));
     upkeep.read_with(cx, |upkeep, _| {
-        let row = &upkeep.deleted()[0];
+        let row = &upkeep.deleted().expect("read")[0];
         assert!(matches!(
             row.standing,
             Standing::ArchivedAgain { at: Some(_) }

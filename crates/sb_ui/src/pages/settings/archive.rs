@@ -248,23 +248,17 @@ impl SettingsPage {
         let chosen = self.chosen.clone()?;
         let c = &theme.colors;
         let room = overlay::room(window.viewport_size(), theme);
-        let current = cx.services().archive.read(cx).dir().display().to_string();
-        let folder = chosen.folder.display().to_string();
         let (title, what, confirm) = match chosen.holds {
             Holds::Archive => (
                 "Open the archive in this folder?",
-                format!(
-                    "scrollback reopens on the archive in {folder}, with its own locations, \
-                     folders and settings."
-                ),
+                "scrollback reopens on the archive there, with its own locations, folders and \
+                 settings.",
                 "Open it",
             ),
             _ => (
                 "Make a new archive in this folder?",
-                format!(
-                    "{folder} is empty. scrollback makes a new archive there and reopens on \
-                     it; the first run asks for its locations."
-                ),
+                "The folder is empty. scrollback makes a new archive there and reopens on it; \
+                 the first run asks for its locations.",
                 "Make it",
             ),
         };
@@ -283,21 +277,29 @@ impl SettingsPage {
                     .gap(theme.spacing.md)
                     .p(theme.spacing.xl)
                     .child(div().text_spec(&theme.text.sheet_title).child(title))
+                    /* The folder in mono on a line of its own, cut in its middle: a path wraps
+                    anywhere, a Windows one straight after its drive. */
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_spec(&theme.text.path)
+                            .text_color(c.fg)
+                            .overflow_hidden()
+                            .text_ellipsis_middle()
+                            .whitespace_nowrap()
+                            .child(chosen.folder.display().to_string())
+                            .automation_target("settings/confirm/folder"),
+                    )
                     .child(
                         div()
                             .text_color(c.fg2)
                             .text_spec(&theme.text.body)
                             .child(what),
                     )
-                    .child(
-                        div()
-                            .text_color(c.fg2)
-                            .text_spec(&theme.text.body)
-                            .child(format!(
-                                "The archive in {current} stays where it is, as it is. Nothing is \
-                         moved, and you can come back to it the same way."
-                            )),
-                    ),
+                    .child(div().text_color(c.fg2).text_spec(&theme.text.body).child(
+                        "The archive open now stays where it is, as it is. Nothing is \
+                                 moved, and you can come back to it the same way.",
+                    )),
             )
             .child(
                 div()
@@ -952,7 +954,7 @@ impl SettingsPage {
         let services = cx.services();
         let opening = services.settings.read(cx).is_switching();
         let upkeep = services.upkeep.read(cx);
-        let (deleted, still) = (upkeep.deleted().to_vec(), upkeep.still_deleted());
+        let (deleted, still) = (upkeep.deleted().map(<[_]>::to_vec), upkeep.still_deleted());
         let now = format::now();
         div()
             .flex()
@@ -980,26 +982,29 @@ impl SettingsPage {
                          Allowing one lets the next sync archive it again, if it is still there.",
                     ),
             )
-            .child(if deleted.is_empty() {
-                info_banner(theme)
-                    .child(div().flex_1().child("No sessions deleted for good."))
-                    .automation_target("settings/deleted/none")
-            } else {
-                div()
-                    .flex()
-                    .flex_col()
-                    .rounded(theme.radii.row)
-                    .border_1()
-                    .border_color(c.line_subtle)
-                    .overflow_hidden()
-                    .children(
-                        deleted
-                            .iter()
-                            .enumerate()
-                            .map(|(at, row)| deleted_row(at, row, now, !opening, theme, cx)),
-                    )
-                    .automation_target("settings/deleted")
-            })
+            /* Nothing until the archive has been read: "none" before then would be wrong. */
+            .children(deleted.map(|deleted| {
+                if deleted.is_empty() {
+                    info_banner(theme)
+                        .child(div().flex_1().child("No sessions deleted for good."))
+                        .automation_target("settings/deleted/none")
+                } else {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .rounded(theme.radii.row)
+                        .border_1()
+                        .border_color(c.line_subtle)
+                        .overflow_hidden()
+                        .children(
+                            deleted
+                                .iter()
+                                .enumerate()
+                                .map(|(at, row)| deleted_row(at, row, now, !opening, theme, cx)),
+                        )
+                        .automation_target("settings/deleted")
+                }
+            }))
             .into_any_element()
     }
 }
