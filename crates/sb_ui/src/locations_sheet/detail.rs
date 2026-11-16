@@ -21,7 +21,6 @@ use crate::components::{
 };
 use crate::format;
 use crate::icons::SbIcon;
-use crate::services::sync::{STALE_AFTER_DAYS, stale};
 use crate::services::{LocationStatus, SyncService};
 use crate::theme::{SbTheme, StyledText as _};
 
@@ -257,17 +256,13 @@ impl LocationsSheet {
             ),
             theme,
         );
-        let stale = stale(
-            location.last_success,
-            sync.details().found(&location.id),
-            now,
-        )
-        .map(|stale| {
+        let stale = sync.stale(location, now).map(|stale| {
             kv(
                 "Stale",
                 div().text_color(c.yellow).child(format!(
-                    "since {} (warning after {STALE_AFTER_DAYS} days)",
-                    format::day(stale.since, now)
+                    "since {} (warning after {} days)",
+                    format::day(stale.since, now),
+                    sync.stale_after_days()
                 )),
                 theme,
             )

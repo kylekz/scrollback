@@ -29,16 +29,13 @@ pub fn default_material() -> Material {
     }
 }
 
-/// Starts following the OS in `mode`, with `support` as the platform's abilities (from
-/// [`MaterialSupport::probe`]), and installs the resolved theme.
-pub fn init(support: MaterialSupport, mode: Mode, cx: &mut App) {
+/// Starts following the OS in `mode` with `material` asked for, with `support` as the
+/// platform's abilities (from [`MaterialSupport::probe`]), and installs the resolved theme.
+pub fn init(support: MaterialSupport, mode: Mode, material: Material, cx: &mut App) {
     gpui_appearance::init(
         Setup {
             support,
-            preferences: Preferences {
-                mode,
-                material: default_material(),
-            },
+            preferences: Preferences { mode, material },
             vibrancy: Vibrancy::default(),
         },
         cx,
@@ -74,7 +71,7 @@ mod tests {
     fn system_mode_follows_the_os(cx: &mut TestAppContext) {
         cx.update(|cx| {
             crate::init(cx).unwrap();
-            init(MaterialSupport::ALL, Mode::System, cx);
+            init(MaterialSupport::ALL, Mode::System, default_material(), cx);
             gpui_appearance::set_system(Appearance::Light, cx);
         });
         assert_eq!(on_screen(cx), (Appearance::Light, default_material()));
@@ -86,7 +83,7 @@ mod tests {
     fn a_forced_mode_ignores_the_os(cx: &mut TestAppContext) {
         cx.update(|cx| {
             crate::init(cx).unwrap();
-            init(MaterialSupport::ALL, Mode::Light, cx);
+            init(MaterialSupport::ALL, Mode::Light, default_material(), cx);
             gpui_appearance::set_system(Appearance::Dark, cx);
         });
         assert_eq!(on_screen(cx).0, Appearance::Light);
@@ -96,7 +93,12 @@ mod tests {
     fn the_platform_narrows_the_material(cx: &mut TestAppContext) {
         cx.update(|cx| {
             crate::init(cx).unwrap();
-            init(MaterialSupport::OPAQUE_ONLY, Mode::System, cx);
+            init(
+                MaterialSupport::OPAQUE_ONLY,
+                Mode::System,
+                default_material(),
+                cx,
+            );
             gpui_appearance::set_preferences(
                 Preferences {
                     mode: Mode::System,

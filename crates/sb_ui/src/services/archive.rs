@@ -1,10 +1,15 @@
 //! The open archive (PLAN §4.4, §11 `Archive`). It is opened when the app starts, in the
-//! folder the binary names, and created there on the first run (PLAN D3).
+//! folder the app's settings name, and created there on the first run when that is the data
+//! dir's (PLAN D3).
 //!
-//! A folder that holds no archive gets one; anything else that keeps the archive from opening
-//! (another scrollback has it, its catalogue is gone, the folder can't be reached) is a
-//! failure that the main area shows, and no archive is ever made in the place of one that
-//! didn't open: [`Archive::create`] itself refuses a folder that holds what is left of one.
+//! The data dir's folder, holding no archive, gets one; anything else that keeps the archive
+//! from opening (another scrollback has it, its catalogue is gone, the folder can't be
+//! reached, a folder the owner chose holds none now) is a failure that the main area shows,
+//! and no archive is ever made in the place of one that didn't open: [`Archive::create`]
+//! itself refuses a folder that holds what is left of one.
+//!
+//! Settings › Use a different folder… opens the other archive itself, and the services over
+//! it start with it open ([`ArchiveService::opened`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,17 +35,30 @@ pub struct Failure {
 
 pub struct ArchiveService {
     dir: PathBuf,
+    /// Whether an archive is made in `dir` when it holds none.
+    create: bool,
     state: ArchiveState,
 }
 
 impl ArchiveService {
-    pub fn new(dir: PathBuf, cx: &mut Context<Self>) -> Self {
+    /// Opens the archive in `dir`; with `create`, makes one there when it holds none.
+    pub fn new(dir: PathBuf, create: bool, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             dir,
+            create,
             state: ArchiveState::Opening,
         };
         this.open(cx);
         this
+    }
+
+    /// Over `archive`, open already.
+    pub fn opened(archive: Arc<Archive>, _: &mut Context<Self>) -> Self {
+        Self {
+            dir: archive.dir().to_path_buf(),
+            create: false,
+            state: ArchiveState::Open(archive),
+        }
     }
 
     /// The archive's folder.
@@ -70,10 +88,10 @@ impl ArchiveService {
     }
 
     fn open(&mut self, cx: &mut Context<Self>) {
-        let dir = self.dir.clone();
+        let (dir, create) = (self.dir.clone(), self.create);
         let job = cx.background_spawn(async move {
             match Archive::open(&dir) {
-                Err(ArchiveError::NotAnArchive(_)) => Archive::create(&dir),
+                Err(ArchiveError::NotAnArchive(_)) if create => Archive::create(&dir),
                 opened => opened,
             }
         });

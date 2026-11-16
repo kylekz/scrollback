@@ -43,7 +43,7 @@ use crate::format;
 use crate::icons::SbIcon;
 use crate::keymap;
 use crate::overlay::{self, Layer};
-use crate::services::sync::{Stale, local_name, refusal, stale};
+use crate::services::sync::{Stale, local_name, refusal};
 use crate::services::{ActiveServices as _, LocationStatus, PassProgress, SyncService};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
@@ -588,7 +588,7 @@ impl LocationsSheet {
                 theme,
             )],
         };
-        let stale = stale(location.last_success, details.found(&location.id), now);
+        let stale = sync.stale(location, now);
         let (action, glyph) = match status {
             LocationStatus::Syncing { .. } => ("Stop", SbIcon::Pause),
             LocationStatus::Unreachable { .. } | LocationStatus::Failed(_) => {
@@ -980,8 +980,7 @@ impl LocationsSheet {
         let stale: Vec<AnyElement> = locations
             .iter()
             .filter_map(|location| {
-                let found = self.sync.read(cx).details().found(&location.id);
-                let stale = stale(location.last_success, found, now)?;
+                let stale = self.sync.read(cx).stale(location, now)?;
                 Some(self.stale_banner(location, &stale, theme, cx))
             })
             .collect();

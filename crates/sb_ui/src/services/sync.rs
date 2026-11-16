@@ -13,8 +13,16 @@
 //! banner, and the next sync tries again.
 //!
 //! **Triggers** (PLAN §5): the start (once the archive is open and its locations are read),
-//! the owner ([`SyncService::sync`], [`SyncService::sync_all`]), and [`SYNC_INTERVAL`] while
-//! the app is open.
+//! whatever Settings says; the owner ([`SyncService::sync`], [`SyncService::sync_all`]); and
+//! while the app is open, every so often as Settings › Sync every says ([`SyncEvery`], every
+//! [`SYNC_INTERVAL`] until the owner says otherwise). A new interval counts from when it is
+//! chosen; "Only when I ask" leaves the start and the owner.
+//!
+//! **Stale** ([`SyncService::stale`]): after how many days without a good sync a location is
+//! stale is the archive's, kept in its catalogue's `kv`, and read with the locations.
+//!
+//! **Fetch again** ([`refetch`]): an item verify found damaged is fetched again from its
+//! location here, as a pass would, and the library hears of it.
 //!
 //! **The index.** A pass indexes what it changed itself. The start also brings the session
 //! index up to date over every location (`sb_core::sync::index`): what an earlier index left,
@@ -49,19 +57,22 @@ use sb_core::location::{Location, LocationId, LocationKind};
 use sb_core::sync::{Found, IndexReport, Progress, SyncError, index, survey, sync_location};
 use sb_core::transport::Transport;
 
+use super::settings::{SettingsEvent, SettingsService, SyncEvery};
 use super::{ArchiveService, Connect, Launch, ListDistros, Providers, Tester};
 use crate::format;
 
 mod locations;
+mod refetch;
 
 pub use locations::{
-    ConnectionTest, Details, Distros, Expiring, STALE_AFTER_DAYS, Stale, TestFailure, TestState,
-    name_problem, refusal, stale,
+    ConnectionTest, Details, Distros, Expiring, STALE_AFTER_DAYS, STALE_AFTER_RANGE, Stale,
+    TestFailure, TestState, name_problem, refusal, stale,
 };
+pub use refetch::Refetch;
 pub use sb_core::location::host_problem;
 
-/// How often every location is synced while the app is open (DESIGN §4.13 offers 5, 15, 30 and
-/// 60 minutes; Settings arrive in a later phase).
+/// How often every location is synced while the app is open until the owner chooses
+/// otherwise in Settings ([`SyncEvery`]'s default).
 pub const SYNC_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// How often a running pass's progress is read.
@@ -179,6 +190,7 @@ pub enum LocationStatus {
 pub type Survey = Vec<Result<Found, String>>;
 
 /// How each kind of location is reached and tested, and how WSL's distros are listed.
+#[derive(Clone)]
 pub struct Reach {
     pub connect: Connect,
     pub tester: Tester,
@@ -344,15 +356,25 @@ pub struct SyncService {
     distros: Option<Distros>,
     /// WSL's distros are being listed.
     listing: bool,
-    /// When every location is synced next ([`SYNC_INTERVAL`]), in Unix milliseconds.
+    /// How often every location is synced while the app is open.
+    every: SyncEvery,
+    /// When every location is synced next, in Unix milliseconds.
     next_round: Option<i64>,
+    /// The start has run on this archive.
+    started: bool,
+    /// The app is moving onto another archive: nothing more starts on this one.
+    closed: bool,
+    /// After how many days without a good sync a location is stale (the module docs).
+    stale_after: u32,
+    /// The items being fetched again, or last fetched again, and how that went.
+    refetches: HashMap<(LocationId, String, String), Refetch>,
     /// Background jobs other than passes and indexes: reading and adding locations, looking
     /// at this machine.
     jobs: usize,
     stop_index: CancelToken,
     #[cfg(any(test, feature = "automation"))]
     hold: Hold,
-    _observers: [Subscription; 2],
+    _observers: [Subscription; 3],
     _interval: Option<Task<()>>,
 }
 
@@ -363,14 +385,20 @@ impl SyncService {
         archive: Entity<ArchiveService>,
         providers: Providers,
         reach: Reach,
+        settings: &Entity<SettingsService>,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
+            every: settings.read(cx).settings().sync_every,
             _observers: [
                 cx.observe(&archive, |this, _, cx| this.start(cx)),
                 cx.on_app_quit(|this, _| {
                     this.stop_everything();
                     async {}
+                }),
+                cx.subscribe(settings, |this, settings, _: &SettingsEvent, cx| {
+                    let every = settings.read(cx).settings().sync_every;
+                    this.set_every(every, cx);
                 }),
             ],
             archive,
@@ -397,6 +425,10 @@ impl SyncService {
             distros: None,
             listing: false,
             next_round: None,
+            started: false,
+            closed: false,
+            stale_after: STALE_AFTER_DAYS,
+            refetches: HashMap::new(),
             jobs: 0,
             stop_index: CancelToken::new(),
             #[cfg(any(test, feature = "automation"))]
@@ -490,15 +522,46 @@ impl SyncService {
 
     /// The start (the module docs), once the archive is open.
     fn start(&mut self, cx: &mut Context<Self>) {
-        if self.archive.read(cx).archive().is_none() || self._interval.is_some() {
+        if self.archive.read(cx).archive().is_none() || self.started {
             return;
         }
-        self.next_round = Some(format::now() + SYNC_INTERVAL.as_millis() as i64);
+        self.started = true;
+        self.schedule(cx);
+        self.read_locations(cx);
+        self.index(None, cx);
+    }
+
+    /// How often every location is synced while the app is open.
+    pub fn every(&self) -> SyncEvery {
+        self.every
+    }
+
+    /// Syncs every location `every` so often from now on, the first round that long from now.
+    fn set_every(&mut self, every: SyncEvery, cx: &mut Context<Self>) {
+        if self.every != every {
+            self.every = every;
+            if self.started {
+                self.schedule(cx);
+            }
+            cx.notify();
+        }
+    }
+
+    /// Starts the rounds of [`Self::every`] over, the first that long from now; with only
+    /// when asked, there are none.
+    fn schedule(&mut self, cx: &mut Context<Self>) {
+        let Some(interval) = self.every.interval() else {
+            self.next_round = None;
+            self._interval = None;
+            return;
+        };
+        let next = move || Some(format::now() + interval.as_millis() as i64);
+        self.next_round = next();
         self._interval = Some(cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(SYNC_INTERVAL).await;
+                cx.background_executor().timer(interval).await;
                 let synced = this.update(cx, |this, cx| {
-                    this.next_round = Some(format::now() + SYNC_INTERVAL.as_millis() as i64);
+                    this.next_round = next();
                     this.sync_all(cx);
                 });
                 if synced.is_err() {
@@ -506,8 +569,6 @@ impl SyncService {
                 }
             }
         }));
-        self.read_locations(cx);
-        self.index(None, cx);
     }
 
     /// Reads the locations, and syncs them all; with none, looks at this machine instead.
@@ -518,13 +579,23 @@ impl SyncService {
         self.run(
             cx,
             move || {
-                let locations = archive.catalogue().locations()?;
-                Ok::<_, sb_core::catalogue::CatalogueError>((locations, Details::read(&archive)?))
+                let catalogue = archive.catalogue();
+                let locations = catalogue.locations()?;
+                let stale_after = catalogue
+                    .setting(locations::STALE_AFTER_KEY)?
+                    .and_then(|days| days.parse().ok())
+                    .filter(|days| STALE_AFTER_RANGE.contains(days));
+                Ok::<_, sb_core::catalogue::CatalogueError>((
+                    locations,
+                    Details::read(&archive)?,
+                    stale_after,
+                ))
             },
             |this, read, cx| match read {
-                Ok((locations, details)) => {
+                Ok((locations, details, stale_after)) => {
                     let (removed, locations) =
                         locations.into_iter().partition(|it| it.removed.is_some());
+                    this.stale_after = stale_after.unwrap_or(STALE_AFTER_DAYS);
                     this.failure = None;
                     this.locations = Some(locations);
                     this.removed = removed;
@@ -596,7 +667,7 @@ impl SyncService {
         let Some(location) = self.locations.iter().flatten().find(|it| it.id == *id) else {
             return;
         };
-        if self.passes.contains_key(id) || self.removing.contains(id) {
+        if self.passes.contains_key(id) || self.removing.contains(id) || self.closed {
             return;
         }
         if self.indexes.contains_key(&Some(id.clone())) {
@@ -735,7 +806,7 @@ impl SyncService {
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return;
         };
-        if self.indexes.contains_key(&location) {
+        if self.indexes.contains_key(&location) || self.closed {
             return;
         }
         let reported = Reported::default();
@@ -865,6 +936,16 @@ impl SyncService {
         self.stop_all();
         self.stop_index.cancel();
         self.cancel_test();
+    }
+
+    /// Stops everything, and starts nothing more: the app is moving onto another archive
+    /// (`super::reopen`).
+    pub(super) fn close(&mut self, cx: &mut Context<Self>) {
+        self.stop_everything();
+        self.closed = true;
+        self._interval = None;
+        self.next_round = None;
+        cx.notify();
     }
 
     /// Makes the next pass act on a hold once it has stored `after` items (see [`Held`]).
