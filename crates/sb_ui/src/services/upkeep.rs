@@ -9,9 +9,14 @@
 //! it: while a sync writes hundreds of files, and on Windows while each new one is scanned,
 //! that can take as long as the pass, and the catalogue's reads don't wait for it (nor for a
 //! pass: the catalogue's readers have connections of their own). Both run when Settings is
-//! shown, after a verify, and while Settings shows, whenever sync says the archive changed;
-//! nothing reads the archive while Settings is not shown. The size measured is kept in the
-//! app's settings, for the page that says when the archive can't be reached (DESIGN §4.14).
+//! shown, after a verify, and while Settings shows, whenever sync says the archive changed
+//! ([`SyncEvent::Archived`]); the measure also whenever a pass has stored more files
+//! ([`SyncEvent::Stored`]), so that the stats follow a first sync, which stores thousands
+//! before it indexes any. Each job runs once at a time, and once more if asked again
+//! meanwhile; a measure rests [`MEASURE_REST`] before the next starts, so that a long sync
+//! doesn't keep the archive's folder walked back to back. Nothing reads the archive while
+//! Settings is not shown. The size measured is kept in the app's settings, for the page that
+//! says when the archive can't be reached (DESIGN §4.14).
 //!
 //! **Verify** runs on a background job with its progress read a few times a second, and
 //! stops at the next version when asked; a verify stopped keeps nothing (`sb_core`).
@@ -47,6 +52,24 @@ const PROGRESS_TICK: Duration = Duration::from_millis(100);
 /// How many of the last verify's problems are shown at first, and how many more each time
 /// the owner asks.
 pub const PROBLEMS_PAGE: usize = 20;
+
+/// How long after a measure of the archive ends the next one may start (the module docs).
+pub const MEASURE_REST: Duration = Duration::from_secs(2);
+
+/// Where measuring the archive stands: one measure at a time, with a rest after each.
+enum Measuring {
+    Idle,
+    /// A measure runs; `again` once another is asked for.
+    Running {
+        again: bool,
+    },
+    /// A measure ended less than [`MEASURE_REST`] ago; `again` once another is asked for,
+    /// which starts when the rest is over.
+    Resting {
+        again: bool,
+        _rest: Task<()>,
+    },
+}
 
 /// What can be done for an item verify found damaged (DESIGN §4.13, decision 5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,10 +288,7 @@ pub struct UpkeepService {
     loading: bool,
     /// A read was asked for while one ran.
     stale: bool,
-    /// The archive is being measured.
-    measuring: bool,
-    /// A measure was asked for while one ran.
-    remeasure: bool,
+    measuring: Measuring,
     /// Writes in flight.
     jobs: usize,
     /// The app has moved onto another archive: nothing more starts on this one.
@@ -287,9 +307,12 @@ impl UpkeepService {
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
-            _observers: [cx.subscribe(&sync, |this, _, _: &SyncEvent, cx| {
+            _observers: [cx.subscribe(&sync, |this, _, event: &SyncEvent, cx| {
                 if this.settings.read(cx).is_shown() {
-                    this.refresh(cx);
+                    match event {
+                        SyncEvent::Archived => this.refresh(cx),
+                        SyncEvent::Stored => this.measure(cx),
+                    }
                 }
             })],
             archive,
@@ -304,8 +327,7 @@ impl UpkeepService {
             read: false,
             loading: false,
             stale: false,
-            measuring: false,
-            remeasure: false,
+            measuring: Measuring::Idle,
             jobs: 0,
             closed: false,
             paused: false,
@@ -344,7 +366,7 @@ impl UpkeepService {
 
     /// The archive is being measured for the first time: its stats aren't known yet.
     pub fn is_measuring(&self) -> bool {
-        self.measuring && self.stats.is_none()
+        matches!(self.measuring, Measuring::Running { .. }) && self.stats.is_none()
     }
 
     /// Whether a change to one of the location `id`'s sessions deleted for good is being
@@ -364,7 +386,13 @@ impl UpkeepService {
 
     /// Nothing is read, written or verified.
     pub fn is_settled(&self) -> bool {
-        !self.loading && !self.measuring && self.verifying.is_none() && self.jobs == 0
+        !self.loading
+            && !matches!(
+                self.measuring,
+                Measuring::Running { .. } | Measuring::Resting { again: true, .. }
+            )
+            && self.verifying.is_none()
+            && self.jobs == 0
     }
 
     /// How many sessions are deleted for good now: not those allowed again since.
@@ -391,7 +419,7 @@ impl UpkeepService {
 
     /**
      * Reads what Settings › Archive shows again: the catalogue and the archive's size, each now
-     * or once its own job running is over (the module docs).
+     * or once its own job running is over, the measure once its rest is too (the module docs).
      */
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.read_catalogue(cx);
@@ -450,21 +478,42 @@ impl UpkeepService {
         .detach();
     }
 
+    /// Measures the archive now, or once the measure running and the rest after it are over.
     fn measure(&mut self, cx: &mut Context<Self>) {
+        if let Measuring::Running { again } | Measuring::Resting { again, .. } = &mut self.measuring
+        {
+            *again = true;
+            return;
+        }
         let Some(archive) = self.readable(cx) else {
             return;
         };
-        if self.measuring {
-            self.remeasure = true;
-            return;
-        }
-        self.measuring = true;
+        self.measuring = Measuring::Running { again: false };
         let id = archive.id().to_string();
         let job = cx.background_spawn(async move { archive.stats() });
         cx.spawn(async move |this, cx| {
             let measured = job.await;
             this.update(cx, |this, cx| {
-                this.measuring = false;
+                /* Closed, nothing more is measured: there is nothing to rest for. */
+                this.measuring = if this.closed {
+                    Measuring::Idle
+                } else {
+                    Measuring::Resting {
+                        again: matches!(this.measuring, Measuring::Running { again: true }),
+                        _rest: cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(MEASURE_REST).await;
+                            this.update(cx, |this, cx| {
+                                let rested =
+                                    std::mem::replace(&mut this.measuring, Measuring::Idle);
+                                if let Measuring::Resting { again: true, .. } = rested {
+                                    this.measure(cx);
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                        }),
+                    }
+                };
                 match measured {
                     Ok(stats) => {
                         this.settings.update(cx, |settings, _| {
@@ -476,9 +525,6 @@ impl UpkeepService {
                         log::error!("the archive could not be measured: {error}");
                         this.failure = Some(error.to_string());
                     }
-                }
-                if std::mem::take(&mut this.remeasure) {
-                    this.measure(cx);
                 }
                 cx.notify();
             })
@@ -600,6 +646,9 @@ impl UpkeepService {
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.stop();
         self.closed = true;
+        if let Measuring::Resting { .. } = self.measuring {
+            self.measuring = Measuring::Idle;
+        }
         cx.notify();
     }
 

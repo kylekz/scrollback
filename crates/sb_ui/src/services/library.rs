@@ -756,7 +756,10 @@ impl LibraryService {
                         this.reload(cx);
                     }
                 }),
-                cx.subscribe(&sync, |this, _, _: &SyncEvent, cx| {
+                cx.subscribe(&sync, |this, _, event: &SyncEvent, cx| {
+                    if *event != SyncEvent::Archived {
+                        return;
+                    }
                     this.seen.news += 1;
                     this.reload(cx);
                 }),

@@ -17,7 +17,7 @@ use sb_test_support::Outline;
 
 use super::settings::{Switch, load};
 use super::sync::Refetch;
-use super::upkeep::{Fix, Standing, UpkeepService};
+use super::upkeep::{Fix, MEASURE_REST, Standing, UpkeepService};
 use super::*;
 use crate::test_support::{
     SESSIONS, archive_dir, init_in, init_library, machine, machine_file, write_session,
@@ -579,6 +579,52 @@ fn damage(key: &str, cx: &mut TestAppContext) {
     let middle = bytes.len() / 2;
     bytes[middle] ^= 0xff;
     std::fs::write(&segments[0], bytes).unwrap();
+}
+
+/**
+ * While Settings shows, the stats follow the archive: when sync says it changed, and when a
+ * pass has stored more files before indexing any. A measure asked for within
+ * [`MEASURE_REST`] of the last one's end waits for the rest to be over, and is not lost.
+ */
+#[gpui::test]
+fn the_stats_follow_the_archive_with_a_rest_between_measures(cx: &mut TestAppContext) {
+    init_library(cx);
+    let (sync, upkeep) = cx.update(|cx| {
+        let services = cx.services();
+        (services.sync.clone(), services.upkeep.clone())
+    });
+    settings(cx).update(cx, |settings, cx| settings.show(true, cx));
+    upkeep.update(cx, |upkeep, cx| upkeep.shown(cx));
+    cx.run_until_parked();
+    let measured = |cx: &mut TestAppContext| {
+        upkeep.read_with(cx, |upkeep, _| {
+            let stats = upkeep.stats().expect("the archive is measured");
+            (stats.totals.sessions, stats.on_disk)
+        })
+    };
+    assert_eq!(measured(cx).0, 3);
+
+    /* A pass archives another session: the measure it asks for waits for the rest. */
+    written_later("Archived while Settings shows", cx);
+    sync.update(cx, |sync, cx| sync.sync_all(cx));
+    cx.run_until_parked();
+    assert_eq!(measured(cx).0, 3);
+    upkeep.read_with(cx, |upkeep, _| assert!(!upkeep.is_settled()));
+    cx.executor().advance_clock(MEASURE_REST);
+    cx.run_until_parked();
+    assert_eq!(measured(cx).0, 4);
+    upkeep.read_with(cx, |upkeep, _| assert!(upkeep.is_settled()));
+
+    /* A pass stores files and says so: the archive's folder is measured again, after the
+    rest. */
+    let (_, on_disk) = measured(cx);
+    std::fs::write(archive_dir(cx).join("stored"), vec![0; 64 * 1024]).unwrap();
+    sync.update(cx, |_, cx| cx.emit(SyncEvent::Stored));
+    cx.run_until_parked();
+    assert_eq!(measured(cx).1, on_disk);
+    cx.executor().advance_clock(MEASURE_REST);
+    cx.run_until_parked();
+    assert!(measured(cx).1 >= on_disk + 64 * 1024);
 }
 
 #[gpui::test]

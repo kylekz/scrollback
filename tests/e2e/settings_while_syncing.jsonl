@@ -1,4 +1,4 @@
-{"scenario": {"window_size": "1440x900", "fixture": "agent-large", "description": "Settings opened while a pass runs, held where the scenario says (DESIGN §4.13): its archive cards are read at once, not once the pass is over, as catalogue reads don't wait on a sync"}}
+{"scenario": {"window_size": "1440x900", "fixture": "agent-large", "description": "Settings opened while a pass runs, held where the scenario says (DESIGN §4.13): its archive cards are read at once, not once the pass is over, as catalogue reads don't wait on a sync, and the stats follow the files the pass stores"}}
 {"cmd": "wait_ready", "timeout_ms": 30000}
 {"cmd": "settle", "timeout_ms": 30000, "expect": {"pointer": "/page", "equals": "first-run"}}
 {"cmd": "set_appearance", "material": "opaque"}
@@ -11,13 +11,20 @@
 
 // Settings, while the pass waits: the stats, the last verify (none yet) and the sessions deleted for good (none) are read and drawn. The stats are a job of their own, measured from the folder, and may land a few tens of milliseconds after the catalogue's cards (on NTFS they always do), so each is waited for.
 {"cmd": "click", "target": "titlebar/settings"}
-{"cmd": "wait_for", "pointer": "/settings/stats/sessions", "gte": 0, "timeout_ms": 5000}
+{"cmd": "wait_for", "pointer": "/settings/stats/items", "equals": 256, "timeout_ms": 5000}
 {"cmd": "wait_for", "pointer": "/settings/deleted", "equals": [], "timeout_ms": 5000}
-{"cmd": "state", "expect": [{"pointer": "/page", "equals": "settings"}, {"pointer": "/sync/held", "equals": true}, {"pointer": "/settings/stats/sessions", "gte": 0}, {"pointer": "/settings/verify/last", "equals": null}]}
+{"cmd": "state", "expect": [{"pointer": "/page", "equals": "settings"}, {"pointer": "/sync/held", "equals": true}, {"pointer": "/settings/stats/sessions", "gte": 0}, {"pointer": "/settings/stats/versions", "equals": 256}, {"pointer": "/settings/verify/last", "equals": null}]}
 {"cmd": "bounds", "target": "settings/archive/stats", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "bounds", "target": "settings/deleted/none", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "screenshot", "name": "settings-while-syncing-dark"}
 
+// The pass stores two more batches and waits again, still before it indexes anything: the stats follow the files it stored, measured again while Settings shows (at most every couple of seconds), not once the pass is over.
+{"cmd": "release_sync", "until": 768}
+{"cmd": "wait_for", "pointer": "/sync/locations/0/progress/items_done", "equals": 768, "timeout_ms": 60000}
+{"cmd": "wait_for", "pointer": "/sync/held", "equals": true, "timeout_ms": 10000}
+{"cmd": "wait_for", "pointer": "/settings/stats/items", "equals": 768, "timeout_ms": 10000}
+{"cmd": "state", "expect": [{"pointer": "/page", "equals": "settings"}, {"pointer": "/sync/held", "equals": true}, {"pointer": "/sync/locations/0/progress/sessions", "equals": 0}, {"pointer": "/settings/stats/versions", "equals": 768}]}
+
 // The pass goes on to its end.
 {"cmd": "release_sync"}
-{"cmd": "settle", "timeout_ms": 120000, "expect": [{"pointer": "/sync/syncing", "equals": false}, {"pointer": "/sync/held", "equals": false}]}
+{"cmd": "settle", "timeout_ms": 120000, "expect": [{"pointer": "/sync/syncing", "equals": false}, {"pointer": "/sync/held", "equals": false}, {"pointer": "/settings/stats/items", "equals": 2318}]}

@@ -147,8 +147,9 @@
 //! the machine's speed:
 //! - `hold_sync {after}` makes the next pass wait once it has stored `after` items. The app
 //!   is not settled while a pass waits: wait for `/sync/held` instead.
-//! - `release_sync {}` lets the waiting pass go on, and clears a hold no pass has reached.
-//!   Stopping the pass does too.
+//! - `release_sync {until?}` lets the waiting pass go on, and clears a hold no pass has
+//!   reached. Stopping the pass does too. With `until`, the pass waits again once it has
+//!   stored that many items, which steps it through a sync.
 //! - `stand_in {distros?, places?}` sets what the stand-ins answer from then on: `distros`,
 //!   WSL's installed distros (each `{name, running?, default?, utility?}`; `[]` is WSL with
 //!   none) or `{"error": …}` for a `wsl.exe` that fails, which are listed again at once; and
@@ -324,8 +325,11 @@ impl AutomationHost for ScrollbackAutomation {
                 service.update(cx, |sync, _| sync.hold_after(after, Held::Pause));
                 sync(cx)
             }),
-            "release_sync" => serde_json::from_value(args).map(|ReleaseSync {}| {
-                service.update(cx, |sync, _| sync.release());
+            "release_sync" => serde_json::from_value(args).map(|ReleaseSync { until }| {
+                service.update(cx, |sync, _| match until {
+                    Some(until) => sync.release_until(until),
+                    None => sync.release(),
+                });
                 sync(cx)
             }),
             "stand_in" => serde_json::from_value(args).map(|StandIn { distros, places }| {
@@ -880,10 +884,12 @@ struct HoldSync {
     after: usize,
 }
 
-/// `release_sync {}`.
+/// `release_sync {"until"?: items}`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReleaseSync {}
+struct ReleaseSync {
+    until: Option<usize>,
+}
 
 /// `stand_in {distros?, places?}`.
 #[derive(Debug, Deserialize)]

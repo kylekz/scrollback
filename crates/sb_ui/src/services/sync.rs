@@ -42,9 +42,11 @@
 //! service's writes, each on a background job, as are the connection test and the listing of
 //! WSL's distros, which views observe.
 //!
-//! Views observe the service for the locations' rows, and the library hears
-//! [`SyncEvent::Archived`] when what it shows may have changed. When the app quits, every pass
-//! and index is told to stop.
+//! Views observe the service for the locations' rows. The library and search hear
+//! [`SyncEvent::Archived`] when what they show may have changed, and Settings › Archive hears
+//! [`SyncEvent::Stored`] too, as a pass stores files before it indexes any. A running pass or
+//! index tells each at most once a second, and once more after its last change. When the app
+//! quits, every pass and index is told to stop.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -87,8 +89,8 @@ const BUSY_RETRY: Duration = Duration::from_secs(2);
 /// How often a running pass's progress is read.
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
 
-/// How often, at most, the library hears that a running pass indexed more sessions.
-const ARCHIVED_EVERY_MS: i64 = 1000;
+/// How often, at most, a running pass or index tells each kind of news ([`SyncEvent`]).
+const NEWS_EVERY_MS: i64 = 1000;
 
 /// What this machine is called as a location (DESIGN §4.10).
 pub fn local_name() -> &'static str {
@@ -231,9 +233,40 @@ fn surveyed(archive: &Archive, transport: &dyn Transport, providers: &Providers)
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncEvent {
     /// The archive may hold sessions it didn't, or other facts about them.
     Archived,
+    /// A running pass stored more files: the archive grew, though no session it holds has
+    /// changed yet (that is [`SyncEvent::Archived`], once they are indexed).
+    Stored,
+}
+
+/// One kind of news a running pass or index has: told at most every [`NEWS_EVERY_MS`], and
+/// owed until then, so that the last change is told however soon it came after the one before.
+struct News {
+    event: SyncEvent,
+    told: i64,
+    owed: bool,
+}
+
+impl News {
+    fn new(event: SyncEvent) -> Self {
+        Self {
+            event,
+            told: format::now(),
+            owed: false,
+        }
+    }
+
+    /// Owes the news if `changed`, and tells what is owed once it may.
+    fn tell(&mut self, changed: bool, cx: &mut Context<SyncService>) {
+        self.owed |= changed;
+        if self.owed && format::now() - self.told >= NEWS_EVERY_MS {
+            (self.told, self.owed) = (format::now(), false);
+            cx.emit(self.event);
+        }
+    }
 }
 
 /// What a pass does when it reaches a [`Hold`].
@@ -295,8 +328,14 @@ impl Hold {
     /// Clears the hold. A pass waiting at it is no longer held from here on, though its
     /// thread may wake a little later.
     fn release(&self) {
+        self.release_then(None);
+    }
+
+    /// Lets a pass waiting at the hold go on, and acts on `then` from here on instead: the
+    /// pass let go among those that reach it.
+    fn release_then(&self, then: Option<(usize, Held)>) {
         let mut state = self.state();
-        state.after = None;
+        state.after = then;
         state.waiting = false;
         state.releases += 1;
         self.0.1.notify_all();
@@ -942,11 +981,12 @@ impl SyncService {
         }
     }
 
-    /// Reads what `work` reports while it runs, and tells the library and search, at most once
-    /// a second, when it has indexed more sessions or made more searchable.
+    /// Reads what `work` reports while it runs, and tells (the module docs) when it has
+    /// indexed more sessions or made more searchable, and when it has stored more files.
     fn poll(&self, work: Work, reported: Reported, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
-            let mut told = format::now();
+            let mut archived = News::new(SyncEvent::Archived);
+            let mut stored = News::new(SyncEvent::Stored);
             loop {
                 cx.background_executor().timer(PROGRESS_TICK).await;
                 let progress = *reported.lock().unwrap_or_else(PoisonError::into_inner);
@@ -955,17 +995,20 @@ impl SyncService {
                         Work::Pass(id) => this.passes.get_mut(id).map(|it| &mut it.progress),
                         Work::Index(of) => this.indexes.get_mut(of).map(|it| &mut it.progress),
                     };
-                    let Some(shown) = shown.filter(|shown| **shown != progress) else {
+                    let Some(shown) = shown else {
                         return;
                     };
-                    let indexed = shown.sessions_done != progress.sessions_done
-                        || shown.searchable_done != progress.searchable_done;
-                    *shown = progress;
-                    if indexed && format::now() - told >= ARCHIVED_EVERY_MS {
-                        told = format::now();
-                        cx.emit(SyncEvent::Archived);
+                    let (indexed, grew) = (
+                        shown.sessions_done != progress.sessions_done
+                            || shown.searchable_done != progress.searchable_done,
+                        shown.items_done != progress.items_done,
+                    );
+                    if *shown != progress {
+                        *shown = progress;
+                        cx.notify();
                     }
-                    cx.notify();
+                    archived.tell(indexed, cx);
+                    stored.tell(grew, cx);
                 });
                 if alive.is_err() {
                     break;
@@ -1033,6 +1076,13 @@ impl SyncService {
     #[cfg(any(test, feature = "automation"))]
     pub fn release(&mut self) {
         self.hold.release();
+    }
+
+    /// Lets a pass that is waiting at a hold go on, to wait again once it has stored `until`
+    /// items: steps it through a sync.
+    #[cfg(any(test, feature = "automation"))]
+    pub fn release_until(&mut self, until: usize) {
+        self.hold.release_then(Some((until, Held::Pause)));
     }
 
     /// Whether a pass is waiting at a hold.

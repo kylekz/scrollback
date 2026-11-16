@@ -292,7 +292,10 @@ impl Palette {
                     }
                     cx.notify();
                 }),
-                cx.subscribe(&sync, |this, _, _: &SyncEvent, cx| {
+                cx.subscribe(&sync, |this, _, event: &SyncEvent, cx| {
+                    if *event != SyncEvent::Archived {
+                        return;
+                    }
                     this.again = Some(cx.spawn(async move |this, cx| {
                         cx.background_executor().timer(AGAIN_AFTER).await;
                         this.update(cx, |this, cx| {
