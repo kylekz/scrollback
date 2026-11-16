@@ -4,7 +4,7 @@
 mod common;
 
 use pretty_assertions::assert_eq;
-use sb_core::catalogue::{Holding, Shelf};
+use sb_core::catalogue::{Holding, LastCheck, Shelf};
 use sb_core::location::LocationKind;
 use sb_core::sync::survey;
 use sb_test_support::Agent;
@@ -14,6 +14,7 @@ use common::{Bench, for_both_agents};
 for_both_agents!(
     removing_one_location_leaves_the_others_as_they_were,
     locations_added_in_the_same_moment_keep_the_order_they_were_added_in,
+    a_locations_last_check_is_kept_in_place_of_the_one_before,
     an_item_with_several_versions_is_held_once,
     a_session_in_trash_is_held_and_one_deleted_for_good_is_not,
     removing_a_location_keeps_everything_archived_from_it,
@@ -212,4 +213,28 @@ fn a_session_in_trash_is_held_and_one_deleted_for_good_is_not<A: Agent + Default
     let held = catalogue.holdings().unwrap();
     assert_eq!((held[0].sessions, held[0].trashed), (1, 0));
     assert_eq!(held[0].bytes, newest_lengths(&bench));
+}
+
+fn a_locations_last_check_is_kept_in_place_of_the_one_before<A: Agent + Default>() {
+    let bench = bench::<A>();
+    let catalogue = bench.archive().catalogue();
+    assert_eq!(catalogue.last_check(&bench.location).unwrap(), None);
+    let first = LastCheck {
+        at: 1,
+        shell: "/bin/sh".to_string(),
+        login_shell: None,
+        missing: vec!["find".to_string(), "sha256sum or shasum".to_string()],
+        took_ms: 1400,
+    };
+    catalogue.record_check(&bench.location, &first).unwrap();
+    assert_eq!(catalogue.last_check(&bench.location).unwrap(), Some(first));
+    let then = LastCheck {
+        at: 2,
+        shell: "/bin/sh".to_string(),
+        login_shell: Some("/bin/zsh".to_string()),
+        missing: Vec::new(),
+        took_ms: 900,
+    };
+    catalogue.record_check(&bench.location, &then).unwrap();
+    assert_eq!(catalogue.last_check(&bench.location).unwrap(), Some(then));
 }

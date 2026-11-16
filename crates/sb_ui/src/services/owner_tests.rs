@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{Entity, TestAppContext};
 use pretty_assertions::assert_eq;
-use sb_core::catalogue::Shelf;
+use sb_core::catalogue::{LastCheck, Shelf};
 use sb_core::location::{Location, LocationKind};
 use sb_core::transport::wsl::Distro;
 use sb_core::transport::{Launcher, Probe, TransportError};
@@ -788,4 +788,47 @@ fn two_adds_under_way_cant_share_a_name(cx: &mut TestAppContext) {
         assert_eq!(sync.refused(), Some("Work Mac is another location's name."));
     });
     assert_eq!(locations(&sync, cx).len(), 1);
+}
+
+fn last_check(sync: &Entity<SyncService>, cx: &mut TestAppContext) -> Option<LastCheck> {
+    let id = locations(sync, cx)[0].id.clone();
+    sync.read_with(cx, |sync, _| sync.details().last_check(&id).cloned())
+}
+
+#[gpui::test]
+fn a_location_keeps_what_its_shell_said_to_its_last_test(cx: &mut TestAppContext) {
+    let lacking = Arc::new(AtomicBool::new(false));
+    let sync = init(
+        {
+            let lacking = lacking.clone();
+            move |_| {
+                Ok(Probe {
+                    missing: if lacking.load(Ordering::SeqCst) {
+                        vec!["find".to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    ..answered()
+                })
+            }
+        },
+        cx,
+    );
+    // The test it was added after is its first check.
+    sync.update(cx, |sync, cx| sync.test_place(macbook(), cx));
+    cx.run_until_parked();
+    add(&sync, macbook(), "user@macbook", false, cx);
+    let first = last_check(&sync, cx).expect("the test it was added after");
+    assert_eq!(first.login_shell.as_deref(), Some("/bin/bash"));
+    assert!(first.missing.is_empty());
+
+    // A later test, tools missing and all, takes its place.
+    lacking.store(true, Ordering::SeqCst);
+    sync.update(cx, |sync, cx| sync.test_place(macbook(), cx));
+    cx.run_until_parked();
+    assert!(matches!(test_state(&sync, cx), Some(TestState::Failed(_))));
+    assert_eq!(
+        last_check(&sync, cx).map(|it| it.missing),
+        Some(vec!["find".to_string()])
+    );
 }

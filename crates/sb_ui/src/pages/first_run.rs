@@ -312,8 +312,17 @@ impl FirstRun {
 
     /// A place's row: a checkbox, its kind's icon, its name and kind over its own lines, and
     /// what was found there.
-    fn row(&self, at: usize, offered: Offered, theme: &SbTheme, cx: &Context<Self>) -> AnyElement {
+    /// `at` is the row's place in its card, and whether it is the card's last.
+    fn row(
+        &self,
+        (at, last): (usize, bool),
+        offered: Offered,
+        theme: &SbTheme,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let c = &theme.colors;
+        // The card's radius inside its 1px border.
+        let inner = theme.radii.card - px(1.);
         let checked = self.is_checked(&offered);
         let target = match &offered.kind {
             LocationKind::Local => "first-run/this-machine".to_string(),
@@ -335,6 +344,10 @@ impl FirstRun {
                 .border_1()
                 .border_color(gpui::transparent_black())
                 .when(at > 0, |this| this.border_t_1().border_color(c.line_subtle))
+                /* Where it meets the card's rounded edge it is as round inside it, so that
+                its focus ring follows the card's corners. */
+                .when(at == 0, |this| this.rounded_t(inner))
+                .when(last, |this| this.rounded_b(inner))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.toggle(kind.clone(), checked, cx);
@@ -467,16 +480,15 @@ impl Render for FirstRun {
             .offered(cx)
             .into_iter()
             .partition(|offered| matches!(offered.kind, LocationKind::Ssh { .. }));
-        let rows: Vec<AnyElement> = found
-            .into_iter()
-            .enumerate()
-            .map(|(at, offered)| self.row(at, offered, &theme, cx))
-            .collect();
-        let hosts: Vec<AnyElement> = hosts
-            .into_iter()
-            .enumerate()
-            .map(|(at, offered)| self.row(at, offered, &theme, cx))
-            .collect();
+        let card = |offered: Vec<Offered>| -> Vec<AnyElement> {
+            let last = offered.len().saturating_sub(1);
+            offered
+                .into_iter()
+                .enumerate()
+                .map(|(at, offered)| self.row((at, at == last), offered, &theme, cx))
+                .collect()
+        };
+        let (rows, hosts) = (card(found), card(hosts));
         let development = self.sync.read(cx).development_home().map(|home| {
             development_notice(home, &theme).automation_target("first-run/development")
         });

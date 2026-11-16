@@ -884,6 +884,7 @@ impl SessionsView {
                     )
                     .children(calls.map(|calls| {
                         div()
+                            .debug_selector(move || format!("card-calls-{index}"))
                             .flex_none()
                             .flex()
                             .items_center()

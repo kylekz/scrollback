@@ -325,5 +325,8 @@ mod tests {
             clean_name(&"x".repeat(400)).map(|it| it.len()),
             Some(NAME_CHARS)
         );
+        // Cut where a space falls, the name doesn't end in it.
+        let spaced = format!("{} tail", "x".repeat(NAME_CHARS - 1));
+        assert_eq!(clean_name(&spaced), Some("x".repeat(NAME_CHARS - 1)));
     }
 }

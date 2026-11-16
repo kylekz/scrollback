@@ -481,6 +481,37 @@ fn picking_a_row_closes_a_narrow_windows_sidebar(cx: &mut TestAppContext) {
     assert_eq!(placement(cx), SidebarPlacement::Collapsed);
 }
 
+/**
+ * A location with a long name: its tag keeps to its cap on the cards (DESIGN §4.4), and the
+ * counts keep their room, in a wide window and in a narrow one.
+ */
+fn a_long_location_name_leaves_the_counts(
+    window_size: gpui::Size<gpui::Pixels>,
+    cx: &mut TestAppContext,
+) {
+    let (_shell, cx) = open_shell_sized(window_size, cx);
+    let sync = cx.update(|_, cx| cx.services().sync.clone());
+    let here = sync.read_with(cx, |sync, _| sync.locations().unwrap()[0].id.clone());
+    sync.update(cx, |sync, cx| {
+        sync.rename(&here, "Distro for Long Running Builds and Experiments", cx)
+            .unwrap();
+    });
+    cx.run_until_parked();
+    let card = bounds(cx, "card-0").expect("the first card");
+    let calls = bounds(cx, "card-calls-0").expect("its count shows");
+    assert!(calls.right() <= card.right(), "{calls:?} inside {card:?}");
+}
+
+#[gpui::test]
+fn a_long_location_name_leaves_the_counts_in_a_wide_window(cx: &mut TestAppContext) {
+    a_long_location_name_leaves_the_counts(size(px(1440.), px(900.)), cx);
+}
+
+#[gpui::test]
+fn a_long_location_name_leaves_the_counts_in_a_narrow_window(cx: &mut TestAppContext) {
+    a_long_location_name_leaves_the_counts(size(px(960.), px(600.)), cx);
+}
+
 #[gpui::test]
 fn the_arrows_row_goes_with_a_location_that_is_removed(cx: &mut TestAppContext) {
     let (shell, cx) = open_shell(cx);

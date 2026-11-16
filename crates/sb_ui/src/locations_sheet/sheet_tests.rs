@@ -183,3 +183,55 @@ fn closing_the_sheet_renames(cx: &mut TestAppContext) {
     assert!(cx.update(|_, cx| shell.read(cx).locations_sheet().is_none()));
     assert_eq!(name(cx), format!("{before} two"));
 }
+
+#[gpui::test]
+fn add_again_with_a_name_taken_since_asks_for_a_new_one_in_the_dialog(cx: &mut TestAppContext) {
+    let (_, sheet, cx) = open_sheet(cx);
+    let host = |name: &str| LocationKind::Ssh {
+        host: name.to_string(),
+    };
+    let sync = sync(cx);
+    sync.update(cx, |sync, cx| {
+        sync.add(host("user@a"), "Workbox".to_string(), false, cx);
+    });
+    cx.run_until_parked();
+    let a = sync.read_with(cx, |sync, _| sync.locations().unwrap()[1].id.clone());
+    sync.update(cx, |sync, cx| sync.remove(&a, cx));
+    cx.run_until_parked();
+    sync.update(cx, |sync, cx| {
+        sync.add(host("user@b"), "Workbox".to_string(), false, cx);
+    });
+    cx.run_until_parked();
+
+    // Not added under the taken name, and no banner: the dialog, on that host.
+    cx.update(|window, cx| {
+        sheet.update(cx, |sheet, cx| {
+            sheet.add_again(host("user@a"), "Workbox".to_string(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(dialog(&sheet, cx), Some("add"));
+    sync.read_with(cx, |sync, _| {
+        assert_eq!(sync.refused(), None);
+        assert_eq!(sync.removed().len(), 1);
+        assert_eq!(
+            sync.test().map(|test| test.kind.clone()),
+            Some(host("user@a"))
+        );
+    });
+}
+
+#[gpui::test]
+fn the_name_field_takes_no_more_than_a_name_keeps(cx: &mut TestAppContext) {
+    let (_, sheet, cx) = open_sheet(cx);
+    cx.update(|window, cx| {
+        let name = sheet.read(cx).name.clone();
+        name.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
+    });
+    cx.simulate_input(&"N".repeat(sb_core::location::NAME_CHARS));
+    cx.simulate_input("more");
+    assert_eq!(field(&sheet, cx), "N".repeat(sb_core::location::NAME_CHARS));
+}

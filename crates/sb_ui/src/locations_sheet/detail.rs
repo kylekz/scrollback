@@ -473,8 +473,49 @@ fn connects(location: &Location, sync: &SyncService, theme: &SbTheme) -> Vec<Any
     }
 }
 
+/**
+ * What a location's shell said the last time it was tested (DESIGN §4.11): the shell that
+ * answered and the tools it has, and when. Nothing for this machine, or one never tested.
+ */
+fn checked(location: &Location, sync: &SyncService, theme: &SbTheme) -> Vec<AnyElement> {
+    let Some(check) = sync.details().last_check(&location.id) else {
+        return Vec::new();
+    };
+    let c = &theme.colors;
+    let when = format::day(check.at, format::now());
+    vec![
+        kv(
+            "Shell",
+            match &check.login_shell {
+                Some(login) => format!("{login}, as a login shell"),
+                None => format!("{}; the login shell didn't answer", check.shell),
+            },
+            theme,
+        )
+        .automation_target("sheet/check/shell"),
+        kv(
+            "Tools",
+            if check.missing.is_empty() {
+                div().child(with_numbers(
+                    format!("All found · tested {when}"),
+                    c.fg2,
+                    &theme.text.secondary,
+                    theme,
+                ))
+            } else {
+                div().text_color(c.red).child(format!(
+                    "Lacks {} · tested {when}",
+                    check.missing.join(", ")
+                ))
+            },
+            theme,
+        )
+        .automation_target("sheet/check/tools"),
+    ]
+}
+
 /// What the location's last passes found (DESIGN §4.11): each agent with where it keeps its
-/// data and how long, and what is archived from here.
+/// data and how long, what is archived from here, and what its shell said to its last test.
 fn found_card(
     location: &Location,
     sync: &SyncService,
@@ -502,6 +543,7 @@ fn found_card(
                     .text_spec(&theme.text.secondary)
                     .child("Nothing yet: its first sync looks for the agents there."),
             )
+            .children(checked(location, sync, theme))
             .automation_target("sheet/found-card");
     }
     let trashed = details.trashed(&location.id);
@@ -545,5 +587,6 @@ fn found_card(
             theme,
         ))
     }))
+    .children(checked(location, sync, theme))
     .automation_target("sheet/found-card")
 }

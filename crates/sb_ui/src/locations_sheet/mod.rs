@@ -28,7 +28,7 @@ use gpui::{
 };
 use gpui_component::FocusTrapElement as _;
 use gpui_component::input::{InputEvent, InputState};
-use sb_core::location::{Location, LocationId, LocationKind};
+use sb_core::location::{Location, LocationId, LocationKind, NAME_CHARS};
 
 use crate::actions::locations::{Close, Confirm, Next, Open, Previous};
 use crate::add_location::{AddLocation, AddLocationEvent, Kind, Purpose};
@@ -95,7 +95,11 @@ impl LocationsSheet {
     /// The sheet with `selected` selected, or the first location, the keyboard on its list.
     pub fn new(selected: Option<LocationId>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let sync = cx.services().sync.clone();
-        let name = cx.new(|cx| InputState::new(window, cx));
+        let name = cx.new(|cx| {
+            InputState::new(window, cx)
+                // The field takes no more than a name keeps.
+                .validate(|name, _| name.chars().count() <= NAME_CHARS)
+        });
         let list_focus = cx.focus_handle().tab_stop(true);
         list_focus.focus(window, cx);
         sync.update(cx, |sync, cx| sync.list_distros(cx));
@@ -278,17 +282,48 @@ impl LocationsSheet {
         self.sync.update(cx, |sync, _| sync.cancel_test());
     }
 
-    /// Opens the add dialog on `kind`, on the distro `distro` for a distro.
+    /**
+     * Add again on a removed location, the place `kind` named `name`: back under that name,
+     * or, when another location has it now, through the add dialog on that place, where a
+     * new one is chosen.
+     */
+    fn add_again(
+        &mut self,
+        kind: LocationKind,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let renamed = self
+            .sync
+            .read(cx)
+            .restoring(&kind)
+            .is_some_and(|(_, renamed)| renamed);
+        if renamed {
+            let shown = match &kind {
+                LocationKind::Local => Kind::ThisMachine,
+                LocationKind::Wsl { .. } => Kind::Wsl,
+                LocationKind::Ssh { .. } => Kind::Ssh,
+            };
+            self.open_add(shown, Some(kind), window, cx);
+        } else {
+            self.to_select = Some(kind.clone());
+            self.sync
+                .update(cx, |sync, cx| sync.add(kind, name, false, cx));
+        }
+    }
+
+    /// Opens the add dialog on `kind`, on the place `place` if one is given.
     fn open_add(
         &mut self,
         kind: Kind,
-        distro: Option<String>,
+        place: Option<LocationKind>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.return_focus = window.focused(cx);
         let dialog =
-            cx.new(|cx| AddLocation::new(Purpose::Add, kind, distro, Vec::new(), window, cx));
+            cx.new(|cx| AddLocation::new(Purpose::Add, kind, place, Vec::new(), window, cx));
         self._dialog = Some(
             cx.subscribe_in(&dialog, window, |this, _, event, window, cx| {
                 if let AddLocationEvent::Added(kind) = event {
@@ -769,7 +804,10 @@ impl LocationsSheet {
                             .on_click(cx.listener({
                                 let name = name.clone();
                                 move |this, _, window, cx| {
-                                    this.open_add(Kind::Wsl, Some(name.clone()), window, cx);
+                                    let distro = LocationKind::Wsl {
+                                        distro: name.clone(),
+                                    };
+                                    this.open_add(Kind::Wsl, Some(distro), window, cx);
                                 }
                             }))
                             .child(icon(SbIcon::Plus, theme.sizes.icon_xs, c.fg2))
@@ -813,7 +851,8 @@ impl LocationsSheet {
     /**
      * The locations the owner removed, under the rest: what the archive still holds from
      * each, and Add again, which brings it back under its name, with what was archived
-     * from it (FEATURES: Locations).
+     * from it (FEATURES: Locations). A name another location has taken since is chosen anew
+     * in the add dialog, on that place.
      */
     fn removed(&self, theme: &SbTheme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let c = &theme.colors;
@@ -882,11 +921,8 @@ impl LocationsSheet {
                             true,
                             theme,
                         )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.to_select = Some(kind.clone());
-                            let (kind, name) = (kind.clone(), name.clone());
-                            this.sync
-                                .update(cx, |sync, cx| sync.add(kind, name, false, cx));
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.add_again(kind.clone(), name.clone(), window, cx);
                         }))
                         .child(icon(SbIcon::Plus, theme.sizes.icon_xs, c.fg2))
                         .child("Add again")

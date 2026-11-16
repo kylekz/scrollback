@@ -238,9 +238,12 @@ pub fn focus_ring(edge: bool, theme: &SbTheme) -> Vec<BoxShadow> {
     }
 }
 
-/// `text` in `color` and `spec`'s face, with every number in it (a run of digits, with the
-/// `,` `.` `:` between them) in the face for numbers (DESIGN §1.3: Geist Mono, whose digits
-/// are all as wide).
+/**
+ * `text` in `color` and `spec`'s face, with the digits of every number in it in the face for
+ * numbers (DESIGN §1.3: Geist Mono, whose digits are all as wide). The `,` `.` `:` between
+ * them stay in `spec`'s face: a mono face gives each a digit's width, which among words reads
+ * as a gap ("5 ,369").
+ */
 pub fn with_numbers(
     text: impl Into<SharedString>,
     color: Hsla,
@@ -270,16 +273,11 @@ pub fn with_numbers(
     StyledText::new(text).with_runs(runs)
 }
 
-/// `text` cut into spans, each its length in bytes and whether it is a number.
+/// `text` cut into spans, each its length in bytes and whether it is a number's digits.
 fn number_spans(text: &str) -> Vec<(usize, bool)> {
-    let bytes = text.as_bytes();
     let mut spans: Vec<(usize, bool)> = Vec::new();
-    for (at, byte) in bytes.iter().enumerate() {
-        let between_digits = matches!(byte, b',' | b'.' | b':')
-            && at > 0
-            && bytes[at - 1].is_ascii_digit()
-            && bytes.get(at + 1).is_some_and(u8::is_ascii_digit);
-        let number = byte.is_ascii_digit() || between_digits;
+    for byte in text.bytes() {
+        let number = byte.is_ascii_digit();
         match spans.last_mut() {
             Some((len, of)) if *of == number => *len += 1,
             _ => spans.push((1, number)),
@@ -679,9 +677,19 @@ mod tests {
             number_spans("WSL · 3 of 28 MB"),
             [(7, false), (1, true), (4, false), (2, true), (3, false)]
         );
-        assert_eq!(number_spans("started 09:02"), [(8, false), (5, true)]);
-        assert_eq!(number_spans("1,414 sessions"), [(5, true), (9, false)]);
-        // A separator not between digits is a word's.
+        // The separators between digits are in the words' face, at their own width.
+        assert_eq!(
+            number_spans("started 09:02"),
+            [(8, false), (2, true), (1, false), (2, true)]
+        );
+        assert_eq!(
+            number_spans("1,414 sessions"),
+            [(1, true), (1, false), (3, true), (9, false)]
+        );
+        assert_eq!(
+            number_spans("stopped · 5,369 files left"),
+            [(11, false), (1, true), (1, false), (3, true), (11, false)]
+        );
         assert_eq!(number_spans("x, 1."), [(3, false), (1, true), (1, false)]);
         assert_eq!(number_spans(""), []);
     }

@@ -6,7 +6,14 @@ use toolbox_store::Schema;
 
 pub(super) const SCHEMA: Schema = Schema {
     domain: "scrollback",
-    steps: &[SYNC, LIBRARY, LOCATIONS, SEARCH_AND_DELETING, REMOVED],
+    steps: &[
+        SYNC,
+        LIBRARY,
+        LOCATIONS,
+        SEARCH_AND_DELETING,
+        REMOVED,
+        CHECKS,
+    ],
 };
 
 /// What sync writes (PLAN §2.2): locations, items, versions and segments. Times are Unix
@@ -297,6 +304,21 @@ const REMOVED: &str = "
 ALTER TABLE location ADD COLUMN removed_at INTEGER;
 -- Where the agent keeps its data there, as the provider names it, from the last pass.
 ALTER TABLE location_provider ADD COLUMN root TEXT;
+";
+
+/// The last connection test of each WSL and SSH location (DESIGN §4.11, §4.12).
+const CHECKS: &str = "
+-- What the location's shell said the last time it was tested: when, the sh that answered, the
+-- login shell when it answered (NULL when it didn't), the tools it lacks, one per line (empty
+-- for none), and how long the test took. Kept when the location is removed.
+CREATE TABLE location_check (
+    location_id TEXT PRIMARY KEY REFERENCES location (id),
+    checked_at INTEGER NOT NULL,
+    shell TEXT NOT NULL,
+    login_shell TEXT,
+    missing TEXT NOT NULL,
+    took_ms INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
 ";
 
 #[cfg(test)]

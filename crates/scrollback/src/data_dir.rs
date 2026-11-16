@@ -88,19 +88,59 @@ fn choose(
 #[cfg(feature = "automation")]
 pub fn for_development(place: &Place) -> Result<()> {
     let own = dirs::data_local_dir().map(|data| data.join("scrollback"));
-    refuse_own(place, own.as_deref())
+    let paths = if cfg!(windows) {
+        Paths::Windows
+    } else {
+        Paths::Unix
+    };
+    refuse_own(place, own.as_deref(), paths)
+}
+
+/// How a platform spells one folder: Windows in any case, with either slash.
+#[cfg(feature = "automation")]
+#[derive(Clone, Copy)]
+enum Paths {
+    Unix,
+    Windows,
 }
 
 #[cfg(feature = "automation")]
-fn refuse_own(place: &Place, own: Option<&Path>) -> Result<()> {
-    let same = |a: &Path, b: &Path| {
-        a == b
-            || a.canonicalize()
-                .ok()
-                .is_some_and(|a| b.canonicalize().ok() == Some(a))
-    };
+impl Paths {
+    /**
+     * `path` as one spelling of its folder under these rules: no `.` steps, no doubled or
+     * trailing separators, and on Windows `/` for `\` and lower case.
+     */
+    fn spelling(self, path: &Path) -> String {
+        let path = path.to_string_lossy();
+        let path = match self {
+            Self::Unix => path.into_owned(),
+            Self::Windows => path.replace('\\', "/").to_lowercase(),
+        };
+        let rooted = path.starts_with('/');
+        let steps: Vec<&str> = path
+            .split('/')
+            .filter(|step| !step.is_empty() && *step != ".")
+            .collect();
+        format!("{}{}", if rooted { "/" } else { "" }, steps.join("/"))
+    }
+
+    /**
+     * Whether `a` and `b` are one folder: as the file system resolves them where both exist
+     * (links, `..`), and otherwise by their spellings, as when the owner's folder isn't made
+     * yet.
+     */
+    fn same(self, a: &Path, b: &Path) -> bool {
+        match (a.canonicalize(), b.canonicalize()) {
+            (Ok(a), Ok(b)) => self.spelling(&a) == self.spelling(&b),
+            _ => self.spelling(a) == self.spelling(b),
+        }
+    }
+}
+
+#[cfg(feature = "automation")]
+fn refuse_own(place: &Place, own: Option<&Path>, paths: Paths) -> Result<()> {
     anyhow::ensure!(
-        place.source == Source::Explicit && !own.is_some_and(|own| same(&place.dir, own)),
+        place.source == Source::Explicit && !own.is_some_and(|own| paths.same(&place.dir, own)),
         "--dev-location-home archives generated data: it needs a scratch --data-dir of its own, \
          never scrollback's own data folder"
     );
@@ -121,10 +161,47 @@ mod tests {
             dir: dir.to_path_buf(),
             source,
         };
-        assert!(refuse_own(&at(Path::new("/tmp/scratch"), Source::Explicit), Some(own)).is_ok());
-        assert!(refuse_own(&at(own, Source::Explicit), Some(own)).is_err());
-        assert!(refuse_own(&at(own, Source::Platform), Some(own)).is_err());
-        assert!(refuse_own(&at(Path::new("/tmp/x"), Source::Automation), Some(own)).is_err());
+        let refused = |dir: &str, source| {
+            refuse_own(&at(Path::new(dir), source), Some(own), Paths::Unix).is_err()
+        };
+        assert!(!refused("/tmp/scratch", Source::Explicit));
+        assert!(refused(
+            "/Users/user/Library/Application Support/scrollback",
+            Source::Explicit
+        ));
+        assert!(refused(
+            "/Users/user/Library/Application Support/scrollback/",
+            Source::Explicit
+        ));
+        assert!(refused(
+            "/Users/user/Library/Application Support/./scrollback",
+            Source::Explicit
+        ));
+        assert!(refused(
+            "/Users/user/Library/Application Support/scrollback",
+            Source::Platform
+        ));
+        assert!(refused("/tmp/x", Source::Automation));
+    }
+
+    /// On Windows a folder is the same in any case and with either slash, made or not.
+    #[cfg(feature = "automation")]
+    #[test]
+    fn the_owners_data_folder_on_windows_is_known_in_any_spelling() {
+        let own = Path::new(r"C:\Users\user\AppData\Local\scrollback");
+        let refused = |dir: &str| {
+            let place = Place {
+                dir: PathBuf::from(dir),
+                source: Source::Explicit,
+            };
+            refuse_own(&place, Some(own), Paths::Windows).is_err()
+        };
+        assert!(refused(r"C:\Users\user\AppData\Local\scrollback"));
+        assert!(refused(r"c:\users\user\appdata\local\SCROLLBACK"));
+        assert!(refused("C:/Users/user/AppData/Local/scrollback/"));
+        assert!(refused(r"C:\Users\user\AppData\Local\.\scrollback\"));
+        assert!(!refused(r"D:\Projects\scratch"));
+        assert!(!refused(r"C:\Users\user\AppData\Local\scrollback-dev"));
     }
 
     #[test]

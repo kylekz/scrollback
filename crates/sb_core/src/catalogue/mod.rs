@@ -32,6 +32,7 @@ use crate::hash::Hash;
 use crate::location::{Location, LocationId, LocationKind, Unreachable};
 use crate::provider::{ItemKind, ScannedItem};
 use crate::search::Log;
+use crate::transport::Probe;
 
 pub use folder::{Folder, FolderPath};
 pub use library::{LibraryCounts, PathGroup, Shelf};
@@ -319,6 +320,34 @@ pub struct ProviderAt {
     pub root: Option<String>,
 }
 
+/// What a WSL or SSH location's shell said the last time it was tested (DESIGN §4.11).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastCheck {
+    /// When, in Unix milliseconds.
+    pub at: i64,
+    /// The `sh` that answered ([`Probe::shell`]).
+    pub shell: String,
+    /// The login shell, when it answered ([`Probe::login_shell`]).
+    pub login_shell: Option<String>,
+    /// The tools it lacks ([`Probe::missing`]).
+    pub missing: Vec<String>,
+    /// How long the test took, in milliseconds.
+    pub took_ms: u64,
+}
+
+impl LastCheck {
+    /// What `probe` says, taken now.
+    pub fn of(probe: &Probe) -> Self {
+        Self {
+            at: now_ms(),
+            shell: probe.shell.clone(),
+            login_shell: probe.login_shell.clone(),
+            missing: probe.missing.clone(),
+            took_ms: u64::try_from(probe.took.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
+}
+
 /// What the archive holds from one agent at one location.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Holding {
@@ -569,6 +598,52 @@ impl Catalogue {
              WHERE id = ?1",
             params![location, now_ms(), reason],
         )
+    }
+
+    /// Keeps `check` as what `location`'s shell last said, in place of what it said before.
+    pub fn record_check(&self, location: &LocationId, check: &LastCheck) -> Result<()> {
+        self.execute(
+            "INSERT INTO location_check
+                 (location_id, checked_at, shell, login_shell, missing, took_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (location_id) DO UPDATE SET checked_at = ?2, shell = ?3,
+                 login_shell = ?4, missing = ?5, took_ms = ?6",
+            params![
+                location,
+                check.at,
+                check.shell,
+                check.login_shell,
+                check.missing.join("\n"),
+                i64::try_from(check.took_ms).unwrap_or(i64::MAX)
+            ],
+        )
+    }
+
+    /// What `location`'s shell said the last time it was tested, if it ever was.
+    pub fn last_check(&self, location: &LocationId) -> Result<Option<LastCheck>> {
+        self.db.read(|c| {
+            Ok(c.query_row(
+                "SELECT checked_at, shell, login_shell, missing, took_ms FROM location_check
+                 WHERE location_id = ?1",
+                [location],
+                |row| {
+                    let missing: String = row.get(3)?;
+                    let took: i64 = row.get(4)?;
+                    Ok(LastCheck {
+                        at: row.get(0)?,
+                        shell: row.get(1)?,
+                        login_shell: row.get(2)?,
+                        missing: missing
+                            .lines()
+                            .filter(|tool| !tool.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                        took_ms: u64::try_from(took).unwrap_or_default(),
+                    })
+                },
+            )
+            .optional()?)
+        })
     }
 
     /// The providers whose agents were found at `location`, with where each keeps its data

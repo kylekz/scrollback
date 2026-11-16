@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use gpui::Context;
 use sb_core::CancelToken;
 use sb_core::archive::Archive;
-use sb_core::catalogue::{CatalogueError, Holding, ProviderAt};
+use sb_core::catalogue::{CatalogueError, Holding, LastCheck, ProviderAt};
 use sb_core::location::{Location, LocationId, LocationKind, clean_name};
 use sb_core::transport::wsl::Distro;
 use sb_core::transport::{Launcher, Probe, TransportError};
@@ -34,24 +34,37 @@ pub const STALE_AFTER_DAYS: i64 = 7;
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// What the archive holds from each location, and what each one's last passes found there.
+/**
+ * What the archive holds from each location, what each one's last passes found there, and
+ * what its shell said the last time it was tested.
+ */
 #[derive(Clone, Debug, Default)]
 pub struct Details {
     holdings: Vec<Holding>,
     found: HashMap<LocationId, Vec<ProviderAt>>,
+    checks: HashMap<LocationId, LastCheck>,
 }
 
 impl Details {
     pub(super) fn read(archive: &Archive) -> Result<Self, CatalogueError> {
         let catalogue = archive.catalogue();
-        let mut found = HashMap::new();
+        let (mut found, mut checks) = (HashMap::new(), HashMap::new());
         for location in catalogue.locations()? {
             found.insert(location.id.clone(), catalogue.providers_at(&location.id)?);
+            if let Some(check) = catalogue.last_check(&location.id)? {
+                checks.insert(location.id.clone(), check);
+            }
         }
         Ok(Self {
             holdings: catalogue.holdings()?,
             found,
+            checks,
         })
+    }
+
+    /// What `location`'s shell said the last time it was tested, if it ever was.
+    pub fn last_check(&self, location: &LocationId) -> Option<&LastCheck> {
+        self.checks.get(location)
     }
 
     /// What the archive holds from each agent at `location`.
@@ -250,6 +263,23 @@ pub fn name_problem<'a>(name: &str, taken: impl IntoIterator<Item = &'a str>) ->
         .map(|it| format!("{it} is another location's name."))
 }
 
+/**
+ * Keeps what `probe` says as the last check of the location that is the place `kind`, if one
+ * is or was. One that can't be kept is told the log: the test's answer stands without it.
+ */
+fn record_check(archive: &Archive, kind: &LocationKind, probe: &Probe) {
+    let catalogue = archive.catalogue();
+    let kept = catalogue
+        .locations()
+        .and_then(|locations| match refusal(kind, locations.iter()) {
+            Some(location) => catalogue.record_check(&location.id, &LastCheck::of(probe)),
+            None => Ok(()),
+        });
+    if let Err(error) = kept {
+        log::error!("a connection test could not be kept: {error}");
+    }
+}
+
 impl SyncService {
     /// The locations the owner removed, whose sessions are still in the archive.
     pub fn removed(&self) -> &[Location] {
@@ -370,6 +400,13 @@ impl SyncService {
             }
         };
         self.adding.push((kind.clone(), name.clone()));
+        // What the shell there said to the test the place was added after is its last check.
+        let check = self.test.as_ref().and_then(|test| match &test.state {
+            TestState::Passed {
+                probe: Some(probe), ..
+            } if test.kind.same_place(&kind) => Some(LastCheck::of(probe)),
+            _ => None,
+        });
         self.run(
             cx,
             {
@@ -385,6 +422,9 @@ impl SyncService {
                         }
                         None => Ok(catalogue.add_location(kind, &name)?.id),
                     };
+                    if let (Ok(id), Some(check)) = (&added, &check) {
+                        catalogue.record_check(id, check)?;
+                    }
                     Ok::<_, CatalogueError>((
                         added,
                         catalogue.locations()?,
@@ -566,12 +606,17 @@ impl SyncService {
                 move || {
                     let probe = match &launcher {
                         Some(launcher) => match tester(launcher, &cancel) {
-                            Ok(probe) if !probe.missing.is_empty() => {
-                                return Some(TestState::Failed(TestFailure::Missing(
-                                    probe.missing,
-                                )));
+                            Ok(probe) => {
+                                /* A place that is a location, or was, keeps what its shell
+                                said, missing tools and all (DESIGN §4.11). */
+                                record_check(&archive, &kind, &probe);
+                                if !probe.missing.is_empty() {
+                                    return Some(TestState::Failed(TestFailure::Missing(
+                                        probe.missing,
+                                    )));
+                                }
+                                Some(probe)
                             }
-                            Ok(probe) => Some(probe),
                             Err(error) => return TestFailure::of(error).map(TestState::Failed),
                         },
                         None => None,
@@ -581,13 +626,15 @@ impl SyncService {
                     (!cancel.is_cancelled()).then_some(TestState::Passed { probe, found })
                 }
             },
-            move |this, state, _| {
+            move |this, state, cx| {
                 // A test cancelled since, or replaced by another, has nothing to say.
                 if let (Some(state), Some(test)) = (state, this.test.as_mut())
                     && !cancel.is_cancelled()
                 {
                     test.state = state;
                 }
+                // What it recorded of a location shows in its detail.
+                this.read_details(cx);
             },
         );
     }

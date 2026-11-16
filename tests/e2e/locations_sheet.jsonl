@@ -56,6 +56,18 @@
 {"cmd": "settle", "expect": {"pointer": "/sync/distros", "equals": ["Ubuntu-24.04", "Debian", "docker-desktop"]}}
 {"cmd": "query", "prefix": "sheet/found/", "expect_result": [{"pointer": "", "len": 2}, {"pointer": "/0/target", "equals": "sheet/found/Debian"}]}
 {"cmd": "screenshot", "name": "sheet-found-dark"}
+
+// Test connection on the running distro keeps what its shell said: Shell and Tools rows in the found card, until the next test.
+{"cmd": "click", "target": "sheet/row/Ubuntu-24.04"}
+{"cmd": "settle", "expect": {"pointer": "/sheet/selected", "equals": "Ubuntu-24.04"}}
+{"cmd": "bounds", "target": "sheet/check/tools", "expect_error": "no target"}
+{"cmd": "click", "target": "sheet/test"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test/state", "equals": "passed"}}
+{"cmd": "bounds", "target": "sheet/check/tools", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "sheet/check/shell", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "sheet-checked-dark"}
+{"cmd": "click", "target": "sheet/row/user@macbook"}
+{"cmd": "settle", "expect": {"pointer": "/sheet/selected", "equals": "user@macbook"}}
 {"cmd": "click", "target": "sheet/found/Debian/add"}
 {"cmd": "settle", "expect": [{"pointer": "/sheet/dialog", "equals": "add"}, {"pointer": "/sync/test", "equals": null}]}
 {"cmd": "bounds", "target": "add/stopped", "expect_result": {"pointer": "/visible", "not_equals": null}}

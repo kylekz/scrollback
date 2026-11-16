@@ -33,7 +33,7 @@ use gpui::{
 };
 use gpui_component::FocusTrapElement as _;
 use gpui_component::input::{Input, InputEvent, InputState};
-use sb_core::location::LocationKind;
+use sb_core::location::{LocationKind, NAME_CHARS};
 use sb_core::transport::quoted;
 
 use crate::actions::locations::{Close, Confirm};
@@ -120,18 +120,25 @@ impl Focusable for AddLocation {
 }
 
 impl AddLocation {
-    /// The dialog on `kind`, on the distro `distro` for a distro, with the keyboard in it.
+    /**
+     * The dialog on `kind`, with the keyboard in it; with `place` a distro chosen or a host
+     * typed, and tested, as for adding a removed location again under a new name.
+     */
     pub fn new(
         purpose: Purpose,
         kind: Kind,
-        distro: Option<String>,
+        place: Option<LocationKind>,
         taken: Vec<(LocationKind, String)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let sync = cx.services().sync.clone();
         let host = cx.new(|cx| InputState::new(window, cx).placeholder("user@host"));
-        let name = cx.new(|cx| InputState::new(window, cx));
+        let name = cx.new(|cx| {
+            InputState::new(window, cx)
+                // The field takes no more than a name keeps.
+                .validate(|name, _| name.chars().count() <= NAME_CHARS)
+        });
         let mut this = Self {
             _subscriptions: [
                 cx.observe(&sync, |_, _, cx| cx.notify()),
@@ -159,8 +166,15 @@ impl AddLocation {
         };
         this.sync.update(cx, |sync, cx| sync.list_distros(cx));
         this.choose(kind, window, cx);
-        if let Some(distro) = distro {
-            this.choose_distro(distro, window, cx);
+        match place {
+            Some(LocationKind::Wsl { distro }) => this.choose_distro(distro, window, cx),
+            Some(LocationKind::Ssh { host }) => {
+                this.host
+                    .update(cx, |input, cx| input.set_value(host, window, cx));
+                this.host_changed(window, cx);
+                this.test_host(cx);
+            }
+            Some(LocationKind::Local) | None => {}
         }
         this
     }
@@ -390,9 +404,10 @@ impl AddLocation {
         };
         match self.purpose {
             Purpose::Add => {
+                // Added first: what the test found there is kept as the location's check.
                 self.sync.update(cx, |sync, cx| {
-                    sync.cancel_test();
                     sync.add(place.clone(), name, sync_now, cx);
+                    sync.cancel_test();
                 });
                 cx.emit(AddLocationEvent::Added(place));
             }
