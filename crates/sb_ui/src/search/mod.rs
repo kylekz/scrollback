@@ -238,6 +238,7 @@ impl Palette {
             locations: sync.locations().unwrap_or_default(),
             agents: &agents,
             models: &models,
+            model_name: &|model| agents::any_model(model, cx),
             branches: &branches,
             dates: &dates,
         })
@@ -280,6 +281,18 @@ impl Palette {
         }
     }
 
+    /// A click on one of the palette's buttons: what it does, then the keyboard back in the
+    /// query field.
+    fn clicked(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        what: impl FnOnce(&mut Self, &mut Context<Self>),
+    ) {
+        what(self, cx);
+        self.input.update(cx, |input, cx| input.focus(window, cx));
+    }
+
     /// Puts `text` in the query field, and searches it.
     fn set_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         self.input
@@ -309,6 +322,19 @@ impl Palette {
     /// The commands the query names.
     fn commands(&self, cx: &App) -> Vec<&'static Command> {
         commands::matching(&parse(&self.text(cx)).terms)
+    }
+
+    /// The names of the commands the query names, as the Commands group lists them.
+    pub fn command_names(&self, cx: &App) -> Vec<&'static str> {
+        self.commands(cx)
+            .iter()
+            .map(|command| command.name)
+            .collect()
+    }
+
+    /// What the completions of the word being typed read as, the one `Tab` takes first.
+    pub fn completion_labels(&self, cx: &App) -> Vec<String> {
+        self.completions(cx).iter().map(Completion::label).collect()
     }
 
     /// The results of the last search, while its answer is some.
@@ -684,7 +710,9 @@ impl Palette {
                     .children(self.chips.iter().enumerate().map(|(at, chip)| {
                         chip_base(("palette-chip", at), true, theme)
                             .aria_label(format!("{}, remove", chip.label))
-                            .on_click(cx.listener(move |this, _, _, cx| this.remove_chip(at, cx)))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.clicked(window, cx, |this, cx| this.remove_chip(at, cx));
+                            }))
                             .children(self.chip_glyph(chip, theme, cx))
                             .child(chip.label.clone())
                             .child(icon(SbIcon::X, theme.sizes.icon_xs, c.accent_text))
@@ -1150,7 +1178,9 @@ impl Palette {
             })
             .children(scoped.map(|at| {
                 button("palette-everywhere", ButtonKind::Plain, true, true, theme)
-                    .on_click(cx.listener(move |this, _, _, cx| this.remove_chip(at, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.clicked(window, cx, |this, cx| this.remove_chip(at, cx));
+                    }))
                     .child("Search everywhere")
                     .automation_target("palette/everywhere")
             }))
@@ -1272,13 +1302,13 @@ impl Render for Palette {
                     .child(keys(&["enter"], "open at the match"))
                     .child(keys(&["tab"], "add a filter"))
                     .child(
+                        // It gives way at its end, where a narrow window cuts it.
                         div()
                             .flex_1()
                             .min_w_0()
-                            .flex()
-                            .justify_end()
                             .overflow_hidden()
                             .text_ellipsis()
+                            .text_right()
                             .child(FOOTER),
                     ),
             )

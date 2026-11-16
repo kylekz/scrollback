@@ -1,0 +1,123 @@
+{"scenario": {"window_size": "1440x900", "fixture": "search", "description": "The search palette (DESIGN §4.9, E-Search) on the boards' library with E-Search's sessions: Ctrl K over fc's page with Folder: fc, results grouped by session with their hits marked, the arrows wrapping, tokens turning into chips, Tab completing, Backspace taking a chip away, nothing found in fc and Search everywhere, a session opened at its match, the recent sessions and searches, the Commands group, Ctrl Enter to the folder page, Esc and Ctrl K closing it; captured dark and light at 1440x900 and 960x600"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/library/sessions", "equals": 2320}]}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+
+// Ctrl K over fc's page: the palette, 840 wide and 64 from the top, scoped to fc, its query field with the keyboard.
+{"cmd": "click", "target": "sidebar/folder/fc"}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 490}}
+{"cmd": "key", "keystroke": "secondary-k"}
+{"cmd": "settle", "expect": [{"pointer": "/palette/chips", "equals": ["Folder: fc"]}, {"pointer": "/palette/answer", "equals": null}]}
+{"cmd": "bounds", "target": "palette", "expect_result": [{"pointer": "/x", "equals": 300}, {"pointer": "/y", "equals": 64}, {"pointer": "/w", "equals": 840}]}
+{"cmd": "screenshot", "name": "empty-dark"}
+
+// A query: the sessions that hold both terms, the best first, each with its matches and "+n more".
+{"cmd": "type", "text": "backoff 429"}
+{"cmd": "settle", "expect": [{"pointer": "/palette/answer/terms", "equals": ["backoff", "429"]}, {"pointer": "/palette/answer/sessions", "equals": ["Back off on 429 only, not on 403", "Throttle yt-dlp metadata backfill"]}, {"pointer": "/palette/searching", "equals": false}]}
+{"cmd": "bounds", "target": "palette/row/0", "expect_result": {"pointer": "/h", "equals": 28}}
+{"cmd": "screenshot", "name": "results-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "results-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// The arrows move over the rows and wrap at both ends.
+{"cmd": "key", "keystroke": "down"}
+{"cmd": "settle", "expect": {"pointer": "/palette/highlighted", "equals": 1}}
+{"cmd": "key", "keystroke": "up"}
+{"cmd": "key", "keystroke": "up"}
+{"cmd": "settle", "expect": {"pointer": "/palette/highlighted", "gte": 4}}
+{"cmd": "key", "keystroke": "down"}
+{"cmd": "settle", "expect": {"pointer": "/palette/highlighted", "equals": 0}}
+
+// A token turns into a chip once a space follows it; the one being typed completes, and Tab takes the first completion.
+{"cmd": "type", "text": " from:ubuntu-24.04 "}
+{"cmd": "settle", "expect": [{"pointer": "/palette/chips", "equals": ["Folder: fc", "Location: Ubuntu-24.04"]}, {"pointer": "/palette/text", "equals": "backoff 429 "}]}
+{"cmd": "type", "text": "model:op"}
+{"cmd": "settle", "expect": {"pointer": "/palette/completions/0", "equals": "Model: Opus 5.5"}}
+{"cmd": "screenshot", "name": "completing-dark"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "settle", "expect": [{"pointer": "/palette/chips", "equals": ["Folder: fc", "Location: Ubuntu-24.04", "Model: Opus 5.5"]}, {"pointer": "/palette/answer/sessions/1", "equals": "Throttle yt-dlp metadata backfill"}]}
+{"cmd": "screenshot", "name": "chips-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "chips-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// Backspace in an empty query takes the last chip away.
+{"cmd": "key", "keystroke": "secondary-a"}
+{"cmd": "key", "keystroke": "backspace"}
+{"cmd": "settle", "expect": [{"pointer": "/palette/text", "equals": ""}, {"pointer": "/palette/chips/2", "equals": "Model: Opus 5.5"}]}
+{"cmd": "key", "keystroke": "backspace"}
+{"cmd": "key", "keystroke": "backspace"}
+{"cmd": "settle", "expect": {"pointer": "/palette/chips", "equals": ["Folder: fc"]}}
+
+// Text nothing in fc holds: "No matches in fc." and Search everywhere, which drops the folder's chip.
+{"cmd": "type", "text": "dotfiles symlink"}
+{"cmd": "settle", "expect": [{"pointer": "/palette/answer/sessions", "equals": []}, {"pointer": "/palette/rows", "equals": 0}]}
+{"cmd": "bounds", "target": "palette/everywhere", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "nothing-dark"}
+{"cmd": "click", "target": "palette/everywhere"}
+{"cmd": "settle", "expect": {"pointer": "/palette/chips", "equals": []}}
+
+// A letter or two of English asks for more.
+{"cmd": "key", "keystroke": "secondary-a"}
+{"cmd": "type", "text": "ok"}
+{"cmd": "settle", "expect": {"pointer": "/palette/answer", "equals": "keep-typing"}}
+
+// Enter on a match opens its session there: the reader gets the turn, the text for Find and the hit to flash.
+{"cmd": "key", "keystroke": "secondary-a"}
+{"cmd": "type", "text": "backoff 429"}
+{"cmd": "settle", "expect": {"pointer": "/palette/answer/sessions/1", "equals": "Throttle yt-dlp metadata backfill"}}
+{"cmd": "key", "keystroke": "down"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": [{"pointer": "/palette", "equals": null}, {"pointer": "/page", "equals": "session"}, {"pointer": "/library/open", "equals": "Back off on 429 only, not on 403"}, {"pointer": "/library/read_at/find", "equals": "backoff 429"}, {"pointer": "/library/read_at/turn", "equals": 0}]}
+
+// With nothing typed, the palette lists the session opened and the search it came from.
+{"cmd": "key", "keystroke": "alt-left"}
+{"cmd": "settle", "expect": {"pointer": "/page", "equals": "sessions"}}
+{"cmd": "key", "keystroke": "secondary-k"}
+{"cmd": "settle", "expect": [{"pointer": "/palette/rows", "equals": 2}, {"pointer": "/palette/answer", "equals": null}]}
+{"cmd": "screenshot", "name": "recent-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "recent-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// A command's name: the Commands group heads the results, each with its key.
+{"cmd": "type", "text": "sync"}
+{"cmd": "settle", "expect": {"pointer": "/palette/commands", "equals": ["Sync all locations"]}}
+{"cmd": "screenshot", "name": "commands-dark"}
+{"cmd": "key", "keystroke": "secondary-a"}
+{"cmd": "type", "text": "show trash"}
+{"cmd": "settle", "expect": {"pointer": "/palette/commands", "equals": ["Show Trash"]}}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": [{"pointer": "/palette", "equals": null}, {"pointer": "/page", "equals": "trash"}]}
+
+// Esc and Ctrl K close it.
+{"cmd": "key", "keystroke": "secondary-k"}
+{"cmd": "settle", "expect": {"pointer": "/palette/chips", "equals": ["In: Trash"]}}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": {"pointer": "/palette", "equals": null}}
+{"cmd": "click", "target": "sidebar/all-sessions"}
+{"cmd": "settle"}
+{"cmd": "click", "target": "titlebar/search"}
+{"cmd": "settle", "expect": {"pointer": "/palette/chips", "equals": []}}
+{"cmd": "key", "keystroke": "secondary-k"}
+{"cmd": "settle", "expect": {"pointer": "/palette", "equals": null}}
+
+// At 960x600 it keeps its width and gives up height; Ctrl Enter shows the session's folder page with it selected.
+{"cmd": "resize", "w": 960, "h": 600}
+{"cmd": "settle"}
+{"cmd": "key", "keystroke": "secondary-k"}
+{"cmd": "type", "text": "backoff"}
+{"cmd": "settle", "expect": {"pointer": "/palette/answer/sessions/0", "equals": "Back off on 429 only, not on 403"}}
+{"cmd": "bounds", "target": "palette", "expect_result": [{"pointer": "/x", "equals": 60}, {"pointer": "/w", "equals": 840}, {"pointer": "/h", "lte": 512}]}
+{"cmd": "screenshot", "name": "narrow-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "narrow-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "key", "keystroke": "secondary-enter"}
+{"cmd": "settle", "expect": [{"pointer": "/palette", "equals": null}, {"pointer": "/page", "equals": "sessions"}, {"pointer": "/library/shelf", "equals": {"folder": "fc"}}, {"pointer": "/library/selected", "equals": "Back off on 429 only, not on 403"}]}

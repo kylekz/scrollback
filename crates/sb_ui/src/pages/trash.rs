@@ -281,6 +281,7 @@ impl TrashView {
         div()
             .id(("trash-row", row))
             .debug_selector(move || format!("trash-row-{row}"))
+            .w_full()
             .flex()
             .items_center()
             .gap(COLUMN_GAP)

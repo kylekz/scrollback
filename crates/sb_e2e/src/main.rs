@@ -21,6 +21,10 @@
 //!   (docs/DESIGN.md §6).
 //! - `"boards-held-back"`: the same, with one of the subfolder player's sessions held back
 //!   and filed by hand ([`boards::build`]).
+//! - `"search"`: the boards' library with the sessions `E-Search` finds, whose prompts,
+//!   replies, commands, paths and subagent hold what it matches ([`extras::search`]).
+//! - `"trash"`: the boards' library with the three sessions `E-Trash` lists in Trash, one of
+//!   them gone at its location ([`extras::trash`]).
 //! - `"locations"`: an archive in the data dir with one location of each kind, the host's
 //!   last good sync twelve days ago, and this machine's agent in the home
 //!   ([`fixture::locations`]): the locations sheet's states (docs/DESIGN.md §4.11).
@@ -29,6 +33,7 @@
 //!   (docs/PLAN.md §4.4).
 
 mod boards;
+mod extras;
 mod fixture;
 
 use std::ffi::OsString;
@@ -41,6 +46,8 @@ use sb_test_support::ProjectsTree;
 use serde::Deserialize;
 use serde_json::Value;
 
+use extras::Extra;
+
 /// What a scenario's app finds (the module docs).
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -51,6 +58,8 @@ enum Library {
     AgentLarge,
     Boards,
     BoardsHeldBack,
+    Search,
+    Trash,
     Locations,
     ArchiveRemains,
 }
@@ -130,14 +139,19 @@ impl RunnerApp for Scrollback {
             Library::Agent => fixture::agent(&mut tree),
             Library::AgentLarge => boards::agent(&mut tree),
             Library::NoAgent => std::fs::remove_dir_all(&home)?,
-            Library::Boards | Library::BoardsHeldBack => {
+            Library::Boards | Library::BoardsHeldBack | Library::Search | Library::Trash => {
                 // Its locations' trees are synced into the archive here, and gone by the
                 // time the app starts: the app finds no agent, and syncs nothing away.
                 std::fs::remove_dir_all(&home)?;
                 boards::build(
                     &cx.data_dir.join("archive"),
                     &cx.out_dir.join("locations"),
-                    matches!(header.fixture, Library::BoardsHeldBack),
+                    match header.fixture {
+                        Library::BoardsHeldBack => Extra::HeldBack,
+                        Library::Search => Extra::Search,
+                        Library::Trash => Extra::Trash,
+                        _ => Extra::Nothing,
+                    },
                 )?;
             }
             Library::Locations => fixture::locations(

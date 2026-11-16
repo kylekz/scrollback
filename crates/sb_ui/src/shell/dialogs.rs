@@ -284,12 +284,12 @@ impl Shell {
                     strikethrough: None,
                 };
                 line.child("The session still exists on")
-                    .children(tag)
-                    .child(".")
-                    .child(StyledText::new(rest).with_runs(vec![
+                    .child(div().flex().items_center().children(tag).child("."))
+                    // A line of its own, so that it wraps inside the dialog.
+                    .child(div().w_full().child(StyledText::new(rest).with_runs(vec![
                         run(bold, FontWeight::SEMIBOLD, c.fg),
                         run(rest.len() - bold, FontWeight::NORMAL, c.fg2),
-                    ]))
+                    ])))
             } else {
                 line.child("It is no longer on")
                     .children(tag)

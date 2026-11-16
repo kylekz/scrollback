@@ -65,6 +65,8 @@ pub struct Known<'a> {
     pub locations: &'a [Location],
     pub agents: &'a [(ProviderId, String)],
     pub models: &'a [String],
+    /// How a model is written: as its agent's provider writes it.
+    pub model_name: &'a dyn Fn(&str) -> String,
     pub branches: &'a [String],
     /// The years and the month after: and before: offer, the latest first.
     pub dates: &'a [String],
@@ -99,7 +101,7 @@ impl Known<'_> {
                     .map_or(typed, |(_, name)| name.as_str());
                 Chip::new(filter.clone(), "Agent", name)
             }
-            Filter::Model(model) => Chip::new(filter.clone(), "Model", model),
+            Filter::Model(model) => Chip::new(filter.clone(), "Model", &(self.model_name)(model)),
             Filter::Branch(branch) => Chip::new(filter.clone(), "Branch", branch),
             Filter::After(_) => Chip::new(filter, "After", typed),
             Filter::Before(_) => Chip::new(filter, "Before", typed),
@@ -321,6 +323,7 @@ mod tests {
             locations: &[],
             agents: &[],
             models: &["model-opus".to_string(), "model-haiku".to_string()],
+            model_name: &|model| model.replace("model-", "Model "),
             branches: &["main".to_string()],
             dates: &["2026".to_string()],
         })
@@ -383,7 +386,7 @@ mod tests {
                     .iter()
                     .map(Completion::label)
                     .collect::<Vec<_>>(),
-                ["Model: model-haiku"]
+                ["Model: Model haiku"]
             );
             assert_eq!(completions("in:", known).len(), 5);
             assert_eq!(completions("x ", known), []);
