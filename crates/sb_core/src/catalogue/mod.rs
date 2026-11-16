@@ -34,7 +34,7 @@ use crate::provider::{ItemKind, ScannedItem};
 use crate::search::Log;
 use crate::transport::Probe;
 
-pub use folder::{Folder, FolderPath};
+pub use folder::{Folder, FolderPath, ProjectPath};
 pub use library::{LibraryCounts, PathGroup, Shelf};
 pub(crate) use session::{Derived, Indexed, Reading, fingerprint};
 pub use session::{Filed, Session, SessionId, Usage};

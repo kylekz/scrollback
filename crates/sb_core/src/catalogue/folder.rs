@@ -12,7 +12,7 @@ use toolbox_store::rusqlite::{self, Connection, OptionalExtension as _, params};
 
 use super::session::{archived, set_state};
 use super::{Catalogue, CatalogueError, FOLDER_NAME_CHARS, Result, SessionId};
-use crate::filing::{self, AttachedPath, FolderId, NormalPath};
+use crate::filing::{self, AttachedPath, Fileable, FolderId, NormalPath};
 use crate::location::LocationId;
 
 /// One of the owner's folders (PLAN §2.1).
@@ -29,6 +29,18 @@ pub struct Folder {
 pub struct FolderPath {
     pub attached: AttachedPath,
     pub typed: String,
+}
+
+/// A project path sessions at one location recorded, as they recorded it: what the folder
+/// paths editor completes from (DESIGN §4.7). Sessions in Trash are not counted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectPath {
+    pub location: LocationId,
+    pub recorded: String,
+    pub project: NormalPath,
+    pub sessions: usize,
+    /// How many of them are in Unsorted.
+    pub unsorted: usize,
 }
 
 impl Catalogue {
@@ -70,6 +82,7 @@ impl Catalogue {
         self.db.write(|tx| {
             let folder = create(tx, name, parent)?;
             attach(tx, folder, typed, &path, location)?;
+            refile(tx)?;
             Ok(folder)
         })
     }
@@ -191,27 +204,151 @@ impl Catalogue {
         location: Option<&LocationId>,
     ) -> Result<()> {
         let (typed, path) = self.typed_path(typed, location)?;
-        self.db
-            .write(|tx| attach(tx, folder, typed, &path, location))
+        self.db.write(|tx| {
+            attach(tx, folder, typed, &path, location)?;
+            Ok(refile(tx)?)
+        })
     }
 
     /// Takes an attached path off its folder. The sessions it filed go where the rules now
     /// put them: to a folder with a shorter path that contains theirs, or to Unsorted.
     pub fn detach_path(&self, attached: &AttachedPath) -> Result<()> {
         self.db.write(|tx| {
-            parent_of(tx, attached.folder)?;
-            let detached = tx.execute(
-                "DELETE FROM folder_path
-                 WHERE folder_id = ?1 AND path = ?2 AND location_id IS ?3",
-                params![attached.folder.0, attached.path, attached.location],
-            )?;
-            if detached == 0 {
-                return Err(CatalogueError::NotAttached(
-                    attached.path.as_str().to_string(),
-                ));
+            detach(tx, attached)?;
+            Ok(refile(tx)?)
+        })
+    }
+
+    /**
+     * Changes a folder's paths in one change (DESIGN §4.7's Save): takes `detach` off it, then
+     * attaches each of `attach`, a path as typed and the one location it is for, and files by
+     * the paths it ends with. A path that is refused, as [`Catalogue::attach_path`] refuses
+     * one, or one to detach that is not attached, leaves every path as it was.
+     */
+    pub fn change_paths(
+        &self,
+        folder: FolderId,
+        detach: &[AttachedPath],
+        attach: &[(String, Option<LocationId>)],
+    ) -> Result<()> {
+        let attach = attach
+            .iter()
+            .map(|(typed, location)| {
+                let (typed, path) = self.typed_path(typed, location.as_ref())?;
+                Ok((typed, path, location.as_ref()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.db.write(|tx| {
+            parent_of(tx, folder)?;
+            for attached in detach {
+                if attached.folder != folder {
+                    return Err(CatalogueError::NotAttached(
+                        attached.path.as_str().to_string(),
+                    ));
+                }
+                self::detach(tx, attached)?;
+            }
+            for (typed, path, location) in &attach {
+                self::attach(tx, folder, typed, path, *location)?;
             }
             Ok(refile(tx)?)
         })
+    }
+
+    /// Moves an attached path to the folder `to`, for the same locations and as it was
+    /// typed, and files by it there (DESIGN §4.4: a path chip dropped on another folder).
+    pub fn move_path(&self, attached: &AttachedPath, to: FolderId) -> Result<()> {
+        self.db.write(|tx| {
+            parent_of(tx, to)?;
+            let typed: String = tx
+                .query_row(
+                    "SELECT typed FROM folder_path
+                     WHERE folder_id = ?1 AND path = ?2 AND location_id IS ?3",
+                    params![attached.folder.0, attached.path, attached.location],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| CatalogueError::NotAttached(attached.path.as_str().to_string()))?;
+            detach(tx, attached)?;
+            attach(tx, to, &typed, &attached.path, attached.location.as_ref())?;
+            Ok(refile(tx)?)
+        })
+    }
+
+    /// Every folder's attached paths, each folder's in the order they were attached.
+    pub fn attached_paths(&self) -> Result<Vec<FolderPath>> {
+        self.db.read(|c| {
+            Ok(c.prepare(
+                "SELECT folder_id, path, location_id, typed FROM folder_path
+                 ORDER BY folder_id, rowid",
+            )?
+            .query_map([], |row| {
+                Ok(FolderPath {
+                    attached: AttachedPath {
+                        folder: FolderId(row.get(0)?),
+                        path: row.get(1)?,
+                        location: row.get(2)?,
+                    },
+                    typed: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// The sessions out of Trash that the rules may move: what a change of paths refiles.
+    pub fn fileable(&self) -> Result<Vec<Fileable>> {
+        self.db.read(|c| {
+            Ok(c.prepare(
+                "SELECT s.project, s.location_id, st.folder_id FROM session s
+                 LEFT JOIN session_state st
+                   ON st.location_id = s.location_id AND st.provider = s.provider
+                  AND st.session = s.session
+                 WHERE s.project IS NOT NULL AND COALESCE(st.by_hand, 0) = 0
+                   AND st.trashed_at IS NULL",
+            )?
+            .query_map([], |row| {
+                Ok(Fileable {
+                    project: row.get(0)?,
+                    location: row.get(1)?,
+                    folder: row.get::<_, Option<i64>>(2)?.map(FolderId),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// Every project path a location's sessions recorded that a folder can take, with how
+    /// many sessions recorded it and how many of those are in Unsorted, the most first.
+    pub fn project_paths(&self) -> Result<Vec<ProjectPath>> {
+        let paths: Vec<ProjectPath> = self.db.read(|c| -> Result<_> {
+            Ok(c.prepare(
+                "SELECT s.location_id, s.project_path, s.project, count(*),
+                        COALESCE(sum(st.folder_id IS NULL), 0)
+                 FROM session s
+                 LEFT JOIN session_state st
+                   ON st.location_id = s.location_id AND st.provider = s.provider
+                  AND st.session = s.session
+                 WHERE s.project IS NOT NULL AND s.project_path IS NOT NULL
+                   AND st.trashed_at IS NULL
+                 GROUP BY s.location_id, s.project_path
+                 ORDER BY count(*) DESC, s.project_path",
+            )?
+            .query_map([], |row| {
+                Ok(ProjectPath {
+                    location: row.get(0)?,
+                    recorded: row.get(1)?,
+                    project: row.get(2)?,
+                    sessions: row.get(3)?,
+                    unsorted: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+        })?;
+        Ok(paths
+            .into_iter()
+            .filter(|path| path.project.is_absolute())
+            .collect())
     }
 
     /// Files a session in a folder by hand. No rule moves it from there (PLAN §8).
@@ -255,11 +392,7 @@ impl Catalogue {
         typed: &'a str,
         location: Option<&LocationId>,
     ) -> Result<(&'a str, NormalPath)> {
-        let typed = typed.trim();
-        let typed = typed
-            .strip_prefix('"')
-            .and_then(|typed| typed.strip_suffix('"'))
-            .map_or(typed, str::trim);
+        let typed = filing::as_typed(typed);
         let mount = match location {
             Some(location) => self.drive_mount(location)?,
             None => None,
@@ -285,8 +418,8 @@ fn create(connection: &Connection, name: &str, parent: Option<FolderId>) -> Resu
     Ok(FolderId(connection.last_insert_rowid()))
 }
 
-/// Attaches `path`, typed as `typed`, to a folder for `location` or for every location, and
-/// files by it. Refused when the path is attached already for that scope.
+/// Attaches `path`, typed as `typed`, to a folder for `location` or for every location,
+/// without filing by it. Refused when the path is attached already for that scope.
 fn attach(
     connection: &Connection,
     folder: FolderId,
@@ -316,7 +449,22 @@ fn attach(
          VALUES (?1, ?2, ?3, ?4)",
         params![folder.0, path, typed, location],
     )?;
-    Ok(refile(connection)?)
+    Ok(())
+}
+
+/// Takes an attached path off its folder, without filing by what is left.
+fn detach(connection: &Connection, attached: &AttachedPath) -> Result<()> {
+    parent_of(connection, attached.folder)?;
+    let detached = connection.execute(
+        "DELETE FROM folder_path WHERE folder_id = ?1 AND path = ?2 AND location_id IS ?3",
+        params![attached.folder.0, attached.path, attached.location],
+    )?;
+    if detached == 0 {
+        return Err(CatalogueError::NotAttached(
+            attached.path.as_str().to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// A folder's name as it is kept: without the white space around it.
