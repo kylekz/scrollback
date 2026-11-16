@@ -36,6 +36,8 @@ impl Shell {
         if self.locations.is_some() || !Showing::now(cx).is_library() {
             return;
         }
+        // A narrow window's sidebar gives way to it, as to a press outside the sidebar.
+        self.sidebar_open = false;
         let back = window.focused(cx);
         let shelf = cx.services().library.read(cx).shelf();
         let palette = cx.new(|cx| Palette::new(shelf, window, cx));

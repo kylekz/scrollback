@@ -23,7 +23,7 @@
 // Stop ends the pass at its next step, and lets it go from the hold. The batch it stored stays and is indexed, so its sessions show; the location says it was stopped, with what it left, which is not a failure.
 {"cmd": "click", "target": "first-sync/stop"}
 {"cmd": "wait_for", "pointer": "/sync/syncing", "equals": false, "timeout_ms": 30000}
-{"cmd": "settle", "timeout_ms": 60000, "expect": [{"pointer": "/sync/held", "equals": false}, {"pointer": "/sync/indexing", "equals": false}, {"pointer": "/sync/locations/0/state", "equals": "stopped"}, {"pointer": "/sync/locations/0/error", "equals": null}, {"pointer": "/page", "equals": "sessions"}, {"pointer": "/library/counts", "equals": {"all": 256, "starred": 0, "unsorted": 256}}, {"pointer": "/library/sessions", "equals": 256}]}
+{"cmd": "settle", "timeout_ms": 60000, "expect": [{"pointer": "/sync/held", "equals": false}, {"pointer": "/sync/indexing", "equals": false}, {"pointer": "/sync/locations/0/state", "equals": "stopped"}, {"pointer": "/sync/locations/0/error", "equals": null}, {"pointer": "/page", "equals": "sessions"}, {"pointer": "/library/counts", "equals": {"all": 256, "starred": 0, "unsorted": 256, "trash": 0}}, {"pointer": "/library/sessions", "equals": 256}]}
 {"cmd": "bounds", "target": "first-sync", "expect_error": "no target"}
 {"cmd": "bounds", "target": "page/empty", "expect_error": "no target"}
 {"cmd": "query", "prefix": "main/sync-failed/", "expect_result": {"pointer": "", "len": 0}}
@@ -36,7 +36,7 @@
 {"cmd": "bounds", "target": "first-sync", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "click", "target": "first-sync/open-unsorted", "expect": {"pointer": "/page", "equals": "unsorted"}}
 {"cmd": "release_sync", "expect_result": {"pointer": "/held", "equals": false}}
-{"cmd": "settle", "timeout_ms": 120000, "expect": [{"pointer": "/sync/syncing", "equals": false}, {"pointer": "/sync/locations/0/state", "equals": "synced"}, {"pointer": "/library/counts", "equals": {"all": 2318, "starred": 0, "unsorted": 2318}}, {"pointer": "/library/groups", "equals": 23}]}
+{"cmd": "settle", "timeout_ms": 120000, "expect": [{"pointer": "/sync/syncing", "equals": false}, {"pointer": "/sync/locations/0/state", "equals": "synced"}, {"pointer": "/library/counts", "equals": {"all": 2318, "starred": 0, "unsorted": 2318, "trash": 0}}, {"pointer": "/library/groups", "equals": 23}]}
 {"cmd": "screenshot", "name": "unsorted-dark"}
 {"cmd": "click", "target": "sidebar/all-sessions"}
 {"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 2318}}
