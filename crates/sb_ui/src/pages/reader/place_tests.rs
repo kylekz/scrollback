@@ -295,9 +295,14 @@ fn a_request_is_dropped_with_a_session_left_before_it_is_parsed(cx: &mut TestApp
     let asked_for = session(&asked.session, true, cx);
     library.update(cx, |library, cx| {
         library.open_at(asked_for.clone(), Some(asked.clone()), cx);
-        library.close(cx);
     });
+    library.update(cx, |library, cx| library.close(cx));
+    /* Its parse still reads the archive: the reader isn't settled until it lands. */
+    let settled =
+        |cx: &mut VisualTestContext| cx.update(|_, cx| cx.services().reader.read(cx).is_settled());
+    assert!(!settled(cx));
     draw(cx);
+    assert!(settled(cx));
     assert!(library.read_with(cx, |it, _| it.read_at().is_none()));
     assert_eq!(snapshot(&shell, cx).read_at, None);
 

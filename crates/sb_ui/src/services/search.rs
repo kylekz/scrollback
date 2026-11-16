@@ -64,7 +64,8 @@ pub struct SearchService {
     refreshed: u64,
     /// The search running, while one is.
     cancel: Option<CancelToken>,
-    /// Reads of what the palette shows before anything is typed, in flight.
+    /// Searches and reads of what the palette shows before anything is typed in flight, those
+    /// superseded or cancelled included: what still reads the archive.
     reading: usize,
     /// The app has moved onto another archive: nothing more is read of this one.
     closed: bool,
@@ -120,9 +121,9 @@ impl SearchService {
         }
     }
 
-    /// Nothing is being searched or read.
+    /// Nothing is being searched or read, not even a search superseded or cancelled.
     pub fn is_settled(&self) -> bool {
-        self.cancel.is_none() && self.reading == 0
+        self.reading == 0
     }
 
     /// Cancels the search running, and reads nothing more of the archive: the app is moving
@@ -275,6 +276,7 @@ impl SearchService {
         };
         let (asked, cancel) = (self.asked, CancelToken::new());
         self.cancel = Some(cancel.clone());
+        self.reading += 1;
         let job = cx.background_spawn(async move {
             let started = Instant::now();
             let searched = archive.search(&query, Limit::default(), &cancel);
@@ -284,6 +286,7 @@ impl SearchService {
         cx.spawn(async move |this, cx| {
             let (query, searched, unsearchable, took) = job.await;
             this.update(cx, |this, cx| {
+                this.reading -= 1;
                 // A later query superseded it: its answer is the one to show.
                 if this.asked != asked {
                     return;
