@@ -21,9 +21,11 @@
 {"cmd": "wait_frames", "n": 2}
 {"cmd": "screenshot", "name": "filed-toast-light"}
 {"cmd": "pin_appearance", "appearance": "dark"}
-// Undo puts it back where the rules had it.
+// Undo puts it back where the rules had it, and says so in a toast with no Undo of its own, dismissed.
 {"cmd": "click", "target": "toast/undo"}
-{"cmd": "settle", "expect": [{"pointer": "/library/toast", "equals": null}, {"pointer": "/library/folders/0/sessions", "equals": 612}, {"pointer": "/library/sessions", "equals": 488}]}
+{"cmd": "settle", "expect": [{"pointer": "/library/toast", "equals": {"text": "Undone", "undo": false}}, {"pointer": "/library/folders/0/sessions", "equals": 612}, {"pointer": "/library/sessions", "equals": 488}]}
+{"cmd": "click", "target": "toast/dismiss"}
+{"cmd": "settle", "expect": {"pointer": "/library/toast", "equals": null}}
 
 // Ctrl-click selects a second card; a drag of either carries both, and the ghost reads "2 sessions". Esc gives it up.
 {"cmd": "click", "target": "card/0"}
@@ -43,7 +45,9 @@
 {"cmd": "mouse_up"}
 {"cmd": "settle", "expect": [{"pointer": "/library/sessions", "equals": 486}, {"pointer": "/library/toast/text", "equals": "2 sessions moved to Trash"}]}
 {"cmd": "click", "target": "toast/undo"}
-{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 488}}
+{"cmd": "settle", "expect": [{"pointer": "/library/sessions", "equals": 488}, {"pointer": "/library/toast/text", "equals": "Undone"}]}
+{"cmd": "click", "target": "toast/dismiss"}
+{"cmd": "settle", "expect": {"pointer": "/library/toast", "equals": null}}
 
 // A path chip of fc onto fc itself: refused, no target shows, and the ghost says why.
 {"cmd": "drag", "from": {"target": "page/path/1"}, "to": {"target": "sidebar/folder/fc"}, "release": false}

@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
-use sb_core::catalogue::{Catalogue, CatalogueError, Filed, Folder, SessionId, Shelf, Undone};
+use sb_core::catalogue::{
+    Catalogue, CatalogueError, Filed, Folder, Restored, SessionId, Shelf, Undone,
+};
 use sb_core::filing::{AttachedPath, FolderId, NormalPath};
 use sb_core::location::{LocationId, LocationKind};
 use sb_core::provider::{Hashed, RangeFailure};
@@ -18,7 +20,8 @@ use sb_core::sync::sync_location;
 use sb_core::transport::{
     Env, FileStat, Listing, PrefixRequest, RangeRequest, RangeSink, Transport, TransportError,
 };
-use sb_test_support::{Agent, DbAgent, FileAgent, HomeTransport, read_catalogue};
+use sb_test_support::{Agent, DbAgent, FileAgent, HomeTransport, ProjectsTree, read_catalogue};
+use serde_json::json;
 
 use common::{Bench, Meddle};
 
@@ -694,6 +697,51 @@ fn the_library_lists_sessions_by_when_they_last_did_something() {
 }
 
 #[test]
+fn the_models_and_branches_offered_are_those_outside_trash_the_commonest_first() {
+    let mut tree = ProjectsTree::new();
+    let mut keys = Vec::new();
+    for (model, branch) in [
+        ("model-b", "main"),
+        ("model-a", "work"),
+        ("model-b", "work"),
+        ("model-c", "trashed"),
+    ] {
+        let mut session = tree.session("/home/user/code/app", 0);
+        let on = json!({ "gitBranch": branch });
+        session.transcript.user(json!("Go on."), on.clone());
+        session
+            .transcript
+            .assistant(1, model, json!([{ "type": "text", "text": "Done." }]), on);
+        keys.push(session.key);
+    }
+    let bench = Bench::new(FileAgent::on(tree));
+    bench.sync();
+    let catalogue = bench.archive().catalogue();
+    let named = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>()
+    };
+    /* Ties go by name. */
+    assert_eq!(
+        catalogue.models_and_branches().unwrap(),
+        (
+            named(&["model-b", "model-a", "model-c"]),
+            named(&["work", "main", "trashed"])
+        )
+    );
+
+    /* A session in Trash offers nothing. */
+    catalogue.trash(&bench.session_id(&keys[3])).unwrap();
+    catalogue.trash(&bench.session_id(&keys[2])).unwrap();
+    assert_eq!(
+        catalogue.models_and_branches().unwrap(),
+        (named(&["model-a", "model-b"]), named(&["main", "work"]))
+    );
+}
+
+#[test]
 fn unsorted_is_grouped_by_where_its_sessions_started() {
     let mut bench = Bench::new(DbAgent::new());
     let mut elsewhere = Elsewhere::new(&bench);
@@ -1083,7 +1131,19 @@ fn what_is_not_there_is_said_not_passed_over() {
             Err(CatalogueError::FolderName)
         ));
     }
-    let twin = catalogue.create_folder("work", Some(folder)).unwrap();
+    /* Controls and the invisible characters that format text are no part of a name: one of
+    nothing else is no name. A folder may be named after a transcript's project path. */
+    for name in ["\u{202E}\u{200B}", "\n\t"] {
+        assert!(matches!(
+            catalogue.create_folder(name, None),
+            Err(CatalogueError::FolderName)
+        ));
+    }
+    let twin = catalogue
+        .create_folder("wo\u{202E}rk\u{7}", Some(folder))
+        .unwrap();
+    let named = (catalogue.folders().unwrap().into_iter()).find(|it| it.id == twin);
+    assert_eq!(named.map(|it| it.name).as_deref(), Some("work"));
     catalogue.rename_folder(twin, &"n".repeat(200)).unwrap();
     catalogue.rename_folder(twin, " work ").unwrap();
     assert_eq!(
@@ -1411,12 +1471,18 @@ fn a_selection_is_filed_starred_and_trashed_in_one_step_and_undone_as_far_as_it_
     );
     assert_eq!(catalogue.library_counts().unwrap().trash, 2);
     catalogue.restore(&two).unwrap();
-    assert!(catalogue.restore_all(&both).unwrap().is_whole());
+    let restored = catalogue.restore_all(&both).unwrap();
+    assert_eq!(restored.gone, 0);
+    /* The one still in Trash, back in the folder it was in. */
+    let [(moved, Filed::ByRule(was), Some(now))] = &restored.moved[..] else {
+        panic!("{:?}", restored.moved);
+    };
+    assert_eq!((moved, was), (&one, now));
     assert_eq!(
         catalogue.restore_all(std::slice::from_ref(&gone)).unwrap(),
-        Undone {
+        Restored {
             gone: 1,
-            refiled: 0
+            moved: Vec::new()
         }
     );
     assert_eq!(catalogue.library_counts().unwrap().trash, 0);

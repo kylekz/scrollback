@@ -1350,7 +1350,8 @@ fn an_undo_quiets_the_toasts_of_changes_made_before_it(cx: &mut TestAppContext) 
         library.undo(cx);
     });
     cx.run_until_parked();
-    assert_eq!(toast(cx), None);
+    // The Undo has the last word: no "Filed in other", only that it is undone.
+    assert_eq!(toast(cx).as_deref(), Some("Undone"));
     assert_eq!(filed(SESSIONS[0].title, cx), Filed::Unsorted);
 }
 
@@ -1389,4 +1390,65 @@ fn a_quit_that_asks_nothing_saves_the_paths_editors_changes(cx: &mut TestAppCont
         .find(|it| it.title.as_deref() == Some(SESSIONS[2].title))
         .map(|it| it.filed);
     assert!(matches!(notes, Some(Filed::ByRule(_))), "{notes:?}");
+}
+
+/**
+ * Restart to update with unsaved paths asks about them first, as Quit does: Cancel keeps
+ * everything and hands nothing over; going on hands the update over.
+ */
+#[gpui::test]
+fn restarting_to_update_with_unsaved_paths_asks_first(cx: &mut TestAppContext) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::services::updates::{FIRST_CHECK_AFTER, Real, Updater};
+
+    let (shell, cx) = open_shell(cx);
+    let _editor = editing_app(&shell, cx);
+    let restarts = Arc::new(AtomicUsize::new(0));
+    let counted = restarts.clone();
+    let updates = cx.update(|_, cx| cx.services().updates.clone());
+    updates.update(cx, |updates, cx| {
+        updates.set_updater(
+            Updater::Real(Real {
+                check: Arc::new(|| Box::pin(async { Ok(Some("0.2.0".to_string())) })),
+                restart: Box::new(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+                others: Box::new(|| 0),
+                then: |_| {},
+            }),
+            cx,
+        )
+    });
+    cx.executor().advance_clock(FIRST_CHECK_AFTER);
+    cx.run_until_parked();
+
+    updates.update(cx, |updates, cx| updates.restart(cx));
+    cx.run_until_parked();
+    assert!(library(cx).read_with(cx, |library, _| matches!(
+        library.asked(),
+        Some(Leave::Restart)
+    )));
+    assert_eq!(
+        restarts.load(Ordering::SeqCst),
+        0,
+        "nothing before the answer"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(library(cx).read_with(cx, |library, _| library.asked().is_none()));
+    assert_eq!(
+        restarts.load(Ordering::SeqCst),
+        0,
+        "Cancel hands nothing over"
+    );
+
+    updates.update(cx, |updates, cx| updates.restart(cx));
+    cx.run_until_parked();
+    library(cx).update(cx, |library, cx| library.answer(true, cx));
+    cx.run_until_parked();
+    assert_eq!(restarts.load(Ordering::SeqCst), 1);
+    updates.read_with(cx, |updates, _| assert!(updates.is_restarted()));
 }

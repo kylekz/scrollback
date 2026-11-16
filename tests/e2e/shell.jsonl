@@ -2,6 +2,8 @@
 {"cmd": "wait_ready", "timeout_ms": 20000}
 {"cmd": "settle"}
 {"cmd": "state", "expect": [{"pointer": "/app", "equals": "scrollback"}, {"pointer": "/data_dir", "equals": "${data_dir}"}, {"pointer": "/window/w", "equals": 1440}, {"pointer": "/window/h", "equals": 900}, {"pointer": "/shell/sidebar", "equals": "docked"}, {"pointer": "/appearance/mode", "equals": "system"}, {"pointer": "/appearance/pinned", "equals": null}]}
+// A scripted run never looks for scrollback's own updates (a development build, and automation).
+{"cmd": "state", "expect": [{"pointer": "/update/off", "equals": "development"}]}
 // The first run (first_run.jsonl) adds this machine; from here on the shell has a library.
 {"cmd": "click", "target": "first-run/add"}
 {"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/sync/syncing", "equals": false}]}
@@ -65,7 +67,8 @@
 {"cmd": "key", "keystroke": "secondary-b", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
 {"cmd": "click", "x": 600, "y": 300, "button": "right", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
 {"cmd": "key", "keystroke": "secondary-b", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
-{"cmd": "click", "target": "titlebar/search", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+{"cmd": "click", "target": "titlebar/search", "expect": [{"pointer": "/shell/sidebar", "equals": "collapsed"}, {"pointer": "/palette/text", "equals": ""}]}
+{"cmd": "key", "keystroke": "escape", "expect": {"pointer": "/palette", "equals": null}}
 // A press on the overlay's empty space leaves it open, picking a row closes it (DESIGN §2), and its own button toggles it.
 {"cmd": "click", "target": "titlebar/sidebar", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
 {"cmd": "click", "x": 100, "y": 420, "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}

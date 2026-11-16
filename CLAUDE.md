@@ -30,7 +30,10 @@ Rust 1.98.1 (pinned in `rust-toolchain.toml`). Run `script/check` with bash; on 
 script/check                 # the gates: fmt, clippy x2, gpui boundary, agent names, tests, e2e
 script/check --fast          # the same without the e2e scenarios
 script/check --e2e-only      # the e2e scenarios alone
-cargo deny check             # licences, advisories and sources (deny.toml); needs cargo-deny
+script/check-workflows       # actionlint + zizmor over .github (script/check's step 1; skips, saying so, if not installed)
+cargo deny check             # licences, advisories and sources (deny.toml); needs cargo-deny; CI runs it
+script/package               # a trial release into target/package/try: Windows from Git Bash, macOS on a Mac;
+                             # needs vpk 1.2.161 (a .NET tool). Never --publish, push a tag or run an installer
 
 cargo build                  # the scrollback binary (default member)
 cargo run -- --data-dir target/tmp/data --window-size 1440x900 --theme dark
@@ -55,3 +58,5 @@ cargo run -p sb_e2e --bin e2e -- --foreground tests/e2e/shell.jsonl
 
 - The e2e runner never builds the app: build it with a plain `cargo build -p scrollback` right before a run. Its windows open on the real desktop, in the background unless `--foreground` is given. toolbox-rs's `docs/automation.md` documents the runner, the scenario format and the protocol; `crates/scrollback/src/automation.rs` documents scrollback's `state` and commands.
 - Never point a run at the real data folder: pass `--data-dir` (or set `SCROLLBACK_DATA_DIR`) under `target/`. The runner gives each scenario its own.
+- CI (`.github/workflows/ci.yml`) runs `script/check` on Windows and macOS, plus actionlint, zizmor and cargo-deny, for pull requests and pushes to main only. `release.yml` builds and, after the owner approves, publishes a release when the owner pushes a `v<version>` tag; an agent never creates or pushes a tag, never runs a release, and never sets a secret.
+- The updater is off in development builds, under automation and with `--data-dir`, so no test or scenario reaches the network for it (`crates/scrollback/src/updates.rs`).

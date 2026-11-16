@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # The local gates in one script (docs/PLAN.md §3, §12), all but `cargo deny check` (deny.toml:
-# licences, advisories and sources), which needs cargo-deny and is run by hand until CI runs it.
-# Agents and the owner run this before a change is committed. It stops at the first failing step
-# with a non-zero exit.
+# licences, advisories and sources), which needs cargo-deny and which CI's dependencies job runs
+# (.github/workflows/ci.yml). Agents and the owner run this before a change is committed; CI
+# runs it on Windows and macOS. It stops at the first failing step with a non-zero exit.
 #
 #   script/check               steps 1-6
 #   script/check --fast        steps 1-5 (skips the e2e scenarios)
@@ -13,7 +13,8 @@ usage() {
     cat <<'EOF'
 usage: script/check [--fast | --e2e-only]
 
-  1. cargo fmt --all --check
+  1. cargo fmt --all --check, and the workflows (script/check-workflows: actionlint and zizmor,
+     skipped when they aren't installed)
   2. cargo clippy in scrollback's two shapes: default (with automation) and the shipped app
      (-p scrollback --no-default-features)
   3. gpui boundary: no gpui in the headless crates' dependency trees
@@ -127,6 +128,9 @@ drop_module_lines() {
 if [[ "$e2e_only" -eq 0 ]]; then
     step 1 "cargo fmt --all --check"
     cargo fmt --all --check
+    # actionlint and zizmor, when they are installed; CI's workflows job runs them regardless.
+    step 1 "script/check-workflows"
+    bash script/check-workflows
 
     # scrollback's two shapes: each drifts silently unless it is linted on its own.
     step 2 "cargo clippy --workspace --all-targets -- -D warnings  (scrollback with automation)"

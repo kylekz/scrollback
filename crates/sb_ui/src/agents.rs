@@ -46,10 +46,46 @@ pub fn named(why: &str, cx: &App) -> String {
         .join("; ")
 }
 
-/// The first of a session's models, as its agent's provider writes it.
+/// The first of a session's models, as its agent's provider writes it, as a label
+/// ([`crate::hostile::label`]: a model is a transcript's).
 pub fn model(id: &str, models: &[String], cx: &App) -> Option<String> {
     let model = models.first()?;
-    Some(provider(id, cx).map_or_else(|| model.clone(), |provider| provider.model_name(model)))
+    Some(crate::hostile::label(&provider(id, cx).map_or_else(
+        || model.clone(),
+        |provider| provider.model_name(model),
+    )))
+}
+
+/**
+ * A model of whichever agent's it is, as that agent's provider writes it, as a label: for a
+ * model seen apart from its sessions (the palette's Model menu). The provider `first`, when given, is
+ * asked first, then the others in the order the app has them, and the first that writes it
+ * otherwise than it is wins; with none, it is written as it is.
+ */
+pub fn any_model(model: &str, first: Option<&str>, cx: &App) -> String {
+    let providers = &cx.services().providers;
+    let first = first.and_then(|id| provider(id, cx));
+    (first.into_iter())
+        .chain(providers.iter().map(Box::as_ref))
+        .map(|provider| provider.model_name(model))
+        .find(|named| named != model)
+        .map_or_else(
+            || crate::hostile::label(model),
+            |named| crate::hostile::label(&named),
+        )
+}
+
+/// The label an activity row gives a call of the tool `name` (DESIGN §4.2.3), as the agent of
+/// the provider `id` has it labelled; the tool's own name for one it doesn't label.
+pub fn tool_label(id: &str, name: &str, cx: &App) -> String {
+    provider(id, cx)
+        .and_then(|provider| provider.tool_label(name))
+        .map_or_else(|| name.to_string(), str::to_string)
+}
+
+/// The model `model`, recorded by the agent of the provider `id`, as its provider writes it.
+pub fn model_name(id: &str, model: &str, cx: &App) -> String {
+    provider(id, cx).map_or_else(|| model.to_string(), |provider| provider.model_name(model))
 }
 
 /// The agent's mark at `size` in its own colour, or the generic `bot` glyph in `fg3` for an

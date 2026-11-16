@@ -121,3 +121,183 @@ pub fn locations(tree: &mut ProjectsTree, archive_dir: &Path, scratch: &Path) ->
 
 /// The catalogue's file in an archive's folder (PLAN §4.1).
 const CATALOGUE: &str = "scrollback.db";
+
+/// When `E-Settings-Archive` says its two sessions were deleted for good: 4 Oct and 2 Aug
+/// 2026, at noon UTC.
+const DELETED_AT: [i64; 2] = [1_791_115_200_000, 1_785_672_000_000];
+
+/// Syncs `location` of `archive` through `transport`, every pass to its end.
+fn synced(
+    archive: &Archive,
+    location: &sb_core::location::LocationId,
+    transport: &dyn sb_core::transport::Transport,
+) -> Result<()> {
+    for pass in sync_location(
+        archive,
+        location,
+        transport,
+        &provider::builtin(),
+        &CancelToken::new(),
+        &mut |_| {},
+    )? {
+        pass.outcome?;
+    }
+    Ok(())
+}
+
+/// Overwrites the middle of the first stored segment of the item `key` in `archive_dir`: what
+/// verify reports as a segment that doesn't hold the bytes archived.
+fn damage(archive_dir: &Path, key: &str) -> Result<()> {
+    /* An item's folder is named by the start of its key's hash (PLAN §4.1). */
+    let folder = &sb_core::hash::Hash::of(key.as_bytes()).to_hex()[..32];
+    let mut segments = Vec::new();
+    let mut folders = vec![archive_dir.join("files")];
+    while let Some(dir) = folders.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                folders.push(path);
+            } else if path.extension().is_some_and(|it| it == "zst")
+                && path.iter().any(|part| part == folder)
+            {
+                segments.push(path);
+            }
+        }
+    }
+    segments.sort();
+    let segment = segments
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("{key} has no segment"))?;
+    let mut bytes = std::fs::read(segment)?;
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    std::fs::write(segment, bytes)?;
+    Ok(())
+}
+
+/**
+ * Settings › Archive's library (DESIGN §4.13, `E-Settings-Archive`): an archive in
+ * `archive_dir` with the distro `Ubuntu-24.04`, synced from this machine's agent in `tree`
+ * (which a scripted run reads as the distro), and the host `user@macbook`, synced from a tree of
+ * its own under `scratch` (removed again), whose two sessions were deleted for good on the
+ * board's days. Two of the distro's transcripts have a damaged segment: "Day 9: disk
+ * compaction", which the distro still has, so it can be fetched again; and "Tidy the notes
+ * folder", which the agent has deleted since, as the start's sync finds.
+ */
+pub fn settings(tree: &mut ProjectsTree, archive_dir: &Path, scratch: &Path) -> Result<()> {
+    agent(tree);
+    /* A session's transcript is its key's file under the agent's `projects/`. */
+    let transcript = |session: String| format!("projects/{session}.jsonl");
+    let compaction = transcript(tree.outlined(&Outline {
+        project: "/home/user/code/server",
+        title: "Day 9: disk compaction",
+        prompt: "Compact the day's segment files into one and check the result.",
+        model: "claude-opus-5-5",
+        day: (2026, 11, 9),
+        calls: 4,
+    }));
+    let notes = transcript(tree.outlined(&Outline {
+        project: "/home/user/notes",
+        title: "Tidy the notes folder",
+        prompt: "Move last month's notes into an archive folder.",
+        model: "claude-sonnet-5",
+        day: (2026, 10, 20),
+        calls: 1,
+    }));
+    tree.write_settings(RETENTION);
+    let archive = Archive::create(archive_dir)?;
+    let distro = archive.catalogue().add_location(
+        LocationKind::Wsl {
+            distro: "Ubuntu-24.04".to_string(),
+        },
+        "Ubuntu-24.04",
+    )?;
+    synced(&archive, &distro.id, &tree.transport())?;
+
+    let mut host_tree = ProjectsTree::in_home(&scratch.join("host"));
+    host_tree.write_settings(RETENTION);
+    for (title, day) in [
+        ("Print the whole .env to debug", (2026, 10, 3)),
+        ("Benchmark: 80 MB transcript fixture", (2026, 8, 1)),
+    ] {
+        host_tree.outlined(&Outline {
+            project: "/Users/user/code/blog",
+            title,
+            prompt: "Made up for the board.",
+            model: "claude-opus-5-5",
+            day,
+            calls: 2,
+        });
+    }
+    let host = archive.catalogue().add_location(
+        LocationKind::Ssh {
+            host: "user@macbook".to_string(),
+        },
+        "user@macbook",
+    )?;
+    synced(&archive, &host.id, &host_tree.transport())?;
+    for session in archive
+        .catalogue()
+        .sessions(sb_core::catalogue::Shelf::All)?
+    {
+        if session.id.location == host.id {
+            archive.catalogue().trash(&session.id)?;
+            archive.delete_for_good(&archive.catalogue().deletion(&session.id)?)?;
+        }
+    }
+    archive.wait_for_removals();
+    drop(archive);
+    std::fs::remove_dir_all(scratch)?;
+    for key in [&compaction, &notes] {
+        damage(archive_dir, key)?;
+    }
+    std::fs::remove_file(tree.path(&notes))?;
+    /* The board's days for the two deletions, the latest first. */
+    let catalogue = rusqlite::Connection::open(archive_dir.join(CATALOGUE))?;
+    for (at, deleted) in DELETED_AT.iter().enumerate() {
+        catalogue.execute(
+            "UPDATE tombstone SET deleted_at = ?1 WHERE session = (
+                 SELECT session FROM tombstone ORDER BY started_at DESC LIMIT 1 OFFSET ?2)",
+            [*deleted, at as i64],
+        )?;
+    }
+    Ok(())
+}
+
+/// The settings file in the data dir (`sb_ui::services::settings`).
+const SETTINGS_FILE: &str = "settings.json";
+
+/**
+ * Settings that name the archive `Archive` under `drive`, which isn't there, as on a drive
+ * unplugged; they remember the archive by its id, when it was last opened (the board's day)
+ * and what it held.
+ */
+pub fn archive_gone(data_dir: &Path, drive: &Path) -> Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    let settings = serde_json::json!({
+        "v": 1,
+        "archive": std::path::absolute(drive.join("Archive"))?,
+        "last_archive": {
+            "id": "a3f061c2-7b1e-4c2a-9d4f-0e5b8c1d2f30",
+            "opened": 1_794_758_400_000_i64,
+            "sessions": 2318,
+            "bytes": 4_400_000_000_u64,
+        },
+    });
+    std::fs::write(
+        data_dir.join(SETTINGS_FILE),
+        serde_json::to_string_pretty(&settings)?,
+    )?;
+    Ok(())
+}
+
+/// A settings file cut short, so not JSON, that names the archive `Archive` under `drive`.
+pub fn settings_unreadable(data_dir: &Path, drive: &Path) -> Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    let archive = serde_json::json!(std::path::absolute(drive.join("Archive"))?);
+    std::fs::write(
+        data_dir.join(SETTINGS_FILE),
+        format!("{{\n  \"v\": 1,\n  \"archive\": {archive},\n  \"mode\": \"da"),
+    )?;
+    Ok(())
+}

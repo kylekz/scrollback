@@ -64,9 +64,22 @@ pub struct Span {
     pub at: At,
     pub kind: SpanKind,
     /// The text is a subagent's, which opens the session at the call that started it (or, for
-    /// one no call is known to have started, at [`At::Unattached`]).
-    pub subagent: bool,
+    /// one no call is known to have started, at [`At::Unattached`]): where in the subagent's
+    /// own conversation it is.
+    pub subagent: Option<InSubagent>,
     pub text: String,
+}
+
+/**
+ * Where in a subagent's conversation a piece of text is: the item that conversation is, and
+ * the turn and block in it. For a subagent started inside another, the innermost one's; the
+ * outermost call is the span's [`At`].
+ */
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InSubagent {
+    pub item: String,
+    pub turn: usize,
+    pub block: BlockId,
 }
 
 /// Where a match opens the session.
@@ -177,47 +190,65 @@ fn collect(conversation: &Conversation, within: Option<At>, index: &mut SessionI
                     index.spans.push(Span {
                         at,
                         kind,
-                        subagent: within.is_some(),
+                        subagent: within.map(|_| InSubagent {
+                            item: conversation.item.to_string(),
+                            turn,
+                            block: *block,
+                        }),
                         text: text.to_string(),
                     });
                 }
             };
-            match &conversation[*block].content {
-                Content::Prompt { text, .. } => span(SpanKind::Prompt, text),
-                Content::Reply { text } => span(SpanKind::Reply, text),
-                Content::ToolCall(call) => {
-                    match &call.input {
-                        ToolInput::Shell { command, .. } => span(SpanKind::Command, command),
-                        ToolInput::Read { path, .. }
-                        | ToolInput::Edit { path, .. }
-                        | ToolInput::Write { path, .. } => span(SpanKind::Path, path),
-                        ToolInput::ContentSearch { pattern, path }
-                        | ToolInput::FileSearch { pattern, path } => {
-                            span(SpanKind::Command, pattern);
-                            span(SpanKind::Path, path.as_deref().unwrap_or_default());
-                        }
-                        ToolInput::Subagent { description, .. } => {
-                            span(
-                                SpanKind::Command,
-                                description.as_deref().unwrap_or_default(),
-                            );
-                        }
-                        ToolInput::WebSearch { query } => span(SpanKind::Command, query),
-                        ToolInput::WebFetch { url, .. } => span(SpanKind::Path, url),
-                        ToolInput::Todos(_) | ToolInput::Mcp { .. } | ToolInput::Other => {}
-                    }
-                    for subagent in &call.subagents {
-                        if let Subagent::Read { conversation, .. } = subagent {
-                            collect(conversation, Some(at), index);
-                        }
+            let content = &conversation[*block].content;
+            for (kind, text) in searchable(content) {
+                span(kind, text);
+            }
+            if let Content::ToolCall(call) = content {
+                for subagent in &call.subagents {
+                    if let Subagent::Read { conversation, .. } = subagent {
+                        collect(conversation, Some(at), index);
                     }
                 }
-                Content::Thinking { .. }
-                | Content::Compaction { .. }
-                | Content::Note { .. }
-                | Content::Unrecognised(_) => {}
             }
         }
+    }
+}
+
+/**
+ * The text of a block that search indexes, each piece with what it is: a prompt's or a
+ * reply's text, and of a call only what it was asked (PLAN D10). A subagent's text is its own
+ * blocks'. The reader checks a match's place against it.
+ */
+pub fn searchable(content: &Content) -> Vec<(SpanKind, &str)> {
+    match content {
+        Content::Prompt { text, .. } => vec![(SpanKind::Prompt, text)],
+        Content::Reply { text } => vec![(SpanKind::Reply, text)],
+        Content::ToolCall(call) => match &call.input {
+            ToolInput::Shell { command, .. } => vec![(SpanKind::Command, command)],
+            ToolInput::Read { path, .. }
+            | ToolInput::Edit { path, .. }
+            | ToolInput::Write { path, .. } => vec![(SpanKind::Path, path)],
+            ToolInput::ContentSearch { pattern, path, .. }
+            | ToolInput::FileSearch { pattern, path } => {
+                vec![
+                    (SpanKind::Command, pattern),
+                    (SpanKind::Path, path.as_deref().unwrap_or_default()),
+                ]
+            }
+            ToolInput::Subagent { description, .. } => {
+                vec![(
+                    SpanKind::Command,
+                    description.as_deref().unwrap_or_default(),
+                )]
+            }
+            ToolInput::WebSearch { query } => vec![(SpanKind::Command, query)],
+            ToolInput::WebFetch { url, .. } => vec![(SpanKind::Path, url)],
+            ToolInput::Todos(_) | ToolInput::Mcp { .. } | ToolInput::Other => Vec::new(),
+        },
+        Content::Thinking { .. }
+        | Content::Compaction { .. }
+        | Content::Note { .. }
+        | Content::Unrecognised(_) => Vec::new(),
     }
 }
 

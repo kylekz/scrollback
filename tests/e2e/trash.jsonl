@@ -1,0 +1,88 @@
+{"scenario": {"window_size": "1440x900", "fixture": "trash", "description": "Trash and deleting for good (DESIGN §4.8, E-Trash) on the boards' library with E-Trash's three sessions in Trash: the page and its table, no key deleting anything, the confirmation with Cancel first and Enter never confirming, the last copy's wording, Restore with its toast and Undo, deleting for good with Tab and Enter, the empty page; captured dark and light at 1440x900 and 960x600"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/library/counts/trash", "equals": 3}, {"pointer": "/library/counts/all", "equals": 2318}]}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+
+// The page: the header with the count and the size, the table with a row of 52 per session, the one moved last first, and the note under it.
+{"cmd": "click", "target": "sidebar/trash"}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "trash"}, {"pointer": "/library/sessions", "equals": 3}]}
+{"cmd": "bounds", "target": "trash/row/0", "expect_result": [{"pointer": "/h", "equals": 52}, {"pointer": "/w", "gte": 1140}]}
+{"cmd": "bounds", "target": "trash/note", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "trash-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "trash-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// No key deletes anything here: Delete moves nothing and asks nothing.
+{"cmd": "click", "target": "page/title"}
+{"cmd": "key", "keystroke": "down"}
+{"cmd": "settle", "expect": {"pointer": "/library/selected", "equals": "Try tree-sitter-bash for command parsing"}}
+{"cmd": "key", "keystroke": "delete"}
+{"cmd": "key", "keystroke": "backspace"}
+{"cmd": "settle", "expect": [{"pointer": "/library/counts/trash", "equals": 3}, {"pointer": "/library/for_good", "equals": null}]}
+
+// Delete for good… asks first, with what it removes: Cancel has the keyboard, so Enter cancels.
+{"cmd": "click", "target": "trash/row/0/delete"}
+{"cmd": "settle", "expect": [{"pointer": "/library/for_good/title", "equals": "Try tree-sitter-bash for command parsing"}, {"pointer": "/library/for_good/files", "equals": 1}, {"pointer": "/library/for_good/at_location", "equals": true}]}
+{"cmd": "bounds", "target": "for-good", "expect_result": {"pointer": "/w", "equals": 540}}
+{"cmd": "screenshot", "name": "for-good-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "for-good-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": [{"pointer": "/library/for_good", "equals": null}, {"pointer": "/library/counts/trash", "equals": 3}]}
+
+// A session its location no longer has: this is the last copy.
+{"cmd": "click", "target": "trash/row/1/delete"}
+{"cmd": "settle", "expect": [{"pointer": "/library/for_good/title", "equals": "test"}, {"pointer": "/library/for_good/at_location", "equals": false}]}
+{"cmd": "screenshot", "name": "last-copy-dark"}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": {"pointer": "/library/for_good", "equals": null}}
+
+// Restore puts a session back in its folder, with a toast whose Undo moves it to Trash again.
+{"cmd": "click", "target": "trash/row/2/restore"}
+{"cmd": "settle", "expect": [{"pointer": "/library/counts/trash", "equals": 2}, {"pointer": "/library/toast/text", "equals": "Restored to dotfiles"}, {"pointer": "/library/toast/undo", "equals": true}]}
+{"cmd": "screenshot", "name": "restored-dark"}
+{"cmd": "click", "target": "toast/undo"}
+{"cmd": "settle", "expect": {"pointer": "/library/counts/trash", "equals": 3}}
+
+// Tab reaches Delete for good, and Enter on it deletes: a toast without Undo, which says the files go in the background. The session the Undo put back was moved last, so it is the first row.
+{"cmd": "click", "target": "trash/row/0/delete"}
+{"cmd": "settle", "expect": [{"pointer": "/library/for_good/title", "equals": "Paste API key into .env by mistake"}, {"pointer": "/library/for_good/files", "equals": 1}]}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": [{"pointer": "/library/for_good", "equals": null}, {"pointer": "/library/counts/trash", "equals": 2}, {"pointer": "/library/toast/text", "contains": "Deleted “Paste API key into .env by mistake” for good"}, {"pointer": "/library/toast/undo", "equals": false}]}
+{"cmd": "screenshot", "name": "deleted-dark"}
+
+// At 960x600 the Session column gives way; the dialog keeps its width.
+{"cmd": "resize", "w": 960, "h": 600}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "trash/row/0/restore", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "narrow-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "narrow-light"}
+{"cmd": "click", "target": "trash/row/0/delete"}
+{"cmd": "settle", "expect": {"pointer": "/library/for_good/title", "equals": "Try tree-sitter-bash for command parsing"}}
+{"cmd": "screenshot", "name": "narrow-for-good-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "narrow-for-good-dark"}
+{"cmd": "click", "target": "for-good/cancel"}
+{"cmd": "settle", "expect": {"pointer": "/library/for_good", "equals": null}}
+
+// Everything restored: "Trash is empty."
+{"cmd": "click", "target": "page/title"}
+{"cmd": "key", "keystroke": "down"}
+{"cmd": "key", "keystroke": "secondary-a"}
+{"cmd": "settle", "expect": {"pointer": "/library/selection/1", "not_equals": null}}
+{"cmd": "click", "target": "trash/row/0/restore"}
+{"cmd": "settle", "expect": [{"pointer": "/library/counts/trash", "equals": 0}, {"pointer": "/library/toast/text", "equals": "2 sessions restored"}]}
+{"cmd": "bounds", "target": "page/empty", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "empty-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "empty-light"}

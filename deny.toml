@@ -1,6 +1,7 @@
-# cargo-deny: every crate comes from crates.io or the owner's toolbox-rs, carries a license on
-# the list below, and has no open security advisory. A change to Cargo.lock that brings in a
-# crate from anywhere else, or a crate RustSec flags, fails `cargo deny check`.
+# cargo-deny, CI's dependencies job (.github/workflows/ci.yml): every crate comes from crates.io
+# or the owner's toolbox-rs, carries a license on the list below, and has no open security
+# advisory. A change to Cargo.lock that brings in a crate from anywhere else, or a crate RustSec
+# flags, fails `cargo deny check` and so CI, and can't reach a release.
 
 [graph]
 all-features = true
@@ -11,7 +12,20 @@ all-features = true
 # gpui and its platform crates, which scrollback doesn't choose.
 yanked = "deny"
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # zip 8 through velopack (=1.2.161, pinned to vpk; the installer's updates, PLAN §13). All
+    # four are in zip's extraction: `ZipArchive::extract` and `ZipStreamReader::extract` keep
+    # setuid bits, follow links out of the folder or abort on a symlink entry that declares a
+    # huge size. velopack's library, the only part of it in scrollback, calls neither: it reads
+    # entries one by one (`by_index`, `bundle.rs`). The archives it reads are the update packages
+    # it downloaded, whose SHA256 it checks against the feed's: integrity, not authenticity, so
+    # this rests on the library never extracting, not on the hash. `[bans]` keeps zip to
+    # velopack alone. Goes when velopack moves to zip 9.
+    { id = "RUSTSEC-2026-0367", reason = "zip via velopack, which never calls ZipArchive::extract or ZipStreamReader::extract" },
+    { id = "RUSTSEC-2026-0368", reason = "zip via velopack, which never calls ZipArchive::extract or ZipStreamReader::extract" },
+    { id = "RUSTSEC-2026-0369", reason = "zip via velopack, which never calls ZipArchive::extract or ZipStreamReader::extract" },
+    { id = "RUSTSEC-2026-0429", reason = "zip via velopack, which never calls ZipArchive::extract or ZipStreamReader::extract" },
+]
 
 [licenses]
 confidence-threshold = 0.9
@@ -31,6 +45,12 @@ allow = [
     "Zlib",
 ]
 
+# webpki-roots, Mozilla's root certificates, through velopack's HTTP client (ureq): its data
+# licence is allowed for it alone.
+[[licenses.exceptions]]
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
 [licenses.private]
 # The workspace's own crates (publish = false) are this repository's MIT.
 ignore = true
@@ -39,6 +59,8 @@ ignore = true
 multiple-versions = "allow"
 wildcards = "deny"
 allow-wildcard-paths = true
+# zip only through velopack, whose use of it the advisories above rest on.
+deny = [{ crate = "zip", wrappers = ["velopack"] }]
 
 [sources]
 unknown-registry = "deny"

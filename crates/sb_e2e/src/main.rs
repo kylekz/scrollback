@@ -21,15 +21,37 @@
 //!   (docs/DESIGN.md §6).
 //! - `"boards-held-back"`: the same, with one of the subfolder player's sessions held back
 //!   and filed by hand ([`boards::build`]).
+//! - `"search"`: the boards' library with the sessions `E-Search` finds, whose prompts,
+//!   replies, commands, paths and subagent hold what it matches ([`extras::search`]).
+//! - `"trash"`: the boards' library with the three sessions `E-Trash` lists in Trash, one of
+//!   them gone at its location ([`extras::trash`]).
+//! - `"reader"`: an archive in the data dir with the sessions the reader's scenarios open
+//!   ([`reader`]): the boards' reader sessions, every construct the reader draws, and the
+//!   edge states.
+//! - `"reader-large"`: the same, with a session large enough to measure the reader's budgets
+//!   against (docs/PLAN.md §14).
+//! - `"reader-versions"`: the same, with `E-Versions`' session, whose newest version is held
+//!   back (docs/DESIGN.md §4.3).
 //! - `"locations"`: an archive in the data dir with one location of each kind, the host's
 //!   last good sync twelve days ago, and this machine's agent in the home
 //!   ([`fixture::locations`]): the locations sheet's states (docs/DESIGN.md §4.11).
 //! - `"archive-remains"`: what is left of an archive in the data dir, its files without its
 //!   `archive.json`: the app must say it can't open it, and make no new one in its place
 //!   (docs/PLAN.md §4.4).
+//! - `"settings"`: an archive in the data dir with a distro read from the home, two of whose
+//!   transcripts are damaged (one still in the home, one gone from it), and a host whose two
+//!   sessions were deleted for good ([`fixture::settings`]): Settings › Archive
+//!   (docs/DESIGN.md §4.13).
+//! - `"archive-gone"`: settings that name an archive in a folder that isn't there, as on a
+//!   drive unplugged, and remember what it held ([`fixture::archive_gone`]): the
+//!   archive-unavailable page (docs/DESIGN.md §4.14).
+//! - `"settings-unreadable"`: a settings file that isn't JSON, naming an archive
+//!   ([`fixture::settings_unreadable`]): nothing is opened or made until the owner chooses.
 
 mod boards;
+mod extras;
 mod fixture;
+mod reader;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -41,6 +63,8 @@ use sb_test_support::ProjectsTree;
 use serde::Deserialize;
 use serde_json::Value;
 
+use extras::Extra;
+
 /// What a scenario's app finds (the module docs).
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -51,8 +75,16 @@ enum Library {
     AgentLarge,
     Boards,
     BoardsHeldBack,
+    Search,
+    Trash,
+    Reader,
+    ReaderLarge,
+    ReaderVersions,
     Locations,
     ArchiveRemains,
+    Settings,
+    ArchiveGone,
+    SettingsUnreadable,
 }
 
 /// scrollback's header keys: `{"scenario": {"fixture": "boards"}}`.
@@ -130,14 +162,31 @@ impl RunnerApp for Scrollback {
             Library::Agent => fixture::agent(&mut tree),
             Library::AgentLarge => boards::agent(&mut tree),
             Library::NoAgent => std::fs::remove_dir_all(&home)?,
-            Library::Boards | Library::BoardsHeldBack => {
+            Library::Boards | Library::BoardsHeldBack | Library::Search | Library::Trash => {
                 // Its locations' trees are synced into the archive here, and gone by the
                 // time the app starts: the app finds no agent, and syncs nothing away.
                 std::fs::remove_dir_all(&home)?;
                 boards::build(
                     &cx.data_dir.join("archive"),
                     &cx.out_dir.join("locations"),
-                    matches!(header.fixture, Library::BoardsHeldBack),
+                    match header.fixture {
+                        Library::BoardsHeldBack => Extra::HeldBack,
+                        Library::Search => Extra::Search,
+                        Library::Trash => Extra::Trash,
+                        _ => Extra::Nothing,
+                    },
+                )?;
+            }
+            Library::Reader | Library::ReaderLarge | Library::ReaderVersions => {
+                std::fs::remove_dir_all(&home)?;
+                reader::build(
+                    &cx.data_dir.join("archive"),
+                    &cx.out_dir.join("locations"),
+                    match header.fixture {
+                        Library::ReaderLarge => reader::Extra::Large,
+                        Library::ReaderVersions => reader::Extra::Versions,
+                        _ => reader::Extra::None,
+                    },
                 )?;
             }
             Library::Locations => fixture::locations(
@@ -145,9 +194,22 @@ impl RunnerApp for Scrollback {
                 &cx.data_dir.join("archive"),
                 &cx.out_dir.join("locations"),
             )?,
+            Library::Settings => fixture::settings(
+                &mut tree,
+                &cx.data_dir.join("archive"),
+                &cx.out_dir.join("locations"),
+            )?,
             Library::ArchiveRemains => {
                 std::fs::remove_dir_all(&home)?;
                 std::fs::create_dir_all(cx.data_dir.join("archive/files/location"))?;
+            }
+            Library::ArchiveGone => {
+                std::fs::remove_dir_all(&home)?;
+                fixture::archive_gone(cx.data_dir, &cx.out_dir.join("drive"))?;
+            }
+            Library::SettingsUnreadable => {
+                std::fs::remove_dir_all(&home)?;
+                fixture::settings_unreadable(cx.data_dir, &cx.out_dir.join("drive"))?;
             }
         }
         Ok(Box::new(Home { env, home }))

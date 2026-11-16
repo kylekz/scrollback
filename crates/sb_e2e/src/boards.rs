@@ -29,6 +29,8 @@ use sb_core::provider;
 use sb_core::sync::sync_location;
 use sb_test_support::{Outline, ProjectsTree};
 
+use crate::extras::{self, Extra};
+
 /// The locations, by their place in [`LOCATIONS`].
 const PC: usize = 0;
 const WSL: usize = 1;
@@ -825,9 +827,10 @@ fn hold_back(
 }
 
 /// Builds the archive in `archive_dir`, writing each location's transcripts under `scratch`
-/// on the way, which is removed again. With `held_back`, one of player's sessions has a newer
-/// version held back and is filed by hand ([`hold_back`]).
-pub fn build(archive_dir: &Path, scratch: &Path, held_back: bool) -> Result<()> {
+/// on the way, which is removed again, with what `extra` adds: one of player's sessions with
+/// a newer version held back and filed by hand ([`hold_back`]), or the sessions of the search
+/// and Trash boards ([`extras`]).
+pub fn build(archive_dir: &Path, scratch: &Path, extra: Extra) -> Result<()> {
     let providers = provider::builtin();
     let provider = providers
         .first()
@@ -842,6 +845,11 @@ pub fn build(archive_dir: &Path, scratch: &Path, held_back: bool) -> Result<()> 
     for (index, name) in LOCATIONS.into_iter().enumerate() {
         let mut tree = ProjectsTree::in_home(&scratch.join(index.to_string()));
         let starred = writer.location(index, &mut tree);
+        match extra {
+            Extra::Search if index == WSL => extras::search(&mut tree),
+            Extra::Trash => extras::trash_sessions(index, &mut tree),
+            Extra::Nothing | Extra::HeldBack | Extra::Search => {}
+        }
         let kind = match index {
             PC => LocationKind::Local,
             WSL => LocationKind::Wsl {
@@ -876,7 +884,7 @@ pub fn build(archive_dir: &Path, scratch: &Path, held_back: bool) -> Result<()> 
             };
             catalogue.set_starred(&session, true)?;
         }
-        if held_back && index == WSL {
+        if extra == Extra::HeldBack && index == WSL {
             held = Some(hold_back(&archive, &location.id, &tree, &providers)?);
         }
         locations.push(location.id);
@@ -917,6 +925,9 @@ pub fn build(archive_dir: &Path, scratch: &Path, held_back: bool) -> Result<()> 
     }
     drop(archive);
     std::fs::remove_dir_all(scratch)?;
+    if extra == Extra::Trash {
+        extras::trash(archive_dir)?;
+    }
     Ok(())
 }
 
@@ -953,7 +964,7 @@ mod tests {
     fn the_archive_holds_the_library_the_boards_draw() {
         let dir = tempfile::tempdir().unwrap();
         let archive_dir = dir.path().join("archive");
-        build(&archive_dir, &dir.path().join("locations"), true).unwrap();
+        build(&archive_dir, &dir.path().join("locations"), Extra::HeldBack).unwrap();
         let archive = Archive::open(&archive_dir).unwrap();
         let catalogue = archive.catalogue();
 

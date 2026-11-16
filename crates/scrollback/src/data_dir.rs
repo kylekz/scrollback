@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 
+/**
+ * The data folder's name in the platform's local data folder. On Windows the installer's folder
+ * sits beside it, under another name (`script/package`'s pack id).
+ */
+pub const FOLDER: &str = "scrollback";
+
 /// How the data dir was chosen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -74,9 +80,27 @@ fn choose(
          SCROLLBACK_DATA_DIR",
     )?;
     Ok(Place {
-        dir: data.join("scrollback"),
+        dir: data.join(FOLDER),
         source: Source::Platform,
     })
+}
+
+/**
+ * Refuses a data folder inside the installer's (`install_root`, in an installed copy), which
+ * its uninstaller removes with whatever is in it: the settings file and the archive with them.
+ */
+pub fn outside_install(dir: &Path, install_root: Option<&Path>) -> Result<()> {
+    let Some(root) = install_root else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        !sb_core::archive::resolved(dir).starts_with(sb_core::archive::resolved(root)),
+        "the data folder {} is inside scrollback's install folder {}, which uninstalling \
+         removes: pass --data-dir or SCROLLBACK_DATA_DIR naming a folder outside it",
+        dir.display(),
+        root.display()
+    );
+    Ok(())
 }
 
 /**
@@ -87,7 +111,7 @@ fn choose(
  */
 #[cfg(feature = "automation")]
 pub fn for_development(place: &Place) -> Result<()> {
-    let own = dirs::data_local_dir().map(|data| data.join("scrollback"));
+    let own = dirs::data_local_dir().map(|data| data.join(FOLDER));
     let paths = if cfg!(windows) {
         Paths::Windows
     } else {
@@ -202,6 +226,19 @@ mod tests {
         assert!(refused(r"C:\Users\user\AppData\Local\.\scrollback\"));
         assert!(!refused(r"D:\Projects\scratch"));
         assert!(!refused(r"C:\Users\user\AppData\Local\scrollback-dev"));
+    }
+
+    #[test]
+    fn a_data_folder_inside_the_install_is_refused() {
+        let install = tempfile::tempdir().unwrap();
+        let root = install.path().join("scrollback-app");
+        std::fs::create_dir_all(root.join("current")).unwrap();
+        for inside in [root.clone(), root.join("current"), root.join("data")] {
+            assert!(outside_install(&inside, Some(&root)).is_err(), "{inside:?}");
+        }
+        let beside = install.path().join("scrollback");
+        assert!(outside_install(&beside, Some(&root)).is_ok());
+        assert!(outside_install(&root, None).is_ok(), "not installed");
     }
 
     #[test]

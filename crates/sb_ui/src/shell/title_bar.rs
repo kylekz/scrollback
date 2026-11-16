@@ -11,9 +11,8 @@
 //! **States** (DESIGN §4.1). The first run shows the mark alone: no search, Sync all or
 //! Settings (DESIGN §4.10). With a library, Sync all syncs every location, and while a pass
 //! runs its glyph turns, it reads "Syncing…", and neither a click nor `Tab` stops on it.
-//! While the archive is opening or didn't open, it is drawn disabled (DESIGN §4.14). Search
-//! needs the index (PLAN §13 phase 6) and Settings its page (phase 7): until then each is
-//! drawn disabled and takes no clicks.
+//! While the archive is opening or didn't open, it is drawn disabled (DESIGN §4.14), and so are
+//! Settings and the search field, which otherwise opens the palette.
 //!
 //! **Caption buttons** (Windows). Each is a 46px-wide box, the bar's height, marked with gpui's
 //! `WindowControlArea` (`Min`, `Max`, `Close`), so Windows itself answers the hit test and
@@ -31,7 +30,7 @@ use gpui::{
 
 use super::{Shell, SidebarPlacement};
 use crate::actions::library::SyncAll;
-use crate::actions::shell::{Dismiss, ToggleSidebar};
+use crate::actions::shell::{Dismiss, Search, ToggleSidebar};
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{DISABLED_OPACITY, icon, kbd, sync_glyph, tab_stop, text_width};
 use crate::icons::SbIcon;
@@ -54,8 +53,13 @@ impl Shell {
     ) -> AnyElement {
         let c = &theme.colors;
         let showing = Showing::now(cx);
-        let first_run = showing == Showing::FirstRun;
+        /* Settings over a first run keeps its title bar. */
+        let first_run = showing == Showing::FirstRun
+            || showing == Showing::Settings && cx.services().sync.read(cx).is_first_run();
         let has_library = showing.is_library();
+        /* A first run shows only the gear, and that only in a folder the owner chose, to choose
+        another. */
+        let gear = !first_run || showing.has_settings(cx);
         let syncing = cx.services().sync.read(cx).is_syncing();
         let traffic_lights = cfg!(target_os = "macos") && !window.is_fullscreen();
         let captions = CaptionButton::row(window);
@@ -71,8 +75,14 @@ impl Shell {
         } + px(18.)
             + theme.spacing.md
             + text_width("scrollback", &theme.text.title, window);
-        let buttons = (!first_run).then(|| {
-            sync_all_width(has_library && syncing, theme, window) + GAP + theme.sizes.control_height
+        let buttons = gear.then(|| {
+            if first_run {
+                theme.sizes.control_height
+            } else {
+                sync_all_width(has_library && syncing, theme, window)
+                    + GAP
+                    + theme.sizes.control_height
+            }
         });
         let right = match (buttons, captions) {
             (Some(buttons), Some(_)) => buttons + GAP + theme.sizes.caption_button_width * 3.,
@@ -119,7 +129,9 @@ impl Shell {
                         .child(mark(theme)),
                 ),
             )
-            .when(!first_run, |this| this.child(search_field(theme)))
+            .when(!first_run, |this| {
+                this.child(search_field(has_library, theme, cx))
+            })
             .child(
                 div()
                     .flex_1()
@@ -134,7 +146,14 @@ impl Shell {
                             .gap(GAP)
                             .when(!first_run, |this| {
                                 this.child(sync_all_button(has_library, syncing, theme, cx))
-                                    .child(settings_button(theme))
+                            })
+                            .when(gear, |this| {
+                                this.child(settings_button(
+                                    has_library || first_run,
+                                    showing == Showing::Settings,
+                                    theme,
+                                    cx,
+                                ))
                             })
                             // The caption buttons sit side by side, flush with the window's edge.
                             .map(|this| match captions {
@@ -234,16 +253,26 @@ fn mark(theme: &SbTheme) -> AnyElement {
 }
 
 /// The search field (DESIGN §4.1): a 460-wide button in the `field` style that opens the
-/// palette (`Ctrl K`). Disabled (module docs).
-fn search_field(theme: &SbTheme) -> AnyElement {
+/// palette (`Ctrl K`). Disabled without a library (module docs).
+fn search_field(enabled: bool, theme: &SbTheme, cx: &mut Context<Shell>) -> AnyElement {
     let c = &theme.colors;
     div()
         .id("titlebar-search")
         .role(Role::Button)
-        .aria_label(format!(
-            "Search the archive ({})",
-            keymap::label(keymap::SEARCH_KEYS)
-        ))
+        .aria_label(format!("Search the archive ({})", keymap::SEARCH.label()))
+        // A control inside the drag region.
+        .occlude()
+        .map(|this| {
+            if enabled {
+                tab_stop(this, theme).cursor_pointer().on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.toggle_palette(&Search, window, cx);
+                    },
+                ))
+            } else {
+                this.opacity(DISABLED_OPACITY)
+            }
+        })
         .flex_shrink(1.)
         .min_w_0()
         .flex()
@@ -257,7 +286,6 @@ fn search_field(theme: &SbTheme) -> AnyElement {
         .border_color(c.line)
         .bg(c.s1)
         .text_color(c.fg3)
-        .opacity(DISABLED_OPACITY)
         .debug_selector(|| "titlebar-search".into())
         .child(icon(SbIcon::Search, theme.sizes.icon_sm, c.fg3))
         .child(
@@ -267,7 +295,7 @@ fn search_field(theme: &SbTheme) -> AnyElement {
                 .whitespace_nowrap()
                 .child("Search titles, prompts, replies and commands"),
         )
-        .child(kbd(keymap::label(keymap::SEARCH_KEYS), theme))
+        .child(kbd(keymap::SEARCH.label(), theme))
         .automation_target("titlebar/search")
 }
 
@@ -334,23 +362,45 @@ fn sync_all_button(
 }
 
 /// Settings (DESIGN §4.1): a ghost icon button that opens Settings in the main area
-/// (`Ctrl ,`). Disabled (module docs).
-fn settings_button(theme: &SbTheme) -> AnyElement {
+/// (`Ctrl ,`), on (`s3`) while they show. Without a library it is disabled (module docs).
+fn settings_button(
+    enabled: bool,
+    on: bool,
+    theme: &SbTheme,
+    cx: &mut Context<Shell>,
+) -> AnyElement {
+    let c = &theme.colors;
     div()
         .id("titlebar-settings")
         .role(Role::Button)
-        .aria_label(format!(
-            "Settings ({})",
-            keymap::label(keymap::SETTINGS_KEYS)
-        ))
+        .debug_selector(|| "titlebar-settings".into())
+        .aria_label(format!("Settings ({})", keymap::OPEN_SETTINGS.label()))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
         .size(theme.sizes.control_height)
         .rounded(theme.radii.control)
-        .opacity(DISABLED_OPACITY)
-        .child(icon(SbIcon::Settings, theme.sizes.icon, theme.colors.fg2))
+        .border_1()
+        .border_color(gpui::transparent_black())
+        // A control inside the drag region.
+        .occlude()
+        .when(on, |this| this.bg(c.s3))
+        .map(|this| {
+            if enabled {
+                tab_stop(this, theme)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(if on { c.s3 } else { c.s2 }))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
+            } else {
+                this.opacity(DISABLED_OPACITY)
+            }
+        })
+        .child(icon(
+            SbIcon::Settings,
+            theme.sizes.icon,
+            if on { c.fg } else { c.fg2 },
+        ))
         .automation_target("titlebar/settings")
 }
 

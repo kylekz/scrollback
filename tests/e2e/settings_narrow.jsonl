@@ -1,0 +1,57 @@
+{"scenario": {"window_size": "960x600", "fixture": "settings", "description": "Settings (DESIGN §4.13) in the smallest window (DESIGN §2): the sidebar collapses, the header, the list of sections and the column still fit, the column scrolls under them, and each section is captured dark and light"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/shell/sidebar", "equals": "collapsed"}, {"pointer": "/sync/syncing", "equals": false}]}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+
+// The sidebar is out of the layout, so Settings takes the window's width: Back at the main area's left, the list 200 wide, the column the rest. Where text is wider (Segoe UI) or the display scale rounds, an edge moves by a pixel.
+{"cmd": "key", "keystroke": "secondary-,"}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "settings"}, {"pointer": "/settings/section", "equals": "archive"}]}
+{"cmd": "bounds", "target": "settings/back", "expect_result": [{"pointer": "/x", "gte": 11}, {"pointer": "/x", "lte": 13}, {"pointer": "/y", "gte": 47}, {"pointer": "/y", "lte": 49}]}
+{"cmd": "bounds", "target": "settings/nav/shortcuts", "expect_result": [{"pointer": "/x", "gte": 9}, {"pointer": "/x", "lte": 11}, {"pointer": "/visible", "not_equals": null}]}
+{"cmd": "bounds", "target": "settings/section/archive", "expect_result": [{"pointer": "/x", "gte": 231}, {"pointer": "/x", "lte": 233}, {"pointer": "/w", "gte": 694}, {"pointer": "/w", "lte": 697}]}
+{"cmd": "bounds", "target": "settings/archive/use-folder", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "archive-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "archive-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// Verify's rows keep their buttons in view at this width.
+{"cmd": "click", "target": "settings/nav/archive"}
+{"cmd": "scroll", "target": "settings/column", "dy": -300}
+{"cmd": "click", "target": "settings/verify/run"}
+{"cmd": "settle", "timeout_ms": 30000, "expect": {"pointer": "/settings/verify/last/problems", "len": 2}}
+{"cmd": "bounds", "target": "settings/verify/problem/0/fetch", "expect_result": [{"pointer": "/visible", "not_equals": null}, {"pointer": "/x", "gte": 232}]}
+{"cmd": "screenshot", "name": "verified-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "verified-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+{"cmd": "click", "target": "settings/nav/sync"}
+{"cmd": "settle", "expect": {"pointer": "/settings/section", "equals": "sync"}}
+{"cmd": "screenshot", "name": "sync-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "sync-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+{"cmd": "click", "target": "settings/nav/appearance"}
+{"cmd": "settle", "expect": {"pointer": "/settings/section", "equals": "appearance"}}
+{"cmd": "screenshot", "name": "appearance-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "appearance-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// Scrolled to its end by hand, the list picks the last section.
+{"cmd": "scroll", "target": "settings/column", "dy": -5000}
+{"cmd": "settle", "expect": {"pointer": "/settings/section", "equals": "shortcuts"}}
+{"cmd": "screenshot", "name": "shortcuts-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "shortcuts-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": {"pointer": "/page", "equals": "sessions"}}

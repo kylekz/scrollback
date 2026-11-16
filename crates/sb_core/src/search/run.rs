@@ -11,7 +11,7 @@ use super::{Found, Limit, Match, MatchKind, Query, Results, SearchError, Searche
 use crate::CancelToken;
 use crate::archive::Archive;
 use crate::catalogue::SessionId;
-use crate::transcript::{At, BlockId};
+use crate::transcript::{At, BlockId, InSubagent};
 
 /// The most terms a query is run with; the rest of a longer query is left out.
 pub const MOST_TERMS: usize = 16;
@@ -170,7 +170,8 @@ impl Archive {
                 /* Of the session's doc still: a doc's id goes to another session's only once
                 this one's is forgotten, between that read and this. */
                 let mut span = c.prepare(
-                    "SELECT s.kind, s.subagent, s.turn, s.block, s.unattached, s.cut, s.text
+                    "SELECT s.kind, s.subagent, s.sub_turn, s.sub_block, s.turn, s.block,
+                            s.unattached, s.cut, s.text
                      FROM span s JOIN doc d ON d.id = ?2
                      WHERE s.id = ?1 AND d.location_id = ?3 AND d.provider = ?4 AND d.session = ?5",
                 )?;
@@ -182,7 +183,7 @@ impl Archive {
                             params![span_id, doc, id.location, id.provider, id.key],
                             |row| {
                                 let kind: String = row.get(0)?;
-                                let at = match (row.get(2)?, row.get(3)?, row.get(4)?) {
+                                let at = match (row.get(4)?, row.get(5)?, row.get(6)?) {
                                     (Some(turn), Some(block), _) => Some(At::Block {
                                         turn,
                                         block: BlockId(block),
@@ -190,14 +191,22 @@ impl Archive {
                                     (_, _, Some(place)) => Some(At::Unattached(place)),
                                     _ => None,
                                 };
-                                let text: String = row.get(6)?;
+                                let subagent = match (row.get(1)?, row.get(2)?, row.get(3)?) {
+                                    (Some(item), Some(turn), Some(block)) => Some(InSubagent {
+                                        item,
+                                        turn,
+                                        block: BlockId(block),
+                                    }),
+                                    _ => None,
+                                };
+                                let text: String = row.get(8)?;
                                 Ok(match MatchKind::from_str(&kind) {
                                     None => None,
                                     Some(kind) => Some(Match {
                                         kind,
-                                        subagent: row.get(1)?,
+                                        subagent,
                                         at,
-                                        cut: row.get(5)?,
+                                        cut: row.get(7)?,
                                         snippet: snippet(&text, &terms),
                                     }),
                                 })

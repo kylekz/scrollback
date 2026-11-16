@@ -1,0 +1,31 @@
+{"scenario": {"window_size": "1440x900", "fixture": "settings", "description": "scrollback's own updates in Settings (PLAN §13): a scripted run never looks for one; with update_ready's scripted feed standing in for Velopack (never the network), the version at the foot of Settings gets Restart to update under it, which asks about the other processes running from the install first, and once clicked hands the update over"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/update/off", "equals": "development"}, {"pointer": "/update/ready", "equals": null}]}
+
+// Settings shows the version, with no update line in a development build.
+{"cmd": "key", "keystroke": "secondary-,"}
+{"cmd": "settle", "expect": {"pointer": "/page", "equals": "settings"}}
+{"cmd": "scroll", "target": "settings/column", "dy": -6000}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "settings/version", "expect_result": {"pointer": "/count", "equals": 1}}
+{"cmd": "query", "prefix": "settings/restart", "expect_result": {"pointer": "", "len": 0}}
+
+// An update downloaded and ready, with another scrollback running from the install.
+{"cmd": "update_ready", "version": "0.2.0", "others": 1}
+{"cmd": "settle", "expect": [{"pointer": "/update/off", "equals": null}, {"pointer": "/update/ready", "equals": "0.2.0"}, {"pointer": "/update/checked/result", "equals": "ready"}]}
+{"cmd": "scroll", "target": "settings/column", "dy": -6000}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "settings/restart-to-update", "expect_result": {"pointer": "/count", "equals": 1}}
+{"cmd": "screenshot", "name": "update-ready"}
+
+// Restart to update asks about the other one first; Not now keeps everything.
+{"cmd": "click", "target": "settings/restart-to-update"}
+{"cmd": "settle", "expect": [{"pointer": "/update/confirm", "equals": 1}, {"pointer": "/update/restarted", "equals": false}]}
+{"cmd": "click", "target": "settings/not-now"}
+{"cmd": "settle", "expect": [{"pointer": "/update/confirm", "equals": null}, {"pointer": "/update/restarted", "equals": false}, {"pointer": "/update/ready", "equals": "0.2.0"}]}
+
+// Restart anyway: the scripted feed takes the update, and the scripted run stays open.
+{"cmd": "click", "target": "settings/restart-to-update"}
+{"cmd": "settle", "expect": {"pointer": "/update/confirm", "equals": 1}}
+{"cmd": "click", "target": "settings/restart-anyway"}
+{"cmd": "settle", "expect": [{"pointer": "/update/restarted", "equals": true}, {"pointer": "/update/failure", "equals": null}]}

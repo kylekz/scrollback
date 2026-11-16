@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 
 use super::{Archive, ArchiveError, Result, accounted, layout, open_search, segment};
-use crate::catalogue::{Catalogue, Deletion, ItemFile, Removal, Stored};
+use crate::catalogue::{AllowedAgain, Catalogue, Deletion, ItemFile, Removal, Stored};
 use crate::search::SearchIndex;
 
 /// What deleting a session for good did.
@@ -132,6 +132,19 @@ impl Archive {
             deletion: shown.clone(),
             pending,
         })
+    }
+
+    /**
+     * Puts back a tombstone the owner removed ([`Catalogue::restore_tombstone`]), unless its
+     * location is being synced ([`ArchiveError::Syncing`]): the sync may be archiving the
+     * session again as it is put back.
+     */
+    pub fn restore_tombstone(&self, allowed: &AllowedAgain) -> Result<()> {
+        let location = &allowed.tombstone.session.location;
+        let _syncing = self
+            .begin_sync(location)
+            .ok_or_else(|| ArchiveError::Syncing(location.clone()))?;
+        Ok(self.catalogue.restore_tombstone(allowed)?)
     }
 
     /// How many deleted items' folders are still to be removed (the module docs).

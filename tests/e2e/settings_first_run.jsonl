@@ -1,0 +1,33 @@
+{"scenario": {"window_size": "1440x900", "fixture": "settings", "description": "Use a different folder… onto an empty folder lands on the new archive's first run, which keeps the gear and Ctrl , while the archive's folder is one the owner chose, so the archive left can be chosen again without adding a location first; its footer names the folder"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+{"cmd": "key", "keystroke": "secondary-,"}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "settings"}, {"pointer": "/settings/default", "equals": true}]}
+{"cmd": "answer_picker", "folder": "${out_dir}/empty-archive"}
+{"cmd": "click", "target": "settings/archive/use-folder"}
+{"cmd": "settle"}
+{"cmd": "click", "target": "settings/confirm/ok"}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "first-run"}, {"pointer": "/settings/archive", "contains": "empty-archive"}, {"pointer": "/settings/default", "equals": false}]}
+
+// The first run's title bar has the gear alone; the search field and Sync all wait for a library.
+{"cmd": "bounds", "target": "titlebar/settings", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "titlebar/search", "expect_error": "no target"}
+{"cmd": "bounds", "target": "titlebar/sync-all", "expect_error": "no target"}
+{"cmd": "screenshot", "name": "first-run-chosen-dark"}
+
+// Ctrl , opens Settings over it, and Esc goes back to it.
+{"cmd": "key", "keystroke": "secondary-,"}
+{"cmd": "settle", "expect": {"pointer": "/page", "equals": "settings"}}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": {"pointer": "/page", "equals": "first-run"}}
+
+// The gear does too, and the archive left is chosen again from Settings: its library is back.
+{"cmd": "click", "target": "titlebar/settings"}
+{"cmd": "settle", "expect": {"pointer": "/page", "equals": "settings"}}
+{"cmd": "answer_picker", "folder": "${data_dir}/archive"}
+{"cmd": "click", "target": "settings/archive/use-folder"}
+{"cmd": "settle"}
+{"cmd": "click", "target": "settings/confirm/ok"}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/settings/default", "equals": true}]}

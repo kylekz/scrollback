@@ -17,14 +17,15 @@ use gpui_component::v_virtual_list;
 use sb_core::catalogue::{Filed, Session, Shelf};
 use sb_core::filing::FolderId;
 
-use super::{LIFTED_OPACITY, SessionsView, UNTITLED, month_name, subfolder_of};
+use super::{LIFTED_OPACITY, SessionsView, month_name, subfolder_of};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{focus_ring, icon, location_tag, overline};
+use crate::components::{focus_ring, icon, location_tag, overline, warn_chip};
 use crate::drag;
 use crate::format;
 use crate::icons::SbIcon;
 use crate::services::Month;
+use crate::services::library::title_of;
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
 /// The columns' widths (DESIGN §4.5). The date has room for a year and the hand glyph.
@@ -307,6 +308,7 @@ impl SessionsView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let c = &theme.colors;
+        let title = title_of(session);
         let library = self.library.read(cx);
         let selected = library.is_selected(&session.id);
         let ringed = keyboard && library.selected_index() == Some(index);
@@ -394,13 +396,12 @@ impl SessionsView {
                             .overflow_hidden()
                             .text_ellipsis()
                             .text_spec(&theme.text.row_title)
-                            .child(
-                                session
-                                    .title
-                                    .clone()
-                                    .unwrap_or_else(|| UNTITLED.to_string()),
-                            ),
+                            .child(title.clone()),
                     )
+                    /* A newer version held back (DESIGN §4.3), found without opening it. */
+                    .when(session.held_back, |this| {
+                        this.child(warn_chip("held back", theme))
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -408,7 +409,9 @@ impl SessionsView {
                             .overflow_hidden()
                             .text_ellipsis()
                             .text_color(c.fg3)
-                            .child(session.first_prompt.clone().unwrap_or_default()),
+                            .child(crate::hostile::label(
+                                session.first_prompt.as_deref().unwrap_or_default(),
+                            )),
                     ),
             )
             .when(columns.folder, |this| {
@@ -478,7 +481,11 @@ impl SessionsView {
                         .text_ellipsis()
                         .text_color(c.fg2)
                         .text_spec(&theme.text.path_small)
-                        .child(session.branch.clone().unwrap_or_default()),
+                        .child(
+                            (session.branch.as_deref())
+                                .map(crate::hostile::label)
+                                .unwrap_or_default(),
+                        ),
                 )
             })
             .child(
@@ -516,7 +523,6 @@ impl SessionsView {
                     .text_spec(&theme.text.number)
                     .child(format::count(u64::from(session.all.calls))),
             );
-        let title = (session.title.clone()).unwrap_or_else(|| UNTITLED.to_string());
         self.draggable(row, (session.id.clone(), index), (title, None), cx)
             .automation_target_with(move || format!("list/row/{place}").into())
     }

@@ -935,7 +935,7 @@ impl Render for PathsEditor {
                         .text_ellipsis()
                         .text_spec(&theme.text.path)
                         .when(kept.removed, |this| this.line_through().text_color(c.fg3))
-                        .child(kept.path.typed.clone()),
+                        .child(crate::hostile::label(&kept.path.typed)),
                 )
                 .children(note.map(|note| {
                     div()

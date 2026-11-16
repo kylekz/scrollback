@@ -14,6 +14,24 @@ use crate::transcript::{Brief, Todo, TodoState, ToolInput, ToolKind};
 /// The tool that runs a workflow, whose subagents are filed by the run's id.
 pub(super) const WORKFLOW: &str = "Workflow";
 
+/// The label an activity row gives the tool `name` (DESIGN §4.2.3).
+pub(super) fn label(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "Bash" => "bash",
+        "Read" => "read",
+        "Edit" => "edit",
+        "Write" => "write",
+        "Grep" => "grep",
+        "Glob" => "glob",
+        "TodoWrite" => "todos",
+        "Agent" | "Task" => "agent",
+        "WebSearch" => "search",
+        "WebFetch" => "fetch",
+        _ if name.starts_with("mcp__") => "mcp",
+        _ => return None,
+    })
+}
+
 /// Which common kind the tool `name` is. `Task` is what earlier releases called `Agent`.
 pub(super) fn kind(name: &str) -> ToolKind {
     match name {
@@ -62,11 +80,14 @@ struct Write<'a> {
     content: &'a RawValue,
 }
 
-/// `Grep`'s input and `Glob`'s.
+/// `Grep`'s input and `Glob`'s; only `Grep` has a file `type`, a `glob` and an `output_mode`.
 #[derive(Deserialize)]
 struct Search {
     pattern: Text,
     path: Option<Text>,
+    r#type: Option<Text>,
+    glob: Option<Text>,
+    output_mode: Option<Text>,
 }
 
 #[derive(Deserialize)]
@@ -126,6 +147,11 @@ pub(super) fn input(name: &str, raw: &RawValue, line: &Line) -> ToolInput {
         ToolKind::ContentSearch => typed(raw).map(|input: Search| ToolInput::ContentSearch {
             pattern: input.pattern.0,
             path: text(input.path),
+            files: match (text(input.r#type), text(input.glob)) {
+                (Some(kind), Some(glob)) => Some(format!("{kind}, {glob}")),
+                (kind, glob) => kind.or(glob),
+            },
+            mode: text(input.output_mode),
         }),
         ToolKind::FileSearch => typed(raw).map(|input: Search| ToolInput::FileSearch {
             pattern: input.pattern.0,
@@ -173,6 +199,28 @@ pub(super) fn input(name: &str, raw: &RawValue, line: &Line) -> ToolInput {
 }
 
 /**
+ * How a `Read`'s text numbers its lines, from its first line (`text`, the result's first text
+ * as recorded): leading spaces, the number, then a tab, or an arrow in earlier releases.
+ */
+pub(super) fn numbered(kind: ToolKind, text: Option<&RawValue>) -> Option<char> {
+    if kind != ToolKind::Read {
+        return None;
+    }
+    let written = text?.get().strip_prefix('"')?.trim_start_matches(' ');
+    let after = written.trim_start_matches(|c: char| c.is_ascii_digit());
+    if after.len() == written.len() {
+        return None;
+    }
+    if after.starts_with("\\t") {
+        Some('\t')
+    } else if after.starts_with('→') || after.starts_with("\\u2192") {
+        Some('→')
+    } else {
+        None
+    }
+}
+
+/**
  * The short form of the result of a call of a tool of the kind `kind`, where the record has
  * one. `text` is the result's first text, `failed` whether the result is marked an error, and
  * `detail` its `toolUseResult`.
@@ -181,9 +229,11 @@ pub(super) fn input(name: &str, raw: &RawValue, line: &Line) -> ToolInput {
  *   A command that worked and printed those words has none.
  * - A search for matching lines found as many as it says, or as many lines; the files it
  *   found them in are not its matches.
- * - The rest is read from `toolUseResult`: the lines a `Read` returned, the `+` and `-` lines
- *   of an `Edit`'s patch, whether a `Write` made the file and the lines of what it wrote, the
- *   matches of a `Grep` or the files of a `Glob`, and what a finished subagent's run came to.
+ * - The rest is read from `toolUseResult`: the lines a `Read` returned and the file's, the `+`
+ *   and `-` lines of an `Edit`'s patch and where what it replaced starts (its first hunk's
+ *   start, past the hunk's leading context), whether a `Write` made the file and the lines of
+ *   what it wrote, the matches of a `Grep` or the files of a `Glob`, and what a finished
+ *   subagent's run came to.
  */
 pub(super) fn brief(
     kind: ToolKind,
@@ -203,18 +253,34 @@ pub(super) fn brief(
                     .len();
             status[..digits].parse().ok().map(Brief::Exit)
         }
-        ToolKind::Read => typed(detail?).map(|read: ReadResult| Brief::Lines(read.file.num_lines)),
+        ToolKind::Read => typed(detail?).map(|read: ReadResult| Brief::Lines {
+            lines: read.file.num_lines,
+            total: read.file.total_lines,
+        }),
         ToolKind::Edit => typed(detail?).map(|edit: EditResult| {
-            let starting = |mark| {
+            let mark = |line: &RawValue| line.get().as_bytes().get(1).copied();
+            let starting = |wanted| {
                 edit.structured_patch
                     .iter()
                     .flat_map(|hunk| &hunk.lines)
-                    .filter(|line| line.get().as_bytes().get(1) == Some(&mark))
+                    .filter(|line| mark(line) == Some(wanted))
                     .count() as u64
             };
+            let start = edit.structured_patch.first().and_then(|hunk| {
+                let context = hunk
+                    .lines
+                    .iter()
+                    .take_while(|line| mark(line) == Some(b' '))
+                    .count() as u64;
+                Some((
+                    hunk.old_start?.saturating_add(context),
+                    hunk.new_start?.saturating_add(context),
+                ))
+            });
             Brief::Changed {
                 added: starting(b'+'),
                 removed: starting(b'-'),
+                start,
             }
         }),
         ToolKind::Write => typed(detail?).map(|written: WriteResult| Brief::Written {

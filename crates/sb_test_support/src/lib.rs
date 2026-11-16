@@ -10,11 +10,16 @@
 //! - [`HomeTransport`]: a fixture as a location, read with `std::fs` or through the shell
 //!   transport by a local shell ([`loopback`]), so each test runs over both too.
 //! - [`Items`]: a session's items as a parser reads them, fetched from an [`Agent`].
+//! - [`markdown`]: generated Markdown, a corpus of every construct a reply can hold.
+//! - [`reader`]: sessions for the reader, every construct it draws in one, and one large
+//!   enough to measure its budgets against.
 //!
 //! gpui: **never** (`script/check` step 3).
 
 mod claude_code;
 mod db_agent;
+pub mod markdown;
+pub mod reader;
 
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -28,7 +33,10 @@ use sb_core::transport::{
 use toolbox_store::rusqlite::Connection;
 use toolbox_store::rusqlite::types::ValueRef;
 
-pub use claude_code::{Call, FileAgent, Outline, ProjectsTree, Records, Session, image_block};
+pub use claude_code::{
+    Call, FileAgent, NestedSubagents, Outline, ProjectsTree, Records, Session, WithSubagents,
+    image_block, nested_subagents, with_subagents,
+};
 pub use db_agent::{DbAgent, DbProvider};
 
 /// The environment variable that names a shell (`sh`, `dash`) to read every fixture location

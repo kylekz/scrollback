@@ -9,7 +9,7 @@ use sb_ui::appearance::Mode;
 /// Back up, archive and read coding-agent transcripts.
 // A repeated option takes its last value: a scenario's own `app_args` follow the runner's.
 #[derive(Parser, Debug, Clone, PartialEq)]
-#[command(name = "scrollback", version, args_override_self = true)]
+#[command(name = "scrollback", version = sb_ui::version::text(), args_override_self = true)]
 #[cfg_attr(
     feature = "automation",
     command(group(clap::ArgGroup::new("automation_mode").args(["automation", "automation_pipe"]).multiple(true)))

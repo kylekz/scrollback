@@ -18,10 +18,16 @@ mod header;
 mod interaction_tests;
 pub(crate) mod menus;
 pub mod paths_editor;
+pub mod reader;
 pub mod sessions;
+pub mod settings;
 mod states;
 #[cfg(test)]
 mod tests;
+pub mod trash;
+#[cfg(test)]
+mod trash_tests;
+pub mod unavailable;
 pub mod unsorted;
 
 use gpui::{
@@ -41,7 +47,11 @@ use crate::keymap;
 use crate::services::{ActiveServices as _, ArchiveState, LibraryService, LocationStatus};
 use crate::theme::{ActiveTheme as _, SbTheme};
 use first_run::FirstRun;
+use reader::ReaderView;
 use sessions::SessionsView;
+use settings::SettingsPage;
+use trash::TrashView;
+use unavailable::UnavailablePage;
 use unsorted::UnsortedView;
 
 /// What the main area shows.
@@ -53,11 +63,14 @@ pub enum Showing {
     /// The archive is open and its locations couldn't be read.
     LocationsFailed,
     FirstRun,
+    /// Settings, over whichever of the pages below it was opened from (DESIGN §4.13).
+    Settings,
     /// An opened session.
     Session,
     Unsorted,
     /// All sessions, Starred or a folder.
     Sessions,
+    Trash,
 }
 
 impl Showing {
@@ -75,40 +88,56 @@ impl Showing {
         match sync.locations() {
             None if sync.failure().is_some() => Self::LocationsFailed,
             None => Self::Starting,
+            Some(_) if services.settings.read(cx).is_shown() => Self::Settings,
             Some(_) if sync.is_first_run() => Self::FirstRun,
             Some(_) if library.open_session().is_some() => Self::Session,
             Some(_) if library.shelf() == Shelf::Unsorted => Self::Unsorted,
+            Some(_) if library.shelf() == Shelf::Trash => Self::Trash,
             Some(_) => Self::Sessions,
         }
     }
 
-    /// `"starting"`, `"archive-failed"`, `"locations-failed"`, `"first-run"`, `"session"`,
-    /// `"unsorted"` or `"sessions"`, as automation's `state` spells it.
+    /// `"starting"`, `"archive-failed"`, `"locations-failed"`, `"first-run"`, `"settings"`,
+    /// `"session"`, `"unsorted"`, `"sessions"` or `"trash"`, as automation's `state` spells it.
     pub fn key(self) -> &'static str {
         match self {
             Self::Starting => "starting",
             Self::ArchiveFailed => "archive-failed",
             Self::LocationsFailed => "locations-failed",
             Self::FirstRun => "first-run",
+            Self::Settings => "settings",
             Self::Session => "session",
             Self::Unsorted => "unsorted",
             Self::Sessions => "sessions",
+            Self::Trash => "trash",
         }
     }
 
     /// The key context of the main area while this shows.
-    fn key_context(self) -> &'static str {
+    pub fn key_context(self) -> &'static str {
         match self {
             Self::Sessions => keymap::SESSIONS,
             Self::Unsorted => keymap::UNSORTED,
+            Self::Trash => keymap::TRASH_PAGE,
             Self::FirstRun => keymap::FIRST_RUN,
-            Self::Starting | Self::ArchiveFailed | Self::LocationsFailed | Self::Session => "Main",
+            Self::Settings => keymap::SETTINGS,
+            Self::Session => keymap::READER,
+            Self::Starting | Self::ArchiveFailed | Self::LocationsFailed => "Main",
         }
     }
 
-    /// Whether a page of the library shows.
+    /// Whether Settings can be opened over what shows: a page of the library, or a first run
+    /// in a folder the owner chose (`SettingsService::is_chosen`).
+    pub fn has_settings(self, cx: &App) -> bool {
+        self.is_library() || self == Self::FirstRun && cx.services().settings.read(cx).is_chosen()
+    }
+
+    /// Whether a page of the library shows, or Settings over one.
     pub fn is_library(self) -> bool {
-        matches!(self, Self::Sessions | Self::Unsorted | Self::Session)
+        matches!(
+            self,
+            Self::Sessions | Self::Unsorted | Self::Trash | Self::Session | Self::Settings
+        )
     }
 }
 
@@ -127,7 +156,12 @@ pub struct MainArea {
     focus_handle: FocusHandle,
     sessions: Entity<SessionsView>,
     unsorted: Entity<UnsortedView>,
+    trash: Entity<TrashView>,
+    reader: Entity<ReaderView>,
     first_run: Entity<FirstRun>,
+    settings: Entity<SettingsPage>,
+    /// What shows while no archive is open (DESIGN §4.14).
+    unavailable: Entity<UnavailablePage>,
     _observers: [Subscription; 3],
 }
 
@@ -138,7 +172,7 @@ impl Focusable for MainArea {
 }
 
 impl MainArea {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let services = cx.services();
         let (archive, sync, library) = (
             services.archive.clone(),
@@ -149,14 +183,62 @@ impl MainArea {
         Self {
             sessions: cx.new(|cx| SessionsView::new(focus_handle.clone(), cx)),
             unsorted: cx.new(|cx| UnsortedView::new(focus_handle.clone(), cx)),
+            trash: cx.new(|cx| TrashView::new(focus_handle.clone(), cx)),
+            reader: cx.new(|cx| ReaderView::new(focus_handle.clone(), cx)),
             focus_handle,
             first_run: cx.new(FirstRun::new),
+            settings: cx.new(|cx| SettingsPage::new(window, cx)),
+            unavailable: cx.new(UnavailablePage::new),
             _observers: [
                 cx.observe(&archive, |_, _, cx| cx.notify()),
                 cx.observe(&sync, |_, _, cx| cx.notify()),
                 cx.observe(&library, |_, _, cx| cx.notify()),
             ],
         }
+    }
+
+    /// Shows Settings, from its top and with what it shows read again (DESIGN §4.13).
+    pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = cx.services().settings.clone();
+        settings.update(cx, |settings, cx| settings.show(true, cx));
+        self.settings
+            .update(cx, |page, cx| page.showing(window, cx));
+    }
+
+    /// `Esc` or Back in Settings: closes what is open on it first, else goes back to the page
+    /// it was opened from.
+    pub fn leave_settings(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.update(cx, SettingsPage::dismiss) {
+            let settings = cx.services().settings.clone();
+            settings.update(cx, |settings, cx| settings.show(false, cx));
+        }
+    }
+
+    pub fn settings_page(&self) -> &Entity<SettingsPage> {
+        &self.settings
+    }
+
+    /// What shows while no archive is open.
+    pub fn unavailable_page(&self) -> &Entity<UnavailablePage> {
+        &self.unavailable
+    }
+
+    /// `Esc` in the reader: closes what it shows over the column, or Find. Whether it closed
+    /// anything.
+    pub fn dismiss_reader(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.reader
+            .update(cx, |reader, cx| reader.dismiss(window, cx))
+    }
+
+    /// The reader, for tests that look inside it.
+    #[cfg(test)]
+    pub fn reader_view(&self) -> Entity<ReaderView> {
+        self.reader.clone()
+    }
+
+    /// What the reader shows, for automation.
+    pub fn reader(&self, cx: &App) -> reader::ReaderSnapshot {
+        self.reader.read(cx).snapshot(cx)
     }
 
     /// The page of All sessions, Starred or a folder.
@@ -173,6 +255,7 @@ impl MainArea {
             Showing::Unsorted => self
                 .unsorted
                 .update(cx, |unsorted, cx| unsorted.step(lines, cx)),
+            Showing::Trash => self.trash.update(cx, |trash, cx| trash.step(lines, cx)),
             _ => {}
         }
     }
@@ -241,6 +324,7 @@ impl MainArea {
             Showing::Unsorted => self
                 .unsorted
                 .update(cx, |unsorted, cx| unsorted.open_selected(cx)),
+            Showing::Trash => self.trash.update(cx, |trash, cx| trash.open_selected(cx)),
             _ => {}
         }
     }
@@ -345,41 +429,18 @@ impl Render for MainArea {
         };
         let page = match showing {
             Showing::Starting => None,
-            Showing::ArchiveFailed => {
-                let archive = services.archive.read(cx);
-                match archive.state() {
-                    ArchiveState::Failed(failure) => Some(states::archive_failed(
-                        archive.dir().display().to_string(),
-                        failure,
-                        &theme,
-                        cx,
-                    )),
-                    _ => None,
-                }
-            }
+            Showing::ArchiveFailed => Some(self.unavailable.clone().into_any_element()),
             Showing::LocationsFailed => services
                 .sync
                 .read(cx)
                 .failure()
                 .map(|why| states::locations_failed(why, &theme, cx)),
             Showing::FirstRun => Some(self.first_run.clone().into_any_element()),
-            Showing::Session => {
-                let library = services.library.read(cx);
-                let from: SharedString = match library.shelf() {
-                    Shelf::All => "All sessions".into(),
-                    Shelf::Starred => "Starred".into(),
-                    Shelf::Unsorted => "Unsorted".into(),
-                    Shelf::Trash => "Trash".into(),
-                    Shelf::Folder(folder) => library
-                        .folder(folder)
-                        .map_or_else(SharedString::default, |it| it.name.clone().into()),
-                };
-                library
-                    .open_session()
-                    .map(|session| states::session(session, from, &theme, cx))
-            }
+            Showing::Settings => Some(self.settings.clone().into_any_element()),
+            Showing::Session => Some(self.reader.clone().into_any_element()),
             Showing::Unsorted => Some(self.unsorted.clone().into_any_element()),
             Showing::Sessions => Some(self.sessions.clone().into_any_element()),
+            Showing::Trash => Some(self.trash.clone().into_any_element()),
         };
         div()
             .id("main-area")
@@ -417,11 +478,16 @@ impl Render for MainArea {
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectAll, window, cx| {
-                if !this.typing(window, cx) {
+                if Showing::now(cx) == Showing::Trash {
+                    this.trash.update(cx, TrashView::select_all);
+                } else if !this.typing(window, cx) {
                     this.each_page(cx, SessionsView::select_all, |_, _| {});
                 }
             }))
             .on_action(cx.listener(Self::add))
+            .when(showing == Showing::Session, |this| {
+                reader::bind_keys(this, &self.reader)
+            })
             .relative()
             .size_full()
             .flex()
@@ -465,11 +531,16 @@ impl MainArea {
                 .bottom(TOAST_BOTTOM)
                 .left_0()
                 .right_0()
+                .px(theme.sizes.page_side)
                 .flex()
                 .justify_center()
                 .child(
                     div()
                         .id("toast")
+                        // As wide as the main area allows, its text giving way, never its
+                        // buttons.
+                        .max_w_full()
+                        .min_w_0()
                         .debug_selector(|| "toast".into())
                         // Its time stops running out while the pointer rests on it.
                         .on_hover(|hovered, _, cx| {
@@ -489,6 +560,10 @@ impl MainArea {
                         .shadow(theme.shadows.pop.clone())
                         .child(
                             div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
                                 .child(toast.text.clone())
                                 .automation_target("toast/text"),
                         )
@@ -496,6 +571,7 @@ impl MainArea {
                             this.child(
                                 div()
                                     .id("toast-undo")
+                                    .flex_none()
                                     .role(Role::Button)
                                     .text_color(c.accent_text)
                                     .font_weight(theme.text.control.weight)

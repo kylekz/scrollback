@@ -13,8 +13,18 @@
 //! banner, and the next sync tries again.
 //!
 //! **Triggers** (PLAN §5): the start (once the archive is open and its locations are read),
-//! the owner ([`SyncService::sync`], [`SyncService::sync_all`]), and [`SYNC_INTERVAL`] while
-//! the app is open.
+//! whatever Settings says; the owner ([`SyncService::sync`], [`SyncService::sync_all`]); and
+//! while the app is open, every so often as Settings › Sync every says ([`SyncEvery`], every
+//! [`SYNC_INTERVAL`] until the owner says otherwise). A new interval counts from when it is
+//! chosen; "Only when I ask" leaves the start and the owner. When the next round is due is a
+//! time of the wall clock, looked at every [`ROUND_TICK`], so a round the machine slept
+//! through runs as soon as it wakes.
+//!
+//! **Stale** ([`SyncService::stale`]): after how many days without a good sync a location is
+//! stale is the archive's, kept in its catalogue's `kv`, and read with the locations.
+//!
+//! **Fetch again** ([`refetch`]): an item verify found damaged is fetched again from its
+//! location here, as a pass would, and the library hears of it.
 //!
 //! **The index.** A pass indexes what it changed itself. The start also brings the session
 //! index up to date over every location (`sb_core::sync::index`): what an earlier index left,
@@ -37,6 +47,7 @@
 //! and index is told to stop.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
 #[cfg(any(test, feature = "automation"))]
 use std::sync::{Condvar, MutexGuard};
@@ -49,20 +60,29 @@ use sb_core::location::{Location, LocationId, LocationKind};
 use sb_core::sync::{Found, IndexReport, Progress, SyncError, index, survey, sync_location};
 use sb_core::transport::Transport;
 
+use super::settings::{SettingsEvent, SettingsService, SyncEvery};
 use super::{ArchiveService, Connect, Launch, ListDistros, Providers, Tester};
 use crate::format;
 
 mod locations;
+mod refetch;
 
 pub use locations::{
-    ConnectionTest, Details, Distros, Expiring, STALE_AFTER_DAYS, Stale, TestFailure, TestState,
-    name_problem, refusal, stale,
+    ConnectionTest, Details, Distros, Expiring, STALE_AFTER_DAYS, STALE_AFTER_RANGE, Stale,
+    TestFailure, TestState, name_problem, refusal, stale,
 };
+pub use refetch::Refetch;
 pub use sb_core::location::host_problem;
 
-/// How often every location is synced while the app is open (DESIGN §4.13 offers 5, 15, 30 and
-/// 60 minutes; Settings arrive in a later phase).
+/// How often every location is synced while the app is open until the owner chooses
+/// otherwise in Settings ([`SyncEvery`]'s default).
 pub const SYNC_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// How often the rounds look whether one is due (the module docs).
+pub const ROUND_TICK: Duration = Duration::from_secs(60);
+
+/// How long a pass that found its location held by something else waits to run again.
+const BUSY_RETRY: Duration = Duration::from_secs(2);
 
 /// How often a running pass's progress is read.
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
@@ -94,6 +114,8 @@ pub struct PassProgress {
     /// The sessions to index and those indexed, once the fetching is over.
     pub sessions: usize,
     pub sessions_done: usize,
+    /// The sessions whose text the index has made searchable, as it goes.
+    pub searchable_done: usize,
     /// What the agents before the one being synced added to the counts above.
     items_before: usize,
     bytes_before: u64,
@@ -120,6 +142,7 @@ impl PassProgress {
             Progress::Indexed { sessions, .. } => {
                 self.sessions_done = self.sessions_before + sessions;
             }
+            Progress::Searchable { sessions } => self.searchable_done = sessions,
         }
     }
 
@@ -179,6 +202,7 @@ pub enum LocationStatus {
 pub type Survey = Vec<Result<Found, String>>;
 
 /// How each kind of location is reached and tested, and how WSL's distros are listed.
+#[derive(Clone)]
 pub struct Reach {
     pub connect: Connect,
     pub tester: Tester,
@@ -344,15 +368,37 @@ pub struct SyncService {
     distros: Option<Distros>,
     /// WSL's distros are being listed.
     listing: bool,
-    /// When every location is synced next ([`SYNC_INTERVAL`]), in Unix milliseconds.
+    /// How often every location is synced while the app is open.
+    every: SyncEvery,
+    /// When every location is synced next, in Unix milliseconds.
     next_round: Option<i64>,
+    /// The start has run on this archive.
+    started: bool,
+    /// The app has moved onto another archive: nothing more starts on this one.
+    closed: bool,
+    /// The app is opening another archive to move onto: no pass starts meanwhile, so that
+    /// the archive it may leave isn't worked ([`super::pause`]).
+    paused: bool,
+    /// After how many days without a good sync a location is stale (the module docs).
+    stale_after: u32,
+    /// The items being fetched again, or last fetched again, and how that went.
+    refetches: HashMap<refetch::RefetchKey, Refetch>,
+    /// The locations fetching an item again, with what stops it.
+    refetching: HashMap<LocationId, CancelToken>,
+    /// Fetch all again, while it runs.
+    fetch_all: Option<refetch::FetchAll>,
+    /**
+     * Now, in Unix milliseconds, as the rounds count it: the wall clock, which goes on while
+     * the machine sleeps. In tests, gpui's clock, which they move.
+     */
+    clock: Rc<dyn Fn() -> i64>,
     /// Background jobs other than passes and indexes: reading and adding locations, looking
     /// at this machine.
     jobs: usize,
     stop_index: CancelToken,
     #[cfg(any(test, feature = "automation"))]
     hold: Hold,
-    _observers: [Subscription; 2],
+    _observers: [Subscription; 3],
     _interval: Option<Task<()>>,
 }
 
@@ -363,14 +409,20 @@ impl SyncService {
         archive: Entity<ArchiveService>,
         providers: Providers,
         reach: Reach,
+        settings: &Entity<SettingsService>,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
+            every: settings.read(cx).settings().sync_every,
             _observers: [
                 cx.observe(&archive, |this, _, cx| this.start(cx)),
                 cx.on_app_quit(|this, _| {
                     this.stop_everything();
                     async {}
+                }),
+                cx.subscribe(settings, |this, settings, _: &SettingsEvent, cx| {
+                    let every = settings.read(cx).settings().sync_every;
+                    this.set_every(every, cx);
                 }),
             ],
             archive,
@@ -397,6 +449,14 @@ impl SyncService {
             distros: None,
             listing: false,
             next_round: None,
+            started: false,
+            closed: false,
+            paused: false,
+            stale_after: STALE_AFTER_DAYS,
+            refetches: HashMap::new(),
+            refetching: HashMap::new(),
+            fetch_all: None,
+            clock: clock(cx),
             jobs: 0,
             stop_index: CancelToken::new(),
             #[cfg(any(test, feature = "automation"))]
@@ -478,6 +538,11 @@ impl SyncService {
         !self.passes.is_empty()
     }
 
+    /// Whether a pass or a fetch again runs at the location `id`.
+    pub fn is_busy(&self, id: &LocationId) -> bool {
+        self.passes.contains_key(id) || self.refetching.contains_key(id)
+    }
+
     /// Whether an index is running outside a pass.
     pub fn is_indexing(&self) -> bool {
         !self.indexes.is_empty()
@@ -490,24 +555,59 @@ impl SyncService {
 
     /// The start (the module docs), once the archive is open.
     fn start(&mut self, cx: &mut Context<Self>) {
-        if self.archive.read(cx).archive().is_none() || self._interval.is_some() {
+        if self.archive.read(cx).archive().is_none() || self.started {
             return;
         }
-        self.next_round = Some(format::now() + SYNC_INTERVAL.as_millis() as i64);
+        self.started = true;
+        self.schedule(cx);
+        self.read_locations(cx);
+        self.index(None, cx);
+    }
+
+    /// How often every location is synced while the app is open.
+    pub fn every(&self) -> SyncEvery {
+        self.every
+    }
+
+    /// Syncs every location `every` so often from now on, the first round that long from now.
+    fn set_every(&mut self, every: SyncEvery, cx: &mut Context<Self>) {
+        if self.every != every && !self.closed {
+            self.every = every;
+            if self.started {
+                self.schedule(cx);
+            }
+            cx.notify();
+        }
+    }
+
+    /// Starts the rounds of [`Self::every`] over, the first that long from now; with only
+    /// when asked, there are none.
+    fn schedule(&mut self, cx: &mut Context<Self>) {
+        let Some(interval) = self.every.interval() else {
+            self.next_round = None;
+            self._interval = None;
+            return;
+        };
+        let every = interval.as_millis() as i64;
+        self.next_round = Some((self.clock)() + every);
         self._interval = Some(cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(SYNC_INTERVAL).await;
-                let synced = this.update(cx, |this, cx| {
-                    this.next_round = Some(format::now() + SYNC_INTERVAL.as_millis() as i64);
-                    this.sync_all(cx);
+                cx.background_executor()
+                    .timer(ROUND_TICK.min(interval))
+                    .await;
+                let alive = this.update(cx, |this, cx| {
+                    let now = (this.clock)();
+                    if this.next_round.is_some_and(|due| now >= due) {
+                        this.next_round = Some(now + every);
+                        this.sync_all(cx);
+                        cx.notify();
+                    }
                 });
-                if synced.is_err() {
+                if alive.is_err() {
                     break;
                 }
             }
         }));
-        self.read_locations(cx);
-        self.index(None, cx);
     }
 
     /// Reads the locations, and syncs them all; with none, looks at this machine instead.
@@ -518,13 +618,23 @@ impl SyncService {
         self.run(
             cx,
             move || {
-                let locations = archive.catalogue().locations()?;
-                Ok::<_, sb_core::catalogue::CatalogueError>((locations, Details::read(&archive)?))
+                let catalogue = archive.catalogue();
+                let locations = catalogue.locations()?;
+                let stale_after = catalogue
+                    .setting(locations::STALE_AFTER_KEY)?
+                    .and_then(|days| days.parse().ok())
+                    .filter(|days| STALE_AFTER_RANGE.contains(days));
+                Ok::<_, sb_core::catalogue::CatalogueError>((
+                    locations,
+                    Details::read(&archive)?,
+                    stale_after,
+                ))
             },
             |this, read, cx| match read {
-                Ok((locations, details)) => {
+                Ok((locations, details, stale_after)) => {
                     let (removed, locations) =
                         locations.into_iter().partition(|it| it.removed.is_some());
+                    this.stale_after = stale_after.unwrap_or(STALE_AFTER_DAYS);
                     this.failure = None;
                     this.locations = Some(locations);
                     this.removed = removed;
@@ -596,10 +706,11 @@ impl SyncService {
         let Some(location) = self.locations.iter().flatten().find(|it| it.id == *id) else {
             return;
         };
-        if self.passes.contains_key(id) || self.removing.contains(id) {
+        if self.passes.contains_key(id) || self.removing.contains(id) || self.closed || self.paused
+        {
             return;
         }
-        if self.indexes.contains_key(&Some(id.clone())) {
+        if self.indexes.contains_key(&Some(id.clone())) || self.refetching.contains_key(id) {
             self.waiting.insert(id.clone());
             return;
         }
@@ -677,6 +788,13 @@ impl SyncService {
                                 changed |= this.indexed(pass.index);
                             }
                         }
+                        /* Something else held the location a moment (a delete for good, an
+                        undo): the pass didn't run, and the location is as it was. It waits,
+                        and runs once that is likely over. */
+                        Err(SyncError::Busy(_)) => {
+                            this.waiting.insert(id.clone());
+                            this.sync_after(id.clone(), BUSY_RETRY, cx);
+                        }
                         /* A stop before the plan was made left nothing that can be counted:
                         the location is as it was before the pass. */
                         Err(SyncError::Cancelled) => {
@@ -710,6 +828,7 @@ impl SyncService {
                     if changed || !whole {
                         cx.emit(SyncEvent::Archived);
                     }
+                    crate::system::give_back_memory(cx);
                     cx.notify();
                 })
                 .ok();
@@ -729,13 +848,27 @@ impl SyncService {
         cx.notify();
     }
 
+    /// Syncs `id` after `delay`, if it is still waiting then: a stop takes it out of waiting.
+    fn sync_after(&mut self, id: LocationId, delay: Duration, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |this, cx| {
+                if this.waiting.remove(&id) {
+                    this.sync(&id, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Brings the session index up to date outside a pass: of `location`, or of every
     /// location. One of each runs at a time.
     fn index(&mut self, location: Option<LocationId>, cx: &mut Context<Self>) {
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return;
         };
-        if self.indexes.contains_key(&location) {
+        if self.indexes.contains_key(&location) || self.closed {
             return;
         }
         let reported = Reported::default();
@@ -787,7 +920,8 @@ impl SyncService {
         cx.notify();
     }
 
-    /// Logs what an index could not do. Returns whether it indexed anything.
+    /// Logs what an index could not do. Returns whether it indexed anything, or made anything
+    /// searchable: either is news for the library and search.
     fn indexed(&self, indexed: Result<IndexReport, SyncError>) -> bool {
         match indexed {
             Ok(report) => {
@@ -798,7 +932,7 @@ impl SyncService {
                         session.provider
                     );
                 }
-                report.sessions > 0
+                report.sessions > 0 || report.searchable > 0
             }
             Err(SyncError::Cancelled) => false,
             Err(error) => {
@@ -808,8 +942,8 @@ impl SyncService {
         }
     }
 
-    /// Reads what `work` reports while it runs, and tells the library, at most once a second,
-    /// when it has indexed more sessions.
+    /// Reads what `work` reports while it runs, and tells the library and search, at most once
+    /// a second, when it has indexed more sessions or made more searchable.
     fn poll(&self, work: Work, reported: Reported, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             let mut told = format::now();
@@ -824,7 +958,8 @@ impl SyncService {
                     let Some(shown) = shown.filter(|shown| **shown != progress) else {
                         return;
                     };
-                    let indexed = shown.sessions_done != progress.sessions_done;
+                    let indexed = shown.sessions_done != progress.sessions_done
+                        || shown.searchable_done != progress.searchable_done;
                     *shown = progress;
                     if indexed && format::now() - told >= ARCHIVED_EVERY_MS {
                         told = format::now();
@@ -845,6 +980,10 @@ impl SyncService {
         for running in self.passes.values() {
             running.cancel.cancel();
         }
+        for cancel in self.refetching.values() {
+            cancel.cancel();
+        }
+        self.fetch_all = None;
         self.waiting.clear();
         #[cfg(any(test, feature = "automation"))]
         self.hold.release();
@@ -852,6 +991,7 @@ impl SyncService {
 
     /// Stops a location's pass at its next step. What it committed stays (PLAN §5).
     pub fn stop(&mut self, id: &LocationId) {
+        self.stop_refetch(id);
         if let Some(running) = self.passes.get(id) {
             running.cancel.cancel();
             #[cfg(any(test, feature = "automation"))]
@@ -865,6 +1005,21 @@ impl SyncService {
         self.stop_all();
         self.stop_index.cancel();
         self.cancel_test();
+    }
+
+    /// Starts no pass while `paused` (the field's docs).
+    pub(super) fn pause(&mut self, paused: bool) {
+        self.paused = paused;
+    }
+
+    /// Stops everything, and starts nothing more: the app is moving onto another archive
+    /// (`super::reopen`).
+    pub(super) fn close(&mut self, cx: &mut Context<Self>) {
+        self.stop_everything();
+        self.closed = true;
+        self._interval = None;
+        self.next_round = None;
+        cx.notify();
     }
 
     /// Makes the next pass act on a hold once it has stored `after` items (see [`Held`]).
@@ -907,6 +1062,20 @@ impl SyncService {
         })
         .detach();
     }
+}
+
+/// What the rounds take for now (`SyncService::clock`).
+#[cfg(not(test))]
+fn clock(_: &mut Context<SyncService>) -> Rc<dyn Fn() -> i64> {
+    Rc::new(format::now)
+}
+
+/// What the rounds take for now in tests: gpui's clock, from the wall clock's now.
+#[cfg(test)]
+fn clock(cx: &mut Context<SyncService>) -> Rc<dyn Fn() -> i64> {
+    let executor = cx.background_executor().clone();
+    let (start, base) = (executor.now(), format::now());
+    Rc::new(move || base + (executor.now() - start).as_millis() as i64)
 }
 
 impl Drop for SyncService {

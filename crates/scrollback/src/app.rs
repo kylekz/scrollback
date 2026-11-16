@@ -11,15 +11,16 @@ use sb_core::location::LocationKind;
 use sb_core::transport::wsl;
 use sb_ui::ActiveTheme as _;
 use sb_ui::appearance::MaterialSupport;
-use sb_ui::services::{Reach, ServicesConfig};
+use sb_ui::services::{Reach, ServicesConfig, Updater};
+use sb_ui::system::SystemShell;
 
 use crate::cli::Cli;
 
 /// Starts the app and blocks until it quits.
 ///
 /// Errors before the app starts are returned, for `main` to report. A failure during startup
-/// inside the app (the window can't open, the fonts don't load) is logged where it happens and
-/// ends the process there with status 1: `Application::run` can't hand an error back, and on
+/// inside the app (the window can't open, the fonts don't load) is reported where it happens
+/// (`crate::fatal`) and ends the process there with status 1: `Application::run` can't hand an error back, and on
 /// macOS a quit ends the process with status 0 without ever returning here.
 pub fn run(cli: Cli) -> Result<()> {
     #[cfg(feature = "automation")]
@@ -31,38 +32,77 @@ pub fn run(cli: Cli) -> Result<()> {
     if cli.dev_location_home.is_some() {
         crate::data_dir::for_development(&place)?;
     }
+    #[cfg(any(windows, target_os = "macos"))]
+    let install_root = crate::installer::root();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let install_root = None;
+    crate::data_dir::outside_install(&place.dir, install_root.as_deref())?;
+    /* A panic's report goes beside the app's other files; under automation the runner keeps
+    stderr, where the default hook writes it. */
+    if !automation {
+        crate::crash::install(&place.dir);
+    }
     log::info!(
         "data directory: {} ({})",
         place.dir.display(),
         place.source.as_str()
     );
+    let updater = crate::updates::updater(automation, place.source);
     gpui_platform::application()
         .with_assets(sb_ui::Assets)
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(move |cx| {
-            if let Err(error) = start(cli, place.dir, cx) {
-                log::error!("scrollback couldn't start: {error:#}");
+            if let Err(error) = start(cli, place.dir, updater, install_root, cx) {
+                crate::fatal::report(&error);
                 std::process::exit(1);
             }
         });
     Ok(())
 }
 
-/// The archive's folder in the data dir (PLAN §4.4, DESIGN §4.10).
-const ARCHIVE: &str = "archive";
-
-/// Opens the main window as `cli` asks. `data_dir` is where this run keeps its files: the
-/// archive is opened in it, and made there on the first run (PLAN D3).
+/**
+ * Opens the main window as `cli` asks. `data_dir` is where this run keeps its files: the
+ * app's settings, and the archive unless they name another folder, made there on the first
+ * run (PLAN D3). `updater` looks for scrollback's own updates, and `install_root` is the
+ * installer's folder, in an installed copy (`crate::updates`, `crate::installer`).
+ */
 #[cfg_attr(not(feature = "automation"), expect(unused_variables))]
-fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
+fn start(
+    cli: Cli,
+    data_dir: PathBuf,
+    updater: Updater,
+    install_root: Option<PathBuf>,
+    cx: &mut App,
+) -> Result<()> {
     sb_ui::init(cx)?;
+    #[cfg(target_os = "macos")]
+    cx.set_global(sb_ui::system::GiveBack(crate::give_back));
     // Before anything writes a date.
     #[cfg(feature = "automation")]
     if let Some(year) = cli.automation_calendar {
         sb_ui::format::pin_calendar(year);
     }
-    // Light or dark and the material, before the first frame.
-    sb_ui::appearance::init(MaterialSupport::probe(), cli.theme.unwrap_or_default(), cx);
+    // A scripted run never reaches Explorer or Finder, a picker, the browser or the clipboard.
+    #[cfg(feature = "automation")]
+    let scripted = cli.automation_enabled();
+    #[cfg(not(feature = "automation"))]
+    let scripted = false;
+    sb_ui::system::install(
+        if scripted {
+            SystemShell::scripted()
+        } else {
+            SystemShell::Real
+        },
+        cx,
+    );
+    let settings = sb_ui::services::settings::load(&data_dir);
+    // Light or dark and the material, before the first frame; `--theme` is for this run.
+    sb_ui::appearance::init(
+        MaterialSupport::probe(),
+        cli.theme.unwrap_or(settings.settings.mode),
+        settings.settings.material,
+        cx,
+    );
     let reach = Reach {
         connect: Arc::new(LocationKind::transport),
         tester: Arc::new(sb_ui::services::probe),
@@ -80,9 +120,12 @@ fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
     };
     sb_ui::services::init(
         ServicesConfig {
-            archive_dir: data_dir.join(ARCHIVE),
+            settings,
+            mode_override: cli.theme,
             providers: sb_core::provider::builtin(),
             reach,
+            updater,
+            install_root,
         },
         cx,
     );

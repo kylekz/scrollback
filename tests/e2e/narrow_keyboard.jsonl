@@ -45,12 +45,14 @@
 {"cmd": "click", "target": "titlebar/sidebar"}
 {"cmd": "click", "target": "sidebar/all-sessions"}
 {"cmd": "settle", "expect": [{"pointer": "/library/shelf", "equals": "all"}, {"pointer": "/shell/sidebar", "equals": "collapsed"}]}
-// The filter field is a stop of its own, after the page's.
+// The sidebar's button, the search field, Sync all and Settings, then the page; the filter field is a stop of its own, after the page's.
 {"cmd": "key", "keystroke": "tab"}
 {"cmd": "key", "keystroke": "tab"}
 {"cmd": "key", "keystroke": "tab"}
 {"cmd": "key", "keystroke": "tab"}
-{"cmd": "screenshot", "name": "after-four-tabs-dark"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "screenshot", "name": "after-six-tabs-dark"}
 {"cmd": "key", "keystroke": "right", "expect": {"pointer": "/library/selected", "equals": "Fix the flaky upload test"}}
 {"cmd": "key", "keystroke": "right", "expect": {"pointer": "/library/selected", "equals": "Add retries to the fetcher"}}
 {"cmd": "key", "keystroke": "enter", "expect": [{"pointer": "/page", "equals": "session"}, {"pointer": "/library/open", "equals": "Add retries to the fetcher"}]}

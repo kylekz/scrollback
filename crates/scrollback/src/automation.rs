@@ -20,9 +20,25 @@
 //!   (what was applied to the window) and `window_native` (macOS: what AppKit reports, `forced`
 //!   light or dark or `null`, `opaque` and `vibrancy_view`; `null` elsewhere).
 //! - `page`: what the main area shows: `starting`, `archive-failed`, `locations-failed`,
-//!   `first-run`, `sessions` (All sessions, Starred or a folder), `unsorted` or `session` (an
-//!   opened session).
-//! - `archive`: `dir`, and `state` (`opening`, `open` or `failed`, then with `error`).
+//!   `first-run`, `settings`, `sessions` (All sessions, Starred or a folder), `unsorted`, `trash`
+//!   or `session` (an opened session).
+//! - `settings` (DESIGN §4.13): `section` (the one picked in Settings' list: `archive`, `sync`,
+//!   `appearance` or `shortcuts`), `archive` (its folder), `default` (whether that is the data
+//!   dir's), `switch` (`null`, `{"opening": folder}` or `{"refused": why}`), `sync_every`
+//!   (`5m`, `15m`, `30m`, `60m` or `asked`), `next_round` (whether a round is due),
+//!   `stale_after` (days), `stats` (`sessions`, `items`, `versions`, or `null` before they are
+//!   measured), `verify` (`running` with its `progress`, the `last` one's `segments` and
+//!   `problems`, each with its `file` and `fix`: `fetch_again`, `fetched`, `damaged` or
+//!   `deleted`, and `refetch`: `null`, `running`, `done`, `skipped: …` or the failure's words;
+//!   and `fetch_all`, Fetch all again's `done` and `total` while it runs, or `null`), `deleted`
+//!   (each session deleted for good's `location`, whether it is `allowed` again, and its
+//!   `standing`: `deleted`, `allowed` or `archived_again`), and `saved` (why the settings
+//!   aren't being saved, or `null`).
+//! - `system`: what the app asked of the operating system (`sb_ui::system`), never done in a
+//!   scripted run, oldest first: each request's `kind` (`reveal` with its `path`,
+//!   `pick_folder`, `open_url` with its `url`, `copy` with the `text` copied).
+//! - `archive`: `dir`, and `state` (`opening`, `open` or `failed`, then with `error` and
+//!   `failure`: `missing`, `empty`, `locked`, `settings` or `other`).
 //! - `sync`: `syncing`, `indexing` (an index runs outside a pass), `held` (a pass waits at
 //!   `hold_sync`'s hold), and `locations`, each with its `name`, `kind` (`local`, `wsl` or
 //!   `ssh`) and `state` (`syncing` with `progress`: the `items` to fetch and `items_done`, the
@@ -37,7 +53,7 @@
 //! - `sheet`: the locations sheet while it is open (`null` otherwise): the name of its
 //!   `selected` location, and its `dialog` (`add`, `remove` or `null`).
 //! - `library`: `shelf` (`all`, `starred`, `unsorted`, `trash`, or `{"folder": name}`), `counts`
-//!   (`all`, `starred`, `unsorted`), `folders` (each with its `name`, its `parent`'s name and its
+//!   (`all`, `starred`, `unsorted`, `trash`), `folders` (each with its `name`, its `parent`'s name and its
 //!   `sessions`, in the catalogue's order), `sessions` and `groups` (how many the shown page
 //!   lists, `null` while it loads or is of the other kind), the titles of the `selected` and
 //!   the `open` session, and `error` (why the library couldn't be read, or `null`).
@@ -49,8 +65,20 @@
 //!   button, which shows the sidebar after 500 ms); and the `verdict` there: `takes`, with the
 //!   ghost's `result` and `note`, or the `note` saying why not); the `toast` (`text` and
 //!   whether it can `undo`); whether leaving, closing the window or quitting `asked` to save
-//!   the paths editor's changes, and the folder `held` by them; and the folder whose deletion
-//!   is being asked about (`deleting`).
+//!   the paths editor's changes, and the folder `held` by them; the folder whose deletion
+//!   is being asked about (`deleting`); the session being asked about deleting for good
+//!   (`for_good`: `null`, or its `title`, and once read what it removes, `files`, `versions`,
+//!   `bytes` and whether its location still has it, `at_location`, with why the last
+//!   confirmation was `refused`); and where the open session was opened at (`read_at`: `null`,
+//!   or its `request` number, the match's `kind`, its `turn` from 0, the `subagent` item it is
+//!   in, the `find` text and the hit to `flash`), until the reader takes it.
+//! - `palette`: the search palette while it is open (`null` otherwise): its query's `text`, the
+//!   labels of its `chips`, its `completions`, how many `rows` the keys move over and the one
+//!   `highlighted`, the `commands` it lists, the finished token that names nothing and so
+//!   holds the results (`unresolved`), whether it is `searching`, how many sessions are
+//!   `unsearchable` yet, and the `answer` to the last search: `null` with no terms, `"keep-typing"`,
+//!   `{"unavailable": why}`, or the `sessions` found (their titles, the best first),
+//!   `total_sessions`, `total_matches`, the query's `terms` and how long it `took_ms`.
 //!
 //!   A drag is driven with `drag` (`release: false` to hold it), `mouse_up`, and keys between:
 //!   no key but `Esc` acts while one is held. Where it is over is read from what the last frame
@@ -69,13 +97,48 @@
 //!   `spare`; and `without_calls`, past `inner` the tags give way past their caps), `tags`
 //!   (each location's and subfolder's tag: `name`, `whole` and `capped` widths), the widest
 //!   `day` and the largest `calls` (each `text` and `width`), in logical pixels.
+//! - `reader`: `state` (`closed`, `opening`, `failed` with `error`, or `open`), `full_calls`,
+//!   `place` (`[n, of]`: the open session among its page's), `rows` (the column's), `top` and
+//!   `top_name` (the row at its top, and what it is: `kind conversation/block`) and
+//!   `top_offset` (how far into that row it is scrolled), `at_end` (whether the last row is
+//!   drawn in full), `following` (whether the column keeps to its end, after End), `focused`
+//!   (`row`, `kind` and the start of the `text` of the keyboard's row, or `null`),
+//!   `open_calls`, `markdown_states` and `held` (how many parsed bodies, and how many prepared
+//!   things of the service's, are kept), `alone` (a subagent read on its own), `loads`
+//!   (`bodies`, `subagents`, `prose`, `images`, `raws`, `wholes`: how many are `loading` and
+//!   `loaded`), `fault` (a read that failed for a reason other than the stored bytes), the
+//!   last request to open the session at a search match it took (`read_at`, as the library's),
+//!   and what `flash`es: its `block` (`conversation/block`), its `text` and whether it was
+//!   `drawn`; `find` (Find in session's `query`, its `count` as the field shows it, and its
+//!   `current` match: `conversation/block` and which text, `prose`, `target`, `input`,
+//!   `output/<n>`, `diff` or `fetched`; `null` while Find is closed), whether the `facts` show,
+//!   whose `history` is open (a file's key), the version read for a look (`viewing`, its
+//!   number) and whether an image shows full size (`full_image`).
+//! - `update`: scrollback's own updates. `off`, with the reason, under automation
+//!   (`development`, or `automation` for a packaged build): a scripted run never looks for one
+//!   (`crate::updates`) until `update_ready` stands one in; then `null`. With the stand-in:
+//!   the version `ready`, whether it is `checking`, the last check (`checked`: `up_to_date`,
+//!   `ready` with its `version` or `failed` with its `error`), how many others Restart to
+//!   update asks about (`confirm`), whether it is `restarting`, whether the stand-in took the
+//!   update (`restarted`) and why a restart failed (`failure`).
 //!
 //! Commands. An argument a command doesn't have is an error, so a misspelt one never passes
 //! for a change. These reply with `state.appearance` after the change:
 //! - `pin_appearance {appearance}` pins `light` or `dark` whatever the mode and the OS say, so
 //!   a scenario looks the same on every machine; `null` lifts the pin.
 //! - `set_appearance {mode?, material?}` changes what scrollback asks for, as Settings ›
-//!   Appearance will (DESIGN §4.13).
+//!   Appearance does (DESIGN §4.13), and keeps it in the app's settings; `--theme` still wins
+//!   for the run.
+//!
+//! And this with `state.system`:
+//! - `answer_picker {folder}` answers the next folder picker with `folder`, or cancels it
+//!   with `null`.
+//!
+//! And this with `state.update`:
+//! - `update_ready {version, fail?, others?}` stands a scripted feed in for Velopack (never
+//!   the network) and checks it at once: `version` is downloaded and ready; Restart to update
+//!   then records the restart in `restarted`, or fails with `fail`, and asks first about
+//!   `others` processes running from the install (none unless given).
 //!
 //! And these with `state.sync`, for a scenario that needs a pass in a known state whatever
 //! the machine's speed:
@@ -102,6 +165,7 @@ use gpui_appearance::{Appearance, Material, Mode};
 use gpui_automation::AutomationHost;
 use sb_core::catalogue::{SessionId, Shelf};
 use sb_core::location::LocationKind;
+use sb_core::transcript::At;
 use sb_core::transport::wsl::Distro;
 use sb_core::transport::{
     Env, FileStat, Hashed, Launcher, Listing, LocalTransport, PrefixRequest, Probe, RangeFailure,
@@ -109,11 +173,15 @@ use sb_core::transport::{
 };
 use sb_ui::Shell;
 use sb_ui::pages::sessions::LineMeasure;
-use sb_ui::services::sync::{TestFailure, TestState, stale};
+use sb_ui::search::Palette;
+use sb_ui::services::settings::Switch;
+use sb_ui::services::sync::{Refetch, TestFailure, TestState};
+use sb_ui::services::upkeep::{Fix, Standing};
 use sb_ui::services::{
-    ActiveServices as _, ArchiveState, Dragged, DropTarget, Held, LocationStatus, Page, Reach,
-    Verdict,
+    ActiveServices as _, Answer as Searched, ArchiveState, CheckResult, Dragged, DropTarget,
+    Failure, Held, LocationStatus, Page, Reach, ReadAt, ReaderState, Verdict,
 };
+use sb_ui::system::{self, SystemRequest};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -145,12 +213,24 @@ impl AutomationHost for ScrollbackAutomation {
             "archive": archive(cx),
             "sync": sync(cx),
             "library": library(cx),
+            "settings": settings(shell, cx),
+            "system": system::requests(cx).iter().map(|request| match request {
+                SystemRequest::Reveal(path) => json!({
+                    "kind": request.kind(),
+                    "path": path.display().to_string(),
+                }),
+                SystemRequest::PickFolder { .. } => json!({ "kind": request.kind() }),
+                SystemRequest::OpenUrl(url) => json!({ "kind": request.kind(), "url": url }),
+                SystemRequest::Copy(text) => json!({ "kind": request.kind(), "text": text }),
+            }).collect::<Vec<_>>(),
             "cards": cards(shell.main().read(cx).sessions().read(cx).line_measure()),
             "page_view": page_view(shell, cx),
+            "palette": shell.palette().map(|palette| self::palette(palette.read(cx), cx)),
             "menu": sb_ui::menu::items(cx).map(|(items, submenu)| json!({
                 "items": items,
                 "submenu": submenu,
             })),
+            "reader": reader(shell, cx),
             "sheet": shell.locations_sheet().map(|sheet| {
                 let sheet = sheet.read(cx);
                 let sync = cx.services().sync.read(cx);
@@ -159,6 +239,7 @@ impl AutomationHost for ScrollbackAutomation {
                     "dialog": sheet.dialog(),
                 })
             }),
+            "update": update(cx),
         })
     }
 
@@ -174,6 +255,8 @@ impl AutomationHost for ScrollbackAutomation {
             "hold_sync",
             "release_sync",
             "stand_in",
+            "answer_picker",
+            "update_ready",
         ]
     }
 
@@ -192,13 +275,48 @@ impl AutomationHost for ScrollbackAutomation {
             }),
             "set_appearance" => {
                 serde_json::from_value(args).map(|SetAppearance { mode, material }| {
-                    let mut preferences = gpui_appearance::state(cx).preferences();
-                    preferences.mode = mode.unwrap_or(preferences.mode);
-                    preferences.material = material.unwrap_or(preferences.material);
-                    gpui_appearance::set_preferences(preferences, cx);
+                    let settings = cx.services().settings.clone();
+                    settings.update(cx, |settings, cx| {
+                        if let Some(mode) = mode {
+                            settings.set_mode(mode, cx);
+                        }
+                        if let Some(material) = material {
+                            settings.set_material(material, cx);
+                        }
+                    });
                     self::appearance(cx)
                 })
             }
+            "answer_picker" => serde_json::from_value(args)
+                .map_err(anyhow::Error::from)
+                .and_then(|AnswerPicker { folder }| {
+                    system::queue_answer(folder, cx)?;
+                    Ok(json!(system::requests(cx).len()))
+                })
+                .map_err(|error| serde_json::Error::io(std::io::Error::other(error.to_string()))),
+            "update_ready" => serde_json::from_value(args).map(
+                |UpdateReady {
+                     version,
+                     fail,
+                     others,
+                 }| {
+                    let updater = crate::updates::real(
+                        Arc::new(ScriptedFeed {
+                            version,
+                            fail,
+                            downloaded: Mutex::new(false),
+                        }),
+                        Box::new(move || others),
+                        |_| {},
+                    );
+                    let updates = cx.services().updates.clone();
+                    updates.update(cx, |updates, cx| {
+                        updates.set_updater(updater, cx);
+                        updates.check_now(cx);
+                    });
+                    update(cx)
+                },
+            ),
             "hold_sync" => serde_json::from_value(args).map(|HoldSync { after }| {
                 service.update(cx, |sync, _| sync.hold_after(after, Held::Pause));
                 sync(cx)
@@ -234,15 +352,82 @@ impl AutomationHost for ScrollbackAutomation {
     }
 }
 
+/// `state.update`.
+fn update(cx: &App) -> Value {
+    let updates = cx.services().updates.read(cx);
+    json!({
+        "off": updates.off().map(|off| off.key()),
+        "ready": updates.ready(),
+        "checking": updates.is_checking(),
+        "checked": updates.last_check().map(|check| match &check.result {
+            CheckResult::UpToDate => json!({"result": "up_to_date"}),
+            CheckResult::Ready(version) => json!({"result": "ready", "version": version}),
+            CheckResult::Failed(error) => json!({"result": "failed", "error": error}),
+        }),
+        "confirm": updates.confirm(),
+        "restarting": updates.is_restarting(),
+        "restarted": updates.is_restarted(),
+        "failure": updates.failure(),
+    })
+}
+
+/**
+ * `update_ready`'s feed: `version` is the newest, downloaded when asked; applying it records
+ * nothing of its own (the service keeps `restarted`) or fails with `fail`. Nothing of it
+ * reaches the network or the disk.
+ */
+struct ScriptedFeed {
+    version: String,
+    fail: Option<String>,
+    downloaded: Mutex<bool>,
+}
+
+impl crate::updates::Releases for ScriptedFeed {
+    fn pending(&self) -> Option<String> {
+        (*self
+            .downloaded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner))
+        .then(|| self.version.clone())
+    }
+
+    fn newer(&self) -> Result<Option<String>, String> {
+        Ok(Some(self.version.clone()))
+    }
+
+    fn download(&self) -> Result<(), String> {
+        *self
+            .downloaded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = true;
+        Ok(())
+    }
+
+    fn apply(&self) -> Result<(), String> {
+        self.fail.clone().map_or(Ok(()), Err)
+    }
+}
+
 /// `state.archive`.
 fn archive(cx: &App) -> Value {
     let archive = cx.services().archive.read(cx);
     let (state, error) = match archive.state() {
         ArchiveState::Opening => ("opening", None),
         ArchiveState::Open(_) => ("open", None),
-        ArchiveState::Failed(failure) => ("failed", Some(&failure.why)),
+        ArchiveState::Failed(failure) => ("failed", Some(failure)),
     };
-    json!({ "dir": archive.dir().display().to_string(), "state": state, "error": error })
+    json!({
+        "dir": archive.dir().display().to_string(),
+        "state": state,
+        "error": error.map(Failure::why),
+        "failure": error.map(|failure| match failure {
+            Failure::Missing { there: false } => "missing",
+            Failure::Missing { there: true } => "empty",
+            Failure::Locked(_) => "locked",
+            Failure::Settings(_) => "settings",
+            Failure::Other(_) => "other",
+        }),
+    })
 }
 
 /// `state.sync`.
@@ -277,8 +462,7 @@ fn sync(cx: &App) -> Value {
                     "sessions": progress.sessions,
                     "sessions_done": progress.sessions_done,
                 })),
-                "stale": stale(location.last_success, sync.details().found(&location.id), now)
-                    .is_some(),
+                "stale": sync.stale(location, now).is_some(),
                 "removing": sync.is_removing(&location.id),
             })
         })
@@ -391,7 +575,17 @@ fn library(cx: &App) -> Value {
             "all": counts.all,
             "starred": counts.starred,
             "unsorted": counts.unsorted,
+            "trash": counts.trash,
         },
+        "for_good": library.for_good().map(|asked| json!({
+            "title": asked.session.title,
+            "files": asked.deletion.as_ref().map(|it| it.files),
+            "versions": asked.deletion.as_ref().map(|it| it.versions),
+            "bytes": asked.deletion.as_ref().map(|it| it.bytes),
+            "at_location": asked.deletion.as_ref().map(|it| it.at_location),
+            "refused": asked.refused.map(|why| why.said()),
+        })),
+        "read_at": library.read_at().map(read_at),
         "folders": folders,
         "sessions": sessions,
         "groups": groups,
@@ -399,6 +593,109 @@ fn library(cx: &App) -> Value {
         "held": library.held().and_then(name),
         "open": library.open_session().and_then(|session| session.title.clone()),
         "error": library.failure(),
+    })
+}
+
+/// `state.settings`.
+fn settings(shell: &Shell, cx: &App) -> Value {
+    let services = cx.services();
+    let settings = services.settings.read(cx);
+    let (sync, upkeep) = (services.sync.read(cx), services.upkeep.read(cx));
+    let archive = services.archive.read(cx).dir().to_path_buf();
+    let problems: Vec<Value> = upkeep
+        .problems()
+        .iter()
+        .map(|problem| {
+            json!({
+                "file": problem.damage.file,
+                "fix": match problem.fix {
+                    Fix::FetchAgain => "fetch_again",
+                    Fix::Fetched { .. } => "fetched",
+                    Fix::Damaged => "damaged",
+                    Fix::Deleted => "deleted",
+                },
+                "refetch": sync.refetch_of(&problem.damage).map(|refetch| match refetch {
+                    Refetch::Running => "running".to_string(),
+                    Refetch::Done(_) => "done".to_string(),
+                    Refetch::Skipped(why) => format!("skipped: {why}"),
+                    Refetch::Failed(why) => why.clone(),
+                }),
+            })
+        })
+        .collect();
+    json!({
+        "section": shell.settings_section(cx).key(),
+        "archive": archive.display().to_string(),
+        "default": settings.is_default(&archive),
+        "switch": settings.switch().map(|switch| match switch {
+            Switch::Opening(folder) => json!({ "opening": folder.display().to_string() }),
+            Switch::Refused { why, .. } => json!({ "refused": why }),
+        }),
+        "sync_every": sync.every().key(),
+        "next_round": sync.next_round().is_some(),
+        "stale_after": sync.stale_after_days(),
+        "stats": upkeep.stats().map(|stats| json!({
+            "sessions": stats.totals.sessions,
+            "items": stats.totals.items,
+            "versions": stats.totals.versions,
+        })),
+        "verify": {
+            "running": upkeep.verifying().is_some(),
+            "progress": upkeep.verifying().map(|verifying| json!({
+                "segments": verifying.progress.segments,
+                "segments_done": verifying.progress.segments_done,
+            })),
+            "last": upkeep.last().map(|last| json!({
+                "segments": last.segments,
+                "problems": problems,
+            })),
+            "fetch_all": sync.fetch_all_progress().map(|(done, total)| json!({
+                "done": done,
+                "total": total,
+            })),
+        },
+        "deleted": upkeep.deleted().iter().map(|deleted| json!({
+            "location": deleted.location.as_ref().map(|location| &location.name),
+            "allowed": matches!(deleted.standing, Standing::Allowed(_)),
+            "standing": match deleted.standing {
+                Standing::Deleted => "deleted",
+                Standing::Allowed(_) => "allowed",
+                Standing::ArchivedAgain { .. } => "archived_again",
+            },
+        })).collect::<Vec<_>>(),
+        "saved": settings.save_failure(),
+    })
+}
+
+/// `state.palette`: the search palette, while it is open.
+fn palette(palette: &Palette, cx: &App) -> Value {
+    let search = cx.services().search.read(cx);
+    let answer = search.answer().map(|answered| match &answered.answer {
+        Searched::KeepTyping => json!("keep-typing"),
+        Searched::Unavailable(why) => json!({ "unavailable": why }),
+        Searched::Found(results) => json!({
+            "sessions": results
+                .sessions
+                .iter()
+                .map(|found| found.session.title.clone())
+                .collect::<Vec<_>>(),
+            "total_sessions": results.total_sessions,
+            "total_matches": results.total_matches,
+            "terms": answered.query.terms,
+            "took_ms": answered.took.as_millis() as u64,
+        }),
+    });
+    json!({
+        "text": palette.text(cx),
+        "chips": palette.chips().iter().map(|chip| &chip.label).collect::<Vec<_>>(),
+        "completions": palette.completion_labels(cx),
+        "rows": palette.rows(cx).len(),
+        "highlighted": palette.highlight(),
+        "commands": palette.command_names(cx),
+        "unresolved": palette.unresolved(cx),
+        "searching": search.is_searching(),
+        "unsearchable": search.unsearchable(),
+        "answer": answer,
     })
 }
 
@@ -447,6 +744,72 @@ fn cards(measure: &LineMeasure) -> Value {
     })
 }
 
+/// `state.reader`.
+fn reader(shell: &Shell, cx: &App) -> Value {
+    let reader = cx.services().reader.read(cx);
+    let view = shell.reader(cx);
+    let open = reader.open_session();
+    json!({
+        "state": reader.state().key(),
+        "error": match reader.state() {
+            ReaderState::Failed { why, .. } => Some(why),
+            _ => None,
+        },
+        "full_calls": reader.full_calls(),
+        "place": cx.services().library.read(cx).open_place().map(|(at, of)| json!([at + 1, of])),
+        "rows": view.rows,
+        "top": view.top,
+        "top_name": view.top_name,
+        "top_offset": view.top_offset,
+        "at_end": view.at_end,
+        "following": view.following,
+        "focused": view.focused.map(|(at, kind, text)| json!({ "row": at, "kind": kind, "text": text })),
+        "open_calls": view.open_calls,
+        "markdown_states": view.states,
+        "held": view.held,
+        "alone": view.alone,
+        "read_at": view.read_at.as_ref().map(read_at),
+        "flash": view.flash.map(|(block, text, drawn)| json!({
+            "block": block,
+            "text": text,
+            "drawn": drawn,
+        })),
+        "find": view.find.map(|(query, count, current)| json!({
+            "query": query,
+            "count": count,
+            "current": current,
+        })),
+        "facts": view.facts,
+        "history": view.history,
+        "viewing": view.viewing,
+        "full_image": view.full_image,
+        "loads": open.map(|open| {
+            open.loads()
+                .into_iter()
+                .map(|(name, loading, loaded)| {
+                    (name.to_string(), json!({ "loading": loading, "loaded": loaded }))
+                })
+                .collect::<serde_json::Map<_, _>>()
+        }),
+        "fault": open.and_then(|open| open.fault()),
+    })
+}
+
+/// A request to open a session at a search match, as `state.library` and `state.reader` show it.
+fn read_at(at: &ReadAt) -> Value {
+    json!({
+        "kind": format!("{:?}", at.kind).to_lowercase(),
+        "turn": match at.at {
+            Some(At::Block { turn, .. }) => Some(turn),
+            _ => None,
+        },
+        "request": at.request,
+        "subagent": at.subagent.as_ref().map(|it| &it.item),
+        "find": at.find,
+        "flash": at.flash,
+    })
+}
+
 /// `state.appearance`.
 fn appearance(cx: &App) -> Value {
     let state = gpui_appearance::state(cx);
@@ -486,6 +849,25 @@ struct PinAppearance {
 struct SetAppearance {
     mode: Option<Mode>,
     material: Option<Material>,
+}
+
+/// `answer_picker {"folder": path | null}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnswerPicker {
+    /// `null` cancels the picker. Required, as `pin_appearance`'s argument is.
+    #[serde(deserialize_with = "Option::deserialize")]
+    folder: Option<PathBuf>,
+}
+
+/// `update_ready {"version": …, "fail"?: …, "others"?: n}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateReady {
+    version: String,
+    fail: Option<String>,
+    #[serde(default)]
+    others: usize,
 }
 
 /// `hold_sync {"after": items}`.

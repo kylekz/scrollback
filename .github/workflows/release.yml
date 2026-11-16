@@ -1,0 +1,405 @@
+# A release (as dv's release.yml): pushing an annotated tag `v<version>` on a commit on main
+# builds the Windows and macOS releases (the installers, and the Velopack update feed an
+# installed app reads) on GitHub's runners, makes sure every CI gate passed on that commit
+# (main's own CI run for it when that one passes, else a run of ci.yml here), and then waits for
+# the owner to approve the `release` environment before anything is published to GitHub Releases.
+# Only a version tag starts it.
+#
+# macOS: Apple silicon alone (`osx-arm64`, the macos-15 runner's); an Intel Mac isn't built.
+#
+# Signing: Windows' installer and executable carry no certificate's signature (SmartScreen asks
+# once). The macOS app is sealed with an ad-hoc signature, unless the repository variable
+# MACOS_SIGNING is `true`: then the `macos-signed` job, in the `release` environment (so it
+# waits for the owner's approval too, and only it sees the secrets), signs the app and the .pkg
+# with a Developer ID and has Apple notarize them. It compiles nothing: the app is built in the
+# unprivileged `macos-build` job, so no dependency's build script runs while the keychain is
+# open, and the keychain is deleted when the job ends, however it ends. Its secrets, all of
+# the `release` environment, none of them in the repository:
+#   MACOS_CERTIFICATES_P12             base64 of a .p12 holding the Developer ID Application and
+#                                      Developer ID Installer certificates and their keys
+#   MACOS_CERTIFICATES_PASSWORD        the .p12's password
+#   MACOS_SIGN_APP_IDENTITY            the Developer ID Application identity, as codesign names it
+#   MACOS_SIGN_INSTALL_IDENTITY        the Developer ID Installer identity
+#   MACOS_NOTARY_APPLE_ID              the Apple Account notarytool signs in with
+#   MACOS_NOTARY_TEAM_ID               its team
+#   MACOS_NOTARY_PASSWORD              an app-specific password for it
+#
+# Security, beyond ci.yml's:
+# - only the owner can create `v*` tags, and no tag can be moved or deleted (a repository
+#   ruleset); the `release` environment admits only `v*` tags and needs the owner's approval
+# - script/release-check refuses a tag that isn't an annotated `v<semver>` on main whose version
+#   is the workspace's; like the approval, it guards against a mistaken tag, not a hostile one
+#   (a tag runs its own commit's copy of this file), which the tag ruleset keeps out
+# - the builds start clean (no cache), with Cargo.lock as it is (`--locked`), in jobs whose token
+#   is read-only
+# - the one job that can write (publish) checks out no code and runs nothing from the repository:
+#   it takes the built files, writes their SHA256SUMS, attests their build provenance (Sigstore,
+#   `gh attestation verify`) and creates the release; releases are immutable once published
+# - the only job that reads a secret (macos-signed) runs the tagged commit's own scripts and
+#   vpk (pinned by version; NuGet's tool install takes no hash), never cargo, after the owner
+#   approved it, with a token that can only read
+# - vpk 1.2.161 is installed by version from NuGet in each packing job
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  verify:
+    name: The tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The tag as it is on GitHub (checkout can leave a lightweight copy)
+        env:
+          TAG: ${{ github.ref_name }}
+        run: git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+      - name: script/release-check
+        id: check
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/notes"
+          bash script/release-check "$TAG" --notes "$RUNNER_TEMP/notes/notes.md" | tee -a "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: notes
+          path: ${{ runner.temp }}/notes/notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  # The tag's commit is on main, whose push ran ci.yml on it moments before the tag: when that
+  # run passes, it is this commit's CI, and the release doesn't run the same gates a second
+  # time, cold. No run, or one that doesn't pass (failed, cancelled, superseded while it
+  # waited), and the `ci` job below runs them here instead.
+  main-ci:
+    name: CI on main for this commit
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      actions: read # lists and watches main's CI runs
+    outputs:
+      passed: ${{ steps.main.outputs.passed }}
+    steps:
+      - name: Wait for main's CI run of this commit
+        id: main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # The push to main comes first, but its run can take a few seconds to be listed.
+          id=""
+          for _ in 1 2 3 4 5 6; do
+            id="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --branch main \
+              --event push --commit "$SHA" --limit 1 --json databaseId --jq '.[0].databaseId // ""')"
+            if [[ -n "$id" ]]; then break; fi
+            sleep 10
+          done
+          if [[ -z "$id" ]]; then
+            echo "No CI run on main for $SHA: this release runs ci.yml itself"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "main's CI run for $SHA: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id"
+          gh run watch "$id" --repo "$GITHUB_REPOSITORY" --interval 60 > /dev/null
+          conclusion="$(gh run view "$id" --repo "$GITHUB_REPOSITORY" --json conclusion --jq .conclusion)"
+          echo "conclusion: $conclusion"
+          if [[ "$conclusion" == success ]]; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "It didn't pass: this release runs ci.yml itself"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  ci:
+    name: CI
+    needs: [verify, main-ci]
+    # main-ci failing to answer counts as no answer: the gates run here.
+    if: ${{ !cancelled() && needs.verify.result == 'success' && needs.main-ci.outputs.passed != 'true' }}
+    # A job-level call resolves from this same commit before anything runs, so the runtime
+    # checkout the self-repository form (`$/`) guards against can't reach it; actionlint doesn't
+    # read `$/` yet.
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+
+  windows:
+    name: Windows release
+    needs: verify
+    runs-on: windows-2025
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain (rust-toolchain.toml)
+        shell: bash
+        run: rustup toolchain install && rustc --version
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 8.0.x
+      - name: vpk 1.2.161 (the velopack crate's version)
+        run: dotnet tool install -g vpk --version 1.2.161
+      - name: The latest release's full package, for the delta
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash script/release-feed previous win target/package/out
+      - name: script/package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash script/package --version "$VERSION" --feed "https://github.com/$GITHUB_REPOSITORY" \
+            --out target/package/out
+      - name: This release's files (vpk's assets.win.json, the feed and RELEASES)
+        shell: bash
+        run: bash script/release-feed files win target/package/out target/package/upload
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-windows
+          path: target/package/upload/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The macOS app, built once for both packing jobs below: unprivileged, no secret.
+  macos-build:
+    name: macOS app (arm64)
+    needs: verify
+    runs-on: macos-15
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - name: script/package --build-only
+        run: |
+          set -euo pipefail
+          bash script/package --version "$VERSION" --feed "https://github.com/$GITHUB_REPOSITORY" \
+            --build-only target/package/app
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-app
+          path: target/package/app/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The macOS release with an ad-hoc signature (MACOS_SIGNING isn't `true`).
+  macos:
+    name: macOS release (arm64)
+    needs: [verify, macos-build]
+    if: ${{ vars.MACOS_SIGNING != 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: macos-app
+          path: target/package/app
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 8.0.x
+      - name: vpk 1.2.161 (the velopack crate's version)
+        run: dotnet tool install -g vpk --version 1.2.161
+      - name: The latest release's full macOS package, for the delta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash script/release-feed previous osx-arm64 target/package/out
+      - name: script/package --prebuilt (the macOS release)
+        run: |
+          set -euo pipefail
+          bash script/package --version "$VERSION" --prebuilt target/package/app \
+            --out target/package/out
+      - name: This release's files (vpk's assets.osx-arm64.json and the feed)
+        run: bash script/release-feed files osx-arm64 target/package/out target/package/upload
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-macos
+          path: target/package/upload/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The macOS release signed with a Developer ID and notarized (MACOS_SIGNING is `true`): in the
+  # `release` environment, whose secrets only this job and publish can read, so it waits for the
+  # owner's approval before it runs. It packs the app macos-build built and compiles nothing.
+  macos-signed:
+    name: macOS release (arm64, signed, after the owner approves)
+    needs: [verify, macos-build]
+    if: ${{ vars.MACOS_SIGNING == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    environment:
+      name: release
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: macos-app
+          path: target/package/app
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 8.0.x
+      - name: vpk 1.2.161 (the velopack crate's version)
+        run: dotnet tool install -g vpk --version 1.2.161
+      - name: The latest release's full macOS package, for the delta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash script/release-feed previous osx-arm64 target/package/out
+      # A keychain of this run's own, deleted by the last step however the job ends.
+      - name: The signing certificates and the notary's credentials, in a keychain of the run's
+        env:
+          P12: ${{ secrets.MACOS_CERTIFICATES_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERTIFICATES_PASSWORD }}
+          APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(uuidgen)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$P12" | base64 --decode > "$RUNNER_TEMP/certificates.p12"
+          security import "$RUNNER_TEMP/certificates.p12" -k "$keychain" -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/productsign -T /usr/bin/pkgbuild
+          rm -f "$RUNNER_TEMP/certificates.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" > /dev/null
+          # Searched with the login keychain, so codesign finds the identities.
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          xcrun notarytool store-credentials scrollback-notary --apple-id "$APPLE_ID" \
+            --team-id "$TEAM_ID" --password "$NOTARY_PASSWORD" --keychain "$keychain"
+      - name: script/package --prebuilt (the macOS release, signed and notarized)
+        env:
+          SCROLLBACK_SIGN_APP_IDENTITY: ${{ secrets.MACOS_SIGN_APP_IDENTITY }}
+          SCROLLBACK_SIGN_INSTALL_IDENTITY: ${{ secrets.MACOS_SIGN_INSTALL_IDENTITY }}
+          SCROLLBACK_NOTARY_PROFILE: scrollback-notary
+        run: |
+          set -euo pipefail
+          export SCROLLBACK_KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          bash script/package --version "$VERSION" --prebuilt target/package/app \
+            --out target/package/out
+      - name: This release's files (vpk's assets.osx-arm64.json and the feed)
+        run: bash script/release-feed files osx-arm64 target/package/out target/package/upload
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-macos
+          path: target/package/upload/
+          if-no-files-found: error
+          retention-days: 7
+      - name: The keychain deleted, with what it holds
+        if: ${{ always() }}
+        run: |
+          security list-keychains -d user -s login.keychain-db
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2> /dev/null || true
+
+  publish:
+    name: Publish (after the owner approves)
+    needs: [verify, main-ci, ci, windows, macos-build, macos, macos-signed]
+    # Every build (one of the two macOS jobs), and the gates either on main or here (`ci` is
+    # skipped when main's run passed).
+    if: >-
+      ${{ !cancelled() && needs.verify.result == 'success' && needs.windows.result == 'success'
+      && (needs.macos.result == 'success' || needs.macos-signed.result == 'success')
+      && (needs.main-ci.outputs.passed == 'true' || needs.ci.result == 'success') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: release
+      url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+    permissions:
+      contents: write # creates the release and uploads its files
+      id-token: write # the OIDC token Sigstore signs the provenance with
+      attestations: write # stores the provenance attestations
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-windows
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-macos
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: notes
+          path: notes
+      - name: SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
+          cat SHA256SUMS
+      - name: Build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      - name: The release, a draft until every file is on it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          kind=(--latest)
+          if [[ "$PRERELEASE" == true ]]; then
+            kind=(--prerelease --latest=false)
+          fi
+          # A re-run after a failure part way finds its own draft and finishes it.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft \
+            2> /dev/null | grep -qx true; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/*
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+              --title "scrollback $VERSION" --notes-file notes/notes.md "${kind[@]}" dist/*
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false "${kind[@]}"

@@ -1,0 +1,82 @@
+{"scenario": {"window_size": "1440x900", "fixture": "reader", "description": "Find in session (DESIGN §4.2.9) on E-Reader's backfill session and E-Reader-Subagent's audit: Ctrl F, the count, Enter and Shift Enter stepping and opening what holds each match (a body, a subagent), the turns' match chips (§4.2.8), No matches, Esc; a search match opened from the palette fills Find (§4.9); dark and light at 1440x900 and 960x600"}}
+{"cmd": "wait_ready", "timeout_ms": 60000}
+{"cmd": "settle", "timeout_ms": 60000, "expect": {"pointer": "/library/counts/all", "equals": 8}}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+{"cmd": "click", "target": "sidebar/folder/fc"}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 5}}
+{"cmd": "click", "target": "card/1/title"}
+{"cmd": "settle", "expect": [{"pointer": "/library/open", "equals": "Throttle yt-dlp metadata backfill"}, {"pointer": "/reader/find", "equals": null}]}
+
+// Ctrl F: the field takes the keyboard and widens to 300. Typing searches the session, its bodies and its subagent included; the first match is current.
+{"cmd": "key", "keystroke": "secondary-f"}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "reader/find/field", "expect_result": {"pointer": "/w", "gte": 299, "lte": 301}}
+{"cmd": "type", "text": "health"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/find/query", "equals": "health"}, {"pointer": "/reader/find/count", "contains": "1 of "}, {"pointer": "/reader/find/current", "equals": "main/0 prose"}]}
+{"cmd": "bounds", "target": "reader/facts/matches", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "find-first-1440-dark"}
+
+// Enter steps on, opening the subagent whose own calls hold the next matches; Shift Enter steps back; the counts wrap.
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/reader/find/count", "contains": "3 of "}}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/find/count", "contains": "6 of "}, {"pointer": "/reader/loads/subagents/loaded", "gte": 1}]}
+{"cmd": "screenshot", "name": "find-in-subagent-1440-dark"}
+{"cmd": "key", "keystroke": "shift-enter"}
+{"cmd": "settle", "expect": {"pointer": "/reader/find/count", "contains": "5 of "}}
+{"cmd": "click", "target": "reader/find/previous-match"}
+{"cmd": "settle", "expect": {"pointer": "/reader/find/count", "contains": "4 of "}}
+
+// No match: the count says so, in fg3, and the field keeps its ring.
+{"cmd": "key", "keystroke": "secondary-f"}
+{"cmd": "type", "text": "nowhere-at-all"}
+{"cmd": "settle", "expect": {"pointer": "/reader/find/count", "equals": "No matches"}}
+{"cmd": "screenshot", "name": "find-none-1440-dark"}
+
+// Esc closes Find and takes its highlights off.
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": {"pointer": "/reader/find", "equals": null}}
+
+// E-Reader-Subagent: a match inside the audit's subagent, with the turns' chips.
+{"cmd": "click", "target": "sidebar/folder/toolbox-rs"}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 1}}
+{"cmd": "click", "target": "card/0/title"}
+{"cmd": "settle", "expect": {"pointer": "/library/open", "equals": "Audit fc and slide for code taken from Zed"}}
+{"cmd": "key", "keystroke": "secondary-f"}
+{"cmd": "type", "text": "sqlez"}
+{"cmd": "settle", "expect": {"pointer": "/reader/find/count", "contains": "1 of "}}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/reader/find/count", "contains": "3 of "}}
+{"cmd": "screenshot", "name": "find-subagent-board-1440-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "find-subagent-board-1440-light"}
+
+// 960x600: the field and its buttons fit beside the controls.
+{"cmd": "resize", "w": 960, "h": 600, "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "reader/find/close", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "find-subagent-board-960-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "find-subagent-board-960-dark"}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "resize", "w": 1440, "h": 900}
+{"cmd": "settle"}
+
+// From the palette: the session opens at the match, and Find is filled with the query, the match flashed being current.
+{"cmd": "key", "keystroke": "secondary-k"}
+// Opened from toolbox-rs's session, the palette is scoped to its folder (§4.9): Backspace on the empty query drops the chip.
+{"cmd": "settle", "expect": {"pointer": "/palette/chips", "equals": ["Folder: toolbox-rs"]}}
+{"cmd": "key", "keystroke": "backspace", "expect": {"pointer": "/palette/chips", "len": 0}}
+{"cmd": "type", "text": "progress"}
+{"cmd": "settle", "expect": {"pointer": "", "exists": true}}
+{"cmd": "key", "keystroke": "down"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "session"}, {"pointer": "/reader/find/query", "equals": "progress"}]}
+{"cmd": "screenshot", "name": "find-from-palette-1440-dark"}
