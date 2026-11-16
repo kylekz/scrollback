@@ -51,6 +51,13 @@
 //! network mount that hangs, a `wsl.exe` that stalls. `ssh` itself notices a host that stops
 //! answering much sooner ([`Launcher`]).
 //!
+//! **An answer whose tail is lost** ([`TransportError::Stopped`]: it began, the launcher ended
+//! with exit status 0 and said nothing, and its end never arrived) has the operation run once
+//! more, with a warning logged, where nothing of the answer reached the caller before its end
+//! was read: `env`, `probe`, `stat`, `list`, `hash_prefixes` and `read_small` each keep what
+//! they read to themselves until then ([`ShellTransport::whole`]). `read_ranges` hands each
+//! range to its sink as it arrives and is never run again: the range it stopped in fails.
+//!
 //! **What the transport can't see.** A group's mark is one byte of evidence that its files
 //! were as long as `stat` said. At a location whose `stat` and `read` disagree (a network
 //! mount with a stale attribute cache), a grouped read can hand over bytes cut at the wrong
@@ -193,6 +200,11 @@ impl ShellTransport {
      * to be stopped is an error, as it is to a pass.
      */
     pub fn probe(&self) -> Result<Probe, TransportError> {
+        self.whole(|| self.probe_once())
+    }
+
+    /// [`Self::probe`], run once. What it read is its own until the answer's end.
+    fn probe_once(&self) -> Result<Probe, TransportError> {
         let started = Instant::now();
         let login = Login::new();
         let script = Script::new().line("probe").login(&login, &[]);
@@ -228,6 +240,32 @@ impl ShellTransport {
             drive_mount,
             took: started.elapsed(),
         })
+    }
+
+    /**
+     * Runs `call` once more when its answer stopped part-way (the module docs). Only for a
+     * call that keeps everything it reads to itself until it has read its answer's end: run
+     * again, it starts over from nothing, and nothing reaches its caller twice.
+     */
+    fn whole<T>(
+        &self,
+        mut call: impl FnMut() -> Result<T, TransportError>,
+    ) -> Result<T, TransportError> {
+        match call() {
+            Err(TransportError::Stopped(first)) if !self.cancel.is_cancelled() => {
+                log::warn!(
+                    "{}: the answer stopped part-way ({first}); the call is run once more",
+                    self.launcher.command_line()
+                );
+                call().map_err(|second| match second {
+                    TransportError::Stopped(said) => TransportError::Stopped(format!(
+                        "{said}\nit was run twice; the first time: {first}"
+                    )),
+                    other => other,
+                })
+            }
+            other => other,
+        }
     }
 
     fn environment(&self) -> MutexGuard<'_, Environment> {
@@ -573,7 +611,8 @@ impl Transport for ShellTransport {
             .filter(|name| !known.vars.contains_key(*name))
             .collect();
         if known.home.is_none() || !new.is_empty() {
-            self.learn(&mut known, &new)?;
+            /* `known` is changed only once the answer's end is read. */
+            self.whole(|| self.learn(&mut known, &new))?;
         }
         Ok(Env {
             home: known.home.clone().ok_or(TransportError::NoHome)?,
@@ -585,6 +624,57 @@ impl Transport for ShellTransport {
     }
 
     fn stat(&self, paths: &[&str]) -> Result<Vec<Option<FileStat>>, TransportError> {
+        self.whole(|| self.stat_once(paths))
+    }
+
+    fn list(&self, root: &str) -> Result<Listing, TransportError> {
+        /* With the names asked about again: the listing is handed over whole, or not. */
+        self.whole(|| self.list_once(root))
+    }
+
+    fn hash_prefixes(
+        &self,
+        requests: &[PrefixRequest],
+    ) -> Result<Vec<Result<Hashed, RangeFailure>>, TransportError> {
+        self.whole(|| {
+            let mut hashes = Vec::with_capacity(requests.len());
+            let mut plain = 0;
+            while hashes.len() < requests.len() {
+                plain = self.hash_from(requests, &mut hashes, plain)?;
+            }
+            Ok(hashes)
+        })
+    }
+
+    /// Never run again: each range goes to `sink` as it arrives, and one that stops part-way
+    /// fails the call there.
+    fn read_ranges(
+        &self,
+        requests: &[RangeRequest],
+        sink: &mut dyn RangeSink,
+    ) -> Result<(), TransportError> {
+        let (mut from, mut plain) = (0, 0);
+        while let Some(group) = self.read_from(requests, from, plain, sink)? {
+            (from, plain) = (group.start, group.end);
+        }
+        Ok(())
+    }
+
+    fn read_small(&self, path: &str) -> Result<Option<Vec<u8>>, TransportError> {
+        self.whole(|| {
+            let script = Script::new().call("small", &[], path)?;
+            let mut reply = self.ask("stat head /dev/zero", script)?;
+            let content = small(&mut reply, path)?;
+            reply.end()?;
+            Ok(content)
+        })
+    }
+}
+
+/* What the operations that are run again whole read, each once: nothing reaches the caller
+before the answer's end is read. */
+impl ShellTransport {
+    fn stat_once(&self, paths: &[&str]) -> Result<Vec<Option<FileStat>>, TransportError> {
         let mut script = Script::new();
         for path in paths {
             script = script.call("file L", &[], path)?;
@@ -605,7 +695,7 @@ impl Transport for ShellTransport {
         Ok(stats)
     }
 
-    fn list(&self, root: &str) -> Result<Listing, TransportError> {
+    fn list_once(&self, root: &str) -> Result<Listing, TransportError> {
         /* find names what it finds as the folder, a slash and the rest. */
         let root = match root.trim_end_matches('/') {
             "" => "/",
@@ -681,38 +771,6 @@ impl Transport for ShellTransport {
         reply.end()?;
         self.list_again(&again, root, &barred, &mut listing)?;
         Ok(listing)
-    }
-
-    fn hash_prefixes(
-        &self,
-        requests: &[PrefixRequest],
-    ) -> Result<Vec<Result<Hashed, RangeFailure>>, TransportError> {
-        let mut hashes = Vec::with_capacity(requests.len());
-        let mut plain = 0;
-        while hashes.len() < requests.len() {
-            plain = self.hash_from(requests, &mut hashes, plain)?;
-        }
-        Ok(hashes)
-    }
-
-    fn read_ranges(
-        &self,
-        requests: &[RangeRequest],
-        sink: &mut dyn RangeSink,
-    ) -> Result<(), TransportError> {
-        let (mut from, mut plain) = (0, 0);
-        while let Some(group) = self.read_from(requests, from, plain, sink)? {
-            (from, plain) = (group.start, group.end);
-        }
-        Ok(())
-    }
-
-    fn read_small(&self, path: &str) -> Result<Option<Vec<u8>>, TransportError> {
-        let script = Script::new().call("small", &[], path)?;
-        let mut reply = self.ask("stat head /dev/zero", script)?;
-        let content = small(&mut reply, path)?;
-        reply.end()?;
-        Ok(content)
     }
 }
 

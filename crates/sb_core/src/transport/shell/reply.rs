@@ -98,6 +98,10 @@ pub(super) struct Reply<'a> {
     before: Vec<u8>,
     /// Set once the process has ended: its exit status, if it could be waited for.
     exit: Option<Option<ExitStatus>>,
+    /// How many bytes of the answer have arrived, and what the last line read was: for
+    /// saying where an answer that stopped part-way stopped.
+    answered: u64,
+    last: String,
 }
 
 impl Drop for Reply<'_> {
@@ -193,6 +197,8 @@ impl<'a> Reply<'a> {
             stderr: Vec::new(),
             before: Vec::new(),
             exit: None,
+            answered: 0,
+            last: "the line it begins with".to_string(),
         };
         /* The script is all the shell is to read. A launcher that ends without reading it
         says why through its exit, and the writer says how far it got. */
@@ -224,6 +230,7 @@ impl<'a> Reply<'a> {
             if let Some(found) = find(&reply.buffer, marker.as_bytes()) {
                 reply.before = reply.buffer[..found.min(KEPT)].to_vec();
                 reply.at = found + marker.len();
+                reply.answered = (reply.buffer.len() - reply.at) as u64;
                 break;
             }
             if reply.buffer.len() > GREETING_MAX {
@@ -265,6 +272,7 @@ impl<'a> Reply<'a> {
             }
             match self.events.recv_timeout(POLL) {
                 Ok(Event::Stdout(bytes)) => {
+                    self.answered += bytes.len() as u64;
                     if self.at == self.buffer.len() {
                         self.buffer = bytes;
                     } else {
@@ -298,11 +306,23 @@ impl<'a> Reply<'a> {
         Ok(false)
     }
 
-    /// The process ended where there should have been more of the answer: why, by the
-    /// launcher's account.
+    /**
+     * The process ended where there should have been more of the answer: why, by the
+     * launcher's account. One that ended well and said nothing lost the rest of its answer on
+     * the way ([`TransportError::Stopped`]): at a WSL location, under load, the tail of an
+     * answer after the login shell's has been seen to go missing so.
+     */
     fn broken(&self) -> TransportError {
-        self.launcher
-            .failure(self.exit.flatten(), &self.stderr, &self.before)
+        let exit = self.exit.flatten();
+        match exit {
+            Some(status) if status.success() && self.stderr.is_empty() => {
+                TransportError::Stopped(format!(
+                    "{} bytes of it arrived; the last line read was {} ({status})",
+                    self.answered, self.last
+                ))
+            }
+            _ => self.launcher.failure(exit, &self.stderr, &self.before),
+        }
     }
 
     /// The bytes up to the next `end`, which is passed over; at most `limit` of them.
@@ -330,12 +350,19 @@ impl<'a> Reply<'a> {
 
     /// The next record's line of fields, without its newline.
     pub(super) fn line(&mut self) -> Result<String, TransportError> {
-        String::from_utf8(self.until(b'\n', LINE_MAX)?).map_err(|error| {
+        let line = String::from_utf8(self.until(b'\n', LINE_MAX)?).map_err(|error| {
             TransportError::Protocol(format!(
                 "{:?} is not a record",
                 String::from_utf8_lossy(error.as_bytes())
             ))
-        })
+        })?;
+        /* Its kind only: a record's first field is one letter, a line of the call's own
+        (the login shell's bounds) is longer. */
+        self.last = match line.split(' ').next() {
+            Some(kind) if kind.len() == 1 => format!("a record of kind {kind}"),
+            _ => "a line of the call's own".to_string(),
+        };
+        Ok(line)
     }
 
     /// The one field of the next record, empty when it has none. The record must be one
@@ -396,6 +423,7 @@ impl<'a> Reply<'a> {
                 .min();
             if let Some((found, which)) = first {
                 self.at += found + lines[which].len();
+                self.last = "a line of the call's own".to_string();
                 return Ok(which);
             }
             /* The end of what was searched may be the start of one of them. */

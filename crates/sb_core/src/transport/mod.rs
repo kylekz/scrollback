@@ -172,6 +172,10 @@ pub enum TransportError {
     /// The launcher or the shell at the location failed some other way.
     #[error("{0}")]
     Failed(String),
+    /// The shell's answer began, and the launcher ended well and said nothing, but the rest
+    /// of the answer never arrived: it was lost on the way. With how far it got.
+    #[error("the answer stopped part-way: {0}")]
+    Stopped(String),
     /// The location lacks tools the shell transport needs (PLAN §6.2).
     #[error("the location has no {}", .0.join(", no "))]
     MissingTools(Vec<String>),
@@ -191,6 +195,7 @@ impl TransportError {
                 | Self::Refused(_)
                 | Self::HostKey(_)
                 | Self::Failed(_)
+                | Self::Stopped(_)
                 | Self::MissingTools(_)
         )
     }

@@ -1,7 +1,9 @@
 //! A script that reaches the location's shell cut short (PLAN §6.2): the shell runs none of it
 //! and ends in one of two ways, the call is run once more, and nothing reaches a sink twice.
-//! Through stand-in launchers that lose or cut the first script they are given, and through
-//! each shell this machine has.
+//! And an answer whose tail is lost on its way back: an operation that hands nothing over
+//! before its answer's end is run once more, and `read_ranges` is not. Through stand-in
+//! launchers that lose or cut the first script or answer, and through each shell this
+//! machine has.
 
 #![cfg(unix)]
 
@@ -108,7 +110,9 @@ type Operation = fn(&ShellTransport, &Path, &[String]) -> Result<String, Transpo
 
 /// Every operation of the transport, each with what it answered.
 const OPERATIONS: [(&str, Operation); 7] = [
-    ("env", |transport, _, _| Ok(transport.env(&[])?.home)),
+    ("env", |transport, _, _| {
+        Ok(format!("{:?}", transport.env(&["SB_UNSET"])?))
+    }),
     ("probe", |transport, _, _| {
         Ok(format!("{:?}", transport.probe()?.missing))
     }),
@@ -234,30 +238,143 @@ fn a_script_cut_short_twice_fails_the_call_once_with_both_attempts() {
     }
 }
 
+/// The user's login shell, for the calls that ask it what its profile sets.
+const LOGIN: &str = "SHELL=/bin/sh; export SHELL";
+
+/// A shell whose answer is lost after the line `line` (a `sed` address), exit status 0 and
+/// nothing said: as the tail of an answer has been seen to go missing at a WSL location.
+fn lost_after(line: &str) -> String {
+    format!("{LOGIN}; sh -s | sed '{line}q'")
+}
+
+/// Right after the answer's first record, and right after the login shell's own last line.
+const AFTER_K: &str = "/^K$/";
+const AFTER_LOGIN: &str = "/^scrollback end /";
+
 #[test]
-fn an_answer_that_began_and_then_stopped_is_not_run_again() {
+fn every_whole_answer_operation_whose_tail_was_lost_is_run_again_and_answers_once() {
+    let (files, paths) = files();
+    let behaves = format!("{LOGIN}; exec sh -s");
+    for (name, operation) in OPERATIONS {
+        if name == "read_ranges" {
+            continue;
+        }
+        let expected = operation(&launched(&behaves), files.path(), &paths).unwrap();
+        /* The login shell's block is in the answers of `env` and `probe`. */
+        let cuts: &[(&str, &str)] = match name {
+            "env" | "probe" => &[
+                (AFTER_K, "a record of kind K"),
+                (AFTER_LOGIN, "of the call's own"),
+            ],
+            _ => &[(AFTER_K, "a record of kind K")],
+        };
+        for (cut, last) in cuts {
+            let dir = tempfile::tempdir().unwrap();
+            let transport = far_side(dir.path(), &lost_after(cut), &behaves);
+            assert_eq!(
+                operation(&transport, files.path(), &paths).unwrap(),
+                expected,
+                "{name} {cut}"
+            );
+            let (runs, warned) = runs(dir.path());
+            assert_eq!((runs, warned.len()), (2, 1), "{name} {cut}: {warned:?}");
+            for words in [
+                "stopped part-way",
+                "bytes of it arrived",
+                last,
+                "exit status: 0",
+            ] {
+                assert!(warned[0].contains(words), "{name}: {}", warned[0]);
+            }
+        }
+    }
+}
+
+#[test]
+fn an_answer_whose_tail_is_lost_twice_fails_the_call_once_with_both_attempts() {
     let dir = tempfile::tempdir().unwrap();
-    /* The marker, the word that no tool is missing, and two of a range's five bytes. */
+    let cut = lost_after(AFTER_LOGIN);
+    let failed = far_side(dir.path(), &cut, &cut).env(&["SB_UNSET"]);
+    let Err(TransportError::Stopped(said)) = &failed else {
+        panic!("{failed:?}");
+    };
+    let shown = failed.as_ref().unwrap_err().to_string();
+    assert!(
+        shown.starts_with("the answer stopped part-way: "),
+        "{shown}"
+    );
+    /* Never the words of an answer that did not begin. */
+    assert!(!shown.contains("ended before it answered"), "{shown}");
+    let attempts: Vec<&str> = said.split("\nit was run twice; the first time: ").collect();
+    assert_eq!(attempts.len(), 2, "{said}");
+    for attempt in attempts {
+        assert!(attempt.contains("bytes of it arrived"), "{said}");
+    }
+    let (runs, warned) = runs(dir.path());
+    assert_eq!((runs, warned.len()), (2, 1));
+}
+
+#[test]
+fn an_answer_that_stops_with_a_failure_or_with_words_is_not_run_again() {
+    for end in ["exit 1", "echo 'Connection reset by peer' >&2"] {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("{}; {end}", lost_after(AFTER_K));
+        let failed = far_side(dir.path(), &line, "exec sh -s").stat(&["/"]);
+        assert!(
+            matches!(failed, Err(TransportError::Failed(_))),
+            "{end}: {failed:?}"
+        );
+        assert_eq!(runs(dir.path()), (1, Vec::new()), "{end}");
+    }
+}
+
+#[test]
+fn ranges_whose_tail_is_lost_are_not_read_again_and_nothing_arrives_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    /* The marker, the word that no tool is missing, a range of two bytes whole, and two of
+    the next one's five. */
     let transport = far_side(
         dir.path(),
         "marker=$(sed -n \"s/^printf '%s\\\\\\\\n' '\\(scrollback answer [0-9a-f]*\\)'$/\\1/p\"); \
-         printf '%s\\nK\\nR 5\\nab' \"$marker\"",
+         printf '%s\\nK\\nR 2\\nabxE\\n\\0R 5\\nab' \"$marker\"",
         "exec sh -s",
     );
-    let requests = [RangeRequest {
-        path: "/file".to_string(),
-        offset: 0,
-        length: 5,
-    }];
+    /* Not from a file's start: ranges each asked for by itself, not as a group. */
+    let requests = [("/one", 2), ("/two", 5)].map(|(path, length)| RangeRequest {
+        path: path.to_string(),
+        offset: 1,
+        length,
+    });
     let mut sink = Collect::default();
     let failed = transport.read_ranges(&requests, &mut sink);
     assert!(
-        matches!(&failed, Err(TransportError::Failed(said)) if said.contains("ended before")),
+        matches!(&failed, Err(TransportError::Stopped(said)) if said.contains("a record of kind R")),
         "{failed:?}"
     );
-    /* What arrived was the start of a range that never ended: had the call been run again,
-    it would arrive a second time. */
-    assert_eq!(sink.ends.len(), 0);
+    /* The first range once; the second began and never ended, and the engine stores none
+    of it. Run again, the first would have arrived twice. */
+    assert_eq!(sink.ends, [Ok(())]);
+    assert_eq!(sink.bytes[0], b"ab");
+    assert_eq!(runs(dir.path()), (1, Vec::new()));
+}
+
+#[test]
+fn a_cancel_while_an_answer_is_part_way_is_not_followed_by_another_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancelToken::new();
+    let line = format!("{}; sleep 2", lost_after(AFTER_K));
+    let transport = far_side(dir.path(), &line, "exec sh -s").cancelled_by(&cancel);
+    let cancelled = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            cancel.cancel();
+        });
+        transport.stat(&["/"])
+    });
+    assert!(
+        matches!(cancelled, Err(TransportError::Cancelled)),
+        "{cancelled:?}"
+    );
     assert_eq!(runs(dir.path()), (1, Vec::new()));
 }
 
