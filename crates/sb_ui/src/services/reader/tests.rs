@@ -126,7 +126,7 @@ fn draw_all(reader: &Entity<ReaderService>, cx: &mut TestAppContext) {
                         at,
                         part: ProsePart::Pending,
                         ..
-                    } => reader.want_prose(at, cx),
+                    } => reader.want_prose(at, Rank::default(), cx),
                     RowKind::UnattachedHead(None) => reader.want_placement(cx),
                     _ => {}
                 }
@@ -707,6 +707,135 @@ fn what_the_views_let_go_of_is_dropped_and_prepared_again_when_wanted(cx: &mut T
             Some(Load::Loaded(_))
         ));
     });
+}
+
+/// The prompts and replies of the open session's own conversation, let go of: none prepared.
+fn prose_blocks(reader: &Entity<ReaderService>, cx: &mut TestAppContext) -> Vec<BlockRef> {
+    let blocks: Vec<BlockRef> = reader.read_with(cx, |reader, _| {
+        let main = reader.open_session().unwrap().main().unwrap();
+        main.blocks()
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| {
+                matches!(
+                    block.content,
+                    Content::Prompt { .. } | Content::Reply { .. }
+                )
+            })
+            .map(|(id, _)| BlockRef {
+                conversation: main.item.clone(),
+                block: sb_core::transcript::BlockId(id),
+            })
+            .collect()
+    });
+    reader.update(cx, |reader, cx| {
+        reader.release(blocks.iter().cloned().map(Held::Prose).collect(), cx);
+    });
+    blocks
+}
+
+fn rank(distance: usize) -> Rank {
+    Rank { frame: 1, distance }
+}
+
+#[gpui::test]
+fn prose_is_prepared_a_few_jobs_at_a_time_nearest_the_top_first_and_once(cx: &mut TestAppContext) {
+    let (library, reader, _) = library(cx);
+    open(&library, "Throttle yt-dlp metadata backfill", cx);
+    let blocks = prose_blocks(&reader, cx);
+    let [a, b, c, d, ..] = blocks.as_slice() else {
+        panic!("{blocks:?}");
+    };
+    reader.update(cx, |reader, cx| {
+        /* The first two start at once; the others wait, the nearest first. */
+        reader.want_prose(a, rank(3), cx);
+        reader.want_prose(b, rank(2), cx);
+        reader.want_prose(c, rank(4), cx);
+        reader.want_prose(d, rank(1), cx);
+        assert_eq!(reader.busy, JOBS);
+        assert!(reader.running.contains_key(&Job::Prose(a.clone())));
+        assert!(reader.running.contains_key(&Job::Prose(b.clone())));
+        assert_eq!(reader.queued.len(), 2);
+        /* Let go of, one waiting is dropped and one running told to stop. */
+        reader.release(vec![Held::Prose(c.clone()), Held::Prose(a.clone())], cx);
+        assert_eq!(reader.queued.len(), 1);
+        assert!(
+            !reader.running[&Job::Prose(a.clone())]
+                .wanted
+                .load(Ordering::Relaxed)
+        );
+        /* Back while its job runs: no second job; it is prepared again once that ends. */
+        reader.want_prose(a, rank(0), cx);
+        assert_eq!(reader.queued.len(), 1);
+        assert_eq!(reader.busy, JOBS);
+    });
+    cx.run_until_parked();
+    reader.read_with(cx, |reader, _| {
+        let open = reader.open_session().unwrap();
+        for at in [a, b, d] {
+            assert!(matches!(open.prose(at), Some(Load::Loaded(_))), "{at:?}");
+        }
+        assert!(open.prose(c).is_none());
+        assert_eq!(reader.busy, 0);
+        assert!(reader.is_settled());
+    });
+}
+
+#[gpui::test]
+fn closing_a_session_stops_its_prose_jobs_at_their_next_piece(cx: &mut TestAppContext) {
+    let (library, reader, _) = library(cx);
+    open(&library, "Throttle yt-dlp metadata backfill", cx);
+    let blocks = prose_blocks(&reader, cx);
+    let wanted = reader.update(cx, |reader, cx| {
+        reader.want_prose(&blocks[0], rank(0), cx);
+        reader.want_prose(&blocks[1], rank(1), cx);
+        reader.want_prose(&blocks[2], rank(2), cx);
+        reader
+            .running
+            .values()
+            .map(|running| running.wanted.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(wanted.len(), JOBS);
+    library.update(cx, |library, cx| library.close(cx));
+    reader.read_with(cx, |reader, _| {
+        assert!(wanted.iter().all(|wanted| !wanted.load(Ordering::Relaxed)));
+        assert!(reader.queued.is_empty() && reader.running.is_empty());
+        /* Still running until each reaches its next piece. */
+        assert_eq!(reader.busy, JOBS);
+    });
+    cx.run_until_parked();
+    reader.read_with(cx, |reader, _| assert_eq!(reader.busy, 0));
+}
+
+#[gpui::test]
+fn code_is_highlighted_off_the_ui_thread_once_and_kept_by_its_text(cx: &mut TestAppContext) {
+    let (library, reader, _) = library(cx);
+    open(&library, "Throttle yt-dlp metadata backfill", cx);
+    let code = Code {
+        language: "rust".into(),
+        text: "fn main() {}".into(),
+    };
+    reader.update(cx, |reader, cx| {
+        assert!(reader.highlighted(&code).is_none());
+        reader.want_highlight(code.clone(), rank(0), cx);
+        reader.want_highlight(code.clone(), rank(0), cx);
+        assert_eq!(reader.busy, 1);
+        assert!(reader.queued.is_empty());
+    });
+    cx.run_until_parked();
+    reader.update(cx, |reader, _| {
+        let highlights = reader.highlighted(&code).expect("highlighted");
+        assert!(
+            highlights
+                .iter()
+                .any(|(range, kind)| *range == (0..2) && *kind == TokenKind::Keyword)
+        );
+    });
+    /* Kept when the session closes, as it is the text's. */
+    library.update(cx, |library, cx| library.close(cx));
+    cx.run_until_parked();
+    reader.update(cx, |reader, _| assert!(reader.highlighted(&code).is_some()));
 }
 
 #[gpui::test]

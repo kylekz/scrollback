@@ -444,7 +444,8 @@ fn prose(
     let piece = |index: usize| prepared.as_ref().and_then(|prose| prose.pieces.get(index));
     let content = match part {
         ProsePart::Pending => {
-            reader.update(cx, |reader, cx| reader.want_prose(at, cx));
+            let rank = view.rank(ix);
+            reader.update(cx, |reader, cx| reader.want_prose(at, rank, cx));
             /* About as high as the prose will be, so that little moves when it lands. */
             let lines = (length / 90).clamp(1, 16);
             div()
@@ -481,6 +482,7 @@ fn prose(
                     ix,
                     language.as_deref(),
                     &code,
+                    cx,
                 );
                 code_view(ix, language.as_deref(), code, &highlights, theme)
             }

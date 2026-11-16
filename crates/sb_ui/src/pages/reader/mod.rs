@@ -55,7 +55,9 @@ use crate::format;
 use crate::icons::SbIcon;
 use crate::keymap;
 use crate::markdown::Sanitized;
-use crate::services::reader::{BlockRef, Held, OpenSession, ReaderService, ReaderState};
+use crate::services::reader::{
+    BlockRef, Code, Held, Highlights, OpenSession, Rank, ReaderService, ReaderState,
+};
 use crate::services::{ActiveServices as _, LibraryService};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 use rows::{Row, RowKind, Space};
@@ -69,9 +71,6 @@ const KEEP_STATES: usize = 40;
 const KEEP_DATA: usize = 160;
 /// How many skeleton rows stand in for the column while a session is parsed.
 const SKELETON_ROWS: usize = 6;
-
-/// The highlights of a piece of fenced code: where each kind of token is.
-type Highlights = Rc<[(std::ops::Range<usize>, crate::syntax::TokenKind)]>;
 
 /// A Markdown state: of a piece of a block's prose.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -121,8 +120,13 @@ pub struct ReaderView {
     /// it until then). Scrolling back down to the end doesn't take it up again.
     wheeled: Rc<Cell<bool>>,
     states: HashMap<Piece, (Entity<TextViewState>, usize)>,
-    /// The highlights of the pieces of fenced code drawn, kept as the Markdown states are.
+    /// The highlights of the pieces of fenced code drawn, kept as the Markdown states are, once
+    /// they are made.
     highlights: HashMap<Piece, (Highlights, usize)>,
+    /// Counts the frames, and the row at the top of the column this frame: where a row is, for
+    /// the jobs it asks for ([`Rank`]).
+    frame: u64,
+    top: usize,
     /// What of the service's the rows drawn hold, by the row last drawn with it.
     held: HashMap<Held, usize>,
     /// The first and last rows drawn in the last frame.
@@ -149,6 +153,8 @@ impl ReaderView {
             wheeled: Rc::default(),
             states: HashMap::new(),
             highlights: HashMap::new(),
+            frame: 0,
+            top: 0,
             held: HashMap::new(),
             drawn: Rc::default(),
             label_width: label,
@@ -507,29 +513,59 @@ impl ReaderView {
         Some(state)
     }
 
-    /// Keeps the highlights of the piece of code `piece` drawn at row `at`, found in `code`
-    /// the first time.
+    /// Where the row `at` is drawn, for the jobs it asks for.
+    fn rank(&self, at: usize) -> Rank {
+        Rank {
+            frame: self.frame,
+            distance: at.abs_diff(self.top),
+        }
+    }
+
+    /**
+     * The highlights of the piece of code `piece` drawn at row `at`, `code` in `language`: kept
+     * once they are made, and asked of the reader service until then, which makes them off
+     * the UI thread. Until they are made the code is plain.
+     */
     fn highlights(
         &mut self,
         piece: Piece,
         at: usize,
         language: Option<&str>,
         code: &str,
+        cx: &mut Context<Self>,
     ) -> Highlights {
         if let Some((highlights, row)) = self.highlights.get_mut(&piece) {
             *row = at;
             return highlights.clone();
         }
-        let highlights: Highlights = match language {
-            Some(language) if code.len() <= crate::syntax::MAX_HIGHLIGHT_BYTES => {
-                crate::syntax::highlight(language, code)
-                    .unwrap_or_default()
-                    .into()
-            }
-            _ => Rc::default(),
+        let Some(language) = language.filter(|_| code.len() <= crate::syntax::MAX_HIGHLIGHT_BYTES)
+        else {
+            self.highlights.insert(piece, (Highlights::default(), at));
+            return Highlights::default();
         };
-        self.highlights.insert(piece, (highlights.clone(), at));
-        highlights
+        let code = Code {
+            language: language.into(),
+            text: code.into(),
+        };
+        let rank = self.rank(at);
+        let reader = cx.services().reader.clone();
+        let made = reader.update(cx, |reader, cx| {
+            let made = reader.highlighted(&code);
+            if made.is_none() {
+                reader.want_highlight(code.clone(), rank, cx);
+            }
+            made
+        });
+        match made {
+            Some(highlights) => {
+                self.highlights.insert(piece, (highlights.clone(), at));
+                highlights
+            }
+            None => {
+                self.hold(Held::Highlight(code), at);
+                Highlights::default()
+            }
+        }
     }
 
     /// Notes that the row `at` drew with `held`, so it is kept while the row is near.
@@ -1006,6 +1042,8 @@ impl Render for ReaderView {
         if self.wheeled.take() {
             self.list.set_follow_mode(gpui::FollowMode::Normal);
         }
+        self.frame += 1;
+        self.top = self.list.logical_scroll_top().item_ix;
         self.let_go_of_far(cx);
         self.drawn.set(None);
         let widest = self

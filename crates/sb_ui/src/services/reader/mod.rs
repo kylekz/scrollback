@@ -12,14 +12,23 @@
 //! another session's content. A parse can't be stopped half-way; going back drops its result.
 //!
 //! **Loading.** What the views draw is prepared when they first draw it, each on a background
-//! task ([`Load`]): a prompt's or a reply's prose ([`Prose`]: cut into pieces, sanitised), a
-//! call's body when its row is open, a subagent's conversation when its call is, a
-//! compaction's summary, an image ([`Picture`]: one bounded frame). The first few prompts and
-//! replies are prepared with the parse, so the first turns paint with it. Loads read the items
-//! at the versions the parse read ([`Pinned`]) through a [`SegmentCache`] of the last segments
-//! decoded, so opening one row after another near the end of a long transcript decodes its
-//! last segment once. Which subagent started which ([`Placement`]) is worked out once the
-//! subagents no call of the session's own started come into view.
+//! task ([`Load`]): a prompt's or a reply's prose ([`Prose`]: cut into pieces, sanitised), the
+//! highlights of a piece of fenced code ([`Code`]), a call's body when its row is open, a
+//! subagent's conversation when its call is, a compaction's summary, an image ([`Picture`]: one
+//! bounded frame). The first few prompts and replies are prepared with the parse, so the first
+//! turns paint with it, while the prose's budget lasts. Loads read the items at the versions the
+//! parse read ([`Pinned`]) through a [`SegmentCache`] of the last segments decoded, so opening
+//! one row after another near the end of a long transcript decodes its last segment once.
+//! Which subagent started which ([`Placement`]) is worked out once the subagents no call of the
+//! session's own started come into view.
+//!
+//! **Jobs.** Prose and highlights take the most time, so they are jobs ([`Job`]), at most
+//! [`JOBS`] running at once on gpui's background executor, whose other threads stay free for
+//! sync and search. The rest wait in a queue, the rows drawn last first, nearest the top of the
+//! column first ([`Rank`]). There is never more than one job for one thing. A row let go of
+//! drops its job from the queue; one running is told to stop at its next piece, and what it
+//! made is dropped (a row that came back meanwhile has it prepared again). Highlights are kept
+//! by the code's text, [`HIGHLIGHTS_KEPT`] of them, so a block scrolled back to costs nothing.
 //!
 //! **Letting go.** The views say what they have scrolled far from ([`ReaderService::release`]):
 //! its prose, bodies and images are dropped, an image's texture with it, and prepared again if
@@ -36,9 +45,12 @@ pub mod prose;
 mod tests;
 pub mod text;
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use gpui::{AppContext as _, Context, Entity, Subscription};
 use sb_core::archive::{Archive, ArchivedSession, Pinned, SegmentCache};
@@ -49,6 +61,7 @@ use sb_core::transcript::{
 };
 
 use super::{ArchiveService, LibraryService, Providers};
+use crate::syntax::TokenKind;
 pub use picture::Picture;
 pub use prose::{Piece, Prose};
 pub use text::Text;
@@ -68,8 +81,72 @@ const HEAD_BYTES: u64 = 16 * 1024;
 const DECODES: usize = 2;
 
 /// How many of the first prompts and replies of the session's own conversation are prepared
-/// with the parse, so that the first turns paint with it: those of at most a piece each.
+/// with the parse, so that the first turns paint with it: those of at most a piece each, for at
+/// most [`prose::PARSE_BUDGET`] all told.
 const EAGER_PROSE: usize = 24;
+
+/// How many jobs run at once (the module docs).
+const JOBS: usize = 2;
+
+/// How many pieces of code's highlights are kept, the one asked for least lately let go first.
+const HIGHLIGHTS_KEPT: usize = 256;
+
+/**
+ * Where a row that asks for a job was drawn, to order the jobs waiting: those of rows drawn in
+ * the newest frame first, of those the nearest the top of the column.
+ */
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rank {
+    /// The view's count of its frames.
+    pub frame: u64,
+    /// How many rows the row is from the one at the top of the column.
+    pub distance: usize,
+}
+
+impl Rank {
+    /// The least first.
+    fn order(self) -> (Reverse<u64>, usize) {
+        (Reverse(self.frame), self.distance)
+    }
+}
+
+/// A piece of fenced code to highlight: its language as its fence names it, and its text.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Code {
+    pub language: Arc<str>,
+    pub text: Arc<str>,
+}
+
+/// The highlights of a piece of code: where each kind of token is. Empty when it is drawn plain.
+pub type Highlights = Arc<[(Range<usize>, TokenKind)]>;
+
+/// What a job is for (the module docs).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Job {
+    Prose(BlockRef),
+    Highlight(Code),
+}
+
+/// A job running: its flag, cleared when what it is for is let go of, and the rank it was
+/// started at, to queue it again by.
+struct Running {
+    wanted: Arc<AtomicBool>,
+    rank: Rank,
+}
+
+/// What a job made, and what for.
+enum Done {
+    Prose(BlockRef, Result<Arc<Prose>, String>),
+    /// `None` when the code is drawn plain.
+    Highlight(Code, Option<Vec<(Range<usize>, TokenKind)>>),
+}
+
+/// The text of a block's prose, as it is prepared: Markdown, plain, or Markdown to read.
+enum Source {
+    Markdown(String),
+    Plain(String),
+    Stored(Stored),
+}
 
 /// A block of one of the session's conversations: the session's own, or a subagent's, named by
 /// the item it was parsed from.
@@ -114,6 +191,9 @@ pub enum Held {
     Subagent(Arc<str>),
     /// The whole of a call's input (`None`) or of a part of its output, read for Show all.
     Whole(BlockRef, Option<usize>),
+    /// A piece of code's highlights, while they are waited for: the job waiting is dropped.
+    /// Those made are kept by the code's text ([`HIGHLIGHTS_KEPT`]).
+    Highlight(Code),
 }
 
 /// A row the owner opened or closed by hand (the module docs).
@@ -439,6 +519,16 @@ pub struct ReaderService {
     alive: Arc<AtomicBool>,
     /// The images being decoded ([`Decoding`]): at most [`DECODES`].
     decoding: Arc<AtomicUsize>,
+    /// The jobs asked for and not started, with their rows' ranks (the module docs).
+    queued: HashMap<Job, Rank>,
+    /// The jobs of this generation running.
+    running: HashMap<Job, Running>,
+    /// How many jobs are running, of any generation: at most [`JOBS`].
+    busy: usize,
+    /// The highlights made lately, by the code's text, each with when it was last asked for.
+    highlights: HashMap<Code, (Highlights, u64)>,
+    /// Counts the asks for highlights, for `highlights`' times.
+    asks: u64,
     _observers: [Subscription; 2],
 }
 
@@ -463,6 +553,11 @@ impl ReaderService {
             loading: 0,
             alive: Arc::new(AtomicBool::new(true)),
             decoding: Arc::default(),
+            queued: HashMap::new(),
+            running: HashMap::new(),
+            busy: 0,
+            highlights: HashMap::new(),
+            asks: 0,
         }
     }
 
@@ -483,7 +578,10 @@ impl ReaderService {
 
     /// Nothing is being parsed or loaded.
     pub fn is_settled(&self) -> bool {
-        !matches!(self.state, ReaderState::Opening(_)) && self.loading == 0
+        !matches!(self.state, ReaderState::Opening(_))
+            && self.loading == 0
+            && self.queued.is_empty()
+            && self.running.is_empty()
     }
 
     /// Shows every call open, or each as the owner left it. Rows closed by hand in Full calls
@@ -529,7 +627,18 @@ impl ReaderService {
         let mut released = false;
         for held in held {
             released |= match held {
-                Held::Prose(at) => open.prose.remove(&at).is_some(),
+                Held::Prose(at) => {
+                    let job = Job::Prose(at.clone());
+                    self.queued.remove(&job);
+                    if let Some(running) = self.running.get(&job) {
+                        running.wanted.store(false, Ordering::Relaxed);
+                    }
+                    open.prose.remove(&at).is_some()
+                }
+                Held::Highlight(code) => {
+                    self.queued.remove(&Job::Highlight(code));
+                    false
+                }
                 Held::Body(at) => open.bodies.remove(&at).is_some(),
                 Held::Image(key) => match open.images.remove(&key) {
                     Some(Load::Loaded(picture)) => {
@@ -579,6 +688,13 @@ impl ReaderService {
         self.loading = 0;
         self.alive.store(false, Ordering::Relaxed);
         self.alive = Arc::new(AtomicBool::new(true));
+        /* A job running goes no further than its next piece; it still counts in `busy` until it
+        ends. */
+        for running in self.running.values() {
+            running.wanted.store(false, Ordering::Relaxed);
+        }
+        self.running.clear();
+        self.queued.clear();
         let before = std::mem::replace(&mut self.state, ReaderState::Closed);
         if let ReaderState::Open(open) = &before {
             for image in open.images.values() {
@@ -615,7 +731,7 @@ impl ReaderService {
                 if !alive.load(Ordering::Relaxed) {
                     return Err("passed over".to_string());
                 }
-                parse(&archive, &providers, &id)
+                parse(&archive, &providers, &id, &alive)
             }
         });
         cx.spawn(async move |this, cx| {
@@ -692,53 +808,159 @@ impl ReaderService {
         .detach();
     }
 
-    /// Prepares the prose of the block at `at`: a prompt, a reply, a thought, or a
-    /// compaction's summary.
-    pub fn want_prose(&mut self, at: &BlockRef, cx: &mut Context<Self>) {
-        enum Source {
-            Markdown(String),
-            Plain(String),
-            Stored(Stored),
-        }
-        let source = match self
-            .open_session()
-            .and_then(|open| open.block(at))
-            .map(|block| &block.content)
-        {
-            Some(Content::Prompt { text, .. } | Content::Reply { text }) => {
-                Source::Markdown(text.clone())
-            }
-            Some(Content::Thinking { text, .. }) => Source::Plain(text.clone()),
-            Some(Content::Compaction {
-                summary: Some(summary),
-                ..
-            }) => Source::Stored(summary.clone()),
-            _ => return,
+    /**
+     * Prepares the prose of the block at `at`, a prompt, a reply, a thought or a compaction's
+     * summary, as a job (the module docs) for a row drawn at `rank`; one waiting already takes
+     * the rank.
+     */
+    pub fn want_prose(&mut self, at: &BlockRef, rank: Rank, cx: &mut Context<Self>) {
+        let ReaderState::Open(open) = &mut self.state else {
+            return;
         };
-        let key = at.clone();
-        let alive = self.alive.clone();
-        self.load(
-            |open| claim(&mut open.prose, &key),
-            move |_, items| {
-                /* A body of a session closed meanwhile goes no further than its next parse. */
-                let wanted = || alive.load(Ordering::Relaxed);
-                match source {
-                    Source::Markdown(text) => Ok(Arc::new(Prose::markdown_while(&text, &wanted))),
-                    Source::Plain(text) => Ok(Arc::new(Prose::plain(&text))),
-                    Source::Stored(stored) => stored
-                        .load_text(items)
-                        .map(|text| Arc::new(Prose::markdown_while(&text, &wanted)))
-                        .map_err(|error| error.to_string()),
+        let job = Job::Prose(at.clone());
+        match open.prose.get(at) {
+            Some(Load::Loading) => {
+                if let Some(queued) = self.queued.get_mut(&job) {
+                    *queued = rank;
                 }
-            },
-            {
-                let at = at.clone();
-                move |open, prose, _| {
-                    land(&mut open.prose, at, loaded(prose));
+                return;
+            }
+            Some(_) => return,
+            None => {}
+        }
+        open.prose.insert(at.clone(), Load::Loading);
+        /* One still running for a row that was let go of and came back is queued again when
+        it ends. */
+        if !self.running.contains_key(&job) {
+            self.queued.insert(job, rank);
+            self.pump(cx);
+        }
+    }
+
+    /// The highlights of `code`, when they have been made; asked for, they are kept longer.
+    pub fn highlighted(&mut self, code: &Code) -> Option<Highlights> {
+        self.asks += 1;
+        let (highlights, asked) = self.highlights.get_mut(code)?;
+        *asked = self.asks;
+        Some(highlights.clone())
+    }
+
+    /// Highlights `code` as a job (the module docs) for a row drawn at `rank`, unless that is
+    /// running; one waiting already takes the rank.
+    pub fn want_highlight(&mut self, code: Code, rank: Rank, cx: &mut Context<Self>) {
+        let job = Job::Highlight(code);
+        if !self.running.contains_key(&job) {
+            self.queued.insert(job, rank);
+            self.pump(cx);
+        }
+    }
+
+    /// Starts the jobs waiting, the first by their rank, while fewer than [`JOBS`] run.
+    fn pump(&mut self, cx: &mut Context<Self>) {
+        while self.busy < JOBS {
+            let Some((job, rank)) = self
+                .queued
+                .iter()
+                .min_by_key(|(_, rank)| rank.order())
+                .map(|(job, rank)| (job.clone(), *rank))
+            else {
+                return;
+            };
+            self.queued.remove(&job);
+            self.start(job, rank, cx);
+        }
+    }
+
+    fn start(&mut self, job: Job, rank: Rank, cx: &mut Context<Self>) {
+        let wanted = Arc::new(AtomicBool::new(true));
+        let work: Box<dyn FnOnce() -> Done + Send> = match &job {
+            Job::Highlight(code) => {
+                let code = code.clone();
+                Box::new(move || {
+                    let highlights = crate::syntax::highlight(&code.language, &code.text);
+                    Done::Highlight(code, highlights)
+                })
+            }
+            Job::Prose(at) => {
+                let archive = self.archive.read(cx).archive().cloned();
+                let ReaderState::Open(open) = &mut self.state else {
+                    return;
+                };
+                let (Some(source), Some(archive)) = (source(open, at), archive) else {
+                    open.prose.remove(at);
+                    return;
+                };
+                let (at, pinned, cache) = (at.clone(), open.pinned.clone(), open.cache.clone());
+                let flag = wanted.clone();
+                Box::new(move || {
+                    /* A body of a row let go of, or of a session closed, meanwhile goes no
+                    further than its next piece. */
+                    let wanted = || flag.load(Ordering::Relaxed);
+                    let prose = match source {
+                        Source::Markdown(text) => {
+                            Ok(Arc::new(Prose::markdown_while(&text, &wanted)))
+                        }
+                        Source::Plain(text) => Ok(Arc::new(Prose::plain(&text))),
+                        Source::Stored(stored) => stored
+                            .load_text(&archive.pinned_session(&pinned, cache))
+                            .map(|text| Arc::new(Prose::markdown_while(&text, &wanted)))
+                            .map_err(|error| error.to_string()),
+                    };
+                    Done::Prose(at, prose)
+                })
+            }
+        };
+        self.busy += 1;
+        self.running.insert(job, Running { wanted, rank });
+        let generation = self.generation;
+        let task = cx.background_spawn(async move { work() });
+        cx.spawn(async move |this, cx| {
+            let done = task.await;
+            this.update(cx, |this, cx| this.finish(generation, done, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Takes in what a job started in `generation` made, and starts the next.
+    fn finish(&mut self, generation: u64, done: Done, cx: &mut Context<Self>) {
+        self.busy -= 1;
+        /* A job of a session closed since is no longer among those running. */
+        let current = generation == self.generation;
+        match done {
+            /* Kept by the code's text, whatever has been opened since. */
+            Done::Highlight(code, highlights) => {
+                if current {
+                    self.running.remove(&Job::Highlight(code.clone()));
                 }
-            },
-            cx,
-        );
+                self.asks += 1;
+                let highlights = highlights.map(Highlights::from).unwrap_or_default();
+                self.highlights.insert(code, (highlights, self.asks));
+                if self.highlights.len() > HIGHLIGHTS_KEPT
+                    && let Some(oldest) = self
+                        .highlights
+                        .iter()
+                        .min_by_key(|(_, (_, asked))| *asked)
+                        .map(|(code, _)| code.clone())
+                {
+                    self.highlights.remove(&oldest);
+                }
+            }
+            Done::Prose(at, prose) => {
+                let running = current
+                    .then(|| self.running.remove(&Job::Prose(at.clone())))
+                    .flatten();
+                if let (Some(running), ReaderState::Open(open)) = (running, &mut self.state) {
+                    if running.wanted.load(Ordering::Relaxed) {
+                        land(&mut open.prose, at, loaded(prose));
+                    } else if matches!(open.prose.get(&at), Some(Load::Loading)) {
+                        self.queued.insert(Job::Prose(at), running.rank);
+                    }
+                }
+            }
+        }
+        cx.notify();
+        self.pump(cx);
     }
 
     /// Loads the body of the call at `at`, unless it is loading or loaded.
@@ -1085,6 +1307,21 @@ impl Drop for Decoding {
     }
 }
 
+/// The text of the prose of the block at `at`, when it has any.
+fn source(open: &OpenSession, at: &BlockRef) -> Option<Source> {
+    match &open.block(at)?.content {
+        Content::Prompt { text, .. } | Content::Reply { text } => {
+            Some(Source::Markdown(text.clone()))
+        }
+        Content::Thinking { text, .. } => Some(Source::Plain(text.clone())),
+        Content::Compaction {
+            summary: Some(summary),
+            ..
+        } => Some(Source::Stored(summary.clone())),
+        _ => None,
+    }
+}
+
 /// Marks `key` loading in `map`; `false` when it is loading or loaded already.
 fn claim<K: Eq + std::hash::Hash + Clone, T>(map: &mut HashMap<K, Load<T>>, key: &K) -> bool {
     if map.contains_key(key) {
@@ -1176,8 +1413,13 @@ fn settle(conversation: &mut Conversation, found: &mut Vec<(Arc<str>, Arc<Subage
 }
 
 /// Parses the session `id` with its agent's provider: what [`ReaderService::open`] runs off
-/// the UI thread.
-fn parse(archive: &Archive, providers: &Providers, id: &SessionId) -> Result<OpenSession, String> {
+/// the UI thread, while `alive` says the session is still the one open.
+fn parse(
+    archive: &Archive,
+    providers: &Providers,
+    id: &SessionId,
+    alive: &AtomicBool,
+) -> Result<OpenSession, String> {
     let provider = providers
         .iter()
         .position(|provider| provider.id().as_str() == id.provider)
@@ -1235,6 +1477,8 @@ fn parse(archive: &Archive, providers: &Providers, id: &SessionId) -> Result<Ope
     if let Some(main) = &mut open.main {
         settle(main, &mut found);
         let item = main.item.clone();
+        let started = Instant::now();
+        let wanted = || alive.load(Ordering::Relaxed);
         let eager = main
             .turns()
             .iter()
@@ -1245,13 +1489,15 @@ fn parse(archive: &Archive, providers: &Providers, id: &SessionId) -> Result<Ope
             })
             .take(EAGER_PROSE)
             .filter(|(_, text)| text.len() <= prose::PIECE_BYTES)
+            /* The rest are prepared as their rows are drawn. */
+            .take_while(|_| started.elapsed() < prose::PARSE_BUDGET && wanted())
             .map(|(id, text)| {
                 (
                     BlockRef {
                         conversation: item.clone(),
                         block: id,
                     },
-                    Load::Loaded(Arc::new(Prose::markdown(text))),
+                    Load::Loaded(Arc::new(Prose::markdown_while(text, &wanted))),
                 )
             });
         open.prose.extend(eager);
