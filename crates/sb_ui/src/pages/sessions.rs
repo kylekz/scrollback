@@ -570,6 +570,8 @@ impl SessionsView {
         if !cut {
             return tag.into_any_element();
         }
+        // On a tight line a tag keeps to its cap and leaves the rest to the model's name.
+        let tag = tag.max_w(least);
         let name = SharedString::from(name.to_string());
         tag.id(id)
             .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx))
@@ -685,12 +687,17 @@ impl SessionsView {
         .chain(tags.iter().map(|(natural, _)| *natural))
         .collect();
         let inner = self.card_width - CARD_PADDING * 2. - px(2.);
-        let tight = line_width(&line, theme) > inner;
-        /* The model's name gives way first: it is cut when the line, with it whole, is too
-        long, and then says itself in full on hover, as a cut tag does. */
-        let model_cut = line_width(&line, theme) - MODEL_MIN
-            + text_width(&model, &theme.text.small, window)
-            > inner;
+        /* With the model's name whole, the count and the tags whole: does it fit? If not, the
+        tags keep to their caps, so that the name and the count keep their room; and the name,
+        which gives way first, says itself in full on hover, as a cut tag does. */
+        let whole =
+            line_width(&line, theme) - MODEL_MIN + text_width(&model, &theme.text.small, window);
+        let tight = whole > inner;
+        let given: Pixels = tags
+            .iter()
+            .map(|(natural, least)| (*natural - *least).max(px(0.)))
+            .sum();
+        let model_cut = tight && whole - given > inner;
         let cut = |(natural, least): (Pixels, Pixels)| tight && natural > least;
 
         let id = session.id.clone();

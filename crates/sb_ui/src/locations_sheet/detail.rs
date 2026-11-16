@@ -7,7 +7,7 @@
 use gpui::{
     AnyElement, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
-    prelude::FluentBuilder as _, px,
+    prelude::FluentBuilder as _,
 };
 use sb_core::location::{Location, LocationKind};
 
@@ -16,7 +16,7 @@ use crate::add_location::{field, help_line, test_card};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
-    ButtonKind, button, card, dot, icon, kind_icon, kind_name, kv, label, location_tag,
+    ButtonKind, button, card, dot, end_cut, icon, kind_icon, kind_name, kv, label, location_tag,
     progress_bar, said, with_numbers,
 };
 use crate::format;
@@ -70,9 +70,9 @@ impl LocationsSheet {
             .flex()
             .flex_col()
             .gap(theme.spacing.lg)
-            .pt(px(18.))
+            .pt(theme.sizes.sheet_padding)
             .pb(theme.spacing.lg)
-            .px(px(20.))
+            .px(theme.sizes.pane_padding)
             .child(
                 div()
                     .flex()
@@ -102,9 +102,23 @@ impl LocationsSheet {
                     .gap(theme.spacing.xs)
                     .child(label("Name", theme))
                     .child(
-                        field(&self.name, false, false, window, theme, cx)
-                            .automation_target("sheet/name"),
-                    ),
+                        field(
+                            &self.name,
+                            false,
+                            self.name_problem().is_some(),
+                            window,
+                            theme,
+                            cx,
+                        )
+                        .automation_target("sheet/name"),
+                    )
+                    .children(self.name_problem().map(|problem| {
+                        div()
+                            .text_color(c.red)
+                            .text_spec(&theme.text.secondary)
+                            .child(problem.to_string())
+                            .automation_target("sheet/name-problem")
+                    })),
             )
             .children(connects)
             .child(status)
@@ -125,7 +139,7 @@ impl LocationsSheet {
                     .gap(theme.spacing.sm)
                     .pt(theme.spacing.sm)
                     .pb(theme.spacing.lg)
-                    .px(px(20.))
+                    .px(theme.sizes.pane_padding)
                     .child(
                 div()
                     .flex()
@@ -146,10 +160,13 @@ impl LocationsSheet {
                         let kind = location.kind.clone();
                         this.child(
                             button("sheet-test", ButtonKind::Plain, true, !removing, theme)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let kind = kind.clone();
-                                    this.sync.update(cx, |sync, cx| sync.test_place(kind, cx));
-                                }))
+                                .when(!removing, |this| {
+                                    this.on_click(cx.listener(move |this, _, _, cx| {
+                                        let kind = kind.clone();
+                                        this.sync
+                                            .update(cx, |sync, cx| sync.test_place(kind, cx));
+                                    }))
+                                })
                                 .child("Test connection")
                                 .automation_target("sheet/test"),
                         )
@@ -182,12 +199,20 @@ impl LocationsSheet {
                 div()
                     .text_color(c.fg3)
                     .text_spec(&theme.text.small)
-                    .child(format!(
-                        "Removing stops syncing {}. Its {} archived {} stay in the archive.",
-                        location.name,
-                        format::count(sessions as u64),
-                        if sessions == 1 { "session" } else { "sessions" }
-                    )),
+                    .overflow_hidden()
+                    .child(if sessions == 0 {
+                        format!(
+                            "Removing stops syncing {}. Nothing was archived from it.",
+                            end_cut(&location.name, 40)
+                        )
+                    } else {
+                        format!(
+                            "Removing stops syncing {}. Its {} archived {} stay in the archive.",
+                            end_cut(&location.name, 40),
+                            format::count(sessions as u64),
+                            if sessions == 1 { "session" } else { "sessions" }
+                        )
+                    }),
             ))
             .automation_target("sheet/detail")
     }
@@ -261,7 +286,7 @@ impl LocationsSheet {
         });
         let card = card(theme)
             .gap(theme.spacing.sm)
-            .py(px(10.))
+            .py(theme.sizes.list_row_padding)
             .px(theme.spacing.lg);
         let (card, target) = match sync.status(location) {
             LocationStatus::Synced(at) => (
@@ -344,6 +369,27 @@ impl LocationsSheet {
                     .children(stale),
                 "sheet/status/failed",
             ),
+            LocationStatus::Stopped {
+                items_left,
+                bytes_left,
+            } => (
+                card.child(headline(
+                    dot(None, theme),
+                    "Stopped",
+                    super::stopped_line(items_left, bytes_left)
+                        .trim_start_matches("Stopped · ")
+                        .to_string(),
+                ))
+                .child(
+                    div()
+                        .text_color(c.fg3)
+                        .text_spec(&theme.text.secondary)
+                        .child("What was copied is kept; the next sync carries on from there."),
+                )
+                .child(last_good)
+                .children(stale),
+                "sheet/status/stopped",
+            ),
             LocationStatus::NeverSynced => (
                 card.child(headline(
                     dot(None, theme),
@@ -366,11 +412,13 @@ impl LocationsSheet {
 fn failed_note(kind: &LocationKind) -> &'static str {
     match kind {
         LocationKind::Ssh { .. } => {
-            "ssh's own words. scrollback never accepts a host key for you: if the key changed, \
-             check why, update known_hosts in a terminal, then Sync now."
+            "scrollback never accepts a host key for you. If the key changed, check why and \
+             update known_hosts in a terminal; if the host is new, connect once with ssh in a \
+             terminal and answer its question. Then Sync now."
         }
-        LocationKind::Wsl { .. } => "wsl.exe's and the distro's own words.",
-        LocationKind::Local => "The words of what failed, as it said them.",
+        LocationKind::Wsl { .. } | LocationKind::Local => {
+            "What failed, as it was recorded. Sync now tries again."
+        }
     }
 }
 
@@ -391,7 +439,7 @@ fn connects(location: &Location, sync: &SyncService, theme: &SbTheme) -> Vec<Any
                         .flex()
                         .items_center()
                         .h(theme.sizes.input_height)
-                        .px(px(10.))
+                        .px(theme.sizes.list_row_padding)
                         .rounded(theme.radii.input)
                         .border_1()
                         .border_color(c.line_subtle)
@@ -416,7 +464,7 @@ fn connects(location: &Location, sync: &SyncService, theme: &SbTheme) -> Vec<Any
             vec![
                 card(theme)
                     .gap(theme.spacing.sm)
-                    .py(px(10.))
+                    .py(theme.sizes.list_row_padding)
                     .px(theme.spacing.lg)
                     .child(kv(
                         "Distro",
@@ -453,7 +501,7 @@ fn found_card(
     let found = details.found(&location.id);
     let card = card(theme)
         .gap(theme.spacing.sm)
-        .py(px(10.))
+        .py(theme.sizes.list_row_padding)
         .px(theme.spacing.lg)
         .child(
             div()
@@ -471,9 +519,15 @@ fn found_card(
             )
             .automation_target("sheet/found-card");
     }
+    let trashed = details.trashed(&location.id);
     let archived = format!(
-        "{} · {}{}",
+        "{}{} · {}{}",
         format::plural(details.sessions(&location.id), "session"),
+        if trashed > 0 {
+            format!(" ({trashed} in Trash)")
+        } else {
+            String::new()
+        },
         format::size(details.bytes(&location.id)),
         details
             .since(&location.id)

@@ -27,6 +27,10 @@ pub fn run(cli: Cli) -> Result<()> {
     #[cfg(not(feature = "automation"))]
     let automation = false;
     let place = crate::data_dir::resolve(cli.data_dir.clone(), automation)?;
+    #[cfg(feature = "automation")]
+    if cli.dev_location_home.is_some() {
+        crate::data_dir::for_development(&place)?;
+    }
     log::info!(
         "data directory: {} ({})",
         place.dir.display(),

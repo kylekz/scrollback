@@ -23,7 +23,8 @@ use crate::add_location::{AddLocation, AddLocationEvent, Kind, Purpose};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
-    ButtonKind, button, checkbox, icon, kind_icon, kind_name, location_tag, overline, tab_stop,
+    ButtonKind, button, checkbox, development_notice, icon, kind_icon, kind_name, location_tag,
+    overline, tab_stop,
 };
 use crate::format;
 use crate::icons::SbIcon;
@@ -88,7 +89,8 @@ struct Offered {
 struct Host {
     kind: LocationKind,
     name: String,
-    sessions: Option<usize>,
+    /// What its test said of it: how many sessions, or why it couldn't tell.
+    said: String,
 }
 
 /**
@@ -159,13 +161,21 @@ impl FirstRun {
                     Err(why) => (why.clone(), true),
                 })
                 .collect();
+            /* A place whose providers could not look is not said to have nothing. */
+            let failed = found.is_some_and(|found| found.iter().any(Result::is_err));
             let count = match found {
+                Some(_) if failed && agents.is_empty() => "couldn't look".to_string(),
                 Some(_) => found_line(&agents),
                 None => "looking…".to_string(),
             };
-            (lines, count, !agents.is_empty())
+            (
+                lines,
+                count,
+                !agents.is_empty(),
+                failed && agents.is_empty(),
+            )
         };
-        let (lines, count, any) = surveyed(sync.found());
+        let (lines, count, any, _) = surveyed(sync.found());
         let mut offered = vec![Offered {
             kind: LocationKind::Local,
             name: local_name().to_string(),
@@ -181,7 +191,7 @@ impl FirstRun {
                     distro: distro.name.clone(),
                 };
                 if distro.running {
-                    let (lines, count, _) = surveyed(distros.surveys.get(&distro.name));
+                    let (lines, count, _, failed) = surveyed(distros.surveys.get(&distro.name));
                     Offered {
                         kind,
                         name: distro.name.clone(),
@@ -192,7 +202,7 @@ impl FirstRun {
                         }),
                         lines,
                         count,
-                        checked: true,
+                        checked: !failed,
                         dim: false,
                     }
                 } else {
@@ -217,10 +227,7 @@ impl FirstRun {
             name: host.name.clone(),
             state: None,
             lines: Vec::new(),
-            count: host.sessions.map_or_else(
-                || "added unreachable".to_string(),
-                |sessions| format::plural(sessions, "session"),
-            ),
+            count: host.said.clone(),
             checked: true,
             dim: false,
         }));
@@ -270,19 +277,16 @@ impl FirstRun {
     /// Opens the add dialog's SSH step: a host chosen there joins the list, checked.
     fn add_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let back = window.focused(cx);
-        let dialog = cx.new(|cx| AddLocation::new(Purpose::Choose, Kind::Ssh, None, window, cx));
+        let taken = self.hosts.iter().map(|host| host.kind.clone()).collect();
+        let dialog =
+            cx.new(|cx| AddLocation::new(Purpose::Choose, Kind::Ssh, None, taken, window, cx));
         let heard = cx.subscribe_in(&dialog, window, |this, _, event, window, cx| {
-            if let AddLocationEvent::Chosen {
-                kind,
-                name,
-                sessions,
-            } = event
-            {
+            if let AddLocationEvent::Chosen { kind, name, said } = event {
                 this.hosts.retain(|host| !host.kind.same_place(kind));
                 this.hosts.push(Host {
                     kind: kind.clone(),
                     name: name.clone(),
-                    sessions: *sessions,
+                    said: said.clone(),
                 });
             }
             this.close_dialog(window, cx);
@@ -451,12 +455,24 @@ impl Render for FirstRun {
                 .err()
                 .map(|said| format!("WSL's distros couldn't be listed: {said}"))
         });
-        let rows: Vec<AnyElement> = self
+        /* What was found here, and apart from it the hosts the owner typed. */
+        let (hosts, found): (Vec<Offered>, Vec<Offered>) = self
             .offered(cx)
+            .into_iter()
+            .partition(|offered| matches!(offered.kind, LocationKind::Ssh { .. }));
+        let rows: Vec<AnyElement> = found
             .into_iter()
             .enumerate()
             .map(|(at, offered)| self.row(at, offered, &theme, cx))
             .collect();
+        let hosts: Vec<AnyElement> = hosts
+            .into_iter()
+            .enumerate()
+            .map(|(at, offered)| self.row(at, offered, &theme, cx))
+            .collect();
+        let development = self.sync.read(cx).development_home().map(|home| {
+            development_notice(home, &theme).automation_target("first-run/development")
+        });
         let dialog = self.dialog.as_ref().map(|(dialog, ..)| {
             let this = cx.entity().downgrade();
             overlay::modal(
@@ -472,13 +488,15 @@ impl Render for FirstRun {
         });
         // The dialog's scrim covers the whole window: it is drawn beside the page, whose
         // edges would clip it.
+        // A window too short for the list scrolls it, so that the button stays in reach.
         let page = div()
+            .id("first-run")
             .size_full()
             .flex()
             .justify_center()
             .items_start()
-            .pt(theme.sizes.first_run_top)
-            .overflow_hidden()
+            .py(theme.sizes.first_run_top)
+            .overflow_y_scroll()
             .child(
                 div()
                     .flex_none()
@@ -509,6 +527,7 @@ impl Render for FirstRun {
                             .flex()
                             .flex_col()
                             .gap(theme.spacing.md)
+                            .children(development)
                             .child(overline(&format!("Found on {}", local_name()), &theme))
                             .child(
                                 div()
@@ -533,6 +552,17 @@ impl Render for FirstRun {
                             .flex_col()
                             .gap(theme.spacing.md)
                             .child(overline("Another machine", &theme))
+                            .when(!hosts.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .rounded(theme.radii.card)
+                                        .border_1()
+                                        .border_color(c.line)
+                                        .bg(c.s1)
+                                        .overflow_hidden()
+                                        .children(hosts),
+                                )
+                            })
                             .child(
                                 tab_stop(
                                     div()

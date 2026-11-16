@@ -350,6 +350,8 @@ pub enum ButtonKind {
     Primary,
     /// `.btn.danger`: as plain, with `red` text.
     Danger,
+    /// `.btn.ghost`: no fill and no border, `fg2` text; `s3` under the pointer.
+    Ghost,
 }
 
 /// A button (`.btn`: 28 high, radius 6, 500), or the small one (`.btn.sm`: 24 high, 12px).
@@ -363,15 +365,15 @@ pub fn button(
     theme: &SbTheme,
 ) -> Stateful<Div> {
     let c = &theme.colors;
+    let none = gpui::transparent_black();
     let (fill, hover, text, border) = match kind {
         ButtonKind::Plain => (c.s2, c.s3, c.fg, c.line),
         ButtonKind::Danger => (c.s2, c.s3, c.red, c.line),
-        ButtonKind::Primary => (
-            c.accent,
-            c.accent.opacity(0.9),
-            c.accent_ink,
-            gpui::transparent_black(),
-        ),
+        ButtonKind::Ghost => (none, c.s3, c.fg2, none),
+        /* A primary button that can't be pressed loses its accent too, so that it reads as
+        off and not as a paler on. */
+        ButtonKind::Primary if !enabled => (c.s3, c.s3, c.fg3, none),
+        ButtonKind::Primary => (c.accent, c.accent.opacity(0.9), c.accent_ink, none),
     };
     div()
         .id(id)
@@ -466,6 +468,58 @@ pub fn page_tile(glyph: SbIcon, accent: bool, theme: &SbTheme) -> impl IntoEleme
         .rounded(theme.radii.tile)
         .bg(fill)
         .child(icon(glyph, theme.sizes.tile_glyph, color))
+}
+
+/// `text` at most `most` characters long, cut in the middle where it is longer: for a path,
+/// whose two ends say the most.
+pub fn middle_cut(text: &str, most: usize) -> String {
+    let count = text.chars().count();
+    if count <= most {
+        return text.to_string();
+    }
+    let head = most.saturating_sub(1) / 2;
+    let tail = most.saturating_sub(1) - head;
+    let start: String = text.chars().take(head).collect();
+    let end: String = text.chars().skip(count - tail).collect();
+    format!("{start}\u{2026}{end}")
+}
+
+/// `text` at most `most` characters long, cut at its end where it is longer: for a name in
+/// a sentence.
+pub fn end_cut(text: &str, most: usize) -> String {
+    if text.chars().count() <= most {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(most.saturating_sub(1)).collect();
+    format!("{kept}\u{2026}")
+}
+
+/// What a build with the development override says wherever locations are listed or added
+/// (`scrollback`'s `--dev-location-home`): from where every distro and host is read.
+pub fn development_notice(home: &str, theme: &SbTheme) -> Div {
+    info_banner(theme).child(div().flex_1().min_w_0().child(format!(
+        "Development override: locations are read from {}",
+        middle_cut(home, 48)
+    )))
+}
+
+/// A chip that warns, led by the alert glyph (`.chip.warn` with its `.ic`).
+pub fn warn_chip_glyph(label: impl Into<SharedString>, theme: &SbTheme) -> Div {
+    let c = &theme.colors;
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(theme.spacing.xs)
+        .h(theme.sizes.tag_small_height)
+        .px(theme.spacing.sm)
+        .rounded(theme.radii.pill)
+        .bg(c.yellow_soft)
+        .text_color(c.yellow)
+        .text_spec(&theme.text.small)
+        .whitespace_nowrap()
+        .child(icon(SbIcon::TriangleAlert, theme.sizes.icon_xs, c.yellow))
+        .child(label.into())
 }
 
 /// A card (`.card`: `s1`, a `line-subtle` border, radius 10).
@@ -609,6 +663,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn a_long_text_is_cut_where_it_says_least() {
+        assert_eq!(middle_cut("/home/user/fixture", 40), "/home/user/fixture");
+        assert_eq!(middle_cut("abcdefghij", 7), "abc\u{2026}hij");
+        assert_eq!(end_cut("Ubuntu development", 7), "Ubuntu\u{2026}");
+        assert_eq!(end_cut("short", 7), "short");
+    }
 
     #[test]
     fn numbers_are_cut_from_the_words_around_them() {

@@ -21,7 +21,7 @@ use gpui::Context;
 use sb_core::CancelToken;
 use sb_core::archive::Archive;
 use sb_core::catalogue::{CatalogueError, Holding, ProviderAt};
-use sb_core::location::{Location, LocationId, LocationKind};
+use sb_core::location::{Location, LocationId, LocationKind, clean_name};
 use sb_core::transport::wsl::Distro;
 use sb_core::transport::{Launcher, Probe, TransportError};
 
@@ -68,7 +68,12 @@ impl Details {
             .sum()
     }
 
-    /// How many bytes the archive holds from `location`, as the sources had them.
+    /// How many of those sessions are in Trash.
+    pub fn trashed(&self, location: &LocationId) -> usize {
+        self.holdings(location).map(|holding| holding.trashed).sum()
+    }
+
+    /// How many bytes the archive holds from `location`, each item's newest version once.
     pub fn bytes(&self, location: &LocationId) -> u64 {
         self.holdings(location).map(|holding| holding.bytes).sum()
     }
@@ -141,6 +146,8 @@ pub enum TestFailure {
     NotInstalled(String),
     /// The tools the location lacks, by name.
     Missing(Vec<String>),
+    /// The user's login shell there was stopped before it answered, in scrollback's words.
+    LoginHung(String),
     /// Any other failure, in the failing tool's words.
     Other(String),
 }
@@ -154,6 +161,7 @@ impl TestFailure {
             TransportError::Refused(said) => Self::Refused(said),
             TransportError::HostKey(said) => Self::HostKey(said),
             TransportError::MissingTools(missing) => Self::Missing(missing),
+            hung @ TransportError::LoginShellHung(_) => Self::LoginHung(hung.to_string()),
             TransportError::Launch { program, source }
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
@@ -169,7 +177,7 @@ impl TestFailure {
     pub fn may_add_anyway(&self) -> bool {
         matches!(
             self,
-            Self::Unreachable(_) | Self::Refused(_) | Self::Other(_)
+            Self::Unreachable(_) | Self::Refused(_) | Self::LoginHung(_) | Self::Other(_)
         )
     }
 }
@@ -227,18 +235,22 @@ pub fn refusal<'a>(
     locations.find(|location| location.kind.same_place(kind))
 }
 
-/// What is wrong with `host` as a host to give `ssh`, if anything: only what must be, since
-/// `ssh` and the owner's config decide the rest (PLAN §6.4).
-pub fn host_problem(host: &str) -> Option<&'static str> {
-    if host.is_empty() {
-        Some("Type a host, as you would after ssh.")
-    } else if host.starts_with('-') {
-        Some("A host can't start with a dash.")
-    } else if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        Some("A host has no spaces or control characters.")
-    } else {
-        None
-    }
+/**
+ * What is wrong with `name` as the name of the location `id` (`None` for a new one) among
+ * `locations`, if anything: nothing left of it once what can't be seen is taken out
+ * ([`clean_name`]), or the name of another location.
+ */
+pub fn name_problem<'a>(
+    name: &str,
+    id: Option<&LocationId>,
+    mut locations: impl Iterator<Item = &'a Location>,
+) -> Option<String> {
+    let Some(name) = clean_name(name) else {
+        return Some("A location needs a name.".to_string());
+    };
+    locations
+        .find(|it| Some(&it.id) != id && it.name.eq_ignore_ascii_case(&name))
+        .map(|it| format!("{} is another location's name.", it.name))
 }
 
 impl SyncService {
@@ -309,8 +321,9 @@ impl SyncService {
 
     /**
      * Adds the place `kind` as a location named `name`, and with `sync_now` starts its first
-     * sync. A place that is a location already, or is being added, is not added again; one
-     * the owner removed comes back under `name` (module docs).
+     * sync. A place that is a location already, or is being added, is not added again, nor
+     * is a name another location has; one the owner removed comes back under the name it had
+     * (module docs). The locations are then as the catalogue orders them.
      */
     pub fn add(
         &mut self,
@@ -325,6 +338,15 @@ impl SyncService {
         if self.is_adding(&kind) || refusal(&kind, self.locations.iter().flatten()).is_some() {
             return;
         }
+        let restored = refusal(&kind, self.removed.iter()).is_some();
+        if !restored
+            && let Some(problem) = name_problem(&name, None, self.locations.iter().flatten())
+        {
+            self.refused = Some(problem);
+            cx.notify();
+            return;
+        }
+        let name = clean_name(&name).unwrap_or(name);
         self.adding.push(kind.clone());
         self.run(
             cx,
@@ -336,31 +358,30 @@ impl SyncService {
                     let added = match place {
                         Some(location) if location.removed.is_none() => Err(location.name),
                         Some(location) => {
-                            catalogue.restore_location(&location.id, &name)?;
-                            Ok(Location {
-                                name,
-                                removed: None,
-                                ..location
-                            })
+                            catalogue.restore_location(&location.id, &location.name)?;
+                            Ok(location.id)
                         }
-                        None => Ok(catalogue.add_location(kind, &name)?),
+                        None => Ok(catalogue.add_location(kind, &name)?.id),
                     };
-                    Ok::<_, CatalogueError>((added, Details::read(&archive)?))
+                    Ok::<_, CatalogueError>((
+                        added,
+                        catalogue.locations()?,
+                        Details::read(&archive)?,
+                    ))
                 }
             },
             move |this, added, cx| {
                 this.adding.retain(|it| !it.same_place(&kind));
                 match added {
-                    Ok((Ok(location), details)) => {
-                        let id = location.id.clone();
-                        this.removed.retain(|it| it.id != id);
-                        this.locations.get_or_insert_default().push(location);
+                    Ok((Ok(id), locations, details)) => {
+                        this.take_locations(locations, Some(&id));
                         this.details = details;
                         if sync_now {
                             this.sync(&id, cx);
                         }
                     }
-                    Ok((Err(name), details)) => {
+                    Ok((Err(name), locations, details)) => {
+                        this.take_locations(locations, None);
                         this.details = details;
                         this.refused = Some(format!("That place is a location already: {name}."));
                     }
@@ -373,14 +394,58 @@ impl SyncService {
         );
     }
 
-    /// Names a location `name`, which is trimmed; nothing happens with nothing left.
-    pub fn rename(&mut self, id: &LocationId, name: &str, cx: &mut Context<Self>) {
+    /**
+     * The locations in the order the catalogue gives them, the order they were added, from
+     * what an add read (`read`) just after it wrote `added`. What the service knows of every
+     * other location is kept: an add that ran beside this one may have read before it, and
+     * one this read missed (added since) goes after the rest.
+     */
+    fn take_locations(&mut self, read: Vec<Location>, added: Option<&LocationId>) {
+        let known: Vec<Location> = self
+            .locations
+            .take()
+            .into_iter()
+            .flatten()
+            .chain(std::mem::take(&mut self.removed))
+            .collect();
+        let mut all: Vec<Location> = read
+            .into_iter()
+            .map(
+                |location| match known.iter().find(|it| it.id == location.id) {
+                    Some(known) if Some(&known.id) != added => known.clone(),
+                    _ => location,
+                },
+            )
+            .collect();
+        for location in known {
+            if !all.iter().any(|it| it.id == location.id) {
+                all.push(location);
+            }
+        }
+        let (removed, locations) = all.into_iter().partition(|it| it.removed.is_some());
+        self.locations = Some(locations);
+        self.removed = removed;
+    }
+
+    /**
+     * Names a location `name`, as [`clean_name`] keeps it. A name that is nothing, or another
+     * location's, is refused with why, for the field to say; the location keeps its name.
+     */
+    pub fn rename(
+        &mut self,
+        id: &LocationId,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if let Some(problem) = name_problem(name, Some(id), self.locations.iter().flatten()) {
+            return Err(problem);
+        }
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
-            return;
+            return Ok(());
         };
-        let name = name.trim().to_string();
-        if name.is_empty() || self.location(id).is_none_or(|it| it.name == name) {
-            return;
+        let name = clean_name(name).unwrap_or_default();
+        if self.location(id).is_none_or(|it| it.name == name) {
+            return Ok(());
         }
         let id = id.clone();
         self.run(
@@ -390,8 +455,9 @@ impl SyncService {
                 move || archive.catalogue().rename_location(&id, &name)
             },
             move |this, renamed, _| match renamed {
+                /* A location removed meanwhile is renamed too, where it is now listed. */
                 Ok(()) => {
-                    for location in this.locations.iter_mut().flatten() {
+                    for location in this.locations.iter_mut().flatten().chain(&mut this.removed) {
                         if location.id == id {
                             location.name = name.clone();
                         }
@@ -403,11 +469,12 @@ impl SyncService {
                 }
             },
         );
+        Ok(())
     }
 
     /// Removes a location (module docs): its pass, if one runs, is stopped first.
     pub fn remove(&mut self, id: &LocationId, cx: &mut Context<Self>) {
-        if !self.removing.insert(id.clone()) {
+        if self.archive.read(cx).archive().is_none() || !self.removing.insert(id.clone()) {
             return;
         }
         if self.passes.contains_key(id) {
@@ -422,6 +489,7 @@ impl SyncService {
     /// Records that the owner removed `id`, whose pass is over.
     pub(super) fn write_removal(&mut self, id: LocationId, cx: &mut Context<Self>) {
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
+            self.removing.remove(&id);
             return;
         };
         self.run(
@@ -605,17 +673,6 @@ mod tests {
         );
         let unknown = stale(synced, &[], last + 8 * DAY_MS).unwrap();
         assert_eq!(unknown.expiring, None);
-    }
-
-    #[test]
-    fn a_host_is_checked_only_for_what_ssh_cannot_take() {
-        assert_eq!(host_problem("user@macbook"), None);
-        assert_eq!(host_problem("macbook.local"), None);
-        assert!(host_problem("").is_some());
-        assert!(host_problem("-oProxyCommand=x").is_some());
-        assert!(host_problem("user@mac book").is_some());
-        assert!(host_problem("mac\tbook").is_some());
-        assert!(host_problem("mac\u{7}book").is_some());
     }
 
     #[test]

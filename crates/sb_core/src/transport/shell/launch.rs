@@ -139,6 +139,33 @@ impl Launcher {
         }
     }
 
+    /// The host the launcher hands `ssh`: its own, or the word after `--` of a command that
+    /// runs `ssh` ([`Self::reading_home`]).
+    fn host(&self) -> Option<&str> {
+        match self {
+            Self::Ssh { host } => Some(host),
+            Self::Wsl { .. } => None,
+            Self::Command { args, .. } if self.is_ssh() => args
+                .iter()
+                .position(|arg| arg == "--")
+                .and_then(|at| args.get(at + 1))
+                .map(String::as_str),
+            Self::Command { .. } => None,
+        }
+    }
+
+    /**
+     * Whether the launcher may run: a host that is not one ssh should be handed
+     * ([`crate::location::host_problem`]) is refused before anything starts, whichever way it
+     * came: typed, or from a catalogue that holds it from before the check.
+     */
+    pub(super) fn check(&self) -> Result<(), TransportError> {
+        match self.host().and_then(crate::location::host_problem) {
+            Some(problem) => Err(TransportError::Failed(problem)),
+            None => Ok(()),
+        }
+    }
+
     /// Whether the launcher's program is `ssh`, whose failures say what they are.
     fn is_ssh(&self) -> bool {
         match self {
@@ -217,8 +244,8 @@ impl Launcher {
 }
 
 /// `word` as a POSIX shell takes it whole: as it is when it holds nothing a shell would take
-/// apart, and in single quotes otherwise.
-fn quoted(word: &str) -> String {
+/// apart, and in single quotes otherwise. For a command the owner is shown and may paste.
+pub fn quoted(word: &str) -> String {
     let plain = !word.is_empty()
         && word
             .chars()

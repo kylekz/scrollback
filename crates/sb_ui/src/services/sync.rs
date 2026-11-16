@@ -56,8 +56,9 @@ mod locations;
 
 pub use locations::{
     ConnectionTest, Details, Distros, Expiring, STALE_AFTER_DAYS, Stale, TestFailure, TestState,
-    host_problem, refusal, stale,
+    name_problem, refusal, stale,
 };
+pub use sb_core::location::host_problem;
 
 /// How often every location is synced while the app is open (DESIGN §4.13 offers 5, 15, 30 and
 /// 60 minutes; Settings arrive in a later phase).
@@ -165,6 +166,12 @@ pub enum LocationStatus {
     },
     /// When the last sync finished, in Unix milliseconds.
     Synced(i64),
+    /// The owner stopped the last pass with this much of its plan left to copy, in files and
+    /// in bytes: what it copied is kept, and the next pass carries on (PLAN §5).
+    Stopped {
+        items_left: usize,
+        bytes_left: u64,
+    },
     NeverSynced,
 }
 
@@ -323,6 +330,8 @@ pub struct SyncService {
     waiting: HashSet<LocationId>,
     /// Why a location's last pass stopped, where the catalogue could not record it.
     errors: HashMap<LocationId, String>,
+    /// What the pass the owner stopped left to copy, files and bytes, until a pass completes.
+    stopped: HashMap<LocationId, (usize, u64)>,
     /// The places being added as locations.
     adding: Vec<LocationKind>,
     /// The locations to remove once their pass has stopped.
@@ -380,6 +389,7 @@ impl SyncService {
             indexes: HashMap::new(),
             waiting: HashSet::new(),
             errors: HashMap::new(),
+            stopped: HashMap::new(),
             adding: Vec::new(),
             removing: HashSet::new(),
             refused: None,
@@ -430,6 +440,12 @@ impl SyncService {
                 progress: running.progress,
                 first: running.first,
                 started: running.started,
+            };
+        }
+        if let Some(&(items_left, bytes_left)) = self.stopped.get(&location.id) {
+            return LocationStatus::Stopped {
+                items_left,
+                bytes_left,
             };
         }
         if let Some(error) = self.errors.get(&location.id) {
@@ -618,7 +634,7 @@ impl SyncService {
             }
         });
         cx.spawn({
-            let id = id.clone();
+            let (id, stopped_at) = (id.clone(), reported.clone());
             async move |this, cx| {
                 let (synced, location) = job.await;
                 this.update(cx, |this, cx| {
@@ -636,16 +652,20 @@ impl SyncService {
                         Ok(None) => {}
                         Err(error) => log::error!("a location could not be read: {error}"),
                     }
-                    let (mut changed, mut whole) = (false, true);
+                    let (mut changed, mut whole, mut stopped) = (false, true, false);
                     match synced {
                         Ok(passes) => {
                             this.errors.remove(&id);
+                            if passes.iter().all(|pass| pass.outcome.is_ok()) {
+                                this.stopped.remove(&id);
+                            }
                             for pass in passes {
                                 match pass.outcome {
                                     Ok(report) => {
                                         changed |=
                                             report.unchanged < report.scanned || report.gone > 0;
                                     }
+                                    Err(SyncError::Cancelled) => stopped = true,
                                     // A normal state (the module docs), on the location's row.
                                     Err(SyncError::Unreachable(reason)) => {
                                         log::info!("{id} could not be reached: {reason}");
@@ -660,12 +680,24 @@ impl SyncService {
                         }
                         Err(SyncError::Cancelled) => {
                             this.errors.remove(&id);
+                            stopped = true;
                             whole = false;
                         }
                         Err(error) => {
                             log::error!("a sync stopped: {error}");
                             this.errors.insert(id.clone(), error.to_string());
                             whole = false;
+                        }
+                    }
+                    // A stopped pass says what it left, until a pass completes.
+                    if stopped {
+                        let left = *stopped_at.lock().unwrap_or_else(PoisonError::into_inner);
+                        let items_left = left.items.saturating_sub(left.items_done);
+                        if left.planned && items_left > 0 {
+                            this.stopped.insert(
+                                id.clone(),
+                                (items_left, left.bytes.saturating_sub(left.bytes_done)),
+                            );
                         }
                     }
                     if !whole {

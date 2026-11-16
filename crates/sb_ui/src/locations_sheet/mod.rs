@@ -33,8 +33,9 @@ use crate::add_location::{AddLocation, AddLocationEvent, Kind, Purpose};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
-    ButtonKind, bad_banner, button, dot, focus_ring, icon, icon_button, info_banner, kind_name,
-    kind_tile, location_tag, overline, progress_bar, warn_banner, warn_chip, with_numbers,
+    ButtonKind, bad_banner, button, development_notice, dot, end_cut, focus_ring, icon,
+    icon_button, kind_name, kind_tile, location_tag, overline, progress_bar, warn_banner,
+    warn_chip_glyph, with_numbers,
 };
 use crate::format;
 use crate::icons::SbIcon;
@@ -62,6 +63,10 @@ pub struct LocationsSheet {
     selected: Option<LocationId>,
     /// The selected location's name, as the owner edits it.
     name: Entity<InputState>,
+    /// The owner typed in the name field since its name was last taken.
+    name_edited: bool,
+    /// Why the name typed was not taken, under the field.
+    name_problem: Option<String>,
     /// The place the add dialog added, to select once it is a location.
     to_select: Option<LocationKind>,
     add: Option<Entity<AddLocation>>,
@@ -96,9 +101,13 @@ impl LocationsSheet {
             _subscriptions: [
                 cx.observe_in(&sync, window, |this, _, window, cx| this.follow(window, cx)),
                 cx.subscribe_in(&name, window, |this, _, event, window, cx| match event {
-                    InputEvent::Blur => this.rename(cx),
+                    InputEvent::Change => {
+                        this.name_edited = true;
+                        this.name_problem = None;
+                    }
+                    InputEvent::Blur => this.take_name(window, cx),
                     InputEvent::PressEnter { .. } => {
-                        this.rename(cx);
+                        this.take_name(window, cx);
                         this.list_focus.focus(window, cx);
                     }
                     _ => {}
@@ -117,6 +126,8 @@ impl LocationsSheet {
             list_focus,
             selected: None,
             name,
+            name_edited: false,
+            name_problem: None,
             to_select: None,
             add: None,
             removing: None,
@@ -151,8 +162,11 @@ impl LocationsSheet {
         self.sync.read(cx).locations().unwrap_or_default()
     }
 
-    /// Selects `id`, its name in the name field.
+    /// Selects `id`, its name in the name field; the name typed for the last is taken first.
     fn select(&mut self, id: LocationId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.as_ref() != Some(&id) {
+            self.take_name(window, cx);
+        }
         let Some(name) = self.sync.read(cx).location(&id).map(|it| it.name.clone()) else {
             return;
         };
@@ -186,13 +200,43 @@ impl LocationsSheet {
         cx.notify();
     }
 
-    /// Takes the name typed for the selected location, unless it is nothing.
-    fn rename(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.selected.clone() else {
+    /**
+     * Takes the name typed for the selected location (DESIGN §4.11: it renames on blur). A
+     * name that is refused (nothing, another location's) is said under the field, and the
+     * field shows the location's name again.
+     */
+    fn take_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected.clone().filter(|_| self.name_edited) else {
             return;
         };
-        let name = self.name.read(cx).value().to_string();
-        self.sync.update(cx, |sync, cx| sync.rename(&id, &name, cx));
+        self.name_edited = false;
+        let typed = self.name.read(cx).value().to_string();
+        let taken = self
+            .sync
+            .update(cx, |sync, cx| sync.rename(&id, &typed, cx));
+        if let Err(problem) = taken {
+            self.name_problem = Some(problem);
+            self.restore_name(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Shows the selected location's name in the field again.
+    fn restore_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.sync.read(cx).location(id).map(|it| it.name.clone()));
+        if let Some(name) = name {
+            self.name
+                .update(cx, |input, cx| input.set_value(name, window, cx));
+        }
+        self.name_edited = false;
+    }
+
+    /// Why the name typed was not taken, if it wasn't.
+    pub(super) fn name_problem(&self) -> Option<&str> {
+        self.name_problem.as_deref()
     }
 
     fn step(&mut self, by: isize, window: &mut Window, cx: &mut Context<Self>) {
@@ -213,12 +257,22 @@ impl LocationsSheet {
         }
     }
 
-    fn close(&mut self, _: &Close, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(LocationsSheetEvent::Close);
+    /// `Esc`: in a name field that was typed in, the name it had; anywhere else, closes.
+    fn close(&mut self, _: &Close, window: &mut Window, cx: &mut Context<Self>) {
+        if self.name_edited && self.name.focus_handle(cx).is_focused(window) {
+            self.restore_name(window, cx);
+            self.name_problem = None;
+            self.list_focus.focus(window, cx);
+            cx.notify();
+        } else {
+            cx.emit(LocationsSheetEvent::Close);
+        }
     }
 
-    /// Cancels the connection test the sheet or its dialog started: the sheet is closing.
-    pub fn cancel_test(&mut self, cx: &mut Context<Self>) {
+    /// The sheet is closing: the name typed is taken, and the connection test the sheet or
+    /// its dialog started is cancelled.
+    pub fn closing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.take_name(window, cx);
         self.sync.update(cx, |sync, _| sync.cancel_test());
     }
 
@@ -231,7 +285,8 @@ impl LocationsSheet {
         cx: &mut Context<Self>,
     ) {
         self.return_focus = window.focused(cx);
-        let dialog = cx.new(|cx| AddLocation::new(Purpose::Add, kind, distro, window, cx));
+        let dialog =
+            cx.new(|cx| AddLocation::new(Purpose::Add, kind, distro, Vec::new(), window, cx));
         self._dialog = Some(
             cx.subscribe_in(&dialog, window, |this, _, event, window, cx| {
                 if let AddLocationEvent::Added(kind) = event {
@@ -244,9 +299,12 @@ impl LocationsSheet {
         cx.notify();
     }
 
-    /// Closes the dialog over the sheet, and gives the keyboard back.
+    /// Closes the dialog over the sheet, cancelling its connection test, and gives the
+    /// keyboard back.
     fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.add = None;
+        if self.add.take().is_some() {
+            self.sync.update(cx, |sync, _| sync.cancel_test());
+        }
         self._dialog = None;
         self.removing = None;
         match self.return_focus.take() {
@@ -282,7 +340,7 @@ impl LocationsSheet {
             .gap(theme.spacing.lg)
             .pt(theme.spacing.xl)
             .pb(theme.spacing.lg)
-            .px(px(18.))
+            .px(theme.sizes.sheet_padding)
             .border_b_1()
             .border_color(c.line_subtle)
             .child(
@@ -335,6 +393,12 @@ impl LocationsSheet {
         let c = &theme.colors;
         let now = format::now();
         let more = match &stale.expiring {
+            Some(expiring) if expiring.at <= now => format!(
+                "{} there deletes transcripts after {} days, so sessions written since the last \
+                 sync may already be expiring. Sync it as soon as you can.",
+                agents::name(&expiring.provider, cx),
+                expiring.retention_days,
+            ),
             Some(expiring) => format!(
                 "{} there deletes transcripts after {} days, so sessions written since the last \
                  sync start expiring around {}. Sync it before then.",
@@ -466,6 +530,21 @@ impl LocationsSheet {
                 lines.extend(last_good.map(IntoElement::into_any_element));
                 lines
             }
+            (
+                LocationStatus::Stopped {
+                    items_left,
+                    bytes_left,
+                },
+                _,
+            ) => {
+                let mut lines = vec![with_dot(
+                    dot(None, theme),
+                    line(stopped_line(*items_left, *bytes_left), c.fg2),
+                    theme,
+                )];
+                lines.extend(last_good.map(IntoElement::into_any_element));
+                lines
+            }
             (LocationStatus::NeverSynced, _) => vec![with_dot(
                 dot(None, theme),
                 line(never_line(location, sync), c.fg2),
@@ -478,9 +557,9 @@ impl LocationsSheet {
             LocationStatus::Unreachable { .. } | LocationStatus::Failed(_) => {
                 ("Retry", SbIcon::RefreshCw)
             }
-            LocationStatus::Synced(_) | LocationStatus::NeverSynced => {
-                ("Sync now", SbIcon::RefreshCw)
-            }
+            LocationStatus::Synced(_)
+            | LocationStatus::Stopped { .. }
+            | LocationStatus::NeverSynced => ("Sync now", SbIcon::RefreshCw),
         };
         let syncing = matches!(status, LocationStatus::Syncing { .. });
         let (id, name) = (location.id.clone(), location.name.clone());
@@ -490,7 +569,7 @@ impl LocationsSheet {
             .flex()
             .items_start()
             .gap(theme.spacing.lg)
-            .p(px(10.))
+            .p(theme.sizes.list_row_padding)
             .rounded(theme.radii.row)
             .cursor_pointer()
             .map(|this| {
@@ -546,7 +625,7 @@ impl LocationsSheet {
                     }))
                     .children(state)
                     .children(stale.map(|stale| {
-                        div().flex().child(warn_chip(
+                        div().flex().child(warn_chip_glyph(
                             format!(
                                 "Stale · {} without a sync",
                                 format::plural(stale.days as usize, "day")
@@ -559,7 +638,7 @@ impl LocationsSheet {
                 this.child(
                     button(
                         SharedString::from(format!("sheet-action-{id}")),
-                        ButtonKind::Plain,
+                        ButtonKind::Ghost,
                         true,
                         true,
                         theme,
@@ -618,7 +697,7 @@ impl LocationsSheet {
                         .items_start()
                         .gap(theme.spacing.lg)
                         .py(theme.spacing.md)
-                        .px(px(10.))
+                        .px(theme.sizes.list_row_padding)
                         .child(
                             div()
                                 .flex_none()
@@ -709,7 +788,7 @@ impl LocationsSheet {
             0,
             div()
                 .py(theme.spacing.sm)
-                .px(px(10.))
+                .px(theme.sizes.list_row_padding)
                 .child(overline(
                     &format!("Found on {}, not added", local_name()),
                     theme,
@@ -722,15 +801,129 @@ impl LocationsSheet {
                 .flex_none()
                 .h(px(1.))
                 .my(theme.spacing.md)
-                .mx(px(10.))
+                .mx(theme.sizes.list_row_padding)
                 .bg(c.line_subtle)
                 .into_any_element(),
         );
         found
     }
 
+    /**
+     * The locations the owner removed, under the rest: what the archive still holds from
+     * each, and Add again, which brings it back under its name, with what was archived
+     * from it (FEATURES: Locations).
+     */
+    fn removed(&self, theme: &SbTheme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let c = &theme.colors;
+        let sync = self.sync.read(cx);
+        let mut rows: Vec<AnyElement> = sync
+            .removed()
+            .iter()
+            .map(|location| {
+                let sessions = sync.details().sessions(&location.id);
+                let (kind, name) = (location.kind.clone(), location.name.clone());
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(theme.spacing.lg)
+                    .py(theme.spacing.md)
+                    .px(theme.sizes.list_row_padding)
+                    .child(kind_tile(&location.kind, theme))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(theme.spacing.xs)
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(theme.spacing.sm)
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_color(c.fg2)
+                                            .text_spec(&theme.text.control)
+                                            .child(location.name.clone()),
+                                    )
+                                    .child(location_tag(
+                                        kind_name(&location.kind),
+                                        &location.kind,
+                                        false,
+                                        theme,
+                                    )),
+                            )
+                            .child(div().text_spec(&theme.text.secondary).child(with_numbers(
+                                if sessions == 0 {
+                                    "Not synced. Nothing was archived from it.".to_string()
+                                } else {
+                                    format!(
+                                        "Not synced. The archive still holds its {}.",
+                                        format::plural(sessions, "session")
+                                    )
+                                },
+                                c.fg3,
+                                &theme.text.secondary,
+                                theme,
+                            ))),
+                    )
+                    .child(
+                        button(
+                            SharedString::from(format!("sheet-removed-{}", location.id)),
+                            ButtonKind::Ghost,
+                            true,
+                            true,
+                            theme,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.to_select = Some(kind.clone());
+                            let (kind, name) = (kind.clone(), name.clone());
+                            this.sync
+                                .update(cx, |sync, cx| sync.add(kind, name, false, cx));
+                        }))
+                        .child(icon(SbIcon::Plus, theme.sizes.icon_xs, c.fg2))
+                        .child("Add again")
+                        .automation_target_with({
+                            let name = location.name.clone();
+                            move || format!("sheet/removed/{name}/add").into()
+                        }),
+                    )
+                    .automation_target_with({
+                        let name = location.name.clone();
+                        move || format!("sheet/removed/{name}").into()
+                    })
+            })
+            .collect();
+        if !rows.is_empty() {
+            rows.insert(
+                0,
+                div()
+                    .py(theme.spacing.sm)
+                    .px(theme.sizes.list_row_padding)
+                    .child(overline("Removed", theme))
+                    .into_any_element(),
+            );
+            rows.insert(
+                0,
+                div()
+                    .flex_none()
+                    .h(px(1.))
+                    .my(theme.spacing.md)
+                    .mx(theme.sizes.list_row_padding)
+                    .bg(c.line_subtle)
+                    .into_any_element(),
+            );
+        }
+        rows
+    }
+
     /// The list (DESIGN §4.11): refusals and stale banners, the locations, what was found and
-    /// not added, and Add location at its foot.
+    /// not added, the locations removed, and Add location at its foot.
     fn list(
         &self,
         width: gpui::Pixels,
@@ -759,6 +952,7 @@ impl LocationsSheet {
             .map(|location| self.row(location, keyboard, theme, cx))
             .collect();
         let found = self.found(theme, cx);
+        let removed = self.removed(theme, cx);
         div()
             .id("sheet-list")
             .key_context(keymap::LOCATIONS_LIST)
@@ -766,8 +960,15 @@ impl LocationsSheet {
             .on_action(cx.listener(|this, _: &Previous, window, cx| this.step(-1, window, cx)))
             .on_action(cx.listener(|this, _: &Next, window, cx| this.step(1, window, cx)))
             .on_action(cx.listener(|this, _: &Open, window, cx| {
-                this.name.update(cx, |name, cx| name.focus(window, cx));
+                if this.list_focus.is_focused(window) {
+                    this.name.update(cx, |name, cx| name.focus(window, cx));
+                } else {
+                    // A button `Tab` put the keyboard on: Enter presses it.
+                    cx.propagate();
+                }
             }))
+            .role(Role::List)
+            .aria_label("Locations")
             .flex_none()
             .w(width)
             .h_full()
@@ -784,16 +985,13 @@ impl LocationsSheet {
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .pt(px(10.))
+                    .pt(theme.sizes.list_row_padding)
                     .px(theme.spacing.md)
                     // A build with the development override says so, plainly, at the top.
                     .children(development.map(|home| {
-                        info_banner(theme)
+                        development_notice(&home, theme)
                             .mx(px(2.))
                             .mb(theme.spacing.sm)
-                            .child(div().flex_1().child(format!(
-                                "Development override: locations are read from {home}"
-                            )))
                             .automation_target("sheet/development")
                     }))
                     .children(refused.map(|refused| {
@@ -827,7 +1025,8 @@ impl LocationsSheet {
                             .map(|banner| div().mx(px(2.)).mb(theme.spacing.sm).child(banner)),
                     )
                     .children(rows)
-                    .children(found),
+                    .children(found)
+                    .children(removed),
             )
             .child(
                 div()
@@ -837,7 +1036,7 @@ impl LocationsSheet {
                     .gap(theme.spacing.md)
                     .pt(theme.spacing.md)
                     .pb(theme.spacing.md)
-                    .px(px(18.))
+                    .px(theme.sizes.sheet_padding)
                     .child(
                         button("sheet-add", ButtonKind::Plain, false, true, theme)
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -875,6 +1074,11 @@ impl Render for LocationsSheet {
             .as_ref()
             .and_then(|id| self.locations(cx).iter().find(|it| it.id == *id))
             .cloned();
+        // What is still synced; and the name typed but not taken where the field has gone.
+        if self.name_edited && !self.name.focus_handle(cx).is_focused(window) {
+            self.take_name(window, cx);
+        }
+        let none_left = !self.sync.read(cx).removed().is_empty();
         let detail = match &selected {
             Some(location) => self.detail(location, window, &theme, cx),
             None => div()
@@ -882,13 +1086,20 @@ impl Render for LocationsSheet {
                 .p(theme.spacing.xxl)
                 .text_color(theme.colors.fg3)
                 .text_spec(&theme.text.secondary)
-                .child("No location yet. Add one to start archiving.")
+                .child(if none_left {
+                    "No location is synced now. The archive still holds what was copied from \
+                     the locations removed; add one again, or another, to sync."
+                } else {
+                    "No location yet. Add one to start archiving."
+                })
                 .into_any_element(),
         };
         let header = self.header(&theme, cx);
         let list = self.list(list, window, &theme, cx);
         overlay::surface(&theme)
             .id("locations-sheet")
+            .role(Role::Dialog)
+            .aria_label("Locations")
             .key_context(keymap::LOCATIONS_SHEET)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::close))
@@ -918,13 +1129,20 @@ impl LocationsSheet {
             weak.update(cx, |this, cx| this.close_dialog(window, cx))
                 .ok();
         };
+        /* A press on the dimmed sheet closes the add dialog, unless that would lose what was
+        typed or a test under way: then it does nothing. */
         if let Some(dialog) = self.add.clone() {
+            let holding = dialog.clone();
             return Some(overlay::modal(
                 dialog,
                 Layer::Dialog,
                 window,
                 &theme,
-                dismiss,
+                move |window, cx| {
+                    if !holding.read(cx).holds_input(cx) {
+                        dismiss(window, cx);
+                    }
+                },
             ));
         }
         let location = self
@@ -958,6 +1176,8 @@ impl LocationsSheet {
         let sessions = self.sync.read(cx).details().sessions(&location.id);
         overlay::surface(theme)
             .id("remove-location")
+            .role(Role::Dialog)
+            .aria_label("Remove location")
             .key_context(keymap::LOCATION_DIALOG)
             .track_focus(&self.remove_focus)
             .on_action(cx.listener(|this, _: &Close, window, cx| this.close_dialog(window, cx)))
@@ -977,19 +1197,22 @@ impl LocationsSheet {
                     .child(
                         div()
                             .text_spec(&theme.text.sheet_title)
-                            .child(format!("Remove {}?", location.name)),
+                            .child(format!("Remove {}?", end_cut(&location.name, 40))),
                     )
-                    .child(
-                        div()
-                            .text_color(c.fg2)
-                            .text_spec(&theme.text.body)
-                            .child(format!(
-                                "Syncing stops. Its {} archived {} stay in the archive and keep \
-                                 their folders. Nothing at the location is touched.",
+                    .child(div().text_color(c.fg2).text_spec(&theme.text.body).child(
+                        if sessions == 0 {
+                            "Syncing stops. Nothing was archived from it. Nothing at the \
+                                 location is touched."
+                                .to_string()
+                        } else {
+                            format!(
+                                "Syncing stops. Its {} archived {} stay in the archive and \
+                                     keep their folders. Nothing at the location is touched.",
                                 format::count(sessions as u64),
                                 if sessions == 1 { "session" } else { "sessions" }
-                            )),
-                    ),
+                            )
+                        },
+                    )),
             )
             .child(
                 div()
@@ -1061,6 +1284,15 @@ fn syncing_line(progress: &PassProgress) -> String {
             format::bytes_of(progress.bytes_done, progress.bytes, " of ")
         )
     }
+}
+
+/// What a location whose last pass the owner stopped says: what it left to copy.
+fn stopped_line(items_left: usize, bytes_left: u64) -> String {
+    format!(
+        "Stopped · {} and {} left to copy",
+        format::plural(items_left, "file"),
+        format::size(bytes_left)
+    )
 }
 
 /// What a location that never synced says: a stopped distro says its first sync starts it

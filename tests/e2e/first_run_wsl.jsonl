@@ -32,6 +32,21 @@
 {"cmd": "screenshot", "name": "first-run-with-host-light"}
 {"cmd": "pin_appearance", "appearance": "dark"}
 
+// The same list in a small window: the page scrolls, so that the button can be reached.
+{"cmd": "resize", "w": 960, "h": 600}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "first-run-narrow-dark"}
+{"cmd": "scroll", "x": 480, "y": 300, "dy": -2000}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "first-run/add", "expect_result": {"pointer": "/visible/h", "equals": 28.0}}
+{"cmd": "screenshot", "name": "first-run-narrow-scrolled-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "first-run-narrow-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "resize", "w": 1440, "h": 900}
+{"cmd": "settle"}
+
 // The button adds this machine, the running distro and the host, and syncs them; the stopped distro stays unadded.
 {"cmd": "click", "target": "first-run/add"}
 {"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/sync/locations", "len": 3}, {"pointer": "/sync/syncing", "equals": false}]}

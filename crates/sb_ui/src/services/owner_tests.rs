@@ -200,13 +200,35 @@ fn a_location_is_renamed_and_keeps_what_it_holds(cx: &mut TestAppContext) {
     let sync = init(|_| Ok(answered()), cx);
     add(&sync, ubuntu(), "Ubuntu-24.04", true, cx);
     let id = locations(&sync, cx)[0].id.clone();
-    sync.update(cx, |sync, cx| sync.rename(&id, "  Work distro ", cx));
+    let renamed = sync.update(cx, |sync, cx| {
+        sync.rename(&id, "  Work\u{202e} distro ", cx)
+    });
+    assert_eq!(renamed, Ok(()));
     cx.run_until_parked();
     assert_eq!(locations(&sync, cx)[0].name, "Work distro");
-    // Nothing is no name.
-    sync.update(cx, |sync, cx| sync.rename(&id, "   ", cx));
+    // Nothing is no name, and is said so; the location keeps its name.
+    let refused = sync.update(cx, |sync, cx| sync.rename(&id, " \u{200b} ", cx));
+    assert_eq!(refused, Err("A location needs a name.".to_string()));
     cx.run_until_parked();
     assert_eq!(locations(&sync, cx)[0].name, "Work distro");
+    // Another location's name is refused, whatever its case; a long one is cut.
+    add(&sync, macbook(), "The Mac", false, cx);
+    let refused = sync.update(cx, |sync, cx| sync.rename(&id, "the mac", cx));
+    assert_eq!(
+        refused,
+        Err("The Mac is another location's name.".to_string())
+    );
+    let long = "x".repeat(400);
+    sync.update(cx, |sync, cx| sync.rename(&id, &long, cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        locations(&sync, cx)[0].name.chars().count(),
+        sb_core::location::NAME_CHARS
+    );
+    sync.update(cx, |sync, cx| sync.rename(&id, "Work distro", cx))
+        .unwrap();
+    cx.run_until_parked();
     let archive = cx.update(|cx| cx.services().archive.read(cx).archive().cloned().unwrap());
     let kept = archive.catalogue().location(&id).unwrap().unwrap();
     assert_eq!(kept.name, "Work distro");
@@ -264,13 +286,13 @@ fn removing_a_syncing_location_stops_it_and_keeps_its_sessions(cx: &mut TestAppC
     let after = catalogue.location(&host.id).unwrap().unwrap();
     assert_eq!(after.last_attempt, removed.last_attempt);
 
-    // Adding its place again brings it back, with everything archived from it.
+    // Adding its place again brings it back, under its name, with everything archived from it.
     add(&sync, macbook(), "The Mac", true, cx);
     let back = locations(&sync, cx);
     assert_eq!(back.len(), 2);
     assert_eq!(
         (back[1].id.clone(), back[1].name.as_str()),
-        (host.id, "The Mac")
+        (host.id, "user@macbook")
     );
     sync.read_with(cx, |sync, _| assert!(sync.removed().is_empty()));
     let all = catalogue.sessions(Shelf::All).unwrap().len();
@@ -511,4 +533,163 @@ fn the_development_override_is_what_a_test_runs_and_shows(cx: &mut TestAppContex
         let command = test.command.as_deref().unwrap();
         assert!(command.ends_with("HOME=/fixture sh -s"), "{command}");
     });
+}
+
+#[gpui::test]
+fn a_test_replaced_by_another_never_shows_its_answer_under_the_new_place(cx: &mut TestAppContext) {
+    let sync = init(
+        |launcher| {
+            let Launcher::Ssh { host } = launcher else {
+                panic!("only hosts here");
+            };
+            Ok(Probe {
+                home: format!("/{host}"),
+                ..answered()
+            })
+        },
+        cx,
+    );
+    let (first, second) = (
+        LocationKind::Ssh {
+            host: "first".to_string(),
+        },
+        LocationKind::Ssh {
+            host: "second".to_string(),
+        },
+    );
+    sync.update(cx, |sync, cx| {
+        sync.test_place(first, cx);
+        sync.test_place(second.clone(), cx);
+    });
+    // Step by step: at no point does the first host's answer show as the second's.
+    while cx.executor().tick() {
+        sync.read_with(cx, |sync, _| {
+            let test = sync.test().unwrap();
+            assert_eq!(test.kind, second);
+            if let TestState::Passed { probe, .. } = &test.state {
+                assert_eq!(probe.as_ref().map(|it| it.home.as_str()), Some("/second"));
+            }
+        });
+    }
+    cx.run_until_parked();
+    assert!(matches!(
+        test_state(&sync, cx),
+        Some(TestState::Passed { .. })
+    ));
+}
+
+#[gpui::test]
+fn a_location_being_removed_is_not_synced(cx: &mut TestAppContext) {
+    let sync = init(|_| Ok(answered()), cx);
+    add(&sync, ubuntu(), "Ubuntu-24.04", false, cx);
+    let id = locations(&sync, cx)[0].id.clone();
+    sync.update(cx, |sync, cx| {
+        sync.remove(&id, cx);
+        sync.sync(&id, cx);
+        assert!(!sync.is_syncing());
+    });
+    cx.run_until_parked();
+    sync.read_with(cx, |sync, _| assert_eq!(sync.removed().len(), 1));
+}
+
+#[gpui::test]
+fn a_place_known_here_is_refused_before_anything_is_written(cx: &mut TestAppContext) {
+    let sync = init(|_| Ok(answered()), cx);
+    add(&sync, ubuntu(), "Ubuntu-24.04", false, cx);
+    // Known to the service: nothing runs, and nothing needs saying.
+    add(&sync, ubuntu(), "Again", false, cx);
+    sync.read_with(cx, |sync, _| assert_eq!(sync.refused(), None));
+    assert_eq!(locations(&sync, cx).len(), 1);
+}
+
+#[gpui::test]
+fn a_place_only_the_catalogue_knows_is_refused_by_the_write(cx: &mut TestAppContext) {
+    let sync = init(|_| Ok(answered()), cx);
+    // Another writer added it since the service read its locations.
+    let archive = cx.update(|cx| cx.services().archive.read(cx).archive().cloned().unwrap());
+    archive
+        .catalogue()
+        .add_location(macbook(), "Behind its back")
+        .unwrap();
+    add(&sync, macbook(), "user@macbook", false, cx);
+    sync.read_with(cx, |sync, _| {
+        assert_eq!(
+            sync.refused(),
+            Some("That place is a location already: Behind its back.")
+        );
+    });
+    assert_eq!(archive.catalogue().locations().unwrap().len(), 1);
+}
+
+#[gpui::test]
+fn a_location_added_again_keeps_its_name_and_its_place_in_the_list(cx: &mut TestAppContext) {
+    let sync = init(|_| Ok(answered()), cx);
+    add(&sync, ubuntu(), "Work distro", false, cx);
+    add(&sync, macbook(), "The Mac", false, cx);
+    let id = locations(&sync, cx)[0].id.clone();
+    sync.update(cx, |sync, cx| sync.remove(&id, cx));
+    cx.run_until_parked();
+    add(&sync, ubuntu(), "Ubuntu-24.04", false, cx);
+    let names: Vec<String> = locations(&sync, cx).into_iter().map(|it| it.name).collect();
+    assert_eq!(names, ["Work distro", "The Mac"]);
+}
+
+#[gpui::test]
+fn a_rename_that_lands_after_a_removal_renames_the_removed_location(cx: &mut TestAppContext) {
+    let sync = init(|_| Ok(answered()), cx);
+    add(&sync, ubuntu(), "Ubuntu-24.04", false, cx);
+    let id = locations(&sync, cx)[0].id.clone();
+    sync.update(cx, |sync, cx| {
+        sync.rename(&id, "Work distro", cx).unwrap();
+        sync.remove(&id, cx);
+    });
+    cx.run_until_parked();
+    sync.read_with(cx, |sync, _| {
+        assert_eq!(sync.removed()[0].name, "Work distro");
+    });
+}
+
+#[gpui::test]
+fn a_stopped_pass_says_what_it_left_until_one_completes(cx: &mut TestAppContext) {
+    // More files than one batch holds, so that stopping after the first leaves some.
+    let mut big = ProjectsTree::new();
+    for at in 0..300 {
+        big.outlined(&Outline {
+            project: "/home/user/code/big",
+            title: &format!("Session {at}"),
+            prompt: "One of many.",
+            model: "model-a",
+            day: (2026, 11, 14),
+            calls: 1,
+        });
+    }
+    init_reaching(
+        tempfile::tempdir().unwrap(),
+        machine(),
+        Reach {
+            connect: Arc::new(move |_, _| Box::new(big.transport())),
+            tester: Arc::new(|_, _| Ok(answered())),
+            distros: Arc::new(|_| Ok(None)),
+            launcher: Arc::new(LocationKind::launcher),
+            development_home: None,
+        },
+        cx,
+    );
+    let sync = cx.update(|cx| cx.services().sync.clone());
+    sync.update(cx, |sync, _| sync.hold_after(1, super::sync::Held::Stop));
+    add(&sync, ubuntu(), "Ubuntu-24.04", true, cx);
+    let distro = locations(&sync, cx)[0].clone();
+    let LocationStatus::Stopped { items_left, .. } =
+        sync.read_with(cx, |sync, _| sync.status(&distro))
+    else {
+        panic!("the stopped pass says so");
+    };
+    assert!(items_left > 0);
+    sync.update(cx, |sync, cx| sync.sync(&distro.id, cx));
+    cx.run_until_parked();
+    let distro = locations(&sync, cx)[0].clone();
+    assert!(matches!(
+        sync.read_with(cx, |sync, _| sync.status(&distro)),
+        LocationStatus::Synced(_)
+    ));
 }

@@ -13,6 +13,7 @@ use common::{Bench, for_both_agents};
 
 for_both_agents!(
     removing_one_location_leaves_the_others_as_they_were,
+    locations_added_in_the_same_moment_keep_the_order_they_were_added_in,
     an_item_with_several_versions_is_held_once,
     a_session_in_trash_is_held_and_one_deleted_for_good_is_not,
     removing_a_location_keeps_everything_archived_from_it,
@@ -160,6 +161,31 @@ fn removing_one_location_leaves_the_others_as_they_were<A: Agent + Default>() {
     for other in others {
         assert_eq!(catalogue.location(&other.id).unwrap(), Some(other));
     }
+}
+
+fn locations_added_in_the_same_moment_keep_the_order_they_were_added_in<A: Agent + Default>() {
+    let bench = bench::<A>();
+    let catalogue = bench.archive().catalogue();
+    // Many in a row, so that several land in the same millisecond.
+    let added: Vec<String> = (0..40)
+        .map(|at| {
+            let kind = LocationKind::Ssh {
+                host: format!("user@host{at}"),
+            };
+            catalogue
+                .add_location(kind, &format!("Host {at}"))
+                .unwrap()
+                .name
+        })
+        .collect();
+    let listed: Vec<String> = catalogue
+        .locations()
+        .unwrap()
+        .into_iter()
+        .skip(1)
+        .map(|location| location.name)
+        .collect();
+    assert_eq!(listed, added);
 }
 
 fn an_item_with_several_versions_is_held_once<A: Agent + Default>() {

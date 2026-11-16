@@ -386,6 +386,17 @@ pub struct Sizes {
     pub location_tile: Pixels,
     /// The label column of a key/value row (`.kv`).
     pub kv_label_width: Pixels,
+    /// A segment's padding at its sides (`.seg button`).
+    pub segment_padding: Pixels,
+    /// The padding above a dialog's header and around its body (`E-Add-Location`).
+    pub dialog_padding: Pixels,
+    /// The sheet's padding at its sides, and its pane's (`E-Locations`).
+    pub sheet_padding: Pixels,
+    pub pane_padding: Pixels,
+    /// The padding of a row of the locations list (`E-Locations`).
+    pub list_row_padding: Pixels,
+    /// The label column of a connection test's result (`E-Add-Location`).
+    pub result_label_width: Pixels,
 }
 
 impl Default for Sizes {
@@ -445,6 +456,12 @@ impl Default for Sizes {
             radio: px(14.),
             location_tile: px(32.),
             kv_label_width: px(128.),
+            segment_padding: px(9.),
+            dialog_padding: px(14.),
+            sheet_padding: px(18.),
+            pane_padding: px(20.),
+            list_row_padding: px(10.),
+            result_label_width: px(110.),
         }
     }
 }
@@ -464,6 +481,8 @@ pub struct Radii {
     pub card: Pixels,
     /// Sheets, dialogs, the empty drop area.
     pub sheet: Pixels,
+    /// A segment of a segmented control (`.seg button`).
+    pub segment: Pixels,
     /// The icon tile of a page's header.
     pub tile: Pixels,
     /// Chips.
@@ -479,6 +498,7 @@ impl Default for Radii {
             row: px(8.),
             card: px(10.),
             sheet: px(12.),
+            segment: px(5.),
             tile: px(14.),
             pill: px(999.),
         }

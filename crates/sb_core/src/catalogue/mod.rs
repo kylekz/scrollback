@@ -46,6 +46,10 @@ pub enum CatalogueError {
     Database(#[from] toolbox_store::Error),
     /// A range was to be recorded as the continuation of a version that is not as long as the
     /// pass that fetched the range found it. Nothing was recorded.
+    /// A host that is not one to hand ssh ([`crate::location::host_problem`]): nothing was
+    /// added.
+    #[error("{0}")]
+    BadHost(String),
     #[error("version {version} is no longer {length} bytes long, so nothing is appended to it")]
     VersionMoved { version: i64, length: u64 },
     /// A path that names no directory (an empty one, `/`) would claim every session.
@@ -399,6 +403,11 @@ impl Catalogue {
 
     /// Adds a location to pull from.
     pub fn add_location(&self, kind: LocationKind, name: &str) -> Result<Location> {
+        if let LocationKind::Ssh { host } = &kind
+            && let Some(problem) = crate::location::host_problem(host)
+        {
+            return Err(CatalogueError::BadHost(problem));
+        }
         let id = LocationId::new();
         let (kind_name, detail) = kind.columns();
         self.execute(
@@ -491,11 +500,12 @@ impl Catalogue {
         })
     }
 
-    /// Every location, oldest first, those the owner removed among them.
+    /// Every location, oldest first, those the owner removed among them. Two added in the same
+    /// millisecond keep the order they were added in (the rowid), not their ids'.
     pub fn locations(&self) -> Result<Vec<Location>> {
         self.db.read(|c| {
             Ok(c.prepare(&format!(
-                "SELECT {LOCATION} FROM location ORDER BY created_at, id"
+                "SELECT {LOCATION} FROM location ORDER BY created_at, rowid"
             ))?
             .query_map([], location_from)?
             .collect::<rusqlite::Result<_>>()?)

@@ -32,7 +32,8 @@
 //!   `distros` (WSL's distros' names as listed, `null` without WSL or before they are
 //!   listed, or `{"error": …}`); and `test`, the connection test (`null`, or its `place` and
 //!   `state`: `running`, `passed`, or the failure: `unreachable`, `refused`, `host_key`,
-//!   `not_installed`, `missing`, `other`).
+//!   `not_installed`, `missing`, `login_hung`, `other`). A location's `state` may also be
+//!   `stopped`: the owner stopped its last pass before it was done.
 //! - `sheet`: the locations sheet while it is open (`null` otherwise): the name of its
 //!   `selected` location, and its `dialog` (`add`, `remove` or `null`).
 //! - `library`: `shelf` (`all`, `starred`, `unsorted`, `trash`, or `{"folder": name}`), `counts`
@@ -58,8 +59,9 @@
 //!   WSL's installed distros (each `{name, running?, default?, utility?}`; `[]` is WSL with
 //!   none) or `{"error": …}` for a `wsl.exe` that fails, which are listed again at once; and
 //!   `places`, how each distro or host by its name answers a connection test and a sync:
-//!   `passes` (it is read from the stand-in home), `unreachable`, `refused`, `host_key`,
-//!   `missing_tools`, `no_ssh`, `login_hung` or `fails`.
+//!   `passes` (it is read from the stand-in home), `unreachable`, `refused`, `host_key` (a key
+//!   that changed), `new_host_key` (one not known yet), `missing_tools`, `no_ssh`,
+//!   `login_hung` or `fails`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -219,6 +221,7 @@ fn sync(cx: &App) -> Value {
                 LocationStatus::Synced(_) => ("synced", None, None),
                 LocationStatus::Failed(error) => ("failed", Some(error), None),
                 LocationStatus::Unreachable { .. } => ("unreachable", None, None),
+                LocationStatus::Stopped { .. } => ("stopped", None, None),
                 LocationStatus::NeverSynced => ("never", None, None),
             };
             json!({
@@ -252,6 +255,7 @@ fn sync(cx: &App) -> Value {
                 TestFailure::HostKey(_) => "host_key",
                 TestFailure::NotInstalled(_) => "not_installed",
                 TestFailure::Missing(_) => "missing",
+                TestFailure::LoginHung(_) => "login_hung",
                 TestFailure::Other(_) => "other",
             },
         };
@@ -426,6 +430,7 @@ enum Answer {
     Unreachable,
     Refused,
     HostKey,
+    NewHostKey,
     MissingTools,
     NoSsh,
     LoginHung,
@@ -444,12 +449,17 @@ impl Answer {
             Self::Refused => {
                 TransportError::Refused(format!("{name}: Permission denied (publickey)."))
             }
+            /* As sb_core reads ssh's words: its verdict first, then what it said before. */
             Self::HostKey => TransportError::HostKey(format!(
-                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+                "Host key verification failed.\n\
+                 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
                  @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n\
                  @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
-                 Host key for {name} has changed and you have requested strict checking.\n\
-                 Host key verification failed."
+                 Host key for {name} has changed and you have requested strict checking."
+            )),
+            Self::NewHostKey => TransportError::HostKey(format!(
+                "Host key verification failed.\n\
+                 No ED25519 host key is known for {name} and you have requested strict checking."
             )),
             Self::MissingTools => {
                 TransportError::MissingTools(vec!["sha256sum or shasum".to_string()])
@@ -458,11 +468,7 @@ impl Answer {
                 program: "ssh".to_string(),
                 source: std::io::ErrorKind::NotFound.into(),
             },
-            Self::LoginHung => TransportError::Failed(
-                "the login shell there was still starting after 5 seconds and was stopped: \
-                 its profile may be waiting for something"
-                    .to_string(),
-            ),
+            Self::LoginHung => TransportError::LoginShellHung(5),
             Self::Fails => TransportError::Failed(
                 "kex_exchange_identification: read: Connection reset by peer".to_string(),
             ),

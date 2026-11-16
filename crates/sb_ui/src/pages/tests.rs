@@ -144,9 +144,11 @@ fn f6_moves_the_keyboard_to_the_sidebar_where_the_arrows_show_pages(cx: &mut Tes
     cx.run_until_parked();
     assert_eq!(shelf(cx), Shelf::Unsorted);
     assert_eq!(showing(cx), Showing::Unsorted);
-    // Trash has no page yet, and there are no folders: Unsorted is the last row.
+    // Trash has no page yet, and there are no folders: Unsorted is the last page's row, and
+    // the arrows go on to the location rows; up comes back.
     cx.simulate_keystrokes("down");
     assert_eq!(shelf(cx), Shelf::Unsorted);
+    cx.simulate_keystrokes("up");
 
     // Enter hands the keyboard to the page: its sessions, top to bottom.
     cx.simulate_keystrokes("enter");

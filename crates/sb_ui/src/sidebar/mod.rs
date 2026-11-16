@@ -90,6 +90,8 @@ const NO_FOLDERS_FIRST_RUN: &str = "Folders come after the first sync.";
 const NO_FOLDERS: &str =
     "None yet. Unsorted groups sessions by project path; make folders from there.";
 const NO_LOCATIONS: &str = "None yet";
+/// What the Locations section says when every location was removed: their sessions stay.
+const NONE_SYNCED: &str = "None synced now. The locations sheet lists those removed.";
 
 /// What a folder is called until the owner names it.
 const NEW_FOLDER_NAME: &str = "New folder";
@@ -124,6 +126,9 @@ pub struct Sidebar {
     /// The tree's rows, as of the library's folders and `open`.
     tree: Vec<TreeRow>,
     renaming: Option<Renaming>,
+    /// The location row the arrows moved to, below the last page's row; `Enter` there opens
+    /// the locations sheet with its location selected (DESIGN §4.1, §5).
+    location_cursor: Option<usize>,
     scroll: UniformListScrollHandle,
     _observers: [Subscription; 3],
     _clock: Task<()>,
@@ -166,6 +171,7 @@ impl Sidebar {
             open: HashSet::new(),
             tree: Vec::new(),
             renaming: None,
+            location_cursor: None,
             scroll: UniformListScrollHandle::new(),
         }
     }
@@ -195,6 +201,7 @@ impl Sidebar {
     }
 
     fn show(&mut self, shelf: Shelf, cx: &mut Context<Self>) {
+        self.location_cursor = None;
         self.library
             .update(cx, |library, cx| library.show(shelf, cx));
         if let Shelf::Folder(folder) = shelf
@@ -218,6 +225,22 @@ impl Sidebar {
         }
         let shelves = self.shelves(cx);
         let shown = self.library.read(cx).shelf();
+        let locations = self.sync.read(cx).locations().map_or(0, <[_]>::len);
+        /* The location rows follow the last page's row: the arrows go on into them. */
+        if let Some(at) = self.location_cursor {
+            self.location_cursor = match at.checked_add_signed(by) {
+                Some(next) if next < locations => Some(next),
+                Some(_) => Some(at),
+                None => None,
+            };
+            cx.notify();
+            return;
+        }
+        if by > 0 && shelves.last() == Some(&shown) && locations > 0 {
+            self.location_cursor = Some(0);
+            cx.notify();
+            return;
+        }
         let next = match shelves.iter().position(|shelf| *shelf == shown) {
             Some(at) => at
                 .checked_add_signed(by)
@@ -310,7 +333,15 @@ impl Sidebar {
     /// `Enter` on the rows hands the keyboard to the page; on one of the sidebar's buttons it
     /// is left to press the button.
     fn open(&mut self, _: &Open, window: &mut Window, cx: &mut Context<Self>) {
-        if self.focus_handle.is_focused(window) {
+        let cursor = self.location_cursor.and_then(|at| {
+            let locations = self.sync.read(cx).locations()?;
+            locations.get(at).map(|it| it.id.clone())
+        });
+        if self.focus_handle.is_focused(window)
+            && let Some(id) = cursor
+        {
+            cx.emit(SidebarEvent::Locations(Some(id)));
+        } else if self.focus_handle.is_focused(window) {
             cx.emit(SidebarEvent::Open);
         } else {
             cx.propagate();
@@ -644,7 +675,10 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let theme = cx.sb_theme().clone();
-        let marked = (self.marked(cx), self.keyboard(window));
+        let marked = (
+            self.marked(cx),
+            self.keyboard(window) && self.location_cursor.is_none(),
+        );
         range
             .filter_map(|at| self.tree.get(at).copied())
             .map(|row| self.folder_row(row, marked, &theme, cx))
@@ -742,7 +776,12 @@ impl Render for Sidebar {
         // While the archive can't be opened the counts aren't known and the section buttons
         // are drawn disabled (DESIGN §4.14).
         let unavailable = Showing::now(cx) == Showing::ArchiveFailed;
-        let rows = (has_library, !unavailable, self.keyboard(window));
+        let rows = (
+            has_library,
+            !unavailable,
+            self.keyboard(window) && self.location_cursor.is_none(),
+        );
+        let cursor = self.location_cursor.filter(|_| self.keyboard(window));
         let disabled_button = |glyph: AnyElement, label: String, target: &'static str| {
             div()
                 .id(target)
@@ -888,7 +927,7 @@ impl Render for Sidebar {
                         }
                     }),
             )
-            .child(self.render_locations(&theme, cx))
+            .child(self.render_locations(cursor, &theme, cx))
     }
 }
 

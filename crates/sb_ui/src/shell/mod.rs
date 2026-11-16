@@ -253,7 +253,7 @@ impl Shell {
     /// Closes the locations sheet, and gives the keyboard back to where it was.
     fn close_locations(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((sheet, back, _)) = self.locations.take() {
-            sheet.update(cx, |sheet, cx| sheet.cancel_test(cx));
+            sheet.update(cx, |sheet, cx| sheet.closing(window, cx));
             back.unwrap_or_else(|| self.main.focus_handle(cx))
                 .focus(window, cx);
             cx.notify();

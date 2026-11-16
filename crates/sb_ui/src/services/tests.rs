@@ -191,8 +191,11 @@ fn a_stopped_first_sync_shows_what_it_copied_and_the_next_carries_on(cx: &mut Te
     let copied = library.read_with(cx, |library, _| library.counts().all);
     sync.read_with(cx, |sync, _| {
         assert!(sync.is_settled());
-        // Stopping is not failing, and the location has not synced whole.
-        assert_eq!(sync.status(&location), LocationStatus::NeverSynced);
+        // Stopping is not failing: the location says it was stopped, and what it left.
+        assert!(matches!(
+            sync.status(&location),
+            LocationStatus::Stopped { items_left, .. } if items_left > 0
+        ));
     });
     // What the pass stored before it stopped was indexed, and shows.
     assert!(copied > 0 && copied < 300, "{copied} of 300 show");

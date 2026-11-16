@@ -78,7 +78,7 @@ use parse::{Trouble, clock, entry, not_unicode, number, parse_stat, range};
 use reply::{END, Reply, unexpected};
 use script::{Asked, Login, Script};
 
-pub use launch::Launcher;
+pub use launch::{Launcher, quoted};
 
 /// How long a launcher may say nothing at all, on either stream, before its call is given
 /// up on. Output comes per file, so the longest silence a healthy location has is one file
@@ -158,10 +158,7 @@ struct Environment {
 
 /// The login shell was killed before it answered.
 fn late() -> TransportError {
-    TransportError::Failed(format!(
-        "the login shell there was still starting after {LOGIN_SECONDS} seconds and was \
-         stopped: its profile may be waiting for something"
-    ))
+    TransportError::LoginShellHung(LOGIN_SECONDS)
 }
 
 impl ShellTransport {

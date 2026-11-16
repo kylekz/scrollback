@@ -537,6 +537,19 @@ fn sizes_radii_and_spacing_match_design() {
     assert_eq!(sizes.segment_height, px(22.));
     // sb.css: a radio is 14 square and a key/value row's label 128 wide.
     assert_eq!((sizes.radio, sizes.kv_label_width), (px(14.), px(128.)));
+    // The boards' paddings: a segment 9 at its sides, a dialog 14, the sheet 18 and its pane
+    // 20, a list row 10; a test result's labels 110 wide.
+    assert_eq!(
+        [
+            sizes.segment_padding,
+            sizes.dialog_padding,
+            sizes.sheet_padding,
+            sizes.pane_padding,
+            sizes.list_row_padding,
+            sizes.result_label_width
+        ],
+        [9., 14., 18., 20., 10., 110.].map(px)
+    );
 
     // Radii: 4 tags, 6 buttons, 7 inputs, 8 rows, 10 cards, 12 sheets, 14 the page tile,
     // 999 chips.
