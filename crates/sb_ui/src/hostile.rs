@@ -2,9 +2,11 @@
 //! whatever the agent saw, and a string from it must not draw as something it isn't.
 //!
 //! - **Bidirectional controls** (the embeddings, overrides and isolates, U+202A–202E and
-//!   U+2066–2069) reorder what follows them, so a path or a command could read reversed. They
-//!   are shown as what they are, `⟦U+202E⟧`. Right-to-left text needs none of them to read
-//!   right, and the marks (U+200E, U+200F) only nudge neutral characters, so both stay.
+//!   U+2066–2069, and the marks, U+200E, U+200F and U+061C) reorder what is around them, so a
+//!   path or a command could read reversed. They are shown as what they are, `⟦U+202E⟧`, all
+//!   alike. Right-to-left text reads right without them.
+//! - **Text with nothing to show** (only controls, invisible formatting and spaces) says so
+//!   ([`nothing_shown`]) rather than drawing as a blank.
 //! - **A one-line label** ([`label`]: a title, a row's target, a tool's name, a model's, a
 //!   note's kind, a caption) is one line: every line break Unicode has (U+2028, U+2029, NEL,
 //!   vertical tab and form feed with the usual ones), tabs and other controls become spaces, a
@@ -22,7 +24,35 @@ pub const LABEL_CHARS: usize = 300;
 pub const COMBINING_MARKS: usize = 4;
 
 fn is_bidi_control(c: char) -> bool {
-    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    matches!(
+        c,
+        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}'
+    )
+}
+
+/**
+ * What to show for `text` when none of it would draw (it is all controls, invisible
+ * formatting and spaces, and isn't empty): how many characters it is.
+ */
+pub fn nothing_shown(text: &str) -> Option<String> {
+    let invisible = |c: char| {
+        c.is_whitespace()
+            || matches!(
+                c.general_category(),
+                GeneralCategory::Control | GeneralCategory::Format
+            )
+    };
+    (!text.is_empty() && text.chars().all(invisible)).then(|| {
+        let count = text.chars().count();
+        format!(
+            "({count} control {})",
+            if count == 1 {
+                "character"
+            } else {
+                "characters"
+            }
+        )
+    })
 }
 
 /// `text` with every bidirectional control shown as its code point.
@@ -88,8 +118,18 @@ mod tests {
     fn a_control_that_reorders_text_is_shown_and_right_to_left_text_is_left_alone() {
         assert_eq!(bidi("rm -rf \u{202E}gpj.exe"), "rm -rf ⟦U+202E⟧gpj.exe");
         assert_eq!(bidi("a\u{2066}b\u{2069}"), "a⟦U+2066⟧b⟦U+2069⟧");
-        let hebrew = "שלום \u{200F}עולם";
+        let hebrew = "שלום עולם";
         assert!(matches!(bidi(hebrew), Cow::Borrowed(text) if text == hebrew));
+        assert_eq!(
+            bidi("a\u{200F}b\u{200E}c\u{061C}"),
+            "a⟦U+200F⟧b⟦U+200E⟧c⟦U+061C⟧"
+        );
+        assert_eq!(
+            nothing_shown("\u{0}\u{1}\u{200B} \n").as_deref(),
+            Some("(5 control characters)")
+        );
+        assert_eq!(nothing_shown(""), None);
+        assert_eq!(nothing_shown("\u{0}a"), None);
     }
 
     #[test]

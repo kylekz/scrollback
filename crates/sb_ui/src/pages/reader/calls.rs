@@ -22,7 +22,7 @@ use sb_core::transcript::{
 
 use super::ReaderView;
 use super::blocks::{failed, more_lines, on_toggle, skeleton, target, text_rows};
-use super::rows::{BodyPart, PanelPart, Row, RowKind};
+use super::rows::{BodyPart, CHUNK_LINES, PanelPart, Row, RowKind};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{Tone, chip, focus_ring, icon, icon_button, tag, text_width};
@@ -519,10 +519,15 @@ fn body(
             (Some(Load::Loaded(whole)), true) => Some(whole.as_ref()),
             _ => text_of(body, *part),
         } {
+            /* Space above the first row and below the last only: the rows of one part read as
+            one block, with no seam where one ends and the next begins. */
             Some(text) => div()
                 .px(theme.spacing.lg)
                 .when(*chunk == 0, |this| this.pt(theme.spacing.md))
-                .pb(theme.spacing.xs)
+                .when(
+                    !all || (chunk + 1) * CHUNK_LINES >= text.line_count(),
+                    |this| this.pb(theme.spacing.xs),
+                )
                 .text_color(c.fg2)
                 .text_spec(&theme.text.code)
                 .child(hostile::bidi(&text_rows(text, *chunk, all)).into_owned())

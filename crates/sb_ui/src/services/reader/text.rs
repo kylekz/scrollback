@@ -1,6 +1,7 @@
 //! Text shown as it is, a bounded number of lines a row: a call's input and output, a record
 //! as recorded, a thought, and prose too large to lay out as Markdown.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 /**
@@ -61,23 +62,31 @@ impl Text {
         self.count
     }
 
-    /// The lines `range`, joined: what a row draws of them.
+    /// The lines `range`, joined: what a row draws of them. The segments of one long line are
+    /// joined without a break.
     pub fn lines(&self, range: Range<usize>) -> String {
         let end = range.end.min(self.count);
         let start = range.start.min(end);
         let Some(&noted) = self.notes.get(start / NOTE_EVERY) else {
             return String::new();
         };
-        let mut lines = Vec::with_capacity(end - start);
+        let mut out = String::new();
         let mut at = noted;
+        /* Whether the segment before was cut from the middle of its line: the next goes on
+        from it with no break, so the row wraps the line where it is wide enough to. */
+        let mut cut = false;
         for line in start / NOTE_EVERY * NOTE_EVERY..end {
             let (shown, next) = segment(&self.text, at);
             if line >= start {
-                lines.push(&self.text[shown]);
+                if line > start && !cut {
+                    out.push('\n');
+                }
+                out.push_str(&expand_tabs(&self.text[shown.clone()]));
             }
+            cut = next == shown.end && next < self.text.len();
             at = next;
         }
-        lines.join("\n")
+        out
     }
 }
 
@@ -100,6 +109,29 @@ fn segment(text: &str, start: usize) -> (Range<usize>, usize) {
         cut = half + space + 1;
     }
     (start..start + cut, start + cut)
+}
+
+/// The columns a tab stops at: a multiple of this. A tab is drawn as the spaces to the next.
+pub const TAB_STOP: usize = 4;
+
+/// `line` with each tab drawn as the spaces to the next [`TAB_STOP`].
+fn expand_tabs(line: &str) -> Cow<'_, str> {
+    if !line.contains('\t') {
+        return Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len() + 16);
+    let mut column = 0;
+    for c in line.chars() {
+        if c == '\t' {
+            let spaces = TAB_STOP - column % TAB_STOP;
+            out.extend(std::iter::repeat_n(' ', spaces));
+            column += spaces;
+        } else {
+            out.push(c);
+            column += 1;
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// The start of the character at `at` in `text`, or `at` if one starts there.
@@ -147,6 +179,9 @@ mod tests {
         assert_eq!(text.lines(130..133), "line 65\n\nline 66");
         assert_eq!(text.lines(1_998..2_005), "line 999\n");
         assert_eq!(text.lines(5..5), "");
+        /* A tab is drawn to the next stop, as a numbered line of a file reads. */
+        let numbered = Text::new("    1\tfn main() {}\nab\tc".to_string());
+        assert_eq!(numbered.lines(0..2), "    1   fn main() {}\nab  c");
 
         /* Ten megabytes of newlines: ten million lines, noted in a few megabytes. */
         let newlines = Text::new("\n".repeat(10_000_000));
@@ -157,10 +192,8 @@ mod tests {
         /* One line of five megabytes: each segment looks only as far as it can reach. */
         let start = std::time::Instant::now();
         let long = Text::new("word ".repeat(1_000_000));
-        assert_eq!(
-            long.lines(0..long.line_count()).len(),
-            5_000_000 + long.line_count() - 1
-        );
+        /* Its segments read on from each other, with no break. */
+        assert_eq!(long.lines(0..long.line_count()).len(), 5_000_000);
         assert!(start.elapsed().as_secs_f64() < 2.0, "{:?}", start.elapsed());
     }
 }

@@ -524,11 +524,13 @@ fn prose(
             .id(("reply", ix))
             .group(group.clone())
             .relative()
-            .pr(theme.sizes.small_button)
             .rounded(theme.radii.control),
         focused,
         theme,
     )
+    /* The Copy button's own column, at the right: the reply's text and a code block's own
+    Copy stop short of it. After `ringed`, whose padding it widens. */
+    .pr(theme.spacing.sm + theme.sizes.small_button + theme.spacing.xs)
     .child(content)
     .child(
         div()

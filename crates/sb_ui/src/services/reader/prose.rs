@@ -87,6 +87,8 @@ fn oversized(source: &str) -> Piece {
 impl Prose {
     /// Text that is shown as it is (a thought): plain, in one piece.
     pub fn plain(text: &str) -> Self {
+        let note = crate::hostile::nothing_shown(text);
+        let text = note.as_deref().unwrap_or(text);
         Self {
             pieces: vec![Piece::Plain {
                 text: Arc::new(Text::new(crate::hostile::bidi(text).into_owned())),
@@ -97,6 +99,9 @@ impl Prose {
 
     /// `text`, a body of Markdown, prepared (the module docs).
     pub fn markdown(text: &str) -> Self {
+        if let Some(note) = crate::hostile::nothing_shown(text) {
+            return Self::plain(&note);
+        }
         let pieces = if text.len() > MARKDOWN_BYTES {
             None
         } else {

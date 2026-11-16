@@ -68,7 +68,7 @@
 {"cmd": "key", "keystroke": "e"}
 {"cmd": "settle", "expect": {"pointer": "/reader/full_calls", "equals": true}}
 {"cmd": "key", "keystroke": "end"}
-{"cmd": "settle"}
+{"cmd": "settle", "expect": {"pointer": "/reader/at_end", "equals": true}}
 {"cmd": "screenshot", "name": "full-calls-end-1440-dark"}
 
 // E-Reader-Calls-1 and -2: J goes to the next session of fc's page, the playlist's, still in Full calls.
@@ -133,7 +133,7 @@
 {"cmd": "key", "keystroke": "e"}
 {"cmd": "settle", "expect": {"pointer": "/reader/full_calls", "equals": true}}
 {"cmd": "key", "keystroke": "end"}
-{"cmd": "settle"}
+{"cmd": "settle", "expect": {"pointer": "/reader/at_end", "equals": true}}
 {"cmd": "screenshot", "name": "hostile-images-1440-dark"}
 {"cmd": "key", "keystroke": "e", "expect": {"pointer": "/reader/full_calls", "equals": false}}
 

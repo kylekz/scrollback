@@ -49,6 +49,9 @@ serde_json = { workspace = true, optional = true }
 # Metal toolchain (Xcode's is a separate download).
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_platform = { workspace = true, features = ["font-kit", "runtime_shaders"] }
+# macOS's own allocator keeps the large blocks a closed session freed resident (PLAN §14), so
+# the app there allocates with mimalloc, which returns them. Windows' returns them already.
+mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 pretty_assertions.workspace = true

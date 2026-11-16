@@ -88,6 +88,8 @@ pub struct ReaderSnapshot {
     pub top: usize,
     pub top_name: String,
     pub top_offset: f32,
+    /// Whether the column's last row is drawn, its bottom within the column.
+    pub at_end: bool,
     /// The open activity rows.
     pub open_calls: usize,
     /// How many Markdown states, and how many prepared things of the service's, are kept.
@@ -169,6 +171,15 @@ impl ReaderView {
                 _ => String::new(),
             },
             top_offset: scroll_top.offset_in_item.into(),
+            at_end: self
+                .rows
+                .len()
+                .checked_sub(1)
+                .and_then(|last| self.list.bounds_for_item(last))
+                .is_some_and(|last| {
+                    let column = self.list.viewport_bounds();
+                    last.bottom() <= column.bottom() + px(1.)
+                }),
             open_calls: self
                 .rows
                 .iter()
@@ -207,6 +218,7 @@ impl ReaderView {
             self.states.clear();
             self.held.clear();
             self.rows = Rc::new(rows);
+            self.list.set_follow_mode(gpui::FollowMode::Normal);
             self.list.reset(self.rows.len());
             self.focus_first();
         } else {
@@ -230,18 +242,22 @@ impl ReaderView {
             .enumerate()
             .map(|(at, row)| (row.key(), at))
             .collect();
-        let anchor = old.get(top.item_ix).and_then(|row| {
-            in_new
-                .get(&row.key())
-                .map(|&at| (at, top.offset_in_item))
-                .or_else(|| {
-                    old[..top.item_ix]
-                        .iter()
-                        .rev()
-                        .find_map(|row| in_new.get(&row.key()))
-                        .map(|&at| (at, px(0.)))
-                })
-        });
+        /* At the end, the list keeps itself there. */
+        let anchor = old
+            .get(top.item_ix)
+            .filter(|_| !self.list.is_following_tail())
+            .and_then(|row| {
+                in_new
+                    .get(&row.key())
+                    .map(|&at| (at, top.offset_in_item))
+                    .or_else(|| {
+                        old[..top.item_ix]
+                            .iter()
+                            .rev()
+                            .find_map(|row| in_new.get(&row.key()))
+                            .map(|&at| (at, px(0.)))
+                    })
+            });
         for (at, removed, inserted) in splices {
             self.list.splice(at..at + removed, inserted);
         }
@@ -1027,6 +1043,8 @@ fn on<A: gpui::Action>(
     element.on_action(move |_: &A, window, cx| {
         view.update(cx, |this, cx| {
             this.keyboard = true;
+            /* Every key but End lets go of the end (below). */
+            this.list.set_follow_mode(gpui::FollowMode::Normal);
             run(this, window, cx);
         });
     })
@@ -1071,8 +1089,10 @@ pub fn bind_keys(
         if let Some(last) = this.rows.iter().rposition(Row::is_focusable) {
             this.focus(last, cx);
         }
-        // What follows the last row the keyboard takes (a body, how the session ended) too.
-        this.list.scroll_to_end();
+        /* What follows the last row the keyboard takes (a body, how the session ended) too;
+        and the column stays at its end while the rows there are measured and those still
+        loading land, until a key or the wheel moves it. */
+        this.list.set_follow_mode(gpui::FollowMode::Tail);
     });
     element
         .on_action(|_: &act::SwitchCalls, _, cx| {

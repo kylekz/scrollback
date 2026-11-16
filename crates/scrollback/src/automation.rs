@@ -35,7 +35,8 @@
 //! - `reader`: `state` (`closed`, `opening`, `failed` with `error`, or `open`), `full_calls`,
 //!   `place` (`[n, of]`: the open session among its page's), `rows` (the column's), `top` and
 //!   `top_name` (the row at its top, and what it is: `kind conversation/block`) and
-//!   `top_offset` (how far into that row it is scrolled), `focused`
+//!   `top_offset` (how far into that row it is scrolled), `at_end` (whether the last row is
+//!   drawn in full), `focused`
 //!   (`row`, `kind` and the start of the `text` of the keyboard's row, or `null`),
 //!   `open_calls`, `markdown_states` and `held` (how many parsed bodies, and how many prepared
 //!   things of the service's, are kept), `alone` (a subagent read on its own), `loads`
@@ -286,6 +287,7 @@ fn reader(shell: &Shell, cx: &App) -> Value {
         "top": view.top,
         "top_name": view.top_name,
         "top_offset": view.top_offset,
+        "at_end": view.at_end,
         "focused": view.focused.map(|(at, kind, text)| json!({ "row": at, "kind": kind, "text": text })),
         "open_calls": view.open_calls,
         "markdown_states": view.states,
