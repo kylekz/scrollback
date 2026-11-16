@@ -1,8 +1,44 @@
 //! Text shown as it is, a bounded number of lines a row: a call's input and output, a record
-//! as recorded, a thought, and prose too large to lay out as Markdown.
+//! as recorded, a thought, and prose too large to lay out as Markdown. A text can carry marks
+//! ([`Mark`]: a token's kind, a terminal's colour, a line's number, a match), ranges of it that
+//! a row draws in their own style ([`Text::draw`]).
 
 use std::borrow::Cow;
 use std::ops::Range;
+use std::sync::Arc;
+
+use crate::syntax::TokenKind;
+
+/// The colours a terminal is asked for that a body draws, each as a colour of the theme
+/// (DESIGN §4.2.4: `green`, `red`, `yellow`, `blue`); the rest of what it asks is dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Ansi {
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    /// Black and bright black, which read as dim: `fg3`.
+    Dim,
+    /// White: `fg`.
+    Bright,
+}
+
+/// What a range of a text is drawn as, besides itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Mark {
+    /// A token of code, coloured by its kind.
+    Token(TokenKind),
+    Ansi(Ansi),
+    /// A line's number, in `fg3`.
+    Number,
+    /// A file named over the lines found in it, in `fg`.
+    File,
+    /// What a search found, in `hl`.
+    Found,
+}
+
+/// Marks of a text: ranges of it, in order, apart.
+pub type Marks = Arc<[(Range<usize>, Mark)]>;
 
 /**
  * The longest line drawn as one: a longer one is shown as several, each wrapping in its row,
@@ -25,6 +61,8 @@ pub struct Text {
     /// When `text` is only the head of something longer: how many bytes more there are, as
     /// stored (an escape counts as written).
     pub rest: Option<u64>,
+    /// Ranges of `text` drawn in a style of their own.
+    pub marks: Marks,
     /// Where every [`NOTE_EVERY`]th line drawn starts.
     notes: Vec<usize>,
     count: usize,
@@ -45,8 +83,17 @@ impl Text {
         Self {
             text,
             rest: None,
+            marks: Arc::from([]),
             notes,
             count,
+        }
+    }
+
+    /// `text` with `marks`, which are ranges of it, in order, apart.
+    pub fn marked(text: String, marks: Vec<(Range<usize>, Mark)>) -> Self {
+        Self {
+            marks: marks.into(),
+            ..Self::new(text)
         }
     }
 
@@ -65,12 +112,43 @@ impl Text {
     /// The lines `range`, joined: what a row draws of them ([`expand_tabs`] last). The segments
     /// of one long line are joined without a break, up to [`JOINED_BYTES`] at a time.
     pub fn lines(&self, range: Range<usize>) -> String {
+        let mut out = String::new();
+        for (shown, broken) in self.segments(range) {
+            if broken {
+                out.push('\n');
+            }
+            out.push_str(&self.text[shown]);
+        }
+        out
+    }
+
+    /// The line drawn that shows `text` at `at`, or the last before it.
+    pub fn line_at(&self, at: usize) -> usize {
+        /* From the note before `at`: at most NOTE_EVERY lines on. */
+        let noted = self.notes.partition_point(|&start| start <= at).max(1) - 1;
+        let mut start = self.notes.get(noted).copied().unwrap_or(0);
+        for line in noted * NOTE_EVERY..self.count {
+            let next = segment(&self.text, start).1;
+            if at < next {
+                return line;
+            }
+            start = next;
+        }
+        self.count.saturating_sub(1)
+    }
+
+    /**
+     * The ranges of `text` the lines `range` show, in order, each with whether a row draws a
+     * line break before it: the segments of one long line are joined without one, up to
+     * [`JOINED_BYTES`] at a time.
+     */
+    fn segments(&self, range: Range<usize>) -> Vec<(Range<usize>, bool)> {
         let end = range.end.min(self.count);
         let start = range.start.min(end);
         let Some(&noted) = self.notes.get(start / NOTE_EVERY) else {
-            return String::new();
+            return Vec::new();
         };
-        let mut out = String::new();
+        let mut out = Vec::new();
         let mut at = noted;
         /* Whether the segment before was cut from the middle of its line: the next goes on
         from it with no break, so the row wraps the line where it is wide enough to, up to
@@ -80,17 +158,94 @@ impl Text {
         for line in start / NOTE_EVERY * NOTE_EVERY..end {
             let (shown, next) = segment(&self.text, at);
             if line >= start {
-                if line > start && (!cut || joined + shown.len() > JOINED_BYTES) {
-                    out.push('\n');
+                let broken = line > start && (!cut || joined + shown.len() > JOINED_BYTES);
+                if broken {
                     joined = 0;
                 }
                 joined += shown.len();
-                out.push_str(&self.text[shown.clone()]);
+                out.push((shown.clone(), broken));
             }
             cut = next == shown.end && next < self.text.len();
             at = next;
         }
         out
+    }
+
+    /**
+     * The lines `range` as a row draws them: joined as [`Text::lines`] joins them, each
+     * bidirectional control shown as its code point ([`crate::hostile::bidi`]) and each tab as
+     * the spaces to its stop ([`expand_tabs`]); and where in that each of `marks` falls, cut
+     * to what the lines show of it, those they don't show left out. `marks` are ranges of
+     * `text`, in order, apart.
+     */
+    pub fn draw<M: Clone>(
+        &self,
+        range: Range<usize>,
+        marks: &[(Range<usize>, M)],
+    ) -> (String, Vec<(Range<usize>, M)>) {
+        let segments = self.segments(range);
+        let (Some(first), Some(last)) = (segments.first(), segments.last()) else {
+            return (String::new(), Vec::new());
+        };
+        let shown = first.0.start..last.0.end;
+        let from = marks.partition_point(|(mark, _)| mark.end <= shown.start);
+        let marks: Vec<(Range<usize>, M)> = marks[from..]
+            .iter()
+            .take_while(|(mark, _)| mark.start < shown.end)
+            .map(|(mark, it)| {
+                (
+                    mark.start.max(shown.start)..mark.end.min(shown.end),
+                    it.clone(),
+                )
+            })
+            .collect();
+        /* Where in what is drawn each end of a mark falls, found as the characters go by. */
+        let mut ends: Vec<usize> = marks
+            .iter()
+            .flat_map(|(mark, _)| [mark.start, mark.end])
+            .collect();
+        ends.sort_unstable();
+        let mut placed: Vec<(usize, usize)> = Vec::with_capacity(ends.len());
+        let mut out = String::with_capacity(shown.len() + 16);
+        let mut column = 0;
+        let place = |at: usize, drawn: usize, placed: &mut Vec<(usize, usize)>| {
+            while placed.len() < ends.len() && ends[placed.len()] <= at {
+                placed.push((ends[placed.len()], drawn));
+            }
+        };
+        for (segment, broken) in &segments {
+            if *broken {
+                out.push('\n');
+                column = 0;
+            }
+            for (offset, c) in self.text[segment.clone()].char_indices() {
+                place(segment.start + offset, out.len(), &mut placed);
+                if c == '\t' {
+                    let spaces = TAB_STOP - column % TAB_STOP;
+                    out.extend(std::iter::repeat_n(' ', spaces));
+                    column += spaces;
+                } else if crate::hostile::is_bidi_control(c) {
+                    let marker = format!("⟦U+{:04X}⟧", c as u32);
+                    column += marker.chars().count();
+                    out.push_str(&marker);
+                } else {
+                    out.push(c);
+                    column += 1;
+                }
+            }
+            place(segment.end, out.len(), &mut placed);
+        }
+        place(usize::MAX, out.len(), &mut placed);
+        let drawn = |at: usize| {
+            let found = placed.partition_point(|(end, _)| *end < at);
+            placed.get(found).map_or(out.len(), |(_, drawn)| *drawn)
+        };
+        let marks = marks
+            .into_iter()
+            .map(|(mark, it)| (drawn(mark.start)..drawn(mark.end), it))
+            .filter(|(mark, _)| !mark.is_empty())
+            .collect();
+        (out, marks)
     }
 }
 

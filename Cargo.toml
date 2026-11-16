@@ -95,6 +95,9 @@ env_logger = "0.11"
 # (`sb_ui::services::reader`); gpui's own pin, the formats a transcript holds.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 log = "0.4"
+# The line and word diff of an edit's body (`sb_ui::services::reader::shape::diff`), dv's, whose
+# word marks are lifted with it (PLAN D15).
+imara-diff = "0.2"
 # The Markdown parser gpui-base's `TextView` uses: `sb_ui::markdown` sanitises a body at the
 # spans it reports before `TextView` sees it. Already in the tree through gpui-base.
 markdown = "1.0.0"
@@ -104,6 +107,9 @@ unicode-properties = { version = "0.1", default-features = false, features = ["g
 # in the tree.
 url = "2.5"
 pretty_assertions = "1.4"
+# A content search's pattern, found again in what it returned to mark it (`sb_ui`'s reader):
+# linear in what it searches whatever the pattern. Already in the tree.
+regex = "1.13"
 # Apple systems only: `fsync` without the full flush std's `sync_all` does there
 # (`sb_core::archive`).
 rustix = "1"

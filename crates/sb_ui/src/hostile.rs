@@ -24,7 +24,7 @@ pub const LABEL_CHARS: usize = 300;
 /// enough that a stack can't spill over the rows above and below.
 pub const COMBINING_MARKS: usize = 4;
 
-fn is_bidi_control(c: char) -> bool {
+pub fn is_bidi_control(c: char) -> bool {
     matches!(
         c,
         '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}'

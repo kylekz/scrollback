@@ -54,6 +54,7 @@
 pub mod highlights;
 pub mod picture;
 pub mod prose;
+pub mod shape;
 #[cfg(test)]
 mod tests;
 pub mod text;
@@ -77,6 +78,7 @@ use super::{ArchiveService, LibraryService, Providers};
 use crate::syntax::TokenKind;
 pub use picture::Picture;
 pub use prose::{Piece, Prose};
+use shape::json::pretty;
 pub use text::Text;
 
 /// How many decoded segments an open session keeps, and how many bytes of them: a segment is
@@ -1541,21 +1543,6 @@ fn copy_parts(parts: impl Iterator<Item = Result<String, String>>, cx: &mut gpui
     if !text.is_empty() {
         crate::system::copy_text(text, cx);
     }
-}
-
-/// The most of a call's input pretty-printed as JSON: past it, parsing it to print it again
-/// takes long and holds several copies; it is shown as it was sent.
-const PRETTY_BYTES: usize = 1024 * 1024;
-
-/// `text` pretty-printed when it is JSON of at most [`PRETTY_BYTES`], else as it is.
-fn pretty(text: String) -> String {
-    if text.len() > PRETTY_BYTES {
-        return text;
-    }
-    serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|value| serde_json::to_string_pretty(&value).ok())
-        .unwrap_or(text)
 }
 
 /// Moves each subagent read with a conversation (one whose records are in its own transcript)

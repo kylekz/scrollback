@@ -27,8 +27,10 @@ gpui-component.workspace = true
 gpui_appearance.workspace = true
 gpui_automation.workspace = true
 image.workspace = true
+imara-diff.workspace = true
 log.workspace = true
 markdown.workspace = true
+regex.workspace = true
 sb_core.workspace = true
 # The app's settings file (`services::settings`), written through a temporary file, and a
 # tool call's input, pretty-printed in its body (`services::reader`).
