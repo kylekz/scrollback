@@ -30,6 +30,7 @@ use crate::keymap;
 use crate::overlay::{self, Layer};
 use crate::services::ActiveServices as _;
 use crate::services::ForGood;
+use crate::services::library::Refusal;
 use crate::services::library::title_of;
 use crate::theme::{SbTheme, StyledText as _};
 
@@ -38,7 +39,7 @@ use crate::theme::{SbTheme, StyledText as _};
 pub(super) enum Asking {
     Delete(FolderId),
     /// Delete for good, of the session, with why its last confirmation was refused.
-    DeleteForGood(SessionId, Option<String>),
+    DeleteForGood(SessionId, Option<Refusal>),
     Save,
 }
 
@@ -67,7 +68,7 @@ impl Shell {
             (Some(folder), ..) => Some(Asking::Delete(folder)),
             (None, Some(asked), _) => Some(Asking::DeleteForGood(
                 asked.session.id.clone(),
-                asked.refused.clone(),
+                asked.refused,
             )),
             (None, None, Some(_)) => Some(Asking::Save),
             (None, None, None) => None,
@@ -82,7 +83,11 @@ impl Shell {
                 open.asking = asking;
             }
             (Some(asking), None) => {
-                let (back, cancel) = (window.focused(cx), cx.focus_handle());
+                // Cancel is a stop of the trap's `Tab` order like the dialog's other buttons.
+                let (back, cancel) = (
+                    window.focused(cx),
+                    cx.focus_handle().tab_index(0).tab_stop(true),
+                );
                 match asking {
                     Asking::DeleteForGood(..) => cancel.focus(window, cx),
                     Asking::Delete(_) | Asking::Save => self.dialog_focus.focus(window, cx),
@@ -244,6 +249,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let c = &theme.colors;
+        let accent = c.accent;
         let ForGood {
             session,
             deletion,
@@ -397,7 +403,7 @@ impl Shell {
                                 .children(refused.map(|why| {
                                     div()
                                         .text_color(c.yellow)
-                                        .child(why)
+                                        .child(why.said())
                                         .automation_target("for-good/refused")
                                 })),
                         )
@@ -419,6 +425,8 @@ impl Shell {
                         .child(
                             button("for-good-cancel", ButtonKind::Plain, false, true, theme)
                                 .track_focus(cancel)
+                                // Its ring shows from the start: the keyboard is on it.
+                                .focus(move |style| style.border_color(accent))
                                 .on_click(answer(false))
                                 .child("Cancel")
                                 .automation_target("for-good/cancel"),

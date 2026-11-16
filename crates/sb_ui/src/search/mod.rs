@@ -20,7 +20,13 @@
 //! wrapping; `Enter` opens the highlighted session at its match (or at its first match, on a
 //! session's row), runs a command or searches a recent search again; `Ctrl Enter` shows the
 //! session's folder page instead; `Esc` closes it, as do `Ctrl K` and a press on the scrim. No
-//! key of the shell or a page acts behind it. A new answer puts the keys back on its first row.
+//! key of the shell or a page acts behind it, nor does `Tab` or `Shift Tab` take the keyboard
+//! out of the query field. A new answer puts the keys on its first row: an exact command's name
+//! first, else the first session found, else the first command.
+//!
+//! **While sessions are indexed** under it, the palette searches its query again (once the
+//! news has paused for half a second) and reads again how many sessions are not searchable
+//! yet, so what it finds and its "Still indexing" banner follow the index.
 //!
 //! **Opening at a match** asks the reader for a [`ReadAt`] made of what the answer was asked
 //! with, not of what has been typed since.
@@ -42,7 +48,7 @@ use gpui::{
 };
 use gpui_component::FocusTrapElement as _;
 use gpui_component::input::{
-    Backspace, Escape, IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp,
+    Backspace, Escape, IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, OutdentInline,
 };
 use sb_core::catalogue::{Filed, Folder, Session, Shelf};
 use sb_core::provider::ProviderId;
@@ -68,7 +74,8 @@ use crate::pages::Showing;
 use crate::services::library::title_of;
 use crate::services::view::{DateRange, RECENT_DAYS};
 use crate::services::{
-    ActiveServices as _, Answer, Answered, LibraryService, ReadAt, SearchService, SyncService,
+    ActiveServices as _, Answer, Answered, LibraryService, ReadAt, SearchService, SyncEvent,
+    SyncService,
 };
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 use query::{Asked, Chip, Completion, Known};
@@ -85,6 +92,8 @@ const BAR_HEIGHT: Pixels = px(2.);
 const CHIP_MENU_WIDTH: Pixels = px(240.);
 /// How many values a chip's menu offers.
 const MENU_VALUES: usize = 30;
+/// How long index news pauses before the palette searches again.
+const AGAIN_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// What the footer says (DESIGN §4.9).
 const FOOTER: &str = "Searches titles, prompts, replies, and tool calls' commands and paths. \
@@ -227,7 +236,9 @@ pub struct Palette {
     library: Entity<LibraryService>,
     search: Entity<SearchService>,
     sync: Entity<SyncService>,
-    _subscriptions: [Subscription; 3],
+    /// The search again that index news asked for, until it runs.
+    again: Option<gpui::Task<()>>,
+    _subscriptions: [Subscription; 4],
 }
 
 impl EventEmitter<PaletteEvent> for Palette {}
@@ -270,11 +281,22 @@ impl Palette {
                         (now, before) => now.is_some() != before.is_some(),
                     };
                     if new {
-                        this.highlight = 0;
+                        this.highlight = start(&this.view(cx));
                         this.scroll.set_offset(point(px(0.), px(0.)));
                         this.shown_answer = answer;
                     }
                     cx.notify();
+                }),
+                cx.subscribe(&sync, |this, _, _: &SyncEvent, cx| {
+                    this.again = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(AGAIN_AFTER).await;
+                        this.update(cx, |this, cx| {
+                            this.again = None;
+                            this.search.update(cx, SearchService::refresh);
+                            this.search_again(true, cx);
+                        })
+                        .ok();
+                    }));
                 }),
                 cx.observe(&library, |this, library, cx| {
                     let folders = library.read(cx).folders();
@@ -285,6 +307,7 @@ impl Palette {
                 }),
             ],
             folders: library.read(cx).folders().to_vec(),
+            again: None,
             input,
             chips: Vec::new(),
             highlight: 0,
@@ -363,6 +386,7 @@ impl Palette {
             model_name: &|model| agents::any_model(model, None, cx),
             branches: &branches,
             dates: &dates,
+            calendar: format::calendar(),
         })
     }
 
@@ -453,6 +477,12 @@ impl Palette {
      * token is being typed.
      */
     fn run(&mut self, cx: &mut Context<Self>) {
+        self.search_again(false, cx);
+    }
+
+    /// Searches for what the chips and the query field say: `always`, even when it is what
+    /// the answer shown is of (the index has news).
+    fn search_again(&mut self, always: bool, cx: &mut Context<Self>) {
         let view = self.view(cx);
         let View { text, asked, .. } = view;
         let query = match asked.unresolved {
@@ -460,10 +490,10 @@ impl Palette {
             None => asked.query,
         };
         let answered = self.search.read(cx).answer().map(|it| &it.query);
-        if answered == Some(&query) && self.search.read(cx).is_settled() {
+        if !always && answered == Some(&query) && self.search.read(cx).is_settled() {
             return;
         }
-        self.highlight = 0;
+        self.highlight = start(&self.view(cx));
         self.search
             .update(cx, |search, cx| search.search(query, text, asked.find, cx));
         cx.notify();
@@ -675,6 +705,20 @@ impl Palette {
             }
         }
     }
+}
+
+/**
+ * The row the keys start on in `view`: a command whose name is the whole query, else the
+ * first session found, else the first row (a command, when there is one).
+ */
+fn start(view: &View) -> usize {
+    let exact = (view.commands.iter())
+        .position(|command| command.name.eq_ignore_ascii_case(view.asked.find.trim()));
+    let first = |wanted: &dyn Fn(&Row) -> bool| view.rows.iter().position(wanted);
+    exact
+        .and_then(|at| first(&|row| *row == Row::Command(at)))
+        .or_else(|| first(&|row| matches!(row, Row::Session(_))))
+        .unwrap_or(0)
 }
 
 /// The token of a page of the library.
@@ -1359,6 +1403,7 @@ impl Render for Palette {
                     this.take(completion, window, cx);
                 }
             }))
+            .capture_action(|_: &OutdentInline, _, cx| cx.stop_propagation())
             .capture_action(cx.listener(|this, _: &Backspace, _, cx| {
                 if this.text(cx).is_empty() && !this.chips.is_empty() {
                     cx.stop_propagation();
@@ -1427,20 +1472,11 @@ impl Render for Palette {
                     .bg(c.s1)
                     .text_color(c.fg3)
                     .text_spec(&theme.text.small)
-                    .whitespace_nowrap()
-                    .child(keys(&["up", "down"], "move"))
-                    .child(keys(&["enter"], "open at the match"))
-                    .child(keys(&["tab"], "add a filter"))
-                    .child(
-                        // It gives way at its end, where a narrow window cuts it.
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .text_right()
-                            .child(FOOTER),
-                    ),
+                    .child(keys(&["up", "down"], "move").whitespace_nowrap())
+                    .child(keys(&["enter"], "open at the match").whitespace_nowrap())
+                    .child(keys(&["tab"], "add a filter").whitespace_nowrap())
+                    // It wraps onto a second line where the window is too narrow for one.
+                    .child(div().flex_1().min_w_0().text_right().child(FOOTER)),
             )
             .focus_trap("palette-trap", &self.focus)
             .debug_selector(|| "palette".into())

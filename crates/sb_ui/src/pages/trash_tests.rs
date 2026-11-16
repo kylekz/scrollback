@@ -11,6 +11,7 @@ use sb_core::catalogue::{Deletion, Filed, Session, SessionId, Shelf};
 use sb_core::filing::FolderId;
 
 use super::Showing;
+use crate::services::library::Refusal;
 use crate::services::{ActiveServices as _, LibraryService};
 use crate::shell::Shell;
 use crate::test_support::{SESSIONS, bounds, open_shell, write_with};
@@ -117,10 +118,11 @@ fn trash_is_a_page_and_restore_puts_a_session_back_with_an_undo(cx: &mut TestApp
     assert_eq!(in_trash(cx), Vec::<String>::new());
     assert!(bounds(cx, "trash-table").is_none(), "Trash is empty");
 
-    // Undo moves it to Trash again.
+    // Undo moves it to Trash again, and its own toast has no Undo.
     library(cx).update(cx, LibraryService::undo);
     cx.run_until_parked();
     assert_eq!(in_trash(cx), [SESSIONS[0].title]);
+    assert_eq!(toast(cx), Some(("Undone".to_string(), false)));
 }
 
 #[gpui::test]
@@ -242,13 +244,13 @@ fn deleting_for_good_asks_with_cancel_first_and_enter_never_confirms(cx: &mut Te
 }
 
 /// What deleting the session asked about would remove, once read.
-fn asked(cx: &mut VisualTestContext) -> Option<(String, Option<Deletion>, Option<String>)> {
+fn asked(cx: &mut VisualTestContext) -> Option<(String, Option<Deletion>, Option<Refusal>)> {
     library(cx).read_with(cx, |it, _| {
         it.for_good().map(|asked| {
             (
                 asked.session.title.clone().unwrap_or_default(),
                 asked.deletion.clone(),
-                asked.refused.clone(),
+                asked.refused,
             )
         })
     })
@@ -326,7 +328,7 @@ fn a_session_changed_since_it_was_shown_asks_again_with_its_numbers_now(cx: &mut
         now.expect("read again").bytes > shown.bytes,
         "its numbers now"
     );
-    assert!(refused.is_some_and(|why| why.contains("changed")));
+    assert_eq!(refused, Some(Refusal::Changed));
     assert!(
         cx.update(|window, cx| {
             shell
@@ -360,7 +362,13 @@ fn a_refusal_while_its_location_syncs_shows_again_or_says_so_over_another(cx: &m
     cx.run_until_parked();
     let (title, _, refused) = asked(cx).expect("asked again");
     assert_eq!(title, SESSIONS[0].title);
-    assert!(refused.is_some_and(|why| why.contains("being synced")));
+    assert_eq!(refused, Some(Refusal::Syncing));
+    // Once no sync runs, it forgets why and reads what it removes again.
+    let sync = cx.update(|_, cx| cx.services().sync.clone());
+    sync.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    let (_, read, refused) = asked(cx).expect("still asked");
+    assert_eq!((read.is_some(), refused), (true, None));
 
     // Over another session's confirmation it never takes that one's place: a toast says it.
     library(cx).update(cx, |library, cx| library.answer_delete_for_good(false, cx));
@@ -454,4 +462,81 @@ fn a_rows_buttons_neither_select_nor_open_it_and_its_reader_highlights_trash(
         library(cx).read_with(cx, |it, _| it.highlighted()),
         Shelf::Trash
     );
+}
+
+#[gpui::test]
+fn tab_and_shift_tab_go_round_cancel_and_delete_for_good(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    trash(SESSIONS[0].title, cx);
+    click("trash-delete-0", cx);
+    let on_cancel = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            shell
+                .read(cx)
+                .for_good_cancel()
+                .is_some_and(|cancel| cancel.is_focused(window))
+        })
+    };
+    assert!(on_cancel(cx));
+    for (key, cancel) in [
+        ("tab", false),
+        ("tab", true),
+        ("tab", false),
+        ("shift-tab", true),
+        ("shift-tab", false),
+        ("shift-tab", true),
+    ] {
+        cx.simulate_keystrokes(key);
+        cx.run_until_parked();
+        assert_eq!(on_cancel(cx), cancel, "after {key}");
+        assert!(asked(cx).is_some(), "the dialog keeps the keyboard");
+    }
+}
+
+#[gpui::test]
+fn a_long_title_is_cut_in_the_middle_in_its_toast(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    trash(SESSIONS[0].title, cx);
+    let mut long = session(SESSIONS[0].title, cx).unwrap();
+    long.title = Some(format!("start {} end", "of a very long title ".repeat(12)));
+    library(cx).update(cx, |library, cx| library.ask_delete_for_good(long, cx));
+    cx.run_until_parked();
+    library(cx).update(cx, |library, cx| library.answer_delete_for_good(true, cx));
+    cx.run_until_parked();
+    let (text, _) = toast(cx).expect("a toast");
+    assert!(
+        text.starts_with("Deleted “start")
+            && text.contains('\u{2026}')
+            && text.contains("end” for good"),
+        "{text}"
+    );
+    assert!(text.chars().count() < 150, "{text}");
+}
+
+#[gpui::test]
+fn delete_folder_goes_round_its_buttons_with_tab_too(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    let folder = filed_in("Kept", SESSIONS[0].title, cx);
+    let ask = |cx: &mut VisualTestContext| {
+        library(cx).update(cx, |library, cx| library.ask_delete(folder, cx));
+        cx.run_until_parked();
+    };
+    let kept =
+        |cx: &mut VisualTestContext| library(cx).read_with(cx, |it, _| it.folder(folder).is_some());
+    // Tab reaches Cancel first, then Delete folder, then Cancel again.
+    ask(cx);
+    press(cx, "tab");
+    press(cx, "enter");
+    assert_eq!(
+        library(cx).read_with(cx, |it, _| it.deleting()),
+        None,
+        "Cancel"
+    );
+    assert!(kept(cx));
+    ask(cx);
+    for key in ["tab", "tab", "tab", "shift-tab"] {
+        press(cx, key);
+    }
+    press(cx, "enter");
+    assert!(!kept(cx), "Delete folder");
 }

@@ -59,9 +59,9 @@ impl Command {
     }
 
     /**
-     * Whether it is what `terms` ask for: each term starts a word of its name, whatever the
-     * case, so "sync", "trash" and "new fol" find "Sync all locations", "Move to Trash" and
-     * "New folder".
+     * Whether it is what `terms` ask for: they are two characters at least, and each starts a
+     * word of its name, whatever the case, so "sync", "trash" and "new fol" find "Sync all
+     * locations", "Move to Trash" and "New folder", and "s" finds nothing.
      */
     pub fn matches(&self, terms: &[String]) -> bool {
         let words: Vec<String> = self
@@ -69,7 +69,7 @@ impl Command {
             .split(|char: char| !char.is_alphanumeric())
             .map(str::to_lowercase)
             .collect();
-        !terms.is_empty()
+        terms.iter().map(|term| term.chars().count()).sum::<usize>() >= 2
             && terms.iter().all(|term| {
                 let term = term.to_lowercase();
                 words.iter().any(|word| word.starts_with(&term))
@@ -242,6 +242,7 @@ mod tests {
         );
         assert_eq!(names("NEW fol", page), ["New folder"]);
         assert_eq!(names("rash", page), Vec::<&str>::new());
+        assert_eq!(names("s", page), Vec::<&str>::new(), "one character");
         assert_eq!(names("", page), Vec::<&str>::new());
     }
 

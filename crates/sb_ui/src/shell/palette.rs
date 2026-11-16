@@ -38,7 +38,12 @@ impl Shell {
         }
         // A narrow window's sidebar gives way to it, as to a press outside the sidebar.
         self.sidebar_open = false;
-        let back = window.focused(cx);
+        /* The keyboard goes back to the sidebar or the main area it was in; from the title
+        bar's search field, which a click gave it, to the main area. */
+        let back = window.focused(cx).filter(|focused| {
+            self.main.focus_handle(cx).contains(focused, window)
+                || self.sidebar.focus_handle(cx).contains(focused, window)
+        });
         let shelf = cx.services().library.read(cx).shelf();
         let palette = cx.new(|cx| Palette::new(shelf, window, cx));
         let heard = cx.subscribe_in(&palette, window, |this, _, event, window, cx| match event {

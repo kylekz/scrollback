@@ -483,11 +483,16 @@ impl MainArea {
                 .bottom(TOAST_BOTTOM)
                 .left_0()
                 .right_0()
+                .px(theme.sizes.page_side)
                 .flex()
                 .justify_center()
                 .child(
                     div()
                         .id("toast")
+                        // As wide as the main area allows, its text giving way, never its
+                        // buttons.
+                        .max_w_full()
+                        .min_w_0()
                         .debug_selector(|| "toast".into())
                         // Its time stops running out while the pointer rests on it.
                         .on_hover(|hovered, _, cx| {
@@ -507,6 +512,10 @@ impl MainArea {
                         .shadow(theme.shadows.pop.clone())
                         .child(
                             div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
                                 .child(toast.text.clone())
                                 .automation_target("toast/text"),
                         )
@@ -514,6 +523,7 @@ impl MainArea {
                             this.child(
                                 div()
                                     .id("toast-undo")
+                                    .flex_none()
                                     .role(Role::Button)
                                     .text_color(c.accent_text)
                                     .font_weight(theme.text.control.weight)

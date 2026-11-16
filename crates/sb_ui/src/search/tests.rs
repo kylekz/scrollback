@@ -11,9 +11,11 @@ use sb_core::transcript::At;
 use serde_json::json;
 
 use super::*;
+use crate::services::SyncEvent;
 use crate::services::{ActiveServices as _, LibraryService};
 use crate::shell::Shell;
-use crate::test_support::{SESSIONS, archive_dir, bounds, open_shell, write_with};
+use crate::test_support::{SESSIONS, archive_dir, bounds, open_shell, write_session, write_with};
+use sb_test_support::Outline;
 
 fn library(cx: &mut VisualTestContext) -> Entity<LibraryService> {
     cx.update(|_, cx| cx.services().library.clone())
@@ -502,4 +504,99 @@ fn the_recent_sessions_leave_once_in_trash_or_deleted_for_good(cx: &mut TestAppC
     library(cx).update(cx, |library, cx| library.answer_delete_for_good(true, cx));
     cx.run_until_parked();
     assert_eq!(recent(cx), Vec::<String>::new());
+}
+
+/// Has this machine's agent write a session titled `title`, and syncs it.
+fn synced(title: &'static str, cx: &mut VisualTestContext) {
+    write_session(
+        &Outline {
+            project: "/home/user/code/app",
+            title,
+            prompt: title,
+            model: "model-a",
+            day: (2026, 11, 14),
+            calls: 0,
+        },
+        cx,
+    );
+    let sync = cx.update(|_, cx| cx.services().sync.clone());
+    sync.update(cx, |sync, cx| sync.sync_all(cx));
+}
+
+#[gpui::test]
+fn an_open_palette_searches_again_as_sessions_are_indexed(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    open_palette(&shell, cx);
+    typed("lighthouse", cx);
+    assert_eq!(found(cx), Some(vec![]));
+    synced("Paint the lighthouse", cx);
+    cx.run_until_parked();
+    // Once the news has paused for half a second.
+    cx.executor().advance_clock(AGAIN_AFTER);
+    cx.run_until_parked();
+    assert_eq!(found(cx), Some(vec!["Paint the lighthouse".to_string()]));
+
+    // And the banner follows how many are not searchable yet.
+    sb_test_support::edit_catalogue(&archive_dir(cx), "UPDATE session SET searchable = 0");
+    let sync = cx.update(|_, cx| cx.services().sync.clone());
+    sync.update(cx, |_, cx| cx.emit(SyncEvent::Archived));
+    cx.executor().advance_clock(AGAIN_AFTER);
+    cx.run_until_parked();
+    assert_eq!(service(cx).read_with(cx, |it, _| it.unsearchable()), 4);
+    assert!(bounds(cx, "palette-indexing").is_some());
+}
+
+#[gpui::test]
+fn the_keys_start_on_an_exact_command_else_a_session_else_a_command(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    synced("Sync all locations at night", cx);
+    cx.run_until_parked();
+    let palette = open_palette(&shell, cx);
+    typed("sync", cx);
+    assert_eq!(rows(&palette, cx)[..2], [Row::Command(0), Row::Session(0)]);
+    assert_eq!(highlight(&palette, cx), 1, "the first session found");
+    set_text(&palette, "sync all locations", cx);
+    assert_eq!(rows(&palette, cx)[..2], [Row::Command(0), Row::Session(0)]);
+    assert_eq!(highlight(&palette, cx), 0, "the command named exactly");
+    set_text(&palette, "new folder", cx);
+    assert_eq!(highlight(&palette, cx), 0, "no session: the first command");
+    set_text(&palette, "s", cx);
+    assert_eq!(
+        palette.read_with(cx, |palette, cx| palette.command_names(cx)),
+        Vec::<&str>::new(),
+        "one character names no command"
+    );
+}
+
+#[gpui::test]
+fn tab_and_shift_tab_never_take_the_keyboard_out_of_the_query(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    let palette = open_palette(&shell, cx);
+    typed("nothing holds this", cx);
+    for key in ["tab", "shift-tab", "tab", "shift-tab"] {
+        cx.simulate_keystrokes(key);
+        cx.run_until_parked();
+        assert!(
+            cx.update(|window, cx| palette.read(cx).input.focus_handle(cx).is_focused(window)),
+            "after {key}"
+        );
+    }
+    typed("!", cx);
+    assert_eq!(text(&palette, cx), "nothing holds this!");
+}
+
+#[gpui::test]
+fn closing_a_palette_opened_from_the_title_bar_puts_the_keyboard_on_the_page(
+    cx: &mut TestAppContext,
+) {
+    let (shell, cx) = open_shell(cx);
+    let field = bounds(cx, "titlebar-search")
+        .expect("the search field")
+        .center();
+    cx.simulate_click(field, Modifiers::none());
+    cx.run_until_parked();
+    assert!(shown(&shell, cx).is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(main_focused(&shell, cx));
 }

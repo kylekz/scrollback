@@ -34,6 +34,14 @@ const MONTHS: [&str; 12] = [
     "December",
 ];
 
+/// The calendar dates are written in, which a date typed in a search is read in too.
+pub fn calendar() -> sb_core::search::Calendar {
+    match PINNED_YEAR.get() {
+        Some(_) => sb_core::search::Calendar::Utc,
+        None => sb_core::search::Calendar::Local,
+    }
+}
+
 /// Now, in Unix milliseconds.
 pub fn now() -> i64 {
     Local::now().timestamp_millis()

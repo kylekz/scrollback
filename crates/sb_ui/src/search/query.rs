@@ -13,7 +13,7 @@ use std::ops::Range;
 use sb_core::catalogue::{Folder, Shelf};
 use sb_core::location::Location;
 use sb_core::provider::ProviderId;
-use sb_core::search::{Filter, Filters, Key, Names, Query, Token, parse};
+use sb_core::search::{Calendar, Filter, Filters, Key, Names, Query, Token, parse, word};
 
 use crate::components::end_cut;
 
@@ -78,6 +78,8 @@ pub struct Known<'a> {
     pub branches: &'a [String],
     /// The years and the month after: and before: offer, the latest first.
     pub dates: &'a [String],
+    /// The calendar dates are shown in, and so read in.
+    pub calendar: Calendar,
 }
 
 impl<'a> Known<'a> {
@@ -122,6 +124,7 @@ impl<'a> Known<'a> {
             folders: self.folders,
             locations: self.locations,
             agents: self.agent_ids,
+            calendar: self.calendar,
         };
         token
             .resolve(&names)
@@ -165,29 +168,20 @@ impl Completion {
     }
 }
 
-/// The words of `text` and where each is, in bytes: white space separates them, but not inside
-/// double quotes, as `sb_core`'s parser reads them.
+/// The words of `text` and where each is, in bytes, as `sb_core`'s parser reads them.
 fn words(text: &str) -> Vec<Range<usize>> {
     let mut words = Vec::new();
-    let mut start = None;
-    let mut quoted = false;
-    for (at, char) in text.char_indices() {
-        match char {
-            char if char.is_whitespace() && !quoted => {
-                if let Some(from) = start.take() {
-                    words.push(from..at);
-                }
-            }
-            char => {
-                if char == '"' {
-                    quoted = !quoted;
-                }
-                start.get_or_insert(at);
-            }
+    let mut at = 0;
+    loop {
+        let rest = &text[at..];
+        let start = at + rest.len() - rest.trim_start().len();
+        if start == text.len() {
+            return words;
         }
+        let (word, _) = word(&text[start..]);
+        words.push(start..start + word.len());
+        at = start + word.len();
     }
-    words.extend(start.map(|from| from..text.len()));
-    words
 }
 
 /// The token `word` is, when it is one with a value.
@@ -307,7 +301,7 @@ pub fn completions(text: &str, known: &Known<'_>) -> Vec<Completion> {
                 .map(Completion::Chip)
                 .collect()
         }
-        None if word.len() >= 2 => KEYS
+        None if word.chars().count() >= 2 => KEYS
             .iter()
             .filter(|key| {
                 key.as_str().len() > word.len()
@@ -350,6 +344,7 @@ mod tests {
             model_name: &|model| model.replace("model-", "Model "),
             branches: &["main".to_string()],
             dates: &["2026".to_string()],
+            calendar: Calendar::Local,
         })
     }
 

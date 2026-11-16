@@ -414,7 +414,7 @@ fn library(cx: &App) -> Value {
             "versions": asked.deletion.as_ref().map(|it| it.versions),
             "bytes": asked.deletion.as_ref().map(|it| it.bytes),
             "at_location": asked.deletion.as_ref().map(|it| it.at_location),
-            "refused": asked.refused,
+            "refused": asked.refused.map(|why| why.said()),
         })),
         "read_at": library.read_at().map(|at| json!({
             "kind": format!("{:?}", at.kind).to_lowercase(),

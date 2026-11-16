@@ -12,7 +12,7 @@ use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::catalogue::Shelf;
 use sb_core::search::{
-    self, Filters, Key, Limit, MatchKind, Names, Query, Results, SearchError, Searched,
+    self, Calendar, Filters, Key, Limit, MatchKind, Names, Query, Results, SearchError, Searched,
 };
 use sb_core::transcript::{At, Content};
 use sb_test_support::{Agent, FileAgent, Items, ProjectsTree};
@@ -84,6 +84,7 @@ fn names<A: Agent>(bench: &Bench<A>) -> Names<'static> {
         folders: catalogue.folders().unwrap().leak(),
         locations: catalogue.locations().unwrap().leak(),
         agents: vec![bench.agent.provider().id()].leak(),
+        calendar: Calendar::Local,
     }
 }
 
@@ -710,6 +711,7 @@ fn a_date_is_the_start_of_its_day_month_or_year_in_local_time() {
         folders: &[],
         locations: &[],
         agents: &[],
+        calendar: Calendar::Local,
     };
     let at = |input: &str| search::query(input, &names).0.filters;
     let midnight = |year, month, day| {
@@ -737,6 +739,29 @@ fn a_date_is_the_start_of_its_day_month_or_year_in_local_time() {
             "{not_a_date}"
         );
     }
+    /* Read in UTC, as the app shows dates under a pinned calendar. */
+    let utc = Names {
+        calendar: Calendar::Utc,
+        ..names
+    };
+    assert_eq!(
+        search::query("after:2026-03-05", &utc).0.filters.after,
+        Some(
+            chrono::Utc
+                .with_ymd_and_hms(2026, 3, 5, 0, 0, 0)
+                .unwrap()
+                .timestamp_millis()
+        )
+    );
+}
+
+#[test]
+fn a_quote_inside_quotes_is_written_with_a_backslash() {
+    let parsed = search::parse(r#"branch:"say \"hi\"" "a \"b\" c" plain"#);
+    assert_eq!(parsed.tokens[0].value, r#"say "hi""#);
+    assert_eq!(parsed.terms, [r#"a "b" c"#, "plain"]);
+    /* Outside quotes a backslash is text, as in a Windows path. */
+    assert_eq!(search::parse(r"C:\Users\user").terms, [r"C:\Users\user"]);
 }
 
 #[test]
@@ -759,6 +784,7 @@ fn in_names_a_page_before_a_folder_and_folder_names_a_folder() {
         folders: &folders,
         locations: &[],
         agents: &[],
+        calendar: Calendar::Local,
     };
     let shelf = |input: &str| search::query(input, &names).0.filters.shelf;
     assert_eq!(shelf("in:trash"), Shelf::Trash);

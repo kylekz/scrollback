@@ -504,7 +504,33 @@ pub struct ForGood {
     pub deletion: Option<Deletion>,
     /// Why the last confirmation was refused: the session changed since it was shown, and
     /// these are its numbers now, or its location is being synced (PLAN §4.5).
-    pub refused: Option<String>,
+    pub refused: Option<Refusal>,
+}
+
+/// Why a confirmation to delete for good was refused, and nothing deleted (PLAN §4.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The session changed since it was shown: the confirmation shows its numbers now.
+    Changed,
+    /// Its location was being synced; the confirmation forgets this once no sync runs.
+    Syncing,
+}
+
+impl Refusal {
+    pub fn said(self) -> &'static str {
+        match self {
+            Self::Changed => "It changed since this was shown. These are its numbers now.",
+            Self::Syncing => "Its location is being synced. Try again once the sync is done.",
+        }
+    }
+}
+
+/// The most characters of a title a toast says: a longer one is cut in its middle.
+const TOAST_TITLE: usize = 60;
+
+/// A session's title as a toast says it.
+fn toast_title(session: &Session) -> String {
+    crate::components::middle_cut(&title_of(session), TOAST_TITLE)
 }
 
 /// What a session without a title is called.
@@ -638,6 +664,9 @@ pub struct LibraryService {
     /// The toast showing, and the one to show once the change being written is.
     toast: Option<Toast>,
     toast_in_hand: (u64, Option<Toast>),
+    /// The numbers of the changes that are Undos: their toast says "Undone", with no Undo of
+    /// its own.
+    undos: HashSet<u64>,
     /// The changes queued before the last Undo, by their number ([`Seen::changes`]), show no
     /// toast when they are written.
     quiet_before: u64,
@@ -668,7 +697,7 @@ pub struct LibraryService {
     creating: HashSet<String>,
     /// The group whose folder the catalogue refused to make, and why.
     refused: Option<(String, String)>,
-    _observers: [Subscription; 3],
+    _observers: [Subscription; 4],
 }
 
 /// What a load saw when it started: how many of the owner's changes had been made, and how
@@ -698,6 +727,19 @@ impl LibraryService {
                     this.seen.news += 1;
                     this.reload(cx);
                 }),
+                // A confirmation refused while its location synced forgets it once none does.
+                cx.observe(&sync, |this, sync, cx| {
+                    let waited = (this.for_good.as_mut())
+                        .filter(|asked| asked.refused == Some(Refusal::Syncing));
+                    if let Some(asked) = waited
+                        && !sync.read(cx).is_syncing()
+                    {
+                        asked.refused = None;
+                        asked.deletion = None;
+                        this.read_deletion(cx);
+                        cx.notify();
+                    }
+                }),
                 cx.on_app_quit(Self::write_what_is_queued),
             ],
             archive,
@@ -725,6 +767,7 @@ impl LibraryService {
             drag: None,
             toast: None,
             toast_in_hand: (0, None),
+            undos: HashSet::new(),
             quiet_before: 0,
             toast_timer: None,
             hold: None,
@@ -1219,6 +1262,7 @@ impl LibraryService {
             && self.undoable(&undo)
         {
             self.write(undo, None, cx);
+            self.undos.insert(self.seen.changes);
             /* A change queued before it may still be being written: its toast would undo into
             a state that never was. */
             self.quiet_before = self.seen.changes;
@@ -1449,7 +1493,7 @@ impl LibraryService {
                         log::warn!(
                             "what deleting a session would remove couldn't be read: {error}"
                         );
-                        let title = title_of(&asked.session);
+                        let title = toast_title(&asked.session);
                         this.for_good = None;
                         let said = this.not_deleted(&title, &error.into());
                         this.show_toast(
@@ -1894,22 +1938,17 @@ impl LibraryService {
                 self.for_good = Some(ForGood {
                     session: (**session).clone(),
                     deletion: None,
-                    refused: Some(
-                        match error {
-                            ArchiveError::Syncing(_) => {
-                                "Its location is being synced. Try again once the sync is done."
-                            }
-                            _ => "It changed since this was shown. These are its numbers now.",
-                        }
-                        .to_string(),
-                    ),
+                    refused: Some(match error {
+                        ArchiveError::Syncing(_) => Refusal::Syncing,
+                        _ => Refusal::Changed,
+                    }),
                 });
                 self.read_deletion(cx);
                 return;
             }
             (Change::DeleteForGood { session, .. }, Err(error)) => {
                 log::warn!("{} was refused: {error}", change.what());
-                let said = self.not_deleted(&title_of(session), &error);
+                let said = self.not_deleted(&toast_title(session), &error);
                 self.show_toast(
                     Toast {
                         text: said,
@@ -1981,11 +2020,11 @@ impl LibraryService {
             Written::DeletedForGood(deleted) => Some(Toast {
                 text: match (&change, deleted.pending) {
                     (Change::DeleteForGood { session, .. }, 0) => {
-                        format!("Deleted “{}” for good", title_of(session))
+                        format!("Deleted “{}” for good", toast_title(session))
                     }
                     (Change::DeleteForGood { session, .. }, _) => format!(
                         "Deleted “{}” for good. Its files are being removed in the background",
-                        title_of(session)
+                        toast_title(session)
                     ),
                     _ => "Deleted for good".to_string(),
                 },
@@ -1995,6 +2034,15 @@ impl LibraryService {
         if let Change::DeleteForGood { deletion, .. } = &change {
             cx.emit(LibraryEvent::DeletedForGood(deletion.session.clone()));
         }
+        // An Undo says it is done, or what it couldn't put back; it has no Undo of its own.
+        let toast = match toast {
+            _ if !self.undos.remove(&number) => toast,
+            Some(Toast { undo: None, text }) => Some(Toast { text, undo: None }),
+            _ => Some(Toast {
+                text: "Undone".to_string(),
+                undo: None,
+            }),
+        };
         // Toasts of changes queued before an Undo say nothing: the Undo has the last word.
         if let Some(toast) = toast.filter(|_| number >= self.quiet_before) {
             self.show_toast(toast, cx);
