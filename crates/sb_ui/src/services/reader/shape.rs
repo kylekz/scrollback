@@ -569,7 +569,7 @@ mod tests {
         assert_eq!(results("[{not json"), []);
     }
 
-    /// Hostile output costs about its bytes: four times the input, about four times the time.
+    /// Hostile output costs about its bytes: eight times the input, about eight times the time.
     #[test]
     fn hostile_output_is_shaped_in_linear_time() {
         /* A pattern that matches everywhere, on a megabyte of one line. */
@@ -579,7 +579,7 @@ mod tests {
         for pattern in ["", "a"] {
             assert_linear(
                 &format!("{pattern:?} on one line"),
-                256 * 1024,
+                128 * 1024,
                 |size| "a".repeat(size),
                 |line| drop(found(line, pattern)),
             );
@@ -587,21 +587,21 @@ mod tests {
         /* A pattern that would be exponential for a backtracking engine. */
         assert_linear(
             "(a*)*b",
-            25_000,
+            12_500,
             |size| "a".repeat(size),
             |line| drop(found(line, "(a*)*b")),
         );
         /* Numbered lines by the hundred thousand, of a language highlighted. */
         assert_linear(
             "numbered lines",
-            25_000,
+            12_500,
             |lines| (1..lines).map(|n| format!("{n:>6}\tx = {n}\n")).collect(),
             |lines: &String| drop(numbered(lines, Some('\t'), Some("py"), &|| true)),
         );
         /* Brackets and quotes that open lists everywhere. */
         assert_linear(
             "lists opened everywhere",
-            25_000,
+            12_500,
             |size| "[{\"title\":".repeat(size),
             |text| drop(results(text)),
         );

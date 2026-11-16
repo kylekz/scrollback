@@ -409,10 +409,10 @@ mod tests {
         let drawn = long.lines(0..long.line_count());
         assert!(drawn.lines().all(|line| line.len() <= JOINED_BYTES));
         assert_eq!(drawn.replace('\n', "").len(), 5_000_000);
-        /* Four times the line, about four times the time. */
+        /* Eight times the line, about eight times the time. */
         sb_test_support::growth::assert_linear(
             "one long line, segmented and drawn",
-            250_000,
+            125_000,
             |words| "word ".repeat(words),
             |line| {
                 let long = Text::new(line.clone());

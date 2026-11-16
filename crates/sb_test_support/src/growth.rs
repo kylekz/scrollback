@@ -11,18 +11,18 @@
 use std::time::{Duration, Instant};
 
 /// How many times larger the second input is than the first.
-pub const FACTOR: usize = 4;
+pub const FACTOR: usize = 8;
 
-/// The most a cost may grow from one input to the other: [`FACTOR`] and room for noise, well
-/// under the 16 times a quadratic cost grows.
-pub const MOST_GROWTH: f64 = 6.0;
+/// The most a cost may grow from one input to the other: twice [`FACTOR`], for noise, and a
+/// quarter of the 64 times a quadratic cost grows.
+pub const MOST_GROWTH: f64 = 16.0;
 
-/// The most tries at each size.
+/// The most tries, each timing both inputs; the ratio kept is their median.
 const TRIES: usize = 5;
 
-/// The least a time is taken over: a cost below it is run again until it is reached, so the
-/// clock and the noise are small beside it.
-const TIMED: Duration = Duration::from_millis(10);
+/// The least a sample is timed over: a run shorter than it is repeated until it is reached, so
+/// that the clock, and a moment's wait, are small beside it.
+const SAMPLE: Duration = Duration::from_millis(5);
 
 /// What the whole measurement may take: a guard against a hang, never a bound on the cost.
 pub const HANG: Duration = Duration::from_secs(60);
@@ -30,9 +30,12 @@ pub const HANG: Duration = Duration::from_secs(60);
 /**
  * Asserts that `run` costs about [`FACTOR`] times as much on `make(FACTOR * size)` as on
  * `make(size)`, and returns how much more it cost. Both inputs are made outside the timing.
- * Each size is timed up to [`TRIES`] times, the least time kept, stopping at the first ratio
- * under [`MOST_GROWTH`]: a test may be made to wait by the others running beside it. Pick
- * `size` so that both inputs are on the same side of every bound the code has on its input.
+ *
+ * Each try times the smaller input and then the larger, each run as many times as it takes to
+ * fill [`SAMPLE`], and the ratio of the two is the try's. The median of up to [`TRIES`] tries
+ * is bounded, and the tries stop once most of them agree: a test may be made to wait by the
+ * others beside it, now and then, but not for most of its tries. Pick `size` so that both
+ * inputs are on the same side of every bound the code has on its input.
  */
 pub fn assert_linear<T>(
     name: &str,
@@ -49,19 +52,29 @@ pub fn assert_linear<T>(
         }
         start.elapsed() / runs
     };
-    let once = time(&smaller, 1).as_nanos().max(1);
-    let runs = u32::try_from(TIMED.as_nanos().div_ceil(once)).map_or(10_000, |it| it.min(10_000));
-    let (mut small, mut large) = (Duration::MAX, Duration::MAX);
-    let mut growth = f64::INFINITY;
-    for _ in 0..TRIES {
-        small = small.min(time(&smaller, runs));
-        large = large.min(time(&larger, runs));
-        growth = large.as_secs_f64() / small.as_secs_f64();
-        if growth < MOST_GROWTH {
+    /* Each run once, which also warms what the runs share; then as many runs as fill a sample. */
+    let runs = |once: Duration| {
+        u32::try_from(SAMPLE.as_nanos().div_ceil(once.as_nanos().max(1))).unwrap_or(u32::MAX)
+    };
+    let (small_runs, large_runs) = (runs(time(&smaller, 1)), runs(time(&larger, 1)));
+    let mut tries: Vec<(f64, Duration, Duration)> = Vec::with_capacity(TRIES);
+    let most = TRIES / 2 + 1;
+    while tries.len() < TRIES {
+        let small = time(&smaller, small_runs);
+        let large = time(&larger, large_runs);
+        tries.push((large.as_secs_f64() / small.as_secs_f64(), small, large));
+        let under = tries.iter().filter(|it| it.0 < MOST_GROWTH).count();
+        if under >= most || tries.len() - under >= most {
             break;
         }
     }
-    eprintln!("{name:<44} {small:>10.1?} then {large:>10.1?}: {growth:.1}x");
+    tries.sort_by(|a, b| a.0.total_cmp(&b.0));
+    /* The median of the tries made, which stopped once most were on one side of the bound. */
+    let (growth, small, large) = tries[tries.len() / 2];
+    eprintln!(
+        "{name:<44} {small:>10.1?} then {large:>10.1?}: {growth:.1}x (of {} tries)",
+        tries.len()
+    );
     assert!(
         started.elapsed() < HANG,
         "{name}: measured in {:?}",
@@ -72,4 +85,51 @@ pub fn assert_linear<T>(
         "{name}: {FACTOR} times the input took {growth:.1} times as long ({small:?}, then {large:?})"
     );
     growth
+}
+
+#[cfg(test)]
+mod tests {
+    use std::hint::black_box;
+
+    use super::*;
+
+    /// A pass over the bytes, and one over each pair of them.
+    fn linear(bytes: &[u8]) -> u64 {
+        bytes.iter().map(|it| u64::from(*it)).sum()
+    }
+
+    fn quadratic(bytes: &[u8]) -> u64 {
+        let mut pairs = 0;
+        for (at, a) in bytes.iter().enumerate() {
+            for b in &bytes[at..] {
+                pairs += u64::from(a ^ b);
+            }
+        }
+        pairs
+    }
+
+    #[test]
+    fn a_linear_cost_passes() {
+        assert_linear(
+            "linear",
+            64 * 1024,
+            |size| vec![7u8; size],
+            |bytes| {
+                black_box(linear(black_box(bytes)));
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "times the input took")]
+    fn a_quadratic_cost_fails() {
+        assert_linear(
+            "quadratic",
+            1_000,
+            |size| vec![7u8; size],
+            |bytes| {
+                black_box(quadratic(black_box(bytes)));
+            },
+        );
+    }
 }

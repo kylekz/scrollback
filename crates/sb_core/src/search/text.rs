@@ -204,12 +204,12 @@ mod tests {
         let long = "é".repeat(5_000_000);
         assert_eq!(find_all(&long, "e", 10_000).len(), 10_000);
         assert_eq!(find_all(&"a".repeat(10_000_000), "a", 10_000).len(), 10_000);
-        /* Four times the text, about four times the time, however many it may find. */
+        /* Eight times the text, about eight times the time, however many it may find. */
         for (most, said) in [(10_000, "the first 10,000"), (usize::MAX, "all")] {
             for (text, term) in [("é", "e"), ("a", "a")] {
                 sb_test_support::growth::assert_linear(
                     &format!("{term} in {text}, {said}"),
-                    250_000,
+                    125_000,
                     |count| text.repeat(count),
                     |text| drop(find_all(text, term, most)),
                 );

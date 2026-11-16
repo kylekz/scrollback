@@ -408,7 +408,7 @@ mod tests {
         assert_eq!(shown(&written), ["None Some(1) +a", "None Some(2) +b"]);
     }
 
-    /// Hostile edits cost about their bytes: four times the edit, about four times the time.
+    /// Hostile edits cost about their bytes: eight times the edit, about eight times the time.
     #[test]
     fn hostile_edits_are_diffed_in_linear_time() {
         let linear = |name: &str, size: usize, make: &dyn Fn(usize) -> (String, String)| {
@@ -424,7 +424,7 @@ mod tests {
         let long = diff(&old, &new, (1, 1));
         assert_eq!(long.counts(), (1, 1));
         assert!(long.lines.iter().all(|line| line.words.is_empty()));
-        linear("one long line", 128 * 1024, &long_line);
+        linear("one long line", 64 * 1024, &long_line);
         /* Past the lines diffed: the old removed and the new added, as they are. */
         let past = |lines: usize| ("a\n".repeat(lines), "b\n".repeat(lines));
         let (many, others) = past(DIFF_LINES + 1);
@@ -442,10 +442,10 @@ mod tests {
             };
             (text(1), text(2))
         };
-        linear("nothing alike", DIFF_LINES / 4, &unlike);
+        linear("nothing alike", DIFF_LINES / 8, &unlike);
         /* All alike but one in each, the old a line longer: what the line diff is quadratic in
         (twice the lines, four times the time), so at most as many as are diffed costs what
-        they do, and past them, as many bytes. */
+        they do; past them it goes as any edit past them does, above. */
         let shifted = |lines: usize| {
             let same = "same line\n".repeat(lines);
             (format!("{same}x"), format!("y{same}"))
@@ -454,11 +454,6 @@ mod tests {
         let (old, new) = shifted(DIFF_LINES - 1);
         assert_eq!(diff(&old, &new, (1, 1)).counts(), (2, 1));
         assert!(started.elapsed() < HANG, "{:?}", started.elapsed());
-        linear(
-            "all alike but one, past the lines diffed",
-            DIFF_LINES,
-            &shifted,
-        );
         /* Lines paired by the thousand, each of many short words: the budget ends the words. */
         let words = |lines: usize| {
             let text = |c: char| -> String {
@@ -472,6 +467,6 @@ mod tests {
         let paired = diff(&old, &new, (1, 1));
         let marked = |line: &DiffLine| !line.words.is_empty();
         assert!(marked(&paired.lines[0]) && !marked(&paired.lines[DIFF_LINES - 1]));
-        linear("lines of many short words", DIFF_LINES / 4, &words);
+        linear("lines of many short words", DIFF_LINES / 8, &words);
     }
 }

@@ -211,16 +211,16 @@ mod tests {
         let numbers = |count: usize| "1,".repeat(count);
         assert_eq!(marks(&numbers(1_000_000)).len(), MARKS);
 
-        /* Each is coloured at about its bytes' cost: four times the text, about four times the
+        /* Each is coloured at about its bytes' cost: eight times the text, about eight times the
         time. Quotes that never close, and escapes everywhere, too. */
         let linear = |name: &str, size: usize, make: &dyn Fn(usize) -> String| {
             assert_linear(name, size, make, |text| drop(marks(text)));
         };
-        linear("nested lists", 25_000, &deep);
-        linear("nested objects", 12_500, &objects);
-        linear("numbers", 250_000, &numbers);
-        linear("escapes everywhere", 250_000, &|count| "\"\\".repeat(count));
-        linear("quotes that never close", 500_000, &|count| {
+        linear("nested lists", 12_500, &deep);
+        linear("nested objects", 6_250, &objects);
+        linear("numbers", 125_000, &numbers);
+        linear("escapes everywhere", 125_000, &|count| "\"\\".repeat(count));
+        linear("quotes that never close", 250_000, &|count| {
             "\"".repeat(count)
         });
     }
