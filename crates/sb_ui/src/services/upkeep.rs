@@ -1,14 +1,17 @@
 //! The archive's upkeep (DESIGN §4.13: Settings › Archive): how big the archive is, verify and
 //! what the last one found, and the sessions deleted for good.
 //!
-//! **Reads.** What Settings shows is read in one background job ([`UpkeepService::refresh`]):
-//! the archive's size, its last verify with what the archive holds now of the damaged items
-//! shown ([`Problem`], [`PROBLEMS_PAGE`] at a time, so a verify that found thousands costs no
-//! more than one that found a few), and the tombstones ([`Deleted`]). It is read when Settings
-//! is shown, after a verify, and while Settings shows, whenever sync says the archive changed.
-//! Measuring walks the whole archive, so nothing reads it while Settings is not shown. The size
-//! measured is kept in the app's settings, for the page that says when the archive can't be
-//! reached (DESIGN §4.14).
+//! **Reads.** What Settings shows is read in two background jobs side by side
+//! ([`UpkeepService::refresh`]). One reads the catalogue: the last verify with what the archive
+//! holds now of the damaged items shown ([`Problem`], [`PROBLEMS_PAGE`] at a time, so a verify
+//! that found thousands costs no more than one that found a few), and the tombstones
+//! ([`Deleted`]). The other measures the archive ([`ArchiveStats`]), which walks every file in
+//! it: while a sync writes hundreds of files, and on Windows while each new one is scanned,
+//! that can take as long as the pass, and the catalogue's reads don't wait for it (nor for a
+//! pass: the catalogue's readers have connections of their own). Both run when Settings is
+//! shown, after a verify, and while Settings shows, whenever sync says the archive changed;
+//! nothing reads the archive while Settings is not shown. The size measured is kept in the
+//! app's settings, for the page that says when the archive can't be reached (DESIGN §4.14).
 //!
 //! **Verify** runs on a background job with its progress read a few times a second, and
 //! stops at the next version when asked; a verify stopped keeps nothing (`sb_core`).
@@ -107,9 +110,8 @@ pub struct Deleted {
     pub refused: Option<String>,
 }
 
-/// What [`load`] reads.
+/// What [`load`] reads of the catalogue.
 struct Loaded {
-    stats: ArchiveStats,
     last: Option<LastVerify>,
     problems: Vec<Problem>,
     deleted: Vec<Deleted>,
@@ -191,8 +193,8 @@ fn problem(
     })
 }
 
-/// Reads what Settings › Archive shows (the module docs): the first `shown` problems, and
-/// which of the sessions `allowed` are archived again.
+/// Reads what Settings › Archive shows of the catalogue (the module docs): the first `shown`
+/// problems, and which of the sessions `allowed` are archived again.
 fn load(archive: &Archive, shown: usize, allowed: Vec<SessionId>) -> Result<Loaded, String> {
     let catalogue = archive.catalogue();
     let read = || -> Result<_, CatalogueError> {
@@ -232,7 +234,6 @@ fn load(archive: &Archive, shown: usize, allowed: Vec<SessionId>) -> Result<Load
     };
     let (last, problems, deleted, again) = read().map_err(|error| error.to_string())?;
     Ok(Loaded {
-        stats: archive.stats().map_err(|error| error.to_string())?,
         last,
         problems,
         deleted,
@@ -259,9 +260,15 @@ pub struct UpkeepService {
     verifying: Option<Verifying>,
     /// Why the last read, or the last verify, failed.
     failure: Option<String>,
+    /// A read of the catalogue has landed: until one has, nothing is said of what it holds.
+    read: bool,
     loading: bool,
     /// A read was asked for while one ran.
     stale: bool,
+    /// The archive is being measured.
+    measuring: bool,
+    /// A measure was asked for while one ran.
+    remeasure: bool,
     /// Writes in flight.
     jobs: usize,
     /// The app has moved onto another archive: nothing more starts on this one.
@@ -294,8 +301,11 @@ impl UpkeepService {
             deleted: Vec::new(),
             verifying: None,
             failure: None,
+            read: false,
             loading: false,
             stale: false,
+            measuring: false,
+            remeasure: false,
             jobs: 0,
             closed: false,
             paused: false,
@@ -325,12 +335,16 @@ impl UpkeepService {
     }
 
     /**
-     * The sessions deleted for good, once the archive has been read: before that there is
-     * nothing to say of them, not even that there are none. They are read with the stats,
-     * which are there from the first read that lands.
+     * The sessions deleted for good, once the catalogue has been read: before that there is
+     * nothing to say of them, not even that there are none.
      */
     pub fn deleted(&self) -> Option<&[Deleted]> {
-        self.stats.as_ref().map(|_| self.deleted.as_slice())
+        self.read.then_some(self.deleted.as_slice())
+    }
+
+    /// The archive is being measured for the first time: its stats aren't known yet.
+    pub fn is_measuring(&self) -> bool {
+        self.measuring && self.stats.is_none()
     }
 
     /// Whether a change to one of the location `id`'s sessions deleted for good is being
@@ -350,7 +364,7 @@ impl UpkeepService {
 
     /// Nothing is read, written or verified.
     pub fn is_settled(&self) -> bool {
-        !self.loading && self.verifying.is_none() && self.jobs == 0
+        !self.loading && !self.measuring && self.verifying.is_none() && self.jobs == 0
     }
 
     /// How many sessions are deleted for good now: not those allowed again since.
@@ -375,12 +389,25 @@ impl UpkeepService {
         self.refresh(cx);
     }
 
-    /// Reads what Settings › Archive shows again, now or once the read running is over.
+    /**
+     * Reads what Settings › Archive shows again: the catalogue and the archive's size, each now
+     * or once its own job running is over (the module docs).
+     */
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.read_catalogue(cx);
+        self.measure(cx);
+    }
+
+    /// The archive to read, unless nothing is to be read of it now.
+    fn readable(&self, cx: &Context<Self>) -> Option<Arc<Archive>> {
         if self.closed || self.paused {
-            return;
+            return None;
         }
-        let Some(archive) = self.archive.read(cx).archive().cloned() else {
+        self.archive.read(cx).archive().cloned()
+    }
+
+    fn read_catalogue(&mut self, cx: &mut Context<Self>) {
+        let Some(archive) = self.readable(cx) else {
             return;
         };
         if self.loading {
@@ -389,7 +416,6 @@ impl UpkeepService {
         }
         self.loading = true;
         let shown = self.shown;
-        let id = archive.id().to_string();
         let allowed = self
             .deleted
             .iter()
@@ -403,14 +429,10 @@ impl UpkeepService {
                 this.loading = false;
                 match loaded {
                     Ok(loaded) => {
-                        let on_disk = loaded.stats.on_disk;
-                        this.settings.update(cx, |settings, _| {
-                            settings.remember_size(&id, on_disk);
-                        });
-                        this.stats = Some(loaded.stats);
                         this.last = loaded.last;
                         this.problems = loaded.problems;
                         this.take_deleted(loaded.deleted, loaded.again);
+                        this.read = true;
                         this.failure = None;
                     }
                     Err(why) => {
@@ -419,7 +441,44 @@ impl UpkeepService {
                     }
                 }
                 if std::mem::take(&mut this.stale) {
-                    this.refresh(cx);
+                    this.read_catalogue(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn measure(&mut self, cx: &mut Context<Self>) {
+        let Some(archive) = self.readable(cx) else {
+            return;
+        };
+        if self.measuring {
+            self.remeasure = true;
+            return;
+        }
+        self.measuring = true;
+        let id = archive.id().to_string();
+        let job = cx.background_spawn(async move { archive.stats() });
+        cx.spawn(async move |this, cx| {
+            let measured = job.await;
+            this.update(cx, |this, cx| {
+                this.measuring = false;
+                match measured {
+                    Ok(stats) => {
+                        this.settings.update(cx, |settings, _| {
+                            settings.remember_size(&id, stats.on_disk);
+                        });
+                        this.stats = Some(stats);
+                    }
+                    Err(error) => {
+                        log::error!("the archive could not be measured: {error}");
+                        this.failure = Some(error.to_string());
+                    }
+                }
+                if std::mem::take(&mut this.remeasure) {
+                    this.measure(cx);
                 }
                 cx.notify();
             })

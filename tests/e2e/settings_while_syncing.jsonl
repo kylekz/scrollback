@@ -1,0 +1,22 @@
+{"scenario": {"window_size": "1440x900", "fixture": "agent-large", "description": "Settings opened while a pass runs, held where the scenario says (DESIGN §4.13): its archive cards are read at once, not once the pass is over, as catalogue reads don't wait on a sync"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": {"pointer": "/page", "equals": "first-run"}}
+{"cmd": "set_appearance", "material": "opaque"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// The first sync waits once it has stored its first batch of 256 files (as in first_sync.jsonl).
+{"cmd": "hold_sync", "after": 256, "expect_result": {"pointer": "/held", "equals": false}}
+{"cmd": "click", "target": "first-run/add"}
+{"cmd": "wait_for", "pointer": "/sync/held", "equals": true, "timeout_ms": 60000}
+
+// Settings, while the pass waits: the stats, the last verify (none yet) and the sessions deleted for good (none) are read and drawn.
+{"cmd": "click", "target": "titlebar/settings"}
+{"cmd": "wait_for", "pointer": "/settings/deleted", "equals": [], "timeout_ms": 5000}
+{"cmd": "state", "expect": [{"pointer": "/page", "equals": "settings"}, {"pointer": "/sync/held", "equals": true}, {"pointer": "/settings/stats/sessions", "gte": 0}, {"pointer": "/settings/verify/last", "equals": null}]}
+{"cmd": "bounds", "target": "settings/archive/stats", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "settings/deleted/none", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "settings-while-syncing-dark"}
+
+// The pass goes on to its end.
+{"cmd": "release_sync"}
+{"cmd": "settle", "timeout_ms": 120000, "expect": [{"pointer": "/sync/syncing", "equals": false}, {"pointer": "/sync/held", "equals": false}]}

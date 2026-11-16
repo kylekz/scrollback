@@ -368,10 +368,24 @@ impl SettingsPage {
         ))
     }
 
-    /// How big the archive is: four numbers, then where the bytes are (`kv` rows).
+    /**
+     * How big the archive is: four numbers, then where the bytes are (`kv` rows). Measuring
+     * walks every file, which while a sync writes can take as long as the pass: until the
+     * first measure lands, a quiet "Reading…".
+     */
     fn stats(&self, theme: &SbTheme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let c = &theme.colors;
-        let stats = *cx.services().upkeep.read(cx).stats()?;
+        let upkeep = cx.services().upkeep.read(cx);
+        let Some(stats) = upkeep.stats().copied() else {
+            return upkeep.is_measuring().then(|| {
+                div()
+                    .text_spec(&theme.text.secondary)
+                    .text_color(c.fg3)
+                    .child("Reading…")
+                    .automation_target("settings/archive/reading")
+                    .into_any_element()
+            });
+        };
         let stat = |value: String, label: &'static str| {
             div()
                 .flex()

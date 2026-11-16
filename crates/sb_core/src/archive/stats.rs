@@ -27,42 +27,54 @@ pub struct ArchiveStats {
 }
 
 impl Archive {
-    /// Measures the archive (the module docs): it walks the whole folder, so it is for a
+    /// Measures the archive (the module docs): it walks the whole folder once, so it is for a
     /// background job.
     pub fn stats(&self) -> Result<ArchiveStats> {
-        let databases = fs::read_dir(&self.dir)
+        let (mut on_disk, mut stored, mut databases) = (0, 0, 0);
+        for entry in fs::read_dir(&self.dir)
             .map_err(io_error("list", &self.dir))?
             .flatten()
-            .filter(|entry| {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                name.starts_with(catalogue::DATABASE) || name.starts_with(SEARCH_DATABASE)
-            })
-            .map(|entry| size(&entry.path()))
-            .sum();
+        {
+            let bytes = size(&entry);
+            on_disk += bytes;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == layout::FILES {
+                stored = bytes;
+            } else if name.starts_with(catalogue::DATABASE) || name.starts_with(SEARCH_DATABASE) {
+                databases += bytes;
+            }
+        }
         let backups = catalogue::backups(&self.dir);
         Ok(ArchiveStats {
-            on_disk: size(&self.dir),
+            on_disk,
             totals: self.catalogue.totals()?,
-            stored: size(&self.dir.join(layout::FILES)),
+            stored,
             databases,
             backups: backups.list().map_or(0, |list| list.len()),
-            backups_bytes: size(backups.dir()),
+            backups_bytes: within(backups.dir()),
         })
     }
 }
 
-/// How many bytes the files at `path` hold, however deep, without following links. What
-/// can't be read, or goes while it is counted, counts as nothing.
-fn size(path: &Path) -> u64 {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return 0;
-    };
-    if !metadata.is_dir() {
-        return metadata.len();
+/**
+ * How many bytes `entry` holds, however deep, without following links, from what each folder's
+ * listing says of its files. No file is opened: on Windows, opening one a sync has just
+ * written waits while it is scanned, and a walk of thousands would wait as long as the pass.
+ * What can't be read, or goes while it is counted, counts as nothing.
+ */
+fn size(entry: &fs::DirEntry) -> u64 {
+    match entry.file_type() {
+        Ok(kind) if kind.is_dir() => within(&entry.path()),
+        Ok(kind) if kind.is_file() => entry.metadata().map_or(0, |metadata| metadata.len()),
+        _ => 0,
     }
-    fs::read_dir(path).map_or(0, |entries| {
-        entries.flatten().map(|entry| size(&entry.path())).sum()
+}
+
+/// How many bytes the folder `dir` holds, however deep ([`size`]).
+fn within(dir: &Path) -> u64 {
+    fs::read_dir(dir).map_or(0, |entries| {
+        entries.flatten().map(|entry| size(&entry)).sum()
     })
 }
 
