@@ -19,14 +19,14 @@
 {"cmd": "click", "target": "card/1", "button": "right"}
 {"cmd": "settle", "expect": [{"pointer": "/menu/items", "equals": ["open", "star", "move", "copy-path", "history", "trash"]}, {"pointer": "/library/selection", "equals": ["libmpv hwdec fallback on AV1"]}]}
 {"cmd": "mouse_move", "target": "menu/move"}
-{"cmd": "settle", "expect": {"pointer": "/menu/submenu", "equals": ["folder/dv", "folder/dv-wsl-backend", "folder/fc", "folder/player", "folder/folio", "folder/slide", "folder/toolbox-rs", "folder/scrollback", "folder/dotfiles", "folder/Scratch", "new-folder"]}}
+{"cmd": "settle", "expect": {"pointer": "/menu/submenu", "equals": ["folder/dv", "folder/dv/dv-wsl-backend", "folder/fc", "folder/fc/player", "folder/folio", "folder/slide", "folder/toolbox-rs", "folder/scrollback", "folder/dotfiles", "folder/Scratch", "new-folder"]}}
 {"cmd": "screenshot", "name": "session-menu-dark"}
 {"cmd": "pin_appearance", "appearance": "light"}
 {"cmd": "wait_frames", "n": 2}
 {"cmd": "screenshot", "name": "session-menu-light"}
 {"cmd": "pin_appearance", "appearance": "dark"}
 // Choosing player files it there by hand.
-{"cmd": "click", "target": "menu/move/folder/player"}
+{"cmd": "click", "target": "menu/move/folder/fc/player"}
 {"cmd": "settle", "expect": [{"pointer": "/menu", "equals": null}, {"pointer": "/library/toast/text", "equals": "Filed in fc › player by hand"}, {"pointer": "/library/folders/9/sessions", "equals": 42}]}
 // Now its menu offers File automatically, which hands it back to the rules: its path is fc's.
 {"cmd": "click", "target": "card/1", "button": "right"}

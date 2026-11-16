@@ -85,7 +85,9 @@
 {"cmd": "settle"}
 {"cmd": "screenshot", "name": "empty-folder-narrow-dark"}
 {"cmd": "click", "target": "paths/suggested/0"}
-{"cmd": "settle", "expect": [{"pointer": "/library/toast/text", "equals": "Attached to blog · 6 sessions filed"}, {"pointer": "/library/sessions", "equals": 6}, {"pointer": "/page_view/editor", "equals": null}]}
+// The attach is written and the page read again before the editor is asked about: the short editor closes once the folder isn't empty, and doesn't open again while the page is read.
+{"cmd": "settle", "expect": [{"pointer": "/library/toast/text", "equals": "Attached to blog · 6 sessions filed"}, {"pointer": "/library/sessions", "equals": 6}]}
+{"cmd": "settle", "expect": {"pointer": "/page_view/editor", "equals": null}}
 
 // The full editor at 960x600.
 {"cmd": "click", "target": "page/edit-paths"}

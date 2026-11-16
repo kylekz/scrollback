@@ -47,11 +47,11 @@
 {"cmd": "settle", "expect": {"pointer": "/library/groups", "equals": 6}}
 {"cmd": "screenshot", "name": "unsorted-1440-light"}
 
-// 1040x700: the sidebar docks; the paths line stays one line.
+// 1040x700: the sidebar docks; the path chips give way in their paths, then wrap onto a second line, and Edit paths keeps its place.
 {"cmd": "resize", "w": 1040, "h": 700, "expect": {"pointer": "/shell/sidebar", "equals": "docked"}}
 {"cmd": "click", "target": "sidebar/folder/fc"}
 {"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 488}}
-{"cmd": "bounds", "target": "page/paths", "expect_result": {"pointer": "/h", "equals": 28}}
+{"cmd": "bounds", "target": "page/paths", "expect_result": [{"pointer": "/h", "gte": 28}, {"pointer": "/h", "lte": 100}]}
 {"cmd": "screenshot", "name": "folder-1040-light"}
 {"cmd": "pin_appearance", "appearance": "dark"}
 {"cmd": "settle"}
