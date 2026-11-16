@@ -189,6 +189,7 @@ Tables, in outline (the schema is `toolbox_store` migrations, append-only):
 | Table | Holds |
 |---|---|
 | `location` | id, kind, name, connection details (distro, or SSH host), its drive mount when it has its own, last sync attempt and success, last error, unreachable since and why, removed-at (a removed location syncs no more and keeps what was archived from it; adding it again clears it) |
+| `location_check` | per location: its last connection test (when, the sh that answered, the login shell if it answered, the tools it lacks, how long it took); written at each test and when a place is added straight after a passing one, not at syncs |
 | `location_provider` | per provider found at a location: the retention last read, and the root where it keeps its data there, from the last pass |
 | `item` | location, provider, key, item id, kind (transcript, subagent, tool result, sidecar), the session it belongs to, last seen length and stamp, gone-since |
 | `version` | item, number, reason, started, length, hash, held-back, held for parsing, accepted by the owner, damaged, the provider's export version when the item is an export |
