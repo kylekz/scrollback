@@ -829,6 +829,9 @@ fn no_text_is_written_for_a_session_deleted_while_it_is_parsed<A: Agent + Defaul
     assert_eq!(made.searchable, 1);
     assert_eq!(docs(), 1);
     assert_eq!(find(&bench, "parse_args in:all").total_sessions, 0);
+    /* Its files leave files/ in the background (PLAN §4.5); verify counts them as still to be
+    removed until then, which `Bench::delete_for_good` waits out and this delete can't. */
+    bench.archive().wait_for_removals();
     bench.assert_verifies();
 }
 
