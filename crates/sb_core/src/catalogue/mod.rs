@@ -40,7 +40,7 @@ pub use batch::{Before, Restored, Undone};
 pub use folder::{Folder, FolderPath, ProjectPath};
 pub use library::{LibraryCounts, PathGroup, Shelf};
 pub(crate) use session::{Derived, Indexed, Reading, fingerprint};
-pub use session::{Filed, Session, SessionId, Usage};
+pub use session::{Filed, History, Session, SessionId, Usage};
 pub use trash::{AllowedAgain, Deletion, Tombstone};
 pub(crate) use trash::{ItemFile, Removal};
 

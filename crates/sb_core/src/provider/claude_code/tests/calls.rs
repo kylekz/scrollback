@@ -62,7 +62,7 @@ fn a_session_with_a_call_of_each_kind_of_tool() {
     t.result_with(&call, json!("The file was created."), false, written);
     let call = t.call(
         "Grep",
-        json!({ "pattern": "fn main", "path": "src", "type": "rust", "glob": "*.rs" }),
+        json!({ "pattern": "fn main", "path": "src", "type": "rust", "glob": "*.rs", "output_mode": "content" }),
     );
     let found = json!({ "mode": "content", "numFiles": 1, "numMatches": 2 });
     t.result_with(&call, json!("src/main.rs:10:fn main() {"), false, found);
@@ -103,12 +103,12 @@ fn a_session_with_a_call_of_each_kind_of_tool() {
   Bash: shell "cargo build" (Some("Build the app"))
     Failed Exit(101) "Exit code 101\nerror: expected `;`"
   Read: read /home/user/code/app/src/main.rs from line Some(10) for Some(20)
-    Ok Lines(1) "10\tfn main() {"
+    Ok Lines { lines: 1, total: Some(40) } "10\tfn main() {"
   Edit: edit /home/user/code/app/src/main.rs: "let a = \"1\"" to "let a = \"1\";", all: true
-    Ok Changed { added: 2, removed: 1 } "The file was updated."
+    Ok Changed { added: 2, removed: 1, start: Some((10, 10)) } "The file was updated."
   Write: write /home/user/code/app/notes.md: "# Notes\n"
     Ok Written { new: true, lines: 1 } "The file was created."
-  Grep: content search "fn main" in Some("src") of Some("rust, *.rs")
+  Grep: content search "fn main" in Some("src") of Some("rust, *.rs") for Some("content")
     Ok Matches(2) "src/main.rs:10:fn main() {"
   Glob: file search "**/*.rs" in None
     Ok Matches(1) "src/main.rs"

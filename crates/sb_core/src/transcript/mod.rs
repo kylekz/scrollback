@@ -369,6 +369,9 @@ pub enum ToolInput {
         path: Option<String>,
         /// Which files are searched, when not all: a file type, a glob, or both.
         files: Option<String>,
+        /// What it was asked to return (the matching lines, the files, a count), in its
+        /// agent's own word.
+        mode: Option<String>,
     },
     FileSearch {
         pattern: String,
@@ -432,10 +435,15 @@ pub enum ToolStatus {
 pub enum Brief {
     /// The status a command that failed exited with.
     Exit(i32),
-    /// How many lines were read.
-    Lines(u64),
-    /// How many lines an edit added and removed.
-    Changed { added: u64, removed: u64 },
+    /// How many lines were read, and how many the file has, where the agent said.
+    Lines { lines: u64, total: Option<u64> },
+    /// How many lines an edit added and removed, and the lines of the file, before and after
+    /// it, where what it replaced starts, where the agent said.
+    Changed {
+        added: u64,
+        removed: u64,
+        start: Option<(u64, u64)>,
+    },
     /// A file was written: whether it is new, and its lines.
     Written { new: bool, lines: u64 },
     /// How many matches a search found.

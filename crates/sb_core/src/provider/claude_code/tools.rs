@@ -80,13 +80,14 @@ struct Write<'a> {
     content: &'a RawValue,
 }
 
-/// `Grep`'s input and `Glob`'s; only `Grep` has a file `type` and a `glob`.
+/// `Grep`'s input and `Glob`'s; only `Grep` has a file `type`, a `glob` and an `output_mode`.
 #[derive(Deserialize)]
 struct Search {
     pattern: Text,
     path: Option<Text>,
     r#type: Option<Text>,
     glob: Option<Text>,
+    output_mode: Option<Text>,
 }
 
 #[derive(Deserialize)]
@@ -150,6 +151,7 @@ pub(super) fn input(name: &str, raw: &RawValue, line: &Line) -> ToolInput {
                 (Some(kind), Some(glob)) => Some(format!("{kind}, {glob}")),
                 (kind, glob) => kind.or(glob),
             },
+            mode: text(input.output_mode),
         }),
         ToolKind::FileSearch => typed(raw).map(|input: Search| ToolInput::FileSearch {
             pattern: input.pattern.0,
@@ -205,9 +207,11 @@ pub(super) fn input(name: &str, raw: &RawValue, line: &Line) -> ToolInput {
  *   A command that worked and printed those words has none.
  * - A search for matching lines found as many as it says, or as many lines; the files it
  *   found them in are not its matches.
- * - The rest is read from `toolUseResult`: the lines a `Read` returned, the `+` and `-` lines
- *   of an `Edit`'s patch, whether a `Write` made the file and the lines of what it wrote, the
- *   matches of a `Grep` or the files of a `Glob`, and what a finished subagent's run came to.
+ * - The rest is read from `toolUseResult`: the lines a `Read` returned and the file's, the `+`
+ *   and `-` lines of an `Edit`'s patch and where what it replaced starts (its first hunk's
+ *   start, past the hunk's leading context), whether a `Write` made the file and the lines of
+ *   what it wrote, the matches of a `Grep` or the files of a `Glob`, and what a finished
+ *   subagent's run came to.
  */
 pub(super) fn brief(
     kind: ToolKind,
@@ -227,18 +231,31 @@ pub(super) fn brief(
                     .len();
             status[..digits].parse().ok().map(Brief::Exit)
         }
-        ToolKind::Read => typed(detail?).map(|read: ReadResult| Brief::Lines(read.file.num_lines)),
+        ToolKind::Read => typed(detail?).map(|read: ReadResult| Brief::Lines {
+            lines: read.file.num_lines,
+            total: read.file.total_lines,
+        }),
         ToolKind::Edit => typed(detail?).map(|edit: EditResult| {
-            let starting = |mark| {
+            let mark = |line: &RawValue| line.get().as_bytes().get(1).copied();
+            let starting = |wanted| {
                 edit.structured_patch
                     .iter()
                     .flat_map(|hunk| &hunk.lines)
-                    .filter(|line| line.get().as_bytes().get(1) == Some(&mark))
+                    .filter(|line| mark(line) == Some(wanted))
                     .count() as u64
             };
+            let start = edit.structured_patch.first().and_then(|hunk| {
+                let context = hunk
+                    .lines
+                    .iter()
+                    .take_while(|line| mark(line) == Some(b' '))
+                    .count() as u64;
+                Some((hunk.old_start? + context, hunk.new_start? + context))
+            });
             Brief::Changed {
                 added: starting(b'+'),
                 removed: starting(b'-'),
+                start,
             }
         }),
         ToolKind::Write => typed(detail?).map(|written: WriteResult| Brief::Written {

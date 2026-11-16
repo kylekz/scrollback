@@ -277,7 +277,8 @@ fn write_block(
                     pattern,
                     path,
                     files,
-                } => format!("content search {pattern:?} in {path:?} of {files:?}"),
+                    mode,
+                } => format!("content search {pattern:?} in {path:?} of {files:?} for {mode:?}"),
                 ToolInput::FileSearch { pattern, path } => {
                     format!("file search {pattern:?} in {path:?}")
                 }

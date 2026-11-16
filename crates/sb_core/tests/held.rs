@@ -17,7 +17,10 @@ use serde_json::json;
 
 use common::{Bench, for_both_agents};
 
-for_both_agents!(the_owner_chooses_an_older_version_until_a_newer_one_arrives);
+for_both_agents!(
+    the_owner_chooses_an_older_version_until_a_newer_one_arrives,
+    a_history_says_what_is_read_and_any_version_reads_without_being_chosen,
+);
 
 /// What a parser is given of the item `key` of the session whose transcript is `session`.
 fn read<A: Agent>(bench: &Bench<A>, session: &str, key: &str) -> Vec<u8> {
@@ -127,6 +130,76 @@ fn the_owner_chooses_an_older_version_until_a_newer_one_arrives<A: Agent + Defau
     assert!(read(&bench, &key, &key) == third);
     /* The choice is over, not waiting for the version to be mended. */
     assert!(read_catalogue(bench.dir(), "SELECT version_id FROM reading_choice").is_empty());
+}
+
+/**
+ * The reader's History (DESIGN §4.3): an item's versions with the syncs that extended each,
+ * which one is read and whether the owner chose it; and a version read for a look, which
+ * chooses nothing.
+ */
+fn a_history_says_what_is_read_and_any_version_reads_without_being_chosen<A: Agent + Default>() {
+    let mut agent = A::default();
+    let keys = [agent.add_session(8), agent.add_session(3)];
+    let mut bench = Bench::new(agent);
+    bench.sync();
+    let key = keys[0].clone();
+    let first = bench.agent.content(&key);
+    bench.agent.append(&key, 2);
+    bench.sync();
+    let extended = bench.agent.content(&key);
+    bench.agent.rewrite(&key);
+    bench.sync();
+    let second = bench.agent.content(&key);
+    let (id, item) = (bench.session_id(&key), bench.item(&key).id);
+    let catalogue = || bench.archive().catalogue();
+
+    let history = catalogue().history(&id, &key).unwrap().unwrap();
+    let versions = bench.versions(&key);
+    assert_eq!(history.item, item);
+    assert_eq!(
+        history
+            .versions
+            .iter()
+            .map(|(version, extended)| (version.id, *extended))
+            .collect::<Vec<_>>(),
+        [(versions[0].id, 1), (versions[1].id, 0)]
+    );
+    assert_eq!((history.reading, history.chosen), (versions[1].id, false));
+    assert_eq!(catalogue().history(&id, "not an item").unwrap(), None);
+
+    /* The first version, read for a look: as long as it was, and nothing is chosen. */
+    let looked = bench
+        .archive()
+        .session_at(&id, &key, versions[0].id)
+        .unwrap();
+    let mut content = Vec::new();
+    looked
+        .open(&key, 0)
+        .unwrap()
+        .read_to_end(&mut content)
+        .unwrap();
+    assert!(content == extended && content.starts_with(&first));
+    assert_eq!(
+        looked
+            .list()
+            .iter()
+            .find(|it| it.key == key)
+            .unwrap()
+            .length,
+        extended.len() as u64
+    );
+    assert!(read(&bench, &key, &key) == second);
+    assert!(read_catalogue(bench.dir(), "SELECT version_id FROM reading_choice").is_empty());
+    /* Another item's version is not this one's. */
+    let other = bench.versions(&keys[1]).remove(0).id;
+    assert!(bench.archive().session_at(&id, &key, other).is_err());
+
+    /* Chosen, the history says so. */
+    catalogue()
+        .set_reading_version(&id, item, Some(versions[0].id))
+        .unwrap();
+    let history = catalogue().history(&id, &key).unwrap().unwrap();
+    assert_eq!((history.reading, history.chosen), (versions[0].id, true));
 }
 
 #[test]

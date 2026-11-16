@@ -121,6 +121,7 @@ fn call_target(call: &ToolCall, root: Option<&str>) -> String {
             pattern,
             path: within,
             files,
+            ..
         } => {
             let searched = match within {
                 Some(within) => format!("\"{pattern}\" in {}", path(within)),
@@ -196,8 +197,8 @@ fn short_result(
     .map(|label| low_chip(label, Tone::Bad, theme).into_any_element());
     let said = match &result.brief {
         Some(Brief::Exit(_)) | None => took.and_then(text),
-        Some(Brief::Lines(lines)) => text(format::plural(*lines as usize, "line")),
-        Some(Brief::Changed { added, removed }) => Some(
+        Some(Brief::Lines { lines, .. }) => text(format::plural(*lines as usize, "line")),
+        Some(Brief::Changed { added, removed, .. }) => Some(
             div()
                 .flex()
                 .gap(theme.spacing.xs)

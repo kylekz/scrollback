@@ -267,6 +267,7 @@ pub(super) struct ReadResult {
 #[serde(rename_all = "camelCase")]
 pub(super) struct ReadFile {
     pub num_lines: u64,
+    pub total_lines: Option<u64>,
 }
 
 /// The `toolUseResult` of an `Edit`: the hunks of the change.
@@ -297,9 +298,13 @@ pub(super) struct SearchResult {
     pub num_files: Option<u64>,
 }
 
-/// A hunk of a `structuredPatch`: its lines, each starting with ` `, `+` or `-`.
+/// A hunk of a `structuredPatch`: where it starts before and after, and its lines, each
+/// starting with ` `, `+` or `-`.
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct Hunk<'a> {
+    pub old_start: Option<u64>,
+    pub new_start: Option<u64>,
     #[serde(borrow)]
     pub lines: Vec<&'a RawValue>,
 }

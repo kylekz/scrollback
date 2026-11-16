@@ -14,7 +14,7 @@ use std::io::{self, Read};
 use std::sync::Arc;
 
 use super::{Archive, Problem, Result, SegmentCache, VersionReader};
-use crate::catalogue::{Reading, SessionId};
+use crate::catalogue::{CatalogueError, Reading, SessionId};
 use crate::provider::{SessionItem, SessionItems};
 
 /// The archived items of one session, by key, and the version each is read at.
@@ -45,6 +45,33 @@ impl Archive {
             self,
             &self.catalogue.session_items(id)?,
         ))
+    }
+
+    /**
+     * The items of the session `id`, each at its reading copy but the item `key`, read at its
+     * version `version`: to read a version that is not the reading copy (PLAN §4.2, DESIGN
+     * §4.3). A version that is not one of that item's is not read.
+     */
+    pub fn session_at(
+        &self,
+        id: &SessionId,
+        key: &str,
+        version: i64,
+    ) -> Result<ArchivedSession<'_>> {
+        let readings = self.catalogue.session_items(id)?;
+        let item = readings
+            .iter()
+            .find(|reading| reading.key == key)
+            .ok_or_else(|| CatalogueError::NoSession(id.clone()))?
+            .item;
+        let length = self
+            .catalogue
+            .versions(item)?
+            .into_iter()
+            .find(|it| it.id == version)
+            .ok_or(CatalogueError::NotOfItem { version, item })?
+            .length;
+        Ok(ArchivedSession::of(self, &readings).at(key, version, length))
     }
 
     /// A session's items at the versions `pinned` holds, read through `cache`.
