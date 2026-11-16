@@ -17,14 +17,14 @@ use gpui_component::v_virtual_list;
 use sb_core::catalogue::{Filed, Session, Shelf};
 use sb_core::filing::FolderId;
 
-use super::{LIFTED_OPACITY, SessionsView, month_name, subfolder_of};
+use super::{LIFTED_OPACITY, SessionsView, UNTITLED, month_name, subfolder_of};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{focus_ring, icon, location_tag, overline};
 use crate::drag;
 use crate::format;
 use crate::icons::SbIcon;
-use crate::services::{Dragged, Month};
+use crate::services::Month;
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
 /// The columns' widths (DESIGN §4.5). The date has room for a year and the hand glyph.
@@ -256,8 +256,8 @@ impl SessionsView {
                     .border_x_1()
                     .border_b_1()
                     .border_color(c.line_subtle);
-                // Each row keeps the page's side padding at its right, so that the list, and
-                // its scrollbar, reach the main area's edge.
+                /* Each row keeps the page's side padding at its right, so that the list, and
+                its scrollbar, reach the main area's edge. */
                 let row = match row {
                     ListRow::Month(month) => part
                         .flex()
@@ -310,10 +310,7 @@ impl SessionsView {
         let library = self.library.read(cx);
         let selected = library.is_selected(&session.id);
         let ringed = keyboard && library.selected_index() == Some(index);
-        let lifted = drag::lifts(
-            library,
-            |what| matches!(what, Dragged::Sessions { ids, .. } if ids.contains(&session.id)),
-        );
+        let lifted = drag::lifts_session(library, &session.id);
         let model = agents::model(&session.id.provider, &session.models, cx)
             .unwrap_or_else(|| agents::name(&session.id.provider, cx));
         let folder_name = match (folder, session.filed) {
@@ -346,13 +343,20 @@ impl SessionsView {
                 }
             })
             .when(lifted, |this| this.opacity(LIFTED_OPACITY))
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                this.click(place, event, window, cx);
+            .on_click(cx.listener({
+                let id = session.id.clone();
+                move |this, event: &ClickEvent, window, cx| {
+                    let pressed = (event.modifiers(), event.click_count());
+                    this.click((&id, index), pressed, window, cx);
+                }
             }))
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    this.right_click(index, event, window, cx);
+                cx.listener({
+                    let id = session.id.clone();
+                    move |this, event: &MouseDownEvent, window, cx| {
+                        this.right_click((&id, index), event, window, cx);
+                    }
                 }),
             )
             .child(
@@ -391,7 +395,7 @@ impl SessionsView {
                                 session
                                     .title
                                     .clone()
-                                    .unwrap_or_else(|| super::UNTITLED.to_string()),
+                                    .unwrap_or_else(|| UNTITLED.to_string()),
                             ),
                     )
                     .child(
@@ -509,7 +513,8 @@ impl SessionsView {
                     .text_spec(&theme.text.number)
                     .child(format::count(u64::from(session.all.calls))),
             );
-        drag::source(row, self.dragged(session, cx))
+        let title = (session.title.clone()).unwrap_or_else(|| UNTITLED.to_string());
+        self.draggable(row, (session.id.clone(), index), (title, None), cx)
             .automation_target_with(move || format!("list/row/{place}").into())
     }
 }

@@ -6,6 +6,8 @@
 //! the pages and the ghost read one answer: a row draws itself as the drop target only when
 //! [`verdict`] says it takes the drop, and the ghost says what it does or why not.
 
+use std::collections::HashSet;
+
 use sb_core::catalogue::{Filed, SessionId};
 use sb_core::filing::{FolderId, NormalPath};
 
@@ -38,9 +40,17 @@ pub enum Dragged {
 /// Where a drop would land.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DropTarget {
-    /// Into a folder: its row in the sidebar, or its empty page.
+    /// Into a folder: its row in the sidebar.
     Folder(FolderId),
+    /// Into a folder: its empty page, which takes sessions alone (DESIGN §4.4).
+    EmptyFolder(FolderId),
     Trash,
+    /**
+     * The button that shows a narrow window's sidebar: it takes no drop, but resting on it
+     * shows the sidebar over the main area until the drag ends, so that a folder can be
+     * reached (spring-loading, as a closed folder opens).
+     */
+    Sidebar,
     /// Between two rows of the folder tree: as the folder at `index` of `parent`'s, its line
     /// drawn at the top of the row `row` of the tree, or at its bottom (`below`), `depth` in.
     Between {
@@ -60,6 +70,8 @@ pub struct DragState {
     /// The pointer has moved [`DRAG_THRESHOLD`] from where it was pressed: until it has, nothing
     /// shows and nothing takes a drop.
     pub moved: bool,
+    /// The sessions dragged, to tell at once whether a card is among them.
+    held: HashSet<SessionId>,
 }
 
 /// What a drop on a target would do.
@@ -81,7 +93,10 @@ impl Verdict {
 pub fn verdict(what: &Dragged, target: DropTarget, library: &LibraryService) -> Option<Verdict> {
     let name = |folder| library.folder_path(folder);
     Some(match (what, target) {
-        (Dragged::Sessions { ids, .. }, DropTarget::Folder(folder)) => {
+        (
+            Dragged::Sessions { ids, .. },
+            DropTarget::Folder(folder) | DropTarget::EmptyFolder(folder),
+        ) => {
             let there = ids.iter().all(|id| {
                 library
                     .session(id)
@@ -159,7 +174,11 @@ pub fn verdict(what: &Dragged, target: DropTarget, library: &LibraryService) -> 
             }
         }
         (Dragged::Sessions { .. } | Dragged::Path { .. }, DropTarget::Between { .. })
-        | (Dragged::Path { .. } | Dragged::Folder(_), DropTarget::Trash) => return None,
+        | (
+            Dragged::Path { .. } | Dragged::Folder(_),
+            DropTarget::Trash | DropTarget::EmptyFolder(_),
+        )
+        | (_, DropTarget::Sidebar) => return None,
     })
 }
 
@@ -172,6 +191,33 @@ fn inside(library: &LibraryService, folder: FolderId, outer: FolderId) -> bool {
 }
 
 impl DragState {
+    /// A drag of `what` that has not moved yet.
+    pub fn new(what: Dragged) -> Self {
+        Self {
+            held: match &what {
+                Dragged::Sessions { ids, .. } => ids.iter().cloned().collect(),
+                Dragged::Path { .. } | Dragged::Folder(_) => HashSet::new(),
+            },
+            what,
+            over: None,
+            moved: false,
+        }
+    }
+
+    /// The drag over `over`, moved far enough or not.
+    pub fn at(self, over: Option<DropTarget>, moved: bool) -> Self {
+        Self {
+            over,
+            moved,
+            ..self
+        }
+    }
+
+    /// Whether the session `id` is among those dragged.
+    pub fn holds(&self, id: &SessionId) -> bool {
+        self.held.contains(id)
+    }
+
     /// What a drop where the pointer is would do, once the pointer has moved far enough.
     pub fn verdict(&self, library: &LibraryService) -> Option<Verdict> {
         self.over

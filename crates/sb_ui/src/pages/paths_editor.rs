@@ -18,8 +18,8 @@ use std::rc::Rc;
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle,
     Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, anchored, canvas, deferred,
-    div, point, prelude::FluentBuilder as _, px,
+    ScrollHandle, StatefulInteractiveElement as _, Styled as _, Subscription, Window, anchored,
+    canvas, deferred, div, point, prelude::FluentBuilder as _, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use sb_core::catalogue::{FolderPath, ProjectPath};
@@ -68,12 +68,15 @@ struct Kept {
 /// Why a path typed can't be added.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Refusal {
-    /// It doesn't say where it is from the top.
+    /// It doesn't say where it is from the top: what is still being typed, which nothing is
+    /// said of.
     NoPath,
-    /// This folder has it already, as typed so.
+    /// It starts from a home directory, `~`, which a location doesn't record.
+    Home,
+    /// This folder has it already, as typed so, for locations that overlap these.
     Here(String),
-    /// Another folder has it for the same locations.
-    Elsewhere(FolderId),
+    /// Another folder has it for the same locations: that one, and the location.
+    Elsewhere(FolderId, Option<LocationId>),
 }
 
 pub struct PathsEditor {
@@ -88,6 +91,8 @@ pub struct PathsEditor {
     read: Option<Rc<Read>>,
     /// Whether the add row takes the keyboard when it is first drawn: the full editor's does.
     focus_first: bool,
+    /// The table's rows, which scroll in a short window.
+    rows_scroll: ScrollHandle,
     /// Where the add row's input was drawn, for its completions.
     input_bounds: Rc<std::cell::Cell<Bounds<Pixels>>>,
     focus: FocusHandle,
@@ -173,6 +178,7 @@ impl PathsEditor {
             input,
             read: None,
             input_bounds: Rc::default(),
+            rows_scroll: ScrollHandle::new(),
             focus_first: !short,
             focus: cx.focus_handle(),
             library,
@@ -260,20 +266,37 @@ impl PathsEditor {
     }
 
     /// Why `path` can't be added now, if it can't.
+    /**
+     * Why `path` can't be added now, if it can't: as the catalogue refuses one (PLAN §8), a
+     * path held by this folder for locations that overlap these (the same one, or either for
+     * any), or by another for the same locations.
+     */
     fn refusal(&self, path: &TypedPath, cx: &App) -> Option<Refusal> {
         let Some(normal) = self.normal(path, cx) else {
-            return Some(Refusal::NoPath);
+            return Some(if filing::as_typed(&path.0).starts_with('~') {
+                Refusal::Home
+            } else {
+                Refusal::NoPath
+            });
+        };
+        let overlaps = |location: &Option<LocationId>| {
+            location.is_none() || path.1.is_none() || *location == path.1
         };
         let here = (self.kept.iter())
             .filter(|kept| !kept.removed)
-            .map(|kept| (kept.path.attached.path.clone(), kept.path.typed.clone()))
+            .map(|kept| {
+                (
+                    kept.path.attached.path.clone(),
+                    &kept.path.attached.location,
+                    kept.path.typed.clone(),
+                )
+            })
             .chain(
-                self.added
-                    .iter()
-                    .filter_map(|added| Some((self.normal(added, cx)?, added.0.clone()))),
+                (self.added.iter())
+                    .filter_map(|added| Some((self.normal(added, cx)?, &added.1, added.0.clone()))),
             )
-            .find(|(path, _)| *path == normal);
-        if let Some((_, typed)) = here {
+            .find(|(path, location, _)| *path == normal && overlaps(location));
+        if let Some((.., typed)) = here {
             return Some(Refusal::Here(typed));
         }
         (self.library.read(cx).attached().iter())
@@ -282,7 +305,7 @@ impl PathsEditor {
                     && it.attached.path == normal
                     && it.attached.location == path.1
             })
-            .map(|it| Refusal::Elsewhere(it.attached.folder))
+            .map(|it| Refusal::Elsewhere(it.attached.folder, it.attached.location.clone()))
     }
 
     /// Adds the path typed: as a change to save, or in the short form at once.
@@ -294,12 +317,17 @@ impl PathsEditor {
         if self.refusal(&path, cx).is_some() {
             return;
         }
-        self.add(path, window, cx);
+        self.add(path, cx);
         self.input
             .update(cx, |input, cx| input.set_value("", window, cx));
     }
 
-    fn add(&mut self, path: TypedPath, _: &mut Window, cx: &mut Context<Self>) {
+    /**
+     * Adds `path`: as a change to save, or in the short form at once. A path taken off in
+     * this editor and added again for the same locations is kept instead, so that the two
+     * changes cancel out.
+     */
+    fn add(&mut self, path: TypedPath, cx: &mut Context<Self>) {
         if self.short {
             let sessions = self.moved_by(&path, cx).0;
             let folder = self.folder;
@@ -308,7 +336,19 @@ impl PathsEditor {
             cx.emit(PathsEditorEvent::Closed);
             return;
         }
-        self.added.push(path);
+        let normal = self.normal(&path, cx);
+        match (self.kept.iter_mut()).find(|kept| {
+            kept.removed
+                && Some(&kept.path.attached.path) == normal.as_ref()
+                && kept.path.attached.location == path.1
+        }) {
+            Some(kept) => kept.removed = false,
+            None => {
+                self.added.push(path);
+                // The row added shows, under the rows above it.
+                self.rows_scroll.scroll_to_bottom();
+            }
+        }
         self.held(cx);
     }
 
@@ -322,8 +362,7 @@ impl PathsEditor {
             path: normal,
             location: path.1.clone(),
         };
-        let after = self.after(cx);
-        let mut after = after;
+        let mut after = self.after(cx);
         if !after.contains(&added) {
             after.push(added.clone());
         }
@@ -567,7 +606,7 @@ impl Render for PathsEditor {
         let said = refusal.clone().filter(|it| *it != Refusal::NoPath);
         let suggestions = self.suggestions(cx);
         let input_focused = self.input.focus_handle(cx).is_focused(window);
-        let completions = if input_focused {
+        let completions = if input_focused && said.is_none() {
             self.completions(cx)
         } else {
             Vec::new()
@@ -660,7 +699,10 @@ impl Render for PathsEditor {
         let refused = said.map(|refusal| {
             let text = match &refusal {
                 Refusal::Here(typed) => format!("Already here as {typed}"),
-                Refusal::NoPath | Refusal::Elsewhere(_) => String::new(),
+                Refusal::Home => {
+                    "Use the full path, as the location reports it (no ~).".to_string()
+                }
+                Refusal::NoPath | Refusal::Elsewhere(..) => String::new(),
             };
             let row = div()
                 .flex()
@@ -671,8 +713,10 @@ impl Render for PathsEditor {
                 .text_spec(&theme.text.secondary)
                 .child(icon(SbIcon::CircleAlert, theme.sizes.icon_sm, c.red));
             match refusal {
-                Refusal::Elsewhere(folder) => {
+                Refusal::Elsewhere(folder, location) => {
                     let holder = self.library.read(cx).folder_path(folder);
+                    let scope = location
+                        .and_then(|it| self.sync.read(cx).location(&it).map(|it| it.name.clone()));
                     row.child("Already attached to")
                         .child(
                             div()
@@ -692,7 +736,15 @@ impl Render for PathsEditor {
                                 }))
                                 .automation_target("paths/holder"),
                         )
-                        .child(". A path belongs to one folder; remove it there first.")
+                        .child(match scope {
+                            Some(name) => format!(
+                                " for {name}. A path belongs to one folder for each location; \
+                                 remove it there first."
+                            ),
+                            None => ". A path belongs to one folder for each location; remove \
+                                     it there first."
+                                .to_string(),
+                        })
                 }
                 _ => row.child(text),
             }
@@ -717,7 +769,7 @@ impl Render for PathsEditor {
                             .shadow(theme.shadows.pop.clone())
                             .occlude()
                             .children(completions.into_iter().enumerate().map(|(at, seen)| {
-                                let path = (seen.recorded.clone(), Some(seen.location.clone()));
+                                let path = seen.recorded.clone();
                                 div()
                                     .id(("paths-completion", at))
                                     .flex()
@@ -748,8 +800,7 @@ impl Render for PathsEditor {
                                         gpui::MouseButton::Left,
                                         cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
-                                            this.scope = path.1.clone();
-                                            let typed = path.0.clone();
+                                            let typed = path.clone();
                                             this.input.update(cx, |input, cx| {
                                                 input.set_value(typed, window, cx)
                                             });
@@ -850,8 +901,8 @@ impl Render for PathsEditor {
                                     .debug_selector(move || format!("paths-attach-{at}"))
                                     .child(icon(SbIcon::Plus, theme.sizes.icon_xs, c.accent_ink))
                                     .child("Attach")
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.add(path.clone(), window, cx);
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.add(path.clone(), cx);
                                     }))
                                     .automation_target(format!("paths/suggested/{at}")),
                                 )
@@ -918,6 +969,7 @@ impl Render for PathsEditor {
                     .automation_target(format!("paths/row/{at}/undo"))
                 } else {
                     icon_button(("paths-remove", at), REMOVE_WIDTH, &theme)
+                        .debug_selector(move || format!("paths-remove-{at}"))
                         .aria_label(format!("Remove {}", kept.path.typed))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.kept[at].removed = true;
@@ -981,156 +1033,185 @@ impl Render for PathsEditor {
                 .automation_target(format!("paths/added/{at}"))
         });
         let pending = self.is_pending();
-        card.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(theme.spacing.md)
-                .pt(theme.spacing.lg)
-                .pb(px(10.))
-                .px(px(14.))
-                .child(title_line(
-                    format!(
-                        "Sessions that started under one of these file themselves into {name}. \
-                         The longest matching path wins, so subfolders claim first."
-                    ),
-                    &theme,
-                )),
-        )
-        .child(
-            div()
-                .mx(px(14.))
-                .flex()
-                .flex_col()
-                .rounded(theme.radii.row)
-                .border_1()
-                .border_color(c.line)
-                .overflow_hidden()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(theme.spacing.lg)
-                        .h(HEAD_HEIGHT)
-                        .px(px(10.))
-                        .bg(c.s1)
-                        .text_color(c.fg3)
-                        .text_spec(&theme.text.tag)
-                        .child(div().w(SCOPE_WIDTH).child("Location"))
-                        .child(div().flex_1().child("Path"))
-                        .child(div().w(COUNT_WIDTH).flex().justify_end().child("Sessions"))
-                        .child(div().w(REMOVE_WIDTH)),
-                )
-                .children(rows)
-                .children(added)
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(theme.spacing.sm)
-                        .p(px(10.))
-                        .border_t_1()
-                        .border_color(c.line_subtle)
-                        .bg(c.s1)
-                        .child(add_row)
-                        .children(refused),
-                ),
-        )
-        .when(!suggestions.is_empty(), |this| {
-            this.child(
+        /* A folder with many paths in a short window: the table's rows and the suggestions
+        scroll, and the add row and the footer, with Save, stay in sight. */
+        let body = div()
+            .flex()
+            .flex_col()
+            .flex_shrink(1.)
+            .min_h_0()
+            .child(
                 div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(theme.spacing.md)
+                    .pt(theme.spacing.lg)
+                    .pb(px(10.))
+                    .px(px(14.))
+                    .child(title_line(
+                        format!(
+                            "Sessions that started under one of these file themselves into {name}. \
+                         The longest matching path wins, so subfolders claim first."
+                        ),
+                        &theme,
+                    )),
+            )
+            .child(
+                div()
+                    .mx(px(14.))
+                    .flex_shrink(1.)
+                    .min_h_0()
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
-                    .pt(px(10.))
-                    .pb(theme.spacing.xs)
-                    .px(px(14.))
-                    .child(div().pt(px(2.)).pb(theme.spacing.sm).child(
-                        crate::components::overline("Suggested from Unsorted", &theme),
-                    ))
-                    .children(suggestions.into_iter().enumerate().map(|(at, seen)| {
-                        let path = (seen.recorded.clone(), Some(seen.location.clone()));
+                    .rounded(theme.radii.row)
+                    .border_1()
+                    .border_color(c.line)
+                    .overflow_hidden()
+                    .child(
                         div()
+                            .flex_none()
                             .flex()
                             .items_center()
-                            .gap(theme.spacing.md)
-                            .h(px(30.))
-                            .text_spec(&theme.text.secondary)
-                            .child(
-                                button(
-                                    ("paths-suggest", at),
-                                    ButtonKind::Plain,
-                                    true,
-                                    true,
-                                    &theme,
-                                )
-                                .child(icon(SbIcon::Plus, theme.sizes.icon_xs, c.fg))
-                                .child("Add")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.add(path.clone(), window, cx);
-                                }))
-                                .automation_target(format!("paths/suggested/{at}")),
-                            )
-                            .child(self.scope_tag(Some(&seen.location), &theme, cx))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .text_color(c.fg2)
-                                    .text_spec(&theme.text.path)
-                                    .child(seen.recorded.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_color(c.fg3)
-                                    .text_spec(&theme.text.number)
-                                    .child(format::plural(seen.unsorted, "session")),
-                            )
-                    })),
+                            .gap(theme.spacing.lg)
+                            .h(HEAD_HEIGHT)
+                            .px(px(10.))
+                            .bg(c.s1)
+                            .text_color(c.fg3)
+                            .text_spec(&theme.text.tag)
+                            .child(div().w(SCOPE_WIDTH).child("Location"))
+                            .child(div().flex_1().child("Path"))
+                            .child(div().w(COUNT_WIDTH).flex().justify_end().child("Sessions"))
+                            .child(div().w(REMOVE_WIDTH)),
+                    )
+                    .child(
+                        div()
+                            .id("paths-rows")
+                            .flex_shrink(1.)
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.rows_scroll)
+                            .children(rows)
+                            .children(added)
+                            .automation_target("paths/rows"),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .gap(theme.spacing.sm)
+                            .p(px(10.))
+                            .border_t_1()
+                            .border_color(c.line_subtle)
+                            .bg(c.s1)
+                            .child(add_row)
+                            .children(refused),
+                    ),
             )
-        })
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(theme.spacing.md)
-                .mt(theme.spacing.md)
-                .py(px(10.))
-                .px(px(14.))
-                .border_t_1()
-                .border_color(c.line_subtle)
-                .bg(c.s1)
-                .child(icon(SbIcon::CircleAlert, theme.sizes.icon_sm, c.fg3))
-                .child(
+            .when(!suggestions.is_empty(), |this| {
+                this.child(
                     div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_color(c.fg2)
-                        .text_spec(&theme.text.secondary)
-                        .child(if pending {
-                            self.summary(cx)
-                        } else {
-                            "No changes yet.".to_string()
-                        })
-                        .automation_target("paths/summary"),
+                        .id("paths-suggestions")
+                        .flex_shrink(1.)
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .pt(px(10.))
+                        .pb(theme.spacing.xs)
+                        .px(px(14.))
+                        .child(div().pt(px(2.)).pb(theme.spacing.sm).child(
+                            crate::components::overline("Suggested from Unsorted", &theme),
+                        ))
+                        .children(suggestions.into_iter().enumerate().map(|(at, seen)| {
+                            let path = (seen.recorded.clone(), Some(seen.location.clone()));
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(theme.spacing.md)
+                                .h(px(30.))
+                                .text_spec(&theme.text.secondary)
+                                .child(
+                                    button(
+                                        ("paths-suggest", at),
+                                        ButtonKind::Plain,
+                                        true,
+                                        true,
+                                        &theme,
+                                    )
+                                    .child(icon(SbIcon::Plus, theme.sizes.icon_xs, c.fg))
+                                    .child("Add")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.add(path.clone(), cx);
+                                    }))
+                                    .automation_target(format!("paths/suggested/{at}")),
+                                )
+                                .child(self.scope_tag(Some(&seen.location), &theme, cx))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .text_color(c.fg2)
+                                        .text_spec(&theme.text.path)
+                                        .child(seen.recorded.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(c.fg3)
+                                        .text_spec(&theme.text.number)
+                                        .child(format::plural(seen.unsorted, "session")),
+                                )
+                        })),
                 )
-                .child(
-                    button("paths-cancel", ButtonKind::Plain, true, true, &theme)
-                        .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)))
-                        .child("Cancel")
-                        .automation_target("paths/cancel"),
-                )
-                .child(
-                    button("paths-save", ButtonKind::Primary, true, pending, &theme)
-                        .on_click(cx.listener(|this, _, window, cx| this.save(window, cx)))
-                        .child("Save paths")
-                        .automation_target("paths/save"),
-                ),
-        )
-        .automation_target("paths/editor")
-        .into_any_element()
+            });
+        card.flex_shrink(1.)
+            .min_h_0()
+            .child(body)
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(theme.spacing.md)
+                    .mt(theme.spacing.md)
+                    .py(px(10.))
+                    .px(px(14.))
+                    .border_t_1()
+                    .border_color(c.line_subtle)
+                    .bg(c.s1)
+                    .child(icon(SbIcon::CircleAlert, theme.sizes.icon_sm, c.fg3))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(c.fg2)
+                            .text_spec(&theme.text.secondary)
+                            .child(if pending {
+                                self.summary(cx)
+                            } else {
+                                "No changes yet.".to_string()
+                            })
+                            .automation_target("paths/summary"),
+                    )
+                    .child(
+                        button("paths-cancel", ButtonKind::Plain, true, true, &theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)))
+                            .child("Cancel")
+                            .automation_target("paths/cancel"),
+                    )
+                    .child(
+                        button("paths-save", ButtonKind::Primary, true, pending, &theme)
+                            .on_click(cx.listener(|this, _, window, cx| this.save(window, cx)))
+                            .child("Save paths")
+                            .automation_target("paths/save"),
+                    ),
+            )
+            .automation_target("paths/editor")
+            .into_any_element()
     }
 }
 
@@ -1138,6 +1219,7 @@ impl Render for PathsEditor {
 fn title_line(text: String, theme: &SbTheme) -> impl IntoElement {
     let c = &theme.colors;
     div()
+        .min_w_0()
         .flex()
         .items_center()
         .gap(theme.spacing.md)
@@ -1150,6 +1232,7 @@ fn title_line(text: String, theme: &SbTheme) -> impl IntoElement {
         )
         .child(
             div()
+                .flex_1()
                 .min_w_0()
                 .overflow_hidden()
                 .text_ellipsis()

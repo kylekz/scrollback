@@ -3,16 +3,18 @@
 //! the test library of [`crate::test_support`]: three sessions, all in Unsorted at first.
 
 use gpui::{
-    Entity, Modifiers, MouseButton, Pixels, Point, TestAppContext, VisualTestContext, point, px,
+    Entity, Focusable as _, Modifiers, MouseButton, Pixels, Point, TestAppContext,
+    VisualTestContext, point, px, size,
 };
 use pretty_assertions::assert_eq;
 use sb_core::catalogue::{Filed, SessionId, Shelf};
 use sb_core::filing::FolderId;
 
+use super::paths_editor::PathsEditor;
 use crate::menu;
-use crate::services::{ActiveServices as _, Dragged, LibraryService, PageView, Verdict};
-use crate::shell::Shell;
-use crate::test_support::{SESSIONS, bounds, open_shell};
+use crate::services::{ActiveServices as _, Dragged, Leave, LibraryService, PageView, Verdict};
+use crate::shell::{Shell, SidebarPlacement};
+use crate::test_support::{SESSIONS, bounds, open_shell, open_shell_sized};
 
 fn library(cx: &mut VisualTestContext) -> Entity<LibraryService> {
     cx.update(|_, cx| cx.services().library.clone())
@@ -289,6 +291,9 @@ fn the_filter_field_narrows_the_page_and_each_page_keeps_its_own(cx: &mut TestAp
         cx.update(|_, cx| shell.read(cx).main().read(cx).sessions().read(cx).shown())
     };
     assert_eq!(shown(&shell, cx), 3);
+    // A card is selected, so that S would star it if the key reached the page.
+    let card = centre("card-0", cx);
+    cx.simulate_click(card, Modifiers::none());
     let field = centre("filter-field", cx);
     cx.simulate_click(field, Modifiers::none());
     cx.simulate_keystrokes("f l a k y");
@@ -318,7 +323,8 @@ fn the_filter_field_narrows_the_page_and_each_page_keeps_its_own(cx: &mut TestAp
     library(cx).update(cx, |library, cx| {
         let mut view = library.view();
         view.clear_filters();
-        view.model = Some("model-a".to_string());
+        let provider = library.sessions().unwrap().sessions[0].id.provider.clone();
+        view.model = Some((provider, "model-a".to_string()));
         library.set_view(view, cx);
     });
     cx.run_until_parked();
@@ -447,13 +453,21 @@ fn a_folder_dropped_on_another_nests_and_between_two_reorders(cx: &mut TestAppCo
     assert!(bounds(cx, "sidebar-folder-b").is_some(), "a opened");
     cx.simulate_keystrokes("escape");
 
-    // A folder doesn't go into itself, nor into one inside it: no target shows.
+    // A folder doesn't go into itself, nor into one inside it: the ghost says why.
     let a_row = centre("sidebar-folder-a", cx);
-    drag_to(a_row, a_row + point(px(0.), px(2.)), cx);
-    drag_to(a_row, a_row, cx);
-    let refused = verdict(cx);
-    assert!(!refused.as_ref().is_some_and(Verdict::takes), "{refused:?}");
+    drag_to(a_row, a_row + point(px(0.), px(6.)), cx);
+    assert_eq!(
+        verdict(cx),
+        Some(Verdict::Refuses("can't go inside itself".to_string()))
+    );
     cx.simulate_keystrokes("escape");
+    let to = drag("sidebar-folder-a", "sidebar-folder-b", cx);
+    assert_eq!(
+        verdict(cx),
+        Some(Verdict::Refuses("can't go inside itself".to_string()))
+    );
+    release(to, cx);
+    assert_eq!(parent(a, cx), None);
 
     // Above the first row, at the top: b moves out of a, before it.
     let top = bounds(cx, "sidebar-folder-a").unwrap();
@@ -663,4 +677,536 @@ fn a_toast_goes_after_five_seconds(cx: &mut TestAppContext) {
         .advance_clock(std::time::Duration::from_secs(5));
     cx.run_until_parked();
     assert_eq!(toast(cx), None);
+}
+
+/// The test library's sessions, the newest first.
+fn session_ids(cx: &mut VisualTestContext) -> Vec<SessionId> {
+    library(cx).read_with(cx, |library, _| {
+        (library.sessions().unwrap().sessions.iter())
+            .map(|it| it.id.clone())
+            .collect()
+    })
+}
+
+fn trashed(cx: &mut VisualTestContext) -> usize {
+    library(cx).read_with(cx, |library, _| library.counts().trash)
+}
+
+fn main_has_keyboard(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|window, cx| shell.read(cx).main().focus_handle(cx).is_focused(window))
+}
+
+#[gpui::test]
+fn the_delete_folder_dialog_keeps_the_page_keys_from_the_page_and_gives_the_keyboard_back(
+    cx: &mut TestAppContext,
+) {
+    let (shell, cx) = open_shell(cx);
+    let work = folder("work", None, cx);
+    show(Shelf::All, cx);
+    let card = centre("card-0", cx);
+    cx.simulate_click(card, Modifiers::none());
+    library(cx).update(cx, |library, cx| library.ask_delete(work, cx));
+    cx.run_until_parked();
+    assert!(!main_has_keyboard(&shell, cx), "the dialog has it");
+
+    // Delete, Enter and S are the page's keys: behind the dialog they do nothing.
+    cx.simulate_keystrokes("delete enter s");
+    cx.run_until_parked();
+    let (starred, open) = library(cx).read_with(cx, |library, _| {
+        (library.counts().starred, library.open_session().is_some())
+    });
+    assert_eq!((trashed(cx), starred, open), (0, 0, false));
+    assert!(bounds(cx, "delete-folder").is_some());
+
+    // Esc answers; the keyboard is back on the page, where Delete acts again.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(bounds(cx, "delete-folder"), None);
+    assert!(main_has_keyboard(&shell, cx));
+    cx.simulate_keystrokes("delete");
+    cx.run_until_parked();
+    assert_eq!(trashed(cx), 1);
+}
+
+/// Opens the paths editor of a folder made from Unsorted's first group, `app`, with a path
+/// added and not saved.
+fn editing_app(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> Entity<PathsEditor> {
+    show(Shelf::Unsorted, cx);
+    let group = library(cx).read_with(cx, |library, _| {
+        crate::services::group_key(&library.groups()[0])
+    });
+    library(cx).update(cx, |library, cx| library.create_folder_from(&group, cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    let app = library(cx).read_with(cx, |library, _| library.folders()[0].id);
+    library(cx).update(cx, |library, cx| library.edit_paths(app, cx));
+    cx.run_until_parked();
+    let editor = cx
+        .update(|_, cx| {
+            shell
+                .read(cx)
+                .main()
+                .read(cx)
+                .sessions()
+                .read(cx)
+                .editor()
+                .cloned()
+        })
+        .expect("the paths editor");
+    cx.simulate_input("/home/user/notes");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    editor
+}
+
+#[gpui::test]
+fn the_question_about_unsaved_paths_has_the_keyboard_until_it_is_answered(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    let editor = editing_app(&shell, cx);
+    let typing =
+        |cx: &mut VisualTestContext| cx.update(|window, cx| editor.read(cx).is_typing(window, cx));
+    assert!(typing(cx));
+    show(Shelf::Starred, cx);
+    assert!(library(cx).read_with(cx, |library, _| library.asked().is_some()));
+    assert!(!typing(cx), "the question has the keyboard");
+
+    // Typing goes nowhere behind it: the editor's changes stay as they were.
+    cx.simulate_input("/home/user/elsewhere");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(editor.read_with(cx, |editor, _| editor.added().count()), 1);
+
+    // Cancel: the question goes and the keyboard is back in the add row.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(library(cx).read_with(cx, |library, _| library.asked().is_none()));
+    assert!(typing(cx));
+}
+
+#[gpui::test]
+fn closing_the_window_with_unsaved_paths_asks_first(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    let editor = editing_app(&shell, cx);
+    assert!(!cx.simulate_close(), "the window stays to ask");
+    assert!(library(cx).read_with(cx, |library, _| matches!(
+        library.asked(),
+        Some(Leave::Close)
+    )));
+    // Cancel keeps the changes, and the next close asks again.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.simulate_close());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    // With nothing to save it closes at once.
+    editor.update(cx, |editor, cx| editor.cancel(cx));
+    cx.run_until_parked();
+    assert!(cx.simulate_close());
+}
+
+#[gpui::test]
+fn the_keys_act_only_on_the_sessions_the_page_shows(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    let ids = session_ids(cx);
+    let (first, second) = (centre("card-0", cx), centre("card-1", cx));
+    cx.simulate_click(first, Modifiers::none());
+    let ctrl = secondary(cx);
+    cx.simulate_click(second, ctrl);
+    // The filter hides both: the selection goes with them, and Delete and S do nothing.
+    library(cx).update(cx, |library, cx| {
+        library.set_view(
+            PageView {
+                filter: "summarise".to_string(),
+                ..PageView::default()
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert!(library(cx).read_with(cx, |library, _| library.selection().is_empty()));
+    cx.simulate_keystrokes("delete s");
+    cx.run_until_parked();
+    assert_eq!(trashed(cx), 0);
+    assert_eq!(
+        library(cx).read_with(cx, |library, _| library.counts().starred),
+        0
+    );
+
+    /* A session moved to Trash leaves the selection at once; the one after it is selected,
+    and the arrows go on from there. */
+    library(cx).update(cx, |library, cx| library.set_view(PageView::default(), cx));
+    cx.run_until_parked();
+    let first = centre("card-0", cx);
+    cx.simulate_click(first, Modifiers::none());
+    cx.simulate_keystrokes("delete");
+    cx.run_until_parked();
+    assert_eq!(trashed(cx), 1);
+    let selected = library(cx).read_with(cx, |library, _| library.selected().cloned());
+    assert_eq!(selected.as_ref(), Some(&ids[1]));
+    cx.simulate_keystrokes("right");
+    let selected = library(cx).read_with(cx, |library, _| library.selected().cloned());
+    assert_eq!(selected.as_ref(), Some(&ids[2]));
+}
+
+#[gpui::test]
+fn undo_puts_back_what_was_before_each_change_however_quickly_they_came(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    let work = folder("work", None, cx);
+    let other = folder("other", None, cx);
+    show(Shelf::All, cx);
+    let id = session_ids(cx)[0].clone();
+    // Two changes made before the first is written.
+    library(cx).update(cx, |library, cx| {
+        library.file_by_hand(vec![id.clone()], work, cx);
+        library.file_by_hand(vec![id.clone()], other, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(toast(cx).as_deref(), Some("Filed in other by hand"));
+    undo(cx);
+    assert_eq!(filed(SESSIONS[0].title, cx), Filed::ByHand(work));
+}
+
+#[gpui::test]
+fn undo_after_the_world_moved_on_puts_back_what_it_can_and_says_what_it_couldnt(
+    cx: &mut TestAppContext,
+) {
+    let (_shell, cx) = open_shell(cx);
+    let work = folder("work", None, cx);
+    let other = folder("other", None, cx);
+    show(Shelf::All, cx);
+    let ids = session_ids(cx);
+    let archive = cx.update(|_, cx| cx.services().archive.read(cx).archive().cloned().unwrap());
+
+    /* The folder one of the sessions was in is deleted before Undo: that one goes where the
+    rules put it, the other back where it was, and the toast says so. */
+    library(cx).update(cx, |library, cx| {
+        library.file_by_hand(vec![ids[0].clone()], work, cx);
+    });
+    cx.run_until_parked();
+    library(cx).update(cx, |library, cx| {
+        library.file_by_hand(vec![ids[0].clone(), ids[1].clone()], other, cx);
+    });
+    cx.run_until_parked();
+    archive.catalogue().delete_folder(work).unwrap();
+    library(cx).update(cx, LibraryService::reload);
+    cx.run_until_parked();
+    undo(cx);
+    assert_eq!(filed(SESSIONS[0].title, cx), Filed::Unsorted);
+    assert_eq!(filed(SESSIONS[1].title, cx), Filed::Unsorted);
+    assert_eq!(
+        toast(cx).as_deref(),
+        Some(
+            "Undone, but 1 session couldn't be put back as it was: deleted for good, or its \
+             folder is gone"
+        )
+    );
+
+    /* A path attached, then moved to another folder before Undo: the Undo is refused, and
+    the banner says why in words. */
+    let app = ("/home/user/code/app".to_string(), None);
+    library(cx).update(cx, |library, cx| library.attach(other, app.clone(), 2, cx));
+    cx.run_until_parked();
+    archive
+        .catalogue()
+        .create_folder("elsewhere", None)
+        .and_then(|elsewhere| {
+            archive
+                .catalogue()
+                .move_path(other, (&app.0, None), elsewhere)
+        })
+        .unwrap();
+    library(cx).update(cx, LibraryService::reload);
+    cx.run_until_parked();
+    undo(cx);
+    let failure =
+        library(cx).read_with(cx, |library, _| library.write_failure().map(str::to_string));
+    assert_eq!(
+        failure.as_deref(),
+        Some(
+            "The change of paths couldn't be saved: /home/user/code/app isn't attached to \
+             that folder any more."
+        )
+    );
+
+    // A toast whose Undo names a folder that is gone goes with it.
+    let notes = ("/home/user/notes".to_string(), None);
+    library(cx).update(cx, |library, cx| library.attach(other, notes, 1, cx));
+    cx.run_until_parked();
+    assert!(toast(cx).is_some());
+    library(cx).update(cx, |library, cx| {
+        library.ask_delete(other, cx);
+        library.answer_delete(true, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(toast(cx), None);
+}
+
+#[gpui::test]
+fn a_click_finds_its_session_on_the_page_as_it_is_when_the_click_lands(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    let ids = session_ids(cx);
+    /* The first two leave the page, as another change would: the third is first now, and a
+    click on it as it was drawn, third, finds it there. */
+    let archive = cx.update(|_, cx| cx.services().archive.read(cx).archive().cloned().unwrap());
+    archive.catalogue().trash_all(&ids[..2]).unwrap();
+    library(cx).update(cx, LibraryService::reload);
+    cx.run_until_parked();
+    let page = cx.update(|_, cx| shell.read(cx).main().read(cx).sessions().clone());
+    let click = |id: &SessionId, hint: usize, cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            page.update(cx, |page, cx| {
+                page.click((id, hint), (Modifiers::none(), 1), window, cx);
+            });
+        });
+    };
+    click(&ids[2], 2, cx);
+    let selected = library(cx).read_with(cx, |library, _| {
+        (library.selected().cloned(), library.selected_index())
+    });
+    assert_eq!(selected, (Some(ids[2].clone()), Some(0)));
+    // One that is gone selects nothing else.
+    click(&ids[0], 0, cx);
+    let selected = library(cx).read_with(cx, |library, _| library.selected().cloned());
+    assert_eq!(selected, Some(ids[2].clone()));
+}
+
+#[gpui::test]
+fn shift_runs_from_the_last_plain_or_ctrl_click_and_ctrl_shift_adds_the_run(
+    cx: &mut TestAppContext,
+) {
+    let (_shell, cx) = open_shell(cx);
+    let cards = [
+        centre("card-0", cx),
+        centre("card-1", cx),
+        centre("card-2", cx),
+    ];
+    let chosen = |cx: &mut VisualTestContext| {
+        library(cx).read_with(cx, |library, _| library.selection().len())
+    };
+    cx.simulate_click(cards[0], Modifiers::none());
+    cx.simulate_click(cards[2], Modifiers::shift());
+    assert_eq!(chosen(cx), 3);
+    // The run starts where the plain click was, not at the last Shift-click.
+    cx.simulate_click(cards[1], Modifiers::shift());
+    assert_eq!(chosen(cx), 2);
+
+    let ctrl = secondary(cx);
+    cx.simulate_click(cards[2], Modifiers::none());
+    cx.simulate_click(cards[0], ctrl);
+    assert_eq!(chosen(cx), 2);
+    cx.simulate_click(
+        cards[1],
+        Modifiers {
+            shift: true,
+            ..ctrl
+        },
+    );
+    assert_eq!(chosen(cx), 3);
+}
+
+#[gpui::test]
+fn a_press_that_never_becomes_a_drag_is_a_click(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    let ids = session_ids(cx);
+    let wiggle = |at: Point<Pixels>, modifiers: Modifiers, cx: &mut VisualTestContext| {
+        cx.simulate_mouse_down(at, MouseButton::Left, modifiers);
+        let moved = at + point(px(3.), px(0.));
+        cx.simulate_mouse_move(moved, Some(MouseButton::Left), modifiers);
+        cx.simulate_mouse_up(moved, MouseButton::Left, modifiers);
+        cx.run_until_parked();
+    };
+    // gpui starts its drag past 2px; the drag never moved 4px, so it was a click.
+    let second = centre("card-1", cx);
+    wiggle(second, Modifiers::none(), cx);
+    let selected = library(cx).read_with(cx, |library, _| library.selected().cloned());
+    assert_eq!(selected, Some(ids[1].clone()));
+    assert!(library(cx).read_with(cx, |library, _| library.drag().is_none()));
+    // With Ctrl it adds to the selection, as a click with Ctrl does.
+    let third = centre("card-2", cx);
+    let ctrl = secondary(cx);
+    wiggle(third, ctrl, cx);
+    assert_eq!(
+        library(cx).read_with(cx, |library, _| library.selection().len()),
+        2
+    );
+}
+
+#[gpui::test]
+fn a_press_that_jumps_to_a_folder_drops_there(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    let work = folder("work", None, cx);
+    show(Shelf::All, cx);
+    let (from, to) = (centre("card-0", cx), centre("sidebar-folder-work", cx));
+    cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::none());
+    release(to, cx);
+    assert_eq!(filed(SESSIONS[0].title, cx), Filed::ByHand(work));
+}
+
+#[gpui::test]
+fn a_key_pressed_mid_drag_does_nothing_and_the_release_still_drops(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    let work = folder("work", None, cx);
+    show(Shelf::All, cx);
+    let to = drag("card-0", "sidebar-folder-work", cx);
+    // Delete would move the dragged session to Trash: no key but Esc acts mid-drag.
+    cx.simulate_keystrokes("delete s");
+    cx.run_until_parked();
+    assert_eq!(trashed(cx), 0);
+    assert!(library(cx).read_with(cx, |library, _| library.drag().is_some()));
+    release(to, cx);
+    assert_eq!(filed(SESSIONS[0].title, cx), Filed::ByHand(work));
+    assert!(library(cx).read_with(cx, |library, _| library.drag().is_none()));
+}
+
+#[gpui::test]
+fn an_empty_folders_page_takes_sessions_but_not_folders(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    let notes = folder("notes", None, cx);
+    folder("work", None, cx);
+    show(Shelf::Folder(notes), cx);
+    drag("sidebar-folder-work", "page-empty", cx);
+    assert_eq!(verdict(cx), None);
+    cx.simulate_keystrokes("escape");
+}
+
+#[gpui::test]
+fn a_drag_resting_on_a_narrow_windows_sidebar_button_shows_the_sidebar_until_it_ends(
+    cx: &mut TestAppContext,
+) {
+    let (shell, cx) = open_shell_sized(size(px(960.), px(600.)), cx);
+    let work = folder("work", None, cx);
+    show(Shelf::All, cx);
+    let placement = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| shell.read(cx).sidebar_placement(px(960.), cx))
+    };
+    // Naming the folder showed the sidebar; Esc hides it again.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(placement(cx), SidebarPlacement::Collapsed);
+    let button = drag("card-0", "titlebar-sidebar", cx);
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(500));
+    cx.run_until_parked();
+    assert_eq!(placement(cx), SidebarPlacement::Overlay);
+    let row = centre("sidebar-folder-work", cx);
+    for step in 1..=8 {
+        let t = step as f32 / 8.;
+        let at = point(
+            button.x + (row.x - button.x) * t,
+            button.y + (row.y - button.y) * t,
+        );
+        cx.simulate_mouse_move(at, Some(MouseButton::Left), Modifiers::none());
+    }
+    release(row, cx);
+    assert_eq!(filed(SESSIONS[0].title, cx), Filed::ByHand(work));
+    assert_eq!(placement(cx), SidebarPlacement::Collapsed);
+}
+
+#[gpui::test]
+fn a_new_folder_takes_a_free_name_and_a_rename_to_a_siblings_name_is_refused(
+    cx: &mut TestAppContext,
+) {
+    let (_shell, cx) = open_shell(cx);
+    folder("work", None, cx);
+    for _ in 0..2 {
+        library(cx).update(cx, |library, cx| {
+            library.create_folder(library.fresh_name(None), None, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+    }
+    let names = |cx: &mut VisualTestContext| {
+        library(cx).read_with(cx, |library, _| {
+            (library.folders().iter())
+                .map(|it| it.name.clone())
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(names(cx), ["work", "New folder", "New folder 2"]);
+    /* F2 renames the folder shown; "WORK" is work's name in another case: Enter leaves the
+    field open with what was typed, and a name of its own is then kept. */
+    let second = library(cx).read_with(cx, |library, _| library.folders()[2].id);
+    show(Shelf::Folder(second), cx);
+    cx.simulate_keystrokes("f2");
+    cx.run_until_parked();
+    cx.simulate_input("WORK");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(names(cx), ["work", "New folder", "New folder 2"]);
+    cx.simulate_input(" 2");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(names(cx), ["work", "New folder", "WORK 2"]);
+    // Esc on a refused name keeps the folder's own.
+    cx.simulate_keystrokes("f2");
+    cx.run_until_parked();
+    cx.simulate_input("new FOLDER");
+    cx.simulate_keystrokes("enter escape");
+    cx.run_until_parked();
+    assert_eq!(names(cx), ["work", "New folder", "WORK 2"]);
+}
+
+#[gpui::test]
+fn shift_f10_in_the_filter_field_opens_no_menu(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    let card = centre("card-0", cx);
+    cx.simulate_click(card, Modifiers::none());
+    let field = centre("filter-field", cx);
+    cx.simulate_click(field, Modifiers::none());
+    cx.simulate_keystrokes("shift-f10");
+    cx.run_until_parked();
+    assert_eq!(menu_items(cx), None);
+}
+
+#[gpui::test]
+fn a_toast_stays_while_the_pointer_rests_on_it(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    let id = session_ids(cx)[0].clone();
+    library(cx).update(cx, |library, cx| library.trash(vec![id], cx));
+    cx.run_until_parked();
+    let over = centre("toast", cx);
+    cx.simulate_mouse_move(over, None, Modifiers::none());
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(6));
+    cx.run_until_parked();
+    assert!(toast(cx).is_some());
+    cx.simulate_mouse_move(point(px(10.), px(400.)), None, Modifiers::none());
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(5));
+    cx.run_until_parked();
+    assert_eq!(toast(cx), None);
+}
+
+#[gpui::test]
+fn a_path_taken_off_and_added_again_is_no_change(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    let work = folder("work", None, cx);
+    let app = ("/home/user/code/app".to_string(), None);
+    library(cx).update(cx, |library, cx| library.attach(work, app, 2, cx));
+    cx.run_until_parked();
+    library(cx).update(cx, |library, cx| library.edit_paths(work, cx));
+    cx.run_until_parked();
+    let editor = cx
+        .update(|_, cx| {
+            shell
+                .read(cx)
+                .main()
+                .read(cx)
+                .sessions()
+                .read(cx)
+                .editor()
+                .cloned()
+        })
+        .expect("the paths editor");
+    let remove = centre("paths-remove-0", cx);
+    cx.simulate_click(remove, Modifiers::none());
+    assert!(editor.read_with(cx, |editor, _| editor.is_pending()));
+    cx.update(|window, cx| editor.update(cx, |editor, cx| editor.focus_input(window, cx)));
+    cx.simulate_input("/home/user/code/app/");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(!editor.read_with(cx, |editor, _| editor.is_pending()));
+    assert_eq!(editor.read_with(cx, |editor, _| editor.added().count()), 0);
 }

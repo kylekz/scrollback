@@ -57,8 +57,9 @@ pub struct PageView {
     pub filter: String,
     /// The provider of the session's agent.
     pub agent: Option<String>,
-    /// One of the session's models, as its provider names it.
-    pub model: Option<String>,
+    /// One of the session's models with the provider of its agent, as [`Facets::models`]
+    /// pairs them, so that a model's name matches only that agent's sessions.
+    pub model: Option<(String, String)>,
     pub branch: Option<String>,
     pub location: Option<LocationId>,
     pub date: Option<DateRange>,
@@ -99,10 +100,9 @@ impl PageView {
                 .agent
                 .as_ref()
                 .is_none_or(|agent| session.id.provider == *agent)
-            && self
-                .model
-                .as_ref()
-                .is_none_or(|model| session.models.contains(model))
+            && self.model.as_ref().is_none_or(|(provider, model)| {
+                session.id.provider == *provider && session.models.contains(model)
+            })
             && self
                 .branch
                 .as_ref()
@@ -348,7 +348,8 @@ mod tests {
     fn each_filter_narrows_the_page_and_they_add_up(cx: &mut TestAppContext) {
         let (mut sessions, now) = library(cx);
         sessions[1].starred = true;
-        let shown = |view: PageView| titles(&sessions, &shown(&sessions, &view, now));
+        let shown_in = |sessions: &[Session], view: &PageView| shown(sessions, view, now);
+        let shown = |view: PageView| titles(&sessions, &shown_in(&sessions, &view));
         let all: Vec<String> = SESSIONS.iter().map(|it| it.title.to_string()).collect();
         assert_eq!(shown(PageView::default()), all);
         // The text is looked for in the title and the first prompt, in any case.
@@ -367,7 +368,7 @@ mod tests {
             [SESSIONS[1].title]
         );
         let model_a = PageView {
-            model: Some("model-a".to_string()),
+            model: Some((sessions[0].id.provider.clone(), "model-a".to_string())),
             ..PageView::default()
         };
         assert_eq!(
@@ -384,7 +385,7 @@ mod tests {
         assert_eq!(
             shown(PageView {
                 oldest_first: true,
-                ..model_a
+                ..model_a.clone()
             }),
             [SESSIONS[2].title, SESSIONS[0].title]
         );
@@ -400,6 +401,13 @@ mod tests {
             ..PageView::default()
         };
         assert!(shown(elsewhere).is_empty());
+        // A model's name is matched with its agent's: another agent's model of that name isn't.
+        let mut others = sessions.clone();
+        others[2].id.provider = "another agent".to_string();
+        assert_eq!(
+            titles(&others, &shown_in(&others, &model_a)),
+            [SESSIONS[0].title]
+        );
         let here = Some(sessions[0].id.location.clone());
         assert_eq!(
             shown(PageView {

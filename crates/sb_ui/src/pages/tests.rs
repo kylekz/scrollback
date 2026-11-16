@@ -145,8 +145,8 @@ fn f6_moves_the_keyboard_to_the_sidebar_where_the_arrows_show_pages(cx: &mut Tes
     cx.run_until_parked();
     assert_eq!(shelf(cx), Shelf::Unsorted);
     assert_eq!(showing(cx), Showing::Unsorted);
-    // Trash has no page yet, and there are no folders: Unsorted is the last page's row, and
-    // the arrows go on to the location rows; up comes back.
+    /* Trash has no page yet, and there are no folders: Unsorted is the last page's row, and
+    the arrows go on to the location rows; up comes back. */
     cx.simulate_keystrokes("down");
     assert_eq!(shelf(cx), Shelf::Unsorted);
     cx.simulate_keystrokes("up");
@@ -231,8 +231,8 @@ fn a_folder_made_in_a_narrow_window_is_named_in_the_sidebar_over_the_page(cx: &m
     assert_eq!(placement(&shell, cx), SidebarPlacement::Collapsed);
     assert!(main_focused(&shell, cx));
 
-    // F2 on the folder's page, with the sidebar hidden, shows it too; Esc leaves the name,
-    // and a second one hides the sidebar.
+    /* F2 on the folder's page, with the sidebar hidden, shows it too; Esc leaves the name,
+    and a second one hides the sidebar. */
     let work = library(cx).read_with(cx, |library, _| library.folders()[0].id);
     library(cx).update(cx, |library, cx| library.show(Shelf::Folder(work), cx));
     cx.run_until_parked();
@@ -285,8 +285,8 @@ fn the_arrows_are_the_text_fields_while_a_folder_is_renamed(cx: &mut TestAppCont
     cx.run_until_parked();
     cx.simulate_keystrokes("f2");
     cx.run_until_parked();
-    // Typing replaces the selected name; Left moves the caret, so the next letter goes
-    // before the last. No arrow, at either end of the text, shows another page.
+    /* Typing replaces the selected name; Left moves the caret, so the next letter goes
+    before the last. No arrow, at either end of the text, shows another page. */
     cx.simulate_input("abc");
     cx.simulate_keystrokes("left");
     cx.simulate_input("Z");
@@ -327,8 +327,8 @@ fn a_folder_hidden_in_a_closed_one_gives_the_arrows_the_row_that_hides_it(cx: &m
     let inner = library(cx).read_with(cx, |library, _| library.folders()[1].id);
     library(cx).update(cx, |library, cx| library.show(Shelf::Folder(inner), cx));
     cx.run_until_parked();
-    // Left on the inner goes to the outer, and again closes it; back on the inner's page,
-    // its row is hidden.
+    /* Left on the inner goes to the outer, and again closes it; back on the inner's page,
+    its row is hidden. */
     cx.simulate_keystrokes("left left");
     assert_eq!(shelf(cx), Shelf::Folder(outer));
     library(cx).update(cx, |library, cx| library.show(Shelf::Folder(inner), cx));
@@ -363,8 +363,8 @@ fn tab_walks_the_buttons_and_never_strands_the_keyboard(cx: &mut TestAppContext)
             break;
         }
     }
-    // The page's filter field, the title bar's Sync all, the sidebar's rows and its two
-    // buttons, the main area.
+    /* The page's filter field, the title bar's Sync all, the sidebar's rows and its two
+    buttons, the main area. */
     assert_eq!(stops, 6);
     // Shift Tab goes the other way: to the sidebar's buttons, where the page's keys still work.
     cx.simulate_keystrokes("shift-tab");
@@ -394,8 +394,8 @@ fn tab_reaches_a_groups_buttons_and_enter_presses_them(cx: &mut TestAppContext) 
     cx.simulate_keystrokes("tab");
     press(cx, "enter");
     assert_eq!(folder_names(cx), ["app"]);
-    // The button went with its group: the keyboard is back on the page, where the new
-    // folder's row took it for its name.
+    /* The button went with its group: the keyboard is back on the page, where the new
+    folder's row took it for its name. */
     assert!(keyboard_is_somewhere(cx));
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
@@ -444,8 +444,8 @@ fn an_arrow_from_a_session_in_a_closed_group_goes_on_from_where_it_is(cx: &mut T
     let selected_id = |cx: &mut VisualTestContext| {
         library(cx).read_with(cx, |library, _| library.selected().cloned())
     };
-    // The second group's session, then that group closed: its toggle is the fourth Tab stop,
-    // after the filter field and the first group's toggle and button.
+    /* The second group's session, then that group closed: its toggle is the fourth Tab stop,
+    after the filter field and the first group's toggle and button. */
     cx.simulate_keystrokes("down down down");
     assert_eq!(selected_id(cx), Some(session(1, 0, cx)));
     cx.simulate_keystrokes("tab tab tab tab");

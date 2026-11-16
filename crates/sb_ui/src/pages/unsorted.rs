@@ -25,7 +25,7 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Div, Entity, FocusHandle,
-    Focusable as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
+    Focusable as _, InteractiveElement as _, IntoElement, Modifiers, MouseButton, MouseDownEvent,
     ParentElement as _, Pixels, Point, Render, Role, ScrollStrategy, SharedString, Size,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, canvas, div, point,
     prelude::FluentBuilder as _, px, size,
@@ -34,7 +34,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use sb_core::catalogue::{PathGroup, Session, SessionId};
-use sb_core::filing::FolderId;
+use sb_core::filing::{FolderId, NormalPath};
 use sb_core::location::LocationId;
 
 use super::header::{Under, header};
@@ -65,7 +65,10 @@ const ATTACH_MENU_WIDTH: Pixels = px(220.);
  * The path a group's chip carries and a folder takes: in its drive form for a drive's path,
  * limited to the group's location, or to none when several share it (DESIGN §4.6).
  */
-fn attachable(group: &PathGroup) -> Option<(TypedPath, sb_core::filing::NormalPath)> {
+fn attachable(group: &PathGroup) -> Option<(TypedPath, NormalPath)> {
+    if !can_attach(group) {
+        return None;
+    }
     let (typed, _) = group_path(group)?;
     let location: Option<LocationId> = match &group.locations[..] {
         [only] => Some(only.clone()),
@@ -360,13 +363,17 @@ impl UnsortedView {
             .is_some_and(|(input, _)| input.focus_handle(cx).is_focused(window))
     }
 
-    /// Opens the selected session's menu, or with `moving` its Move to folder, under its row.
+    /// Opens the selected session's menu, or with `moving` its Move to folder, under its row;
+    /// when the row isn't drawn, in the middle of the window.
     pub fn menu_selected(&mut self, moving: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.library.read(cx).selected().cloned() else {
             return;
         };
         let at = self.drawn.borrow().get(&id).map_or_else(
-            || window.mouse_position(),
+            || {
+                let viewport = window.viewport_size();
+                point(viewport.width / 2., viewport.height / 3.)
+            },
             |bounds| bounds.bottom_left() + point(px(12.), px(-8.)),
         );
         self.open_menu(&id, moving, at, window, cx);
@@ -397,39 +404,32 @@ impl UnsortedView {
     }
 
     /**
-     * A click on a session's row: it alone is selected; with `Ctrl` it joins the selection or
-     * leaves it; with `Shift` the run of rows from the selected one to it is selected.
+     * A click on a session's row: it alone is selected and becomes where a run starts; with
+     * `Ctrl` it joins the selection or leaves it; with `Shift` the run of rows from where the
+     * last plain or `Ctrl` click was to it is selected, and with `Ctrl Shift` added to the
+     * selection. A second click opens it.
      */
     fn click(
         &mut self,
         id: &SessionId,
-        event: &ClickEvent,
+        (modifiers, count): (Modifiers, usize),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // The page takes the keyboard, so that its keys act on what was clicked.
         self.focus.focus(window, cx);
-        if event.click_count() > 1 {
+        if count > 1 {
             return self.open(id, cx);
         }
         let library = self.library.read(cx);
-        let modifiers = event.modifiers();
-        let chosen = if modifiers.secondary(cx) {
-            let mut chosen = library.selection();
-            match chosen.iter().position(|it| it == id) {
-                Some(at) => {
-                    chosen.remove(at);
-                }
-                None => chosen.push(id.clone()),
-            }
-            Some(chosen)
-        } else if modifiers.shift
-            && let Some(from) = library.selected().cloned()
+        let secondary = modifiers.secondary(cx);
+        let chosen = if modifiers.shift
+            && let Some(from) = library.anchor().cloned()
         {
             let groups = library.groups();
             let ids: Vec<&SessionId> = (self.items.iter())
                 .filter_map(|item| match item {
-                    Item::Row(group, row) => Some(&groups[*group].sessions[*row].id),
+                    Item::Row(group, row) => Some(&groups.get(*group)?.sessions.get(*row)?.id),
                     _ => None,
                 })
                 .collect();
@@ -438,20 +438,29 @@ impl UnsortedView {
                 ids.iter().position(|it| *it == id),
             );
             match ends {
-                (Some(a), Some(b)) => Some(
-                    ids[a.min(b)..=a.max(b)]
-                        .iter()
-                        .map(|it| (*it).clone())
-                        .collect(),
-                ),
+                (Some(a), Some(b)) => {
+                    let mut chosen: HashSet<SessionId> = if secondary {
+                        library.selection().into_iter().collect()
+                    } else {
+                        HashSet::new()
+                    };
+                    chosen.extend(ids[a.min(b)..=a.max(b)].iter().map(|it| (*it).clone()));
+                    Some((chosen, false))
+                }
                 _ => None,
             }
+        } else if secondary {
+            let mut chosen: HashSet<SessionId> = library.selection().into_iter().collect();
+            if !chosen.remove(id) {
+                chosen.insert(id.clone());
+            }
+            Some((chosen, true))
         } else {
             None
         };
         let id = id.clone();
         self.library.update(cx, |library, cx| match chosen {
-            Some(chosen) => library.choose(chosen, (id, None), cx),
+            Some((chosen, anchored)) => library.choose(chosen, (id, None), anchored, cx),
             None => library.select(id, cx),
         });
     }
@@ -476,9 +485,12 @@ impl UnsortedView {
             .map(|row| {
                 let folder = &folders[row.folder];
                 let (id, path, sessions) = (folder.id, path.clone(), group.sessions.len());
-                let item = MenuItem::new(format!("folder/{}", folder.name), folder.name.clone())
-                    .glyph(SbIcon::Folder)
-                    .indent(NESTED_INDENT * row.depth as f32);
+                let item = MenuItem::new(
+                    format!("folder/{}", menus::folder_key(library, id)),
+                    folder.name.clone(),
+                )
+                .glyph(SbIcon::Folder)
+                .indent(NESTED_INDENT * row.depth as f32);
                 Entry::Item(match verdict(&dragged, DropTarget::Folder(id), library) {
                     Some(Verdict::Refuses(why)) => item.off(why),
                     _ => item.on(move |_, cx| {
@@ -586,14 +598,12 @@ impl UnsortedView {
         let open = !self.closed.contains(&key);
         let path = group_path(group);
         let creating = library.is_creating(&key);
-        let dragged = attachable(group)
-            .filter(|_| can_attach(group))
-            .map(|(path, normal)| Dragged::Path {
-                path,
-                normal,
-                from: None,
-                sessions: group.sessions.len(),
-            });
+        let dragged = attachable(group).map(|(path, normal)| Dragged::Path {
+            path,
+            normal,
+            from: None,
+            sessions: group.sessions.len(),
+        });
         let lifted = dragged
             .as_ref()
             .is_some_and(|dragged| drag::lifts(library, |what| what == dragged));
@@ -682,9 +692,10 @@ impl UnsortedView {
                         );
                     match dragged.clone() {
                         Some(dragged) => {
-                            drag::source(chip, dragged).automation_target_with(move || {
-                                format!("unsorted/group/{index}/chip").into()
-                            })
+                            drag::source(chip, move |_| dragged.clone(), |_, _, _, _| {})
+                                .automation_target_with(move || {
+                                    format!("unsorted/group/{index}/chip").into()
+                                })
                         }
                         None => chip.into_any_element(),
                     }
@@ -788,15 +799,15 @@ impl UnsortedView {
         let library = self.library.read(cx);
         let selected = library.is_selected(&session.id);
         let ringed = keyboard && library.selected() == Some(&session.id);
-        let lifted = drag::lifts(library, |what| match what {
-            Dragged::Sessions { ids, .. } => ids.contains(&session.id),
-            Dragged::Path { path, .. } => library
-                .groups()
-                .get(group)
-                .and_then(attachable)
-                .is_some_and(|(it, _)| it == *path),
-            Dragged::Folder(_) => false,
-        });
+        let lifted = drag::lifts_session(library, &session.id)
+            || drag::lifts(library, |what| match what {
+                Dragged::Sessions { .. } | Dragged::Folder(_) => false,
+                Dragged::Path { path, .. } => library
+                    .groups()
+                    .get(group)
+                    .and_then(attachable)
+                    .is_some_and(|(it, _)| it == *path),
+            });
         let drawn = self.drawn.clone();
         let title: SharedString = session
             .title
@@ -806,10 +817,6 @@ impl UnsortedView {
         let model = agents::model(&session.id.provider, &session.models, cx)
             .unwrap_or_else(|| agents::name(&session.id.provider, cx));
         let id = session.id.clone();
-        let dragged = Dragged::Sessions {
-            ids: library.acted_on(&id),
-            title: title.to_string(),
-        };
         let element = part
             .id(("row", at))
             .debug_selector(move || format!("unsorted-row-{group}-{row}"))
@@ -834,7 +841,10 @@ impl UnsortedView {
             })
             .on_click(cx.listener({
                 let id = id.clone();
-                move |this, event: &ClickEvent, window, cx| this.click(&id, event, window, cx)
+                move |this, event: &ClickEvent, window, cx| {
+                    let pressed = (event.modifiers(), event.click_count());
+                    this.click(&id, pressed, window, cx);
+                }
             }))
             .on_mouse_down(
                 MouseButton::Right,
@@ -878,7 +888,7 @@ impl UnsortedView {
                             .overflow_hidden()
                             .text_ellipsis()
                             .text_spec(&theme.text.row_title)
-                            .child(title),
+                            .child(title.clone()),
                     )
                     .child(
                         div()
@@ -932,8 +942,23 @@ impl UnsortedView {
                     .text_spec(&theme.text.number)
                     .child(format::plural(session.all.calls as usize, "call")),
             );
-        drag::source(element, dragged)
-            .automation_target_with(move || format!("unsorted/row/{group}/{row}").into())
+        let (library, view) = (self.library.clone(), cx.entity().downgrade());
+        let title = title.to_string();
+        drag::source(
+            element,
+            {
+                let id = id.clone();
+                move |cx| Dragged::Sessions {
+                    ids: library.read(cx).acted_on(&id),
+                    title: title.clone(),
+                }
+            },
+            move |modifiers, _, window, cx| {
+                view.update(cx, |view, cx| view.click(&id, (modifiers, 1), window, cx))
+                    .ok();
+            },
+        )
+        .automation_target_with(move || format!("unsorted/row/{group}/{row}").into())
     }
 
     /// The row that shows the rest of a group's sessions, `left` of them as the filters leave
@@ -1193,6 +1218,8 @@ impl UnsortedView {
 impl Render for UnsortedView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.sb_theme().clone();
+        // Where each row is drawn is learnt again as this frame draws it.
+        self.drawn.borrow_mut().clear();
         if self.filter.is_none() {
             let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter in Unsorted"));
             let heard = cx.subscribe(&input, |this, input, event, cx| {
@@ -1243,8 +1270,8 @@ impl Render for UnsortedView {
             .when(loaded && !groups.is_empty(), |this| {
                 this.child(self.filter_row(summary, window, &theme, cx))
                     .child(
-                        // The list reaches the main area's edge, and its scrollbar sits in the
-                        // page's side padding, clear of the rows ([`Self::render_items`]).
+                        /* The list reaches the main area's edge, and its scrollbar sits in the
+                        page's side padding, clear of the rows ([`Self::render_items`]). */
                         div()
                             .relative()
                             .flex_1()
@@ -1285,8 +1312,8 @@ mod tests {
 
     #[test]
     fn a_group_is_its_head_and_the_sessions_that_show() {
-        // Seven sessions with five showing, two with both, three closed, one refused; and a
-        // group sorted ahead whose filters leave two of its sessions.
+        /* Seven sessions with five showing, two with both, three closed, one refused; and a
+        group sorted ahead whose filters leave two of its sessions. */
         assert_eq!(
             items([
                 (0, (0..7).collect(), 5, false),

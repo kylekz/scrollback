@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 
 use gpui::{App, ClipboardItem, Pixels, px};
-use sb_core::catalogue::{Filed, Session, SessionId};
+use sb_core::catalogue::{Filed, Session, SessionId, Shelf};
 use sb_core::filing::FolderId;
 
 use crate::icons::SbIcon;
@@ -129,14 +129,17 @@ pub fn move_entries(ids: Vec<SessionId>, filed: Filed, library: &LibraryService)
         let folder = &folders[row.folder];
         let (id, ids) = (folder.id, ids.clone());
         Entry::Item(
-            Item::new(format!("folder/{}", folder.name), folder.name.clone())
-                .glyph(SbIcon::Folder)
-                .checked(current == Some(id))
-                .indent(NESTED_INDENT * row.depth as f32)
-                .on(move |_, cx| {
-                    let library = cx.services().library.clone();
-                    library.update(cx, |library, cx| library.file_by_hand(ids.clone(), id, cx));
-                }),
+            Item::new(
+                format!("folder/{}", folder_key(library, id)),
+                folder.name.clone(),
+            )
+            .glyph(SbIcon::Folder)
+            .checked(current == Some(id))
+            .indent(NESTED_INDENT * row.depth as f32)
+            .on(move |_, cx| {
+                let library = cx.services().library.clone();
+                library.update(cx, |library, cx| library.file_by_hand(ids.clone(), id, cx));
+            }),
         )
     }));
     entries.push(Entry::Separator);
@@ -149,6 +152,18 @@ pub fn move_entries(ids: Vec<SessionId>, filed: Filed, library: &LibraryService)
             }),
     ));
     entries
+}
+
+/// How automation names a folder's item in a menu: its name with the folders it is in, as
+/// `fc/player`, which no two folders share.
+pub fn folder_key(library: &LibraryService, folder: FolderId) -> String {
+    let mut names: Vec<&str> = std::iter::successors(library.folder(folder), |it| {
+        it.parent.and_then(|parent| library.folder(parent))
+    })
+    .map(|it| it.name.as_str())
+    .collect();
+    names.reverse();
+    names.join("/")
 }
 
 /**
@@ -168,7 +183,7 @@ pub fn folder_menu(folder: FolderId, open: bool) -> Vec<Entry> {
             Item::new("open", "Open")
                 .glyph(SbIcon::Eye)
                 .on(act(|library, folder, cx| {
-                    library.show(sb_core::catalogue::Shelf::Folder(folder), cx);
+                    library.show(Shelf::Folder(folder), cx);
                 })),
         ));
     }
@@ -183,7 +198,7 @@ pub fn folder_menu(folder: FolderId, open: bool) -> Vec<Entry> {
             Item::new("new-subfolder", "New subfolder")
                 .glyph(SbIcon::FolderPlus)
                 .on(act(|library, folder, cx| {
-                    library.create_folder("New folder".to_string(), Some(folder), cx);
+                    library.create_folder(library.fresh_name(Some(folder)), Some(folder), cx);
                 })),
         ),
         Entry::Item(

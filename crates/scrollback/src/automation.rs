@@ -44,11 +44,18 @@
 //!   It also has the titles of the `selection` (the sessions selected together, or the
 //!   selected one); the `drag` under way (`null`, or `what` is dragged: `{"sessions": n}`,
 //!   `{"path": typed}` or `{"folder": name}`; whether it has `moved` past the 4px threshold;
-//!   what it is `over`: `{"folder": name}`, `"trash"` or `{"between": {parent, index}}`; and
-//!   the `verdict` there: `takes`, with the ghost's `result` and `note`, or the `note` saying
-//!   why not); the `toast` (`text` and whether it can `undo`); whether leaving `asked` to save
-//!   the paths editor's changes; and the folder whose deletion is being asked about
-//!   (`deleting`).
+//!   what it is `over`: `{"folder": name}`, `{"empty_folder": name}` (a folder's empty page),
+//!   `"trash"`, `{"between": {parent, index}}` or `"sidebar"` (a narrow window's sidebar
+//!   button, which shows the sidebar after 500 ms); and the `verdict` there: `takes`, with the
+//!   ghost's `result` and `note`, or the `note` saying why not); the `toast` (`text` and
+//!   whether it can `undo`); whether leaving, closing the window or quitting `asked` to save
+//!   the paths editor's changes, and the folder `held` by them; and the folder whose deletion
+//!   is being asked about (`deleting`).
+//!
+//!   A drag is driven with `drag` (`release: false` to hold it), `mouse_up`, and keys between:
+//!   no key but `Esc` acts while one is held. Where it is over is read from what the last frame
+//!   drew, so a press that jumps straight to a target drops there; a drag that never moved 4px
+//!   is a click on what was pressed.
 //! - `page_view`: how the page of sessions shows: `list`, `oldest_first`, the `filter` text,
 //!   whether it is `filtered` at all, how many
 //!   sessions are `shown`, and its paths `editor` (`null`, or whether it is the `short` form
@@ -56,9 +63,12 @@
 //! - `menu`: the open menu (`null`, or the names of its `items` and of its open `submenu`'s;
 //!   each item is the target `menu/<name>`, a submenu's `menu/<submenu>/<name>`).
 //! - `cards`: what the page of cards last decided its cards' last lines from (DESIGN §4.4):
-//!   `shows_calls`, `tags_past_caps`, `inner` (a card's width inside its padding and border),
-//!   `tags` (each location's and subfolder's tag: `name`, `whole` and `capped` widths), the
-//!   widest `day` and the largest `calls` (each `text` and `width`), in logical pixels.
+//!   `shows_calls`, `tags_past_caps`, the window's `viewport` width and `scale` factor, `inner`
+//!   (a card's width inside its padding and border), `line` (the width of the line the counts
+//!   were decided on, `with_calls`, which shows them while it is no wider than `inner` less
+//!   `spare`; and `without_calls`, past `inner` the tags give way past their caps), `tags`
+//!   (each location's and subfolder's tag: `name`, `whole` and `capped` widths), the widest
+//!   `day` and the largest `calls` (each `text` and `width`), in logical pixels.
 //!
 //! Commands. An argument a command doesn't have is an error, so a misspelt one never passes
 //! for a change. These reply with `state.appearance` after the change:
@@ -336,21 +346,13 @@ fn library(cx: &App) -> Value {
         Some(Page::Unsorted(groups)) => (None, Some(groups.len())),
         None => (None, None),
     };
-    // The selected session's title: on a page of sessions by its place, in Unsorted by its id.
-    let title_of = |id: &SessionId| match library.page()? {
-        Page::Sessions(page) => page.sessions.get(library.selected_index()?)?.title.clone(),
-        Page::Unsorted(groups) => groups
-            .iter()
-            .flat_map(|group| &group.sessions)
-            .find(|session| session.id == *id)?
-            .title
-            .clone(),
-    };
     let title = |id: &SessionId| library.session(id).and_then(|it| it.title.clone());
     let drag = library.drag().map(|drag| {
         let over = drag.over.map(|over| match over {
             DropTarget::Folder(folder) => json!({ "folder": name(folder) }),
+            DropTarget::EmptyFolder(folder) => json!({ "empty_folder": name(folder) }),
             DropTarget::Trash => json!("trash"),
+            DropTarget::Sidebar => json!("sidebar"),
             DropTarget::Between { parent, index, .. } => {
                 json!({ "between": { "parent": parent.and_then(name), "index": index } })
             }
@@ -393,7 +395,8 @@ fn library(cx: &App) -> Value {
         "folders": folders,
         "sessions": sessions,
         "groups": groups,
-        "selected": library.selected().and_then(title_of),
+        "selected": library.selected().and_then(title),
+        "held": library.held().and_then(name),
         "open": library.open_session().and_then(|session| session.title.clone()),
         "error": library.failure(),
     })
@@ -426,7 +429,14 @@ fn cards(measure: &LineMeasure) -> Value {
     json!({
         "shows_calls": measure.shows_calls,
         "tags_past_caps": measure.tags_past_caps,
+        "viewport": px(measure.viewport),
+        "scale": measure.scale,
         "inner": px(measure.inner),
+        "line": {
+            "with_calls": px(measure.with_calls),
+            "without_calls": px(measure.without_calls),
+            "spare": px(measure.spare),
+        },
         "tags": measure.tags.iter().map(|(name, whole, capped)| json!({
             "name": name,
             "whole": px(*whole),

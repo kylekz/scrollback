@@ -3,21 +3,34 @@
 //! pointer ([`Ghost`]). What is dragged, where it is over and what a drop would do are the
 //! library's ([`crate::services::drag`]).
 //!
-//! **A press becomes a drag after 4px** ([`DRAG_THRESHOLD`]): gpui starts its drag sooner, so
-//! until the pointer is 4px from where it was pressed the ghost draws nothing, nothing lifts
-//! and nothing takes the drop. `Esc` ends a drag (the shell's `Dismiss`), and so does letting
-//! go anywhere that takes no drop.
+//! **A press becomes a drag after 4px** ([`DRAG_THRESHOLD`]): gpui starts its drag after 2px,
+//! so until the pointer is 4px from where it was pressed the ghost draws nothing, nothing lifts
+//! and nothing takes the drop; let go before then, and it was a click on what was pressed, as
+//! the source says ([`source`]'s `click`). `Esc` ends a drag (the shell's `Dismiss`), and so
+//! does letting go anywhere that takes no drop.
+//!
+//! **Where the pointer is over** is read from the drop targets the last frame drew, the one
+//! drawn last on top ([`layer`]), and not from gpui's hover: a key pressed mid-drag turns
+//! gpui's hover off until the pointer moves, and the release must still drop. The drag catches
+//! up with the pointer the moment it starts, so a press that jumps straight to a target drops
+//! there. The shell's [`layer`] hears every release, wherever it is, and drops or ends the
+//! drag.
 //!
 //! **The ghost** is a pre-rendered row (`.drag-ghost`): `s2`, a `line` border, radius 8, its
 //! own shadow, the grip glyph (a link for a path), what is dragged, "→" and the result in
 //! `accent-text`, then a `fg3` note on what it does; over a target that refuses, the note says
 //! why instead and no target shows.
 
+use std::rc::Rc;
+
 use gpui::{
-    App, AppContext as _, Bounds, BoxShadow, Context, Global, InteractiveElement, IntoElement,
-    ParentElement as _, Pixels, Point, Render, Styled as _, Window, div, hsla, point,
+    AnyElement, App, AppContext as _, Bounds, BoxShadow, Context, DispatchPhase, Global,
+    IntoElement, Modifiers, MouseButton, MouseUpEvent, ParentElement, Pixels, Point, Render,
+    StatefulInteractiveElement, Styled as _, Window, canvas, div, hsla, point,
     prelude::FluentBuilder as _, px,
 };
+
+use sb_core::catalogue::SessionId;
 
 use crate::components::{Tone, icon, location_tag, tag};
 use crate::icons::SbIcon;
@@ -27,15 +40,34 @@ use crate::services::{
 };
 use crate::theme::{ActiveTheme as _, StyledText as _};
 
-/// What gpui carries while something of the library is dragged.
-#[derive(Clone, Debug)]
-pub struct Drag(pub Dragged);
+/// What gpui carries while something of the library is dragged: the library holds what.
+#[derive(Clone, Copy, Debug)]
+pub struct Drag;
 
 /// Where the left button last went down: a drag is measured from there.
 #[derive(Clone, Copy, Default)]
 struct Pressed(Point<Pixels>);
 
 impl Global for Pressed {}
+
+/// Which drop target a place in a target's bounds is, for what is dragged.
+type Pick = Rc<dyn Fn(&Dragged, Bounds<Pixels>, Point<Pixels>) -> DropTarget>;
+
+/// The drop targets the last frame drew, in the order it drew them, each with what is visible
+/// of it.
+#[derive(Default)]
+struct Targets(Vec<(Bounds<Pixels>, Pick)>);
+
+impl Global for Targets {}
+
+/// What letting go of the drag's source before it moved does: the click it was, with the
+/// modifiers held and where it was let go.
+type Click = Rc<dyn Fn(Modifiers, Point<Pixels>, &mut Window, &mut App)>;
+
+#[derive(Default)]
+struct Source(Option<Click>);
+
+impl Global for Source {}
 
 /// How far from the pointer the ghost sits.
 const GHOST_OFFSET: Point<Pixels> = Point {
@@ -55,102 +87,134 @@ pub fn pressed(at: Point<Pixels>, cx: &mut App) {
     cx.set_global(Pressed(at));
 }
 
-/// Follows the pointer while something is dragged: the shell's root hears every move.
+/**
+ * The shell's part (module docs): forgets the last frame's targets before this one draws its
+ * own, and hears every release of the left button, wherever it is.
+ */
+pub fn layer() -> AnyElement {
+    canvas(
+        |_, _, cx| cx.set_global(Targets::default()),
+        |_, (), window, _| {
+            window.on_mouse_event(|event: &MouseUpEvent, phase, window, cx| {
+                if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                    released(event, window, cx);
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_0()
+    .into_any_element()
+}
+
+/// Follows the pointer while something is dragged: whether it has moved far enough, and
+/// which target it is over.
 pub fn moved(at: Point<Pixels>, cx: &mut App) {
     let from = cx.try_global::<Pressed>().copied().unwrap_or_default().0;
     let library = cx.services().library.clone();
+    let Some(drag) = library.read(cx).drag().cloned() else {
+        return;
+    };
+    let over = cx.try_global::<Targets>().and_then(|targets| {
+        let (bounds, pick) = targets.0.iter().rev().find(|(it, _)| it.contains(&at))?;
+        Some(pick(&drag.what, *bounds, at))
+    });
+    let moved = drag.moved || (at - from).magnitude() >= f64::from(DRAG_THRESHOLD);
     library.update(cx, |library, cx| {
-        if let Some(drag) = library.drag().filter(|drag| !drag.moved).cloned()
-            && (at - from).magnitude() >= f64::from(DRAG_THRESHOLD)
-        {
-            library.set_drag(
-                Some(DragState {
-                    moved: true,
-                    ..drag
-                }),
-                cx,
-            );
-        }
+        library.set_drag(Some(drag.at(over, moved)), cx);
     });
 }
 
 /// Ends a drag that was let go of, or given up with `Esc`.
 pub fn end(window: &mut Window, cx: &mut App) {
     cx.stop_active_drag(window);
+    cx.set_global(Source::default());
     let library = cx.services().library.clone();
     library.update(cx, |library, cx| library.set_drag(None, cx));
 }
 
-/// Makes `element` draggable as `what`.
-pub fn source<E: gpui::StatefulInteractiveElement>(element: E, what: Dragged) -> E {
-    element.on_drag(Drag(what), |drag, offset, _, cx| {
+/// The left button let go while something is dragged: a drop where the pointer is, the click
+/// of a drag that never moved, or nothing.
+fn released(event: &MouseUpEvent, window: &mut Window, cx: &mut App) {
+    let library = cx.services().library.clone();
+    if library.read(cx).drag().is_none() {
+        return;
+    }
+    moved(event.position, cx);
+    let Some(drag) = library.read(cx).drag().cloned() else {
+        return;
+    };
+    let click = cx.global_mut::<Source>().0.take();
+    end(window, cx);
+    match (drag.moved, drag.over) {
+        (true, Some(over)) if drag.targets(over, library.read(cx)) => {
+            library.update(cx, |library, cx| drop(&drag.what, over, library, cx));
+        }
+        (false, _) => {
+            if let Some(click) = click {
+                click(event.modifiers, event.position, window, cx);
+            }
+        }
+        (true, _) => {}
+    }
+}
+
+/**
+ * Makes `element` draggable: `what` says what a drag of it carries, read when the drag starts
+ * (the selection, when the element is in it); `click` is what letting go before the drag moved
+ * does, with the modifiers held then and where it was let go.
+ */
+pub fn source<E: StatefulInteractiveElement>(
+    element: E,
+    what: impl Fn(&App) -> Dragged + 'static,
+    click: impl Fn(Modifiers, Point<Pixels>, &mut Window, &mut App) + 'static,
+) -> E {
+    let click: Click = Rc::new(click);
+    element.on_drag(Drag, move |_, offset, window, cx| {
+        let dragged = what(cx);
         let library = cx.services().library.clone();
         library.update(cx, |library, cx| {
-            library.set_drag(
-                Some(DragState {
-                    what: drag.0.clone(),
-                    over: None,
-                    moved: false,
-                }),
-                cx,
-            );
+            library.set_drag(Some(DragState::new(dragged)), cx);
         });
+        cx.set_global(Source(Some(click.clone())));
+        // gpui starts the drag on a move: where that move went is where the drag is.
+        moved(window.mouse_position(), cx);
         cx.new(|_| Ghost { offset })
     })
 }
 
-/**
- * Makes `element` a place that takes drops as `target`: the library hears when the pointer is
- * over it, and a drop there does what [`crate::services::drag::verdict`] says, when it takes
- * it.
- */
-pub fn target<E: InteractiveElement>(element: E, target: DropTarget) -> E {
-    target_by(element, move |_, _, _| target, move |over| over == target)
+/// Makes `element` a place that takes drops as `target` (see [`target_by`]).
+pub fn target<E: ParentElement>(element: E, target: DropTarget) -> E {
+    target_by(element, move |_, _, _| target)
 }
 
 /**
- * [`target`] for an element that is more than one target: `pick` says which, from what is
+ * Makes `element` a place that takes drops: `pick` says which target it is, from what is
  * dragged, the element's bounds and where the pointer is in them (a folder's row is the
- * folder, or the place above or below it); `owns` says which targets are this element's.
+ * folder, or the place above or below it). A drop there does what
+ * [`crate::services::drag::verdict`] says, when it takes it. The element draws a child that
+ * says where it is ([`Targets`]); its own layout is untouched, as the child is out of its flow.
  */
-pub fn target_by<E: InteractiveElement>(
+pub fn target_by<E: ParentElement>(
     element: E,
     pick: impl Fn(&Dragged, Bounds<Pixels>, Point<Pixels>) -> DropTarget + 'static,
-    owns: impl Fn(DropTarget) -> bool + Clone + 'static,
 ) -> E {
-    let (owned, dropped) = (owns.clone(), owns.clone());
-    element
-        .on_drag_move::<Drag>(move |event, _, cx| {
-            let at = event.event.position;
-            let inside = event.bounds.contains(&at);
-            let library = cx.services().library.clone();
-            library.update(cx, |library, cx| {
-                let Some(drag) = library.drag().cloned() else {
-                    return;
-                };
-                let over = inside.then(|| pick(&drag.what, event.bounds, at));
-                if over.is_some() && drag.over != over {
-                    library.set_drag(Some(DragState { over, ..drag }), cx);
-                } else if !inside && drag.over.is_some_and(&owns) {
-                    library.set_drag(Some(DragState { over: None, ..drag }), cx);
+    let pick: Pick = Rc::new(pick);
+    element.child(
+        canvas(
+            |_, _, _| (),
+            move |bounds, (), window, cx| {
+                let visible = bounds.intersect(&window.content_mask().bounds);
+                if cx.has_global::<Targets>() {
+                    cx.global_mut::<Targets>().0.push((visible, pick.clone()));
                 }
-            });
-        })
-        .can_drop(move |_, _, cx| {
-            let library = cx.services().library.read(cx);
-            library.drag().is_some_and(|drag| {
-                drag.over
-                    .is_some_and(|over| owned(over) && drag.targets(over, library))
-            })
-        })
-        .on_drop::<Drag>(move |drag, window, cx| {
-            let library = cx.services().library.clone();
-            let over = library.read(cx).drag().and_then(|it| it.over);
-            if let Some(over) = over.filter(|over| dropped(*over)) {
-                library.update(cx, |library, cx| drop(&drag.0, over, library, cx));
-            }
-            end(window, cx);
-        })
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full(),
+    )
 }
 
 /// Does what a drop of `what` on `target` does.
@@ -161,9 +225,10 @@ fn drop(
     cx: &mut Context<LibraryService>,
 ) {
     match (what, target) {
-        (Dragged::Sessions { ids, .. }, DropTarget::Folder(folder)) => {
-            library.file_by_hand(ids.clone(), folder, cx);
-        }
+        (
+            Dragged::Sessions { ids, .. },
+            DropTarget::Folder(folder) | DropTarget::EmptyFolder(folder),
+        ) => library.file_by_hand(ids.clone(), folder, cx),
         (Dragged::Sessions { ids, .. }, DropTarget::Trash) => library.trash(ids.clone(), cx),
         (
             Dragged::Path {
@@ -204,6 +269,13 @@ pub fn lifts(library: &LibraryService, what: impl Fn(&Dragged) -> bool) -> bool 
     library
         .drag()
         .is_some_and(|drag| drag.moved && what(&drag.what))
+}
+
+/// Whether the session `id` is among the sessions dragged, past the threshold.
+pub fn lifts_session(library: &LibraryService, id: &SessionId) -> bool {
+    library
+        .drag()
+        .is_some_and(|drag| drag.moved && drag.holds(id))
 }
 
 /// The ghost under the pointer.

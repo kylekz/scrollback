@@ -3,11 +3,14 @@
 //! sort and the cards / list switch. A chip that is set reads "Model: Opus 5.5 ×" on
 //! `accent-soft`, and a click takes it away.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui::Focusable as _;
 use gpui::{
-    AnyElement, App, Context, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
-    SharedString, StatefulInteractiveElement as _, Styled as _, div, prelude::FluentBuilder as _,
-    px,
+    AnyElement, App, Bounds, Context, InteractiveElement as _, IntoElement, ParentElement as _,
+    Pixels, Point, SharedString, StatefulInteractiveElement as _, Styled as _, canvas, div, point,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::input::Input;
 
@@ -104,18 +107,12 @@ impl SessionsView {
             self.chip(
                 "model",
                 "Model",
-                view.model.as_ref().and_then(|model| {
-                    facets
-                        .models
-                        .iter()
-                        .find(|(_, it)| it == model)
-                        .map(model_name)
-                }),
+                view.model.as_ref().map(model_name),
                 facets
                     .models
                     .iter()
                     .map(|pair| {
-                        let model = pair.1.clone();
+                        let model = pair.clone();
                         (
                             model_name(pair),
                             Box::new(move |view: &mut PageView| view.model = Some(model.clone()))
@@ -219,8 +216,12 @@ impl SessionsView {
         });
         let list = view.list;
         let oldest = view.oldest_first;
-        div()
-            .flex_none()
+        let sort_at = Rc::new(Cell::new(Bounds::default()));
+        /* The field, the count and the chips wrap onto more lines when they don't fit; the sort
+        and the switch keep their place at the right of the first. */
+        let filters = div()
+            .flex_1()
+            .min_w_0()
             .flex()
             .flex_wrap()
             .items_center()
@@ -261,10 +262,15 @@ impl SessionsView {
                         .child("Clear filters")
                         .automation_target("filter/clear"),
                 )
-            })
-            .child(div().flex_1())
+            });
+        let order = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(theme.spacing.sm)
             .child(
                 chip_base("filter-sort", false, theme)
+                    .child(bounds_of(sort_at.clone()))
                     .on_click(move |_, window, cx| {
                         let entries = [(false, "Newest first"), (true, "Oldest first")]
                             .into_iter()
@@ -286,7 +292,7 @@ impl SessionsView {
                                 )
                             })
                             .collect();
-                        menu::open(entries, window.mouse_position(), px(180.), window, cx);
+                        menu::open(entries, below(&sort_at), px(180.), window, cx);
                     })
                     .child(if oldest {
                         "Oldest first"
@@ -324,7 +330,14 @@ impl SessionsView {
                         cx,
                         true,
                     )),
-            )
+            );
+        div()
+            .flex_none()
+            .flex()
+            .items_start()
+            .gap(theme.spacing.sm)
+            .child(filters)
+            .child(order)
             .automation_target("filter/row")
             .into_any_element()
     }
@@ -354,8 +367,10 @@ impl SessionsView {
                 .automation_target(target)
                 .into_any_element(),
             None => {
-                let values: std::rc::Rc<Vec<(String, Setter)>> = std::rc::Rc::new(values);
+                let values: Rc<Vec<(String, Setter)>> = Rc::new(values);
+                let at = Rc::new(Cell::new(Bounds::default()));
                 chip_base(SharedString::from(target.clone()), false, theme)
+                    .child(bounds_of(at.clone()))
                     .on_click(move |_, window, cx| {
                         let entries = values
                             .iter()
@@ -375,13 +390,7 @@ impl SessionsView {
                             })
                             .collect::<Vec<_>>();
                         if !entries.is_empty() {
-                            menu::open(
-                                entries,
-                                window.mouse_position(),
-                                CHIP_MENU_WIDTH,
-                                window,
-                                cx,
-                            );
+                            menu::open(entries, below(&at), CHIP_MENU_WIDTH, window, cx);
                         }
                     })
                     .child(label)
@@ -396,6 +405,20 @@ impl SessionsView {
 /// What a filter menu's item sets.
 type Setter = Box<dyn Fn(&mut PageView)>;
 
+/// Keeps where its parent, a chip, was last drawn: its menu opens below it.
+fn bounds_of(at: Rc<Cell<Bounds<Pixels>>>) -> impl IntoElement {
+    canvas(move |bounds, _, _| at.set(bounds), |_, _, _, _| {})
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+}
+
+/// Where a chip's menu opens: under it, from its left edge.
+fn below(chip: &Cell<Bounds<Pixels>>) -> Point<Pixels> {
+    chip.get().bottom_left() + point(px(0.), px(4.))
+}
+
 /// A chip (`.chip`: 22 high, `s2` with a `line-subtle` border, radius 999, 12px `fg2`), or a
 /// set one (`.chip.acc`).
 fn chip_base(
@@ -408,6 +431,7 @@ fn chip_base(
     div()
         .id(id)
         .role(gpui::Role::Button)
+        .relative()
         .flex_none()
         .flex()
         .items_center()

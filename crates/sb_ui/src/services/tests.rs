@@ -355,7 +355,7 @@ fn a_star_shows_at_once_and_is_kept(cx: &mut TestAppContext) {
     init_library(cx);
     let (_, library) = services(cx);
     let second = id_at(&library, 1, cx);
-    library.update(cx, |library, cx| library.toggle_star(&second, 1, cx));
+    library.update(cx, |library, cx| library.toggle_star(&second, cx));
     // Before the catalogue has it.
     library.read_with(cx, |library, _| {
         assert!(library.sessions().unwrap().sessions[1].starred);
@@ -369,7 +369,7 @@ fn a_star_shows_at_once_and_is_kept(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(titles(&library, cx), ["Add retries to the fetcher"]);
     // The place it was drawn at may be out of date: it is found by what it is.
-    library.update(cx, |library, cx| library.toggle_star(&second, 7, cx));
+    library.update(cx, |library, cx| library.toggle_star(&second, cx));
     cx.run_until_parked();
     assert_eq!(titles(&library, cx), [""; 0]);
     library.read_with(cx, |library, _| assert_eq!(library.counts().starred, 0));
@@ -411,7 +411,7 @@ fn a_star_made_while_the_page_loads_is_not_undone_by_the_load(cx: &mut TestAppCo
     // The load starts before the star is made, and may finish before or after it is written.
     library.update(cx, |library, cx| {
         library.reload(cx);
-        library.toggle_star(&first, 0, cx);
+        library.toggle_star(&first, cx);
     });
     assert_eq!(starred(&library, &first, cx).0, true, "shown at once");
     cx.run_until_parked();
@@ -433,8 +433,8 @@ fn no_load_takes_a_star_away_while_it_waits_to_be_written(cx: &mut TestAppContex
     // The second star waits while the first is written; a load asked for now must not start
     // before both are, or it reads the catalogue without them.
     library.update(cx, |library, cx| {
-        library.toggle_star(&a, 0, cx);
-        library.toggle_star(&b, 1, cx);
+        library.toggle_star(&a, cx);
+        library.toggle_star(&b, cx);
         library.reload(cx);
     });
     cx.run_until_parked();
@@ -527,15 +527,15 @@ fn quick_stars_are_written_in_the_order_they_were_made(cx: &mut TestAppContext) 
     let first = id_at(&library, 0, cx);
     // On and off again before either is written.
     library.update(cx, |library, cx| {
-        library.toggle_star(&first, 0, cx);
-        library.toggle_star(&first, 0, cx);
+        library.toggle_star(&first, cx);
+        library.toggle_star(&first, cx);
     });
     cx.run_until_parked();
     assert_eq!(starred(&library, &first, cx), (false, false));
     // And three: on, off, on.
     library.update(cx, |library, cx| {
         for _ in 0..3 {
-            library.toggle_star(&first, 0, cx);
+            library.toggle_star(&first, cx);
         }
     });
     cx.run_until_parked();
@@ -573,7 +573,7 @@ fn what_the_owner_changed_is_written_when_the_app_quits(cx: &mut TestAppContext)
     let archive = cx.update(|cx| cx.services().archive.read(cx).archive().cloned().unwrap());
     // Nothing of this has reached the catalogue when the app is told to quit, mid-sync.
     library.update(cx, |library, cx| {
-        library.toggle_star(&first, 0, cx);
+        library.toggle_star(&first, cx);
         library.create_folder("made at the last moment".into(), None, cx);
     });
     sync.update(cx, |sync, cx| sync.sync_all(cx));

@@ -23,16 +23,18 @@
 mod locations;
 pub mod tree;
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::ops::Range;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, Role,
-    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Task, UniformListScrollHandle, Window, div, prelude::FluentBuilder as _, px,
-    uniform_list,
+    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Div, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
+    Pixels, Render, Role, ScrollHandle, ScrollStrategy, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, UniformListScrollHandle,
+    Window, anchored, canvas, deferred, div, point, prelude::FluentBuilder as _, px, uniform_list,
 };
 use gpui_component::input::{Input, InputState};
 use sb_core::catalogue::{FOLDER_NAME_CHARS, Shelf};
@@ -97,9 +99,6 @@ const NO_LOCATIONS: &str = "None yet";
 /// What the Locations section says when every location was removed: their sessions stay.
 const NONE_SYNCED: &str = "None synced now. The locations sheet lists those removed.";
 
-/// What a folder is called until the owner names it.
-const NEW_FOLDER_NAME: &str = "New folder";
-
 /// How often the locations' "synced 2 min ago" is drawn again.
 const CLOCK_TICK: Duration = Duration::from_secs(30);
 
@@ -125,6 +124,8 @@ pub enum SidebarEvent {
 struct Renaming {
     folder: FolderId,
     input: Entity<InputState>,
+    /// Where its row was last drawn: a name refused is said under it.
+    row: Rc<Cell<Bounds<Pixels>>>,
 }
 
 pub struct Sidebar {
@@ -185,7 +186,7 @@ impl Sidebar {
                     LibraryEvent::FolderCreated(folder) | LibraryEvent::Rename(folder) => {
                         this.rename(*folder, window, cx);
                     }
-                    LibraryEvent::EditPaths(_) => {}
+                    LibraryEvent::EditPaths(_) | LibraryEvent::Leave(_) => {}
                 }),
             ],
             _clock: cx.spawn(async move |this, cx| {
@@ -413,7 +414,7 @@ impl Sidebar {
             _ => None,
         };
         self.library.update(cx, |library, cx| {
-            library.create_folder(NEW_FOLDER_NAME.to_string(), parent, cx);
+            library.create_folder(library.fresh_name(parent), parent, cx);
         });
     }
 
@@ -455,7 +456,11 @@ impl Sidebar {
             input.focus(window, cx);
             input.select_all(window, cx);
         });
-        self.renaming = Some(Renaming { folder, input });
+        self.renaming = Some(Renaming {
+            folder,
+            input,
+            row: Rc::default(),
+        });
         cx.emit(SidebarEvent::Renaming);
         cx.notify();
     }
@@ -475,9 +480,26 @@ impl Sidebar {
         }
     }
 
-    /// Ends a rename: with `keep`, the folder takes what was typed, unless that is nothing
-    /// or its name already. The keyboard goes back to the sidebar if the input had it.
+    /// Whether the name typed for the folder renamed is another's in its place.
+    fn name_taken(&self, cx: &App) -> bool {
+        self.renaming.as_ref().is_some_and(|renaming| {
+            let library = self.library.read(cx);
+            let parent = library.folder(renaming.folder).and_then(|it| it.parent);
+            library.name_taken(
+                &renaming.input.read(cx).value(),
+                parent,
+                Some(renaming.folder),
+            )
+        })
+    }
+
+    /**
+     * Ends a rename: with `keep`, the folder takes what was typed, unless that is nothing, its
+     * name already, or another folder's in its place (then it keeps its name). The keyboard goes
+     * back to the sidebar if the input had it.
+     */
     fn end_rename(&mut self, keep: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let keep = keep && !self.name_taken(cx);
         let Some(renaming) = self.renaming.take() else {
             return;
         };
@@ -649,17 +671,13 @@ impl Sidebar {
                 _ => DropTarget::Folder(id),
             }
         };
-        let owns = move |over: DropTarget| match over {
-            DropTarget::Folder(folder) => folder == id,
-            DropTarget::Between { row, .. } => row == at,
-            DropTarget::Trash => false,
-        };
         let sessions = library.counts().folders.get(&id).copied().unwrap_or(0);
         let renaming = self
             .renaming
             .as_ref()
             .filter(|renaming| renaming.folder == id)
-            .map(|renaming| renaming.input.clone());
+            .map(|renaming| (renaming.input.clone(), renaming.row.clone()));
+        let taken = renaming.is_some() && self.name_taken(cx);
         let chevron = row.has_children.then(|| {
             div()
                 .id(("folder-chevron", row.folder))
@@ -733,7 +751,11 @@ impl Sidebar {
                     .map(|this| {
                         if renaming.is_some() {
                             // The row is an input while its folder is named (`.inp.focus`).
-                            this.bg(c.s1).border_1().border_color(c.accent)
+                            this.bg(c.s1).border_1().border_color(if taken {
+                                c.red
+                            } else {
+                                c.accent
+                            })
                         } else if targeted {
                             this.bg(c.accent_soft)
                                 .text_color(c.accent_text)
@@ -758,17 +780,29 @@ impl Sidebar {
                             cx,
                         );
                     })
-                    .map(|this| crate::drag::target_by(this, pick, owns))
+                    .map(|this| crate::drag::target_by(this, pick))
                     .map(|this| {
                         if is_renaming {
                             this
                         } else {
-                            crate::drag::source(this, Dragged::Folder(id))
+                            // Let go before it moved, it was a click: the folder shows.
+                            let view = cx.entity().downgrade();
+                            crate::drag::source(
+                                this,
+                                move |_| Dragged::Folder(id),
+                                move |_, _, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.show(Shelf::Folder(id), cx);
+                                        cx.emit(SidebarEvent::Picked);
+                                    })
+                                    .ok();
+                                },
+                            )
                         }
                     })
-                    // The levels' guides and the chevron's place, with no gap between them,
-                    // so that each level moves the row's glyph in by the indent alone. A
-                    // level's guide runs under the middle of its folder's chevron.
+                    /* The levels' guides and the chevron's place, with no gap between them,
+                    so that each level moves the row's glyph in by the indent alone. A
+                    level's guide runs under the middle of its folder's chevron. */
                     .child(
                         div()
                             .flex_none()
@@ -802,15 +836,18 @@ impl Sidebar {
                         },
                     ))
                     .map(|this| match renaming {
-                        Some(input) => this.child(
+                        Some((input, row)) => this.child(
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                // The input passes Enter and Esc on. They end here, so
-                                // that Enter isn't also the sidebar's key for the page.
+                                /* The input passes Enter and Esc on. They end here, so
+                                that Enter isn't also the sidebar's key for the page. */
                                 .key_context(keymap::FOLDER_RENAME)
                                 .on_action(cx.listener(|this, _: &KeepName, window, cx| {
-                                    this.end_rename(true, window, cx);
+                                    // A name another folder here has is refused in place.
+                                    if !this.name_taken(cx) {
+                                        this.end_rename(true, window, cx);
+                                    }
                                 }))
                                 .on_action(cx.listener(|this, _: &DropName, window, cx| {
                                     this.end_rename(false, window, cx);
@@ -821,6 +858,14 @@ impl Sidebar {
                                         .aria_label("Folder name")
                                         .px_0(),
                                 )
+                                .child({
+                                    let row = row.clone();
+                                    canvas(move |bounds, _, _| row.set(bounds), |_, _, _, _| {})
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .size_full()
+                                })
                                 .automation_target("sidebar/folder-rename"),
                         ),
                         None => this
@@ -1046,8 +1091,8 @@ impl Render for Sidebar {
         let has_library = self.has_library(cx);
         let first_run = self.sync.read(cx).is_first_run();
         let syncing = self.sync.read(cx).is_syncing();
-        // While the archive can't be opened the counts aren't known and the section buttons
-        // are drawn disabled (DESIGN §4.14).
+        /* While the archive can't be opened the counts aren't known and the section buttons
+        are drawn disabled (DESIGN §4.14). */
         let unavailable = Showing::now(cx) == Showing::ArchiveFailed;
         let rows = (
             has_library,
@@ -1084,6 +1129,12 @@ impl Render for Sidebar {
             .on_action(cx.listener(Self::collapse))
             .on_action(cx.listener(Self::expand))
             .on_action(cx.listener(Self::open))
+            // A name refused in a rename is said under its row, over the rows below.
+            .children(
+                (self.renaming.as_ref())
+                    .filter(|_| self.name_taken(cx))
+                    .map(|renaming| name_taken_note(renaming.row.get(), &theme)),
+            )
             .flex()
             .flex_col()
             .size_full()
@@ -1207,6 +1258,37 @@ impl Render for Sidebar {
     }
 }
 
+/// What a rename says under its row while the name typed is another folder's in its place,
+/// over the rows below it.
+fn name_taken_note(row: Bounds<Pixels>, theme: &SbTheme) -> AnyElement {
+    let c = &theme.colors;
+    deferred(
+        anchored()
+            .position(row.bottom_left() + point(px(0.), px(4.)))
+            .child(
+                div()
+                    .id("folder-rename-taken")
+                    .flex()
+                    .items_center()
+                    .gap(theme.spacing.sm)
+                    .py(theme.spacing.xs)
+                    .px(theme.spacing.md)
+                    .rounded(theme.radii.control)
+                    .border_1()
+                    .border_color(c.line)
+                    .bg(c.s2)
+                    .shadow(theme.shadows.pop.clone())
+                    .text_color(c.red)
+                    .text_spec(&theme.text.secondary)
+                    .child(icon(SbIcon::CircleAlert, theme.sizes.icon_sm, c.red))
+                    .child("A folder here has this name already")
+                    .automation_target("sidebar/folder-rename/taken"),
+            ),
+    )
+    .with_priority(1)
+    .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use gpui::{TestAppContext, VisualTestContext};
@@ -1265,8 +1347,8 @@ mod tests {
         sidebar.update(cx, |sidebar, cx| sidebar.toggle(outer, cx));
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
-        // The field went with its row. The keyboard is on what was around it and is still
-        // drawn, the sidebar's rows, not back on the main area; and the name is kept.
+        /* The field went with its row. The keyboard is on what was around it and is still
+        drawn, the sidebar's rows, not back on the main area; and the name is kept. */
         assert!(cx.update(|window, cx| sidebar.focus_handle(cx).is_focused(window)));
         assert_eq!(folder_names(&library, cx), ["outer", "kept"]);
     }

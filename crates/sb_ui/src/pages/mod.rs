@@ -39,7 +39,7 @@ use crate::automation::AutomationTargetExt as _;
 use crate::components::{ButtonKind, bad_banner, button};
 use crate::keymap;
 use crate::services::{ActiveServices as _, ArchiveState, LibraryService, LocationStatus};
-use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
+use crate::theme::{ActiveTheme as _, SbTheme};
 use first_run::FirstRun;
 use sessions::SessionsView;
 use unsorted::UnsortedView;
@@ -334,7 +334,7 @@ impl MainArea {
 }
 
 impl Render for MainArea {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.sb_theme().clone();
         let showing = Showing::now(cx);
         let services = cx.services();
@@ -411,7 +411,11 @@ impl Render for MainArea {
                     this.menu(true, window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &Menu, window, cx| this.menu(false, window, cx)))
+            .on_action(cx.listener(|this, _: &Menu, window, cx| {
+                if !this.typing(window, cx) {
+                    this.menu(false, window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &SelectAll, window, cx| {
                 if !this.typing(window, cx) {
                     this.each_page(cx, SessionsView::select_all, |_, _| {});
@@ -441,7 +445,6 @@ impl Render for MainArea {
                     .then(|| self.toast(&theme, cx))
                     .flatten(),
             )
-            .children(self.deleting(window, &theme, cx))
     }
 }
 
@@ -466,6 +469,13 @@ impl MainArea {
                 .justify_center()
                 .child(
                     div()
+                        .id("toast")
+                        .debug_selector(|| "toast".into())
+                        // Its time stops running out while the pointer rests on it.
+                        .on_hover(|hovered, _, cx| {
+                            let library = cx.services().library.clone();
+                            library.update(cx, |library, cx| library.pause_toast(*hovered, cx));
+                        })
                         .flex()
                         .items_center()
                         .gap(theme.spacing.lg)
@@ -513,100 +523,12 @@ impl MainArea {
                                 crate::icons::SbIcon::X,
                                 theme.sizes.icon_sm,
                                 c.fg2,
-                            )),
+                            ))
+                            .automation_target("toast/dismiss"),
                         )
                         .automation_target("toast"),
                 )
                 .into_any_element(),
         )
-    }
-
-    /**
-     * Delete folder… (DESIGN §4.1): "Delete fc? Its 447 sessions go to Unsorted and are filed
-     * again by the rules; its subfolders move up to its parent. Nothing is deleted from the
-     * archive." with Cancel and Delete folder. `Enter` doesn't confirm.
-     */
-    fn deleting(&self, window: &Window, theme: &SbTheme, cx: &Context<Self>) -> Option<AnyElement> {
-        let c = &theme.colors;
-        let library = cx.services().library.read(cx);
-        let folder = library.folder(library.deleting()?)?;
-        let counts = &library.counts().folders;
-        let inside: usize = (library.folders().iter())
-            .filter(|it| it.parent == Some(folder.id))
-            .filter_map(|it| counts.get(&it.id))
-            .sum();
-        let own = counts
-            .get(&folder.id)
-            .copied()
-            .unwrap_or(0)
-            .saturating_sub(inside);
-        let answer = |delete: bool| {
-            move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-                let library = cx.services().library.clone();
-                library.update(cx, |library, cx| library.answer_delete(delete, cx));
-            }
-        };
-        let dialog = crate::overlay::surface(theme)
-            .w(theme.sizes.dialog_width)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(theme.spacing.md)
-                    .p(theme.sizes.dialog_padding)
-                    .child(
-                        div()
-                            .flex()
-                            .gap(theme.spacing.xs)
-                            .text_spec(&theme.text.sheet_title)
-                            .child("Delete")
-                            .child(
-                                div()
-                                    .flex()
-                                    .child(div().italic().child(folder.name.clone()))
-                                    .child("?"),
-                            ),
-                    )
-                    .child(div().text_color(c.fg2).child(format!(
-                        "Its {} go to Unsorted and are filed again by the rules; its \
-                         subfolders move up to its parent. Nothing is deleted from the \
-                         archive.",
-                        crate::format::plural(own, "session")
-                    ))),
-            )
-            .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap(theme.spacing.md)
-                    .p(theme.sizes.dialog_padding)
-                    .border_t_1()
-                    .border_color(c.line_subtle)
-                    .bg(c.s1)
-                    .child(
-                        button("delete-cancel", ButtonKind::Plain, false, true, theme)
-                            .on_click(answer(false))
-                            .child("Cancel")
-                            .automation_target("delete-folder/cancel"),
-                    )
-                    .child(
-                        button("delete-confirm", ButtonKind::Danger, false, true, theme)
-                            .on_click(answer(true))
-                            .child("Delete folder")
-                            .automation_target("delete-folder/confirm"),
-                    ),
-            )
-            .debug_selector(|| "delete-folder".into())
-            .automation_target("delete-folder");
-        Some(crate::overlay::modal(
-            dialog,
-            crate::overlay::Layer::Dialog,
-            window,
-            theme,
-            |_, cx| {
-                let library = cx.services().library.clone();
-                library.update(cx, |library, cx| library.answer_delete(false, cx));
-            },
-        ))
     }
 }
