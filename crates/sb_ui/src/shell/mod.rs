@@ -238,7 +238,10 @@ impl Shell {
                             .updates
                             .clone()
                             .update(cx, |updates, cx| updates.hand_over(cx)),
-                        Leave::Show(_) | Leave::Open(..) | Leave::Edit(_) => {}
+                        Leave::Show(_)
+                        | Leave::Open(..)
+                        | Leave::OpenWhere(..)
+                        | Leave::Edit(_) => {}
                     }
                 }
             }),

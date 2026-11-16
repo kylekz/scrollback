@@ -573,6 +573,8 @@ const TOAST_TIME: Duration = Duration::from_secs(5);
 pub enum Leave {
     Show(Shelf),
     Open(Box<Session>, Option<ReadAt>),
+    /// A session found anywhere, opened from its own page ([`LibraryService::open_where`]).
+    OpenWhere(Box<Session>, Option<ReadAt>),
     /// Another folder's paths editor: its page, with the editor open.
     Edit(FolderId),
     /// Closing the window.
@@ -581,6 +583,15 @@ pub enum Leave {
     /// Restart to update (`crate::services::updates`): the installer takes the update and the
     /// app quits.
     Restart,
+}
+
+/// The page a session is on: its folder's, Unsorted, or Trash where it is in Trash.
+fn shelf_of(session: &Session) -> Shelf {
+    match session.filed {
+        _ if session.trashed.is_some() => Shelf::Trash,
+        Filed::ByRule(folder) | Filed::ByHand(folder) => Shelf::Folder(folder),
+        Filed::Unsorted => Shelf::Unsorted,
+    }
 }
 
 /**
@@ -1178,16 +1189,32 @@ impl LibraryService {
      * `Ctrl Enter`, DESIGN §4.9).
      */
     pub fn show_where(&mut self, session: &Session, cx: &mut Context<Self>) {
-        let shelf = match session.filed {
-            _ if session.trashed.is_some() => Shelf::Trash,
-            Filed::ByRule(folder) | Filed::ByHand(folder) => Shelf::Folder(folder),
-            Filed::Unsorted => Shelf::Unsorted,
-        };
+        let shelf = shelf_of(session);
         self.show(shelf, cx);
         if self.shelf == shelf && self.open.is_none() {
             let at = self.sessions().and_then(|page| page.find(&session.id, 0));
             self.selected = Some((session.id.clone(), at));
         }
+    }
+
+    /**
+     * Opens a session found anywhere (the palette, DESIGN §4.9) at `at`, as though from the
+     * page it is on: its folder's, Unsorted, or Trash where it is in Trash. That page is then
+     * the one the reader names in its breadcrumb, goes Back to and steps through with J and K,
+     * and the session is selected on it.
+     */
+    pub fn open_where(&mut self, session: Session, at: Option<ReadAt>, cx: &mut Context<Self>) {
+        if self.hold.is_some() {
+            self.asked = Some(Leave::OpenWhere(Box::new(session), at));
+            cx.notify();
+            return;
+        }
+        self.show(shelf_of(&session), cx);
+        let place = self.sessions().and_then(|page| page.find(&session.id, 0));
+        self.selected = Some((session.id.clone(), place));
+        self.chosen.clear();
+        self.anchor = None;
+        self.open_at(session, at, cx);
     }
 
     /// Selects and opens the session `id` of the shown page's sessions, last drawn at `hint`.
@@ -1438,6 +1465,7 @@ impl LibraryService {
             match asked {
                 Leave::Show(shelf) => self.show(shelf, cx),
                 Leave::Open(session, at) => self.open_at(*session, at, cx),
+                Leave::OpenWhere(session, at) => self.open_where(*session, at, cx),
                 Leave::Edit(folder) => self.edit_paths(folder, cx),
                 leave @ (Leave::Close | Leave::Quit | Leave::Restart) => {
                     cx.emit(LibraryEvent::Leave(leave));

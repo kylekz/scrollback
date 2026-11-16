@@ -660,7 +660,7 @@ impl Palette {
             if folder_page {
                 library.show_where(&session, cx);
             } else {
-                library.open_at(session, at, cx);
+                library.open_where(session, at, cx);
             }
         });
         // Opening a session or a page leaves Settings for it (DESIGN §4.13).

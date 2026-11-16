@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use gpui::{Entity, TestAppContext, VisualTestContext};
 use pretty_assertions::assert_eq;
-use sb_core::catalogue::SessionId;
+use sb_core::catalogue::{SessionId, Shelf};
 use sb_core::transcript::{At, BlockId};
 use sb_test_support::{NestedSubagents, WithSubagents, nested_subagents, with_subagents};
 
@@ -280,7 +280,9 @@ fn a_request_is_dropped_with_a_session_left_before_it_is_parsed(cx: &mut TestApp
         .read_at
         .expect("the reader took the request");
     let library = cx.update(|_, cx| cx.services().library.clone());
+    /* Back goes to the session's own page, Unsorted; the sessions are taken from All. */
     cx.simulate_keystrokes("alt-left");
+    library.update(cx, |library, cx| library.show(Shelf::All, cx));
     cx.run_until_parked();
     let session = |id: &SessionId, same: bool, cx: &mut VisualTestContext| {
         library.read_with(cx, |library, _| {

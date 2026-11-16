@@ -436,6 +436,113 @@ fn ctrl_enter_shows_the_sessions_folder_page_with_it_selected(cx: &mut TestAppCo
     assert_eq!(title.as_deref(), Some(SESSIONS[2].title));
 }
 
+/**
+ * A session opened from the palette is read as though opened from its own page: its folder's,
+ * whatever page was under the palette. The breadcrumb names it, Back goes to it, and J and K
+ * step through its sessions.
+ */
+#[gpui::test]
+fn a_session_opened_from_the_palette_takes_its_own_page(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    let library = library(cx);
+    for name in ["app", "elsewhere"] {
+        library.update(cx, |library, cx| {
+            library.create_folder(name.to_string(), None, cx)
+        });
+    }
+    cx.run_until_parked();
+    let (app, elsewhere) = library.read_with(cx, |library, _| {
+        let id = |name: &str| {
+            (library.folders().iter())
+                .find(|folder| folder.name == name)
+                .map(|folder| folder.id)
+                .expect("the folder is made")
+        };
+        (id("app"), id("elsewhere"))
+    });
+    let filed: Vec<_> = library.read_with(cx, |library, _| {
+        (library
+            .sessions()
+            .expect("All sessions is loaded")
+            .sessions
+            .iter())
+        .filter(|session| session.title.as_deref() != Some(SESSIONS[2].title))
+        .map(|session| session.id.clone())
+        .collect()
+    });
+    library.update(cx, |library, cx| library.file_by_hand(filed, app, cx));
+    library.update(cx, |library, cx| library.show(Shelf::Folder(elsewhere), cx));
+    cx.run_until_parked();
+
+    /* Found from another folder's page, beyond the palette's scope of it. */
+    let open_found = |term: &str, cx: &mut VisualTestContext| {
+        open_palette(&shell, cx);
+        typed(term, cx);
+        let search_everywhere = bounds(cx, "palette-everywhere").expect("Search everywhere");
+        cx.simulate_click(search_everywhere.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+    };
+    open_found("backoff", cx);
+    let read = |cx: &mut VisualTestContext| {
+        library.read_with(cx, |library, _| {
+            (
+                library.shelf(),
+                library.open_session().and_then(|it| it.title.clone()),
+                library.open_place(),
+            )
+        })
+    };
+    assert_eq!(
+        read(cx),
+        (
+            Shelf::Folder(app),
+            Some(SESSIONS[1].title.to_string()),
+            Some((1, 2))
+        )
+    );
+    assert!(taken(&shell, cx).is_some(), "it opens at the match");
+
+    /* K steps to the folder's other session; Back leaves it selected on the folder's page. */
+    cx.simulate_keystrokes("k");
+    cx.run_until_parked();
+    assert_eq!(
+        read(cx),
+        (
+            Shelf::Folder(app),
+            Some(SESSIONS[0].title.to_string()),
+            Some((0, 2))
+        )
+    );
+    cx.simulate_keystrokes("alt-left");
+    cx.run_until_parked();
+    let (shelf, open, selected) = library.read_with(cx, |library, _| {
+        (
+            library.shelf(),
+            library.open_session().is_some(),
+            library
+                .selected()
+                .and_then(|id| library.session(id))
+                .and_then(|it| it.title.clone()),
+        )
+    });
+    assert_eq!(shelf, Shelf::Folder(app));
+    assert!(!open);
+    assert_eq!(selected.as_deref(), Some(SESSIONS[0].title));
+
+    /* One in Unsorted opens from Unsorted. */
+    open_found("summary", cx);
+    assert_eq!(
+        read(cx),
+        (
+            Shelf::Unsorted,
+            Some(SESSIONS[2].title.to_string()),
+            Some((0, 1))
+        )
+    );
+}
+
 #[gpui::test]
 fn the_commands_group_heads_the_results_and_enter_runs_one(cx: &mut TestAppContext) {
     let (shell, cx) = open_shell(cx);
