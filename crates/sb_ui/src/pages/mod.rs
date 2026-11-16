@@ -15,6 +15,7 @@ pub mod first_run;
 mod first_sync;
 mod header;
 pub mod sessions;
+pub mod settings;
 mod states;
 #[cfg(test)]
 mod tests;
@@ -38,6 +39,7 @@ use crate::services::{ActiveServices as _, ArchiveState, LibraryService, Locatio
 use crate::theme::{ActiveTheme as _, SbTheme};
 use first_run::FirstRun;
 use sessions::SessionsView;
+use settings::SettingsPage;
 use unsorted::UnsortedView;
 
 /// What the main area shows.
@@ -49,6 +51,8 @@ pub enum Showing {
     /// The archive is open and its locations couldn't be read.
     LocationsFailed,
     FirstRun,
+    /// Settings, over whichever of the pages below it was opened from (DESIGN §4.13).
+    Settings,
     /// An opened session.
     Session,
     Unsorted,
@@ -72,20 +76,22 @@ impl Showing {
             None if sync.failure().is_some() => Self::LocationsFailed,
             None => Self::Starting,
             Some(_) if sync.is_first_run() => Self::FirstRun,
+            Some(_) if services.settings.read(cx).is_shown() => Self::Settings,
             Some(_) if library.open_session().is_some() => Self::Session,
             Some(_) if library.shelf() == Shelf::Unsorted => Self::Unsorted,
             Some(_) => Self::Sessions,
         }
     }
 
-    /// `"starting"`, `"archive-failed"`, `"locations-failed"`, `"first-run"`, `"session"`,
-    /// `"unsorted"` or `"sessions"`, as automation's `state` spells it.
+    /// `"starting"`, `"archive-failed"`, `"locations-failed"`, `"first-run"`, `"settings"`,
+    /// `"session"`, `"unsorted"` or `"sessions"`, as automation's `state` spells it.
     pub fn key(self) -> &'static str {
         match self {
             Self::Starting => "starting",
             Self::ArchiveFailed => "archive-failed",
             Self::LocationsFailed => "locations-failed",
             Self::FirstRun => "first-run",
+            Self::Settings => "settings",
             Self::Session => "session",
             Self::Unsorted => "unsorted",
             Self::Sessions => "sessions",
@@ -98,13 +104,17 @@ impl Showing {
             Self::Sessions => keymap::SESSIONS,
             Self::Unsorted => keymap::UNSORTED,
             Self::FirstRun => keymap::FIRST_RUN,
+            Self::Settings => keymap::SETTINGS,
             Self::Starting | Self::ArchiveFailed | Self::LocationsFailed | Self::Session => "Main",
         }
     }
 
-    /// Whether a page of the library shows.
+    /// Whether a page of the library shows, or Settings over one.
     pub fn is_library(self) -> bool {
-        matches!(self, Self::Sessions | Self::Unsorted | Self::Session)
+        matches!(
+            self,
+            Self::Sessions | Self::Unsorted | Self::Session | Self::Settings
+        )
     }
 }
 
@@ -124,6 +134,7 @@ pub struct MainArea {
     sessions: Entity<SessionsView>,
     unsorted: Entity<UnsortedView>,
     first_run: Entity<FirstRun>,
+    settings: Entity<SettingsPage>,
     _observers: [Subscription; 3],
 }
 
@@ -134,7 +145,7 @@ impl Focusable for MainArea {
 }
 
 impl MainArea {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let services = cx.services();
         let (archive, sync, library) = (
             services.archive.clone(),
@@ -147,12 +158,34 @@ impl MainArea {
             unsorted: cx.new(|cx| UnsortedView::new(focus_handle.clone(), cx)),
             focus_handle,
             first_run: cx.new(FirstRun::new),
+            settings: cx.new(|cx| SettingsPage::new(window, cx)),
             _observers: [
                 cx.observe(&archive, |_, _, cx| cx.notify()),
                 cx.observe(&sync, |_, _, cx| cx.notify()),
                 cx.observe(&library, |_, _, cx| cx.notify()),
             ],
         }
+    }
+
+    /// Shows Settings, from its top and with what it shows read again (DESIGN §4.13).
+    pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = cx.services().settings.clone();
+        settings.update(cx, |settings, cx| settings.show(true, cx));
+        self.settings
+            .update(cx, |page, cx| page.showing(window, cx));
+    }
+
+    /// `Esc` or Back in Settings: closes what is open on it first, else goes back to the page
+    /// it was opened from.
+    pub fn leave_settings(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.update(cx, SettingsPage::dismiss) {
+            let settings = cx.services().settings.clone();
+            settings.update(cx, |settings, cx| settings.show(false, cx));
+        }
+    }
+
+    pub fn settings_page(&self) -> &Entity<SettingsPage> {
+        &self.settings
     }
 
     /// Moves a page's selection: `by` along the reading order, or `lines` up or down.
@@ -311,6 +344,7 @@ impl Render for MainArea {
                 .failure()
                 .map(|why| states::locations_failed(why, &theme, cx)),
             Showing::FirstRun => Some(self.first_run.clone().into_any_element()),
+            Showing::Settings => Some(self.settings.clone().into_any_element()),
             Showing::Session => {
                 let library = services.library.read(cx);
                 let from: SharedString = match library.shelf() {

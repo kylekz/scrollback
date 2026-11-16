@@ -221,6 +221,9 @@ impl Sidebar {
         self.location_cursor = None;
         self.library
             .update(cx, |library, cx| library.show(shelf, cx));
+        // Picking a page leaves Settings for it (DESIGN §4.13).
+        let settings = cx.services().settings.clone();
+        settings.update(cx, |settings, cx| settings.show(false, cx));
         if let Shelf::Folder(folder) = shelf
             && let Some(at) = self.row_of(folder, cx)
         {

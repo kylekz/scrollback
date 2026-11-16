@@ -247,6 +247,8 @@ pub struct TypeScale {
     pub lead: TextSpec,
     /// 15/20 a sheet's or a dialog's title.
     pub sheet_title: TextSpec,
+    /// 17/24 a section's title in Settings.
+    pub section_title: TextSpec,
     /// 11/16 JetBrains Mono: a tool's own words in a box of their own (DESIGN §4.11).
     pub said: TextSpec,
 }
@@ -277,6 +279,7 @@ impl TypeScale {
             empty_title: TextSpec::new(&fonts.ui, 15., 20., semibold),
             lead: TextSpec::new(&fonts.ui, 14., 21., regular),
             sheet_title: TextSpec::new(&fonts.ui, 15., 20., semibold),
+            section_title: TextSpec::new(&fonts.ui, 17., 24., semibold),
             said: TextSpec::new(&fonts.mono, 11., 16., regular),
         }
     }
@@ -397,6 +400,11 @@ pub struct Sizes {
     pub list_row_padding: Pixels,
     /// The label column of a connection test's result (`E-Add-Location`).
     pub result_label_width: Pixels,
+    /// Settings: its header, its list of sections, and its column at its widest
+    /// (DESIGN §4.13).
+    pub settings_header_height: Pixels,
+    pub settings_nav_width: Pixels,
+    pub settings_column_width: Pixels,
 }
 
 impl Default for Sizes {
@@ -462,6 +470,9 @@ impl Default for Sizes {
             pane_padding: px(20.),
             list_row_padding: px(10.),
             result_label_width: px(110.),
+            settings_header_height: px(44.),
+            settings_nav_width: px(200.),
+            settings_column_width: px(780.),
         }
     }
 }

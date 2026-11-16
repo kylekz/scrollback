@@ -362,8 +362,9 @@ fn tab_walks_the_buttons_and_never_strands_the_keyboard(cx: &mut TestAppContext)
             break;
         }
     }
-    // The title bar's Sync all, the sidebar's rows and its two buttons, the main area.
-    assert_eq!(stops, 5);
+    // The title bar's Sync all and Settings, the sidebar's rows and its two buttons, the main
+    // area.
+    assert_eq!(stops, 6);
     // Shift Tab goes the other way: to the sidebar's buttons, where the page's keys still work.
     cx.simulate_keystrokes("shift-tab");
     assert!(!main_focused(&shell, cx));

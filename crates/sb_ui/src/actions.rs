@@ -41,6 +41,8 @@ pub mod shell {
             Dismiss,
             /// Open the locations sheet (`Ctrl L`, DESIGN §4.11).
             OpenLocations,
+            /// Open Settings in the main area (`Ctrl ,`, DESIGN §4.13).
+            OpenSettings,
         ]
     );
 }

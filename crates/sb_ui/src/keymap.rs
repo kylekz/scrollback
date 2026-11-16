@@ -1,9 +1,11 @@
 //! The keymap (DESIGN §5). One table, [`SHORTCUTS`], holds the gpui bindings, and a view draws
-//! a bound action's keycap from its row ([`Shortcut::label`]), so the two can't drift.
+//! a bound action's keycap from its row ([`Shortcut::label`]), so the two can't drift. Settings
+//! › Shortcuts lists what [`SHORTCUT_ROWS`] says each action does, with the keys these rows
+//! bind it to.
 //!
-//! Two keycaps are ahead of the table: the title bar shows DESIGN §5's keys for the palette and
-//! for Settings, whose actions arrive with them in phases 6 and 7 (PLAN §13). Their keys are
-//! [`SEARCH_KEYS`] and [`SETTINGS_KEYS`] until then; each becomes a row with its action.
+//! One keycap is ahead of the table: the title bar shows DESIGN §5's key for the palette, whose
+//! action arrives with it in phase 6 (PLAN §13). Its keys are [`SEARCH_KEYS`] until then; it
+//! becomes a row with its action.
 //!
 //! `secondary` is gpui's platform modifier: `Ctrl` on Windows, `Cmd` on macOS (DESIGN §5:
 //! "macOS uses Cmd for every Ctrl").
@@ -11,6 +13,9 @@
 use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, SharedString};
 
 use crate::actions::{app, first_run, library, locations, sessions, shell, sidebar};
+
+/// Key context of the main area while it shows Settings (DESIGN §4.13).
+pub const SETTINGS: &str = "Settings";
 
 /// Key context of the shell's root element: everything in the main window.
 pub const SHELL: &str = "Shell";
@@ -93,6 +98,8 @@ pub const BACK: Shortcut = shortcut!("alt-left", SHELL, library::Back);
 pub const STAR: Shortcut = shortcut!("s", SESSIONS, sessions::Star);
 /// `Ctrl L`. Named, because the Locations overline's label says it.
 pub const LOCATIONS: Shortcut = shortcut!("secondary-l", SHELL, shell::OpenLocations);
+/// `Ctrl ,`. Named, because the title bar's Settings button says it.
+pub const OPEN_SETTINGS: Shortcut = shortcut!("secondary-,", SHELL, shell::OpenSettings);
 
 /// Every binding scrollback defines.
 pub const SHORTCUTS: &[Shortcut] = &[
@@ -121,6 +128,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut!("enter", UNSORTED, sessions::Open),
     shortcut!("enter", FIRST_RUN, first_run::Add),
     LOCATIONS,
+    OPEN_SETTINGS,
     shortcut!("escape", LOCATIONS_SHEET, locations::Close),
     shortcut!("up", LOCATIONS_LIST, locations::Previous),
     shortcut!("down", LOCATIONS_LIST, locations::Next),
@@ -131,8 +139,84 @@ pub const SHORTCUTS: &[Shortcut] = &[
 
 /// `Ctrl K`, the palette's key (module docs).
 pub const SEARCH_KEYS: &str = "secondary-k";
-/// `Ctrl ,`, Settings' key (module docs).
-pub const SETTINGS_KEYS: &str = "secondary-,";
+
+/// A row of Settings › Shortcuts (DESIGN §5, §4.13): what it does, and the actions whose keys
+/// it shows, by their names (`sidebar::Rename`). The keys are whatever [`SHORTCUTS`] binds
+/// those actions to.
+#[derive(Clone, Copy, Debug)]
+pub struct ShortcutRow {
+    pub does: &'static str,
+    pub actions: &'static [&'static str],
+}
+
+const fn row(does: &'static str, actions: &'static [&'static str]) -> ShortcutRow {
+    ShortcutRow { does, actions }
+}
+
+/// Settings › Shortcuts, in DESIGN §5's order: every key that works wherever the keyboard is
+/// in the window, then the keys of lists and pages. A key DESIGN §5 lists whose action isn't
+/// built yet has no row until it is.
+pub const SHORTCUT_ROWS: &[ShortcutRow] = &[
+    row(
+        "Back to the page the session was opened from",
+        &["library::Back"],
+    ),
+    row("Star or unstar the selected session", &["sessions::Star"]),
+    row("New folder", &["library::NewFolder"]),
+    row("Sync all", &["library::SyncAll"]),
+    row("Locations", &["shell::OpenLocations"]),
+    row("Settings", &["shell::OpenSettings"]),
+    row(
+        "Move and open in the sidebar and the locations list",
+        &[
+            "sidebar::Previous",
+            "sidebar::Next",
+            "sidebar::Open",
+            "locations::Previous",
+            "locations::Next",
+            "locations::Open",
+        ],
+    ),
+    row(
+        "Move between sessions",
+        &[
+            "sessions::Left",
+            "sessions::Right",
+            "sessions::Up",
+            "sessions::Down",
+        ],
+    ),
+    row("Open the selected session", &["sessions::Open"]),
+    row("Rename the folder shown", &["sidebar::Rename"]),
+    row(
+        "Narrow windows: show the sidebar; otherwise move between the sidebar and the page",
+        &["shell::ToggleSidebar"],
+    ),
+    row(
+        "Move between the sidebar and the page",
+        &["shell::FocusOther"],
+    ),
+    row(
+        "Close what is on top, or leave Settings",
+        &["shell::Dismiss"],
+    ),
+];
+
+impl ShortcutRow {
+    /// The keycaps of its actions' bindings, each once, in the table's order.
+    pub fn keycaps(&self) -> Vec<SharedString> {
+        let mut keycaps: Vec<SharedString> = Vec::new();
+        for name in self.actions {
+            for shortcut in SHORTCUTS {
+                let label = shortcut.label();
+                if (shortcut.action)().name() == *name && !keycaps.contains(&label) {
+                    keycaps.push(label);
+                }
+            }
+        }
+        keycaps
+    }
+}
 
 /// The keys every Mac app has (DESIGN §5, "macOS"), bound on macOS only, anywhere in the window:
 /// the app menu shows them (`crate::app_menu`).
@@ -255,6 +339,51 @@ mod tests {
             assert!(
                 seen.insert((shortcut.keys, shortcut.context)),
                 "{shortcut:?} is bound twice"
+            );
+        }
+    }
+
+    #[test]
+    fn every_row_of_settings_shows_keys_that_are_bound() {
+        for row in SHORTCUT_ROWS {
+            for name in row.actions {
+                assert!(
+                    SHORTCUTS
+                        .iter()
+                        .any(|shortcut| (shortcut.action)().name() == *name),
+                    "{name} ({}) is bound to no key",
+                    row.does
+                );
+            }
+        }
+        let caps = |does: &str| {
+            SHORTCUT_ROWS
+                .iter()
+                .find(|row| row.does == does)
+                .unwrap()
+                .keycaps()
+        };
+        assert_eq!(caps("Settings"), [OPEN_SETTINGS.label()]);
+        /* ↑ is bound for the cards and for Unsorted's rows: shown once. */
+        assert_eq!(
+            caps("Move between sessions"),
+            ["left", "right", "up", "down"].map(label)
+        );
+    }
+
+    /// A key that works wherever the keyboard is in the window can't be added without a row
+    /// in Settings › Shortcuts.
+    #[test]
+    fn every_key_of_the_whole_window_has_a_row_in_settings() {
+        let listed: HashSet<&str> = SHORTCUT_ROWS
+            .iter()
+            .flat_map(|row| row.actions.iter().copied())
+            .collect();
+        for shortcut in SHORTCUTS.iter().filter(|it| it.context == SHELL) {
+            let name = (shortcut.action)().name();
+            assert!(
+                listed.contains(name),
+                "{name} has no row in Settings › Shortcuts"
             );
         }
     }

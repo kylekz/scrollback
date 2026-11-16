@@ -135,6 +135,8 @@ pub enum Tone {
     Blue,
     /// `yellow-soft` with `yellow`: a warning.
     Warn,
+    /// `red-soft` with `red`: something broken.
+    Bad,
 }
 
 impl Tone {
@@ -145,6 +147,7 @@ impl Tone {
             Self::Accent => (c.accent_soft, c.accent_text),
             Self::Blue => (c.blue_soft, c.blue),
             Self::Warn => (c.yellow_soft, c.yellow),
+            Self::Bad => (c.red_soft, c.red),
         }
     }
 }
@@ -196,6 +199,23 @@ pub fn location_tag(
         LocationKind::Ssh { .. } => Tone::Neutral,
     };
     tag(name, tone, small, theme)
+}
+
+/// A chip (`.chip`: 22 high, a pill, 12px), in `tone`'s colours.
+pub fn chip(label: impl Into<SharedString>, tone: Tone, theme: &SbTheme) -> Div {
+    let (fill, text) = tone.colors(theme);
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .h(px(22.))
+        .px(theme.spacing.md)
+        .rounded(theme.radii.pill)
+        .bg(fill)
+        .text_color(text)
+        .text_spec(&theme.text.secondary)
+        .whitespace_nowrap()
+        .child(label.into())
 }
 
 /// A chip that warns (`.chip.warn`), as low as a card's last line.

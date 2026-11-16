@@ -11,9 +11,9 @@
 //! **States** (DESIGN §4.1). The first run shows the mark alone: no search, Sync all or
 //! Settings (DESIGN §4.10). With a library, Sync all syncs every location, and while a pass
 //! runs its glyph turns, it reads "Syncing…", and neither a click nor `Tab` stops on it.
-//! While the archive is opening or didn't open, it is drawn disabled (DESIGN §4.14). Search
-//! needs the index (PLAN §13 phase 6) and Settings its page (phase 7): until then each is
-//! drawn disabled and takes no clicks.
+//! While the archive is opening or didn't open, it is drawn disabled (DESIGN §4.14), and so is
+//! Settings. Search needs the index (PLAN §13 phase 6): until then it is drawn disabled and
+//! takes no clicks.
 //!
 //! **Caption buttons** (Windows). Each is a 46px-wide box, the bar's height, marked with gpui's
 //! `WindowControlArea` (`Min`, `Max`, `Close`), so Windows itself answers the hit test and
@@ -134,7 +134,12 @@ impl Shell {
                             .gap(GAP)
                             .when(!first_run, |this| {
                                 this.child(sync_all_button(has_library, syncing, theme, cx))
-                                    .child(settings_button(theme))
+                                    .child(settings_button(
+                                        has_library,
+                                        showing == Showing::Settings,
+                                        theme,
+                                        cx,
+                                    ))
                             })
                             // The caption buttons sit side by side, flush with the window's edge.
                             .map(|this| match captions {
@@ -332,23 +337,45 @@ fn sync_all_button(
 }
 
 /// Settings (DESIGN §4.1): a ghost icon button that opens Settings in the main area
-/// (`Ctrl ,`). Disabled (module docs).
-fn settings_button(theme: &SbTheme) -> AnyElement {
+/// (`Ctrl ,`), on (`s3`) while they show. Without a library it is disabled (module docs).
+fn settings_button(
+    enabled: bool,
+    on: bool,
+    theme: &SbTheme,
+    cx: &mut Context<Shell>,
+) -> AnyElement {
+    let c = &theme.colors;
     div()
         .id("titlebar-settings")
         .role(Role::Button)
-        .aria_label(format!(
-            "Settings ({})",
-            keymap::label(keymap::SETTINGS_KEYS)
-        ))
+        .debug_selector(|| "titlebar-settings".into())
+        .aria_label(format!("Settings ({})", keymap::OPEN_SETTINGS.label()))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
         .size(theme.sizes.control_height)
         .rounded(theme.radii.control)
-        .opacity(DISABLED_OPACITY)
-        .child(icon(SbIcon::Settings, theme.sizes.icon, theme.colors.fg2))
+        .border_1()
+        .border_color(gpui::transparent_black())
+        // A control inside the drag region.
+        .occlude()
+        .when(on, |this| this.bg(c.s3))
+        .map(|this| {
+            if enabled {
+                tab_stop(this, theme)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(if on { c.s3 } else { c.s2 }))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
+            } else {
+                this.opacity(DISABLED_OPACITY)
+            }
+        })
+        .child(icon(
+            SbIcon::Settings,
+            theme.sizes.icon,
+            if on { c.fg } else { c.fg2 },
+        ))
         .automation_target("titlebar/settings")
 }
 

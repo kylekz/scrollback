@@ -34,6 +34,15 @@
 //! **The locations sheet** ([`LocationsSheet`], DESIGN §4.11) opens over the scrim from a
 //! sidebar location row, the Locations overline or `Ctrl L`, while a library page shows. It
 //! keeps the keyboard while it is open, and gives it back to where it was when it closes.
+//!
+//! **Settings** (DESIGN §4.13) open in the main area from the title bar's gear or `Ctrl ,`,
+//! while a library page shows; `Esc`, `Alt ←` and Back go back to the page they were opened
+//! from.
+//!
+//! **Another archive.** When the app moves onto another archive (Settings › Use a different
+//! folder…, `crate::services::reopen`), the shell makes its sidebar and main area anew over
+//! the new services, and closes the locations sheet: the window is the same, its contents are
+//! the other archive's.
 
 pub mod title_bar;
 
@@ -51,14 +60,14 @@ use gpui_appearance::Backing;
 use gpui_component::Root;
 
 use crate::actions::library::{Back, NewFolder, SyncAll};
-use crate::actions::shell::{Dismiss, FocusOther, OpenLocations, ToggleSidebar};
+use crate::actions::shell::{Dismiss, FocusOther, OpenLocations, OpenSettings, ToggleSidebar};
 use crate::actions::sidebar::Rename;
 use crate::automation::AutomationTargetExt as _;
 use crate::keymap;
 use crate::locations_sheet::{LocationsSheet, LocationsSheetEvent};
 use crate::overlay::{self, Layer};
 use crate::pages::{MainArea, Showing};
-use crate::services::ActiveServices as _;
+use crate::services::{ActiveServices as _, Services};
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::theme::{ActiveTheme as _, Material, SbTheme, StyledText as _};
 
@@ -99,57 +108,22 @@ pub struct Shell {
         Option<FocusHandle>,
         [Subscription; 2],
     )>,
-    _observers: [Subscription; 6],
+    /// What the shell hears from the services and the sidebar, made anew with them.
+    attached: [Subscription; 5],
+    _observers: [Subscription; 3],
 }
 
 impl Shell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let main = cx.new(MainArea::new);
-        main.focus_handle(cx).focus(window, cx);
-        let sidebar = cx.new(|cx| Sidebar::new(window, cx));
-        let services = cx.services();
-        let (archive, sync, library) = (
-            services.archive.clone(),
-            services.sync.clone(),
-            services.library.clone(),
-        );
+        let (main, sidebar, attached) = Self::attach(window, cx);
         Self {
             // gpui opened the window light or dark as the OS is; the theme may say otherwise.
             appearance: gpui_appearance::track_window(Backing::Solid, window, cx),
             sidebar_open: false,
             locations: None,
+            attached,
             _observers: [
                 cx.observe_global_in::<SbTheme>(window, |_, _, cx| cx.notify()),
-                // The title bar follows the archive, the locations and the passes.
-                cx.observe(&archive, |_, _, cx| cx.notify()),
-                cx.observe(&sync, |_, _, cx| cx.notify()),
-                cx.observe(&library, |_, _, cx| cx.notify()),
-                cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
-                    match event {
-                        // Picking a row closes a narrow window's overlay (DESIGN §2), and
-                        // the keyboard goes to the page with it.
-                        SidebarEvent::Picked => {
-                            if std::mem::take(&mut this.sidebar_open) {
-                                this.main.focus_handle(cx).focus(window, cx);
-                            }
-                        }
-                        SidebarEvent::Open => {
-                            this.sidebar_open = false;
-                            this.main.focus_handle(cx).focus(window, cx);
-                        }
-                        // The row that is renamed has the keyboard, so it must show.
-                        SidebarEvent::Renaming => {
-                            this.sidebar_open = this
-                                .sidebar_placement(window.viewport_size().width, cx)
-                                != SidebarPlacement::Docked;
-                        }
-                        SidebarEvent::Locations(selected) => {
-                            this.sidebar_open = false;
-                            this.open_locations(selected.clone(), window, cx);
-                        }
-                    }
-                    cx.notify();
-                }),
                 // What had the keyboard is gone from the window (module docs).
                 cx.on_focus_lost(window, |this, window, cx| {
                     window
@@ -157,15 +131,84 @@ impl Shell {
                         .unwrap_or_else(|| this.main.focus_handle(cx))
                         .focus(window, cx);
                 }),
+                // Another archive's services (module docs).
+                cx.observe_global_in::<Services>(window, |this, window, cx| {
+                    this.locations = None;
+                    this.sidebar_open = false;
+                    (this.main, this.sidebar, this.attached) = Self::attach(window, cx);
+                    cx.notify();
+                }),
             ],
             sidebar,
             main,
         }
     }
 
+    /// The main area and the sidebar over the services there are now, the keyboard on the
+    /// main area, and what the shell hears from them.
+    fn attach(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<MainArea>, Entity<Sidebar>, [Subscription; 5]) {
+        let main = cx.new(|cx| MainArea::new(window, cx));
+        main.focus_handle(cx).focus(window, cx);
+        let sidebar = cx.new(|cx| Sidebar::new(window, cx));
+        let services = cx.services();
+        let (archive, sync, library, settings) = (
+            services.archive.clone(),
+            services.sync.clone(),
+            services.library.clone(),
+            services.settings.clone(),
+        );
+        let attached = [
+            // The title bar follows the archive, the locations and the passes.
+            cx.observe(&archive, |_, _, cx| cx.notify()),
+            cx.observe(&sync, |_, _, cx| cx.notify()),
+            cx.observe(&library, |_, _, cx| cx.notify()),
+            cx.observe(&settings, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+                match event {
+                    // Picking a row closes a narrow window's overlay (DESIGN §2), and
+                    // the keyboard goes to the page with it.
+                    SidebarEvent::Picked => {
+                        if std::mem::take(&mut this.sidebar_open) {
+                            this.main.focus_handle(cx).focus(window, cx);
+                        }
+                    }
+                    SidebarEvent::Open => {
+                        this.sidebar_open = false;
+                        this.main.focus_handle(cx).focus(window, cx);
+                    }
+                    // The row that is renamed has the keyboard, so it must show.
+                    SidebarEvent::Renaming => {
+                        this.sidebar_open = this
+                            .sidebar_placement(window.viewport_size().width, cx)
+                            != SidebarPlacement::Docked;
+                    }
+                    SidebarEvent::Locations(selected) => {
+                        this.sidebar_open = false;
+                        this.open_locations(selected.clone(), window, cx);
+                    }
+                }
+                cx.notify();
+            }),
+        ];
+        (main, sidebar, attached)
+    }
+
     #[cfg(test)]
     pub(crate) fn sidebar(&self) -> &Entity<Sidebar> {
         &self.sidebar
+    }
+
+    #[cfg(test)]
+    pub(crate) fn main(&self) -> &Entity<MainArea> {
+        &self.main
+    }
+
+    /// The section picked in Settings' list (DESIGN §4.13), whether or not they show.
+    pub fn settings_section(&self, cx: &App) -> crate::pages::settings::Section {
+        self.main.read(cx).settings_page().read(cx).current()
     }
 
     /// The material applied to the window.
@@ -224,7 +267,21 @@ impl Shell {
             self.sidebar_open = false;
             self.main.focus_handle(cx).focus(window, cx);
             cx.notify();
+        } else if Showing::now(cx) == Showing::Settings {
+            self.main.update(cx, MainArea::leave_settings);
         }
+    }
+
+    /// Shows Settings in the main area, while a library page shows (module docs).
+    pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !Showing::now(cx).is_library() {
+            return;
+        }
+        self.sidebar_open = false;
+        self.main
+            .update(cx, |main, cx| main.open_settings(window, cx));
+        self.main.focus_handle(cx).focus(window, cx);
+        cx.notify();
     }
 
     /// Opens the locations sheet with `selected` selected, while a library page shows.
@@ -281,6 +338,10 @@ impl Shell {
     }
 
     fn back(&mut self, _: &Back, _: &mut Window, cx: &mut Context<Self>) {
+        if Showing::now(cx) == Showing::Settings {
+            let settings = cx.services().settings.clone();
+            return settings.update(cx, |settings, cx| settings.show(false, cx));
+        }
         let library = cx.services().library.clone();
         library.update(cx, |library, cx| library.close(cx));
     }
@@ -380,6 +441,9 @@ impl Render for Shell {
             .on_action(cx.listener(Self::back))
             .on_action(cx.listener(|this, _: &OpenLocations, window, cx| {
                 this.open_locations(None, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.open_settings(window, cx);
             }))
             .relative()
             .size_full()
