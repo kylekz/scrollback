@@ -122,8 +122,10 @@ pub struct Shell {
     _observers: [Subscription; 8],
 }
 
-/// How long a drag rests on the sidebar's button before the sidebar shows (DESIGN §4.1's
-/// closed folders open after as long).
+/**
+ * How long a drag rests on the sidebar's button before the sidebar shows (DESIGN §4.1's closed
+ * folders open after as long).
+ */
 const SPRING: Duration = Duration::from_millis(500);
 
 impl Shell {
@@ -321,9 +323,9 @@ impl Shell {
                 cx.background_executor().timer(SPRING).await;
                 this.update(cx, |this, cx| {
                     this.springing = None;
-                    let still = cx.services().library.read(cx).drag().and_then(|it| it.over)
-                        == Some(DropTarget::Sidebar);
-                    if still {
+                    if cx.services().library.read(cx).drag().and_then(|it| it.over)
+                        == Some(DropTarget::Sidebar)
+                    {
                         this.sidebar_open = true;
                         this.sprung = true;
                         cx.notify();
@@ -479,16 +481,20 @@ impl Render for Shell {
         div()
             .id("shell")
             .key_context(keymap::SHELL)
-            .on_action(cx.listener(Self::toggle_sidebar))
-            .on_action(cx.listener(Self::focus_other))
             .on_action(cx.listener(Self::dismiss))
-            .on_action(cx.listener(Self::new_folder))
-            .on_action(cx.listener(Self::rename))
-            .on_action(cx.listener(Self::sync_all))
-            .on_action(cx.listener(Self::back))
-            .on_action(cx.listener(|this, _: &OpenLocations, window, cx| {
-                this.open_locations(None, window, cx);
-            }))
+            /* The shell's other keys are for the window under a dialog: while one is open they
+            do nothing, so that nothing changes behind it nor takes the keyboard from it. */
+            .when(self.dialog.is_none(), |this| {
+                this.on_action(cx.listener(Self::toggle_sidebar))
+                    .on_action(cx.listener(Self::focus_other))
+                    .on_action(cx.listener(Self::new_folder))
+                    .on_action(cx.listener(Self::rename))
+                    .on_action(cx.listener(Self::sync_all))
+                    .on_action(cx.listener(Self::back))
+                    .on_action(cx.listener(|this, _: &OpenLocations, window, cx| {
+                        this.open_locations(None, window, cx);
+                    }))
+            })
             // A drag is measured from its press, and ends wherever it is let go (`crate::drag`).
             .capture_any_mouse_down(|event, _, cx| crate::drag::pressed(event.position, cx))
             .on_drag_move::<crate::drag::Drag>(|event, _, cx| {

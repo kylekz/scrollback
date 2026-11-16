@@ -11,6 +11,7 @@ use sb_core::filing::FolderId;
 use crate::icons::SbIcon;
 use crate::keymap;
 use crate::menu::{Entry, Item, NESTED_INDENT};
+use crate::services::library::NEW_FOLDER;
 use crate::services::{ActiveServices as _, LibraryService};
 use crate::sidebar::tree;
 
@@ -154,16 +155,29 @@ pub fn move_entries(ids: Vec<SessionId>, filed: Filed, library: &LibraryService)
     entries
 }
 
-/// How automation names a folder's item in a menu: its name with the folders it is in, as
-/// `fc/player`, which no two folders share.
+/**
+ * How automation names a folder: its name with the folders it is in, as `fc/player`; or, in a
+ * catalogue from before two folders in one place were kept from sharing a name, where another
+ * folder's is the same, `#` and its id.
+ */
 pub fn folder_key(library: &LibraryService, folder: FolderId) -> String {
-    let mut names: Vec<&str> = std::iter::successors(library.folder(folder), |it| {
-        it.parent.and_then(|parent| library.folder(parent))
-    })
-    .map(|it| it.name.as_str())
-    .collect();
-    names.reverse();
-    names.join("/")
+    let path = |folder: FolderId| {
+        let mut names: Vec<&str> = std::iter::successors(library.folder(folder), |it| {
+            it.parent.and_then(|parent| library.folder(parent))
+        })
+        .map(|it| it.name.as_str())
+        .collect();
+        names.reverse();
+        names.join("/")
+    };
+    let key = path(folder);
+    let shared =
+        (library.folders().iter()).any(|other| other.id != folder && path(other.id) == key);
+    if shared {
+        format!("#{}", folder.0)
+    } else {
+        key
+    }
 }
 
 /**
@@ -198,7 +212,7 @@ pub fn folder_menu(folder: FolderId, open: bool) -> Vec<Entry> {
             Item::new("new-subfolder", "New subfolder")
                 .glyph(SbIcon::FolderPlus)
                 .on(act(|library, folder, cx| {
-                    library.create_folder(library.fresh_name(Some(folder)), Some(folder), cx);
+                    library.create_folder(NEW_FOLDER.to_string(), Some(folder), cx);
                 })),
         ),
         Entry::Item(

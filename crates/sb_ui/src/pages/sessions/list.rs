@@ -361,8 +361,11 @@ impl SessionsView {
             )
             .child(
                 canvas(
-                    move |bounds, _, _| {
-                        drawn.borrow_mut().insert(place, bounds);
+                    {
+                        let id = session.id.clone();
+                        move |bounds, _, _| {
+                            drawn.borrow_mut().insert(id.clone(), bounds);
+                        }
                     },
                     |_, _, _, _| {},
                 )

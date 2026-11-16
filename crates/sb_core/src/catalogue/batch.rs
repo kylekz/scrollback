@@ -3,25 +3,36 @@
 //! says how the sessions were before it, read in the same transaction, which is what its Undo
 //! puts back.
 //!
-//! An Undo puts back what it can: a session deleted for good since has nothing to put back,
-//! and a folder deleted since has no place to put a session back in, which then goes where the
-//! rules file it. [`Undone::skipped`] counts them, for the owner to be told.
+//! An Undo puts back what it can: a session deleted for good since has nothing to put back
+//! ([`Undone::gone`]), and a folder deleted since has no place to put a session back in, which
+//! then goes where the rules file it ([`Undone::refiled`]). Both are counted, for the owner to
+//! be told.
 
 use toolbox_store::rusqlite::{Connection, OptionalExtension as _, params};
 
-use super::folder::{file_by_rule, parent_of};
+use super::folder::{create, file_by_rule, folder_exists, free_name, named, parent_of};
 use super::session::{archived, set_state};
 use super::trash::trashed_at;
-use super::{Catalogue, Filed, Result, SessionId, now_ms};
+use super::{Catalogue, CatalogueError, Filed, Result, SessionId, now_ms};
 use crate::filing::{FolderId, NormalPath};
 
 /// How a session was filed before a change.
 pub type Before = (SessionId, Filed);
 
-/// What an Undo could not put back.
+/// What an Undo could not put back as it was.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Undone {
-    pub skipped: usize,
+    /// Sessions deleted for good since.
+    pub gone: usize,
+    /// Sessions whose folder was deleted since, filed by their paths instead.
+    pub refiled: usize,
+}
+
+impl Undone {
+    /// Whether everything was put back as it was.
+    pub fn is_whole(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Catalogue {
@@ -65,22 +76,28 @@ impl Catalogue {
         })
     }
 
-    /// Puts sessions back as they were filed: the Undo of filing them. See the module docs
-    /// for what it can't put back.
+    /**
+     * Puts sessions back as they were filed: the Undo of filing them. A session deleted for
+     * good since is left out, and one whose folder is gone is filed by its path (the module
+     * docs).
+     */
     pub fn refile_as(&self, before: &[Before]) -> Result<Undone> {
         self.db.write(|tx| {
             let mut undone = Undone::default();
             for (id, was) in before {
-                if archived(tx, id).is_err() {
-                    undone.skipped += 1;
-                    continue;
+                match archived(tx, id) {
+                    Err(CatalogueError::NoSession(_)) => {
+                        undone.gone += 1;
+                        continue;
+                    }
+                    other => other?,
                 }
                 match was {
-                    Filed::ByHand(folder) if parent_of(tx, *folder).is_ok() => {
+                    Filed::ByHand(folder) if folder_exists(tx, *folder)? => {
                         set_state(tx, id, &[("folder_id", &folder.0), ("by_hand", &true)])?;
                     }
                     Filed::ByHand(_) => {
-                        undone.skipped += 1;
+                        undone.refiled += 1;
                         set_state(tx, id, &[("by_hand", &false)])?;
                         file_by_rule(tx, id, project(tx, id)?.as_ref())?;
                     }
@@ -123,25 +140,54 @@ impl Catalogue {
 
     /**
      * Takes `ids` out of Trash, as [`Catalogue::restore`] does each: the Undo of moving them
-     * there. A session deleted for good since, or taken out already, is skipped.
+     * there. A session deleted for good since is left out and counted; one taken out already
+     * is where the Undo puts it.
      */
     pub fn restore_all(&self, ids: &[SessionId]) -> Result<Undone> {
         self.db.write(|tx| {
             let mut undone = Undone::default();
             for id in ids {
-                if archived(tx, id).is_err() || trashed_at(tx, id)?.is_none() {
-                    undone.skipped += 1;
-                    continue;
+                match archived(tx, id) {
+                    Err(CatalogueError::NoSession(_)) => undone.gone += 1,
+                    other => {
+                        other?;
+                        if trashed_at(tx, id)?.is_some() {
+                            restore(tx, id)?;
+                        }
+                    }
                 }
-                restore(tx, id)?;
             }
             Ok(undone)
         })
     }
+
+    /**
+     * Makes a folder in `parent`, or at the top, named `name` or, where a folder there has
+     * that, the next free "name 2", "name 3" (New folder, Move to folder › New folder…), and
+     * files `sessions` in it by hand, in one change.
+     */
+    pub fn create_folder_with(
+        &self,
+        name: &str,
+        parent: Option<FolderId>,
+        sessions: &[SessionId],
+    ) -> Result<FolderId> {
+        let name = named(name)?;
+        self.db.write(|tx| {
+            let folder = create(tx, &free_name(tx, name, parent, None)?, parent)?;
+            for id in sessions {
+                archived(tx, id)?;
+                set_state(tx, id, &[("folder_id", &folder.0), ("by_hand", &true)])?;
+            }
+            Ok(folder)
+        })
+    }
 }
 
-/// Takes a session in Trash out, and runs the rules on it, which left it alone while it was
-/// there: the folder it was in may have lost its path or gone.
+/**
+ * Takes a session in Trash out, and runs the rules on it, which left it alone while it was
+ * there: the folder it was in may have lost its path or gone.
+ */
 pub(super) fn restore(connection: &Connection, id: &SessionId) -> Result<()> {
     set_state(connection, id, &[("trashed_at", &None::<i64>)])?;
     file_by_rule(connection, id, project(connection, id)?.as_ref())?;

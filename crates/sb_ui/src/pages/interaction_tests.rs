@@ -3,7 +3,7 @@
 //! the test library of [`crate::test_support`]: three sessions, all in Unsorted at first.
 
 use gpui::{
-    Entity, Focusable as _, Modifiers, MouseButton, Pixels, Point, TestAppContext,
+    App, Entity, Focusable as _, Modifiers, MouseButton, Pixels, Point, TestAppContext,
     VisualTestContext, point, px, size,
 };
 use pretty_assertions::assert_eq;
@@ -12,6 +12,7 @@ use sb_core::filing::FolderId;
 
 use super::paths_editor::PathsEditor;
 use crate::menu;
+use crate::services::library::NEW_FOLDER;
 use crate::services::{ActiveServices as _, Dragged, Leave, LibraryService, PageView, Verdict};
 use crate::shell::{Shell, SidebarPlacement};
 use crate::test_support::{SESSIONS, bounds, open_shell, open_shell_sized};
@@ -895,10 +896,7 @@ fn undo_after_the_world_moved_on_puts_back_what_it_can_and_says_what_it_couldnt(
     assert_eq!(filed(SESSIONS[1].title, cx), Filed::Unsorted);
     assert_eq!(
         toast(cx).as_deref(),
-        Some(
-            "Undone, but 1 session couldn't be put back as it was: deleted for good, or its \
-             folder is gone"
-        )
+        Some("Undone, but 1 session was filed by its path, as its folder is gone")
     );
 
     /* A path attached, then moved to another folder before Undo: the Undo is refused, and
@@ -1111,7 +1109,7 @@ fn a_new_folder_takes_a_free_name_and_a_rename_to_a_siblings_name_is_refused(
     folder("work", None, cx);
     for _ in 0..2 {
         library(cx).update(cx, |library, cx| {
-            library.create_folder(library.fresh_name(None), None, cx);
+            library.create_folder(NEW_FOLDER.to_string(), None, cx);
         });
         cx.run_until_parked();
         cx.simulate_keystrokes("enter");
@@ -1209,4 +1207,186 @@ fn a_path_taken_off_and_added_again_is_no_change(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(!editor.read_with(cx, |editor, _| editor.is_pending()));
     assert_eq!(editor.read_with(cx, |editor, _| editor.added().count()), 0);
+}
+
+#[gpui::test]
+fn ctrl_click_takes_a_session_out_of_the_selection_and_the_keys_follow(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    let ids = session_ids(cx);
+    let cards = [
+        centre("card-0", cx),
+        centre("card-1", cx),
+        centre("card-2", cx),
+    ];
+    let ctrl = secondary(cx);
+    let state = |cx: &mut VisualTestContext| {
+        library(cx).read_with(cx, |library, _| {
+            let selection = library.selection();
+            let shown: Vec<bool> = ids.iter().map(|id| library.is_selected(id)).collect();
+            (selection.len(), library.selected().cloned(), shown)
+        })
+    };
+    // Three, then Ctrl on the last: two are left, the first (where the run starts) acted on.
+    cx.simulate_click(cards[0], Modifiers::none());
+    cx.simulate_click(cards[1], ctrl);
+    cx.simulate_click(cards[2], ctrl);
+    cx.simulate_click(cards[2], ctrl);
+    assert_eq!(
+        state(cx),
+        (2, Some(ids[0].clone()), vec![true, true, false])
+    );
+    // Two, then Ctrl on the first: the other alone is selected.
+    cx.simulate_click(cards[0], ctrl);
+    assert_eq!(
+        state(cx),
+        (1, Some(ids[1].clone()), vec![false, true, false])
+    );
+    // Delete trashes what shows as selected.
+    cx.simulate_keystrokes("delete");
+    cx.run_until_parked();
+    assert_eq!(trashed(cx), 1);
+    assert_eq!(filed(SESSIONS[0].title, cx), Filed::Unsorted);
+    let archive = cx.update(|_, cx| cx.services().archive.read(cx).archive().cloned().unwrap());
+    let in_trash = archive.catalogue().sessions(Shelf::Trash).unwrap();
+    assert_eq!(in_trash[0].id, ids[1]);
+}
+
+#[gpui::test]
+fn the_shells_keys_do_nothing_behind_a_dialog(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    let work = folder("work", None, cx);
+    show(Shelf::Folder(work), cx);
+    show(Shelf::All, cx);
+    let card = centre("card-0", cx);
+    cx.simulate_click(card, Modifiers::none());
+    library(cx).update(cx, |library, cx| library.ask_delete(work, cx));
+    cx.run_until_parked();
+    // F6 twice, Ctrl B, Ctrl Shift N, F2, Ctrl L and Alt ←, then the page's Delete.
+    cx.simulate_keystrokes("f6 f6 secondary-b secondary-shift-n f2 secondary-l alt-left delete");
+    cx.run_until_parked();
+    let folders = library(cx).read_with(cx, |library, _| library.folders().len());
+    assert_eq!((folders, trashed(cx)), (1, 0));
+    assert!(cx.update(|_, cx| shell.read(cx).locations_sheet().is_none()));
+    assert!(bounds(cx, "delete-folder").is_some());
+    assert!(!main_has_keyboard(&shell, cx));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(main_has_keyboard(&shell, cx));
+}
+
+#[gpui::test]
+fn new_folders_made_before_the_folders_are_read_again_each_take_a_free_name(
+    cx: &mut TestAppContext,
+) {
+    let (_shell, cx) = open_shell(cx);
+    library(cx).update(cx, |library, cx| {
+        library.create_folder(NEW_FOLDER.to_string(), None, cx);
+        library.create_folder(NEW_FOLDER.to_string(), None, cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let names = library(cx).read_with(cx, |library, _| {
+        (library.folders().iter())
+            .map(|it| it.name.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(names, ["New folder", "New folder 2"]);
+    assert_eq!(
+        library(cx).read_with(cx, |library, _| library.write_failure().map(str::to_string)),
+        None
+    );
+}
+
+#[gpui::test]
+fn a_folder_doesnt_go_where_a_folder_has_its_name_and_a_delete_renames_what_would_clash(
+    cx: &mut TestAppContext,
+) {
+    let (_shell, cx) = open_shell(cx);
+    folder("Work", None, cx);
+    let x = folder("x", None, cx);
+    folder("work", Some(x), cx);
+    // x is open, its work shown: Work onto x is refused, and the ghost says why.
+    let to = drag("sidebar-folder-Work", "sidebar-folder-x", cx);
+    assert_eq!(
+        verdict(cx),
+        Some(Verdict::Refuses(
+            "a folder named Work is in x already".to_string()
+        ))
+    );
+    release(to, cx);
+    // Deleting x moves its work up beside Work: it is work 2 now, and the toast says so.
+    library(cx).update(cx, |library, cx| {
+        library.ask_delete(x, cx);
+        library.answer_delete(true, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        toast(cx).as_deref(),
+        Some("Folder deleted; its subfolder work is work 2 now")
+    );
+    let names = library(cx).read_with(cx, |library, _| {
+        (library.folders().iter())
+            .map(|it| it.name.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(names, ["Work", "work 2"]);
+}
+
+#[gpui::test]
+fn an_undo_quiets_the_toasts_of_changes_made_before_it(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    let work = folder("work", None, cx);
+    let other = folder("other", None, cx);
+    show(Shelf::All, cx);
+    let id = session_ids(cx)[0].clone();
+    library(cx).update(cx, |library, cx| {
+        library.file_by_hand(vec![id.clone()], work, cx)
+    });
+    cx.run_until_parked();
+    // Filed in other, and before that is written, the first toast's Undo.
+    library(cx).update(cx, |library, cx| {
+        library.file_by_hand(vec![id.clone()], other, cx);
+        library.undo(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(toast(cx), None);
+    assert_eq!(filed(SESSIONS[0].title, cx), Filed::Unsorted);
+}
+
+#[gpui::test]
+fn saving_from_the_close_question_saves_the_paths_and_closes(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    editing_app(&shell, cx);
+    let archive = cx.update(|_, cx| cx.services().archive.read(cx).archive().cloned().unwrap());
+    assert!(!cx.simulate_close());
+    let page = cx.update(|_, cx| shell.read(cx).main().read(cx).sessions().clone());
+    cx.update(|window, cx| page.update(cx, |page, cx| page.answer(Some(true), window, cx)));
+    cx.run_until_parked();
+    let notes = archive
+        .catalogue()
+        .sessions(Shelf::All)
+        .unwrap()
+        .into_iter()
+        .find(|it| it.title.as_deref() == Some(SESSIONS[2].title))
+        .map(|it| it.filed);
+    assert!(matches!(notes, Some(Filed::ByRule(_))), "{notes:?}");
+}
+
+#[gpui::test]
+fn a_quit_that_asks_nothing_saves_the_paths_editors_changes(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    editing_app(&shell, cx);
+    let archive = cx.update(|_, cx| cx.services().archive.read(cx).archive().cloned().unwrap());
+    // From the Dock, or at logout: gpui runs the quit hooks without asking anything.
+    let app: &mut TestAppContext = cx;
+    app.update(App::shutdown);
+    let notes = archive
+        .catalogue()
+        .sessions(Shelf::All)
+        .unwrap()
+        .into_iter()
+        .find(|it| it.title.as_deref() == Some(SESSIONS[2].title))
+        .map(|it| it.filed);
+    assert!(matches!(notes, Some(Filed::ByRule(_))), "{notes:?}");
 }

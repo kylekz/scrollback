@@ -413,9 +413,9 @@ pub struct SessionsView {
     list_rows: Vec<list::ListRow>,
     list_sizes: Rc<Vec<Size<Pixels>>>,
     list_scroll: VirtualListScrollHandle,
-    /// Where each session that shows was drawn last, by its place in `shown`: where its menu
+    /// Where each session that shows was drawn last, by its id: where its menu
     /// opens from the keys.
-    drawn: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    drawn: Rc<RefCell<HashMap<SessionId, Bounds<Pixels>>>>,
     /// The filter field, made with the first frame, and the page its placeholder names.
     filter: Option<(Entity<InputState>, Subscription)>,
     filter_for: Option<Shelf>,
@@ -799,7 +799,7 @@ impl SessionsView {
         let (Some((id, at)), Some(place)) = (self.selected(cx), self.selected_place(cx)) else {
             return;
         };
-        let drawn = self.drawn.borrow().get(&place).copied();
+        let drawn = self.drawn.borrow().get(&id).copied();
         let at_point = drawn.map_or_else(
             || {
                 self.reveal(place);
@@ -887,11 +887,12 @@ impl SessionsView {
             self.library.update(cx, |library, cx| {
                 library.choose(chosen, (id, Some(index)), false, cx)
             });
+        } else if modifiers.secondary(cx) && library.is_selected(&id) {
+            self.library
+                .update(cx, |library, cx| library.unchoose(&id, cx));
         } else if modifiers.secondary(cx) {
             let mut chosen: HashSet<SessionId> = library.selection().into_iter().collect();
-            if !chosen.remove(&id) {
-                chosen.insert(id.clone());
-            }
+            chosen.insert(id.clone());
             self.library.update(cx, |library, cx| {
                 library.choose(chosen, (id, Some(index)), true, cx)
             });
@@ -1012,12 +1013,14 @@ impl SessionsView {
                     .gap(theme.spacing.lg)
                     .pr(theme.sizes.page_side)
                     .on_children_prepainted({
-                        let (drawn, start) = (self.drawn.clone(), places.start);
+                        let drawn = self.drawn.clone();
+                        let ids: Vec<SessionId> = (places.clone())
+                            .filter_map(|place| {
+                                Some(page.sessions.get(*self.shown.get(place)?)?.id.clone())
+                            })
+                            .collect();
                         move |bounds, _, _| {
-                            let mut drawn = drawn.borrow_mut();
-                            for (at, bounds) in bounds.into_iter().enumerate() {
-                                drawn.insert(start + at, bounds);
-                            }
+                            drawn.borrow_mut().extend(ids.iter().cloned().zip(bounds));
                         }
                     })
                     .children(places.clone().map(|place| {

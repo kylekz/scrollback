@@ -124,10 +124,16 @@ pub fn verdict(what: &Dragged, target: DropTarget, library: &LibraryService) -> 
             },
             DropTarget::Folder(folder),
         ) => {
+            /* As the catalogue refuses one (PLAN §8): the path held for the same location by
+            any folder, or by this one for a location that overlaps (either is for any). The
+            path being moved is not in the way of itself. */
             let holder = library.attached().iter().find(|it| {
+                let moved = Some(it.attached.folder) == *from && it.attached.location == *location;
                 it.attached.path == *normal
-                    && it.attached.location == *location
-                    && (it.attached.folder == folder || Some(it.attached.folder) != *from)
+                    && !moved
+                    && (it.attached.location == *location
+                        || (it.attached.folder == folder
+                            && (it.attached.location.is_none() || location.is_none())))
             });
             match holder {
                 Some(holder) => Verdict::Refuses(format!(
@@ -156,6 +162,8 @@ pub fn verdict(what: &Dragged, target: DropTarget, library: &LibraryService) -> 
                 Verdict::Refuses("can't go inside itself".to_string())
             } else if library.folder(*dragged).and_then(|it| it.parent) == Some(folder) {
                 Verdict::Refuses(format!("already in {}", name(folder)))
+            } else if let Some(why) = name_taken(library, *dragged, Some(folder)) {
+                Verdict::Refuses(why)
             } else {
                 Verdict::Takes {
                     result: name(folder),
@@ -166,6 +174,11 @@ pub fn verdict(what: &Dragged, target: DropTarget, library: &LibraryService) -> 
         (Dragged::Folder(dragged), DropTarget::Between { parent, .. }) => {
             if parent.is_some_and(|parent| inside(library, parent, *dragged)) {
                 Verdict::Refuses("can't go inside itself".to_string())
+            } else if let Some(why) = (library.folder(*dragged).and_then(|it| it.parent) != parent)
+                .then(|| name_taken(library, *dragged, parent))
+                .flatten()
+            {
+                Verdict::Refuses(why)
             } else {
                 Verdict::Takes {
                     result: parent.map_or_else(|| "the top".to_string(), name),
@@ -180,6 +193,24 @@ pub fn verdict(what: &Dragged, target: DropTarget, library: &LibraryService) -> 
         )
         | (_, DropTarget::Sidebar) => return None,
     })
+}
+
+/// Why `dragged` can't go into `parent`, or to the top: a folder there has its name.
+fn name_taken(
+    library: &LibraryService,
+    dragged: FolderId,
+    parent: Option<FolderId>,
+) -> Option<String> {
+    let name = &library.folder(dragged)?.name;
+    library
+        .name_taken(name, parent, Some(dragged))
+        .then(|| match parent {
+            Some(parent) => format!(
+                "a folder named {name} is in {} already",
+                library.folder_path(parent)
+            ),
+            None => format!("a folder named {name} is at the top already"),
+        })
 }
 
 /// Whether `folder` is `outer` or a folder inside it.

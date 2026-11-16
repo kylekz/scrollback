@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
-use sb_core::catalogue::{Catalogue, CatalogueError, Filed, Folder, SessionId, Shelf};
+use sb_core::catalogue::{Catalogue, CatalogueError, Filed, Folder, SessionId, Shelf, Undone};
 use sb_core::filing::{AttachedPath, FolderId, NormalPath};
 use sb_core::location::{LocationId, LocationKind};
 use sb_core::provider::{Hashed, RangeFailure};
@@ -407,12 +407,6 @@ fn two_folders_in_one_place_have_different_names_whatever_their_case() {
     let catalogue = bench.archive().catalogue();
     let work = catalogue.create_folder("work", None).unwrap();
     assert!(taken(catalogue.create_folder(" Work ", None)));
-    assert!(taken(catalogue.create_folder_with_path(
-        "WORK",
-        None,
-        "/home/user/code/work",
-        None
-    )));
 
     /* In another place the name is free, and a folder keeps its own in another case. */
     let inner = catalogue.create_folder("work", Some(work)).unwrap();
@@ -424,6 +418,75 @@ fn two_folders_in_one_place_have_different_names_whatever_their_case() {
         "work(Work notes)"
     );
     assert!(catalogue.attached_paths().unwrap().is_empty());
+    /* A folder keeps its name as it is, too. */
+    catalogue.rename_folder(notes, "notes").unwrap();
+
+    /* A move into a place with the name is refused; reordering where it is isn't. */
+    assert!(taken(catalogue.move_folder(inner, None, 0)));
+    catalogue.move_folder(inner, Some(work), 5).unwrap();
+    assert_eq!(
+        outline(&catalogue.folders().unwrap(), None),
+        "work(notes Work)"
+    );
+
+    /* New folder, twice before anything reads the folders, and with sessions: each takes the
+    next free name in its own change. */
+    let first = catalogue
+        .create_folder_with("New folder", None, &[])
+        .unwrap();
+    let second = catalogue
+        .create_folder_with("New folder", None, &[])
+        .unwrap();
+    let names = |catalogue: &Catalogue| {
+        catalogue
+            .folders()
+            .unwrap()
+            .into_iter()
+            .map(|it| it.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(catalogue),
+        ["work", "New folder", "New folder 2", "notes", "Work"]
+    );
+    /* Made from a path whose name a folder at the top has: it is "work 2". */
+    catalogue
+        .create_folder_with_path("work", None, "/home/user/code/work", None)
+        .unwrap();
+    assert!(names(catalogue).contains(&"work 2".to_string()));
+
+    /* Deleting a folder whose subfolder's name is its new siblings' renames the subfolder. */
+    catalogue.move_folder(second, Some(first), 0).unwrap();
+    catalogue.rename_folder(second, "work").unwrap();
+    assert_eq!(
+        catalogue.delete_folder(first).unwrap(),
+        [("work".to_string(), "work 3".to_string())]
+    );
+    assert!(names(catalogue).contains(&"work 3".to_string()));
+}
+
+#[test]
+fn new_folder_files_its_sessions_in_the_same_change() {
+    let mut bench = Bench::new(DbAgent::new());
+    let key = started(&mut bench.agent, "/home/user/notes");
+    bench.sync();
+    let id = bench.session_id(&key);
+    let catalogue = bench.archive().catalogue();
+    let gone = SessionId {
+        key: "deleted-for-good".to_string(),
+        ..id.clone()
+    };
+    /* With a session that isn't archived there is no folder. */
+    assert!(
+        catalogue
+            .create_folder_with("New folder", None, &[id.clone(), gone])
+            .is_err()
+    );
+    assert!(catalogue.folders().unwrap().is_empty());
+    let folder = catalogue
+        .create_folder_with("New folder", None, std::slice::from_ref(&id))
+        .unwrap();
+    assert_eq!(filed(catalogue, &id), Filed::ByHand(folder));
 }
 
 #[test]
@@ -997,7 +1060,7 @@ fn what_is_not_there_is_said_not_passed_over() {
     assert!(no_folder(catalogue.rename_folder(missing, "x")));
     assert!(no_folder(catalogue.move_folder(missing, None, 0)));
     assert!(no_folder(catalogue.move_folder(folder, Some(missing), 0)));
-    assert!(no_folder(catalogue.delete_folder(missing)));
+    assert!(no_folder(catalogue.delete_folder(missing).map(drop)));
     assert!(no_folder(catalogue.attach_path(
         missing,
         "/home/user/code",
@@ -1008,7 +1071,8 @@ fn what_is_not_there_is_said_not_passed_over() {
     ));
     assert_eq!(outline(&catalogue.folders().unwrap(), None), "work b c");
 
-    /* A name is some text, of no great length, and two folders may share one. */
+    /* A name is some text, of no great length, and two folders in different places may share
+    one. */
     for name in ["", "   ", &"n".repeat(201)] {
         assert!(matches!(
             catalogue.create_folder(name, None),
@@ -1037,10 +1101,11 @@ fn what_is_not_there_is_said_not_passed_over() {
     );
     assert_eq!(read_catalogue(bench.dir(), top), ["0", "1"]);
     catalogue.move_folder(b, None, 1).unwrap();
+    catalogue.rename_folder(twin, "twin").unwrap();
     catalogue.move_folder(twin, None, 1).unwrap();
     assert_eq!(read_catalogue(bench.dir(), top), ["0", "1", "2", "3"]);
     catalogue.delete_folder(folder).unwrap();
-    assert_eq!(outline(&catalogue.folders().unwrap(), None), "work b c");
+    assert_eq!(outline(&catalogue.folders().unwrap(), None), "twin b c");
     assert_eq!(read_catalogue(bench.dir(), top), ["0", "1", "2"]);
 
     /* Paths of a folder that is not there, and a path that is not attached. */
@@ -1296,34 +1361,49 @@ fn a_selection_is_filed_starred_and_trashed_in_one_step_and_undone_as_far_as_it_
         ]
     );
 
-    /* The Undo puts each back; a session deleted for good since is skipped, and so is one
-    whose folder went, which the rules file. */
+    /* The Undo puts each back; a session deleted for good since is left out, and one whose
+    folder went is filed by its path. Each is counted apart. */
     let undone = catalogue
         .refile_as(&[
             (one.clone(), Filed::ByHand(kept)),
             (gone.clone(), Filed::ByHand(kept)),
         ])
         .unwrap();
-    assert_eq!(undone.skipped, 1);
+    assert_eq!(
+        undone,
+        Undone {
+            gone: 1,
+            refiled: 0
+        }
+    );
     assert_eq!(filed(catalogue, &one), Filed::ByHand(kept));
     catalogue.delete_folder(kept).unwrap();
     let undone = catalogue
         .refile_as(&[(one.clone(), Filed::ByHand(kept))])
         .unwrap();
-    assert_eq!(undone.skipped, 1);
+    assert_eq!(
+        undone,
+        Undone {
+            gone: 0,
+            refiled: 1
+        }
+    );
     assert_eq!(filed(catalogue, &one), Filed::ByRule(app));
 
-    /* Starred together, or not at all. */
+    /* Starred together, or not at all: with one that isn't archived, the other keeps no star. */
     assert!(
         catalogue
             .set_starred_all(&[one.clone(), gone.clone()], true)
             .is_err()
     );
+    assert_eq!(catalogue.library_counts().unwrap().starred, 0);
     catalogue.set_starred_all(&both, true).unwrap();
     assert_eq!(catalogue.library_counts().unwrap().starred, 2);
 
-    /* To Trash together: only those not there already are moved; the Undo takes out those
-    still there. */
+    /* To Trash together, or not at all; only those not there already are moved; the Undo
+    takes out those still there, and one taken out already is where it puts it. */
+    assert!(catalogue.trash_all(&[one.clone(), gone.clone()]).is_err());
+    assert_eq!(catalogue.library_counts().unwrap().trash, 0);
     catalogue.trash(&two).unwrap();
     assert_eq!(
         catalogue.trash_all(&both).unwrap(),
@@ -1331,7 +1411,14 @@ fn a_selection_is_filed_starred_and_trashed_in_one_step_and_undone_as_far_as_it_
     );
     assert_eq!(catalogue.library_counts().unwrap().trash, 2);
     catalogue.restore(&two).unwrap();
-    assert_eq!(catalogue.restore_all(&both).unwrap().skipped, 1);
+    assert!(catalogue.restore_all(&both).unwrap().is_whole());
+    assert_eq!(
+        catalogue.restore_all(std::slice::from_ref(&gone)).unwrap(),
+        Undone {
+            gone: 1,
+            refiled: 0
+        }
+    );
     assert_eq!(catalogue.library_counts().unwrap().trash, 0);
 }
 

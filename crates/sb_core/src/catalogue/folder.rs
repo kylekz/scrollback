@@ -68,11 +68,18 @@ impl Catalogue {
      */
     pub fn create_folder(&self, name: &str, parent: Option<FolderId>) -> Result<FolderId> {
         let name = named(name)?;
-        self.db.write(|tx| create(tx, name, parent))
+        self.db.write(|tx| {
+            refuse_taken(tx, name, parent, None)?;
+            create(tx, name, parent)
+        })
     }
 
-    /// Makes a folder with a project path attached to it, as [`Catalogue::create_folder`] and
-    /// [`Catalogue::attach_path`] do, in one change: a path that is refused leaves no folder.
+    /**
+     * Makes a folder with a project path attached to it, as [`Catalogue::create_folder`] and
+     * [`Catalogue::attach_path`] do, in one change: a path that is refused leaves no folder.
+     * Where a folder in `parent` has the name, it takes the next free one, "app 2" (Unsorted's
+     * Create folder from this path, whose name the owner then changes in place).
+     */
     pub fn create_folder_with_path(
         &self,
         name: &str,
@@ -83,7 +90,7 @@ impl Catalogue {
         let name = named(name)?;
         let (typed, path) = self.typed_path(typed, location)?;
         self.db.write(|tx| {
-            let folder = create(tx, name, parent)?;
+            let folder = create(tx, &free_name(tx, name, parent, None)?, parent)?;
             attach(tx, folder, typed, &path, location)?;
             refile(tx)?;
             Ok(folder)
@@ -95,7 +102,7 @@ impl Catalogue {
         let name = named(name)?;
         self.db.write(|tx| {
             let parent = parent_of(tx, folder)?.map(FolderId);
-            free_name(tx, name, parent, Some(folder))?;
+            refuse_taken(tx, name, parent, Some(folder))?;
             tx.execute(
                 "UPDATE folder SET name = ?2 WHERE id = ?1",
                 params![folder.0, name],
@@ -104,9 +111,12 @@ impl Catalogue {
         })
     }
 
-    /// Moves a folder into `parent`, or to the top, as the one at `position` among the
-    /// folders there (counted from 0, without itself; past the end is the end). Nesting and
-    /// reordering are both this.
+    /**
+     * Moves a folder into `parent`, or to the top, as the one at `position` among the folders
+     * there (counted from 0, without itself; past the end is the end). Nesting and reordering
+     * are both this. A move into a place where a folder has its name is refused
+     * ([`CatalogueError::NameTaken`]); reordering among the folders it is with already is not.
+     */
     pub fn move_folder(
         &self,
         folder: FolderId,
@@ -122,6 +132,9 @@ impl Catalogue {
                 }
                 above = parent_of(tx, id)?.map(FolderId);
             }
+            if from != parent.map(|parent| parent.0) {
+                refuse_taken(tx, &name_of(tx, folder)?, parent, Some(folder))?;
+            }
             let parent = parent.map(|parent| parent.0);
             let mut siblings = children(tx, parent)?;
             siblings.retain(|id| *id != folder.0);
@@ -136,10 +149,13 @@ impl Catalogue {
         })
     }
 
-    /// Deletes a folder (PLAN §8): its subfolders move up to its parent, in its place; its
-    /// paths are dropped; and its sessions go to Unsorted, those filed by hand too, from where
-    /// the rules file them again.
-    pub fn delete_folder(&self, folder: FolderId) -> Result<()> {
+    /**
+     * Deletes a folder (PLAN §8): its subfolders move up to its parent, in its place; its paths
+     * are dropped; and its sessions go to Unsorted, those filed by hand too, from where the
+     * rules file them again. A subfolder whose name a folder there has takes the next free one,
+     * "work 2"; says which were renamed, from what to what.
+     */
+    pub fn delete_folder(&self, folder: FolderId) -> Result<Vec<(String, String)>> {
         self.db.write(|tx| {
             let parent = parent_of(tx, folder)?;
             let inside = children(tx, Some(folder.0))?;
@@ -165,7 +181,20 @@ impl Catalogue {
                 tx.execute(change, [folder.0])?;
             }
             order(tx, &siblings)?;
-            Ok(refile(tx)?)
+            let mut renamed = Vec::new();
+            for child in inside.into_iter().map(FolderId) {
+                let name = name_of(tx, child)?;
+                let free = free_name(tx, &name, parent.map(FolderId), Some(child))?;
+                if free != name {
+                    tx.execute(
+                        "UPDATE folder SET name = ?2 WHERE id = ?1",
+                        params![child.0, free],
+                    )?;
+                    renamed.push((name, free));
+                }
+            }
+            refile(tx)?;
+            Ok(renamed)
         })
     }
 
@@ -409,12 +438,18 @@ impl Catalogue {
     }
 }
 
-/// Makes the folder `name` in `parent`, or at the top, after the folders already there.
-fn create(connection: &Connection, name: &str, parent: Option<FolderId>) -> Result<FolderId> {
+/**
+ * Makes the folder `name` in `parent`, or at the top, after the folders already there. Its
+ * caller has made sure the name is free there.
+ */
+pub(super) fn create(
+    connection: &Connection,
+    name: &str,
+    parent: Option<FolderId>,
+) -> Result<FolderId> {
     if let Some(parent) = parent {
         parent_of(connection, parent)?;
     }
-    free_name(connection, name, parent, None)?;
     let parent = parent.map(|parent| parent.0);
     connection.execute(
         "INSERT INTO folder (parent_id, name, position)
@@ -504,32 +539,85 @@ fn detach(connection: &Connection, attached: &AttachedPath) -> Result<()> {
     Ok(())
 }
 
-/// Refuses `name` in `parent` when another folder there than `folder` has it, whatever its
-/// case.
-fn free_name(
+/**
+ * The names of the folders in `parent`, or at the top, but `except`'s, in lower case: what a
+ * name is compared with there. Two folders in one place don't share a name, whatever its case.
+ */
+fn names_in(
     connection: &Connection,
-    name: &str,
     parent: Option<FolderId>,
-    folder: Option<FolderId>,
-) -> Result<()> {
-    let taken = connection
+    except: Option<FolderId>,
+) -> Result<Vec<String>> {
+    Ok(connection
         .prepare("SELECT id, name FROM folder WHERE parent_id IS ?1")?
         .query_map([parent.map(|parent| parent.0)], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
-        .any(|(id, other)| {
-            Some(FolderId(id)) != folder && other.to_lowercase() == name.to_lowercase()
-        });
-    if taken {
+        .filter(|(id, _)| Some(FolderId(*id)) != except)
+        .map(|(_, name)| name.to_lowercase())
+        .collect())
+}
+
+/// Refuses `name` in `parent` when a folder there other than `except` has it.
+fn refuse_taken(
+    connection: &Connection,
+    name: &str,
+    parent: Option<FolderId>,
+    except: Option<FolderId>,
+) -> Result<()> {
+    if names_in(connection, parent, except)?.contains(&name.to_lowercase()) {
         return Err(CatalogueError::NameTaken(name.to_string()));
     }
     Ok(())
 }
 
+/**
+ * `name`, or where a folder in `parent` other than `except` has it, the first of "name 2",
+ * "name 3" and on that none has, cut to [`FOLDER_NAME_CHARS`].
+ */
+pub(super) fn free_name(
+    connection: &Connection,
+    name: &str,
+    parent: Option<FolderId>,
+    except: Option<FolderId>,
+) -> Result<String> {
+    let taken = names_in(connection, parent, except)?;
+    Ok((1..)
+        .map(|n| match n {
+            1 => name.to_string(),
+            n => {
+                let suffix = format!(" {n}");
+                let kept = FOLDER_NAME_CHARS - suffix.chars().count();
+                format!("{}{suffix}", name.chars().take(kept).collect::<String>())
+            }
+        })
+        .find(|it| !taken.contains(&it.to_lowercase()))
+        .unwrap_or_default())
+}
+
+/// The name of `folder`.
+fn name_of(connection: &Connection, folder: FolderId) -> Result<String> {
+    connection
+        .query_row("SELECT name FROM folder WHERE id = ?1", [folder.0], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .ok_or(CatalogueError::NoFolder(folder))
+}
+
+/// Whether there is a folder `folder`.
+pub(super) fn folder_exists(connection: &Connection, folder: FolderId) -> Result<bool> {
+    match parent_of(connection, folder) {
+        Ok(_) => Ok(true),
+        Err(CatalogueError::NoFolder(_)) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// A folder's name as it is kept: without the white space around it.
-fn named(name: &str) -> Result<&str> {
+pub(super) fn named(name: &str) -> Result<&str> {
     let name = name.trim();
     if name.is_empty() || name.chars().count() > FOLDER_NAME_CHARS {
         return Err(CatalogueError::FolderName);
@@ -576,8 +664,10 @@ pub(super) fn file_by_rule(
     Ok(folder.is_some())
 }
 
-/// Runs the rules over every indexed session that is not filed by hand nor in Trash, each by
-/// the project path its row has. A session in Trash is filed when it is restored.
+/**
+ * Runs the rules over every indexed session that is not filed by hand nor in Trash, each by
+ * the project path its row has. A session in Trash is filed when it is restored.
+ */
 fn refile(connection: &Connection) -> rusqlite::Result<()> {
     let attached = attached(connection)?;
     let filed: Vec<(SessionId, Option<NormalPath>, Option<i64>)> = connection

@@ -53,15 +53,19 @@ impl Global for Pressed {}
 /// Which drop target a place in a target's bounds is, for what is dragged.
 type Pick = Rc<dyn Fn(&Dragged, Bounds<Pixels>, Point<Pixels>) -> DropTarget>;
 
-/// The drop targets the last frame drew, in the order it drew them, each with what is visible
-/// of it.
+/**
+ * The drop targets the last frame drew, in the order it drew them, each with what is visible
+ * of it.
+ */
 #[derive(Default)]
 struct Targets(Vec<(Bounds<Pixels>, Pick)>);
 
 impl Global for Targets {}
 
-/// What letting go of the drag's source before it moved does: the click it was, with the
-/// modifiers held and where it was let go.
+/**
+ * What letting go of the drag's source before it moved does: the click it was, with the
+ * modifiers held and where it was let go.
+ */
 type Click = Rc<dyn Fn(Modifiers, Point<Pixels>, &mut Window, &mut App)>;
 
 #[derive(Default)]
@@ -81,8 +85,10 @@ const GHOST_HEIGHT: Pixels = px(30.);
 const PATH_GHOST_HEIGHT: Pixels = px(34.);
 const GHOST_PADDING: Pixels = px(12.);
 
-/// Remembers where a press went down; the shell calls it for every press, before anything
-/// else hears of it.
+/**
+ * Remembers where a press went down; the shell calls it for every press, before anything
+ * else hears of it.
+ */
 pub fn pressed(at: Point<Pixels>, cx: &mut App) {
     cx.set_global(Pressed(at));
 }
@@ -107,8 +113,10 @@ pub fn layer() -> AnyElement {
     .into_any_element()
 }
 
-/// Follows the pointer while something is dragged: whether it has moved far enough, and
-/// which target it is over.
+/**
+ * Follows the pointer while something is dragged: whether it has moved far enough, and
+ * which target it is over.
+ */
 pub fn moved(at: Point<Pixels>, cx: &mut App) {
     let from = cx.try_global::<Pressed>().copied().unwrap_or_default().0;
     let library = cx.services().library.clone();
@@ -133,8 +141,10 @@ pub fn end(window: &mut Window, cx: &mut App) {
     library.update(cx, |library, cx| library.set_drag(None, cx));
 }
 
-/// The left button let go while something is dragged: a drop where the pointer is, the click
-/// of a drag that never moved, or nothing.
+/**
+ * The left button let go while something is dragged: a drop where the pointer is, the click
+ * of a drag that never moved, or nothing.
+ */
 fn released(event: &MouseUpEvent, window: &mut Window, cx: &mut App) {
     let library = cx.services().library.clone();
     if library.read(cx).drag().is_none() {

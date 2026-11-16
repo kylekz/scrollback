@@ -449,11 +449,14 @@ impl UnsortedView {
                 }
                 _ => None,
             }
+        } else if secondary && library.is_selected(id) {
+            let id = id.clone();
+            self.library
+                .update(cx, |library, cx| library.unchoose(&id, cx));
+            return;
         } else if secondary {
             let mut chosen: HashSet<SessionId> = library.selection().into_iter().collect();
-            if !chosen.remove(id) {
-                chosen.insert(id.clone());
-            }
+            chosen.insert(id.clone());
             Some((chosen, true))
         } else {
             None
@@ -595,6 +598,7 @@ impl UnsortedView {
         let sync = self.sync.read(cx);
         let library = self.library.read(cx);
         let key = group_key(group);
+        let attach_key = key.clone();
         let open = !self.closed.contains(&key);
         let path = group_path(group);
         let creating = library.is_creating(&key);
@@ -756,8 +760,12 @@ impl UnsortedView {
                     this.child(
                         button(("attach", at), ButtonKind::Plain, true, true, theme)
                             .debug_selector(move || format!("unsorted-attach-{index}"))
+                            // The group by its key: a load may have moved it since it was drawn.
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                let Some(group) = this.library.read(cx).groups().get(index) else {
+                                let library = this.library.read(cx);
+                                let Some(group) = (library.groups().iter())
+                                    .find(|it| group_key(it) == attach_key)
+                                else {
                                     return;
                                 };
                                 let entries = this.attach_menu(group, cx);

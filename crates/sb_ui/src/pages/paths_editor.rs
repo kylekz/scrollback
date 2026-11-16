@@ -265,7 +265,6 @@ impl PathsEditor {
         after
     }
 
-    /// Why `path` can't be added now, if it can't.
     /**
      * Why `path` can't be added now, if it can't: as the catalogue refuses one (PLAN §8), a
      * path held by this folder for locations that overlap these (the same one, or either for
@@ -464,10 +463,7 @@ impl PathsEditor {
         if !self.is_pending() {
             return self.cancel(cx);
         }
-        let detach: Vec<TypedPath> = (self.kept.iter())
-            .filter(|kept| kept.removed)
-            .map(|kept| (kept.path.typed.clone(), kept.path.attached.location.clone()))
-            .collect();
+        let detach = self.detached();
         let name = self.library.read(cx).folder_path(self.folder);
         let said = format!("Paths of {name} saved");
         let (folder, attach) = (self.folder, std::mem::take(&mut self.added));
@@ -484,10 +480,18 @@ impl PathsEditor {
         cx.emit(PathsEditorEvent::Closed);
     }
 
-    /// Tells the library whether leaving waits on the owner.
+    /// The paths to be taken off, as typed and for their locations.
+    fn detached(&self) -> Vec<TypedPath> {
+        (self.kept.iter())
+            .filter(|kept| kept.removed)
+            .map(|kept| (kept.path.typed.clone(), kept.path.attached.location.clone()))
+            .collect()
+    }
+
+    /// Tells the library whether leaving waits on the owner, and what saving would change.
     fn held(&mut self, cx: &mut Context<Self>) {
-        let folder = self.is_pending().then_some(self.folder);
-        self.library.update(cx, |library, _| library.hold(folder));
+        let held = (self.is_pending()).then(|| (self.folder, self.detached(), self.added.clone()));
+        self.library.update(cx, |library, _| library.hold(held));
         cx.notify();
     }
 

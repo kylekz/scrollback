@@ -51,7 +51,7 @@ use crate::keymap;
 use crate::menu;
 use crate::pages::Showing;
 use crate::pages::menus::{self, FOLDER_MENU_WIDTH};
-use crate::services::library::LibraryEvent;
+use crate::services::library::{LibraryEvent, NEW_FOLDER};
 use crate::services::{ActiveServices as _, LibraryService, SyncService};
 use crate::services::{Dragged, DropTarget};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
@@ -414,7 +414,7 @@ impl Sidebar {
             _ => None,
         };
         self.library.update(cx, |library, cx| {
-            library.create_folder(library.fresh_name(parent), parent, cx);
+            library.create_folder(NEW_FOLDER.to_string(), parent, cx);
         });
     }
 
@@ -626,6 +626,12 @@ impl Sidebar {
         let folder = &library.folders()[row.folder];
         let id = folder.id;
         let name: SharedString = folder.name.clone().into();
+        // Automation's name for the row: the folder's, or its path where another has its name.
+        let target = if (library.folders().iter()).any(|it| it.id != id && it.name == folder.name) {
+            menus::folder_key(library, id)
+        } else {
+            folder.name.clone()
+        };
         let selected = marked == Some(id);
         let drag = library.drag();
         let targeted = drag.is_some_and(|drag| drag.targets(DropTarget::Folder(id), library));
@@ -922,7 +928,7 @@ impl Sidebar {
                                 ),
                             ),
                     })
-                    .automation_target_with(move || format!("sidebar/folder/{name}").into()),
+                    .automation_target_with(move || format!("sidebar/folder/{target}").into()),
             )
             .into_any_element()
     }
