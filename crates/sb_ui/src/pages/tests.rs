@@ -478,3 +478,26 @@ fn picking_a_row_closes_a_narrow_windows_sidebar(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("f6");
     assert_eq!(placement(cx), SidebarPlacement::Collapsed);
 }
+
+/** Every key the reader binds (`Enter` last: it opens the next session from a page of them). */
+const READER_KEYS: &str =
+    "[ ] up down right left space secondary-c pageup pagedown home end e e s s enter";
+
+#[gpui::test]
+fn the_readers_keys_do_nothing_while_a_session_opens_or_after_it_failed(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    let reader =
+        |cx: &mut VisualTestContext| cx.update(|_, cx| cx.services().reader.read(cx).state().key());
+    cx.simulate_keystrokes("right enter");
+    assert_eq!(reader(cx), "open");
+    /* `j` opens the next session, and the keys after it land before it is parsed. */
+    cx.simulate_keystrokes(&format!("j {READER_KEYS}"));
+    assert_eq!(reader(cx), "open");
+
+    /* A catalogue that has lost its versions cannot say what a session is made of. */
+    sb_test_support::edit_catalogue(&archive_dir(cx), "ALTER TABLE version RENAME TO lost");
+    cx.simulate_keystrokes("k");
+    assert_eq!(reader(cx), "failed");
+    cx.simulate_keystrokes(READER_KEYS);
+    assert_eq!(showing(cx), Showing::Session);
+}

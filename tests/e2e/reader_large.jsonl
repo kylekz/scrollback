@@ -1,14 +1,14 @@
 {"scenario": {"window_size": "1440x900", "fixture": "reader-large", "description": "The reader's budgets (docs/PLAN.md §14) on a session of 500 calls in a main transcript of about 100 MB, with subagents of a few hundred more: opened from fc's page, scrolled a screen at a time, its last call opened, Full calls and back. The steps' times are in the transcript; the assertions are on what is drawn"}}
 {"cmd": "wait_ready", "timeout_ms": 120000}
-{"cmd": "settle", "timeout_ms": 120000, "expect": {"pointer": "/library/counts/all", "equals": 8}}
+{"cmd": "settle", "timeout_ms": 120000, "expect": {"pointer": "/library/counts/all", "equals": 9}}
 {"cmd": "set_appearance", "material": "opaque"}
 {"cmd": "pin_appearance", "appearance": "dark"}
 {"cmd": "click", "target": "sidebar/folder/fc"}
-{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 5}}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 6}}
 
-// Opening: the header at once, then the column once the main transcript is parsed.
+// Opening: the header at once, then the column once the main transcript is parsed, within the budget of first paint (500 ms).
 {"cmd": "click", "target": "card/0/title"}
-{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/reader/state", "equals": "open"}, {"pointer": "/library/open", "equals": "A long session to measure the reader"}]}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/reader/state", "equals": "open"}, {"pointer": "/library/open", "equals": "A long session to measure the reader"}], "expect_result": {"pointer": "/elapsed_ms", "lte": 500}}
 {"cmd": "screenshot", "name": "large-top-1440-dark"}
 
 // A screen at a time, twenty times: each step waits for its frame.

@@ -19,8 +19,6 @@ pub mod library;
 mod location_tests;
 pub mod reader;
 #[cfg(test)]
-mod reader_tests;
-#[cfg(test)]
 mod scale;
 pub mod sync;
 #[cfg(test)]

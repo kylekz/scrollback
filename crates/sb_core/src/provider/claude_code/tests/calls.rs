@@ -60,7 +60,10 @@ fn a_session_with_a_call_of_each_kind_of_tool() {
         "structuredPatch": [], "originalFile": null,
     });
     t.result_with(&call, json!("The file was created."), false, written);
-    let call = t.call("Grep", json!({ "pattern": "fn main", "path": "src" }));
+    let call = t.call(
+        "Grep",
+        json!({ "pattern": "fn main", "path": "src", "type": "rust" }),
+    );
     let found = json!({ "mode": "content", "numFiles": 1, "numMatches": 2 });
     t.result_with(&call, json!("src/main.rs:10:fn main() {"), false, found);
     let call = t.call("Glob", json!({ "pattern": "**/*.rs" }));
@@ -105,7 +108,7 @@ fn a_session_with_a_call_of_each_kind_of_tool() {
     Ok Changed { added: 2, removed: 1 } "The file was updated."
   Write: write /home/user/code/app/notes.md: "# Notes\n"
     Ok Written { new: true, lines: 1 } "The file was created."
-  Grep: content search "fn main" in Some("src")
+  Grep: content search "fn main" in Some("src") of Some("rust")
     Ok Matches(2) "src/main.rs:10:fn main() {"
   Glob: file search "**/*.rs" in None
     Ok Matches(1) "src/main.rs"
@@ -187,6 +190,22 @@ fn tool_names_map_to_the_common_kinds() {
         ("bash", ToolKind::Other),
     ] {
         assert_eq!(tools::kind(name), kind, "{name}");
+    }
+}
+
+#[test]
+fn each_mapped_tool_has_the_label_its_row_shows() {
+    for (name, label) in [
+        ("Bash", Some("bash")),
+        ("TodoWrite", Some("todos")),
+        ("Agent", Some("agent")),
+        ("Task", Some("agent")),
+        ("WebSearch", Some("search")),
+        ("WebFetch", Some("fetch")),
+        ("mcp__tracker__search_issues", Some("mcp")),
+        ("Teleport", None),
+    ] {
+        assert_eq!(tools::label(name), label, "{name}");
     }
 }
 

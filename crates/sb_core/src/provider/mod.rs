@@ -205,6 +205,13 @@ pub trait Provider: Send + Sync {
         model.to_string()
     }
 
+    /// The short label an activity row gives a call of the tool `name` (DESIGN §4.2.3: `bash`,
+    /// `todos`, `fetch`); `None` for a tool the provider doesn't label, which is shown by its
+    /// own name.
+    fn tool_label(&self, _name: &str) -> Option<&'static str> {
+        None
+    }
+
     /**
      * Whether the agent is present at the location behind `transport`; where it is, its data
      * there for one pass, which may borrow from the provider. `scratch` is a folder on this

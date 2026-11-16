@@ -163,11 +163,13 @@ impl From<Problem> for io::Error {
 /**
  * Segments readers decoded and checked, kept to be read again without decoding them anew: a
  * reader that opens one body after another of a session (PLAN §9) reads the same few segments.
- * It holds the `capacity` segments read last, each up to [`SEGMENT_BYTES`]. A stored segment
- * never changes, so a kept one is always its file's bytes.
+ * It holds the segments read last, at most `segments` of them and `bytes` together (each is up
+ * to [`SEGMENT_BYTES`]). A stored segment never changes, so a kept one is always its file's
+ * bytes.
  */
 pub struct SegmentCache {
-    capacity: usize,
+    segments: usize,
+    bytes: usize,
     /// The one read last at the back.
     kept: Mutex<VecDeque<Kept>>,
 }
@@ -180,10 +182,11 @@ struct Kept {
 }
 
 impl SegmentCache {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(segments: usize, bytes: usize) -> Self {
         Self {
-            capacity,
-            kept: Mutex::new(VecDeque::with_capacity(capacity)),
+            segments,
+            bytes,
+            kept: Mutex::new(VecDeque::with_capacity(segments)),
         }
     }
 
@@ -199,12 +202,14 @@ impl SegmentCache {
     }
 
     fn put(&self, path: PathBuf, hash: Hash, bytes: Arc<Vec<u8>>) {
-        if self.capacity == 0 {
+        if self.segments == 0 || bytes.len() > self.bytes {
             return;
         }
         let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
         kept.retain(|it| it.file != path);
-        if kept.len() == self.capacity {
+        while kept.len() >= self.segments
+            || kept.iter().map(|it| it.bytes.len()).sum::<usize>() + bytes.len() > self.bytes
+        {
             kept.pop_front();
         }
         kept.push_back(Kept {
@@ -400,6 +405,29 @@ impl Read for VersionReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cache_keeps_what_its_count_and_its_bytes_allow_the_last_read_last() {
+        let cache = SegmentCache::new(3, 10);
+        let hash = Hash::of(b"");
+        let put = |name: &str, bytes: usize| {
+            cache.put(PathBuf::from(name), hash, Arc::new(vec![0; bytes]));
+        };
+        let kept = |name: &str| cache.get(Path::new(name), hash).is_some();
+        put("a", 4);
+        put("b", 4);
+        // Reading a again makes b the oldest; c needs b's room.
+        assert!(kept("a"));
+        put("c", 4);
+        assert!(!kept("b") && kept("a") && kept("c"));
+        // Over the bytes on its own: not kept, and nothing is given way for it.
+        put("huge", 11);
+        assert!(!kept("huge") && kept("a") && kept("c"));
+        // The count bounds it too.
+        put("d", 1);
+        put("e", 1);
+        assert!(!kept("a") && kept("c") && kept("d") && kept("e"));
+    }
 
     #[test]
     fn a_range_is_cut_into_segments_wherever_its_writes_fall() {

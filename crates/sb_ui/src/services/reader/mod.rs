@@ -11,43 +11,53 @@
 //! (the owner went back, or on to another session) is dropped, so no view is ever handed
 //! another session's content. A parse can't be stopped half-way; going back drops its result.
 //!
-//! **Loading.** What a parse leaves where it is archived ([`sb_core::transcript::Stored`]) is
-//! loaded when a view first draws it: a call's body when its row is expanded, a subagent's
-//! conversation when its call is, a compaction's summary, a prompt's images. Each load is a
-//! background job ([`Load`]), reading the items at the versions the parse read
-//! ([`Pinned`]) through a [`SegmentCache`] of the last few segments decoded, so opening one
-//! row after another near the end of a long transcript decodes its last segment once.
+//! **Loading.** What the views draw is prepared when they first draw it, each on a background
+//! task ([`Load`]): a prompt's or a reply's prose ([`Prose`]: cut into pieces, sanitised), a
+//! call's body when its row is open, a subagent's conversation when its call is, a
+//! compaction's summary, an image ([`Picture`]: one bounded frame). The first few prompts and
+//! replies are prepared with the parse, so the first turns paint with it. Loads read the items
+//! at the versions the parse read ([`Pinned`]) through a [`SegmentCache`] of the last segments
+//! decoded, so opening one row after another near the end of a long transcript decodes its
+//! last segment once. Which subagent started which ([`Placement`]) is worked out once the
+//! subagents no call of the session's own started come into view.
+//!
+//! **Letting go.** The views say what they have scrolled far from ([`ReaderService::release`]):
+//! its prose, bodies and images are dropped, an image's texture with it, and prepared again if
+//! it comes back. Closing the reader drops all of it, off the UI thread.
 //!
 //! **What is shown open.** The Activity / Full calls switch is the app's, not a session's
 //! (DESIGN §4.2.1). Each row the owner opens or closes by hand is a [`Toggle`]: in Activity a
 //! toggle opens a row; in Full calls, where every call, thought and subagent's call list is
 //! open, it closes one until the switch is flipped again (DESIGN §4.2.3).
-//!
-//! Closing the reader drops all of it, off the UI thread.
 
-use std::collections::{HashMap, HashSet};
-use std::io::Cursor;
-use std::ops::Range;
+pub mod picture;
+pub mod prose;
+#[cfg(test)]
+mod tests;
+pub mod text;
+
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use gpui::{AppContext as _, Context, Entity, ImageFormat, Subscription};
+use gpui::{AppContext as _, Context, Entity, Subscription};
 use sb_core::archive::{Archive, ArchivedSession, Pinned, SegmentCache};
 use sb_core::catalogue::SessionId;
 use sb_core::provider::{ItemKind, Provider, SessionItems};
-use sb_core::transcript::{BlockId, Content, Conversation, Image, Output, Subagent, ToolCall};
+use sb_core::transcript::{BlockId, Content, Conversation, Output, Subagent, ToolCall};
 
 use super::{ArchiveService, LibraryService, Providers};
-use crate::markdown::Sanitized;
+pub use picture::Picture;
+pub use prose::{Piece, Prose};
+pub use text::Text;
 
-/// How many decoded segments an open session keeps: each is up to 8 MiB.
+/// How many decoded segments an open session keeps, and how many bytes of them: a segment is
+/// up to 8 MiB.
 const CACHED_SEGMENTS: usize = 4;
+const CACHED_BYTES: usize = 32 * 1024 * 1024;
 
-/// The most of a line a call body draws; the rest is clipped by the body anyway.
-const LINE_BYTES: usize = 512;
-
-/// A body over this is sanitised with the parse, off the UI thread; a smaller one is sanitised
-/// when its row is first drawn, which costs well under a millisecond.
-pub const SANITIZE_ON_DRAW_BYTES: usize = 4 * 1024;
+/// How many of the first prompts and replies of the session's own conversation are prepared
+/// with the parse, so that the first turns paint with it: those of at most a piece each.
+const EAGER_PROSE: usize = 24;
 
 /// A block of one of the session's conversations: the session's own, or a subagent's, named by
 /// the item it was parsed from.
@@ -66,11 +76,35 @@ pub enum Load<T> {
     Failed(String),
 }
 
+/// Where an image is in its block: among a prompt's, or among a call's output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Slot {
+    Prompt(usize),
+    Output(usize),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ImageKey {
+    pub at: BlockRef,
+    pub slot: Slot,
+}
+
+/// What the views can let go of ([`ReaderService::release`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Held {
+    /// A block's prose: a prompt's, a reply's, a thought's, a compaction's summary.
+    Prose(BlockRef),
+    Body(BlockRef),
+    Image(ImageKey),
+}
+
 /// A row the owner opened or closed by hand (the module docs).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Toggle {
-    /// A call's body, or a subagent's panel.
+    /// A call's body, or the panels of the subagents it started.
     Call(BlockRef),
+    /// A call that started subagents: its own input and output.
+    CallIo(BlockRef),
     Thought(BlockRef),
     /// A compaction's summary.
     Summary(BlockRef),
@@ -83,6 +117,8 @@ pub enum Toggle {
     /// Every line of a part of a call's body, not only its first: the input (`None`) or the
     /// output part at its place.
     AllLines(BlockRef, Option<usize>),
+    /// Every line of a piece of prose shown as plain text.
+    ProseLines(BlockRef, usize),
 }
 
 impl Toggle {
@@ -104,75 +140,33 @@ pub struct SubagentRead {
     pub conversation: Conversation,
 }
 
-/// Text as a call body shows it: whole, and cut into lines, each at most [`LINE_BYTES`] long.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Text {
-    pub text: String,
-    lines: Vec<Range<usize>>,
-}
-
-impl Text {
-    pub fn new(text: String) -> Self {
-        let mut lines = Vec::new();
-        let mut start = 0;
-        for line in text.split_inclusive('\n') {
-            let shown = line.trim_end_matches(['\n', '\r']);
-            let mut end = shown.len().min(LINE_BYTES);
-            while !shown.is_char_boundary(end) {
-                end -= 1;
-            }
-            lines.push(start..start + end);
-            start += line.len();
-        }
-        Self { text, lines }
-    }
-
-    pub fn line_count(&self) -> usize {
-        self.lines.len()
-    }
-
-    /// The lines `range`, joined: what a body draws of them.
-    pub fn lines(&self, range: Range<usize>) -> String {
-        self.lines[range.start.min(self.lines.len())..range.end.min(self.lines.len())]
-            .iter()
-            .map(|line| &self.text[line.clone()])
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-}
-
-/// An image from the transcript, ready to draw.
-#[derive(Clone, Debug)]
-pub struct Picture {
-    pub image: Arc<gpui::Image>,
-    pub media_type: String,
-    /// Its size in pixels, from its header.
-    pub width: u32,
-    pub height: u32,
-    /// How many bytes it is.
-    pub bytes: usize,
-}
-
-impl PartialEq for Picture {
-    fn eq(&self, other: &Self) -> bool {
-        self.image.id() == other.image.id()
-    }
-}
-
-impl Eq for Picture {}
-
-/// One part of what a tool returned.
+/// One part of what a tool returned: text, or an image ([`Slot::Output`]) loaded on its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Part {
-    Text(Result<Text, String>),
-    Image(Result<Picture, String>),
+    Text(Result<Arc<Text>, String>),
+    Image,
 }
 
 /// A call's body: its input as it was sent, and its output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallBody {
-    pub input: Result<Text, String>,
+    pub input: Result<Arc<Text>, String>,
     pub output: Vec<Part>,
+}
+
+/// What a subagent says it is, from its own record of itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Names {
+    pub kind: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Which subagent started which, from reading every subagent of the session.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Placement {
+    /// Each subagent started by another subagent's call, and that other subagent.
+    pub parents: HashMap<Arc<str>, Arc<str>>,
+    pub names: HashMap<Arc<str>, Names>,
 }
 
 /// The session's main transcript is gone at its location (DESIGN §4.14).
@@ -193,20 +187,20 @@ pub struct OpenSession {
     cache: Arc<SegmentCache>,
     /// The session's own conversation; `None` when its items hold no main transcript.
     main: Option<Conversation>,
-    /// The subagents no call is known to have started, by item.
+    /// The subagents no call of the session's own conversation started, by item. Until
+    /// [`Placement`] is worked out, those started by another subagent are among them.
     unattached: Vec<Arc<str>>,
     /// Why a read failed for a reason that is not the stored bytes (a file in use, a disk
     /// error): what was parsed around it is then not all the session holds, and opening it
     /// again may read more.
     fault: Option<String>,
     gone: Option<Gone>,
-    /// Bodies over [`SANITIZE_ON_DRAW_BYTES`], sanitised with the parse or the subagent's read.
-    prose: HashMap<BlockRef, Sanitized>,
+    prose: HashMap<BlockRef, Load<Arc<Prose>>>,
     subagents: HashMap<Arc<str>, Load<Arc<SubagentRead>>>,
     bodies: HashMap<BlockRef, Load<Arc<CallBody>>>,
-    summaries: HashMap<BlockRef, Load<Sanitized>>,
     raws: HashMap<BlockRef, Load<Arc<Text>>>,
-    images: HashMap<(BlockRef, usize), Load<Picture>>,
+    images: HashMap<ImageKey, Load<Picture>>,
+    placement: Option<Load<Arc<Placement>>>,
     /// The rows opened by hand in Activity, and closed by hand in Full calls.
     opened: HashSet<Toggle>,
     closed: HashSet<Toggle>,
@@ -217,8 +211,35 @@ impl OpenSession {
         self.main.as_ref()
     }
 
-    pub fn unattached(&self) -> &[Arc<str>] {
-        &self.unattached
+    /// The subagents no call is known to have started; `None` until that is known, while
+    /// some of them may have been started by another subagent.
+    pub fn unattached(&self) -> Option<Vec<Arc<str>>> {
+        match &self.placement {
+            _ if self.unattached.is_empty() => Some(Vec::new()),
+            Some(Load::Loaded(placement)) => Some(
+                self.unattached
+                    .iter()
+                    .filter(|item| !placement.parents.contains_key(*item))
+                    .cloned()
+                    .collect(),
+            ),
+            Some(Load::Failed(_)) => Some(self.unattached.clone()),
+            _ => None,
+        }
+    }
+
+    /// What the subagent `item` says it is, once read or placed.
+    pub fn names(&self, item: &str) -> Names {
+        if let Some(Load::Loaded(read)) = self.subagents.get(item) {
+            return Names {
+                kind: read.kind.clone(),
+                description: read.description.clone(),
+            };
+        }
+        match &self.placement {
+            Some(Load::Loaded(placement)) => placement.names.get(item).cloned().unwrap_or_default(),
+            _ => Names::default(),
+        }
     }
 
     pub fn fault(&self) -> Option<&str> {
@@ -257,28 +278,20 @@ impl OpenSession {
         self.subagents.get(item)
     }
 
-    pub fn body(&self, at: &BlockRef) -> Option<&Load<Arc<CallBody>>> {
-        self.bodies.get(at)
+    pub fn prose(&self, at: &BlockRef) -> Option<&Load<Arc<Prose>>> {
+        self.prose.get(at)
     }
 
-    pub fn summary(&self, at: &BlockRef) -> Option<&Load<Sanitized>> {
-        self.summaries.get(at)
+    pub fn body(&self, at: &BlockRef) -> Option<&Load<Arc<CallBody>>> {
+        self.bodies.get(at)
     }
 
     pub fn raw(&self, at: &BlockRef) -> Option<&Load<Arc<Text>>> {
         self.raws.get(at)
     }
 
-    pub fn image(&self, at: &BlockRef, index: usize) -> Option<&Load<Picture>> {
-        self.images.get(&(at.clone(), index))
-    }
-
-    /// A prompt's or a reply's text, sanitised: with the parse when it is large, else now.
-    pub fn prose(&self, at: &BlockRef, text: &str) -> Sanitized {
-        self.prose
-            .get(at)
-            .cloned()
-            .unwrap_or_else(|| Sanitized::new(text))
+    pub fn image(&self, key: &ImageKey) -> Option<&Load<Picture>> {
+        self.images.get(key)
     }
 
     /// Whether `toggle` is open, with Full calls on or off.
@@ -291,7 +304,7 @@ impl OpenSession {
     }
 
     /// What is loading or loaded, by kind, for automation's `state`.
-    pub fn loads(&self) -> [(&'static str, usize, usize); 4] {
+    pub fn loads(&self) -> [(&'static str, usize, usize); 5] {
         fn count<K, T>(map: &HashMap<K, Load<T>>) -> (usize, usize) {
             let loaded = map
                 .values()
@@ -303,9 +316,41 @@ impl OpenSession {
         [
             row("bodies", count(&self.bodies)),
             row("subagents", count(&self.subagents)),
-            row("summaries", count(&self.summaries)),
+            row("prose", count(&self.prose)),
             row("images", count(&self.images)),
+            row("raws", count(&self.raws)),
         ]
+    }
+
+    /// Keeps a subagent's conversation just read, with the subagents it read in place (whose
+    /// records are in its own transcript) moved out of it, and those its calls started placed
+    /// under them rather than with the ones no call is known to have started.
+    fn take_in(
+        &mut self,
+        kind: Option<String>,
+        description: Option<String>,
+        mut conversation: Conversation,
+    ) -> Arc<SubagentRead> {
+        let mut found = Vec::new();
+        settle(&mut conversation, &mut found);
+        let started: Vec<Arc<str>> = conversation
+            .blocks()
+            .iter()
+            .filter_map(|block| match &block.content {
+                Content::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .flat_map(|call| call.subagents.iter().map(|it| it.item().clone()))
+            .collect();
+        self.unattached.retain(|item| !started.contains(item));
+        for (item, read) in found {
+            self.subagents.insert(item, Load::Loaded(read));
+        }
+        Arc::new(SubagentRead {
+            kind,
+            description,
+            conversation,
+        })
     }
 }
 
@@ -417,8 +462,7 @@ impl ReaderService {
         let ReaderState::Open(open) = &mut self.state else {
             return;
         };
-        let by_full_calls = full_calls && toggle.opened_by_full_calls();
-        let set = if by_full_calls {
+        let set = if full_calls && toggle.opened_by_full_calls() {
             &mut open.closed
         } else {
             &mut open.opened
@@ -427,6 +471,30 @@ impl ReaderService {
             set.insert(toggle);
         }
         cx.notify();
+    }
+
+    /// Lets go of what the views have scrolled far from (the module docs).
+    pub fn release(&mut self, held: Vec<Held>, cx: &mut Context<Self>) {
+        let ReaderState::Open(open) = &mut self.state else {
+            return;
+        };
+        let mut released = false;
+        for held in held {
+            released |= match held {
+                Held::Prose(at) => open.prose.remove(&at).is_some(),
+                Held::Body(at) => open.bodies.remove(&at).is_some(),
+                Held::Image(key) => match open.images.remove(&key) {
+                    Some(Load::Loaded(picture)) => {
+                        cx.drop_image(picture.image, None);
+                        true
+                    }
+                    other => other.is_some(),
+                },
+            };
+        }
+        if released {
+            cx.notify();
+        }
     }
 
     /// Opens the session the library has open, or closes the reader when it has none.
@@ -456,15 +524,24 @@ impl ReaderService {
         self.generation += 1;
         self.loading = 0;
         let before = std::mem::replace(&mut self.state, ReaderState::Closed);
+        if let ReaderState::Open(open) = &before {
+            for image in open.images.values() {
+                if let Load::Loaded(picture) = image {
+                    cx.drop_image(picture.image.clone(), None);
+                }
+            }
+        }
         cx.background_spawn(async move { drop(before) }).detach();
         cx.notify();
     }
 
     fn open(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.close(cx);
+        /* Without the archive there is nothing to read: the reader stays closed rather than
+        show the session it had. */
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return;
         };
-        self.close(cx);
         self.state = ReaderState::Opening(id.clone());
         let generation = self.generation;
         let providers = self.providers.clone();
@@ -503,7 +580,7 @@ impl ReaderService {
         &mut self,
         claim: impl FnOnce(&mut OpenSession) -> bool,
         work: impl FnOnce(&dyn Provider, &ArchivedSession) -> T + Send + 'static,
-        done: impl FnOnce(&mut OpenSession, T) + 'static,
+        done: impl FnOnce(&mut OpenSession, T, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) {
         let ReaderState::Open(open) = &mut self.state else {
@@ -531,13 +608,57 @@ impl ReaderService {
                 }
                 this.loading -= 1;
                 if let ReaderState::Open(open) = &mut this.state {
-                    done(open, value);
+                    done(open, value, cx);
                 }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Prepares the prose of the block at `at`: a prompt, a reply, a thought, or a
+    /// compaction's summary.
+    pub fn want_prose(&mut self, at: &BlockRef, cx: &mut Context<Self>) {
+        enum Source {
+            Markdown(String),
+            Plain(String),
+            Stored(sb_core::transcript::Stored),
+        }
+        let source = match self
+            .open_session()
+            .and_then(|open| open.block(at))
+            .map(|block| &block.content)
+        {
+            Some(Content::Prompt { text, .. } | Content::Reply { text }) => {
+                Source::Markdown(text.clone())
+            }
+            Some(Content::Thinking { text, .. }) => Source::Plain(text.clone()),
+            Some(Content::Compaction {
+                summary: Some(summary),
+                ..
+            }) => Source::Stored(summary.clone()),
+            _ => return,
+        };
+        let key = at.clone();
+        self.load(
+            |open| claim(&mut open.prose, &key),
+            move |_, items| match source {
+                Source::Markdown(text) => Ok(Arc::new(Prose::markdown(&text))),
+                Source::Plain(text) => Ok(Arc::new(Prose::plain(&text))),
+                Source::Stored(stored) => stored
+                    .load_text(items)
+                    .map(|text| Arc::new(Prose::markdown(&text)))
+                    .map_err(|error| error.to_string()),
+            },
+            {
+                let at = at.clone();
+                move |open, prose, _| {
+                    open.prose.insert(at, loaded(prose));
+                }
+            },
+            cx,
+        );
     }
 
     /// Loads the body of the call at `at`, unless it is loading or loaded.
@@ -553,28 +674,25 @@ impl ReaderService {
         self.load(
             |open| claim(&mut open.bodies, &key),
             move |_, items| {
+                let text = |text: Result<String, _>| {
+                    text.map(|text| Arc::new(Text::new(text)))
+                        .map_err(|error: sb_core::transcript::LoadError| error.to_string())
+                };
                 Arc::new(CallBody {
-                    input: input
-                        .load_text(items)
-                        .map(|text| Text::new(pretty(text)))
-                        .map_err(|error| error.to_string()),
+                    input: text(input.load_text(items).map(pretty)),
                     output: output
                         .unwrap_or_default()
                         .iter()
                         .map(|part| match part {
-                            Output::Text(text) => Part::Text(
-                                text.load_text(items)
-                                    .map(Text::new)
-                                    .map_err(|error| error.to_string()),
-                            ),
-                            Output::Image(image) => Part::Image(picture(image, items)),
+                            Output::Text(stored) => Part::Text(text(stored.load_text(items))),
+                            Output::Image(_) => Part::Image,
                         })
                         .collect(),
                 })
             },
             {
                 let at = at.clone();
-                move |open, body| {
+                move |open, body, _| {
                     open.bodies.insert(at, Load::Loaded(body));
                 }
             },
@@ -591,7 +709,7 @@ impl ReaderService {
             move |provider, items| provider.subagent(items, &read),
             {
                 let item = item.clone();
-                move |open, subagent| {
+                move |open, subagent, _| {
                     let loaded = match subagent {
                         Subagent::Read {
                             kind,
@@ -609,34 +727,59 @@ impl ReaderService {
         );
     }
 
-    /// Loads a compaction's summary.
-    pub fn want_summary(&mut self, at: &BlockRef, cx: &mut Context<Self>) {
-        let Some(Content::Compaction {
-            summary: Some(summary),
-            ..
-        }) = self
-            .open_session()
-            .and_then(|open| open.block(at))
-            .map(|block| &block.content)
-        else {
+    /**
+     * Works out which subagent started which (the module docs): reads every subagent the
+     * session has, keeping only what each says it is and the subagents its calls started.
+     * Wanted once those no call of the session's own started come into view.
+     */
+    pub fn want_placement(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.open_session() else {
             return;
         };
-        let summary = summary.clone();
-        let key = at.clone();
+        let mut first: Vec<Arc<str>> = open.unattached.clone();
+        if let Some(main) = &open.main {
+            first.extend(
+                main.calls()
+                    .flat_map(|(_, call)| call.subagents.iter().map(|it| it.item().clone())),
+            );
+        }
         self.load(
-            |open| claim(&mut open.summaries, &key),
-            move |_, items| {
-                summary
-                    .load_text(items)
-                    .map(|text| Sanitized::new(&text))
-                    .map_err(|error| error.to_string())
-            },
-            {
-                let at = at.clone();
-                move |open, summary| {
-                    open.summaries.insert(at, loaded(summary));
+            |open| {
+                if open.placement.is_some() {
+                    return false;
                 }
+                open.placement = Some(Load::Loading);
+                true
             },
+            move |provider, items| {
+                let mut placement = Placement::default();
+                let mut seen: HashSet<Arc<str>> = first.iter().cloned().collect();
+                let mut queue: VecDeque<Arc<str>> = first.into();
+                while let Some(item) = queue.pop_front() {
+                    let Subagent::Read {
+                        kind,
+                        description,
+                        conversation,
+                    } = provider.subagent(items, &item)
+                    else {
+                        continue;
+                    };
+                    placement
+                        .names
+                        .insert(item.clone(), Names { kind, description });
+                    for (_, call) in conversation.calls() {
+                        for child in &call.subagents {
+                            let child = child.item().clone();
+                            placement.parents.insert(child.clone(), item.clone());
+                            if seen.insert(child.clone()) {
+                                queue.push_back(child);
+                            }
+                        }
+                    }
+                }
+                Arc::new(placement)
+            },
+            |open, placement, _| open.placement = Some(Load::Loaded(placement)),
             cx,
         );
     }
@@ -661,7 +804,7 @@ impl ReaderService {
             },
             {
                 let at = at.clone();
-                move |open, raw| {
+                move |open, raw, _| {
                     open.raws.insert(at, loaded(raw));
                 }
             },
@@ -669,68 +812,46 @@ impl ReaderService {
         );
     }
 
-    /// Loads the `index`th image of the prompt at `at`.
-    pub fn want_image(&mut self, at: &BlockRef, index: usize, cx: &mut Context<Self>) {
-        let Some(Content::Prompt { images, .. }) = self
-            .open_session()
-            .and_then(|open| open.block(at))
-            .map(|block| &block.content)
-        else {
+    /// Decodes an image: one of a prompt's, or one a call returned.
+    pub fn want_image(&mut self, key: &ImageKey, cx: &mut Context<Self>) {
+        let image = match (
+            self.open_session()
+                .and_then(|open| open.block(&key.at))
+                .map(|block| &block.content),
+            key.slot,
+        ) {
+            (Some(Content::Prompt { images, .. }), Slot::Prompt(index)) => images.get(index),
+            (Some(Content::ToolCall(call)), Slot::Output(index)) => {
+                call.result
+                    .as_ref()
+                    .and_then(|result| match result.output.get(index)? {
+                        Output::Image(image) => Some(image),
+                        Output::Text(_) => None,
+                    })
+            }
+            _ => None,
+        };
+        let Some(image) = image.cloned() else {
             return;
         };
-        let Some(image) = images.get(index).cloned() else {
-            return;
-        };
-        let key = (at.clone(), index);
+        let claimed = key.clone();
         self.load(
-            |open| claim(&mut open.images, &key),
-            move |_, items| picture(&image, items),
+            |open| claim(&mut open.images, &claimed),
+            move |_, items| {
+                image
+                    .data
+                    .load(items)
+                    .map_err(|error| error.to_string())
+                    .and_then(|bytes| picture::decode(&image.media_type, &bytes))
+            },
             {
-                let key = (at.clone(), index);
-                move |open, picture| {
+                let key = key.clone();
+                move |open, picture, _| {
                     open.images.insert(key, loaded(picture));
                 }
             },
             cx,
         );
-    }
-}
-
-impl OpenSession {
-    /// Keeps a subagent's conversation just read: its large bodies sanitised, and the
-    /// subagents it read in place (whose records are in its own transcript) moved out of it.
-    fn take_in(
-        &mut self,
-        kind: Option<String>,
-        description: Option<String>,
-        mut conversation: Conversation,
-    ) -> Arc<SubagentRead> {
-        let mut found = Vec::new();
-        settle(&mut conversation, &mut self.prose, &mut found);
-        /* A subagent its calls started is placed under them now, not with those no call is
-        known to have started. */
-        let started: Vec<Arc<str>> = conversation
-            .blocks()
-            .iter()
-            .filter_map(|block| match &block.content {
-                Content::ToolCall(call) => Some(call),
-                _ => None,
-            })
-            .flat_map(|call| {
-                call.subagents
-                    .iter()
-                    .map(|subagent| subagent.item().clone())
-            })
-            .collect();
-        self.unattached.retain(|item| !started.contains(item));
-        for (item, read) in found {
-            self.subagents.insert(item, Load::Loaded(read));
-        }
-        Arc::new(SubagentRead {
-            kind,
-            description,
-            conversation,
-        })
     }
 }
 
@@ -758,59 +879,11 @@ fn pretty(text: String) -> String {
         .unwrap_or(text)
 }
 
-/// An image from the transcript, decoded far enough to know its size. Only raster formats are
-/// drawn: an SVG can name files and addresses to load.
-fn picture(image: &Image, items: &dyn SessionItems) -> Result<Picture, String> {
-    let format = match image.media_type.as_str() {
-        "image/png" => ImageFormat::Png,
-        "image/jpeg" | "image/jpg" => ImageFormat::Jpeg,
-        "image/gif" => ImageFormat::Gif,
-        "image/webp" => ImageFormat::Webp,
-        other => return Err(format!("{other} images aren't shown")),
-    };
-    let bytes = image.data.load(items).map_err(|error| error.to_string())?;
-    let (width, height) = image::ImageReader::new(Cursor::new(&bytes))
-        .with_guessed_format()
-        .map_err(|error| error.to_string())?
-        .into_dimensions()
-        .map_err(|error| format!("the image can't be read: {error}"))?;
-    Ok(Picture {
-        media_type: image.media_type.clone(),
-        width,
-        height,
-        bytes: bytes.len(),
-        image: Arc::new(gpui::Image::from_bytes(format, bytes)),
-    })
-}
-
-/**
- * Prepares a conversation just parsed or read for the views: sanitises its large prompts and
- * replies into `prose`, and moves each subagent read with it (one whose records are in its
- * own transcript) out of its call into `found`, so that every subagent is looked up by item.
- */
-fn settle(
-    conversation: &mut Conversation,
-    prose: &mut HashMap<BlockRef, Sanitized>,
-    found: &mut Vec<(Arc<str>, Arc<SubagentRead>)>,
-) {
-    let item = conversation.item.clone();
+/// Moves each subagent read with a conversation (one whose records are in its own transcript)
+/// out of its call into `found`, so that every subagent is looked up by item.
+fn settle(conversation: &mut Conversation, found: &mut Vec<(Arc<str>, Arc<SubagentRead>)>) {
     for at in 0..conversation.blocks().len() {
-        let id = BlockId(at);
-        match &conversation[id].content {
-            Content::Prompt { text, .. } | Content::Reply { text }
-                if text.len() > SANITIZE_ON_DRAW_BYTES =>
-            {
-                prose.insert(
-                    BlockRef {
-                        conversation: item.clone(),
-                        block: id,
-                    },
-                    Sanitized::new(text),
-                );
-            }
-            _ => {}
-        }
-        let Some(call) = conversation.call_mut(id) else {
+        let Some(call) = conversation.call_mut(BlockId(at)) else {
             continue;
         };
         for subagent in &mut call.subagents {
@@ -823,7 +896,7 @@ fn settle(
                 mut conversation,
             } = std::mem::replace(subagent, unread)
             {
-                settle(&mut conversation, prose, found);
+                settle(&mut conversation, found);
                 found.push((
                     conversation.item.clone(),
                     Arc::new(SubagentRead {
@@ -844,7 +917,7 @@ fn parse(archive: &Archive, providers: &Providers, id: &SessionId) -> Result<Ope
         .iter()
         .position(|provider| provider.id().as_str() == id.provider)
         .ok_or_else(|| format!("this build has no provider for {}", id.provider))?;
-    let cache = Arc::new(SegmentCache::new(CACHED_SEGMENTS));
+    let cache = Arc::new(SegmentCache::new(CACHED_SEGMENTS, CACHED_BYTES));
     let items = archive
         .session(id)
         .map_err(|error| error.to_string())?
@@ -885,15 +958,36 @@ fn parse(archive: &Archive, providers: &Providers, id: &SessionId) -> Result<Ope
         prose: HashMap::new(),
         subagents: HashMap::new(),
         bodies: HashMap::new(),
-        summaries: HashMap::new(),
         raws: HashMap::new(),
         images: HashMap::new(),
+        placement: None,
         opened: HashSet::new(),
         closed: HashSet::new(),
     };
     let mut found = Vec::new();
     if let Some(main) = &mut open.main {
-        settle(main, &mut open.prose, &mut found);
+        settle(main, &mut found);
+        let item = main.item.clone();
+        let eager = main
+            .turns()
+            .iter()
+            .flat_map(|turn| &turn.blocks)
+            .filter_map(|&id| match &main[id].content {
+                Content::Prompt { text, .. } | Content::Reply { text } => Some((id, text)),
+                _ => None,
+            })
+            .take(EAGER_PROSE)
+            .filter(|(_, text)| text.len() <= prose::PIECE_BYTES)
+            .map(|(id, text)| {
+                (
+                    BlockRef {
+                        conversation: item.clone(),
+                        block: id,
+                    },
+                    Load::Loaded(Arc::new(Prose::markdown(text))),
+                )
+            });
+        open.prose.extend(eager);
     }
     for subagent in transcript.unattached {
         if let Subagent::Read {
@@ -912,24 +1006,4 @@ fn parse(archive: &Archive, providers: &Providers, id: &SessionId) -> Result<Ope
         open.subagents.insert(item, Load::Loaded(read));
     }
     Ok(open)
-}
-
-#[cfg(test)]
-mod tests {
-    use pretty_assertions::assert_eq;
-
-    use super::Text;
-
-    #[test]
-    fn a_body_is_cut_into_lines_each_clipped_at_a_character() {
-        let long = "é".repeat(400);
-        let text = Text::new(format!("one\r\ntwo\n{long}\n"));
-        assert_eq!(text.line_count(), 3);
-        assert_eq!(text.lines(0..2), "one\ntwo");
-        let third = text.lines(2..3);
-        assert_eq!(third.len(), 512);
-        assert!(long.starts_with(&third));
-        assert_eq!(text.lines(2..99), third);
-        assert_eq!(Text::new(String::new()).line_count(), 0);
-    }
 }

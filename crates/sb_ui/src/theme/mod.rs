@@ -18,7 +18,8 @@ pub mod tokens;
 mod tests;
 
 use gpui::{
-    App, BoxShadow, FontWeight, Global, Hsla, Pixels, Rgba, SharedString, Styled, point, px,
+    App, BoxShadow, FontFeatures, FontWeight, Global, Hsla, Pixels, Rgba, SharedString, Styled,
+    point, px,
 };
 use gpui_component::{Theme, ThemeMode, ThemeTokens};
 
@@ -187,6 +188,9 @@ pub struct TextSpec {
     pub size: Pixels,
     pub line_height: Pixels,
     pub weight: FontWeight,
+    /// Whether the face may join characters into ligatures: not the code face, whose text is
+    /// source and output to be read as it was written (`->` is two characters, not an arrow).
+    pub ligatures: bool,
 }
 
 impl TextSpec {
@@ -196,6 +200,7 @@ impl TextSpec {
             size: px(size),
             line_height: px(line_height),
             weight,
+            ligatures: family.as_ref() != fonts::JETBRAINS_MONO,
         }
     }
 }
@@ -315,10 +320,16 @@ impl TypeScale {
 /// Applies a [`TextSpec`] to any styled element.
 pub trait StyledText: Styled + Sized {
     fn text_spec(self, spec: &TextSpec) -> Self {
-        self.font_family(spec.family.clone())
+        let styled = self
+            .font_family(spec.family.clone())
             .text_size(spec.size)
             .line_height(spec.line_height)
-            .font_weight(spec.weight)
+            .font_weight(spec.weight);
+        if spec.ligatures {
+            styled
+        } else {
+            styled.font_features(FontFeatures::disable_ligatures())
+        }
     }
 }
 
@@ -414,6 +425,8 @@ pub struct Sizes {
     pub activity_row: Pixels,
     pub activity_row_nested: Pixels,
     pub activity_name_width: Pixels,
+    /// The widest an activity row's label column grows to fit the labels on screen.
+    pub activity_name_max: Pixels,
     pub call_indent: Pixels,
     /// A call body's header and footer.
     pub call_header: Pixels,
@@ -486,6 +499,7 @@ impl Default for Sizes {
             activity_row: px(26.),
             activity_row_nested: px(24.),
             activity_name_width: px(44.),
+            activity_name_max: px(96.),
             call_indent: px(30.),
             call_header: px(26.),
             call_footer: px(24.),

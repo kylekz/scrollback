@@ -1,6 +1,7 @@
-//! The reader's rows of prose (DESIGN §4.2.2, §4.2.5, §4.2.6): prompts and replies with their
-//! Markdown, the agent's header over what it wrote, thoughts, notes, compactions, records the
-//! provider didn't know, and how a conversation ended.
+//! The reader's rows of prose (DESIGN §4.2.2, §4.2.5, §4.2.6): a prompt's header, a task's
+//! box, the pieces of a block's prose, a prompt's images, the agent's header over what it
+//! wrote, thoughts, notes, compactions, records the provider didn't know, and how a
+//! conversation ended.
 
 use std::sync::Arc;
 
@@ -9,36 +10,41 @@ use gpui::{
     ObjectFit, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
     StyledImage as _, Window, div, img, prelude::FluentBuilder as _, px,
 };
-use sb_core::transcript::{Content, Ending};
+use sb_core::transcript::Content;
 
-use super::rows::{PanelPart, Row, RowKind};
-use super::{Body, ReaderView};
+use super::rows::{CHUNK_LINES, Ended, FIRST_LINES, PanelPart, ProsePart, Row, RowKind};
+use super::{Piece, ReaderView, message_text};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
     BANNER_GAP, Tone, bad_banner, focus_ring, icon, icon_button, overline, tag,
 };
 use crate::format;
+use crate::hostile;
 use crate::icons::SbIcon;
 use crate::markdown::{self, Size};
 use crate::services::ActiveServices as _;
-use crate::services::reader::{BlockRef, Load, OpenSession, Picture};
+use crate::services::reader::{
+    BlockRef, Held, ImageKey, Load, OpenSession, Picture, Piece as ProsePiece, Slot, Text,
+};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
 /// What a row is, for automation and the keyboard's place.
 pub fn kind_name(kind: &RowKind) -> &'static str {
     match kind {
-        RowKind::Turn => "turn",
+        RowKind::Turn(_) => "turn",
         RowKind::Prompt(_) => "prompt",
         RowKind::Task { .. } => "task",
+        RowKind::Prose { reply: true, .. } => "reply",
+        RowKind::Prose { .. } => "prose",
+        RowKind::Images(_) => "images",
         RowKind::Author(_) => "author",
-        RowKind::Reply(_) => "reply",
         RowKind::Thought { .. } => "thought",
         RowKind::Call { .. } => "call",
+        RowKind::CallIo { .. } => "call-io",
         RowKind::Body { .. } => "body",
         RowKind::Panel { .. } => "panel",
         RowKind::Compaction { .. } => "compaction",
-        RowKind::Summary { .. } => "summary",
         RowKind::Note(_) => "note",
         RowKind::Unrecognised { .. } => "unrecognised",
         RowKind::Raw { .. } => "raw",
@@ -50,10 +56,38 @@ pub fn kind_name(kind: &RowKind) -> &'static str {
     }
 }
 
+/// The name automation knows a row by: `kind conversation/block`, for its `top_name`.
+pub fn row_name(row: &Row, open: &OpenSession) -> String {
+    match row.block() {
+        Some(at) => format!(
+            "{} {}/{}",
+            kind_name(&row.kind),
+            conversation_name(&at.conversation, open),
+            at.block.0
+        ),
+        None => kind_name(&row.kind).to_string(),
+    }
+}
+
+/// The text of a row's block, for automation to assert on: a message's, a call's tool.
+pub fn row_text(row: &Row, open: &OpenSession) -> String {
+    let Some(at) = row.block() else {
+        return String::new();
+    };
+    match open.block(at).map(|block| &block.content) {
+        Some(
+            Content::Prompt { text, .. } | Content::Reply { text } | Content::Thinking { text, .. },
+        ) => hostile::label(text),
+        Some(Content::ToolCall(call)) => hostile::label(&call.name),
+        Some(Content::Note { text, .. }) => hostile::label(text),
+        _ => String::new(),
+    }
+}
+
 /// What a row the keyboard can rest on is, whether it is open or not.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FocusKey<'a> {
-    Block(&'a BlockRef),
+    Block(&'static str, &'a BlockRef),
     More(&'a Arc<str>),
     Unattached(&'a Arc<str>),
 }
@@ -62,11 +96,14 @@ pub fn focus_key(kind: &RowKind) -> Option<FocusKey<'_>> {
     match kind {
         RowKind::Prompt(at)
         | RowKind::Task { at, .. }
-        | RowKind::Reply(at)
+        | RowKind::Prose {
+            at, reply: true, ..
+        }
         | RowKind::Thought { at, .. }
         | RowKind::Call { at, .. }
+        | RowKind::CallIo { at, .. }
         | RowKind::Compaction { at, .. }
-        | RowKind::Unrecognised { at, .. } => Some(FocusKey::Block(at)),
+        | RowKind::Unrecognised { at, .. } => Some(FocusKey::Block(kind_name(kind), at)),
         RowKind::Panel {
             item,
             part: PanelPart::More(_),
@@ -122,20 +159,45 @@ pub fn render(
 ) -> AnyElement {
     let theme = cx.sb_theme().clone();
     let c = &theme.colors;
-    let size = if row.depth > 0 {
-        Size::Nested
-    } else {
-        Size::Reading
-    };
     match &row.kind {
-        RowKind::Turn => div().h(px(1.)).bg(c.line_subtle).into_any_element(),
-        RowKind::Prompt(at) => message(view, ix, at, None, size, focused, cx),
-        RowKind::Task { at, from } => message(view, ix, at, Some(from.clone()), size, focused, cx),
+        RowKind::Turn(_) => div().h(px(1.)).bg(c.line_subtle).into_any_element(),
+        RowKind::Prompt(at) => prompt_head(ix, at, focused, &theme, cx),
+        RowKind::Task { at, from } => task_head(ix, at, from.as_ref(), focused, &theme, cx),
+        RowKind::Prose {
+            at,
+            part,
+            boxed,
+            last,
+            reply,
+        } => {
+            let size = if row.depth > 0 || *boxed {
+                Size::Nested
+            } else {
+                Size::Reading
+            };
+            let content = prose(view, ix, at, part, size, *reply, focused, &theme, cx);
+            if *boxed {
+                div()
+                    .px(px(10.))
+                    .bg(c.s2)
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(c.line_subtle)
+                    .when(*last, |this| {
+                        this.pb(theme.spacing.md)
+                            .border_b_1()
+                            .rounded_b(theme.radii.row)
+                    })
+                    .child(content)
+                    .into_any_element()
+            } else {
+                content
+            }
+        }
+        RowKind::Images(at) => images(view, ix, at, &theme, cx),
         RowKind::Author(at) => author(at, &theme, cx),
-        RowKind::Reply(at) => reply(view, ix, at, size, focused, cx),
         RowKind::Thought { at, open } => thought(ix, row, at, *open, focused, &theme, cx),
         RowKind::Compaction { at, open } => compaction(ix, row, at, *open, focused, &theme, cx),
-        RowKind::Summary { at, .. } => summary(view, ix, at, &theme, cx),
         RowKind::Note(at) => note(at, &theme, cx),
         RowKind::Unrecognised { at, open } => unrecognised(ix, row, at, *open, focused, &theme, cx),
         RowKind::Raw { at, .. } => raw(at, &theme, cx),
@@ -149,26 +211,31 @@ pub fn render(
                 "This session has no conversation of its own: its items hold no main \
                  transcript, only what went with one.",
             )
-            .automation_target("reader/no-conversation")
+            .automation_target("reader/no-conversation"),
+        RowKind::UnattachedHead(count) => match count {
+            Some(count) => overline(
+                &format!("Subagents not placed under a call · {count}"),
+                &theme,
+            )
             .into_any_element(),
-        RowKind::UnattachedHead(count) => overline(
-            &format!("Subagents not placed under a call · {count}"),
-            &theme,
-        )
-        .into_any_element(),
+            None => {
+                let reader = cx.services().reader.clone();
+                reader.update(cx, |reader, cx| reader.want_placement(cx));
+                skeleton(2, &theme)
+            }
+        },
         RowKind::Alone(_) => alone(&theme, cx),
         RowKind::Call { .. }
+        | RowKind::CallIo { .. }
         | RowKind::Body { .. }
         | RowKind::Panel { .. }
         | RowKind::Unattached { .. } => div().into_any_element(),
     }
 }
 
-/**
- * The ring of the keyboard's row, on `element`, which reaches 6 past its content on either
- * side so the ring doesn't touch it. A ring is a shadow, drawn under the element: the element
- * is filled so that only its edge shows.
- */
+/// The ring of the keyboard's row, on `element`, which reaches 6 past its content on either
+/// side so the ring doesn't touch it. A ring is a shadow, drawn under the element: the element
+/// is filled so that only its edge shows.
 fn ringed<E: gpui::Styled>(element: E, focused: bool, theme: &SbTheme) -> E {
     let element = element.mx(-theme.spacing.sm).px(theme.spacing.sm);
     if focused {
@@ -180,164 +247,402 @@ fn ringed<E: gpui::Styled>(element: E, focused: bool, theme: &SbTheme) -> E {
     }
 }
 
-/// A Copy button that shows while the pointer is over its message or the keyboard is on it.
+/// A Copy button for the message at `at`, which shows while the pointer is over the message
+/// (the group `group`) or the keyboard is on it. The text is read when it is clicked.
 fn copy_button(
     id: ElementId,
     group: SharedString,
     shown: bool,
-    text: String,
+    at: &BlockRef,
     theme: &SbTheme,
 ) -> AnyElement {
+    let at = at.clone();
     icon_button(id, theme.sizes.small_button, theme)
-        .ml_auto()
         .aria_label("Copy message")
         .when(!shown, |this| {
             this.opacity(0.)
                 .group_hover(group, |style| style.opacity(1.))
         })
-        .on_click(move |_, _, cx| crate::system::copy_text(text.clone(), cx))
+        .on_click(move |_, _, cx| {
+            let text = cx
+                .services()
+                .reader
+                .read(cx)
+                .open_session()
+                .and_then(|open| message_text(open, &at));
+            if let Some(text) = text {
+                crate::system::copy_text(text, cx);
+            }
+        })
         .child(icon(SbIcon::Copy, theme.sizes.icon_xs, theme.colors.fg2))
         .into_any_element()
 }
 
 /**
- * A prompt (DESIGN §4.2.2 "You"): who asked and when, the prompt as Markdown, and its images as
- * thumbnails. A prompt from another sender is labelled with that sender, never as You; a
- * subagent's task (`task` is the model that gave it) is drawn as the box it was handed in.
+ * Over a prompt (DESIGN §4.2.2 "You"): who asked and when, and Copy. A prompt from another
+ * sender is labelled with that sender, never as You.
  */
-#[allow(clippy::too_many_arguments)]
-fn message(
-    view: &mut ReaderView,
+fn prompt_head(
     ix: usize,
     at: &BlockRef,
-    task: Option<Option<Arc<str>>>,
-    size: Size,
     focused: bool,
+    theme: &SbTheme,
     cx: &mut Context<ReaderView>,
 ) -> AnyElement {
-    let theme = cx.sb_theme().clone();
     let c = &theme.colors;
-    let reader = cx.services().reader.clone();
-    let (text, from, time, images, prose, name, provider) = {
-        let reader = reader.read(cx);
+    let (from, time, name) = {
+        let reader = cx.services().reader.read(cx);
         let Some(open) = reader.open_session() else {
             return div().into_any_element();
         };
         let Some(block) = open.block(at) else {
             return div().into_any_element();
         };
-        let Content::Prompt { text, images, from } = &block.content else {
+        let Content::Prompt { from, .. } = &block.content else {
             return div().into_any_element();
         };
-        let images: Vec<Option<Load<Picture>>> = (0..images.len())
-            .map(|index| open.image(at, index).cloned())
-            .collect();
-        let prose =
-            (!view.states.contains_key(&Body::Prose(at.clone()))).then(|| open.prose(at, text));
         (
-            text.clone(),
-            from.clone(),
+            from.as_deref().map(hostile::label),
             block.at,
-            images,
-            prose,
-            target(if task.is_some() { "task" } else { "prompt" }, at, open),
-            open.id.provider.clone(),
+            target("prompt", at, open),
         )
     };
-    for (index, image) in images.iter().enumerate() {
-        if image.is_none() {
-            reader.update(cx, |reader, cx| reader.want_image(at, index, cx));
-        }
-    }
-    let state = view.markdown_state(Body::Prose(at.clone()), ix, || prose, cx);
-    let body = state.map(|state| markdown::view(&state, size, cx).w_full());
     let group: SharedString = format!("message-{ix}").into();
-    let thumbnails = (!images.is_empty()).then(|| {
-        div()
-            .flex()
-            .flex_wrap()
-            .gap(theme.spacing.md)
-            .children(images.into_iter().map(|image| shot(image, &theme)))
-    });
-    if let Some(from) = task {
-        let label = match from {
-            Some(model) => format!("Task from {}", agents::model_name(&provider, &model, cx)),
-            None => "Task".to_string(),
-        };
-        return div()
-            .id(("task", ix))
-            .flex()
-            .flex_col()
-            .gap(theme.spacing.xs)
-            .py(theme.spacing.md)
-            .px(px(10.))
-            .rounded(theme.radii.row)
-            .bg(c.s2)
-            .border_1()
-            .border_color(c.line_subtle)
-            .when(focused, |this| this.shadow(focus_ring(false, &theme)))
-            .child(
-                div()
-                    .text_color(c.fg3)
-                    .text_spec(&theme.text.tag)
-                    .child(label),
-            )
-            .children(body)
-            .children(thumbnails)
-            .automation_target(name);
-    }
     ringed(
         div()
             .id(("prompt", ix))
             .group(group.clone())
             .flex()
-            .flex_col()
+            .items_center()
             .gap(theme.spacing.md)
-            .rounded(theme.radii.control),
+            .rounded(theme.radii.control)
+            .text_color(c.fg3)
+            .text_spec(&theme.text.secondary),
         focused,
-        &theme,
+        theme,
     )
     .child(
         div()
-            .flex()
-            .items_center()
-            .gap(theme.spacing.md)
-            .text_color(c.fg3)
-            .text_spec(&theme.text.secondary)
-            .child(
-                div()
-                    .text_color(c.fg)
-                    .text_spec(&theme.text.author)
-                    .child(from.clone().unwrap_or_else(|| "You".to_string())),
-            )
-            .when(from.is_some(), |this| {
-                this.child(tag("not you", Tone::Neutral, true, &theme))
-            })
-            .children(time.map(|time| {
-                div()
-                    .text_spec(&theme.text.number)
-                    .child(format::clock(time))
-            }))
-            .child(copy_button(
-                ("copy-prompt", ix).into(),
-                group,
-                focused,
-                text,
-                &theme,
-            )),
+            .text_color(c.fg)
+            .text_spec(&theme.text.author)
+            .child(from.clone().unwrap_or_else(|| "You".to_string())),
     )
-    .children(body)
-    .children(thumbnails)
+    .when(from.is_some(), |this| {
+        this.child(tag("not you", Tone::Neutral, true, theme))
+    })
+    .children(time.map(|time| {
+        div()
+            .text_spec(&theme.text.number)
+            .child(format::clock(time))
+    }))
+    .child(div().flex_1())
+    .child(copy_button(
+        ("copy-prompt", ix).into(),
+        group,
+        focused,
+        at,
+        theme,
+    ))
     .automation_target(name)
 }
 
-/// A prompt's image as a thumbnail (DESIGN §4.2.2 `shot`: 200 × 116, a caption under it).
+/// The top of a subagent's task box (DESIGN §4.2.7 `userbox`): "Task from" the model that gave
+/// it. Its prose rows go on in the box.
+fn task_head(
+    ix: usize,
+    at: &BlockRef,
+    from: Option<&Arc<str>>,
+    focused: bool,
+    theme: &SbTheme,
+    cx: &mut Context<ReaderView>,
+) -> AnyElement {
+    let c = &theme.colors;
+    let (provider, name) = {
+        let reader = cx.services().reader.read(cx);
+        let Some(open) = reader.open_session() else {
+            return div().into_any_element();
+        };
+        (open.id.provider.clone(), target("task", at, open))
+    };
+    let label = match from {
+        Some(model) => format!("Task from {}", agents::model_name(&provider, model, cx)),
+        None => "Task".to_string(),
+    };
+    div()
+        .id(("task", ix))
+        .pt(theme.spacing.md)
+        .px(px(10.))
+        .bg(c.s2)
+        .border_t_1()
+        .border_l_1()
+        .border_r_1()
+        .border_color(c.line_subtle)
+        .rounded_t(theme.radii.row)
+        .when(focused, |this| this.shadow(focus_ring(false, theme)))
+        .text_color(c.fg3)
+        .text_spec(&theme.text.tag)
+        .child(label)
+        .automation_target(name)
+}
+
+/// A row of a block's prose (the module docs): a piece of Markdown, a note that a piece is
+/// shown as plain text for its size, a chunk of plain text, and how many more lines it has.
+#[allow(clippy::too_many_arguments)]
+fn prose(
+    view: &mut ReaderView,
+    ix: usize,
+    at: &BlockRef,
+    part: &ProsePart,
+    size: Size,
+    reply: bool,
+    focused: bool,
+    theme: &SbTheme,
+    cx: &mut Context<ReaderView>,
+) -> AnyElement {
+    let c = &theme.colors;
+    let reader = cx.services().reader.clone();
+    let (prepared, thinking, length, name) = {
+        let reader = reader.read(cx);
+        let Some(open) = reader.open_session() else {
+            return div().into_any_element();
+        };
+        let block = open.block(at).map(|block| &block.content);
+        (
+            match open.prose(at) {
+                Some(Load::Loaded(prose)) => Some(prose.clone()),
+                _ => None,
+            },
+            matches!(block, Some(Content::Thinking { .. })),
+            match block {
+                Some(Content::Prompt { text, .. } | Content::Reply { text }) => text.len(),
+                _ => 0,
+            },
+            target(if reply { "reply" } else { "prose" }, at, open),
+        )
+    };
+    view.hold(Held::Prose(at.clone()), ix);
+    let piece = |index: usize| prepared.as_ref().and_then(|prose| prose.pieces.get(index));
+    let content = match part {
+        ProsePart::Pending => {
+            reader.update(cx, |reader, cx| reader.want_prose(at, cx));
+            /* About as high as the prose will be, so that little moves when it lands. */
+            let lines = (length / 90).clamp(1, 16);
+            div()
+                .h(theme.text.reading.line_height * lines as f32)
+                .child(skeleton(lines.min(3), theme))
+                .into_any_element()
+        }
+        ProsePart::Failed(why) => failed(&format!("This couldn't be read: {why}"), theme),
+        ProsePart::Markdown(index) => {
+            let sanitized = match piece(*index) {
+                Some(ProsePiece::Markdown(sanitized)) => Some(sanitized.clone()),
+                _ => None,
+            };
+            view.markdown_state(
+                Piece {
+                    at: at.clone(),
+                    piece: *index,
+                },
+                ix,
+                || sanitized,
+                cx,
+            )
+            .map(|state| markdown::view(&state, size, cx).w_full().into_any_element())
+            .unwrap_or_else(|| div().into_any_element())
+        }
+        ProsePart::Note(index) => {
+            let lines = match piece(*index) {
+                Some(ProsePiece::Plain { text, .. }) => text.line_count(),
+                _ => 0,
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap(theme.spacing.sm)
+                .text_color(c.fg3)
+                .text_spec(&theme.text.secondary)
+                .child(icon(SbIcon::FileText, theme.sizes.icon_xs, c.fg3))
+                .child(format!(
+                    "Shown as plain text, {}: too large or too deeply nested to lay out as \
+                     Markdown.",
+                    format::plural(lines, "line")
+                ))
+                .into_any_element()
+        }
+        ProsePart::Lines {
+            piece: index,
+            chunk,
+        } => match piece(*index) {
+            Some(ProsePiece::Plain { text, oversized }) => {
+                let all = !oversized
+                    || reader.read(cx).open_session().is_some_and(|open| {
+                        open.is_open(
+                            &crate::services::reader::Toggle::ProseLines(at.clone(), *index),
+                            reader.read(cx).full_calls(),
+                        )
+                    });
+                let lines = text_rows(text, *chunk, all);
+                let spec = if thinking {
+                    &theme.text.thought_open
+                } else {
+                    &theme.text.code
+                };
+                div()
+                    .when(thinking, |this| this.pl(px(22.)).italic())
+                    .text_color(c.fg2)
+                    .text_spec(spec)
+                    .child(lines)
+                    .into_any_element()
+            }
+            _ => div().into_any_element(),
+        },
+        ProsePart::More { piece: index, all } => {
+            let count = match piece(*index) {
+                Some(ProsePiece::Plain { text, .. }) => text.line_count(),
+                _ => 0,
+            };
+            let toggle = crate::services::reader::Toggle::ProseLines(at.clone(), *index);
+            more_lines(
+                format!("prose-more-{ix}").into(),
+                count,
+                *all,
+                toggle,
+                theme,
+                cx,
+            )
+        }
+    };
+    if !reply {
+        return content;
+    }
+    let group: SharedString = format!("message-{ix}").into();
+    ringed(
+        div()
+            .id(("reply", ix))
+            .group(group.clone())
+            .relative()
+            .pr(theme.sizes.small_button)
+            .rounded(theme.radii.control),
+        focused,
+        theme,
+    )
+    .child(content)
+    .child(
+        div()
+            .absolute()
+            .top_0()
+            .right(theme.spacing.sm)
+            .child(copy_button(
+                ("copy-reply", ix).into(),
+                group,
+                focused,
+                at,
+                theme,
+            )),
+    )
+    .automation_target(name)
+}
+
+/// The lines of the `chunk`th row of `text`: its first [`FIRST_LINES`] until all are shown,
+/// then [`CHUNK_LINES`] a row.
+pub fn text_rows(text: &Text, chunk: usize, all: bool) -> String {
+    let count = text.line_count();
+    if all {
+        text.lines(chunk * CHUNK_LINES..((chunk + 1) * CHUNK_LINES).min(count))
+    } else {
+        text.lines(0..FIRST_LINES.min(count))
+    }
+}
+
+/// Under lines that have more than their first: how many more, and Show all; or Show fewer
+/// once all are shown.
+pub fn more_lines(
+    id: SharedString,
+    count: usize,
+    all: bool,
+    toggle: crate::services::reader::Toggle,
+    theme: &SbTheme,
+    cx: &mut Context<ReaderView>,
+) -> AnyElement {
+    let c = &theme.colors;
+    div()
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .h(theme.sizes.call_footer)
+        .text_color(c.fg3)
+        .text_spec(&theme.text.small)
+        .when(!all, |this| {
+            this.child(format!(
+                "+{} more lines",
+                format::count(count.saturating_sub(FIRST_LINES) as u64)
+            ))
+        })
+        .child(
+            div()
+                .id(id)
+                .ml_auto()
+                .text_color(c.accent_text)
+                .cursor_pointer()
+                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                    let reader = cx.services().reader.clone();
+                    let toggle = toggle.clone();
+                    reader.update(cx, |reader, cx| reader.toggle(toggle, cx));
+                }))
+                .child(if all { "Show fewer" } else { "Show all" }),
+        )
+        .into_any_element()
+}
+
+/// A prompt's images as thumbnails (DESIGN §4.2.2 `shot`: 200 × 116, a caption under it).
+fn images(
+    view: &mut ReaderView,
+    ix: usize,
+    at: &BlockRef,
+    theme: &SbTheme,
+    cx: &mut Context<ReaderView>,
+) -> AnyElement {
+    let reader = cx.services().reader.clone();
+    let shots: Vec<(ImageKey, Option<Load<Picture>>)> = {
+        let reader = reader.read(cx);
+        let Some(open) = reader.open_session() else {
+            return div().into_any_element();
+        };
+        let count = match open.block(at).map(|block| &block.content) {
+            Some(Content::Prompt { images, .. }) => images.len(),
+            _ => 0,
+        };
+        (0..count)
+            .map(|index| {
+                let key = ImageKey {
+                    at: at.clone(),
+                    slot: Slot::Prompt(index),
+                };
+                let load = open.image(&key).cloned();
+                (key, load)
+            })
+            .collect()
+    };
+    for (key, load) in &shots {
+        view.hold(Held::Image(key.clone()), ix);
+        if load.is_none() {
+            reader.update(cx, |reader, cx| reader.want_image(key, cx));
+        }
+    }
+    div()
+        .flex()
+        .flex_wrap()
+        .gap(theme.spacing.md)
+        .children(shots.into_iter().map(|(_, load)| shot(load, theme)))
+        .into_any_element()
+}
+
+/// One thumbnail: the image, or why it can't be shown.
 fn shot(image: Option<Load<Picture>>, theme: &SbTheme) -> AnyElement {
     let c = &theme.colors;
     let caption = match &image {
         Some(Load::Loaded(picture)) => format!(
-            "{} · {} × {} · {}",
-            picture.media_type,
+            "{} × {} · {}",
             picture.width,
             picture.height,
             format::size(picture.bytes as u64)
@@ -345,6 +650,7 @@ fn shot(image: Option<Load<Picture>>, theme: &SbTheme) -> AnyElement {
         Some(Load::Failed(why)) => why.clone(),
         None | Some(Load::Loading) => "Loading…".to_string(),
     };
+    let bad = matches!(image, Some(Load::Failed(_)));
     div()
         .flex_none()
         .flex()
@@ -363,14 +669,21 @@ fn shot(image: Option<Load<Picture>>, theme: &SbTheme) -> AnyElement {
                 .min_h_0()
                 .overflow_hidden()
                 .bg(c.s3)
+                .flex()
+                .items_center()
+                .justify_center()
                 .children(match image {
                     Some(Load::Loaded(picture)) => Some(
-                        img(ImageSource::Image(picture.image))
+                        img(ImageSource::Render(picture.image))
                             .absolute()
                             .inset_0()
                             .size_full()
-                            .object_fit(ObjectFit::Cover),
+                            .object_fit(ObjectFit::Cover)
+                            .into_any_element(),
                     ),
+                    Some(Load::Failed(_)) => {
+                        Some(icon(SbIcon::CircleAlert, theme.sizes.icon, c.red).into_any_element())
+                    }
                     _ => None,
                 }),
         )
@@ -384,7 +697,7 @@ fn shot(image: Option<Load<Picture>>, theme: &SbTheme) -> AnyElement {
                 .px(theme.spacing.md)
                 .border_t_1()
                 .border_color(c.line_subtle)
-                .text_color(c.fg3)
+                .text_color(if bad { c.red } else { c.fg3 })
                 .text_spec(&theme.text.small)
                 .child(icon(SbIcon::Image, theme.sizes.icon_xs, c.fg3))
                 .child(
@@ -413,7 +726,7 @@ fn author(at: &BlockRef, theme: &SbTheme, cx: &mut Context<ReaderView>) -> AnyEl
     let model = block
         .model
         .as_deref()
-        .map(|model| agents::model_name(&provider, model, cx));
+        .map(|model| hostile::label(&agents::model_name(&provider, model, cx)));
     let time = block.at;
     div()
         .flex()
@@ -436,57 +749,7 @@ fn author(at: &BlockRef, theme: &SbTheme, cx: &mut Context<ReaderView>) -> AnyEl
         .into_any_element()
 }
 
-/// A reply as Markdown, with Copy on hover.
-fn reply(
-    view: &mut ReaderView,
-    ix: usize,
-    at: &BlockRef,
-    size: Size,
-    focused: bool,
-    cx: &mut Context<ReaderView>,
-) -> AnyElement {
-    let theme = cx.sb_theme().clone();
-    let (text, prose, name) = {
-        let reader = cx.services().reader.read(cx);
-        let Some(open) = reader.open_session() else {
-            return div().into_any_element();
-        };
-        let Some(Content::Reply { text }) = open.block(at).map(|block| &block.content) else {
-            return div().into_any_element();
-        };
-        let prose =
-            (!view.states.contains_key(&Body::Prose(at.clone()))).then(|| open.prose(at, text));
-        (text.clone(), prose, target("reply", at, open))
-    };
-    let state = view.markdown_state(Body::Prose(at.clone()), ix, || prose, cx);
-    let group: SharedString = format!("message-{ix}").into();
-    ringed(
-        div()
-            .id(("reply", ix))
-            .group(group.clone())
-            .relative()
-            .rounded(theme.radii.control),
-        focused,
-        &theme,
-    )
-    .children(state.map(|state| markdown::view(&state, size, cx).w_full()))
-    .child(
-        div()
-            .absolute()
-            .top(-theme.sizes.small_button)
-            .right_0()
-            .child(copy_button(
-                ("copy-reply", ix).into(),
-                group,
-                focused,
-                text,
-                &theme,
-            )),
-    )
-    .automation_target(name)
-}
-
-/// A thought (DESIGN §4.2.5): one line until opened, then all of it in italic.
+/// A thought (DESIGN §4.2.5): one line until opened; opened, its text follows in rows.
 fn thought(
     ix: usize,
     row: &Row,
@@ -497,7 +760,7 @@ fn thought(
     cx: &mut Context<ReaderView>,
 ) -> AnyElement {
     let c = &theme.colors;
-    let (text, duration, name) = {
+    let (start, duration, name) = {
         let reader = cx.services().reader.read(cx);
         let Some(session) = reader.open_session() else {
             return div().into_any_element();
@@ -507,7 +770,12 @@ fn thought(
         else {
             return div().into_any_element();
         };
-        (text.clone(), *duration, target("thought", at, session))
+        let start = text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(hostile::label)
+            .unwrap_or_default();
+        (start, *duration, target("thought", at, session))
     };
     let lead = match duration {
         Some(duration) => format!(
@@ -516,29 +784,32 @@ fn thought(
         ),
         None => "Thought".to_string(),
     };
-    let head = div()
-        .id(("thought", ix))
-        .flex()
-        .items_center()
-        .gap(theme.spacing.md)
-        .h(theme.sizes.thought_row)
-        .px(theme.spacing.xs)
-        .rounded(theme.radii.control)
-        .cursor_pointer()
-        .hover(|style| style.bg(c.s1))
-        .on_click(on_toggle(ix, row, cx))
-        .child(icon(SbIcon::Lightbulb, theme.sizes.icon_sm, c.fg3));
-    let head = ringed(head, focused, theme);
-    if !open {
-        let start: String = text
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("")
-            .chars()
-            .take(300)
-            .collect();
-        return head
-            .child(
+    ringed(
+        div()
+            .id(("thought", ix))
+            .flex()
+            .items_center()
+            .gap(theme.spacing.md)
+            .h(theme.sizes.thought_row)
+            .rounded(theme.radii.control)
+            .cursor_pointer()
+            .hover(|style| style.bg(c.s1)),
+        focused,
+        theme,
+    )
+    .on_click(on_toggle(ix, row, cx))
+    .child(icon(SbIcon::Lightbulb, theme.sizes.icon_sm, c.fg3))
+    .map(|this| {
+        if open {
+            this.child(
+                div()
+                    .text_color(c.fg2)
+                    .text_spec(&theme.text.control_small)
+                    .child(lead),
+            )
+            .child(icon(SbIcon::ChevronDown, theme.sizes.icon_xs, c.fg3))
+        } else {
+            this.child(
                 div()
                     .min_w_0()
                     .flex_1()
@@ -550,34 +821,13 @@ fn thought(
                     .italic()
                     .child(format!("{lead} · {start}")),
             )
-            .automation_target(name);
-    }
-    div()
-        .flex()
-        .flex_col()
-        .gap(theme.spacing.xs)
-        .child(
-            head.child(
-                div()
-                    .text_color(c.fg2)
-                    .text_spec(&theme.text.control_small)
-                    .child(lead),
-            )
-            .child(icon(SbIcon::ChevronDown, theme.sizes.icon_xs, c.fg3)),
-        )
-        .child(
-            div()
-                .pl(px(22.))
-                .text_color(c.fg2)
-                .text_spec(&theme.text.thought_open)
-                .italic()
-                .child(text),
-        )
-        .automation_target(name)
+        }
+    })
+    .automation_target(name)
 }
 
 /// A compaction boundary (DESIGN §4.2.6): rules either side of when, and the tokens before and
-/// after; Show summary opens the summary the agent went on with.
+/// after; Show summary opens the summary the agent went on with, in rows under it.
 fn compaction(
     ix: usize,
     row: &Row,
@@ -658,46 +908,6 @@ fn compaction(
     .automation_target(name)
 }
 
-/// A compaction's summary, as Markdown, once it is loaded.
-fn summary(
-    view: &mut ReaderView,
-    ix: usize,
-    at: &BlockRef,
-    theme: &SbTheme,
-    cx: &mut Context<ReaderView>,
-) -> AnyElement {
-    let c = &theme.colors;
-    let reader = cx.services().reader.clone();
-    let loaded = reader
-        .read(cx)
-        .open_session()
-        .and_then(|open| open.summary(at).cloned());
-    let inner = match loaded {
-        None => {
-            reader.update(cx, |reader, cx| reader.want_summary(at, cx));
-            skeleton(3, theme)
-        }
-        Some(Load::Loading) => skeleton(3, theme),
-        Some(Load::Failed(why)) => failed(&format!("The summary couldn't be read: {why}"), theme),
-        Some(Load::Loaded(text)) => view
-            .markdown_state(Body::Summary(at.clone()), ix, || Some(text), cx)
-            .map(|state| {
-                markdown::view(&state, Size::Nested, cx)
-                    .w_full()
-                    .into_any_element()
-            })
-            .unwrap_or_else(|| div().into_any_element()),
-    };
-    div()
-        .p(theme.spacing.lg)
-        .rounded(theme.radii.row)
-        .bg(c.s1)
-        .border_1()
-        .border_color(c.line_subtle)
-        .child(inner)
-        .into_any_element()
-}
-
 /// Text the agent's harness wrote, quietly: its kind and the text, three lines at most.
 fn note(at: &BlockRef, theme: &SbTheme, cx: &mut Context<ReaderView>) -> AnyElement {
     let c = &theme.colors;
@@ -708,14 +918,14 @@ fn note(at: &BlockRef, theme: &SbTheme, cx: &mut Context<ReaderView>) -> AnyElem
     let Some(Content::Note { kind, text }) = session.block(at).map(|block| &block.content) else {
         return div().into_any_element();
     };
-    let text: String = text.chars().take(2_000).collect();
+    let text: String = hostile::bidi(&text.chars().take(1_000).collect::<String>()).into_owned();
     div()
         .flex()
         .items_start()
         .gap(theme.spacing.md)
         .text_color(c.fg3)
         .text_spec(&theme.text.secondary)
-        .child(tag(kind.clone(), Tone::Neutral, true, theme))
+        .child(tag(hostile::label(kind), Tone::Neutral, true, theme).max_w(px(160.)))
         .child(div().flex_1().min_w_0().line_clamp(3).child(text))
         .automation_target(target("note", at, session))
 }
@@ -743,7 +953,10 @@ fn unrecognised(
         let mut said = if record.kind.is_empty() {
             "A record that couldn't be read".to_string()
         } else {
-            format!("A record scrollback doesn't know: {}", record.kind)
+            format!(
+                "A record scrollback doesn't know: {}",
+                hostile::label(&record.kind)
+            )
         };
         if let Some(misfit) = record.misfit {
             said.push_str(&format!(" ({misfit})"));
@@ -810,9 +1023,7 @@ fn raw(at: &BlockRef, theme: &SbTheme, cx: &mut Context<ReaderView>) -> AnyEleme
                     div()
                         .text_color(c.fg2)
                         .text_spec(&theme.text.code)
-                        .whitespace_nowrap()
-                        .overflow_hidden()
-                        .child(text.lines(0..RAW_LINES)),
+                        .child(hostile::bidi(&text.lines(0..RAW_LINES)).into_owned()),
                 )
                 .when(more > 0, |this| {
                     this.child(
@@ -840,7 +1051,7 @@ fn raw(at: &BlockRef, theme: &SbTheme, cx: &mut Context<ReaderView>) -> AnyEleme
 /// How a conversation ended when it isn't whole (PLAN §7.4).
 fn ending_row(
     conversation: &Arc<str>,
-    ending: &Ending,
+    ending: &Ended,
     theme: &SbTheme,
     cx: &mut Context<ReaderView>,
 ) -> AnyElement {
@@ -853,8 +1064,7 @@ fn ending_row(
         )
     };
     match ending {
-        Ending::Whole => div().into_any_element(),
-        Ending::MidRecord => div()
+        Ended::MidRecord => div()
             .flex()
             .items_center()
             .gap(BANNER_GAP)
@@ -872,11 +1082,11 @@ fn ending_row(
                  when it was synced. The rest comes with a later sync.",
             ))
             .automation_target(name),
-        Ending::Unreadable(why) => bad_banner(theme)
+        Ended::Unreadable(why) => bad_banner(theme)
             .text_spec(&theme.text.row)
             .child(div().flex_1().min_w_0().child(format!(
                 "What follows couldn't be read: {}.",
-                why.trim_end_matches('.')
+                hostile::label(why.trim_end_matches('.'))
             )))
             .automation_target(name),
     }
@@ -924,6 +1134,6 @@ pub fn failed(why: &str, theme: &SbTheme) -> AnyElement {
     div()
         .text_color(theme.colors.red)
         .text_spec(&theme.text.secondary)
-        .child(format!("{}.", why.trim_end_matches('.')))
+        .child(format!("{}.", hostile::label(why.trim_end_matches('.'))))
         .into_any_element()
 }

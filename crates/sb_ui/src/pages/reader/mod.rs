@@ -3,26 +3,28 @@
 //! service holds ([`crate::services::reader`]).
 //!
 //! **The list.** gpui's `list` lays out only the rows on screen and a screenful around them,
-//! and keeps the height of each row it has measured. A collapsed activity row is a fixed
-//! height; a message is as high as its Markdown lays out. When the service changes, the rows
-//! are laid out again and compared with the ones before ([`ReaderView::set_rows`]): only the
-//! rows that changed are measured again, and the list keeps what is on screen where it was
-//! when rows open or close above it.
+//! and keeps the height of each row it has measured. Every row is bounded: a collapsed activity
+//! row is a fixed height, prose comes a piece a row, text a bounded number of lines a row. When
+//! the service changes, the rows are laid out again and matched with the ones before by what
+//! they are ([`ReaderView::set_rows`]): rows that came are spliced in, rows that went are
+//! spliced out, rows changed in place are measured again, and the row at the top of the
+//! column stays where it is.
 //!
-//! **Markdown states** ([`crate::markdown`]) are kept for the rows near what is on screen only
-//! (PLAN D11): each frame keeps the states of the rows within [`KEEP_ROWS`] of those drawn, and
-//! drops the rest.
+//! **What is kept near the screen.** Markdown states ([`crate::markdown`]) are kept for the
+//! rows within [`KEEP_STATES`] of those drawn, and the service's prepared prose, bodies and
+//! images for those within [`KEEP_DATA`] (PLAN D11); the rest is let go each frame, and
+//! prepared again if it comes back.
 //!
-//! **Loading** is asked for by the rows that need it as they are drawn: a call's body row, a
-//! subagent's panel, a summary, a prompt's images. Until it lands they show a skeleton.
+//! **Loading** is asked for by the rows that need it as they are drawn. Until it lands they
+//! show a skeleton.
 //!
 //! **Keyboard** (DESIGN §5): `↑` / `↓` move between the rows that take the keyboard, `Enter`
 //! opens or closes the one it is on, `→` / `←` open and close it (`←` on a row inside a body or
 //! a panel goes to the call above), `]` / `[` go to the next and previous turn, `J` / `K` to
 //! the next and previous session, `E` switches Activity / Full calls, `S` stars the session and
-//! `Ctrl C` copies the message the keyboard is on. The keyboard's row is held by what it is,
-//! not where, so it stays on that row when rows open or load above it, and goes to the row
-//! before when its own goes away.
+//! `Ctrl C` copies the text selected, else the message the keyboard is on. The keyboard's row
+//! is held by what it is, not where, so it stays on that row when rows open or load above it,
+//! and goes to the row before when its own goes away. Its ring shows once a key is used.
 
 mod blocks;
 mod calls;
@@ -35,7 +37,7 @@ use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
-    ListAlignment, ListState, ParentElement as _, Render, SharedString,
+    ListAlignment, ListState, ParentElement as _, Pixels, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, list,
     prelude::FluentBuilder as _, px,
 };
@@ -51,7 +53,7 @@ use crate::format;
 use crate::icons::SbIcon;
 use crate::keymap;
 use crate::markdown::Sanitized;
-use crate::services::reader::{BlockRef, OpenSession, ReaderService, ReaderState};
+use crate::services::reader::{BlockRef, Held, OpenSession, ReaderService, ReaderState};
 use crate::services::{ActiveServices as _, LibraryService};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 use rows::{Row, RowKind, Space};
@@ -59,30 +61,34 @@ use rows::{Row, RowKind, Space};
 /// How far past what is on screen the list lays rows out, so that a row is measured and its
 /// Markdown parsed before it scrolls into view.
 const OVERDRAW: f32 = 1200.;
-/// How many rows either side of those drawn keep their Markdown states (the module docs).
-const KEEP_ROWS: usize = 40;
+/// How many rows either side of those drawn keep their Markdown states, and their prepared
+/// prose, bodies and images (the module docs).
+const KEEP_STATES: usize = 40;
+const KEEP_DATA: usize = 160;
 /// How many skeleton rows stand in for the column while a session is parsed.
 const SKELETON_ROWS: usize = 6;
 
-/// Which of a row's Markdown bodies a state is: its prose, or a compaction's summary.
+/// A Markdown state: of a piece of a block's prose.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Body {
-    Prose(BlockRef),
-    Summary(BlockRef),
+struct Piece {
+    at: BlockRef,
+    piece: usize,
 }
 
 /// What [`ReaderView`] tells automation (`scrollback`'s `state.reader`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReaderSnapshot {
     pub rows: usize,
-    /// The row the keyboard is on, and what kind of row it is.
-    pub focused: Option<(usize, &'static str)>,
-    /// The row at the top of the column.
+    /// The row the keyboard is on, what kind of row it is, and the start of its text.
+    pub focused: Option<(usize, &'static str, String)>,
+    /// The row at the top of the column, and its name ([`blocks::row_name`]).
     pub top: usize,
+    pub top_name: String,
     /// The open activity rows.
     pub open_calls: usize,
-    /// How many Markdown states are kept.
+    /// How many Markdown states, and how many prepared things of the service's, are kept.
     pub states: usize,
+    pub held: usize,
     /// Whether a subagent is read on its own.
     pub alone: bool,
 }
@@ -98,15 +104,24 @@ pub struct ReaderView {
     alone: Option<(Arc<str>, Option<BlockRef>)>,
     /// Where the keyboard is: the row's place in `rows`, and what the row is.
     focused: Option<(usize, Row)>,
-    states: HashMap<Body, (Entity<TextViewState>, usize)>,
+    /// Whether a key has moved the keyboard in this session: until then no ring is drawn.
+    keyboard: bool,
+    states: HashMap<Piece, (Entity<TextViewState>, usize)>,
+    /// What of the service's the rows drawn hold, by the row last drawn with it.
+    held: HashMap<Held, usize>,
     /// The first and last rows drawn in the last frame.
     drawn: Rc<Cell<Option<(usize, usize)>>>,
+    /// How wide the activity rows' labels are: the widest of those drawn last frame, within
+    /// the bounds of DESIGN §4.2.3; and the widest drawn this frame so far.
+    label_width: Pixels,
+    label_width_next: Cell<Pixels>,
     _observers: [Subscription; 1],
 }
 
 impl ReaderView {
     pub fn new(focus_handle: FocusHandle, cx: &mut Context<Self>) -> Self {
         let reader = cx.services().reader.clone();
+        let label = cx.sb_theme().sizes.activity_name_width;
         let mut this = Self {
             focus_handle,
             list: ListState::new(0, ListAlignment::Top, px(OVERDRAW)),
@@ -114,28 +129,47 @@ impl ReaderView {
             session: None,
             alone: None,
             focused: None,
+            keyboard: false,
             states: HashMap::new(),
+            held: HashMap::new(),
             drawn: Rc::default(),
+            label_width: label,
+            label_width_next: Cell::new(label),
             _observers: [cx.observe(&reader, |this, _, cx| this.refresh(cx))],
         };
         this.refresh(cx);
         this
     }
 
-    pub fn snapshot(&self) -> ReaderSnapshot {
+    pub fn snapshot(&self, cx: &App) -> ReaderSnapshot {
+        let reader = cx.services().reader.read(cx);
+        let open = reader.open_session();
+        let top = self.list.logical_scroll_top().item_ix;
         ReaderSnapshot {
             rows: self.rows.len(),
-            focused: self
-                .focused
-                .as_ref()
-                .map(|(at, row)| (*at, blocks::kind_name(&row.kind))),
-            top: self.list.logical_scroll_top().item_ix,
+            focused: self.focused.as_ref().map(|(at, row)| {
+                (
+                    *at,
+                    blocks::kind_name(&row.kind),
+                    open.map(|open| blocks::row_text(row, open))
+                        .unwrap_or_default()
+                        .chars()
+                        .take(80)
+                        .collect(),
+                )
+            }),
+            top,
+            top_name: match (self.rows.get(top), open) {
+                (Some(row), Some(open)) => blocks::row_name(row, open),
+                _ => String::new(),
+            },
             open_calls: self
                 .rows
                 .iter()
                 .filter(|row| matches!(row.kind, RowKind::Call { open: true, .. }))
                 .count(),
             states: self.states.len(),
+            held: self.held.len(),
             alone: self.alone.is_some(),
         }
     }
@@ -163,7 +197,9 @@ impl ReaderView {
             self.session = id;
             self.alone = None;
             self.focused = None;
+            self.keyboard = false;
             self.states.clear();
+            self.held.clear();
             self.rows = Rc::new(rows);
             self.list.reset(self.rows.len());
             self.focus_first();
@@ -174,17 +210,28 @@ impl ReaderView {
     }
 
     /**
-     * Puts `new` in the place of the rows, telling the list which rows changed: those equal
-     * before and after are kept with their measured heights, the rest are measured again. A
-     * change is looked for a short way ahead on either side; past that, rows are taken as
-     * replaced one for one, which costs measuring them again and nothing else.
+     * Puts `new` in the place of the rows (the module docs). Rows are matched by
+     * [`Row::key`]: one in both, in order, is kept, and measured again if it changed; one only
+     * in the old rows is spliced out, one only in the new spliced in. What is matched out of
+     * order is spliced out and in again.
      */
     fn set_rows(&mut self, new: Vec<Row>) {
-        const AHEAD: usize = 64;
         let old = self.rows.clone();
-        let (mut i, mut j) = (0, 0);
-        /* Splices in the list's current indices: everything before `j` is already `new`. */
+        let old_keys: Vec<RowKind> = old.iter().map(Row::key).collect();
+        let new_keys: Vec<RowKind> = new.iter().map(Row::key).collect();
+        let in_new: HashMap<&RowKind, usize> = new_keys
+            .iter()
+            .enumerate()
+            .map(|(at, key)| (key, at))
+            .collect();
+        let in_old: HashMap<&RowKind, usize> = old_keys
+            .iter()
+            .enumerate()
+            .map(|(at, key)| (key, at))
+            .collect();
+        /* In the list's indices as it is being changed: everything before `j` is already new. */
         let mut splices: Vec<(usize, usize, usize)> = Vec::new();
+        let mut changed: Vec<usize> = Vec::new();
         let mut splice = |at: usize, removed: usize, inserted: usize| match splices.last_mut() {
             Some(last) if last.0 + last.2 == at => {
                 last.1 += removed;
@@ -192,32 +239,23 @@ impl ReaderView {
             }
             _ => splices.push((at, removed, inserted)),
         };
+        let (mut i, mut j) = (0, 0);
         while i < old.len() && j < new.len() {
-            if old[i] == new[j] {
+            if old_keys[i] == new_keys[j] {
+                if old[i] != new[j] {
+                    changed.push(j);
+                }
                 i += 1;
                 j += 1;
-                continue;
-            }
-            let inserted = new[j..].iter().take(AHEAD).position(|row| *row == old[i]);
-            let removed = old[i..].iter().take(AHEAD).position(|row| *row == new[j]);
-            match (inserted, removed) {
-                (Some(count), Some(other)) if other < count => {
-                    splice(j, other, 0);
-                    i += other;
-                }
-                (Some(count), _) => {
-                    splice(j, 0, count);
-                    j += count;
-                }
-                (None, Some(count)) => {
-                    splice(j, count, 0);
-                    i += count;
-                }
-                (None, None) => {
-                    splice(j, 1, 1);
-                    i += 1;
-                    j += 1;
-                }
+            } else if in_new.get(&old_keys[i]).is_none_or(|&at| at < j) {
+                splice(j, 1, 0);
+                i += 1;
+            } else if in_old.get(&new_keys[j]).is_none_or(|&at| at < i) {
+                splice(j, 0, 1);
+                j += 1;
+            } else {
+                splice(j, 1, 0);
+                i += 1;
             }
         }
         splice(j, old.len() - i, new.len() - j);
@@ -225,6 +263,10 @@ impl ReaderView {
             if removed + inserted > 0 {
                 self.list.splice(at..at + removed, inserted);
             }
+        }
+        /* The changed rows' places are the new rows', which the list's are once spliced. */
+        for at in changed {
+            self.list.remeasure_items(at..at + 1);
         }
         self.rows = Rc::new(new);
         if old.is_empty() {
@@ -288,20 +330,21 @@ impl ReaderView {
 
     /// Goes to the next turn's prompt (`by` 1) or the previous one (`by` -1).
     fn turn(&mut self, by: isize, cx: &mut Context<Self>) {
+        if self.rows.is_empty() {
+            return;
+        }
         let from = self
             .focused
             .as_ref()
-            .map_or_else(|| self.list.logical_scroll_top().item_ix, |(at, _)| *at);
+            .map_or_else(|| self.list.logical_scroll_top().item_ix, |(at, _)| *at)
+            .min(self.rows.len() - 1);
         let next = if by > 0 {
-            self.rows[(from + 1).min(self.rows.len())..]
+            self.rows[from + 1..]
                 .iter()
                 .position(Row::starts_turn)
                 .map(|found| from + 1 + found)
         } else {
-            let current = self.rows[..=from.min(self.rows.len().saturating_sub(1))]
-                .iter()
-                .rposition(Row::starts_turn);
-            match current {
+            match self.rows[..=from].iter().rposition(Row::starts_turn) {
                 Some(at) if at < from => Some(at),
                 Some(at) => self.rows[..at].iter().rposition(Row::starts_turn),
                 None => None,
@@ -343,8 +386,18 @@ impl ReaderView {
         }
     }
 
-    /// Copies what the keyboard is on: a message's text, a call's command or path.
+    /// Copies the text selected in a message, else what the keyboard is on: a message's text,
+    /// a call's command or path (DESIGN §4.2.2, §5).
     fn copy(&mut self, cx: &mut Context<Self>) {
+        let selected = self
+            .states
+            .values()
+            .map(|(state, _)| state.read(cx).selected_text())
+            .find(|text| !text.is_empty());
+        if let Some(text) = selected {
+            crate::system::copy_text(text, cx);
+            return;
+        }
         let Some((_, row)) = &self.focused else {
             return;
         };
@@ -353,14 +406,6 @@ impl ReaderView {
             return;
         };
         let text = match &row.kind {
-            RowKind::Prompt(at) | RowKind::Task { at, .. } | RowKind::Reply(at) => {
-                match open.block(at).map(|block| &block.content) {
-                    Some(Content::Prompt { text, .. } | Content::Reply { text }) => {
-                        Some(text.clone())
-                    }
-                    _ => None,
-                }
-            }
             RowKind::Call { at, .. } => open.call(at).and_then(|call| match &call.input {
                 ToolInput::Shell { command, .. } => Some(command.clone()),
                 ToolInput::Read { path, .. }
@@ -368,16 +413,25 @@ impl ReaderView {
                 | ToolInput::Write { path, .. } => Some(path.clone()),
                 _ => None,
             }),
-            _ => None,
+            _ => row.block().and_then(|at| message_text(open, at)),
         };
         if let Some(text) = text {
             crate::system::copy_text(text, cx);
         }
     }
 
+    /// Scrolls a screen, and puts the keyboard on the first row of it that takes it.
     fn scroll_page(&mut self, down: bool, cx: &mut Context<Self>) {
         let height = self.list.viewport_bounds().size.height * 0.9;
         self.list.scroll_by(if down { height } else { -height });
+        let top = self.list.logical_scroll_top().item_ix;
+        if let Some(at) = self.rows.get(top..).and_then(|rows| {
+            rows.iter()
+                .position(Row::is_focusable)
+                .map(|found| top + found)
+        }) {
+            self.focused = Some((at, self.rows[at].clone()));
+        }
         cx.notify();
     }
 
@@ -385,7 +439,6 @@ impl ReaderView {
     fn read_alone(&mut self, item: Option<(Arc<str>, Option<BlockRef>)>, cx: &mut Context<Self>) {
         let back_to = self.alone.as_ref().and_then(|(_, call)| call.clone());
         self.alone = item;
-        self.rows = Rc::default();
         self.states.clear();
         self.focused = None;
         let reader = cx.services().reader.clone();
@@ -413,31 +466,53 @@ impl ReaderView {
         cx.notify();
     }
 
-    /// Keeps the Markdown state of the body `body` drawn at row `at`, made from `text` the
+    /// Keeps the Markdown state of the piece `piece` drawn at row `at`, made from `text` the
     /// first time.
     fn markdown_state(
         &mut self,
-        body: Body,
+        piece: Piece,
         at: usize,
         text: impl FnOnce() -> Option<Sanitized>,
         cx: &mut App,
     ) -> Option<Entity<TextViewState>> {
-        if let Some((state, row)) = self.states.get_mut(&body) {
+        if let Some((state, row)) = self.states.get_mut(&piece) {
             *row = at;
             return Some(state.clone());
         }
         let state = crate::markdown::state(&text()?, cx);
-        self.states.insert(body, (state.clone(), at));
+        self.states.insert(piece, (state.clone(), at));
         Some(state)
     }
 
-    /// Drops the Markdown states of the rows far from those drawn last.
-    fn drop_far_states(&mut self) {
+    /// Notes that the row `at` drew with `held`, so it is kept while the row is near.
+    fn hold(&mut self, held: Held, at: usize) {
+        self.held.insert(held, at);
+    }
+
+    /// Lets go of the Markdown states, and of the service's prose, bodies and images, of the
+    /// rows far from those drawn last (the module docs).
+    fn let_go_of_far(&mut self, cx: &mut Context<Self>) {
         let Some((first, last)) = self.drawn.get() else {
             return;
         };
-        let keep = first.saturating_sub(KEEP_ROWS)..last + KEEP_ROWS + 1;
-        self.states.retain(|_, (_, row)| keep.contains(row));
+        let near = |keep: usize| first.saturating_sub(keep)..last + keep + 1;
+        let states = near(KEEP_STATES);
+        self.states.retain(|_, (_, row)| states.contains(row));
+        let data = near(KEEP_DATA);
+        let far: Vec<Held> = self
+            .held
+            .iter()
+            .filter(|(_, row)| !data.contains(row))
+            .map(|(held, _)| held.clone())
+            .collect();
+        if far.is_empty() {
+            return;
+        }
+        for held in &far {
+            self.held.remove(held);
+        }
+        let reader = cx.services().reader.clone();
+        cx.defer(move |cx| reader.update(cx, |reader, cx| reader.release(far, cx)));
     }
 
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -449,9 +524,10 @@ impl ReaderView {
             None => (ix, ix),
         }));
         let theme = cx.sb_theme().clone();
-        let focused = self.focused.as_ref().is_some_and(|(at, _)| *at == ix);
+        let focused = self.keyboard && self.focused.as_ref().is_some_and(|(at, _)| *at == ix);
         let content = match &row.kind {
             RowKind::Call { .. }
+            | RowKind::CallIo { .. }
             | RowKind::Body { .. }
             | RowKind::Panel { .. }
             | RowKind::Unattached { .. } => calls::render(self, ix, &row, focused, window, cx),
@@ -712,6 +788,14 @@ impl ReaderView {
     }
 }
 
+/// The text of the message at `at`, a prompt or a reply, to copy as it was written.
+fn message_text(open: &OpenSession, at: &BlockRef) -> Option<String> {
+    match &open.block(at)?.content {
+        Content::Prompt { text, .. } | Content::Reply { text } => Some(text.clone()),
+        _ => None,
+    }
+}
+
 /// The reading column: at most 720 wide with 32 at its sides, centred.
 fn column(theme: &SbTheme) -> gpui::Div {
     div()
@@ -779,8 +863,15 @@ fn frame(row: &Row, content: AnyElement, theme: &SbTheme) -> AnyElement {
 impl Render for ReaderView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.sb_theme().clone();
-        self.drop_far_states();
+        self.let_go_of_far(cx);
         self.drawn.set(None);
+        let widest = self
+            .label_width_next
+            .replace(theme.sizes.activity_name_width);
+        self.label_width = widest.clamp(
+            theme.sizes.activity_name_width,
+            theme.sizes.activity_name_max,
+        );
         let header = self.render_header(&theme, cx);
         let reader = cx.services().reader.read(cx);
         let body = match reader.state() {
@@ -850,7 +941,10 @@ fn on<A: gpui::Action>(
 ) -> gpui::Stateful<gpui::Div> {
     let view = view.clone();
     element.on_action(move |_: &A, window, cx| {
-        view.update(cx, |this, cx| run(this, window, cx));
+        view.update(cx, |this, cx| {
+            this.keyboard = true;
+            run(this, window, cx);
+        });
     })
 }
 

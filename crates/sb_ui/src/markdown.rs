@@ -21,16 +21,18 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext as _, Entity, FontWeight, HighlightStyle, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled as _, div, px, rems,
+    App, AppContext as _, Entity, FontFeatures, FontWeight, HighlightStyle, Hsla,
+    InteractiveElement as _, IntoElement, Overflow, ParentElement as _, Pixels, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, div, px, rems,
 };
 use gpui_base::text::{CodeBlock, TextView, TextViewState, TextViewStyle};
 
 use crate::syntax;
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _, SyntaxColors, TextSpec};
 
-pub use sanitize::sanitize;
+#[cfg(test)]
+pub(crate) use sanitize::inert;
+pub use sanitize::{options, sanitize};
 
 /// A body that has been through [`sanitize`]: nothing in it fetches anything or renders
 /// markup. The only way to make one is to sanitise text.
@@ -38,8 +40,10 @@ pub use sanitize::sanitize;
 pub struct Sanitized(SharedString);
 
 impl Sanitized {
+    /// `text` sanitised, its bidirectional controls shown as what they are
+    /// ([`crate::hostile::bidi`]).
     pub fn new(text: &str) -> Self {
-        Self(sanitize(text).into())
+        Self(sanitize(&crate::hostile::bidi(text)).into())
     }
 
     pub fn as_str(&self) -> &str {
@@ -129,6 +133,7 @@ pub fn style(theme: &SbTheme) -> TextViewStyle {
         .with_inline_code_style(
             StyleRefinement::default()
                 .font_family(theme.text.inline_code.family.clone())
+                .font_features(FontFeatures::disable_ligatures())
                 .text_size(theme.text.inline_code.size)
                 .bg(c.s3)
                 .rounded(theme.radii.small)
@@ -137,6 +142,7 @@ pub fn style(theme: &SbTheme) -> TextViewStyle {
         )
         .with_code_block(
             refined(&theme.text.code_block)
+                .font_features(FontFeatures::disable_ligatures())
                 .font_weight(FontWeight::NORMAL)
                 .text_color(c.fg2)
                 .rounded(radius)
@@ -149,12 +155,15 @@ pub fn style(theme: &SbTheme) -> TextViewStyle {
                 .pb(CODE_PADDING_Y),
         )
         .with_blockquote_style(StyleRefinement::default().text_color(c.fg2))
-        .with_table(
-            StyleRefinement::default()
+        .with_table({
+            let mut table = StyleRefinement::default()
                 .rounded(radius)
                 .bg(c.bg_app)
-                .text_size(theme.text.body.size),
-        )
+                .text_size(theme.text.body.size);
+            // A table wider than the column scrolls sideways rather than lose its columns.
+            table.overflow.x = Some(Overflow::Scroll);
+            table
+        })
         .with_table_head(
             StyleRefinement::default()
                 .bg(c.s1)

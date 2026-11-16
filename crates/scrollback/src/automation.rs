@@ -33,11 +33,16 @@
 //!   lists, `null` while it loads or is of the other kind), the titles of the `selected` and
 //!   the `open` session, and `error` (why the library couldn't be read, or `null`).
 //! - `reader`: `state` (`closed`, `opening`, `failed` with `error`, or `open`), `full_calls`,
-//!   `place` (`[n, of]`: the open session among its page's), `rows` (the column's), `top` (the
-//!   row at its top), `focused` (`row` and `kind` of the keyboard's row, or `null`),
-//!   `open_calls`, `markdown_states` (how many parsed bodies are kept), `alone` (a subagent read
-//!   on its own), `loads` (`bodies`, `subagents`, `summaries`, `images`: how many are `loading`
-//!   and `loaded`) and `fault` (a read that failed for a reason other than the stored bytes).
+//!   `place` (`[n, of]`: the open session among its page's), `rows` (the column's), `top` and
+//!   `top_name` (the row at its top, and what it is: `kind conversation/block`), `focused`
+//!   (`row`, `kind` and the start of the `text` of the keyboard's row, or `null`),
+//!   `open_calls`, `markdown_states` and `held` (how many parsed bodies, and how many prepared
+//!   things of the service's, are kept), `alone` (a subagent read on its own), `loads`
+//!   (`bodies`, `subagents`, `prose`, `images`, `raws`: how many are `loading` and
+//!   `loaded`) and `fault` (a read that failed for a reason other than the stored bytes).
+//! - `system`: what the app would have opened and copied (`sb_ui::system`): every link
+//!   `opened`, and how many texts were `copied`. A scripted run records them instead of reaching
+//!   the browser or the clipboard.
 //!
 //! Commands. An argument a command doesn't have is an error, so a misspelt one never passes
 //! for a change. These reply with `state.appearance` after the change:
@@ -101,6 +106,10 @@ impl AutomationHost for ScrollbackAutomation {
             "sync": sync(cx),
             "library": library(cx),
             "reader": reader(shell, cx),
+            "system": cx.try_global::<sb_ui::system::Recorded>().map(|recorded| json!({
+                "opened": recorded.opened,
+                "copied": recorded.copied.len(),
+            })),
         })
     }
 
@@ -273,9 +282,11 @@ fn reader(shell: &Shell, cx: &App) -> Value {
         "place": cx.services().library.read(cx).open_place().map(|(at, of)| json!([at + 1, of])),
         "rows": view.rows,
         "top": view.top,
-        "focused": view.focused.map(|(at, kind)| json!({ "row": at, "kind": kind })),
+        "top_name": view.top_name,
+        "focused": view.focused.map(|(at, kind, text)| json!({ "row": at, "kind": kind, "text": text })),
         "open_calls": view.open_calls,
         "markdown_states": view.states,
+        "held": view.held,
         "alone": view.alone,
         "loads": open.map(|open| {
             open.loads()
@@ -466,6 +477,8 @@ pub fn start(
     pipe: Option<String>,
     cx: &mut App,
 ) -> Result<()> {
+    // A scripted run never reaches the browser or the clipboard of whoever is at the machine.
+    sb_ui::system::record(cx);
     let host = cx.new(|_| ScrollbackAutomation { shell, data_dir });
     let options = gpui_automation::Options {
         pipe,

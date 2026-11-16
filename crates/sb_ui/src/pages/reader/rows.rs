@@ -1,24 +1,26 @@
 //! The reader's rows (PLAN §9): an open session laid flat into the items of the virtualised
 //! list, as the service holds it now.
 //!
-//! A row is one thing the column draws at one place: a message, a thought, one activity row, a
-//! piece of a call's body, a line of a subagent's panel. A subagent's conversation is laid out
-//! by the same code as the session's own, a level deeper, inside its panel, so a subagent with
-//! thousands of blocks costs what its visible rows do. A call's body is cut into rows of a
-//! bounded number of lines for the same reason.
+//! A row is one thing the column draws at one place: a message's header, a piece of its prose,
+//! a thought, one activity row, a piece of a call's body, a line of a subagent's panel. Nothing
+//! one row draws is unbounded: prose comes in pieces ([`crate::services::reader::Prose`]), and
+//! text shown as it is in rows of at most [`CHUNK_LINES`] lines. A subagent's conversation is
+//! laid out by the same code as the session's own, a level deeper, inside its panel, so a
+//! subagent with thousands of blocks costs what its visible rows do.
 //!
-//! A [`Row`] is a value that says everything its height depends on, so the view can compare the
-//! rows before and after a change and tell the list which ones to measure again.
+//! A [`Row`] is a value that says everything its height depends on; [`Row::key`] says which
+//! row it is whatever its state, so the view can match the rows before and after a change and
+//! tell the list which ones were added, removed, or changed in place.
 
 use std::sync::Arc;
 
-use sb_core::transcript::{BlockId, Content, Conversation, Ending, ToolKind, Turn};
+use sb_core::transcript::{BlockId, Content, Conversation, Ending, Turn};
 
-use crate::services::reader::{BlockRef, CallBody, Load, OpenSession, Part, Toggle};
+use crate::services::reader::{BlockRef, CallBody, Load, OpenSession, Part, Piece, Prose, Toggle};
 
-/// How many lines a call body shows of a part until "Show all" (DESIGN §4.2.4).
+/// How many lines text shown as it is shows until "Show all" (DESIGN §4.2.4).
 pub const FIRST_LINES: usize = 20;
-/// How many lines one row of a body holds once it shows all of them.
+/// How many lines one row holds once all are shown.
 pub const CHUNK_LINES: usize = 100;
 /// How many of a subagent's calls its panel shows until "Show n more calls" (DESIGN §4.2.7).
 pub const FIRST_CALLS: usize = 5;
@@ -27,7 +29,7 @@ pub const FIRST_CALLS: usize = 5;
 pub const MAX_DEPTH: usize = 3;
 
 /// The space above a row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Space {
     None,
     /// Between two activity rows of a group (1).
@@ -41,7 +43,7 @@ pub enum Space {
 }
 
 /// What a row of a call's body is.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BodyPart {
     /// The body is being read: a skeleton of three lines.
     Loading,
@@ -71,8 +73,38 @@ pub enum BodyPart {
     Footer,
 }
 
+/// What a row of a block's prose is.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ProsePart {
+    /// Being prepared: a skeleton.
+    Pending,
+    Failed(String),
+    /// A piece laid out as Markdown.
+    Markdown(usize),
+    /// Over a piece shown as plain text for its size: says so.
+    Note(usize),
+    /// The `chunk`th row of a piece's lines.
+    Lines {
+        piece: usize,
+        chunk: usize,
+    },
+    More {
+        piece: usize,
+        all: bool,
+    },
+}
+
+/// How a conversation that isn't whole ended (PLAN §7.4).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Ended {
+    /// Inside a record, as one still being written does.
+    MidRecord,
+    /// Reading it failed from some point, for this reason.
+    Unreadable(String),
+}
+
 /// What a row of a subagent's panel is, besides the blocks of its conversation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PanelPart {
     /// The meta line: "subagent", start, model, calls, duration; Open on its own.
     Meta,
@@ -84,25 +116,42 @@ pub enum PanelPart {
     TooDeep,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RowKind {
-    /// The hairline between two turns.
-    Turn,
-    /// A prompt. A subagent's first prompt is its task, from the agent that started it.
+    /// The hairline before the turn that opens at this prompt.
+    Turn(BlockRef),
+    /// Over a prompt: who asked, and when. A subagent's first prompt is its task, from the
+    /// agent that started it, drawn in a box its prose rows go on in.
     Prompt(BlockRef),
     Task {
         at: BlockRef,
         from: Option<Arc<str>>,
     },
+    /// A row of a block's prose: a prompt's, a reply's, an open thought's or summary's. `boxed`
+    /// when it is in a task's box, and `last` when it ends the box; `reply` on a reply's first
+    /// row, where the keyboard rests on the reply and its Copy is.
+    Prose {
+        at: BlockRef,
+        part: ProsePart,
+        boxed: bool,
+        last: bool,
+        reply: bool,
+    },
+    /// A prompt's images as thumbnails.
+    Images(BlockRef),
     /// The agent's mark, the model and the time, over what it wrote.
     Author(BlockRef),
-    Reply(BlockRef),
     Thought {
         at: BlockRef,
         open: bool,
     },
     /// An activity row (DESIGN §4.2.3).
     Call {
+        at: BlockRef,
+        open: bool,
+    },
+    /// Under a call that started subagents: its own input and output, opened.
+    CallIo {
         at: BlockRef,
         open: bool,
     },
@@ -123,11 +172,6 @@ pub enum RowKind {
         at: BlockRef,
         open: bool,
     },
-    /// A compaction's summary, once open: loaded or not.
-    Summary {
-        at: BlockRef,
-        ready: bool,
-    },
     Note(BlockRef),
     Unrecognised {
         at: BlockRef,
@@ -140,12 +184,12 @@ pub enum RowKind {
     /// How the conversation of the item ended, when it isn't whole.
     Ending {
         conversation: Arc<str>,
-        ending: Ending,
+        ending: Ended,
     },
     /// The session holds no conversation of its own.
     NoConversation,
-    /// Over the subagents no call is known to have started, and one of them.
-    UnattachedHead(usize),
+    /// Over the subagents no call is known to have started: how many, once that is known.
+    UnattachedHead(Option<usize>),
     Unattached {
         item: Arc<str>,
         open: bool,
@@ -154,7 +198,7 @@ pub enum RowKind {
     Alone(Arc<str>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Row {
     pub kind: RowKind,
     /// How many subagent panels it is inside.
@@ -167,15 +211,56 @@ pub struct Row {
 }
 
 impl Row {
+    /// Which row it is, whatever its state: open or closed, loading or loaded. The rows before
+    /// and after a change are matched by it.
+    pub fn key(&self) -> RowKind {
+        let mut key = self.kind.clone();
+        match &mut key {
+            RowKind::Thought { open, .. }
+            | RowKind::Call { open, .. }
+            | RowKind::CallIo { open, .. }
+            | RowKind::Compaction { open, .. }
+            | RowKind::Unrecognised { open, .. }
+            | RowKind::Unattached { open, .. } => *open = false,
+            RowKind::Raw { ready, .. } => *ready = false,
+            RowKind::Body {
+                part, first, last, ..
+            } => {
+                (*first, *last) = (false, false);
+                match part {
+                    BodyPart::Failed(_) => *part = BodyPart::Loading,
+                    BodyPart::More { all, .. } => *all = false,
+                    _ => {}
+                }
+            }
+            RowKind::Prose { part, last, .. } => {
+                *last = false;
+                match part {
+                    ProsePart::Failed(_) => *part = ProsePart::Pending,
+                    ProsePart::More { all, .. } => *all = false,
+                    _ => {}
+                }
+            }
+            RowKind::Panel { part, .. } => {
+                if let PanelPart::Failed(_) = part {
+                    *part = PanelPart::Loading;
+                }
+            }
+            RowKind::UnattachedHead(count) => *count = None,
+            _ => {}
+        }
+        key
+    }
+
     /// Whether the keyboard can rest on it (DESIGN §5: move between rows).
     pub fn is_focusable(&self) -> bool {
         matches!(
             self.kind,
             RowKind::Prompt(_)
                 | RowKind::Task { .. }
-                | RowKind::Reply(_)
                 | RowKind::Thought { .. }
                 | RowKind::Call { .. }
+                | RowKind::CallIo { .. }
                 | RowKind::Compaction { .. }
                 | RowKind::Unrecognised { .. }
                 | RowKind::Unattached { .. }
@@ -183,7 +268,7 @@ impl Row {
                     part: PanelPart::More(_),
                     ..
                 }
-        )
+        ) || matches!(self.kind, RowKind::Prose { reply: true, .. })
     }
 
     /// What `Enter` opens or closes on it.
@@ -191,6 +276,7 @@ impl Row {
         match &self.kind {
             RowKind::Thought { at, .. } => Some(Toggle::Thought(at.clone())),
             RowKind::Call { at, .. } => Some(Toggle::Call(at.clone())),
+            RowKind::CallIo { at, .. } => Some(Toggle::CallIo(at.clone())),
             RowKind::Compaction { at, .. } => Some(Toggle::Summary(at.clone())),
             RowKind::Unrecognised { at, .. } => Some(Toggle::Raw(at.clone())),
             RowKind::Unattached { item, .. } => Some(Toggle::Subagent(item.clone())),
@@ -208,6 +294,7 @@ impl Row {
         match self.kind {
             RowKind::Thought { open, .. }
             | RowKind::Call { open, .. }
+            | RowKind::CallIo { open, .. }
             | RowKind::Compaction { open, .. }
             | RowKind::Unrecognised { open, .. }
             | RowKind::Unattached { open, .. } => open,
@@ -218,6 +305,27 @@ impl Row {
     /// Whether a turn starts at it.
     pub fn starts_turn(&self) -> bool {
         self.depth == 0 && matches!(self.kind, RowKind::Prompt(_))
+    }
+
+    /// The block it is of, if it is one block's.
+    pub fn block(&self) -> Option<&BlockRef> {
+        match &self.kind {
+            RowKind::Turn(at)
+            | RowKind::Prompt(at)
+            | RowKind::Task { at, .. }
+            | RowKind::Prose { at, .. }
+            | RowKind::Images(at)
+            | RowKind::Author(at)
+            | RowKind::Thought { at, .. }
+            | RowKind::Call { at, .. }
+            | RowKind::CallIo { at, .. }
+            | RowKind::Body { at, .. }
+            | RowKind::Compaction { at, .. }
+            | RowKind::Note(at)
+            | RowKind::Unrecognised { at, .. }
+            | RowKind::Raw { at, .. } => Some(at),
+            _ => None,
+        }
     }
 }
 
@@ -244,23 +352,28 @@ pub fn rows(
         Some(main) => out.conversation(main, false),
         None => out.push(RowKind::NoConversation, Space::Top),
     }
-    let unattached = open.unattached();
-    if !unattached.is_empty() {
-        out.push(RowKind::UnattachedHead(unattached.len()), Space::Block);
-        for item in unattached {
-            let toggle = Toggle::Subagent(item.clone());
-            let opened = open.is_open(&toggle, full_calls);
+    match open.unattached() {
+        None => out.push(RowKind::UnattachedHead(None), Space::Block),
+        Some(unattached) if !unattached.is_empty() => {
             out.push(
-                RowKind::Unattached {
-                    item: item.clone(),
-                    open: opened,
-                },
-                Space::Group,
+                RowKind::UnattachedHead(Some(unattached.len())),
+                Space::Block,
             );
-            if opened {
-                out.panel(item, None, Space::None, false);
+            for item in &unattached {
+                let opened = open.is_open(&Toggle::Subagent(item.clone()), full_calls);
+                out.push(
+                    RowKind::Unattached {
+                        item: item.clone(),
+                        open: opened,
+                    },
+                    Space::Group,
+                );
+                if opened {
+                    out.panel(item, None, Space::None, false);
+                }
             }
         }
+        Some(_) => {}
     }
     out.finish()
 }
@@ -310,7 +423,10 @@ impl Rows<'_> {
     fn conversation(&mut self, conversation: &Conversation, subagent: bool) {
         for (index, turn) in conversation.turns().iter().enumerate() {
             if index > 0 && self.depth == 0 {
-                self.push(RowKind::Turn, Space::Block);
+                self.push(
+                    RowKind::Turn(Self::at(conversation, turn.blocks[0])),
+                    Space::Block,
+                );
             }
             self.turn(conversation, turn, subagent && index == 0);
         }
@@ -338,7 +454,8 @@ impl Rows<'_> {
                 (false, false) => Space::Block,
             };
             last_call = is_call;
-            self.block(conversation, id, at, space, task);
+            let first = task && id == conversation.turns()[0].blocks[0];
+            self.block(conversation, id, at, space, first);
         }
     }
 
@@ -353,18 +470,42 @@ impl Rows<'_> {
         let full_calls = self.full_calls;
         let open = self.open;
         match &conversation[id].content {
-            Content::Prompt { .. } if task && id == conversation.turns()[0].blocks[0] => self.push(
-                RowKind::Task {
-                    at,
-                    from: self.task_from.clone(),
-                },
-                space,
-            ),
-            Content::Prompt { .. } => self.push(RowKind::Prompt(at), space),
-            Content::Reply { .. } => self.push(RowKind::Reply(at), space),
+            Content::Prompt { images, .. } => {
+                if task {
+                    self.push(
+                        RowKind::Task {
+                            at: at.clone(),
+                            from: self.task_from.clone(),
+                        },
+                        space,
+                    );
+                } else {
+                    self.push(RowKind::Prompt(at.clone()), space);
+                }
+                self.prose(&at, task, false);
+                if !images.is_empty() {
+                    self.push(RowKind::Images(at), Space::Tight);
+                }
+            }
+            Content::Reply { .. } => {
+                let start = self.rows.len();
+                self.prose(&at, false, true);
+                if let Some(first) = self.rows.get_mut(start) {
+                    first.space = space;
+                }
+            }
             Content::Thinking { .. } => {
                 let opened = open.is_open(&Toggle::Thought(at.clone()), full_calls);
-                self.push(RowKind::Thought { at, open: opened }, space);
+                self.push(
+                    RowKind::Thought {
+                        at: at.clone(),
+                        open: opened,
+                    },
+                    space,
+                );
+                if opened {
+                    self.prose(&at, false, false);
+                }
             }
             Content::ToolCall(call) => {
                 let opened = open.is_open(&Toggle::Call(at.clone()), full_calls);
@@ -375,14 +516,26 @@ impl Rows<'_> {
                     },
                     space,
                 );
-                if opened {
-                    if call.kind == ToolKind::Subagent && !call.subagents.is_empty() {
-                        for subagent in &call.subagents {
-                            self.panel(subagent.item(), Some(&at), Space::None, false);
-                        }
-                    } else {
-                        self.body(&at);
-                    }
+                if !opened {
+                    return;
+                }
+                if call.subagents.is_empty() {
+                    self.body(&at);
+                    return;
+                }
+                for subagent in &call.subagents {
+                    self.panel(subagent.item(), Some(&at), Space::None, false);
+                }
+                let io = open.is_open(&Toggle::CallIo(at.clone()), full_calls);
+                self.push(
+                    RowKind::CallIo {
+                        at: at.clone(),
+                        open: io,
+                    },
+                    Space::None,
+                );
+                if io {
+                    self.body(&at);
                 }
             }
             Content::Compaction { summary, .. } => {
@@ -396,9 +549,7 @@ impl Rows<'_> {
                     Space::Block,
                 );
                 if opened {
-                    let ready =
-                        matches!(open.summary(&at), Some(Load::Loaded(_) | Load::Failed(_)));
-                    self.push(RowKind::Summary { at, ready }, Space::Tight);
+                    self.prose(&at, false, false);
                 }
             }
             Content::Note { .. } => self.push(RowKind::Note(at), space),
@@ -419,16 +570,79 @@ impl Rows<'_> {
         }
     }
 
-    fn ending(&mut self, conversation: &Conversation) {
-        if conversation.ending != Ending::Whole {
+    /// The rows of a block's prose, as far as it is prepared. In a task's box, the last closes
+    /// it; a reply's first is where the keyboard rests on it.
+    fn prose(&mut self, at: &BlockRef, boxed: bool, reply: bool) {
+        let parts = match self.open.prose(at) {
+            None | Some(Load::Loading) => vec![ProsePart::Pending],
+            Some(Load::Failed(why)) => vec![ProsePart::Failed(why.clone())],
+            Some(Load::Loaded(prose)) => self.prose_parts(at, prose),
+        };
+        let count = parts.len();
+        for (index, part) in parts.into_iter().enumerate() {
+            let space = if index == 0 {
+                Space::Tight
+            } else {
+                Space::None
+            };
             self.push(
-                RowKind::Ending {
-                    conversation: conversation.item.clone(),
-                    ending: conversation.ending.clone(),
+                RowKind::Prose {
+                    at: at.clone(),
+                    part,
+                    boxed,
+                    last: boxed && index + 1 == count,
+                    reply: reply && index == 0,
                 },
-                Space::Block,
+                space,
             );
         }
+    }
+
+    fn prose_parts(&self, at: &BlockRef, prose: &Prose) -> Vec<ProsePart> {
+        let mut parts = Vec::new();
+        for (index, piece) in prose.pieces.iter().enumerate() {
+            match piece {
+                Piece::Markdown(_) => parts.push(ProsePart::Markdown(index)),
+                Piece::Plain { text, oversized } => {
+                    if *oversized {
+                        parts.push(ProsePart::Note(index));
+                    }
+                    let count = text.line_count();
+                    let all = !oversized
+                        || self
+                            .open
+                            .is_open(&Toggle::ProseLines(at.clone(), index), self.full_calls);
+                    let chunks = if all {
+                        count.div_ceil(CHUNK_LINES)
+                    } else {
+                        count.min(1)
+                    };
+                    parts.extend((0..chunks).map(|chunk| ProsePart::Lines {
+                        piece: index,
+                        chunk,
+                    }));
+                    if *oversized && count > FIRST_LINES {
+                        parts.push(ProsePart::More { piece: index, all });
+                    }
+                }
+            }
+        }
+        parts
+    }
+
+    fn ending(&mut self, conversation: &Conversation) {
+        let ending = match &conversation.ending {
+            Ending::Whole => return,
+            Ending::MidRecord => Ended::MidRecord,
+            Ending::Unreadable(why) => Ended::Unreadable(why.clone()),
+        };
+        self.push(
+            RowKind::Ending {
+                conversation: conversation.item.clone(),
+                ending,
+            },
+            Space::Block,
+        );
     }
 
     /// The rows of a call's body, as far as it is loaded.
@@ -452,6 +666,11 @@ impl Rows<'_> {
         }
     }
 
+    /**
+     * The generic call body (DESIGN §4.2.4): the input as sent and each part of the output.
+     * A kind's own renderer takes its place here, by the call's kind, and in the view's
+     * drawing of the parts it adds.
+     */
     fn body_parts(&self, at: &BlockRef, body: &CallBody) -> Vec<BodyPart> {
         let mut parts = vec![BodyPart::InputHead];
         self.lines(
@@ -472,8 +691,7 @@ impl Rows<'_> {
                     text.as_ref().map(|text| text.line_count()),
                     &mut parts,
                 ),
-                Part::Image(Ok(_)) => parts.push(BodyPart::Image(index)),
-                Part::Image(Err(_)) => parts.push(BodyPart::PartFailed { part: Some(index) }),
+                Part::Image => parts.push(BodyPart::Image(index)),
             }
         }
         parts.push(BodyPart::Footer);
@@ -568,13 +786,12 @@ impl Rows<'_> {
         if let Some(&first) = shown.first()
             && matches!(conversation[first].content, Content::Prompt { .. })
         {
-            let at = Self::at(conversation, first);
-            self.push(
-                RowKind::Task {
-                    at,
-                    from: self.task_from.clone(),
-                },
+            self.block(
+                conversation,
+                first,
+                Self::at(conversation, first),
                 Space::Tight,
+                true,
             );
         }
         let calls: Vec<BlockId> = conversation.calls().map(|(id, _)| id).collect();
@@ -601,7 +818,13 @@ impl Rows<'_> {
             .rev()
             .find(|id| matches!(conversation[**id].content, Content::Reply { .. }))
         {
-            self.push(RowKind::Reply(Self::at(conversation, reply)), Space::Tight);
+            self.block(
+                conversation,
+                reply,
+                Self::at(conversation, reply),
+                Space::Tight,
+                false,
+            );
         }
         self.ending(conversation);
     }

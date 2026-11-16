@@ -892,6 +892,139 @@ pub fn constructs(tree: &mut ProjectsTree) -> String {
     session.session_key().to_string()
 }
 
+/// Replies built to get markup or a fetch past the reader, or to stall or crash its Markdown
+/// view: each must read literally, as plain text where it is too large or too deep.
+pub const HOSTILE_REPLIES: &[&str] = &[
+    "!![x](https://evil.example/p.png) and !![y][r]\n\n[r]: https://evil.example/q.png",
+    "$x`$ <img src=\"https://evil.example/p.png\"> `y and $a <a href=\"file:///etc/passwd\">b</a> c$",
+    "fetch('http://evil.example/script');</script> stays text",
+    "<div>\n<img src=\"https://evil.example/p.png\">\n</div>",
+    "A path that reads backwards: \u{202E}gnp.exe and a hard break  \nhere",
+];
+
+/// The links of every scheme the link scenario clicks, one a reply, each long enough that its
+/// reply's centre is on it.
+pub const SCHEME_LINKS: &[&str] = &[
+    "http://example.com/plain",
+    "https://example.com/secure",
+    "file:///etc/hosts",
+    "javascript:alert(1)",
+    "app-scheme://open/something",
+    "\\\\server\\share\\file",
+];
+
+/// A PNG of `width` × `height` with its header's size changed to `claimed`, its checksum
+/// fixed, so that only the claim is wrong.
+pub fn claiming_png(claimed: u32) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    let mut png = screenshot(16, 16, 0);
+    png[16..20].copy_from_slice(&claimed.to_be_bytes());
+    png[20..24].copy_from_slice(&claimed.to_be_bytes());
+    let crc = crc32(&png[12..29]);
+    png[29..33].copy_from_slice(&crc.to_be_bytes());
+    png
+}
+
+/// An animated GIF of `frames` frames.
+pub fn animated_gif(frames: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut encoder = image::codecs::gif::GifEncoder::new(&mut out);
+        for n in 0..frames {
+            let frame =
+                image::RgbaImage::from_pixel(64, 64, image::Rgba([n as u8 * 20, 80, 160, 255]));
+            encoder
+                .encode_frame(image::Frame::new(frame))
+                .expect("a generated frame encodes");
+        }
+    }
+    out
+}
+
+/**
+ * The reader's hostile content in one session of fc: replies of markup a sanitiser must catch,
+ * Markdown nested past what the view's parser survives, a reply of one very long line and one
+ * fenced block of very many lines, links of every scheme, a command and a target that hold
+ * bidirectional controls and line breaks, and images that are truncated, animated, claim a
+ * vast size, or are SVG. `big` sets how large the long line and the long block are, in bytes.
+ * Returns the session's key.
+ */
+pub fn hostile(tree: &mut ProjectsTree, big: usize) -> String {
+    let mut session = tree.session(FC, 0);
+    let mut s = Script::new(&mut session.transcript, "2026-11-07", "r");
+    s.at("08:00:00")
+        .prompt("Show me everything that could go wrong.");
+    for (index, reply) in HOSTILE_REPLIES.iter().enumerate() {
+        s.at(&format!("08:00:{:02}", 1 + index))
+            .reply(OPUS_55, reply);
+    }
+    s.at("08:01:00")
+        .reply(OPUS_55, &(">".repeat(300) + " three hundred quotes deep"));
+    let lists: String = (0..200)
+        .map(|n| format!("{}- level {n}\n", "  ".repeat(n)))
+        .collect();
+    s.at("08:01:01").reply(OPUS_55, &lists);
+    s.at("08:01:02").reply(OPUS_55, &"word ".repeat(big / 5));
+    s.at("08:01:03").reply(
+        OPUS_55,
+        &format!(
+            "A long block:\n\n```text\n{}```\n\nAfter it.",
+            "line\n".repeat(big / 5)
+        ),
+    );
+    for (index, url) in SCHEME_LINKS.iter().enumerate() {
+        s.at(&format!("08:02:{:02}", index)).reply(
+            OPUS_55,
+            &format!(
+                "[Follow this deliberately long link text to the destination {index}](<{url}>)"
+            ),
+        );
+    }
+    let bidi = s.at("08:03:00").call(
+        OPUS_55,
+        "Bash",
+        json!({ "command": "cat \u{202E}txt.exe\necho second line" }),
+    );
+    s.result(&bidi, json!("ok"), json!({}));
+    let images: [(&str, Vec<u8>); 4] = [
+        ("image/png", screenshot(64, 64, 4)[..60].to_vec()),
+        ("image/gif", animated_gif(12)),
+        ("image/png", claiming_png(60_000)),
+        (
+            "image/svg+xml",
+            b"<svg xmlns='http://www.w3.org/2000/svg'><image href='file:///etc/passwd'/></svg>"
+                .to_vec(),
+        ),
+    ];
+    for (index, (media_type, bytes)) in images.iter().enumerate() {
+        let look = s.at(&format!("08:04:{:02}", index)).call(
+            OPUS_55,
+            "Read",
+            json!({ "file_path": format!("/home/user/code/fc/image_{index}") }),
+        );
+        s.result(
+            &look,
+            json!([image_block(media_type, bytes)]),
+            json!({ "type": "image" }),
+        );
+    }
+    session.title("Reader fixture: hostile content");
+    session.session_key().to_string()
+}
+
 /// A session whose items hold no main transcript, only a subagent's: what is left when a
 /// transcript was never archived. Returns its folder's key.
 pub fn subagents_only(tree: &mut ProjectsTree) -> String {

@@ -88,6 +88,10 @@ impl Provider for Agent {
         model_name(model)
     }
 
+    fn tool_label(&self, name: &str) -> Option<&'static str> {
+        tools::label(name)
+    }
+
     fn detect<'a>(
         &'a self,
         transport: &'a dyn Transport,

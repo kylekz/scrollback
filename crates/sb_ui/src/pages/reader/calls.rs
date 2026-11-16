@@ -1,12 +1,12 @@
 //! The reader's tool calls (DESIGN §4.2.3, §4.2.4, §4.2.7): an activity row per call, the body
-//! it opens into, and the panel of a subagent it started.
+//! it opens into, and the panels of the subagents it started.
 //!
 //! **The body is the same for every kind of tool for now**: the call's input as it was sent
 //! and what it returned, in a call body with a header over each, the first lines of each part
-//! and "Show all", the images as images. The kinds' own renderers (DESIGN §4.2.4: a diff for an
-//! edit, the shell's transcript, search results, todos, web results, MCP side by side) take a
-//! kind's place in [`super::rows`]' body parts and in [`body`] here, by the call's kind, and
-//! leave the list alone.
+//! and "Show all", the images as images, the text wrapping. The kinds' own renderers (DESIGN
+//! §4.2.4: a diff for an edit, the shell's transcript, search results, todos, web results, MCP
+//! side by side) take a kind's place in [`super::rows`]' body parts and in [`body`] here, by the
+//! call's kind, and leave the list alone.
 
 use std::sync::Arc;
 
@@ -15,20 +15,22 @@ use gpui::{
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
     StyledImage as _, Window, div, img, prelude::FluentBuilder as _, px,
 };
+use gpui_component::tooltip::Tooltip;
 use sb_core::transcript::{
     Brief, Content, Conversation, TodoState, ToolCall, ToolInput, ToolKind, ToolStatus,
 };
 
 use super::ReaderView;
-use super::blocks::{failed, on_toggle, skeleton, target};
-use super::rows::{BodyPart, CHUNK_LINES, FIRST_LINES, PanelPart, Row, RowKind};
+use super::blocks::{failed, more_lines, on_toggle, skeleton, target, text_rows};
+use super::rows::{BodyPart, PanelPart, Row, RowKind};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{Tone, chip, focus_ring, icon, icon_button, tag};
+use crate::components::{Tone, chip, focus_ring, icon, icon_button, tag, text_width};
 use crate::format;
+use crate::hostile;
 use crate::icons::SbIcon;
 use crate::services::ActiveServices as _;
-use crate::services::reader::{BlockRef, CallBody, Load, Part, Text, Toggle};
+use crate::services::reader::{BlockRef, CallBody, Held, ImageKey, Load, Part, Slot, Text, Toggle};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
 pub fn render(
@@ -36,18 +38,19 @@ pub fn render(
     ix: usize,
     row: &Row,
     focused: bool,
-    _: &mut Window,
+    window: &mut Window,
     cx: &mut Context<ReaderView>,
 ) -> AnyElement {
     let theme = cx.sb_theme().clone();
     let element = match &row.kind {
-        RowKind::Call { at, open } => activity(ix, row, at, *open, focused, &theme, cx),
+        RowKind::Call { at, open } => activity(view, ix, row, at, *open, focused, window, cx),
+        RowKind::CallIo { at, open } => call_io(ix, row, at, *open, focused, &theme, cx),
         RowKind::Body {
             at,
             part,
             first,
             last,
-        } => body(at, part, *first, *last, &theme, cx),
+        } => body(view, ix, at, part, *first, *last, &theme, cx),
         RowKind::Panel { item, call, part } => {
             panel(view, ix, row, item, call, part, focused, &theme, cx)
         }
@@ -83,18 +86,6 @@ pub fn kind_icon(kind: ToolKind) -> SbIcon {
     }
 }
 
-/**
- * The name an activity row gives a call: the tool's name as its agent calls it, lowercase
- * (DESIGN §4.2.3 draws `bash`, `read`, `grep`), except an MCP tool's, whose name holds its
- * server's: `mcp`, with the server and tool as the target.
- */
-fn short_name(call: &ToolCall) -> String {
-    match call.kind {
-        ToolKind::Mcp => "mcp".to_string(),
-        _ => call.name.to_lowercase(),
-    }
-}
-
 /// `path` under the session's project folder `root`, as the boards write it; else whole.
 fn relative<'a>(path: &'a str, root: Option<&str>) -> &'a str {
     root.and_then(|root| path.strip_prefix(root))
@@ -110,28 +101,35 @@ fn call_target(call: &ToolCall, root: Option<&str>) -> String {
     match &call.input {
         ToolInput::Shell { command, .. } => command.lines().next().unwrap_or("").to_string(),
         ToolInput::Read {
-            path,
+            path: file,
             first_line,
             lines,
         } => match (first_line, lines) {
             (Some(first), Some(lines)) => {
                 format!(
                     "{}  {first}–{}",
-                    relative(path, root),
+                    path(file),
                     first + lines.saturating_sub(1)
                 )
             }
-            (Some(first), None) => format!("{}  {first}–", relative(path, root)),
-            _ => relative(path, root).to_string(),
+            (Some(first), None) => format!("{}  {first}–", path(file)),
+            _ => path(file),
         },
         ToolInput::Edit { path: file, .. } | ToolInput::Write { path: file, .. } => path(file),
         ToolInput::ContentSearch {
             pattern,
             path: within,
-        } => match within {
-            Some(within) => format!("\"{pattern}\" in {}", path(within)),
-            None => format!("\"{pattern}\""),
-        },
+            files,
+        } => {
+            let searched = match within {
+                Some(within) => format!("\"{pattern}\" in {}", path(within)),
+                None => format!("\"{pattern}\""),
+            };
+            match files {
+                Some(files) => format!("{searched} · {files}"),
+                None => searched,
+            }
+        }
         ToolInput::FileSearch {
             pattern,
             path: within,
@@ -165,8 +163,11 @@ fn call_target(call: &ToolCall, root: Option<&str>) -> String {
     }
 }
 
-/// The short result a collapsed row shows (DESIGN §4.2.3), and its status chip. A result with
-/// no brief is not taken for a success: a failed one says so.
+/**
+ * The status chip and the short result a collapsed row shows (DESIGN §4.2.3). A result with no
+ * brief is not taken for a success, and a failed result reads as failed whatever its brief
+ * says. A list of todos shows its progress in its target, not how long it took.
+ */
 fn short_result(
     call: &ToolCall,
     took: Option<i64>,
@@ -181,15 +182,19 @@ fn short_result(
             None,
         );
     };
-    let took = took.map(format::duration);
+    let took = took
+        .filter(|_| call.kind != ToolKind::Todos)
+        .map(format::duration);
     let text = |text: String| Some(div().child(text).into_any_element());
-    let mut status = (result.status == ToolStatus::Failed)
-        .then(|| chip("failed", Tone::Bad, theme).into_any_element());
+    let failed = result.status == ToolStatus::Failed;
+    let status = match (&result.brief, failed) {
+        (Some(Brief::Exit(code)), true) if *code != 0 => Some(format!("exit {code}")),
+        (_, true) => Some("failed".to_string()),
+        _ => None,
+    }
+    .map(|label| chip(label, Tone::Bad, theme).into_any_element());
     let said = match &result.brief {
-        Some(Brief::Exit(code)) => {
-            status = Some(chip(format!("exit {code}"), Tone::Bad, theme).into_any_element());
-            took.and_then(text)
-        }
+        Some(Brief::Exit(_)) | None => took.and_then(text),
         Some(Brief::Lines(lines)) => text(format::plural(*lines as usize, "line")),
         Some(Brief::Changed { added, removed }) => Some(
             div()
@@ -217,7 +222,7 @@ fn short_result(
             let parts: Vec<String> = [
                 model
                     .as_deref()
-                    .map(|model| agents::model_name(provider, model, cx)),
+                    .map(|model| hostile::label(&agents::model_name(provider, model, cx))),
                 calls.map(|calls| format::plural(calls as usize, "call")),
                 duration.map(|duration| {
                     format::duration(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
@@ -228,21 +233,27 @@ fn short_result(
             .collect();
             text(parts.join(" · "))
         }
-        None => took.and_then(text),
     };
     (status, said)
 }
 
-/// An activity row (DESIGN §4.2.3): glyph, name, target, status, short result, chevron.
+/**
+ * An activity row (DESIGN §4.2.3): glyph, label, target, status, short result, chevron. The
+ * label column is as wide as the widest label drawn, up to a bound past which a label ends in
+ * an ellipsis with the tool's name in a tooltip, so that the targets line up.
+ */
+#[allow(clippy::too_many_arguments)]
 fn activity(
+    view: &mut ReaderView,
     ix: usize,
     row: &Row,
     at: &BlockRef,
     open: bool,
     focused: bool,
-    theme: &SbTheme,
+    window: &mut Window,
     cx: &mut Context<ReaderView>,
 ) -> AnyElement {
+    let theme = cx.sb_theme().clone();
     let c = &theme.colors;
     let (call, took, provider, name) = {
         let reader = cx.services().reader.read(cx);
@@ -266,13 +277,19 @@ fn activity(
             target("call", at, session),
         )
     };
-    let (status, said) = short_result(&call, took, &provider, theme, cx);
+    let (status, said) = short_result(&call, took, &provider, &theme, cx);
     let root = cx
         .services()
         .library
         .read(cx)
         .open_session()
         .and_then(|session| session.project_path.clone());
+    let label = hostile::label(&agents::tool_label(&provider, &call.name, cx));
+    let label_width = text_width(&label, &theme.text.activity_name, window);
+    view.label_width_next
+        .set(view.label_width_next.get().max(label_width));
+    let clipped = label_width > view.label_width;
+    let tool = hostile::label(&call.name);
     let height = if row.depth > 0 {
         theme.sizes.activity_row_nested
     } else {
@@ -292,17 +309,23 @@ fn activity(
         .when(open, |this| this.bg(c.s1))
         .hover(|style| style.bg(c.s1))
         .when(focused, |this| {
-            this.bg(c.s1).shadow(focus_ring(true, theme))
+            this.bg(c.s1).shadow(focus_ring(true, &theme))
         })
         .on_click(on_toggle(ix, row, cx))
         .child(icon(kind_icon(call.kind), theme.sizes.icon_sm, c.fg3))
         .child(
             div()
+                .id(("label", ix))
                 .flex_none()
-                .min_w(theme.sizes.activity_name_width)
+                .w(view.label_width)
+                .overflow_hidden()
+                .text_ellipsis()
                 .text_color(c.fg)
                 .text_spec(&theme.text.activity_name)
-                .child(short_name(&call)),
+                .when(clipped, |this| {
+                    this.tooltip(move |window, cx| Tooltip::new(tool.clone()).build(window, cx))
+                })
+                .child(label),
         )
         .child(
             div()
@@ -311,7 +334,7 @@ fn activity(
                 .overflow_hidden()
                 .text_ellipsis()
                 .text_color(c.fg2)
-                .child(call_target(&call, root.as_deref())),
+                .child(hostile::label(&call_target(&call, root.as_deref()))),
         )
         .children(status)
         .children(said.map(|said| {
@@ -333,9 +356,59 @@ fn activity(
         .automation_target(name)
 }
 
+/// Under a call that started subagents: its own input and output, opened in a body under it.
+fn call_io(
+    ix: usize,
+    row: &Row,
+    at: &BlockRef,
+    open: bool,
+    focused: bool,
+    theme: &SbTheme,
+    cx: &mut Context<ReaderView>,
+) -> AnyElement {
+    let c = &theme.colors;
+    let name = {
+        let reader = cx.services().reader.read(cx);
+        reader
+            .open_session()
+            .map(|session| target("call-io", at, session))
+    };
+    div()
+        .id(("call-io", ix))
+        .flex()
+        .items_center()
+        .gap(theme.spacing.sm)
+        .ml(theme.sizes.call_indent)
+        .px(theme.spacing.sm)
+        .h(theme.sizes.call_footer)
+        .rounded(theme.radii.control)
+        .text_color(c.accent_text)
+        .text_spec(&theme.text.small)
+        .cursor_pointer()
+        .when(focused, |this| this.shadow(focus_ring(true, theme)))
+        .on_click(on_toggle(ix, row, cx))
+        .child(icon(
+            if open {
+                SbIcon::ChevronDown
+            } else {
+                SbIcon::ChevronRight
+            },
+            theme.sizes.icon_xs,
+            c.fg3,
+        ))
+        .child("The call as it was sent and answered")
+        .map(|this| match name {
+            Some(name) => this.automation_target(name),
+            None => this.into_any_element(),
+        })
+}
+
 /// One row of a call's body (DESIGN §4.2.4 `callbody`): a piece of a box drawn across rows, its
 /// top on the first and its bottom on the last.
+#[allow(clippy::too_many_arguments)]
 fn body(
+    view: &mut ReaderView,
+    ix: usize,
     at: &BlockRef,
     part: &BodyPart,
     first: bool,
@@ -345,10 +418,26 @@ fn body(
 ) -> AnyElement {
     let c = &theme.colors;
     let reader = cx.services().reader.clone();
-    let (loaded, call, name) = {
+    let (loaded, call, image, all, name) = {
         let reader = reader.read(cx);
         let Some(session) = reader.open_session() else {
             return div().into_any_element();
+        };
+        let image = match part {
+            BodyPart::Image(index) => {
+                let key = ImageKey {
+                    at: at.clone(),
+                    slot: Slot::Output(*index),
+                };
+                Some((session.image(&key).cloned(), key))
+            }
+            _ => None,
+        };
+        let all = match part {
+            BodyPart::Lines { part, .. } => {
+                session.is_open(&Toggle::AllLines(at.clone(), *part), reader.full_calls())
+            }
+            _ => false,
         };
         (
             match session.body(at) {
@@ -356,9 +445,12 @@ fn body(
                 _ => None,
             },
             session.call(at).cloned(),
+            image,
+            all,
             target("body", at, session),
         )
     };
+    view.hold(Held::Body(at.clone()), ix);
     if matches!(part, BodyPart::Loading) && loaded.is_none() {
         reader.update(cx, |reader, cx| reader.want_body(at, cx));
     }
@@ -373,38 +465,59 @@ fn body(
             .px(theme.spacing.lg)
             .child(failed(&format!("The call couldn't be read: {why}"), theme))
             .into_any_element(),
-        (BodyPart::InputHead, Some(body), Some(call)) => head(
-            &call.name,
+        (BodyPart::InputHead, Some(_), Some(call)) => head(
+            ix,
+            &hostile::label(&call.name),
             "input",
             None,
-            body.input.as_ref().ok().map(|text| text.text.clone()),
+            Copy::Input(at.clone()),
             first,
             theme,
         ),
-        (BodyPart::OutputHead, Some(body), Some(call)) => head(
+        (BodyPart::OutputHead, Some(_), Some(call)) => head(
+            ix,
             "",
             "output",
             call.result
                 .as_ref()
                 .filter(|result| result.status == ToolStatus::Failed)
                 .map(|_| "failed"),
-            Some(output_text(body)).filter(|text| !text.is_empty()),
+            Copy::Output(at.clone()),
             first,
             theme,
         ),
         (BodyPart::Lines { part, chunk }, Some(body), _) => match text_of(body, *part) {
-            Some(text) => lines(text, *part, *chunk, at, theme, cx),
+            Some(text) => div()
+                .px(theme.spacing.lg)
+                .when(*chunk == 0, |this| this.pt(theme.spacing.md))
+                .pb(theme.spacing.xs)
+                .text_color(c.fg2)
+                .text_spec(&theme.text.code)
+                .child(hostile::bidi(&text_rows(text, *chunk, all)).into_owned())
+                .into_any_element(),
             None => div().into_any_element(),
         },
         (BodyPart::More { part, all }, Some(body), _) => {
             let count = text_of(body, *part).map_or(0, Text::line_count);
-            more(at, *part, *all, count, theme, cx)
+            div()
+                .px(px(10.))
+                .border_t_1()
+                .border_color(c.line_subtle)
+                .child(more_lines(
+                    format!("more-{ix}").into(),
+                    count,
+                    *all,
+                    Toggle::AllLines(at.clone(), *part),
+                    theme,
+                    cx,
+                ))
+                .into_any_element()
         }
         (BodyPart::PartFailed { part }, Some(body), _) => {
             let why = match part {
                 None => body.input.as_ref().err(),
                 Some(index) => match body.output.get(*index) {
-                    Some(Part::Text(Err(why)) | Part::Image(Err(why))) => Some(why),
+                    Some(Part::Text(Err(why))) => Some(why),
                     _ => None,
                 },
             };
@@ -420,45 +533,16 @@ fn body(
                 ))
                 .into_any_element()
         }
-        (BodyPart::Image(index), Some(body), Some(call)) => match body.output.get(*index) {
-            Some(Part::Image(Ok(picture))) => {
-                let height = theme
-                    .sizes
-                    .tool_image_max_height
-                    .min(px(picture.height as f32));
-                div()
-                    .p(px(10.))
-                    .bg(c.s1)
-                    .flex()
-                    .flex_col()
-                    .gap(theme.spacing.md)
-                    .child(
-                        img(ImageSource::Image(picture.image.clone()))
-                            .w_full()
-                            .h(height)
-                            .object_fit(ObjectFit::Contain),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(theme.spacing.sm)
-                            .text_color(c.fg3)
-                            .text_spec(&theme.text.small)
-                            .child(icon(SbIcon::Image, theme.sizes.icon_xs, c.fg3))
-                            .child(format!(
-                                "{} · returned by {} · {} × {} · {}",
-                                picture.media_type,
-                                call.name,
-                                picture.width,
-                                picture.height,
-                                format::size(picture.bytes as u64)
-                            )),
-                    )
-                    .into_any_element()
+        (BodyPart::Image(_), _, Some(call)) => {
+            let Some((load, key)) = image else {
+                return div().into_any_element();
+            };
+            view.hold(Held::Image(key.clone()), ix);
+            if load.is_none() {
+                reader.update(cx, |reader, cx| reader.want_image(&key, cx));
             }
-            _ => div().into_any_element(),
-        },
+            tool_image(load, &hostile::label(&call.name), theme)
+        }
         (BodyPart::NoOutput, _, Some(call)) => div()
             .py(theme.spacing.md)
             .px(theme.spacing.lg)
@@ -495,10 +579,61 @@ fn body(
     }
 }
 
+/// An image a tool returned (DESIGN §4.2.4): fitted to the column, at most 320 high, with a
+/// caption; or why it can't be shown.
+fn tool_image(
+    load: Option<Load<crate::services::reader::Picture>>,
+    tool: &str,
+    theme: &SbTheme,
+) -> AnyElement {
+    let c = &theme.colors;
+    let caption = |text: String, bad: bool| {
+        div()
+            .flex()
+            .items_center()
+            .gap(theme.spacing.sm)
+            .text_color(if bad { c.red } else { c.fg3 })
+            .text_spec(&theme.text.small)
+            .child(icon(SbIcon::Image, theme.sizes.icon_xs, c.fg3))
+            .child(text)
+    };
+    let inner = match load {
+        Some(Load::Loaded(picture)) => {
+            let height = theme
+                .sizes
+                .tool_image_max_height
+                .min(px(picture.height as f32));
+            div()
+                .flex()
+                .flex_col()
+                .gap(theme.spacing.md)
+                .child(
+                    img(ImageSource::Render(picture.image.clone()))
+                        .w_full()
+                        .h(height)
+                        .object_fit(ObjectFit::Contain),
+                )
+                .child(caption(
+                    format!(
+                        "returned by {tool} · {} × {} · {}",
+                        picture.width,
+                        picture.height,
+                        format::size(picture.bytes as u64)
+                    ),
+                    false,
+                ))
+                .into_any_element()
+        }
+        Some(Load::Failed(why)) => caption(why, true).into_any_element(),
+        None | Some(Load::Loading) => skeleton(3, theme),
+    };
+    div().p(px(10.)).bg(c.s1).child(inner).into_any_element()
+}
+
 /// The text of the input (`None`) or of an output part.
 fn text_of(body: &CallBody, part: Option<usize>) -> Option<&Text> {
     match part {
-        None => body.input.as_ref().ok(),
+        None => body.input.as_ref().ok().map(Arc::as_ref),
         Some(index) => match body.output.get(index)? {
             Part::Text(Ok(text)) => Some(text),
             _ => None,
@@ -506,24 +641,19 @@ fn text_of(body: &CallBody, part: Option<usize>) -> Option<&Text> {
     }
 }
 
-/// Every text part of the output, joined: what Copy output copies.
-fn output_text(body: &CallBody) -> String {
-    body.output
-        .iter()
-        .filter_map(|part| match part {
-            Part::Text(Ok(text)) => Some(text.text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+/// What a body header's Copy copies, read when it is clicked.
+enum Copy {
+    Input(BlockRef),
+    Output(BlockRef),
 }
 
 /// A call body's header (`callhd`, 26): what follows, a status, and Copy.
 fn head(
+    ix: usize,
     name: &str,
     what: &'static str,
     status: Option<&'static str>,
-    copy: Option<String>,
+    copy: Copy,
     first: bool,
     theme: &SbTheme,
 ) -> AnyElement {
@@ -554,104 +684,54 @@ fn head(
         })
         .child(what)
         .children(status.map(|status| div().text_color(c.red).child(status)))
-        .children(copy.map(|text| {
+        .child(
             icon_button(
-                SharedString::from(format!("copy-{what}")),
+                SharedString::from(format!("copy-{what}-{ix}")),
                 theme.sizes.small_button,
                 theme,
             )
             .ml_auto()
             .aria_label(format!("Copy the {what}"))
-            .on_click(move |_, _, cx| crate::system::copy_text(text.clone(), cx))
-            .child(icon(SbIcon::Copy, theme.sizes.icon_xs, c.fg2))
-        }))
-        .into_any_element()
-}
-
-/// The `chunk`th row of a part's lines: its first [`FIRST_LINES`] until all are shown, then
-/// [`CHUNK_LINES`] a row.
-fn lines(
-    text: &Text,
-    part: Option<usize>,
-    chunk: usize,
-    at: &BlockRef,
-    theme: &SbTheme,
-    cx: &mut Context<ReaderView>,
-) -> AnyElement {
-    let all = {
-        let reader = cx.services().reader.read(cx);
-        reader.open_session().is_some_and(|open| {
-            open.is_open(&Toggle::AllLines(at.clone(), part), reader.full_calls())
-        })
-    };
-    let count = text.line_count();
-    let range = if all {
-        chunk * CHUNK_LINES..((chunk + 1) * CHUNK_LINES).min(count)
-    } else {
-        0..FIRST_LINES.min(count)
-    };
-    let last = range.end == count || !all;
-    div()
-        .px(theme.spacing.lg)
-        .when(chunk == 0, |this| this.pt(theme.spacing.md))
-        .when(last, |this| this.pb(theme.spacing.md))
-        .text_color(theme.colors.fg2)
-        .text_spec(&theme.text.code)
-        .whitespace_nowrap()
-        .overflow_hidden()
-        .child(text.lines(range))
-        .into_any_element()
-}
-
-/// Under a part's lines when it has more than its first: how many more, and Show all; or Show
-/// fewer once all are shown.
-fn more(
-    at: &BlockRef,
-    part: Option<usize>,
-    all: bool,
-    count: usize,
-    theme: &SbTheme,
-    cx: &mut Context<ReaderView>,
-) -> AnyElement {
-    let c = &theme.colors;
-    let toggle = Toggle::AllLines(at.clone(), part);
-    let id = SharedString::from(format!(
-        "more-{}-{}",
-        at.block.0,
-        part.map_or(0, |part| part + 1)
-    ));
-    div()
-        .flex()
-        .items_center()
-        .gap(px(10.))
-        .h(theme.sizes.call_footer)
-        .px(px(10.))
-        .border_t_1()
-        .border_color(c.line_subtle)
-        .text_color(c.fg3)
-        .text_spec(&theme.text.small)
-        .when(!all, |this| {
-            this.child(format!(
-                "+{} more lines",
-                format::count(count.saturating_sub(FIRST_LINES) as u64)
-            ))
-        })
-        .child(
-            div()
-                .id(id)
-                .ml_auto()
-                .text_color(c.accent_text)
-                .cursor_pointer()
-                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                    let reader = cx.services().reader.clone();
-                    reader.update(cx, |reader, cx| reader.toggle(toggle.clone(), cx));
-                }))
-                .child(if all { "Show fewer" } else { "Show all" }),
+            .on_click(move |_, _, cx| {
+                let text = {
+                    let reader = cx.services().reader.read(cx);
+                    let open = reader.open_session();
+                    match &copy {
+                        Copy::Input(at) => open.and_then(|open| match open.body(at)? {
+                            Load::Loaded(body) => {
+                                body.input.as_ref().ok().map(|text| text.text.clone())
+                            }
+                            _ => None,
+                        }),
+                        Copy::Output(at) => open.and_then(|open| match open.body(at)? {
+                            Load::Loaded(body) => Some(output_text(body)),
+                            _ => None,
+                        }),
+                    }
+                };
+                if let Some(text) = text.filter(|text| !text.is_empty()) {
+                    crate::system::copy_text(text, cx);
+                }
+            })
+            .child(icon(SbIcon::Copy, theme.sizes.icon_xs, c.fg2)),
         )
         .into_any_element()
 }
 
-/// A call body's footer (`callfoot`, 24): its status, how long it took, its output's lines.
+/// Every text part of the output, joined: what Copy output copies.
+fn output_text(body: &CallBody) -> String {
+    body.output
+        .iter()
+        .filter_map(|part| match part {
+            Part::Text(Ok(text)) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A call body's footer (`callfoot`, 24): its status and its output's lines. A failed call
+/// reads as failed whatever its exit status.
 fn footer(call: &ToolCall, body: &CallBody, theme: &SbTheme) -> AnyElement {
     let c = &theme.colors;
     let lines: usize = body
@@ -662,14 +742,13 @@ fn footer(call: &ToolCall, body: &CallBody, theme: &SbTheme) -> AnyElement {
             _ => 0,
         })
         .sum();
-    let (status, bad) = match (
-        &call.result,
-        call.result.as_ref().and_then(|r| r.brief.as_ref()),
-    ) {
-        (None, _) => ("not answered".to_string(), false),
-        (Some(_), Some(Brief::Exit(code))) => (format!("exit {code}"), *code != 0),
-        (Some(result), _) if result.status == ToolStatus::Failed => ("failed".to_string(), true),
-        (Some(_), _) => ("ok".to_string(), false),
+    let (status, bad) = match &call.result {
+        None => ("not answered".to_string(), false),
+        Some(result) if result.status == ToolStatus::Failed => match result.brief {
+            Some(Brief::Exit(code)) if code != 0 => (format!("failed · exit {code}"), true),
+            _ => ("failed".to_string(), true),
+        },
+        Some(_) => ("ok".to_string(), false),
     };
     div()
         .flex()
@@ -764,7 +843,7 @@ fn panel(
                         .min_w_0()
                         .overflow_hidden()
                         .text_ellipsis()
-                        .child(said),
+                        .child(hostile::label(&said)),
                 )
                 .when(!alone, |this| {
                     this.child(alone_button(format!("alone-{ix}").into()))
@@ -830,7 +909,8 @@ fn meta(conversation: &Conversation, kind: Option<&str>, provider: &str, cx: &gp
     .join(" · ")
 }
 
-/// A subagent no call is known to have started, as an `agent` row that opens its panel.
+/// A subagent no call is known to have started, as an `agent` row that opens its panel, named
+/// from what it says it is.
 fn unattached(
     ix: usize,
     row: &Row,
@@ -847,15 +927,20 @@ fn unattached(
             return div().into_any_element();
         };
         let stem = super::blocks::conversation_name(item, session).to_string();
-        let said = match session.subagent(item) {
-            Some(Load::Loaded(read)) => [read.kind.clone(), read.description.clone()]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" · "),
-            _ => stem.clone(),
-        };
-        (said, format!("reader/unattached/{stem}"))
+        let names = session.names(item);
+        let said = [names.kind, names.description]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+        (
+            if said.is_empty() {
+                "a subagent".to_string()
+            } else {
+                said
+            },
+            format!("reader/unattached/{stem}"),
+        )
     };
     div()
         .id(("unattached", ix))
@@ -890,7 +975,7 @@ fn unattached(
                 .overflow_hidden()
                 .text_ellipsis()
                 .text_color(c.fg2)
-                .child(said),
+                .child(hostile::label(&said)),
         )
         .child(icon(
             if open {

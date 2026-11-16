@@ -22,6 +22,7 @@ pub mod assets;
 pub mod automation;
 pub mod components;
 pub mod format;
+pub mod hostile;
 pub mod icons;
 pub mod keymap;
 pub mod markdown;

@@ -162,7 +162,7 @@ impl MainArea {
 
     /// What the reader shows, for automation.
     pub fn reader(&self, cx: &App) -> reader::ReaderSnapshot {
-        self.reader.read(cx).snapshot()
+        self.reader.read(cx).snapshot(cx)
     }
 
     /// Moves a page's selection: `by` along the reading order, or `lines` up or down.

@@ -489,7 +489,7 @@ fn a_read_that_stops_inside_a_segment_has_been_handed_no_bytes_that_were_not_arc
 fn a_session_read_again_through_its_cache_reads_the_bytes_it_was_parsed_from() {
     let (mut bench, key) = two_segments();
     let id = bench.session_id(&key);
-    let cache = Arc::new(SegmentCache::new(1));
+    let cache = Arc::new(SegmentCache::new(1, usize::MAX));
     let (pinned, first) = {
         let session = bench
             .archive()

@@ -365,6 +365,8 @@ pub enum ToolInput {
     ContentSearch {
         pattern: String,
         path: Option<String>,
+        /// Which files are searched, when not all: a file type or a glob.
+        files: Option<String>,
     },
     FileSearch {
         pattern: String,

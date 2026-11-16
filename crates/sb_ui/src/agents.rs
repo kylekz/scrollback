@@ -52,6 +52,14 @@ pub fn model(id: &str, models: &[String], cx: &App) -> Option<String> {
     Some(provider(id, cx).map_or_else(|| model.clone(), |provider| provider.model_name(model)))
 }
 
+/// The label an activity row gives a call of the tool `name` (DESIGN §4.2.3), as the agent of
+/// the provider `id` has it labelled; the tool's own name for one it doesn't label.
+pub fn tool_label(id: &str, name: &str, cx: &App) -> String {
+    provider(id, cx)
+        .and_then(|provider| provider.tool_label(name))
+        .map_or_else(|| name.to_string(), str::to_string)
+}
+
 /// The model `model`, recorded by the agent of the provider `id`, as its provider writes it.
 pub fn model_name(id: &str, model: &str, cx: &App) -> String {
     provider(id, cx).map_or_else(|| model.to_string(), |provider| provider.model_name(model))

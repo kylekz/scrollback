@@ -2,7 +2,8 @@
 //! an archive with the real engine from `sb_test_support::reader`'s sessions:
 //!
 //! - **This PC**, a folder fc with the boards' sessions (`E-Reader`, `E-Reader-Calls-1` and
-//!   `-2`), the session of every construct, one with no conversation of its own, and one whose
+//!   `-2`), the session of every construct, one of hostile content, one with no conversation of
+//!   its own, and one whose
 //!   later part was damaged in the archive after it was synced; a folder toolbox-rs with the
 //!   board's audit (`E-Reader-Subagent`). Every construct's transcript ends inside a record,
 //!   archived so by a second sync.
@@ -84,6 +85,7 @@ pub fn build(archive_dir: &Path, scratch: &Path, large: Option<Large>) -> Result
     reader::backfill(&mut pc);
     reader::constructs(&mut pc);
     reader::subagents_only(&mut pc);
+    reader::hostile(&mut pc, 2 * 1024 * 1024);
     reader::audit(&mut pc);
     let mut damaged = pc.session(FC, 40);
     damaged.title("A session damaged in the archive");
