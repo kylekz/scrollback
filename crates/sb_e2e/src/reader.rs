@@ -1,0 +1,125 @@
+//! The library the reader's scenarios open sessions from (docs/DESIGN.md §4.2, §6), built as
+//! an archive with the real engine from `sb_test_support::reader`'s sessions:
+//!
+//! - **This PC**, a folder fc with the boards' sessions (`E-Reader`, `E-Reader-Calls-1` and
+//!   `-2`), the session of every construct, one of hostile content, one with no conversation of
+//!   its own, and one whose
+//!   later part was damaged in the archive after it was synced; a folder toolbox-rs with the
+//!   board's audit (`E-Reader-Subagent`). Every construct's transcript ends inside a record,
+//!   archived so by a second sync.
+//! - **Ubuntu-24.04**, a WSL distro, with the garden session of `E-Edge-Source-Gone`, synced
+//!   and then deleted at its source, so its main transcript is gone there.
+//!
+//! With `large`, This PC also holds the large session of the reader's budgets (PLAN §14).
+
+use std::path::Path;
+
+use anyhow::{Context as _, Result, ensure};
+use sb_core::CancelToken;
+use sb_core::archive::Archive;
+use sb_core::hash::Hash;
+use sb_core::location::{LocationId, LocationKind};
+use sb_core::provider::{self, Provider};
+use sb_core::sync::sync_location;
+use sb_test_support::ProjectsTree;
+use sb_test_support::reader::{self, FC, Large, TOOLBOX};
+
+/// Syncs `tree` into `location`, all of it.
+fn sync(
+    archive: &Archive,
+    location: &LocationId,
+    tree: &ProjectsTree,
+    providers: &[Box<dyn Provider>],
+) -> Result<()> {
+    for pass in sync_location(
+        archive,
+        location,
+        &tree.transport(),
+        providers,
+        &CancelToken::new(),
+        &mut |_| {},
+    )? {
+        let report = pass.outcome?;
+        let index = pass.index?;
+        ensure!(
+            report.failed.is_empty() && index.failed.is_empty(),
+            "the reader's library did not sync whole: {report:?}, {index:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The segment files of the item `key`, in the order of their versions and offsets.
+fn segments_of(archive_dir: &Path, key: &str) -> Result<Vec<std::path::PathBuf>> {
+    /* An item's folder is named by the start of its key's hash (PLAN §4.1). */
+    let folder = Hash::of(key.as_bytes()).to_hex()[..32].to_string();
+    let mut found = Vec::new();
+    let mut stack = vec![archive_dir.join("files")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|it| it == "zst")
+                && path
+                    .iter()
+                    .any(|part| part.to_str() == Some(folder.as_str()))
+            {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Builds the archive in `archive_dir` (the module docs), writing the locations' transcripts
+/// under `scratch`, which is removed again.
+pub fn build(archive_dir: &Path, scratch: &Path, large: Option<Large>) -> Result<()> {
+    let providers = provider::builtin();
+    let archive = Archive::create(archive_dir)?;
+    let catalogue = archive.catalogue();
+
+    let mut pc = ProjectsTree::in_home(&scratch.join("pc"));
+    reader::playlist(&mut pc);
+    reader::backfill(&mut pc);
+    reader::constructs(&mut pc);
+    reader::subagents_only(&mut pc);
+    reader::hostile(&mut pc, 2 * 1024 * 1024);
+    reader::audit(&mut pc);
+    let mut damaged = pc.session(FC, 40);
+    damaged.title("A session damaged in the archive");
+    if let Some(spec) = large {
+        reader::large(&mut pc, spec);
+    }
+    let here = catalogue.add_location(LocationKind::Local, "This PC")?;
+    sync(&archive, &here.id, &pc, &providers)?;
+    /* A second pass archives the tail of the transcript cut inside a record, and the damaged
+    session's second segment, which is then broken. */
+    damaged.append(40);
+    sync(&archive, &here.id, &pc, &providers)?;
+    let last = segments_of(archive_dir, &damaged.key)?
+        .pop()
+        .context("the damaged session has segments")?;
+    std::fs::write(&last, b"not the segment that was archived")?;
+
+    let mut wsl = ProjectsTree::in_home(&scratch.join("wsl"));
+    let garden = reader::garden(&mut wsl);
+    let distro = catalogue.add_location(
+        LocationKind::Wsl {
+            distro: "Ubuntu-24.04".to_string(),
+        },
+        "Ubuntu-24.04",
+    )?;
+    sync(&archive, &distro.id, &wsl, &providers)?;
+    std::fs::remove_file(wsl.path(&garden.key))?;
+    sync(&archive, &distro.id, &wsl, &providers)?;
+
+    for (name, path) in [("fc", FC), ("toolbox-rs", TOOLBOX)] {
+        let folder = catalogue.create_folder(name, None)?;
+        catalogue.attach_path(folder, path, None)?;
+    }
+    drop(archive);
+    std::fs::remove_dir_all(scratch)?;
+    Ok(())
+}

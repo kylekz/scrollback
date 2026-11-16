@@ -490,6 +490,121 @@ fn picking_a_row_closes_a_narrow_windows_sidebar(cx: &mut TestAppContext) {
     assert_eq!(placement(cx), SidebarPlacement::Collapsed);
 }
 
+/** Every key the reader binds (`Enter` last: it opens the next session from a page of them). */
+const READER_KEYS: &str =
+    "[ ] up down right left space secondary-c pageup pagedown home end e e s s enter";
+
+#[gpui::test]
+fn the_readers_keys_do_nothing_while_a_session_opens_or_after_it_failed(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    let reader =
+        |cx: &mut VisualTestContext| cx.update(|_, cx| cx.services().reader.read(cx).state().key());
+    cx.simulate_keystrokes("right enter");
+    assert_eq!(reader(cx), "open");
+    /* `j` opens the next session, and the keys after it land before it is parsed. */
+    cx.simulate_keystrokes(&format!("j {READER_KEYS}"));
+    assert_eq!(reader(cx), "open");
+
+    /* A catalogue that has lost its versions cannot say what a session is made of. */
+    sb_test_support::edit_catalogue(&archive_dir(cx), "ALTER TABLE version RENAME TO lost");
+    cx.simulate_keystrokes("k");
+    assert_eq!(reader(cx), "failed");
+    cx.simulate_keystrokes(READER_KEYS);
+    assert_eq!(showing(cx), Showing::Session);
+}
+
+/**
+ * The reader's keys and the library's share letters, each in its own context: in the reader
+ * `S` stars the open session, `J` opens the next one shown and selects it on the page, and
+ * the page's `Delete` and `Ctrl A` do nothing to it. A dialog over it has the keyboard. It
+ * opens from the list view as from the cards.
+ */
+#[gpui::test]
+fn the_readers_keys_act_on_the_open_session_and_the_pages_keys_dont_reach_it(
+    cx: &mut TestAppContext,
+) {
+    let (shell, cx) = open_shell(cx);
+    let open_title = |cx: &mut VisualTestContext| {
+        library(cx).read_with(cx, |library, _| {
+            library.open_session().and_then(|open| open.title.clone())
+        })
+    };
+    let starred = |title: &str, cx: &mut VisualTestContext| {
+        library(cx).read_with(cx, |library, _| {
+            let page = library.sessions().unwrap();
+            page.sessions
+                .iter()
+                .find(|session| session.title.as_deref() == Some(title))
+                .unwrap()
+                .starred
+        })
+    };
+    /* A folder for a dialog to ask about, its name kept in its row. */
+    library(cx).update(cx, |library, cx| {
+        library.create_folder("work".to_string(), None, cx)
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let work = library(cx).read_with(cx, |library, _| library.folders()[0].id);
+    library(cx).update(cx, |library, cx| library.show(Shelf::All, cx));
+    cx.update(|window, cx| shell.read(cx).focus_handle(cx).focus(window, cx));
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("right enter");
+    assert_eq!(showing(cx), Showing::Session);
+    assert_eq!(open_title(cx).as_deref(), Some(SESSIONS[0].title));
+    cx.simulate_keystrokes("s");
+    cx.run_until_parked();
+    assert!(starred(SESSIONS[0].title, cx));
+    assert!(library(cx).read_with(cx, |library, _| library.open_session().unwrap().starred));
+
+    cx.simulate_keystrokes("j");
+    cx.run_until_parked();
+    assert_eq!(open_title(cx).as_deref(), Some(SESSIONS[1].title));
+    assert_eq!(selected(cx).as_deref(), Some(SESSIONS[1].title));
+
+    cx.simulate_keystrokes("delete secondary-a");
+    cx.run_until_parked();
+    assert_eq!(showing(cx), Showing::Session);
+    assert_eq!(open_title(cx).as_deref(), Some(SESSIONS[1].title));
+    library(cx).read_with(cx, |library, _| {
+        assert_eq!(
+            library.counts().all,
+            SESSIONS.len(),
+            "nothing went to Trash"
+        );
+    });
+
+    /* A dialog over the reader has the keyboard: the reader's keys don't reach it. */
+    library(cx).update(cx, |library, cx| library.ask_delete(work, cx));
+    cx.run_until_parked();
+    assert!(bounds(cx, "delete-folder").is_some());
+    cx.simulate_keystrokes("k s");
+    cx.run_until_parked();
+    assert_eq!(open_title(cx).as_deref(), Some(SESSIONS[1].title));
+    assert!(!starred(SESSIONS[1].title, cx));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(library(cx).read_with(cx, |library, _| library.deleting().is_none()));
+    cx.simulate_keystrokes("k");
+    cx.run_until_parked();
+    assert_eq!(open_title(cx).as_deref(), Some(SESSIONS[0].title));
+
+    /* Back, to the list view, and open from its row. */
+    cx.simulate_keystrokes("alt-left");
+    let library = library(cx);
+    library.update(cx, |library, cx| {
+        let mut view = library.view();
+        view.list = true;
+        library.set_view(view, cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down enter");
+    assert_eq!(showing(cx), Showing::Session);
+    assert_eq!(open_title(cx).as_deref(), Some(SESSIONS[1].title));
+}
+
 /**
  * A location with a long name: its tag keeps to its cap on the cards (DESIGN §4.4), and the
  * counts keep their room, in a wide window and in a narrow one.

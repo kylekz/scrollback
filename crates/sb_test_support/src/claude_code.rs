@@ -401,6 +401,8 @@ pub struct Records {
     parent: Option<String>,
     /// The filler's call that its next record answers.
     unanswered: Option<Call>,
+    /// The time the records written from now on carry, when one is set ([`Records::set_time`]).
+    clock: Option<String>,
 }
 
 impl Records {
@@ -422,7 +424,14 @@ impl Records {
             filled: 0,
             parent: None,
             unanswered: None,
+            clock: None,
         }
+    }
+
+    /// Makes the records written from now on carry the time `timestamp` (`2026-11-09T09:12:00Z`),
+    /// in place of one a second after the record before.
+    pub fn set_time(&mut self, timestamp: &str) {
+        self.clock = Some(timestamp.to_string());
     }
 
     /// Makes the next record follow the record `uuid` and not the last one written: the
@@ -477,8 +486,11 @@ impl Records {
         uuid
     }
 
-    /// When the next record is written: a second after the one before it.
+    /// When the next record is written: the time set, else a second after the one before it.
     fn time(&self) -> String {
+        if let Some(clock) = &self.clock {
+            return clock.clone();
+        }
         format!(
             "2026-01-01T{:02}:{:02}:{:02}.000Z",
             self.written / 3600 % 24,

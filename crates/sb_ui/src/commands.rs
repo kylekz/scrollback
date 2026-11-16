@@ -4,12 +4,13 @@
 //! library, which has no key.
 //!
 //! **It can't drift from the keymap.** A command holds the keymap's own row, and a test checks
-//! that the action of every row of the shell's and the pages' contexts is a command's or is
-//! listed as moving the keyboard, which no command does ([`NOT_COMMANDS`]).
+//! that the action of every row of the shell's, the pages' and the reader's contexts is a
+//! command's or is listed as moving the keyboard, which no command does ([`NOT_COMMANDS`]).
 //!
 //! **A command shows only where it does something:** one of the shell's anywhere, one of a
 //! page's only while a page whose key context binds its action shows ([`Command::available`]),
-//! so Move to Trash is not offered on Trash's page, nor any page's command over the reader.
+//! so Move to Trash is not offered on Trash's page, nor any page's command over the reader,
+//! nor the reader's over a page.
 
 use gpui::{App, SharedString};
 use sb_core::catalogue::Shelf;
@@ -144,6 +145,34 @@ pub const COMMANDS: &[Command] = &[
         run: Run::Key(keymap::BACK),
     },
     Command {
+        name: "Open the next session",
+        run: Run::Key(keymap::NEXT_SESSION),
+    },
+    Command {
+        name: "Open the previous session",
+        run: Run::Key(keymap::PREVIOUS_SESSION),
+    },
+    Command {
+        name: "Go to the next turn",
+        run: Run::Key(keymap::NEXT_TURN),
+    },
+    Command {
+        name: "Go to the previous turn",
+        run: Run::Key(keymap::PREVIOUS_TURN),
+    },
+    Command {
+        name: "Switch between Activity and Full calls",
+        run: Run::Key(keymap::SWITCH_CALLS),
+    },
+    Command {
+        name: "Star or unstar the open session",
+        run: Run::Key(keymap::READER_STAR),
+    },
+    Command {
+        name: "Copy the message the keyboard is on",
+        run: Run::Key(keymap::COPY),
+    },
+    Command {
         name: "Show or hide the sidebar",
         run: Run::Key(keymap::TOGGLE_SIDEBAR),
     },
@@ -154,8 +183,9 @@ pub const COMMANDS: &[Command] = &[
 ];
 
 /**
- * The actions of the shell's and the pages' rows that are no command: the palette's own key,
- * `Esc`, and the arrows, which move over what has the keyboard and so mean nothing from the
+ * The actions of the shell's, the pages' and the reader's rows that are no command: the
+ * palette's own key, `Esc`, and the keys that move over what has the keyboard or act on the row
+ * it is on (the arrows, the reader's `Enter`, `Page Up`, `Home`…), which mean nothing from the
  * palette. Each is its action's name.
  */
 pub const NOT_COMMANDS: &[&str] = &[
@@ -165,6 +195,15 @@ pub const NOT_COMMANDS: &[&str] = &[
     "sessions::Right",
     "sessions::Up",
     "sessions::Down",
+    "reader::Up",
+    "reader::Down",
+    "reader::Toggle",
+    "reader::Expand",
+    "reader::Collapse",
+    "reader::PageUp",
+    "reader::PageDown",
+    "reader::Top",
+    "reader::Bottom",
 ];
 
 /// The commands whose names `terms` ask for that do something on the page whose key context
@@ -196,6 +235,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::pages::Showing;
 
     fn terms(text: &str) -> Vec<String> {
         text.split_whitespace().map(str::to_string).collect()
@@ -208,12 +248,13 @@ mod tests {
     }
 
     #[test]
-    fn every_key_of_the_shell_and_the_pages_is_a_command() {
+    fn every_key_of_the_shell_the_pages_and_the_reader_is_a_command() {
         let pages = [
             keymap::SHELL,
             keymap::SESSIONS,
             keymap::UNSORTED,
             keymap::TRASH_PAGE,
+            keymap::READER,
         ];
         for shortcut in keymap::SHORTCUTS {
             if !pages.contains(&shortcut.context) {
@@ -262,7 +303,18 @@ mod tests {
             names("star", keymap::UNSORTED),
             ["Show Starred", "Star or unstar the selected sessions"]
         );
-        assert_eq!(names("star", "Main"), ["Show Starred"], "over the reader");
-        assert_eq!(names("sync", "Main"), ["Sync all locations"]);
+        let reader = Showing::Session.key_context();
+        assert_eq!(
+            names("star", reader),
+            ["Show Starred", "Star or unstar the open session"],
+            "over the reader"
+        );
+        assert_eq!(names("sync", reader), ["Sync all locations"]);
+        assert_eq!(names("turn", keymap::SESSIONS), Vec::<&str>::new());
+        assert_eq!(
+            names("turn", reader),
+            ["Go to the next turn", "Go to the previous turn"]
+        );
+        assert_eq!(names("settings", reader), ["Open Settings"]);
     }
 }

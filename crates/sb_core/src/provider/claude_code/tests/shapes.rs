@@ -125,6 +125,35 @@ fn a_subagent_kept_in_the_sessions_own_transcript_is_not_the_sessions_conversati
         panic!("{:?}", transcript.unattached);
     };
     assert_eq!(prompts(counted), ["Count the tests."]);
+    /* Each is a conversation of its own, named apart from the session's and from each other,
+    and read again by that name. */
+    let own_item = &conversation.item;
+    assert!(listed.item != *own_item && counted.item != *own_item && listed.item != counted.item);
+    /* Named by where their first record is in the session's transcript: only a name of that
+    shape, after the transcript's own key, is one. */
+    for (key, inline) in [
+        (format!("{own_item}#120"), true),
+        (format!("{own_item}#"), false),
+        (format!("{own_item}#a#1"), false),
+        (own_item.to_string(), false),
+    ] {
+        assert_eq!(
+            super::super::parse::is_inline(&key, own_item),
+            inline,
+            "{key}"
+        );
+    }
+    assert!(listed.item.starts_with(&format!("{own_item}#")));
+    for read in [listed, counted] {
+        let Subagent::Read {
+            conversation: again,
+            ..
+        } = crate::provider::Provider::subagent(&super::super::Agent, &files, &read.item)
+        else {
+            panic!("{} is read again", read.item);
+        };
+        assert_eq!(*again, **read);
+    }
 
     /* What the subagents used and did is counted with them, not as the session's own. */
     let derived = index(&transcript);

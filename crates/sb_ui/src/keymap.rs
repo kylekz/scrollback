@@ -11,7 +11,7 @@
 
 use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, SharedString};
 
-use crate::actions::{app, first_run, library, locations, menu, sessions, shell, sidebar};
+use crate::actions::{app, first_run, library, locations, menu, reader, sessions, shell, sidebar};
 
 /// Key context of the main area while it shows Settings (DESIGN §4.13).
 pub const SETTINGS: &str = "Settings";
@@ -36,6 +36,8 @@ pub const TRASH_PAGE: &str = "Trash";
 pub const PALETTE: &str = "Palette";
 /// Key context of the main area while it shows the first run.
 pub const FIRST_RUN: &str = "FirstRun";
+/// Key context of the main area while it shows a session.
+pub const READER: &str = "Reader";
 /// Key context of the locations sheet (DESIGN §4.11), and of its list while it has the
 /// keyboard.
 pub const LOCATIONS_SHEET: &str = "LocationsSheet";
@@ -114,6 +116,15 @@ pub const SYNC_ALL: Shortcut = shortcut!("f5", SHELL, library::SyncAll);
 pub const BACK: Shortcut = shortcut!("alt-left", SHELL, library::Back);
 /// `S`. Named, because a card's star button says it.
 pub const STAR: Shortcut = shortcut!("s", SESSIONS, sessions::Star);
+/// The reader's keys its header's buttons say (DESIGN §4.2.1).
+pub const READER_STAR: Shortcut = shortcut!("s", READER, reader::Star);
+pub const NEXT_SESSION: Shortcut = shortcut!("j", READER, reader::NextSession);
+pub const PREVIOUS_SESSION: Shortcut = shortcut!("k", READER, reader::PreviousSession);
+pub const SWITCH_CALLS: Shortcut = shortcut!("e", READER, reader::SwitchCalls);
+/// `]`, `[` and `Ctrl C` in the reader. Named, because the palette's commands say them.
+pub const NEXT_TURN: Shortcut = shortcut!("]", READER, reader::NextTurn);
+pub const PREVIOUS_TURN: Shortcut = shortcut!("[", READER, reader::PreviousTurn);
+pub const COPY: Shortcut = shortcut!("secondary-c", READER, reader::Copy);
 /// `Ctrl L`. Named, because the Locations overline's label says it.
 pub const LOCATIONS: Shortcut = shortcut!("secondary-l", SHELL, shell::OpenLocations);
 /// `Ctrl ,`. Named, because the title bar's Settings button says it.
@@ -179,6 +190,22 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut!("secondary-enter", PATHS_EDITOR, sessions::SavePaths),
     shortcut!("escape", PATHS_EDITOR, sessions::CancelPaths),
     shortcut!("enter", FIRST_RUN, first_run::Add),
+    READER_STAR,
+    NEXT_SESSION,
+    PREVIOUS_SESSION,
+    SWITCH_CALLS,
+    NEXT_TURN,
+    PREVIOUS_TURN,
+    shortcut!("up", READER, reader::Up),
+    shortcut!("down", READER, reader::Down),
+    shortcut!("enter", READER, reader::Toggle),
+    shortcut!("right", READER, reader::Expand),
+    shortcut!("left", READER, reader::Collapse),
+    COPY,
+    shortcut!("pageup", READER, reader::PageUp),
+    shortcut!("pagedown", READER, reader::PageDown),
+    shortcut!("home", READER, reader::Top),
+    shortcut!("end", READER, reader::Bottom),
     LOCATIONS,
     OPEN_SETTINGS,
     shortcut!("escape", LOCATIONS_SHEET, locations::Close),
@@ -214,7 +241,19 @@ pub const SHORTCUT_ROWS: &[ShortcutRow] = &[
         "Back to the page the session was opened from, or leave Settings",
         &["library::Back"],
     ),
-    row("Star or unstar the selected session", &["sessions::Star"]),
+    row(
+        "Next or previous session in that page",
+        &["reader::NextSession", "reader::PreviousSession"],
+    ),
+    row(
+        "Next or previous turn",
+        &["reader::NextTurn", "reader::PreviousTurn"],
+    ),
+    row("Switch Activity or Full calls", &["reader::SwitchCalls"]),
+    row(
+        "Star or unstar the selected or open session",
+        &["sessions::Star", "reader::Star"],
+    ),
     row(
         "Move the focused or selected sessions to Trash",
         &["sessions::Trash"],
@@ -254,6 +293,29 @@ pub const SHORTCUT_ROWS: &[ShortcutRow] = &[
     row(
         "Open a menu's submenu, back out of it, or close the menu",
         &["menu::Open", "menu::Back", "menu::Close"],
+    ),
+    row(
+        "Move between the rows of a session, and open or close the one the keyboard is on",
+        &[
+            "reader::Up",
+            "reader::Down",
+            "reader::Toggle",
+            "reader::Expand",
+            "reader::Collapse",
+        ],
+    ),
+    row(
+        "Scroll a session a screen, or go to its first or last row",
+        &[
+            "reader::PageUp",
+            "reader::PageDown",
+            "reader::Top",
+            "reader::Bottom",
+        ],
+    ),
+    row(
+        "Copy the message the keyboard is on, or a call's command or path",
+        &["reader::Copy"],
     ),
     row("Save the paths editor's changes", &["sessions::SavePaths"]),
     row(
@@ -462,15 +524,15 @@ mod tests {
         );
     }
 
-    /// A key that works wherever the keyboard is in the window can't be added without a row
-    /// in Settings › Shortcuts.
+    /// A key that works wherever the keyboard is in the window, or in the reader, can't be
+    /// added without a row in Settings › Shortcuts.
     #[test]
-    fn every_key_of_the_whole_window_has_a_row_in_settings() {
+    fn every_key_of_the_whole_window_and_the_reader_has_a_row_in_settings() {
         let listed: HashSet<&str> = SHORTCUT_ROWS
             .iter()
             .flat_map(|row| row.actions.iter().copied())
             .collect();
-        for shortcut in SHORTCUTS.iter().filter(|it| it.context == SHELL) {
+        for shortcut in (SHORTCUTS.iter()).filter(|it| [SHELL, READER].contains(&it.context)) {
             let name = (shortcut.action)().name();
             assert!(
                 listed.contains(name),

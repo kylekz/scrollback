@@ -18,6 +18,7 @@ mod header;
 mod interaction_tests;
 pub(crate) mod menus;
 pub mod paths_editor;
+pub mod reader;
 pub mod sessions;
 pub mod settings;
 mod states;
@@ -46,6 +47,7 @@ use crate::keymap;
 use crate::services::{ActiveServices as _, ArchiveState, LibraryService, LocationStatus};
 use crate::theme::{ActiveTheme as _, SbTheme};
 use first_run::FirstRun;
+use reader::ReaderView;
 use sessions::SessionsView;
 use settings::SettingsPage;
 use trash::TrashView;
@@ -119,7 +121,8 @@ impl Showing {
             Self::Trash => keymap::TRASH_PAGE,
             Self::FirstRun => keymap::FIRST_RUN,
             Self::Settings => keymap::SETTINGS,
-            Self::Starting | Self::ArchiveFailed | Self::LocationsFailed | Self::Session => "Main",
+            Self::Session => keymap::READER,
+            Self::Starting | Self::ArchiveFailed | Self::LocationsFailed => "Main",
         }
     }
 
@@ -154,6 +157,7 @@ pub struct MainArea {
     sessions: Entity<SessionsView>,
     unsorted: Entity<UnsortedView>,
     trash: Entity<TrashView>,
+    reader: Entity<ReaderView>,
     first_run: Entity<FirstRun>,
     settings: Entity<SettingsPage>,
     /// What shows while no archive is open (DESIGN §4.14).
@@ -180,6 +184,7 @@ impl MainArea {
             sessions: cx.new(|cx| SessionsView::new(focus_handle.clone(), cx)),
             unsorted: cx.new(|cx| UnsortedView::new(focus_handle.clone(), cx)),
             trash: cx.new(|cx| TrashView::new(focus_handle.clone(), cx)),
+            reader: cx.new(|cx| ReaderView::new(focus_handle.clone(), cx)),
             focus_handle,
             first_run: cx.new(FirstRun::new),
             settings: cx.new(|cx| SettingsPage::new(window, cx)),
@@ -216,6 +221,11 @@ impl MainArea {
     /// What shows while no archive is open.
     pub fn unavailable_page(&self) -> &Entity<UnavailablePage> {
         &self.unavailable
+    }
+
+    /// What the reader shows, for automation.
+    pub fn reader(&self, cx: &App) -> reader::ReaderSnapshot {
+        self.reader.read(cx).snapshot(cx)
     }
 
     /// The page of All sessions, Starred or a folder.
@@ -414,21 +424,7 @@ impl Render for MainArea {
                 .map(|why| states::locations_failed(why, &theme, cx)),
             Showing::FirstRun => Some(self.first_run.clone().into_any_element()),
             Showing::Settings => Some(self.settings.clone().into_any_element()),
-            Showing::Session => {
-                let library = services.library.read(cx);
-                let from: SharedString = match library.shelf() {
-                    Shelf::All => "All sessions".into(),
-                    Shelf::Starred => "Starred".into(),
-                    Shelf::Unsorted => "Unsorted".into(),
-                    Shelf::Trash => "Trash".into(),
-                    Shelf::Folder(folder) => library
-                        .folder(folder)
-                        .map_or_else(SharedString::default, |it| it.name.clone().into()),
-                };
-                library
-                    .open_session()
-                    .map(|session| states::session(session, from, &theme, cx))
-            }
+            Showing::Session => Some(self.reader.clone().into_any_element()),
             Showing::Unsorted => Some(self.unsorted.clone().into_any_element()),
             Showing::Sessions => Some(self.sessions.clone().into_any_element()),
             Showing::Trash => Some(self.trash.clone().into_any_element()),
@@ -476,6 +472,9 @@ impl Render for MainArea {
                 }
             }))
             .on_action(cx.listener(Self::add))
+            .when(showing == Showing::Session, |this| {
+                reader::bind_keys(this, &self.reader)
+            })
             .relative()
             .size_full()
             .flex()

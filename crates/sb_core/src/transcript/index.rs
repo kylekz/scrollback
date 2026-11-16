@@ -208,7 +208,7 @@ fn collect(conversation: &Conversation, within: Option<At>, index: &mut SessionI
                         ToolInput::Read { path, .. }
                         | ToolInput::Edit { path, .. }
                         | ToolInput::Write { path, .. } => span(SpanKind::Path, path),
-                        ToolInput::ContentSearch { pattern, path }
+                        ToolInput::ContentSearch { pattern, path, .. }
                         | ToolInput::FileSearch { pattern, path } => {
                             span(SpanKind::Command, pattern);
                             span(SpanKind::Path, path.as_deref().unwrap_or_default());

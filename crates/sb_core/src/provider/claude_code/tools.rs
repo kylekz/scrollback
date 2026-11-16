@@ -14,6 +14,24 @@ use crate::transcript::{Brief, Todo, TodoState, ToolInput, ToolKind};
 /// The tool that runs a workflow, whose subagents are filed by the run's id.
 pub(super) const WORKFLOW: &str = "Workflow";
 
+/// The label an activity row gives the tool `name` (DESIGN §4.2.3).
+pub(super) fn label(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "Bash" => "bash",
+        "Read" => "read",
+        "Edit" => "edit",
+        "Write" => "write",
+        "Grep" => "grep",
+        "Glob" => "glob",
+        "TodoWrite" => "todos",
+        "Agent" | "Task" => "agent",
+        "WebSearch" => "search",
+        "WebFetch" => "fetch",
+        _ if name.starts_with("mcp__") => "mcp",
+        _ => return None,
+    })
+}
+
 /// Which common kind the tool `name` is. `Task` is what earlier releases called `Agent`.
 pub(super) fn kind(name: &str) -> ToolKind {
     match name {
@@ -62,11 +80,13 @@ struct Write<'a> {
     content: &'a RawValue,
 }
 
-/// `Grep`'s input and `Glob`'s.
+/// `Grep`'s input and `Glob`'s; only `Grep` has a file `type` and a `glob`.
 #[derive(Deserialize)]
 struct Search {
     pattern: Text,
     path: Option<Text>,
+    r#type: Option<Text>,
+    glob: Option<Text>,
 }
 
 #[derive(Deserialize)]
@@ -126,6 +146,10 @@ pub(super) fn input(name: &str, raw: &RawValue, line: &Line) -> ToolInput {
         ToolKind::ContentSearch => typed(raw).map(|input: Search| ToolInput::ContentSearch {
             pattern: input.pattern.0,
             path: text(input.path),
+            files: match (text(input.r#type), text(input.glob)) {
+                (Some(kind), Some(glob)) => Some(format!("{kind}, {glob}")),
+                (kind, glob) => kind.or(glob),
+            },
         }),
         ToolKind::FileSearch => typed(raw).map(|input: Search| ToolInput::FileSearch {
             pattern: input.pattern.0,

@@ -820,6 +820,7 @@ impl SyncService {
                     if changed || !whole {
                         cx.emit(SyncEvent::Archived);
                     }
+                    crate::system::give_back_memory(cx);
                     cx.notify();
                 })
                 .ok();

@@ -137,7 +137,9 @@ pub enum Tone {
     Blue,
     /// `yellow-soft` with `yellow`: a warning.
     Warn,
-    /// `red-soft` with `red`: something broken.
+    /// `green-soft` with `green`: what went well (`.chip.ok`).
+    Good,
+    /// `red-soft` with `red`: what failed (`.chip.bad`).
     Bad,
 }
 
@@ -149,9 +151,27 @@ impl Tone {
             Self::Accent => (c.accent_soft, c.accent_text),
             Self::Blue => (c.blue_soft, c.blue),
             Self::Warn => (c.yellow_soft, c.yellow),
+            Self::Good => (c.green_soft, c.green),
             Self::Bad => (c.red_soft, c.red),
         }
     }
+}
+
+/// A chip in `tone` (`.chip`), as low as a tag: a status beside an activity row's target.
+pub fn low_chip(label: impl Into<SharedString>, tone: Tone, theme: &SbTheme) -> Div {
+    let (fill, text) = tone.colors(theme);
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .h(theme.sizes.tag_height)
+        .px(theme.spacing.md)
+        .rounded(theme.radii.pill)
+        .bg(fill)
+        .text_color(text)
+        .text_spec(&theme.text.small)
+        .whitespace_nowrap()
+        .child(label.into())
 }
 
 /// A tag (`.tag`: 18 high, radius 4, 11px at 500), or the 16px one of a card's last line. It

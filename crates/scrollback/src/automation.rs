@@ -34,8 +34,9 @@
 //!   (each session deleted for good's `location`, whether it is `allowed` again, and its
 //!   `standing`: `deleted`, `allowed` or `archived_again`), and `saved` (why the settings
 //!   aren't being saved, or `null`).
-//! - `system`: what the app asked of the operating system, never done in a scripted run: each
-//!   request's `kind` (`reveal`, `pick_folder`) and its `path`.
+//! - `system`: what the app asked of the operating system (`sb_ui::system`), never done in a
+//!   scripted run, oldest first: each request's `kind` (`reveal` with its `path`,
+//!   `pick_folder`, `open_url` with its `url`, `copy` with the `text` copied).
 //! - `archive`: `dir`, and `state` (`opening`, `open` or `failed`, then with `error` and
 //!   `failure`: `missing`, `empty`, `locked`, `settings` or `other`).
 //! - `sync`: `syncing`, `indexing` (an index runs outside a pass), `held` (a pass waits at
@@ -96,6 +97,16 @@
 //!   `spare`; and `without_calls`, past `inner` the tags give way past their caps), `tags`
 //!   (each location's and subfolder's tag: `name`, `whole` and `capped` widths), the widest
 //!   `day` and the largest `calls` (each `text` and `width`), in logical pixels.
+//! - `reader`: `state` (`closed`, `opening`, `failed` with `error`, or `open`), `full_calls`,
+//!   `place` (`[n, of]`: the open session among its page's), `rows` (the column's), `top` and
+//!   `top_name` (the row at its top, and what it is: `kind conversation/block`) and
+//!   `top_offset` (how far into that row it is scrolled), `at_end` (whether the last row is
+//!   drawn in full), `following` (whether the column keeps to its end, after End), `focused`
+//!   (`row`, `kind` and the start of the `text` of the keyboard's row, or `null`),
+//!   `open_calls`, `markdown_states` and `held` (how many parsed bodies, and how many prepared
+//!   things of the service's, are kept), `alone` (a subagent read on its own), `loads`
+//!   (`bodies`, `subagents`, `prose`, `images`, `raws`, `wholes`: how many are `loading` and
+//!   `loaded`) and `fault` (a read that failed for a reason other than the stored bytes).
 //!
 //! Commands. An argument a command doesn't have is an error, so a misspelt one never passes
 //! for a change. These reply with `state.appearance` after the change:
@@ -148,7 +159,7 @@ use sb_ui::services::sync::{Refetch, TestFailure, TestState};
 use sb_ui::services::upkeep::{Fix, Standing};
 use sb_ui::services::{
     ActiveServices as _, Answer as Searched, ArchiveState, Dragged, DropTarget, Failure, Held,
-    LocationStatus, Page, Reach, Verdict,
+    LocationStatus, Page, Reach, ReaderState, Verdict,
 };
 use sb_ui::system::{self, SystemRequest};
 use serde::Deserialize;
@@ -183,13 +194,15 @@ impl AutomationHost for ScrollbackAutomation {
             "sync": sync(cx),
             "library": library(cx),
             "settings": settings(shell, cx),
-            "system": system::requests(cx).iter().map(|request| json!({
-                "kind": request.kind(),
-                "path": match request {
-                    SystemRequest::Reveal(path) => Some(path.display().to_string()),
-                    SystemRequest::PickFolder { .. } => None,
-                },
-            })).collect::<Vec<_>>(),
+            "system": system::requests(cx).iter().map(|request| match request {
+                SystemRequest::Reveal(path) => json!({
+                    "kind": request.kind(),
+                    "path": path.display().to_string(),
+                }),
+                SystemRequest::PickFolder { .. } => json!({ "kind": request.kind() }),
+                SystemRequest::OpenUrl(url) => json!({ "kind": request.kind(), "url": url }),
+                SystemRequest::Copy(text) => json!({ "kind": request.kind(), "text": text }),
+            }).collect::<Vec<_>>(),
             "cards": cards(shell.main().read(cx).sessions().read(cx).line_measure()),
             "page_view": page_view(shell, cx),
             "palette": shell.palette().map(|palette| self::palette(palette.read(cx), cx)),
@@ -197,6 +210,7 @@ impl AutomationHost for ScrollbackAutomation {
                 "items": items,
                 "submenu": submenu,
             })),
+            "reader": reader(shell, cx),
             "sheet": shell.locations_sheet().map(|sheet| {
                 let sheet = sheet.read(cx);
                 let sync = cx.services().sync.read(cx);
@@ -636,6 +650,42 @@ fn cards(measure: &LineMeasure) -> Value {
         })).collect::<Vec<_>>(),
         "day": { "text": measure.day.0, "width": px(measure.day.1) },
         "calls": { "text": measure.calls.0, "width": px(measure.calls.1) },
+    })
+}
+
+/// `state.reader`.
+fn reader(shell: &Shell, cx: &App) -> Value {
+    let reader = cx.services().reader.read(cx);
+    let view = shell.reader(cx);
+    let open = reader.open_session();
+    json!({
+        "state": reader.state().key(),
+        "error": match reader.state() {
+            ReaderState::Failed { why, .. } => Some(why),
+            _ => None,
+        },
+        "full_calls": reader.full_calls(),
+        "place": cx.services().library.read(cx).open_place().map(|(at, of)| json!([at + 1, of])),
+        "rows": view.rows,
+        "top": view.top,
+        "top_name": view.top_name,
+        "top_offset": view.top_offset,
+        "at_end": view.at_end,
+        "following": view.following,
+        "focused": view.focused.map(|(at, kind, text)| json!({ "row": at, "kind": kind, "text": text })),
+        "open_calls": view.open_calls,
+        "markdown_states": view.states,
+        "held": view.held,
+        "alone": view.alone,
+        "loads": open.map(|open| {
+            open.loads()
+                .into_iter()
+                .map(|(name, loading, loaded)| {
+                    (name.to_string(), json!({ "loading": loading, "loaded": loaded }))
+                })
+                .collect::<serde_json::Map<_, _>>()
+        }),
+        "fault": open.and_then(|open| open.fault()),
     })
 }
 

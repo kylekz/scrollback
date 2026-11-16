@@ -55,12 +55,14 @@ pub fn run(cli: Cli) -> Result<()> {
 #[cfg_attr(not(feature = "automation"), expect(unused_variables))]
 fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
     sb_ui::init(cx)?;
+    #[cfg(target_os = "macos")]
+    cx.set_global(sb_ui::system::GiveBack(crate::give_back));
     // Before anything writes a date.
     #[cfg(feature = "automation")]
     if let Some(year) = cli.automation_calendar {
         sb_ui::format::pin_calendar(year);
     }
-    // A scripted run shows nothing in Explorer or Finder and opens no picker.
+    // A scripted run never reaches Explorer or Finder, a picker, the browser or the clipboard.
     #[cfg(feature = "automation")]
     let scripted = cli.automation_enabled();
     #[cfg(not(feature = "automation"))]

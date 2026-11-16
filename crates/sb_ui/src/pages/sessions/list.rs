@@ -308,6 +308,7 @@ impl SessionsView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let c = &theme.colors;
+        let title = title_of(session);
         let library = self.library.read(cx);
         let selected = library.is_selected(&session.id);
         let ringed = keyboard && library.selected_index() == Some(index);
@@ -395,7 +396,7 @@ impl SessionsView {
                             .overflow_hidden()
                             .text_ellipsis()
                             .text_spec(&theme.text.row_title)
-                            .child(title_of(session)),
+                            .child(title.clone()),
                     )
                     .child(
                         div()
@@ -404,7 +405,9 @@ impl SessionsView {
                             .overflow_hidden()
                             .text_ellipsis()
                             .text_color(c.fg3)
-                            .child(session.first_prompt.clone().unwrap_or_default()),
+                            .child(crate::hostile::label(
+                                session.first_prompt.as_deref().unwrap_or_default(),
+                            )),
                     ),
             )
             .when(columns.folder, |this| {
@@ -512,7 +515,6 @@ impl SessionsView {
                     .text_spec(&theme.text.number)
                     .child(format::count(u64::from(session.all.calls))),
             );
-        let title = title_of(session);
         self.draggable(row, (session.id.clone(), index), (title, None), cx)
             .automation_target_with(move || format!("list/row/{place}").into())
     }

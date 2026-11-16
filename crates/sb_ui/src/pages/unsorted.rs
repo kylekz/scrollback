@@ -902,7 +902,9 @@ impl UnsortedView {
                             .overflow_hidden()
                             .text_ellipsis()
                             .text_color(c.fg3)
-                            .child(session.first_prompt.clone().unwrap_or_default()),
+                            .child(crate::hostile::label(
+                                session.first_prompt.as_deref().unwrap_or_default(),
+                            )),
                     ),
             )
             .child(

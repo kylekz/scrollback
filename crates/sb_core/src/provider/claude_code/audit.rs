@@ -10,7 +10,9 @@ use std::io::{BufRead as _, BufReader};
 
 use serde_json::Value;
 
-use super::parse::{BOOKKEEPING, BOUNDARY, CONTEXT, CONVERSATION, NOTICES, QUEUED, SILENT, TITLE};
+use super::parse::{
+    BOOKKEEPING, BOUNDARY, CONTEXT, CONVERSATION, NOTICES, QUEUED, SILENT, TITLE, is_inline,
+};
 use super::said::unknown_element;
 use crate::provider::{Audit, SessionItems};
 use crate::transcript::{Content, Conversation, Ending, Subagent, Tokens, Transcript};
@@ -41,7 +43,7 @@ pub(in crate::provider) fn audit(items: &dyn SessionItems, transcript: &Transcri
         .unattached
         .iter()
         .filter_map(Subagent::conversation)
-        .partition(|conversation| own.is_some_and(|own| own.item == conversation.item));
+        .partition(|conversation| own.is_some_and(|own| is_inline(&conversation.item, &own.item)));
     if let Some(own) = own {
         *audit.counts.entry(INLINE.to_string()).or_default() += inline.len() as u64;
         check(items, own, &inline, true, &mut audit, &mut mismatches);
@@ -130,7 +132,7 @@ fn tally(
                 counts.calls += 1;
                 counts.results += usize::from(call.result.is_some());
                 for inner in call.subagents.iter().filter_map(Subagent::conversation) {
-                    if inner.item == conversation.item {
+                    if is_inline(&inner.item, &conversation.item) {
                         for what in [INLINE, ATTACHED] {
                             *audit.counts.entry(what.to_string()).or_default() += 1;
                         }

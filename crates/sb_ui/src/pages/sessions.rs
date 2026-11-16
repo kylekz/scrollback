@@ -1390,7 +1390,9 @@ impl SessionsView {
                     .text_ellipsis()
                     .text_color(c.fg2)
                     .text_spec(&theme.text.secondary)
-                    .child(session.first_prompt.clone().unwrap_or_default()),
+                    .child(crate::hostile::label(
+                        session.first_prompt.as_deref().unwrap_or_default(),
+                    )),
             )
             .child(
                 div()

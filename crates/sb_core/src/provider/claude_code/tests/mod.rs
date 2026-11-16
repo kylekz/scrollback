@@ -273,9 +273,11 @@ fn write_block(
                 ToolInput::Write { path, content } => {
                     format!("write {path}: {:?}", text(content))
                 }
-                ToolInput::ContentSearch { pattern, path } => {
-                    format!("content search {pattern:?} in {path:?}")
-                }
+                ToolInput::ContentSearch {
+                    pattern,
+                    path,
+                    files,
+                } => format!("content search {pattern:?} in {path:?} of {files:?}"),
                 ToolInput::FileSearch { pattern, path } => {
                     format!("file search {pattern:?} in {path:?}")
                 }

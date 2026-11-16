@@ -25,6 +25,11 @@
 //!   replies, commands, paths and subagent hold what it matches ([`extras::search`]).
 //! - `"trash"`: the boards' library with the three sessions `E-Trash` lists in Trash, one of
 //!   them gone at its location ([`extras::trash`]).
+//! - `"reader"`: an archive in the data dir with the sessions the reader's scenarios open
+//!   ([`reader`]): the boards' reader sessions, every construct the reader draws, and the
+//!   edge states.
+//! - `"reader-large"`: the same, with a session large enough to measure the reader's budgets
+//!   against (docs/PLAN.md §14).
 //! - `"locations"`: an archive in the data dir with one location of each kind, the host's
 //!   last good sync twelve days ago, and this machine's agent in the home
 //!   ([`fixture::locations`]): the locations sheet's states (docs/DESIGN.md §4.11).
@@ -44,6 +49,7 @@
 mod boards;
 mod extras;
 mod fixture;
+mod reader;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -69,6 +75,8 @@ enum Library {
     BoardsHeldBack,
     Search,
     Trash,
+    Reader,
+    ReaderLarge,
     Locations,
     ArchiveRemains,
     Settings,
@@ -164,6 +172,15 @@ impl RunnerApp for Scrollback {
                         Library::Trash => Extra::Trash,
                         _ => Extra::Nothing,
                     },
+                )?;
+            }
+            Library::Reader | Library::ReaderLarge => {
+                std::fs::remove_dir_all(&home)?;
+                reader::build(
+                    &cx.data_dir.join("archive"),
+                    &cx.out_dir.join("locations"),
+                    matches!(header.fixture, Library::ReaderLarge)
+                        .then_some(sb_test_support::reader::Large::BUDGET),
                 )?;
             }
             Library::Locations => fixture::locations(

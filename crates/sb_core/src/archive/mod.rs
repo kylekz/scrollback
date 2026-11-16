@@ -44,9 +44,9 @@ use crate::location::LocationId;
 use crate::search::{SearchError, SearchIndex};
 
 pub use delete::Deleted;
-pub use items::ArchivedSession;
+pub use items::{ArchivedSession, Pinned};
 pub(crate) use layout::item_folder;
-pub use segment::{Problem, SEGMENT_BYTES, VersionReader};
+pub use segment::{Problem, SEGMENT_BYTES, SegmentCache, VersionReader};
 pub(crate) use segment::{RangeWriter, Sealed};
 pub use stats::{ArchiveStats, Holds, id_in, open_or_make, resolved, what_is_in};
 pub(crate) use verify::LAST_VERIFY_VERSION;
@@ -394,14 +394,30 @@ impl Archive {
     /// The content of a version from its byte `offset` on. Only the segment that holds that
     /// byte and the ones after it are read; each is checked as [`Archive::read_version`] does.
     pub fn read_version_from(&self, version: i64, offset: u64) -> Result<VersionReader> {
+        self.read_version_cached(version, offset, None)
+    }
+
+    /// [`Archive::read_version_from`], keeping the segments it decodes in `cache` and taking
+    /// those already there from it.
+    pub(crate) fn read_version_cached(
+        &self,
+        version: i64,
+        offset: u64,
+        cache: Option<Arc<SegmentCache>>,
+    ) -> Result<VersionReader> {
         let stored = self
             .catalogue
             .stored_version(version)?
             .ok_or(ArchiveError::UnknownVersion(version))?;
-        Ok(self.reader(stored, offset))
+        Ok(self.reader(stored, offset, cache))
     }
 
-    fn reader(&self, stored: Stored, start: u64) -> VersionReader {
+    fn reader(
+        &self,
+        stored: Stored,
+        start: u64,
+        cache: Option<Arc<SegmentCache>>,
+    ) -> VersionReader {
         VersionReader::new(
             self.dir
                 .join(layout::item_dir(
@@ -414,6 +430,7 @@ impl Archive {
             stored.version.length,
             stored.version.hash,
             start,
+            cache,
         )
     }
 

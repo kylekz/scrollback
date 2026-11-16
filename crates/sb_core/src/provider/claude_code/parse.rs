@@ -218,7 +218,42 @@ pub(super) fn parse(items: &dyn SessionItems) -> Transcript {
     }
 }
 
+/**
+ * The name of the subagent whose records are kept in the session's own transcript `item`, in
+ * the tree whose first record starts at byte `offset` of it: what its conversation's `item`
+ * is, so that each such subagent is one of its own, and what [`subagent`] reads it by. Every
+ * record has a place, and no record can name another's.
+ */
+fn inline_key(item: &str, offset: u64) -> String {
+    format!("{item}#{offset}")
+}
+
+/// Whether the conversation `key` is a subagent's kept in the transcript `item` ([`inline_key`]).
+pub(super) fn is_inline(key: &str, item: &str) -> bool {
+    key.strip_prefix(item)
+        .and_then(|rest| rest.strip_prefix('#'))
+        .is_some_and(|offset| !offset.is_empty() && offset.bytes().all(|it| it.is_ascii_digit()))
+}
+
 pub(super) fn subagent(items: &dyn SessionItems, key: &str) -> Subagent {
+    /* A subagent kept in the session's own transcript: read with it, and found by its name. */
+    if items
+        .list()
+        .iter()
+        .any(|it| it.kind == ItemKind::Transcript && is_inline(key, &it.key))
+    {
+        let transcript = parse(items);
+        let under_calls = transcript
+            .conversation
+            .iter()
+            .flat_map(|conversation| conversation.calls())
+            .flat_map(|(_, call)| call.subagents.iter());
+        return under_calls
+            .chain(&transcript.unattached)
+            .find(|subagent| matches!(subagent, Subagent::Read { .. }) && &**subagent.item() == key)
+            .cloned()
+            .unwrap_or_else(|| Subagent::Unread { item: key.into() });
+    }
     let mut conversation = Reading::of(items, key, &saved(items.list()), false)
         .finish(items)
         .conversation;
@@ -237,26 +272,35 @@ pub(super) fn subagent(items: &dyn SessionItems, key: &str) -> Subagent {
     }
 }
 
-fn file_name(key: &str) -> &str {
+pub(super) fn file_name(key: &str) -> &str {
     key.rsplit_once('/').map_or(key, |(_, name)| name)
 }
 
 /// The key of the `.meta.json` beside the subagent transcript `key`.
-fn meta_key(key: &str) -> String {
+pub(super) fn meta_key(key: &str) -> String {
     format!("{}.meta.json", key.strip_suffix(".jsonl").unwrap_or(key))
 }
 
+/// The most of a sidecar read: those Claude Code writes are a few hundred bytes.
+const SIDECAR_BYTES: u64 = 64 * 1024;
+
 /// The small JSON file `key` of the session, when it is there. An error is why it couldn't be
-/// read, or that it isn't what `T` reads.
-fn sidecar<T: DeserializeOwned>(items: &dyn SessionItems, key: &str) -> Result<Option<T>, String> {
+/// read, that it is larger than [`SIDECAR_BYTES`], or that it isn't what `T` reads.
+pub(super) fn sidecar<T: DeserializeOwned>(
+    items: &dyn SessionItems,
+    key: &str,
+) -> Result<Option<T>, String> {
     if !items.list().iter().any(|item| item.key == key) {
         return Ok(None);
     }
     let mut json = Vec::new();
     items
         .open(key, 0)
-        .and_then(|mut file| file.read_to_end(&mut json))
+        .and_then(|file| file.take(SIDECAR_BYTES + 1).read_to_end(&mut json))
         .map_err(|error| error.to_string())?;
+    if json.len() as u64 > SIDECAR_BYTES {
+        return Err(format!("it is larger than {SIDECAR_BYTES} bytes"));
+    }
     serde_json::from_slice(&json)
         .map(Some)
         .map_err(|error| format!("it is not as expected ({:?})", error.classify()))
@@ -272,6 +316,8 @@ struct Node {
     /// What the reply the record is part of used, on the first record of the reply.
     tokens: Tokens,
     contents: Vec<Content>,
+    /// Where the record starts in its item.
+    offset: u64,
 }
 
 /// Where a tool call is: its record's node, and its place among that node's contents.
@@ -449,31 +495,32 @@ impl<'a> Reading<'a> {
                 .as_ref()
                 .is_some_and(|uuid| self.by_uuid.contains_key(uuid)) => {}
             "assistant" => {
-                self.node(&mut record);
+                self.node(&mut record, line.offset);
                 self.assistant(&record, line);
             }
             "user" => {
-                self.node(&mut record);
+                self.node(&mut record, line.offset);
                 self.user(&record, line);
             }
             "system" => {
-                self.node(&mut record);
+                self.node(&mut record, line.offset);
                 self.system(&record, line);
             }
             "attachment" => {
-                self.node(&mut record);
+                self.node(&mut record, line.offset);
                 self.attachment(&record, line);
             }
             _ if record.uuid.is_some() => {
-                self.node(&mut record);
+                self.node(&mut record, line.offset);
                 self.push(Content::Unrecognised(unknown(record.kind, line.whole())));
             }
             _ => self.unplaced.push(unknown(record.kind, line.whole())),
         }
     }
 
-    /// Starts the node of a record. What the record holds is pushed onto it next.
-    fn node(&mut self, record: &mut Record) {
+    /// Starts the node of a record, which starts at `offset` in the item. What the record holds
+    /// is pushed onto it next.
+    fn node(&mut self, record: &mut Record, offset: u64) {
         if let Some(uuid) = record.uuid.take() {
             self.by_uuid.insert(uuid, self.nodes.len());
         }
@@ -490,6 +537,7 @@ impl<'a> Reading<'a> {
             model: None,
             tokens: Tokens::default(),
             contents: Vec::new(),
+            offset,
         });
     }
 
@@ -576,6 +624,7 @@ impl<'a> Reading<'a> {
                     duration: record.thinking_duration_ms.map(Duration::from_millis),
                 });
             }
+            /* What `Block::call` says a call is, the outline's scan too. */
             "tool_use" => match (block.id, block.name, block.input) {
                 (Some(id), Some(name), Some(input)) => {
                     let place = self.push(Content::ToolCall(Box::new(ToolCall {
@@ -1046,6 +1095,13 @@ impl<'a> Reading<'a> {
         }
 
         let hidden = hidden(&self.nodes, &parent, &order);
+        /* Apart, each tree is a conversation of its own, named by the item and where its first
+        record starts in it (`inline_key`), which `subagent` reads it by again. */
+        let names: Vec<Arc<str>> = self
+            .nodes
+            .iter()
+            .map(|node| inline_key(&self.item, node.offset).into())
+            .collect();
         /* The conversation each record goes into: that of its tree's first record, or the
         one there is. */
         let mut builders: Vec<Builder> = Vec::new();
@@ -1059,7 +1115,7 @@ impl<'a> Reading<'a> {
                 _ if !apart => 0,
                 Some(parent) => of[parent],
                 None => {
-                    builders.push(Builder::new(self.item.clone()));
+                    builders.push(Builder::new(names[node].clone()));
                     builders.len() - 1
                 }
             };

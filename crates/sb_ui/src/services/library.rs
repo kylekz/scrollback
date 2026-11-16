@@ -536,12 +536,13 @@ fn toast_title(session: &Session) -> String {
 /// What a session without a title is called.
 pub const UNTITLED: &str = "Untitled session";
 
-/// A session's title, or [`UNTITLED`].
+/// A session's title as it is drawn, one line with its controls shown
+/// ([`crate::hostile::label`]: a title is a transcript's text), or [`UNTITLED`].
 pub fn title_of(session: &Session) -> String {
     session
         .title
-        .clone()
-        .unwrap_or_else(|| UNTITLED.to_string())
+        .as_deref()
+        .map_or_else(|| UNTITLED.to_string(), crate::hostile::label)
 }
 
 /// What a new folder is called until it is named; the catalogue makes it "New folder 2" and on
@@ -1196,6 +1197,62 @@ impl LibraryService {
             self.prune();
             cx.notify();
         }
+    }
+
+    /// Where the open session is among the sessions the page it was opened from shows, from 0,
+    /// and how many that page shows (DESIGN §4.2.1: "4 of 488"), as filtered and sorted.
+    pub fn open_place(&self) -> Option<(usize, usize)> {
+        let id = &self.open.as_ref()?.id;
+        let shown = self.shown();
+        let at = shown.iter().position(|(shown, _)| shown == id)?;
+        Some((at, shown.len()))
+    }
+
+    /// Opens the session `by` places after the open one (before, for a negative `by`) among
+    /// those the page it was opened from shows, and selects it there. Nothing happens past
+    /// either end.
+    pub fn open_step(&mut self, by: isize, cx: &mut Context<Self>) {
+        let Some((at, _)) = self.open_place() else {
+            return;
+        };
+        let Some((session, place)) = at
+            .checked_add_signed(by)
+            .and_then(|next| self.shown().get(next).cloned())
+            .and_then(|(id, place)| Some((self.session(&id)?.clone(), place)))
+        else {
+            return;
+        };
+        self.selected = Some((session.id.clone(), place));
+        self.chosen.clear();
+        self.open(session, cx);
+    }
+
+    /// Stars the open session, or takes its star away.
+    pub fn toggle_open_star(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = &mut self.open else {
+            return;
+        };
+        open.starred = !open.starred;
+        let (id, starred) = (open.id.clone(), open.starred);
+        if let Some((_, Page::Sessions(page))) = &mut self.page
+            && let Some(listed) = page.sessions.iter_mut().find(|session| session.id == id)
+        {
+            listed.starred = starred;
+        }
+        if starred {
+            self.counts.starred += 1;
+        } else {
+            self.counts.starred = self.counts.starred.saturating_sub(1);
+        }
+        self.write(
+            Change::Star {
+                ids: vec![id],
+                starred,
+            },
+            None,
+            cx,
+        );
+        cx.notify();
     }
 
     pub fn unsorted_view(&self) -> &UnsortedView {

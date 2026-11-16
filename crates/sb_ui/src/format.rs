@@ -115,6 +115,37 @@ pub fn clock(ms: i64) -> String {
     local(ms).map_or_else(String::new, |time| time.format("%H:%M").to_string())
 }
 
+/// How long `ms` milliseconds took, as the reader writes it (DESIGN §4.2.3): `0.1s`, `15.4s`,
+/// `41s`, `2 min 41 s`, `1 h 4 min`.
+pub fn duration(ms: i64) -> String {
+    let ms = ms.max(0);
+    let seconds = ms / 1000;
+    match seconds {
+        0..20 if ms % 1000 != 0 => format!("{:.1}s", ms as f64 / 1000.),
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{} min {} s", seconds / 60, seconds % 60),
+        _ => format!("{} h {} min", seconds / 3600, seconds % 3600 / 60),
+    }
+}
+
+/// A count of tokens, short: `950`, `24k`, `171k`, `1.2M`.
+pub fn tokens(count: u64) -> String {
+    match count {
+        0..1000 => count.to_string(),
+        1000..1_000_000 => format!("{}k", (count + 500) / 1000),
+        _ => format!("{:.1}M", count as f64 / 1_000_000.),
+    }
+}
+
+/// A file's size, as the reader writes one: `812 B`, `14 KB`, `2.4 MB`.
+pub fn file_size(bytes: u64) -> String {
+    match bytes {
+        0..1024 => format!("{bytes} B"),
+        1024..1_048_576 => format!("{} KB", (bytes + 512) / 1024),
+        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.),
+    }
+}
+
 /// `Nov 2025 – Nov 2026`, or `Nov 2026` when both ends are in one month.
 pub fn span(from: i64, to: i64) -> String {
     let short = |ms| {
@@ -230,6 +261,25 @@ mod tests {
         assert_eq!(fine_size(412 * mb), "412 MB");
         assert_eq!(fine_size(18 * 1024), "18 KB");
         assert_eq!(fine_size(0), "0 KB");
+    }
+
+    #[test]
+    fn the_reader_writes_durations_tokens_and_sizes_as_design_does() {
+        // DESIGN §4.2.3: "0.1s", "15.4s", "41s", "2 min 41 s".
+        assert_eq!(duration(100), "0.1s");
+        assert_eq!(duration(15_400), "15.4s");
+        assert_eq!(duration(41_000), "41s");
+        assert_eq!(duration(161_000), "2 min 41 s");
+        assert_eq!(duration(3_840_000), "1 h 4 min");
+        assert_eq!(duration(14_000), "14s");
+        assert_eq!(duration(-5), "0s");
+        // §4.2.6: "171k → 24k tokens".
+        assert_eq!(tokens(950), "950");
+        assert_eq!(tokens(171_200), "171k");
+        assert_eq!(tokens(1_234_567), "1.2M");
+        assert_eq!(file_size(812), "812 B");
+        assert_eq!(file_size(14_000), "14 KB");
+        assert_eq!(file_size(2_516_582), "2.4 MB");
     }
 
     /// Noon, local time, on the day given.

@@ -29,6 +29,7 @@
 //! way to check the parse against.
 
 mod audit;
+mod outline;
 mod parse;
 mod record;
 mod said;
@@ -46,7 +47,7 @@ use super::{
     Display, FileClass, FileTree, Hashed, ItemKind, ItemPrefix, ItemRange, Mark, Provider,
     ProviderError, ProviderId, RangeFailure, Scan, SessionItems, Source,
 };
-use crate::transcript::{Subagent, Transcript};
+use crate::transcript::{Outline, Subagent, Transcript};
 use crate::transport::{Env, RangeSink, Transport};
 
 pub(super) const ID: ProviderId = ProviderId::new("claude-code");
@@ -88,6 +89,10 @@ impl Provider for Agent {
         model_name(model)
     }
 
+    fn tool_label(&self, name: &str) -> Option<&'static str> {
+        tools::label(name)
+    }
+
     fn detect<'a>(
         &'a self,
         transport: &'a dyn Transport,
@@ -114,6 +119,10 @@ impl Provider for Agent {
 
     fn subagent(&self, items: &dyn SessionItems, item: &str) -> Subagent {
         parse::subagent(items, item)
+    }
+
+    fn outlines(&self, items: &dyn SessionItems) -> Vec<Outline> {
+        outline::outlines(items)
     }
 
     fn classify(&self, key: &str) -> (ItemKind, Option<String>) {

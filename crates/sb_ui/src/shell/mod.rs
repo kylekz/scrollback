@@ -312,6 +312,11 @@ impl Shell {
         Showing::now(cx)
     }
 
+    /// What the reader shows, for automation.
+    pub fn reader(&self, cx: &App) -> crate::pages::reader::ReaderSnapshot {
+        self.main.read(cx).reader(cx)
+    }
+
     /// Shows or hides a narrow window's sidebar, the keyboard going with it. A docked
     /// sidebar always shows, so there the keyboard alone moves.
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, window: &mut Window, cx: &mut Context<Self>) {

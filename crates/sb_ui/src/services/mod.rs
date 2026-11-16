@@ -6,6 +6,8 @@
 //! - [`SyncService`] (`Sync`): the locations, the passes that sync them and their progress.
 //! - [`LibraryService`] (`Library`): the page shown, what is selected on it, and what the
 //!   sidebar and the pages read from the catalogue.
+//! - [`ReaderService`] (the reader, PLAN §9): the session open in the main area, parsed, and
+//!   what of it has been loaded.
 //! - [`SettingsService`] (`Settings`): the app's own settings, which outlive the archive the
 //!   others are over, and whether Settings is shown.
 //! - [`UpkeepService`]: the archive's size, verify and the sessions deleted for good, for
@@ -27,6 +29,7 @@ mod location_tests;
 #[cfg(test)]
 mod owner_tests;
 pub mod read_at;
+pub mod reader;
 #[cfg(test)]
 mod scale;
 pub mod search;
@@ -57,6 +60,7 @@ pub use library::{
     can_attach, group_key, group_path,
 };
 pub use read_at::ReadAt;
+pub use reader::{ReaderService, ReaderState};
 pub use search::{Answer, Answered, SearchService};
 pub use settings::{SettingsService, SyncEvery};
 #[cfg(any(test, feature = "automation"))]
@@ -113,6 +117,7 @@ pub struct Services {
     pub archive: Entity<ArchiveService>,
     pub sync: Entity<SyncService>,
     pub library: Entity<LibraryService>,
+    pub reader: Entity<ReaderService>,
     pub upkeep: Entity<UpkeepService>,
     pub search: Entity<SearchService>,
     pub providers: Providers,
@@ -123,7 +128,8 @@ pub struct Services {
 impl Global for Services {}
 
 impl Services {
-    /// Nothing is opening, syncing, indexing, loading or being saved: automation's `settled`.
+    /// Nothing is opening, syncing, indexing, loading, being read or being saved:
+    /// automation's `settled`.
     pub fn is_settled(&self, cx: &App) -> bool {
         self.is_quiet(cx) && self.settings.read(cx).is_settled()
     }
@@ -134,6 +140,7 @@ impl Services {
         !matches!(self.archive.read(cx).state(), ArchiveState::Opening)
             && self.sync.read(cx).is_settled()
             && self.library.read(cx).is_settled()
+            && self.reader.read(cx).is_settled()
             && self.upkeep.read(cx).is_settled()
             && self.search.read(cx).is_settled()
     }
@@ -183,6 +190,8 @@ fn build(
         )
     });
     let library = cx.new(|cx| LibraryService::new(archive.clone(), sync.clone(), cx));
+    let reader =
+        cx.new(|cx| ReaderService::new(archive.clone(), library.clone(), providers.clone(), cx));
     let upkeep = cx.new(|cx| UpkeepService::new(archive.clone(), sync.clone(), &settings, cx));
     let search = cx.new(|cx| SearchService::new(archive.clone(), library.clone(), cx));
     Services {
@@ -190,6 +199,7 @@ fn build(
         archive,
         sync,
         library,
+        reader,
         upkeep,
         search,
         providers,

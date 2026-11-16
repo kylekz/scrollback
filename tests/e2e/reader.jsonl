@@ -1,0 +1,214 @@
+{"scenario": {"window_size": "1440x900", "fixture": "reader", "description": "The reader (DESIGN §4.2) on the boards' sessions and the fixture of every construct: opened from a folder page, a call and a subagent opened and closed, Full calls, the next and previous session, the edge states, and back; dark at 1440x900"}}
+{"cmd": "wait_ready", "timeout_ms": 60000}
+{"cmd": "settle", "timeout_ms": 60000, "expect": {"pointer": "/library/counts/all", "equals": 8}}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+{"cmd": "click", "target": "sidebar/folder/fc"}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 5}}
+
+// E-Reader: the backfill session, opened from fc's page. The header names the folder and the place among its sessions; the column is at most 720 wide (a message reaches 6 past it either side, for the keyboard's ring); a collapsed activity row is 26 high.
+{"cmd": "click", "target": "card/1/title"}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "session"}, {"pointer": "/reader/state", "equals": "open"}, {"pointer": "/reader/place", "equals": [2, 5]}, {"pointer": "/reader/full_calls", "equals": false}, {"pointer": "/reader/open_calls", "equals": 0}, {"pointer": "/reader/top_name", "equals": "prompt main/0"}]}
+{"cmd": "bounds", "target": "session/title", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "reader/call/main/4", "expect_result": [{"pointer": "/h", "gte": 25, "lte": 26}, {"pointer": "/w", "equals": 736}]}
+{"cmd": "bounds", "target": "reader/reply/main/2", "expect_result": {"pointer": "/w", "equals": 732}}
+{"cmd": "screenshot", "name": "reader-top-1440-dark"}
+
+// A click opens a call in place; its body loads and hangs under it, and the rows below move down.
+{"cmd": "click", "target": "reader/call/main/3"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/open_calls", "equals": 1}, {"pointer": "/reader/loads/bodies/loaded", "equals": 1}, {"pointer": "/reader/focused/kind", "equals": "call"}]}
+{"cmd": "bounds", "target": "reader/body/main/3", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "call-open-1440-dark"}
+
+// The keyboard: down to the agent's row, Enter opens its subagent, read on the way.
+{"cmd": "key", "keystroke": "down"}
+{"cmd": "key", "keystroke": "down"}
+{"cmd": "key", "keystroke": "down", "expect": {"pointer": "/reader/focused/kind", "equals": "call"}}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/open_calls", "equals": 2}, {"pointer": "/reader/loads/subagents/loaded", "equals": 1}]}
+{"cmd": "scroll", "target": "reader/column", "dy": -500}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "reader/panel/agent-a0000000000000001", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "subagent-open-1440-dark"}
+// Open on its own: the subagent is the column's whole content, every call shown; back goes to the call that started it.
+{"cmd": "click", "target": "reader/alone/agent-a0000000000000001"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/alone", "equals": true}, {"pointer": "/reader/open_calls", "equals": 0}]}
+{"cmd": "screenshot", "name": "subagent-alone-1440-dark"}
+{"cmd": "click", "target": "reader/alone/back"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/alone", "equals": false}, {"pointer": "/reader/open_calls", "equals": 2}, {"pointer": "/reader/focused/kind", "equals": "call"}]}
+// Enter again closes it; the body stays open.
+{"cmd": "key", "keystroke": "enter", "expect": {"pointer": "/reader/open_calls", "equals": 1}}
+{"cmd": "key", "keystroke": "up"}
+{"cmd": "key", "keystroke": "up"}
+{"cmd": "key", "keystroke": "up"}
+{"cmd": "key", "keystroke": "left", "expect": {"pointer": "/reader/open_calls", "equals": 0}}
+
+// The rows say what they hold: the first prompt, and the reply after the first calls.
+{"cmd": "key", "keystroke": "home"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/focused/kind", "equals": "prompt"}, {"pointer": "/reader/focused/text", "contains": "The metadata backfill hammers YouTube"}]}
+{"cmd": "key", "keystroke": "down"}
+{"cmd": "key", "keystroke": "down"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/focused/kind", "equals": "reply"}, {"pointer": "/reader/focused/text", "equals": "Let me find where the backfill is scheduled first."}]}
+// Ctrl C with nothing selected copies the focused message.
+{"cmd": "key", "keystroke": "secondary-c", "expect": [{"pointer": "/system", "len": 1}, {"pointer": "/system/0/kind", "equals": "copy"}, {"pointer": "/system/0/text", "contains": "Let me find where the backfill is scheduled first."}]}
+
+// Full calls (E): every call open; the choice is the app's, kept for the next session. The row at the top stays at the top. Where it sits is a range: the rows above it lay out a few pixels apart at each display scale and on each platform; it must not move when the calls open.
+{"cmd": "key", "keystroke": "]"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/top_name", "equals": "reply main/12"}, {"pointer": "/reader/top_offset", "gte": 164, "lte": 188}]}
+{"cmd": "key", "keystroke": "e"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/full_calls", "equals": true}, {"pointer": "/reader/open_calls", "equals": 17}, {"pointer": "/reader/top_name", "equals": "reply main/12"}, {"pointer": "/reader/top_offset", "gte": 164, "lte": 188}]}
+{"cmd": "key", "keystroke": "home"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "full-calls-1440-dark"}
+// Back to Activity with the top of the column inside a body: the call it was under takes the top.
+{"cmd": "scroll", "target": "reader/column", "dy": -760}
+{"cmd": "settle", "expect": {"pointer": "/reader/top_name", "equals": "body main/3"}}
+{"cmd": "key", "keystroke": "e"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/full_calls", "equals": false}, {"pointer": "/reader/top_name", "equals": "call main/3"}, {"pointer": "/reader/top_offset", "equals": 0}]}
+{"cmd": "key", "keystroke": "e"}
+{"cmd": "settle", "expect": {"pointer": "/reader/full_calls", "equals": true}}
+{"cmd": "key", "keystroke": "end"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/at_end", "equals": true}, {"pointer": "/reader/following", "equals": true}]}
+{"cmd": "screenshot", "name": "full-calls-end-1440-dark"}
+// End keeps to the end until the wheel moves the column; back at the end by the wheel, it doesn't take it up again. A key other than End lets go of it too.
+{"cmd": "scroll", "target": "reader/column", "dy": 300}
+{"cmd": "settle", "expect": {"pointer": "/reader/following", "equals": false}}
+{"cmd": "scroll", "target": "reader/column", "dy": -5000}
+{"cmd": "settle", "expect": [{"pointer": "/reader/at_end", "equals": true}, {"pointer": "/reader/following", "equals": false}]}
+{"cmd": "key", "keystroke": "end"}
+{"cmd": "settle", "expect": {"pointer": "/reader/following", "equals": true}}
+{"cmd": "key", "keystroke": "up"}
+{"cmd": "settle", "expect": {"pointer": "/reader/following", "equals": false}}
+
+// E-Reader-Calls-1 and -2: J goes to the next session of fc's page, the playlist's, still in Full calls.
+{"cmd": "key", "keystroke": "j"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/place", "equals": [3, 5]}, {"pointer": "/library/open", "equals": "Downloads: paste a whole playlist"}, {"pointer": "/reader/full_calls", "equals": true}]}
+{"cmd": "screenshot", "name": "calls-1-1440-dark"}
+{"cmd": "key", "keystroke": "]"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "calls-2-1440-dark"}
+{"cmd": "key", "keystroke": "end"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "image-result-1440-dark"}
+{"cmd": "key", "keystroke": "e", "expect": {"pointer": "/reader/full_calls", "equals": false}}
+
+// Every construct: Markdown of every kind, notes, a prompt from another sender, the subagent of a subagent, a compaction and a transcript cut inside a record.
+{"cmd": "key", "keystroke": "k"}
+{"cmd": "key", "keystroke": "k"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/place", "equals": [1, 5]}, {"pointer": "/library/open", "equals": "Reader fixture: every construct"}]}
+{"cmd": "screenshot", "name": "markdown-1440-dark"}
+{"cmd": "scroll", "target": "reader/column", "dy": -1700}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "markdown-table-1440-dark"}
+{"cmd": "scroll", "target": "reader/column", "dy": -1500}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "markdown-code-1440-dark"}
+{"cmd": "key", "keystroke": "e"}
+{"cmd": "settle", "expect": {"pointer": "/reader/full_calls", "equals": true}}
+{"cmd": "key", "keystroke": "end"}
+{"cmd": "settle"}
+{"cmd": "key", "keystroke": "["}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "nested-subagent-1440-dark"}
+{"cmd": "key", "keystroke": "end"}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "reader/ending/main", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "ending-mid-record-1440-dark"}
+{"cmd": "key", "keystroke": "e", "expect": {"pointer": "/reader/full_calls", "equals": false}}
+
+// Hostile content: Markdown that tries to load, run or hide things is shown as text; what is too deep or too big to lay out is plain text with a note.
+{"cmd": "key", "keystroke": "j"}
+{"cmd": "key", "keystroke": "j"}
+{"cmd": "key", "keystroke": "j"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/place", "equals": [4, 5]}, {"pointer": "/reader/state", "equals": "open"}]}
+{"cmd": "screenshot", "name": "hostile-top-1440-dark"}
+// Ctrl C on a reply copies it as it was written and shown: its bidirectional control as the marker it is shown as, never the control. The click that focuses it lands on its address, which opens.
+{"cmd": "click", "target": "reader/reply/main/6"}
+{"cmd": "key", "keystroke": "secondary-c"}
+{"cmd": "settle", "expect": [{"pointer": "/system", "contains": {"kind": "open_url", "url": "https://example.com/x"}}, {"pointer": "/system", "contains": {"kind": "copy", "text": "Copied as written: <b>bold</b> at https://example.com/x and ⟦U+202E⟧txt.exe"}}]}
+{"cmd": "scroll", "target": "reader/column", "dy": -900}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "hostile-deep-1440-dark"}
+// A link of each scheme: only http and https are opened (after the address in the reply copied above, whose click landed on it).
+{"cmd": "key", "keystroke": "end"}
+{"cmd": "settle"}
+{"cmd": "click", "target": "reader/reply/main/11"}
+{"cmd": "click", "target": "reader/reply/main/12"}
+{"cmd": "click", "target": "reader/reply/main/13"}
+{"cmd": "click", "target": "reader/reply/main/14"}
+{"cmd": "click", "target": "reader/reply/main/15"}
+{"cmd": "click", "target": "reader/reply/main/16"}
+{"cmd": "settle", "expect": [{"pointer": "/system", "len": 5}, {"pointer": "/system", "contains": {"kind": "open_url", "url": "http://example.com/plain"}}, {"pointer": "/system", "contains": {"kind": "open_url", "url": "https://example.com/secure"}}]}
+{"cmd": "key", "keystroke": "e"}
+{"cmd": "settle", "expect": {"pointer": "/reader/full_calls", "equals": true}}
+{"cmd": "key", "keystroke": "end"}
+{"cmd": "settle", "expect": {"pointer": "/reader/at_end", "equals": true}}
+{"cmd": "screenshot", "name": "hostile-images-1440-dark"}
+{"cmd": "key", "keystroke": "e", "expect": {"pointer": "/reader/full_calls", "equals": false}}
+
+// A session damaged in the archive: what was read, then where reading stopped.
+{"cmd": "key", "keystroke": "j"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/place", "equals": [5, 5]},{"pointer": "/library/open", "equals": "A session damaged in the archive"}]}
+{"cmd": "key", "keystroke": "end"}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "reader/ending/main", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "ending-unreadable-1440-dark"}
+
+// Back (Alt ←) to fc's page.
+{"cmd": "key", "keystroke": "alt-left"}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/reader/state", "equals": "closed"}, {"pointer": "/library/shelf", "equals": {"folder": "fc"}}]}
+
+// E-Edge-Source-Gone: from Unsorted, a session gone at its location.
+{"cmd": "click", "target": "sidebar/unsorted"}
+{"cmd": "settle", "expect": {"pointer": "/library/groups", "equals": 2}}
+{"cmd": "click", "target": "unsorted/row/0/0"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "session"}, {"pointer": "/reader/place", "equals": [1, 2]}]}
+{"cmd": "screenshot", "name": "unsorted-first-1440-dark"}
+{"cmd": "key", "keystroke": "j"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "unsorted-second-1440-dark"}
+
+// E-Reader-Subagent: the audit of toolbox-rs, its subagent open with its first five calls.
+{"cmd": "click", "target": "sidebar/folder/toolbox-rs"}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 1}}
+{"cmd": "click", "target": "card/0/title"}
+{"cmd": "settle", "expect": {"pointer": "/library/open", "equals": "Audit fc and slide for code taken from Zed"}}
+{"cmd": "click", "target": "reader/call/main/2"}
+{"cmd": "settle", "expect": {"pointer": "/reader/loads/subagents/loaded", "equals": 1}}
+{"cmd": "screenshot", "name": "subagent-board-1440-dark"}
+
+// Light.
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "subagent-board-1440-light"}
+{"cmd": "click", "target": "sidebar/folder/fc"}
+{"cmd": "settle"}
+{"cmd": "click", "target": "card/1/title"}
+{"cmd": "settle", "expect": {"pointer": "/reader/state", "equals": "open"}}
+{"cmd": "screenshot", "name": "reader-top-1440-light"}
+{"cmd": "key", "keystroke": "e"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "full-calls-1440-light"}
+{"cmd": "key", "keystroke": "e"}
+
+// 1280x800: the column keeps its 720.
+{"cmd": "resize", "w": 1280, "h": 800, "expect": {"pointer": "/shell/sidebar", "equals": "docked"}}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "reader/reply/main/2", "expect_result": {"pointer": "/w", "equals": 732}}
+{"cmd": "screenshot", "name": "reader-top-1280-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "reader-top-1280-dark"}
+
+// 960x600: the sidebar collapses and the column narrows to what is left, less its sides.
+{"cmd": "resize", "w": 960, "h": 600, "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "reader/reply/main/2", "expect_result": {"pointer": "/w", "equals": 732}}
+{"cmd": "screenshot", "name": "reader-top-960-dark"}
+{"cmd": "key", "keystroke": "e"}
+{"cmd": "settle", "expect": {"pointer": "/reader/full_calls", "equals": true}}
+{"cmd": "screenshot", "name": "full-calls-960-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "full-calls-960-light"}
