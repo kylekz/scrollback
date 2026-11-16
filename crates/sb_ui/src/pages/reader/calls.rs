@@ -558,7 +558,7 @@ fn body(
             if load.is_none() {
                 reader.update(cx, |reader, cx| reader.want_image(&key, cx));
             }
-            tool_image(load, &hostile::label(&call.name), theme)
+            tool_image(ix, load, key, &hostile::label(&call.name), theme, cx)
         }
         (BodyPart::NoOutput, _, Some(call)) => div()
             .py(theme.spacing.md)
@@ -656,9 +656,12 @@ fn body(
 /// An image a tool returned (DESIGN §4.2.4): fitted to the column, at most 320 high, with a
 /// caption; or why it can't be shown.
 fn tool_image(
+    ix: usize,
     load: Option<Load<crate::services::reader::Picture>>,
+    key: ImageKey,
     tool: &str,
     theme: &SbTheme,
+    cx: &mut Context<ReaderView>,
 ) -> AnyElement {
     let c = &theme.colors;
     let caption = |text: String, bad: bool| {
@@ -671,6 +674,7 @@ fn tool_image(
             .child(icon(SbIcon::Image, theme.sizes.icon_xs, c.fg3))
             .child(hostile::label(&text))
     };
+    let name = format!("reader/full-size/{}", key.at.block.0);
     let inner = match load {
         Some(Load::Loaded(picture)) => {
             let height = theme
@@ -687,15 +691,30 @@ fn tool_image(
                         .h(height)
                         .object_fit(ObjectFit::Contain),
                 )
-                .child(caption(
-                    format!(
-                        "returned by {tool} · {} × {} · {}",
-                        picture.width,
-                        picture.height,
-                        format::file_size(picture.bytes as u64)
+                .child(
+                    caption(
+                        format!(
+                            "returned by {tool} · {} × {} · {}",
+                            picture.width,
+                            picture.height,
+                            format::file_size(picture.bytes as u64)
+                        ),
+                        false,
+                    )
+                    .child(
+                        div()
+                            .id(("full-size", ix))
+                            .ml_auto()
+                            .text_color(c.accent_text)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.full_image = Some(key.clone());
+                                cx.notify();
+                            }))
+                            .child("Open full size")
+                            .automation_target(name),
                     ),
-                    false,
-                ))
+                )
                 .into_any_element()
         }
         Some(Load::Failed(why)) => caption(why, true).into_any_element(),

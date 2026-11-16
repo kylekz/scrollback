@@ -20,7 +20,7 @@ use sb_core::filing::FolderId;
 use super::{LIFTED_OPACITY, SessionsView, month_name, subfolder_of};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{focus_ring, icon, location_tag, overline};
+use crate::components::{focus_ring, icon, location_tag, overline, warn_chip};
 use crate::drag;
 use crate::format;
 use crate::icons::SbIcon;
@@ -398,6 +398,10 @@ impl SessionsView {
                             .text_spec(&theme.text.row_title)
                             .child(title.clone()),
                     )
+                    /* A newer version held back (DESIGN §4.3), found without opening it. */
+                    .when(session.held_back, |this| {
+                        this.child(warn_chip("held back", theme))
+                    })
                     .child(
                         div()
                             .flex_1()
