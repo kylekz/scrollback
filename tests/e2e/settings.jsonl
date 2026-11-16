@@ -98,10 +98,10 @@
 {"cmd": "click", "target": "settings/appearance/theme/system"}
 {"cmd": "settle", "expect": {"pointer": "/appearance/mode", "equals": "system"}}
 
-// Shortcuts: one row per action the keymap binds.
+// Shortcuts: one row per action the keymap binds (keymap::SHORTCUT_ROWS), Find in the session's among them.
 {"cmd": "click", "target": "settings/nav/shortcuts"}
 {"cmd": "settle", "expect": {"pointer": "/settings/section", "equals": "shortcuts"}}
-{"cmd": "query", "prefix": "settings/shortcuts/", "expect_result": {"pointer": "", "len": 28}}
+{"cmd": "query", "prefix": "settings/shortcuts/", "expect_result": {"pointer": "", "len": 29}}
 {"cmd": "screenshot", "name": "shortcuts-dark"}
 {"cmd": "pin_appearance", "appearance": "light"}
 {"cmd": "settle"}

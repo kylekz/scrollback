@@ -71,9 +71,11 @@
 
 // From the palette: the session opens at the match, and Find is filled with the query, the match flashed being current.
 {"cmd": "key", "keystroke": "secondary-k"}
-{"cmd": "settle", "expect": {"pointer": "/palette", "not_equals": null}}
+// Opened from toolbox-rs's session, the palette is scoped to its folder (§4.9): Backspace on the empty query drops the chip.
+{"cmd": "settle", "expect": {"pointer": "/palette/chips", "equals": ["Folder: toolbox-rs"]}}
+{"cmd": "key", "keystroke": "backspace", "expect": {"pointer": "/palette/chips", "len": 0}}
 {"cmd": "type", "text": "progress"}
-{"cmd": "settle"}
+{"cmd": "settle", "expect": {"pointer": "", "exists": true}}
 {"cmd": "key", "keystroke": "down"}
 {"cmd": "key", "keystroke": "enter"}
 {"cmd": "settle", "expect": [{"pointer": "/page", "equals": "session"}, {"pointer": "/reader/find/query", "equals": "progress"}]}

@@ -61,7 +61,7 @@
 {"cmd": "settle"}
 {"cmd": "screenshot", "name": "full-calls-1440-dark"}
 // Back to Activity with the top of the column inside a body: the call it was under takes the top.
-{"cmd": "scroll", "target": "reader/column", "dy": -760}
+{"cmd": "scroll", "target": "reader/column", "dy": -510}
 {"cmd": "settle", "expect": {"pointer": "/reader/top_name", "equals": "body main/3"}}
 {"cmd": "key", "keystroke": "e"}
 {"cmd": "settle", "expect": [{"pointer": "/reader/full_calls", "equals": false}, {"pointer": "/reader/top_name", "equals": "call main/3"}, {"pointer": "/reader/top_offset", "equals": 0}]}
