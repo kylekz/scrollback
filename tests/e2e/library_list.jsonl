@@ -1,0 +1,68 @@
+{"scenario": {"window_size": "1440x900", "fixture": "boards", "description": "The filter row and the list view (DESIGN §4.4, §4.5; E-All-Sessions), on the boards' library: All sessions as a list; a Model filter as an accent chip and the count \"N of 2,318\"; Starred; the filter field narrowing to nothing and Clear filters; the Date header flipping the order; the arrows and Ctrl-click in the list; each page keeping its own view; and the list at 960x600, whose columns drop. Captured dark and light"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/library/sessions", "equals": 2318}]}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+
+// The list: a header row, then each month's overline with its count and its rows, 34 high.
+{"cmd": "click", "target": "filter/list"}
+{"cmd": "settle", "expect": [{"pointer": "/page_view/list", "equals": true}, {"pointer": "/page_view/shown", "equals": 2318}]}
+{"cmd": "bounds", "target": "list/row/0", "expect_result": [{"pointer": "/h", "equals": 34}, {"pointer": "/x", "equals": 272}, {"pointer": "/w", "equals": 1144}]}
+{"cmd": "bounds", "target": "card/0", "expect_error": "no target"}
+{"cmd": "screenshot", "name": "list-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "list-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// A Model filter: its menu lists the page's models, the most common first; chosen, it is an accent chip and the count reads "N of 2,318".
+{"cmd": "click", "target": "filter/model"}
+{"cmd": "settle", "expect": {"pointer": "/menu/items/0", "equals": "0"}}
+{"cmd": "click", "target": "menu/0"}
+{"cmd": "settle", "expect": [{"pointer": "/page_view/filtered", "equals": true}, {"pointer": "/page_view/shown", "lte": 2317}, {"pointer": "/page_view/shown", "gte": 1}]}
+{"cmd": "bounds", "target": "filter/clear", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "click", "target": "filter/starred"}
+{"cmd": "settle", "expect": {"pointer": "/page_view/shown", "lte": 14}}
+{"cmd": "screenshot", "name": "filtered-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "filtered-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// Text that no title or prompt holds: "No sessions match these filters" and Clear filters, which takes every filter away.
+{"cmd": "click", "target": "filter/field"}
+{"cmd": "type", "text": "nothing holds this"}
+{"cmd": "settle", "expect": {"pointer": "/page_view/shown", "equals": 0}}
+{"cmd": "bounds", "target": "page/no-match", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "no-match-dark"}
+{"cmd": "click", "target": "page/no-match/clear"}
+{"cmd": "settle", "expect": [{"pointer": "/page_view/filtered", "equals": false}, {"pointer": "/page_view/shown", "equals": 2318}, {"pointer": "/page_view/list", "equals": true}]}
+
+// The Date header flips the order, and flips it back.
+{"cmd": "click", "target": "list/date"}
+{"cmd": "settle", "expect": {"pointer": "/page_view/oldest_first", "equals": true}}
+{"cmd": "click", "target": "list/date"}
+{"cmd": "settle", "expect": {"pointer": "/page_view/oldest_first", "equals": false}}
+
+// The keys in the list: down moves a row, Ctrl-click adds a row to the selection.
+{"cmd": "click", "target": "list/row/0"}
+{"cmd": "key", "keystroke": "down"}
+{"cmd": "state", "expect": {"pointer": "/library/selection", "len": 1}}
+{"cmd": "click", "target": "list/row/3", "modifiers": "secondary"}
+{"cmd": "state", "expect": {"pointer": "/library/selection", "len": 2}}
+{"cmd": "screenshot", "name": "list-selection-dark"}
+
+// Each page keeps its own view: fc shows cards, All sessions its list again.
+{"cmd": "click", "target": "sidebar/folder/fc"}
+{"cmd": "settle", "expect": {"pointer": "/page_view/list", "equals": false}}
+{"cmd": "click", "target": "sidebar/all-sessions"}
+{"cmd": "settle", "expect": {"pointer": "/page_view/list", "equals": true}}
+
+// At 960x600 Branch goes, then Location; Title keeps its room.
+{"cmd": "resize", "w": 960, "h": 600}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "list/row/0", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "list-narrow-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "list-narrow-light"}

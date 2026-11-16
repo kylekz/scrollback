@@ -1,0 +1,76 @@
+{"scenario": {"window_size": "1440x900", "fixture": "boards", "description": "The hover bar and the menus (DESIGN §4.1, §4.4, §4.5; E-Folder, E-All-Sessions), on the boards' library: a card's hover bar; its menu from a right-click with Move to folder › open; filing by hand from it, then File automatically, which the menu offers only then; the keys M and Shift F10; a folder's actions from its page and from its sidebar row; and Delete folder… asking first. Captured dark and light, and the menu at 960x600"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/library/sessions", "equals": 2318}]}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+{"cmd": "click", "target": "sidebar/folder/fc"}
+{"cmd": "settle", "expect": {"pointer": "/library/shelf", "equals": {"folder": "fc"}}}
+
+// The hover bar: Star, Move to folder, Move to Trash, More.
+{"cmd": "mouse_move", "target": "card/4"}
+{"cmd": "bounds", "target": "card/4/more", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "hover-bar-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "hover-bar-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// A right-click selects the card and opens its menu (E-All-Sessions); Move to folder opens beside it: how it is filed now, the tree with fc checked, New folder…. History… is there but off until versions are built.
+{"cmd": "click", "target": "card/1", "button": "right"}
+{"cmd": "settle", "expect": [{"pointer": "/menu/items", "equals": ["open", "star", "move", "copy-path", "history", "trash"]}, {"pointer": "/library/selection", "equals": ["libmpv hwdec fallback on AV1"]}]}
+{"cmd": "mouse_move", "target": "menu/move"}
+{"cmd": "settle", "expect": {"pointer": "/menu/submenu", "equals": ["folder/dv", "folder/dv-wsl-backend", "folder/fc", "folder/player", "folder/folio", "folder/slide", "folder/toolbox-rs", "folder/scrollback", "folder/dotfiles", "folder/Scratch", "new-folder"]}}
+{"cmd": "screenshot", "name": "session-menu-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "session-menu-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+// Choosing player files it there by hand.
+{"cmd": "click", "target": "menu/move/folder/player"}
+{"cmd": "settle", "expect": [{"pointer": "/menu", "equals": null}, {"pointer": "/library/toast/text", "equals": "Filed in fc › player by hand"}, {"pointer": "/library/folders/9/sessions", "equals": 42}]}
+// Now its menu offers File automatically, which hands it back to the rules: its path is fc's.
+{"cmd": "click", "target": "card/1", "button": "right"}
+{"cmd": "settle", "expect": {"pointer": "/menu/items", "equals": ["open", "star", "move", "copy-path", "history", "file-automatically", "trash"]}}
+{"cmd": "click", "target": "menu/file-automatically"}
+{"cmd": "settle", "expect": [{"pointer": "/library/toast/text", "equals": "Filed in fc by its path"}, {"pointer": "/library/folders/9/sessions", "equals": 41}]}
+
+// The keys: M opens Move to folder for the selected card, Esc closes it; Shift F10 its menu, where the arrows and Enter work.
+{"cmd": "key", "keystroke": "m"}
+{"cmd": "settle", "expect": {"pointer": "/menu/items/0", "equals": "folder/dv"}}
+{"cmd": "key", "keystroke": "escape", "expect": {"pointer": "/menu", "equals": null}}
+{"cmd": "key", "keystroke": "shift-f10"}
+{"cmd": "settle", "expect": {"pointer": "/menu/items/0", "equals": "open"}}
+{"cmd": "keys", "keys": "down down enter"}
+{"cmd": "settle", "expect": [{"pointer": "/menu", "equals": null}, {"pointer": "/library/counts/starred", "equals": 15}]}
+
+// A folder's actions: from its page's ⋯, and from its row in the sidebar.
+{"cmd": "click", "target": "page/folder-actions"}
+{"cmd": "settle", "expect": {"pointer": "/menu/items", "equals": ["rename", "new-subfolder", "edit-paths", "delete"]}}
+{"cmd": "screenshot", "name": "folder-menu-dark"}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "click", "target": "sidebar/folder/dotfiles", "button": "right"}
+{"cmd": "settle", "expect": {"pointer": "/menu/items", "equals": ["open", "rename", "new-subfolder", "edit-paths", "delete"]}}
+// Delete folder… asks first; Cancel leaves it.
+{"cmd": "click", "target": "menu/delete"}
+{"cmd": "settle", "expect": {"pointer": "/library/deleting", "equals": "dotfiles"}}
+{"cmd": "screenshot", "name": "delete-folder-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "delete-folder-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "click", "target": "delete-folder/cancel"}
+{"cmd": "settle", "expect": [{"pointer": "/library/deleting", "equals": null}, {"pointer": "/library/folders", "len": 10}]}
+// Confirmed, its sessions go to Unsorted and are filed again: dotfiles' path is attached to no other folder.
+{"cmd": "click", "target": "sidebar/folder/dotfiles", "button": "right"}
+{"cmd": "click", "target": "menu/delete"}
+{"cmd": "click", "target": "delete-folder/confirm"}
+{"cmd": "settle", "expect": [{"pointer": "/library/folders", "len": 9}, {"pointer": "/library/counts/unsorted", "equals": 101}]}
+
+// At the smallest window the menu stays inside it.
+{"cmd": "resize", "w": 960, "h": 600}
+{"cmd": "settle"}
+{"cmd": "click", "target": "card/1", "button": "right"}
+{"cmd": "mouse_move", "target": "menu/move"}
+{"cmd": "settle", "expect": {"pointer": "/menu/submenu/0", "equals": "folder/dv"}}
+{"cmd": "screenshot", "name": "session-menu-narrow-dark"}
+{"cmd": "key", "keystroke": "escape"}
