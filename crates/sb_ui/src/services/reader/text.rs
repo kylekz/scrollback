@@ -404,12 +404,20 @@ mod tests {
         assert_eq!(newlines.lines(9_999_998..10_000_000), "\n");
 
         /* One line of five megabytes: each segment looks only as far as it can reach. */
-        let start = std::time::Instant::now();
         let long = Text::new("word ".repeat(1_000_000));
         /* Its segments read on from each other, broken every JOINED_BYTES or so. */
         let drawn = long.lines(0..long.line_count());
         assert!(drawn.lines().all(|line| line.len() <= JOINED_BYTES));
         assert_eq!(drawn.replace('\n', "").len(), 5_000_000);
-        assert!(start.elapsed().as_secs_f64() < 2.0, "{:?}", start.elapsed());
+        /* Four times the line, about four times the time. */
+        sb_test_support::growth::assert_linear(
+            "one long line, segmented and drawn",
+            250_000,
+            |words| "word ".repeat(words),
+            |line| {
+                let long = Text::new(line.clone());
+                drop(long.lines(0..long.line_count()));
+            },
+        );
     }
 }

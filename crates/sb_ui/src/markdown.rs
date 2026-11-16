@@ -83,17 +83,24 @@ impl Sanitized {
      * been made to wait.
      */
     pub fn measured(text: &str) -> Option<Self> {
-        let sanitized = sanitize(&crate::hostile::bidi(text));
-        let limit = view_parse_limit(sanitized.len());
-        let parse = || {
+        Self::gated(text, |sanitized| {
             let start = Instant::now();
             let parsed =
-                gpui_base::text::editor_host::parse_markdown(&sanitized, Default::default());
+                gpui_base::text::editor_host::parse_markdown(sanitized, Default::default());
             drop(parsed.ok()?);
             Some(start.elapsed())
-        };
-        let took = match parse()? {
-            took if took > limit && took < limit * 4 => took.min(parse()?),
+        })
+    }
+
+    /**
+     * [`Sanitized::measured`]'s gate, with `parse` for the timed parse of the sanitised text:
+     * how long it took, or `None` when it failed. The tests hand it the times to decide on.
+     */
+    fn gated(text: &str, mut parse: impl FnMut(&str) -> Option<Duration>) -> Option<Self> {
+        let sanitized = sanitize(&crate::hostile::bidi(text));
+        let limit = view_parse_limit(sanitized.len());
+        let took = match parse(&sanitized)? {
+            took if took > limit && took < limit * 4 => took.min(parse(&sanitized)?),
             took => took,
         };
         (took <= limit).then(|| Self(sanitized.into()))
@@ -297,6 +304,52 @@ mod tests {
     use super::*;
     use crate::services::reader::Code;
     use crate::theme::{Appearance, Material};
+
+    /**
+     * [`Sanitized::measured`]'s gate, on the times it is handed in place of the clock's: a body
+     * the view parsed within its limit is Markdown and any other plain; one a little past it is
+     * timed again and the shorter time decides, one far past it is not; the limit grows with the
+     * body. How long the view takes on each body the reader makes is measured, in a release
+     * build, by `every_piece_the_view_is_handed_is_one_it_parses_quickly`.
+     */
+    #[test]
+    fn a_body_is_markdown_only_when_the_view_parsed_it_within_its_limit() {
+        /* What the gate kept, given `times` in turn, and how many it asked for. */
+        let gate = |text: &str, times: &[Option<Duration>]| {
+            let sanitized = sanitize(&crate::hostile::bidi(text));
+            let mut asked = 0;
+            let kept = Sanitized::gated(text, |parsed| {
+                assert_eq!(parsed, sanitized);
+                asked += 1;
+                times[asked - 1]
+            });
+            (kept.map(|it| it.as_str().to_string()), asked)
+        };
+        let text = "A *short* body.";
+        let markdown = Some(sanitize(text));
+        let limit = VIEW_PARSE_LIMIT;
+        let over = limit + Duration::from_micros(1);
+        assert_eq!(gate(text, &[Some(limit / 2)]), (markdown.clone(), 1));
+        assert_eq!(gate(text, &[Some(limit)]), (markdown.clone(), 1));
+        /* A little past it, as when the thread was made to wait: timed again. */
+        assert_eq!(
+            gate(text, &[Some(over), Some(limit)]),
+            (markdown.clone(), 2)
+        );
+        assert_eq!(gate(text, &[Some(limit * 3), Some(over)]), (None, 2));
+        /* Far past it: plain, without another try. */
+        assert_eq!(gate(text, &[Some(limit * 4)]), (None, 1));
+        /* A parse that fails is plain. */
+        assert_eq!(gate(text, &[None]), (None, 1));
+        assert_eq!(gate(text, &[Some(over), None]), (None, 2));
+        /* Three units begun: three times the limit. */
+        let long = "word ".repeat(2 * VIEW_PARSE_UNIT / 5 + 100);
+        let long_limit = view_parse_limit(sanitize(&long).len());
+        assert_eq!(long_limit, limit * 3);
+        assert!(gate(&long, &[Some(long_limit)]).0.is_some());
+        let past = long_limit + Duration::from_micros(1);
+        assert_eq!(gate(&long, &[Some(past), Some(past)]).0, None);
+    }
 
     /// A view of one body, as the reader's (`markdown::view`) or as any other `TextView`.
     struct Body {

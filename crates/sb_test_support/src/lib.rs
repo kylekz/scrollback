@@ -13,11 +13,14 @@
 //! - [`markdown`]: generated Markdown, a corpus of every construct a reply can hold.
 //! - [`reader`]: sessions for the reader, every construct it draws in one, and one large
 //!   enough to measure its budgets against.
+//! - [`growth`]: how a cost grows with its input, for the tests that hostile input costs no
+//!   more than its bytes.
 //!
 //! gpui: **never** (`script/check` step 3).
 
 mod claude_code;
 mod db_agent;
+pub mod growth;
 pub mod markdown;
 pub mod reader;
 

@@ -619,15 +619,24 @@ mod tests {
             .find(|(name, _)| name == "comment /*")
             .expect("the slowest code");
         grammar("swift");
-        let asked = std::sync::atomic::AtomicUsize::new(0);
-        let start = Instant::now();
-        let wanted = || asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8;
-        assert_eq!(highlight_while("swift", &code, &wanted), None);
-        assert!(
-            start.elapsed() < HIGHLIGHT_BUDGET / 2,
-            "{:?}",
+        let given_up = || {
+            let asked = std::sync::atomic::AtomicUsize::new(0);
+            let wanted = || asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8;
+            let start = Instant::now();
+            assert_eq!(highlight_while("swift", &code, &wanted), None);
             start.elapsed()
-        );
+        };
+        /* The least of up to three tries: a test may be made to wait by the others beside it. */
+        let bound = HIGHLIGHT_BUDGET / 2;
+        let mut took = given_up();
+        for _ in 1..3 {
+            if took < bound {
+                break;
+            }
+            took = took.min(given_up());
+        }
+        eprintln!("given up in {took:?}");
+        assert!(took < bound, "{took:?}");
     }
 
     #[test]
@@ -974,13 +983,21 @@ mod tests {
                 continue;
             }
             for (name, code) in &inputs {
-                let start = Instant::now();
-                highlight(&language, code);
-                let took = start.elapsed();
-                assert!(
-                    took <= HIGHLIGHT_BUDGET + slack,
-                    "{language} on {name} took {took:?}"
-                );
+                let bound = HIGHLIGHT_BUDGET + slack;
+                let time = || {
+                    let start = Instant::now();
+                    highlight(&language, code);
+                    start.elapsed()
+                };
+                /* The least of up to three tries, as a test may be made to wait. */
+                let mut took = time();
+                for _ in 1..3 {
+                    if took <= bound {
+                        break;
+                    }
+                    took = took.min(time());
+                }
+                assert!(took <= bound, "{language} on {name} took {took:?}");
                 if took > worst.0 {
                     worst = (took, format!("{language} on {name}"));
                 }

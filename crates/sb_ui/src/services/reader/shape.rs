@@ -500,9 +500,8 @@ pub fn results(text: &str) -> Vec<WebResult> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use pretty_assertions::assert_eq;
+    use sb_test_support::growth::assert_linear;
 
     use super::*;
 
@@ -570,24 +569,41 @@ mod tests {
         assert_eq!(results("[{not json"), []);
     }
 
+    /// Hostile output costs about its bytes: four times the input, about four times the time.
     #[test]
-    fn hostile_output_is_shaped_in_bounded_time() {
-        let started = Instant::now();
+    fn hostile_output_is_shaped_in_linear_time() {
         /* A pattern that matches everywhere, on a megabyte of one line. */
         let line = "a".repeat(1024 * 1024);
         assert_eq!(found(&line, "").len(), 0);
         assert_eq!(found(&line, "a").len(), MARKS);
+        for pattern in ["", "a"] {
+            assert_linear(
+                &format!("{pattern:?} on one line"),
+                256 * 1024,
+                |size| "a".repeat(size),
+                |line| drop(found(line, pattern)),
+            );
+        }
         /* A pattern that would be exponential for a backtracking engine. */
-        found(&"a".repeat(100_000), "(a*)*b");
+        assert_linear(
+            "(a*)*b",
+            25_000,
+            |size| "a".repeat(size),
+            |line| drop(found(line, "(a*)*b")),
+        );
         /* Numbered lines by the hundred thousand, of a language highlighted. */
-        let lines: String = (1..100_000).map(|n| format!("{n:>6}\tx = {n}\n")).collect();
-        numbered(&lines, Some('\t'), Some("py"), &|| true);
+        assert_linear(
+            "numbered lines",
+            25_000,
+            |lines| (1..lines).map(|n| format!("{n:>6}\tx = {n}\n")).collect(),
+            |lines: &String| drop(numbered(lines, Some('\t'), Some("py"), &|| true)),
+        );
         /* Brackets and quotes that open lists everywhere. */
-        results(&"[{\"title\":".repeat(100_000));
-        assert!(
-            started.elapsed().as_secs_f64() < 10.0,
-            "{:?}",
-            started.elapsed()
+        assert_linear(
+            "lists opened everywhere",
+            25_000,
+            |size| "[{\"title\":".repeat(size),
+            |text| drop(results(text)),
         );
     }
 }

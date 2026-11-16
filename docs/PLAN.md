@@ -491,6 +491,7 @@ Nothing else changes: no migration, and no change to the archive, sync, filing, 
 - **No agent's name outside its provider:** `script/check` fails if `claude` appears in `sb_core` outside `provider/claude_code`, or anywhere in `sb_ui` outside the provider's display name and mark.
 - **Filing:** table tests of path normalisation and longest-prefix matching, including the WSL mount mapping and Windows case.
 - **Parser:** golden tests from fixture transcripts; a record of an unknown type and a tool of an unknown name must survive.
+- **Costs by their growth, not by the clock.** A test that hostile input costs no more than its bytes times the work on two sizes of it and bounds the ratio (`sb_test_support::growth`), so it says the same on a slow or busy CI runner. A latency budget (the view's parse limit, a first paint) is a measurement: `#[ignore]`d, run by hand on a release build; the code that enforces one is tested on times handed to it. A wall-clock bound in the default run is a guard against a hang, or many times what the work takes, with the least of a few tries kept.
 - **GUI scenarios** with `gpui_automation_runner`: first run → add a local location → sync → a session appears in Unsorted → create a folder from its path → open the session → expand a tool call.
 - **The owner's live checks,** not automated: a real WSL distro on the PC; SSH from the PC to the Mac; a first sync of the real archive, timed.
 

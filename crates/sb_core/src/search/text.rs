@@ -201,15 +201,20 @@ mod tests {
         assert_eq!(find_all("aaaa", "aa", 10), [0..2, 2..4]);
         assert_eq!(find_all("anything", "", 10), []);
         /* A term that matches every character, in a long text: the first `most`, at once. */
-        let started = std::time::Instant::now();
         let long = "é".repeat(5_000_000);
         assert_eq!(find_all(&long, "e", 10_000).len(), 10_000);
         assert_eq!(find_all(&"a".repeat(10_000_000), "a", 10_000).len(), 10_000);
-        assert!(
-            started.elapsed().as_secs_f64() < 5.0,
-            "{:?}",
-            started.elapsed()
-        );
+        /* Four times the text, about four times the time, however many it may find. */
+        for (most, said) in [(10_000, "the first 10,000"), (usize::MAX, "all")] {
+            for (text, term) in [("é", "e"), ("a", "a")] {
+                sb_test_support::growth::assert_linear(
+                    &format!("{term} in {text}, {said}"),
+                    250_000,
+                    |count| text.repeat(count),
+                    |text| drop(find_all(text, term, most)),
+                );
+            }
+        }
     }
 
     /**

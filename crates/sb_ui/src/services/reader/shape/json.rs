@@ -137,9 +137,8 @@ pub fn marks(text: &str) -> Vec<(Range<usize>, Mark)> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use pretty_assertions::assert_eq;
+    use sb_test_support::growth::assert_linear;
 
     use super::*;
 
@@ -183,14 +182,13 @@ mod tests {
 
     #[test]
     fn deep_and_large_json_is_shown_as_sent_and_coloured_in_one_pass() {
-        let started = Instant::now();
         /* Nested past serde's bound: shown as it was sent, never parsed to the bottom. */
-        let deep = format!("{}{}", "[".repeat(100_000), "]".repeat(100_000));
-        assert_eq!(pretty(deep.clone()), deep);
-        assert_eq!(one_line(deep.clone()), deep);
-        let objects = format!("{}1{}", "{\"a\":".repeat(50_000), "}".repeat(50_000));
-        assert_eq!(pretty(objects.clone()), objects);
-        assert_eq!(marks(&objects).len(), 50_001);
+        let deep = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        assert_eq!(pretty(deep(100_000)), deep(100_000));
+        assert_eq!(one_line(deep(100_000)), deep(100_000));
+        let objects = |depth: usize| format!("{}1{}", "{\"a\":".repeat(depth), "}".repeat(depth));
+        assert_eq!(pretty(objects(50_000)), objects(50_000));
+        assert_eq!(marks(&objects(50_000)).len(), 50_001);
         /* Past the bound: not parsed at all. */
         let large = format!("[{}0]", "0,".repeat(PRETTY_BYTES));
         assert_eq!(pretty(large.clone()).len(), large.len());
@@ -210,15 +208,20 @@ mod tests {
         }
         assert!(pretty(r#"{"a":[1,2]}"#.to_string()).contains('\n'));
         /* A text of nothing but tokens: the marks stop at their bound. */
-        let numbers = "1,".repeat(1_000_000);
-        assert_eq!(marks(&numbers).len(), MARKS);
-        /* Quotes that never close, and escapes everywhere. */
-        marks(&"\"\\".repeat(1_000_000));
-        marks(&"\"".repeat(2_000_000));
-        assert!(
-            started.elapsed().as_secs_f64() < 5.0,
-            "{:?}",
-            started.elapsed()
-        );
+        let numbers = |count: usize| "1,".repeat(count);
+        assert_eq!(marks(&numbers(1_000_000)).len(), MARKS);
+
+        /* Each is coloured at about its bytes' cost: four times the text, about four times the
+        time. Quotes that never close, and escapes everywhere, too. */
+        let linear = |name: &str, size: usize, make: &dyn Fn(usize) -> String| {
+            assert_linear(name, size, make, |text| drop(marks(text)));
+        };
+        linear("nested lists", 25_000, &deep);
+        linear("nested objects", 12_500, &objects);
+        linear("numbers", 250_000, &numbers);
+        linear("escapes everywhere", 250_000, &|count| "\"\\".repeat(count));
+        linear("quotes that never close", 500_000, &|count| {
+            "\"".repeat(count)
+        });
     }
 }

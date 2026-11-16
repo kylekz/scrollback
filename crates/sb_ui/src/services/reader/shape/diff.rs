@@ -362,6 +362,7 @@ mod tests {
     use std::time::Instant;
 
     use pretty_assertions::assert_eq;
+    use sb_test_support::growth::{HANG, assert_linear};
 
     use super::*;
 
@@ -407,44 +408,70 @@ mod tests {
         assert_eq!(shown(&written), ["None Some(1) +a", "None Some(2) +b"]);
     }
 
+    /// Hostile edits cost about their bytes: four times the edit, about four times the time.
     #[test]
-    fn hostile_edits_are_diffed_in_bounded_time() {
-        let started = Instant::now();
+    fn hostile_edits_are_diffed_in_linear_time() {
+        let linear = |name: &str, size: usize, make: &dyn Fn(usize) -> (String, String)| {
+            assert_linear(name, size, make, |(old, new)| drop(diff(old, new, (1, 1))));
+        };
         /* One line of a megabyte each side: a line diff, and no words. */
-        let old = "x ".repeat(512 * 1024);
-        let new = format!("{old}y");
+        let long_line = |size: usize| {
+            let old = "x ".repeat(size);
+            let new = format!("{old}y");
+            (old, new)
+        };
+        let (old, new) = long_line(512 * 1024);
         let long = diff(&old, &new, (1, 1));
         assert_eq!(long.counts(), (1, 1));
         assert!(long.lines.iter().all(|line| line.words.is_empty()));
+        linear("one long line", 128 * 1024, &long_line);
         /* Past the lines diffed: the old removed and the new added, as they are. */
-        let many = "a\n".repeat(DIFF_LINES + 1);
-        let others = "b\n".repeat(DIFF_LINES + 1);
+        let past = |lines: usize| ("a\n".repeat(lines), "b\n".repeat(lines));
+        let (many, others) = past(DIFF_LINES + 1);
         assert_eq!(
             diff(&many, &others, (1, 1)).counts(),
             (DIFF_LINES + 1, DIFF_LINES + 1)
         );
-        /* As many lines as are diffed, nothing alike, then all alike but one in each. */
-        let lines = |seed: usize| -> String {
-            (0..DIFF_LINES)
-                .map(|n| format!("line {} of {seed}\n", n * 7919 % 1009))
-                .collect()
+        linear("past the lines diffed", DIFF_LINES + 1, &past);
+        /* As many lines as are diffed, nothing alike. */
+        let unlike = |lines: usize| {
+            let text = |seed: usize| -> String {
+                (0..lines)
+                    .map(|n| format!("line {} of {seed}\n", n * 7919 % 1009))
+                    .collect()
+            };
+            (text(1), text(2))
         };
-        diff(&lines(1), &lines(2), (1, 1));
-        let same = "same line\n".repeat(DIFF_LINES);
-        diff(&format!("{same}x"), &format!("y{same}"), (1, 1));
+        linear("nothing alike", DIFF_LINES / 4, &unlike);
+        /* All alike but one in each, the old a line longer: what the line diff is quadratic in
+        (twice the lines, four times the time), so at most as many as are diffed costs what
+        they do, and past them, as many bytes. */
+        let shifted = |lines: usize| {
+            let same = "same line\n".repeat(lines);
+            (format!("{same}x"), format!("y{same}"))
+        };
+        let started = Instant::now();
+        let (old, new) = shifted(DIFF_LINES - 1);
+        assert_eq!(diff(&old, &new, (1, 1)).counts(), (2, 1));
+        assert!(started.elapsed() < HANG, "{:?}", started.elapsed());
+        linear(
+            "all alike but one, past the lines diffed",
+            DIFF_LINES,
+            &shifted,
+        );
         /* Lines paired by the thousand, each of many short words: the budget ends the words. */
-        let words = |c: char| -> String {
-            (0..DIFF_LINES)
-                .map(|n| format!("{}{c}{n}\n", "w ".repeat(40)))
-                .collect()
+        let words = |lines: usize| {
+            let text = |c: char| -> String {
+                (0..lines)
+                    .map(|n| format!("{}{c}{n}\n", "w ".repeat(40)))
+                    .collect()
+            };
+            (text('a'), text('b'))
         };
-        let paired = diff(&words('a'), &words('b'), (1, 1));
+        let (old, new) = words(DIFF_LINES);
+        let paired = diff(&old, &new, (1, 1));
         let marked = |line: &DiffLine| !line.words.is_empty();
         assert!(marked(&paired.lines[0]) && !marked(&paired.lines[DIFF_LINES - 1]));
-        assert!(
-            started.elapsed().as_secs_f64() < 20.0,
-            "{:?}",
-            started.elapsed()
-        );
+        linear("lines of many short words", DIFF_LINES / 4, &words);
     }
 }
