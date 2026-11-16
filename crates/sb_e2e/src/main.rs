@@ -30,6 +30,8 @@
 //!   edge states.
 //! - `"reader-large"`: the same, with a session large enough to measure the reader's budgets
 //!   against (docs/PLAN.md §14).
+//! - `"reader-versions"`: the same, with `E-Versions`' session, whose newest version is held
+//!   back (docs/DESIGN.md §4.3).
 //! - `"locations"`: an archive in the data dir with one location of each kind, the host's
 //!   last good sync twelve days ago, and this machine's agent in the home
 //!   ([`fixture::locations`]): the locations sheet's states (docs/DESIGN.md §4.11).
@@ -77,6 +79,7 @@ enum Library {
     Trash,
     Reader,
     ReaderLarge,
+    ReaderVersions,
     Locations,
     ArchiveRemains,
     Settings,
@@ -174,13 +177,16 @@ impl RunnerApp for Scrollback {
                     },
                 )?;
             }
-            Library::Reader | Library::ReaderLarge => {
+            Library::Reader | Library::ReaderLarge | Library::ReaderVersions => {
                 std::fs::remove_dir_all(&home)?;
                 reader::build(
                     &cx.data_dir.join("archive"),
                     &cx.out_dir.join("locations"),
-                    matches!(header.fixture, Library::ReaderLarge)
-                        .then_some(sb_test_support::reader::Large::BUDGET),
+                    match header.fixture {
+                        Library::ReaderLarge => reader::Extra::Large,
+                        Library::ReaderVersions => reader::Extra::Versions,
+                        _ => reader::Extra::None,
+                    },
                 )?;
             }
             Library::Locations => fixture::locations(

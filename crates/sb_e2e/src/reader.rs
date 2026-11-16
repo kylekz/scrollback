@@ -10,7 +10,10 @@
 //! - **Ubuntu-24.04**, a WSL distro, with the garden session of `E-Edge-Source-Gone`, synced
 //!   and then deleted at its source, so its main transcript is gone there.
 //!
-//! With `large`, This PC also holds the large session of the reader's budgets (PLAN §14).
+//! With [`Extra::Large`], This PC also holds the large session of the reader's budgets
+//! (PLAN §14); with [`Extra::Versions`], toolbox-rs also holds the session of `E-Versions`,
+//! whose transcript has three versions: the first extended by a second sync, a second that
+//! rewrote it, and a third, shorter, held back (DESIGN §4.3).
 
 use std::path::Path;
 
@@ -22,7 +25,15 @@ use sb_core::location::{LocationId, LocationKind};
 use sb_core::provider::{self, Provider};
 use sb_core::sync::sync_location;
 use sb_test_support::ProjectsTree;
-use sb_test_support::reader::{self, FC, Large, TOOLBOX};
+use sb_test_support::reader::{self, FC, Large, OPUS_55, Script, TOOLBOX};
+
+/// What the reader's library holds besides its sessions (the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Extra {
+    None,
+    Large,
+    Versions,
+}
 
 /// Syncs `tree` into `location`, all of it.
 fn sync(
@@ -46,6 +57,65 @@ fn sync(
             "the reader's library did not sync whole: {report:?}, {index:?}"
         );
     }
+    Ok(())
+}
+
+/**
+ * `E-Versions`' session, synced into `location` three times over (the module docs): extended,
+ * rewritten, then shrunk to its first turn, which is held back.
+ */
+fn versions(
+    archive: &Archive,
+    location: &LocationId,
+    pc: &mut ProjectsTree,
+    providers: &[Box<dyn Provider>],
+) -> Result<()> {
+    let mut session = pc.session(TOOLBOX, 0);
+    {
+        let mut s = Script::new(&mut session.transcript, "2026-11-08", "v");
+        s.at("21:58:00").prompt(
+            "Changed lines in dv highlight the whole line. Add word-level highlighting inside \
+             them, like GitHub does, without slowing down a 10k-line diff.",
+        );
+        s.at("21:58:20").reply(
+            OPUS_55,
+            "The row renderer already gets both sides of a changed pair, so the word diff can \
+             run per pair, lazily, when a row first paints.",
+        );
+    }
+    session.title("Word-level marks in dv's diff");
+    sync(archive, location, pc, providers)?;
+    {
+        let mut s = Script::new(&mut session.transcript, "2026-11-08", "w");
+        s.at("22:10:00").prompt("Cap it for minified lines.");
+        s.at("22:10:30").reply(
+            OPUS_55,
+            "Pairs past 10,000 token products are left unmarked.",
+        );
+    }
+    sync(archive, location, pc, providers)?;
+    let file = pc.path(&session.key);
+    let text = std::fs::read_to_string(&file)?;
+    std::fs::write(
+        &file,
+        text.replacen("Cap it for minified", "Cap it for very long", 1),
+    )?;
+    sync(archive, location, pc, providers)?;
+    let first: String = text
+        .lines()
+        .take(2)
+        .map(|line| format!("{line}\n"))
+        .collect();
+    std::fs::write(&file, first)?;
+    sync(archive, location, pc, providers)?;
+    ensure!(
+        archive
+            .catalogue()
+            .sessions(sb_core::catalogue::Shelf::All)?
+            .iter()
+            .any(|it| it.title.as_deref() == Some("Word-level marks in dv's diff") && it.held_back),
+        "the session of E-Versions is not held back"
+    );
     Ok(())
 }
 
@@ -75,7 +145,7 @@ fn segments_of(archive_dir: &Path, key: &str) -> Result<Vec<std::path::PathBuf>>
 
 /// Builds the archive in `archive_dir` (the module docs), writing the locations' transcripts
 /// under `scratch`, which is removed again.
-pub fn build(archive_dir: &Path, scratch: &Path, large: Option<Large>) -> Result<()> {
+pub fn build(archive_dir: &Path, scratch: &Path, extra: Extra) -> Result<()> {
     let providers = provider::builtin();
     let archive = Archive::create(archive_dir)?;
     let catalogue = archive.catalogue();
@@ -89,8 +159,8 @@ pub fn build(archive_dir: &Path, scratch: &Path, large: Option<Large>) -> Result
     reader::audit(&mut pc);
     let mut damaged = pc.session(FC, 40);
     damaged.title("A session damaged in the archive");
-    if let Some(spec) = large {
-        reader::large(&mut pc, spec);
+    if extra == Extra::Large {
+        reader::large(&mut pc, Large::BUDGET);
     }
     let here = catalogue.add_location(LocationKind::Local, "This PC")?;
     sync(&archive, &here.id, &pc, &providers)?;
@@ -102,6 +172,9 @@ pub fn build(archive_dir: &Path, scratch: &Path, large: Option<Large>) -> Result
         .pop()
         .context("the damaged session has segments")?;
     std::fs::write(&last, b"not the segment that was archived")?;
+    if extra == Extra::Versions {
+        versions(&archive, &here.id, &mut pc, &providers)?;
+    }
 
     let mut wsl = ProjectsTree::in_home(&scratch.join("wsl"));
     let garden = reader::garden(&mut wsl);
@@ -122,4 +195,48 @@ pub fn build(archive_dir: &Path, scratch: &Path, large: Option<Large>) -> Result
     drop(archive);
     std::fs::remove_dir_all(scratch)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use sb_core::catalogue::Shelf;
+    use sb_core::provider::{ItemKind, SessionItems as _};
+
+    use super::*;
+
+    #[test]
+    fn the_versions_session_has_three_versions_the_newest_held_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_dir = dir.path().join("archive");
+        build(&archive_dir, &dir.path().join("locations"), Extra::Versions).unwrap();
+        let archive = Archive::open(&archive_dir).unwrap();
+        let session = archive
+            .catalogue()
+            .sessions(Shelf::All)
+            .unwrap()
+            .into_iter()
+            .find(|it| it.title.as_deref() == Some("Word-level marks in dv's diff"))
+            .unwrap();
+        let key = archive
+            .session(&session.id)
+            .unwrap()
+            .list()
+            .iter()
+            .find(|item| item.kind == ItemKind::Transcript)
+            .unwrap()
+            .key
+            .clone();
+        let history = archive
+            .catalogue()
+            .history(&session.id, &key)
+            .unwrap()
+            .unwrap();
+        let numbers: Vec<(u32, usize, bool)> = history
+            .versions
+            .iter()
+            .map(|(version, extended)| (version.number, *extended, version.held_back.is_some()))
+            .collect();
+        assert_eq!(numbers, [(1, 1, false), (2, 0, false), (3, 0, true)]);
+        assert_eq!(history.reading, history.versions[1].0.id);
+    }
 }

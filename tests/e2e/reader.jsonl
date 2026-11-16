@@ -192,10 +192,10 @@
 {"cmd": "screenshot", "name": "full-calls-1440-light"}
 {"cmd": "key", "keystroke": "e"}
 
-// 1280x800: the column keeps its 720.
+// 1280x800: the facts margin still shows (DESIGN §2), and the column gives way to it.
 {"cmd": "resize", "w": 1280, "h": 800, "expect": {"pointer": "/shell/sidebar", "equals": "docked"}}
 {"cmd": "settle"}
-{"cmd": "bounds", "target": "reader/reply/main/2", "expect_result": {"pointer": "/w", "equals": 732}}
+{"cmd": "bounds", "target": "reader/reply/main/2", "expect_result": [{"pointer": "/w", "gte": 700}, {"pointer": "/w", "lte": 732}]}
 {"cmd": "screenshot", "name": "reader-top-1280-light"}
 {"cmd": "pin_appearance", "appearance": "dark"}
 {"cmd": "settle"}
