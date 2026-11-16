@@ -7,7 +7,9 @@
 //! A scripted run never reaches a real WSL distro or SSH host, nor runs `wsl.exe` or `ssh`
 //! ([`stand_ins`]): a distro or a host that answers is read from the folder
 //! `--automation-wsl-home` names (and can't be reached without one), a host the scenario has
-//! not named is unreachable, and WSL is not there until a scenario lists distros.
+//! not named is unreachable, and WSL is not there until a scenario lists distros. Should
+//! anything still try to start a launcher, it is refused and logged as an error
+//! (`sb_core::transport::refuse_launchers`), and the e2e runner fails the scenario.
 //!
 //! `state`:
 //! - `app`: `"scrollback"`.
@@ -1016,12 +1018,14 @@ fn answer<'a>(kind: &'a LocationKind, home: Option<&str>) -> Option<(&'a str, An
  * passes is read from the folder `--automation-wsl-home` names ([`StandInHome`]); without one
  * it can't be reached, so a distro or a host is never read as this machine. Any other place
  * fails every call as the scenario said ([`Answer`]). The connection test answers the same
- * way, and WSL's distros are the scenario's.
+ * way, and WSL's distros are the scenario's. Every launcher is refused from then on, so a
+ * path that bypasses the stand-ins starts nothing either.
  */
 pub fn stand_ins(cli: &Cli) -> Option<Reach> {
     if !cli.automation_enabled() {
         return None;
     }
+    sb_core::transport::refuse_launchers();
     let home = cli
         .automation_wsl_home
         .as_ref()
@@ -1250,6 +1254,7 @@ mod tests {
     }
 
     use sb_core::CancelToken;
+    use sb_core::transport::LAUNCH_REFUSED;
 
     fn cli(args: &[&str]) -> Cli {
         use clap::Parser as _;
@@ -1292,6 +1297,31 @@ mod tests {
             (named.connect)(&host, &cancel).env(&[]),
             Err(TransportError::Unreachable(_))
         ));
+    }
+
+    #[test]
+    fn a_run_with_the_driver_starts_no_launcher_even_past_its_stand_ins() {
+        let reach = stand_ins(&cli(&["--automation"])).unwrap();
+        let cancel = CancelToken::new();
+        let host = LocationKind::Ssh {
+            host: "user@macbook.invalid".to_string(),
+        };
+        let distro = LocationKind::Wsl {
+            distro: "Ubuntu-24.04".to_string(),
+        };
+        let refused = |result: Result<Env, TransportError>| match result {
+            Err(TransportError::Failed(said)) => said.starts_with(LAUNCH_REFUSED),
+            _ => false,
+        };
+        for kind in [&host, &distro] {
+            /* The stand-ins answer without a launcher… */
+            assert!(!refused((reach.connect)(kind, &cancel).env(&[])));
+            let launcher = (reach.launcher)(kind).unwrap();
+            assert!((reach.tester)(&launcher, &cancel).is_err());
+            /* …and the real transport, reached past them, is refused before it starts. */
+            assert!(refused(kind.transport(&cancel).env(&[])), "{kind:?}");
+        }
+        assert_eq!((reach.distros)(&cancel).unwrap(), None);
     }
 
     #[test]

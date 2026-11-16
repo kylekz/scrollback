@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use toolbox_process::{CancelToken, Event, Handle, ProcessError, Stop, spawn_streaming};
 
 use super::Launcher;
+use crate::transport::launching::may_start;
 use crate::transport::{Halt, TransportError};
 
 /// How often a read that is waiting for the process looks at the cancel token and the clock.
@@ -175,6 +176,7 @@ impl<'a> Reply<'a> {
             return Err(TransportError::Cancelled);
         }
         launcher.check()?;
+        may_start(&launcher.command_line())?;
         let (tx, events) = sync_channel(QUEUE);
         let process = spawn_streaming(&launcher.command(), move |event| {
             let _ = tx.send(event);

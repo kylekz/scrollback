@@ -14,6 +14,7 @@
 //! or a host over SSH by running POSIX `sh` scripts there (PLAN §6.2); [`wsl`] lists the
 //! distros there are.
 
+mod launching;
 mod local;
 mod shell;
 pub mod wsl;
@@ -25,6 +26,7 @@ use thiserror::Error;
 
 use crate::hash::Hash;
 
+pub use launching::{LAUNCH_REFUSED, refuse_launchers};
 pub use local::LocalTransport;
 pub use shell::{Launcher, Probe, ShellTransport, quoted};
 

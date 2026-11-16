@@ -47,6 +47,11 @@
 //!   archive-unavailable page (docs/DESIGN.md §4.14).
 //! - `"settings-unreadable"`: a settings file that isn't JSON, naming an archive
 //!   ([`fixture::settings_unreadable`]): nothing is opened or made until the owner chooses.
+//!
+//! **No scenario starts `ssh` or `wsl.exe`.** The app reaches every distro and host through its
+//! stand-ins and refuses any launcher under automation, logging the attempt as an error; a
+//! scenario whose app logged one fails ([`Home::finish`]). On Unix, a tripwire for each comes
+//! first on the app's `PATH` as well and notes being started, which fails the scenario too.
 
 mod boards;
 mod extras;
@@ -54,11 +59,12 @@ mod fixture;
 mod reader;
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use gpui_automation_runner::{Fixture, FixtureCx, NoAction, Profile, RunnerApp};
+use sb_core::transport::LAUNCH_REFUSED;
 use sb_test_support::ProjectsTree;
 use serde::Deserialize;
 use serde_json::Value;
@@ -96,10 +102,51 @@ struct Header {
 }
 
 /// What every launch of a scenario's app is started with: the environment that points this
-/// machine at the scenario's home, and that home as the stand-in for a WSL distro.
+/// machine at the scenario's home, and that home as the stand-in for a WSL distro. `out_dir`
+/// is where its logs and the tripwires' note are looked through once it is done.
 struct Home {
     env: Vec<(OsString, Option<OsString>)>,
     home: PathBuf,
+    out_dir: PathBuf,
+}
+
+/// The launchers no scenario may start.
+#[cfg(unix)]
+const LAUNCHERS: [&str; 2] = ["ssh", "wsl.exe"];
+
+/// Where a tripwire notes that it was started, in the scenario's output folder.
+const TRIPPED: &str = "launchers-started.log";
+
+/**
+ * Lays a tripwire for each of [`LAUNCHERS`] in `out_dir` and gives the `PATH` that finds them
+ * first. Each notes what it was started with in [`TRIPPED`] and fails as an unreachable `ssh`
+ * would. Unix only: Windows finds `wsl.exe` in its system folder before any on `PATH`.
+ */
+#[cfg(unix)]
+fn tripwires(out_dir: &Path) -> Result<Vec<(OsString, Option<OsString>)>> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let bin = out_dir.join("tripwires");
+    std::fs::create_dir_all(&bin)?;
+    for launcher in LAUNCHERS {
+        let tripwire = bin.join(launcher);
+        std::fs::write(
+            &tripwire,
+            format!(
+                "#!/bin/sh\necho \"{launcher} $*\" >> '{}'\nexit 255\n",
+                out_dir.join(TRIPPED).display()
+            ),
+        )?;
+        std::fs::set_permissions(&tripwire, std::fs::Permissions::from_mode(0o755))?;
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path)))?;
+    Ok(vec![("PATH".into(), Some(path))])
+}
+
+#[cfg(not(unix))]
+fn tripwires(_: &Path) -> Result<Vec<(OsString, Option<OsString>)>> {
+    Ok(Vec::new())
 }
 
 /// The year the fixtures' newest sessions are dated in. The app writes its dates as seen
@@ -122,6 +169,28 @@ impl Fixture<NoAction> for Home {
 
     fn run(&mut self, action: &NoAction) -> Result<Value> {
         match *action {}
+    }
+
+    /// Fails the scenario when its app tried to start a launcher, or started one.
+    fn finish(&mut self) -> Result<()> {
+        if let Ok(started) = std::fs::read_to_string(self.out_dir.join(TRIPPED)) {
+            bail!("the app started a launcher:\n{started}");
+        }
+        for entry in std::fs::read_dir(&self.out_dir)? {
+            let path = entry?.path();
+            let is_log = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("app.") && name.ends_with(".stderr.log"));
+            if !is_log {
+                continue;
+            }
+            let log = std::fs::read_to_string(&path)?;
+            if let Some(refused) = log.lines().find(|line| line.contains(LAUNCH_REFUSED)) {
+                bail!("the app tried to start a launcher: {refused}");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -157,6 +226,7 @@ impl RunnerApp for Scrollback {
             .vars()
             .iter()
             .map(|(name, value)| (name.into(), Some(value.into())))
+            .chain(tripwires(cx.out_dir)?)
             .collect();
         match header.fixture {
             Library::Agent => fixture::agent(&mut tree),
@@ -212,7 +282,11 @@ impl RunnerApp for Scrollback {
                 fixture::settings_unreadable(cx.data_dir, &cx.out_dir.join("drive"))?;
             }
         }
-        Ok(Box::new(Home { env, home }))
+        Ok(Box::new(Home {
+            env,
+            home,
+            out_dir: cx.out_dir.to_path_buf(),
+        }))
     }
 }
 

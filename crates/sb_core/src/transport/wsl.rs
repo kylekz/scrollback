@@ -10,6 +10,7 @@ use std::time::Duration;
 use toolbox_process::{CancelToken, Command, ProcessError, run};
 
 use super::TransportError;
+use super::launching::may_start;
 
 /// The program every WSL command runs through.
 pub(super) const WSL_EXE: &str = "wsl.exe";
@@ -52,6 +53,7 @@ pub fn distros(cancel: &CancelToken) -> Result<Option<Vec<Distro>>, TransportErr
     if !cfg!(windows) {
         return Ok(None);
     }
+    may_start(&format!("{WSL_EXE} --list --verbose"))?;
     let listing = Command::new(WSL_EXE)
         .args(["--list", "--verbose"])
         .env(UTF8, "1");
