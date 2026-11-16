@@ -17,19 +17,21 @@
 //! **Find in session** is filled with the request's `find` once there ([`super::find`]), the
 //! match where it flashes being current, without going to the first.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{App, Context, Entity, ListOffset, Task, px};
+use gpui::{App, Context, Entity, EntityId, ListOffset, Task, px};
 use gpui_base::text::{RangeHighlight, TextViewState};
 use sb_core::search::first_match;
-use sb_core::transcript::{At, BlockId, searchable};
+use sb_core::transcript::{At, searchable};
 
 use super::rows::{MAX_DEPTH, Row};
 use super::{Piece, ReaderView};
-use crate::services::reader::{BlockRef, Load, OpenSession, ReaderService, Toggle};
+use crate::services::reader::{
+    BlockRef, Load, OpenSession, Piece as ProsePiece, ReaderService, Toggle,
+};
 use crate::services::{ActiveServices as _, ReadAt};
 use crate::theme::ActiveTheme as _;
 
@@ -45,8 +47,13 @@ const FLASH_TICK: Duration = Duration::from_millis(50);
 pub(super) struct Flash {
     pub(super) at: BlockRef,
     pub(super) text: String,
-    /// The piece of prose it is lit in, once it is.
-    lit: Option<Piece>,
+    /// The piece of prose it is lit in, once it is, and the Markdown state it was lit on: one
+    /// made again (let go of and drawn again) is lit again.
+    lit: Option<(Piece, EntityId)>,
+    /// The pieces of its block's prose drawn without it, and whether the activity row drawn for
+    /// the block lacks it: once all that could hold it don't, it won't light.
+    missed: HashSet<Piece>,
+    missed_row: bool,
     /// Whether it has been drawn: it shows for [`FLASH`] from then.
     drawn: bool,
     _ticks: Task<()>,
@@ -67,10 +74,6 @@ enum Step {
     /// Nowhere in particular: the session stays at its start.
     Start,
 }
-
-/// The subagents from the outermost down to the one a match is in, each with the call of
-/// its own that starts the next.
-type Chain = Vec<(Arc<str>, Option<BlockId>)>;
 
 impl ReaderView {
     /// The last request to open the session at a match the reader took, while that session
@@ -225,7 +228,7 @@ impl ReaderView {
                     } else {
                         waited += FLASH_TICK;
                     }
-                    if shown >= FLASH || waited >= FLASH_WAIT {
+                    if shown >= FLASH || waited >= FLASH_WAIT || this.wont_light(cx) {
                         this.end_flash(cx);
                         return false;
                     }
@@ -242,9 +245,38 @@ impl ReaderView {
             at,
             text,
             lit: None,
+            missed: HashSet::new(),
+            missed_row: false,
             drawn: false,
             _ticks: ticks,
         });
+    }
+
+    /**
+     * Whether the flash, not drawn yet, is clear not to light: the activity row drawn for its
+     * block lacks it, or every piece of its block's prose the Markdown view draws was drawn
+     * without it (a hit in fenced code or plain lines isn't lit).
+     */
+    fn wont_light(&self, cx: &App) -> bool {
+        let Some(flash) = self.flash.as_ref().filter(|flash| !flash.drawn) else {
+            return false;
+        };
+        if flash.missed_row {
+            return true;
+        }
+        let reader = cx.services().reader.read(cx);
+        let Some(Load::Loaded(prose)) = reader.open_session().and_then(|it| it.prose(&flash.at))
+        else {
+            return false;
+        };
+        (prose.pieces.iter().enumerate())
+            .filter(|(_, piece)| matches!(piece, ProsePiece::Markdown(_)))
+            .all(|(index, _)| {
+                flash.missed.contains(&Piece {
+                    at: flash.at.clone(),
+                    piece: index,
+                })
+            })
     }
 
     /// Stops the flash, and takes its highlight off the prose it lit.
@@ -252,7 +284,7 @@ impl ReaderView {
         let Some(flash) = self.flash.take() else {
             return;
         };
-        if let Some((state, _)) = flash.lit.and_then(|piece| self.states.get(&piece)) {
+        if let Some((state, _)) = flash.lit.and_then(|(piece, _)| self.states.get(&piece)) {
             state.update(cx, |state, cx| state.clear_range_highlights(cx));
         }
         /* Find's matches are lit there again. */
@@ -262,8 +294,10 @@ impl ReaderView {
         cx.notify();
     }
 
-    /// Lights the flash in the piece of prose `piece`, drawn with `state`, if it is in that
-    /// piece and isn't lit elsewhere.
+    /**
+     * Lights the flash in the piece of prose `piece`, drawn with `state`, if it is in that
+     * piece's text as drawn and isn't lit in another piece; again on a state made anew.
+     */
     pub(super) fn light_prose(
         &mut self,
         piece: &Piece,
@@ -274,10 +308,15 @@ impl ReaderView {
             return;
         };
         match &flash.lit {
-            Some(lit) => flash.drawn |= lit == piece,
-            None => {
+            Some((lit, on)) if lit == piece && *on == state.entity_id() => flash.drawn = true,
+            Some((lit, _)) if lit != piece => {}
+            _ => {
                 let rendered = state.read(cx).rendered_text();
-                let Some(range) = first_match(rendered.as_str(), &flash.text) else {
+                if rendered.is_empty() {
+                    return;
+                }
+                let Some(range) = shown_match(rendered.as_str(), &flash.text) else {
+                    flash.missed.insert(piece.clone());
                     return;
                 };
                 let accent = cx.sb_theme().colors.accent;
@@ -285,7 +324,7 @@ impl ReaderView {
                     state.set_range_highlights([RangeHighlight::new(range, accent)], cx)
                 });
                 if lit.is_ok() {
-                    flash.lit = Some(piece.clone());
+                    flash.lit = Some((piece.clone(), state.entity_id()));
                     flash.drawn = true;
                 }
             }
@@ -296,10 +335,30 @@ impl ReaderView {
     /// row's command or path), if it is there.
     pub(super) fn flash_in(&mut self, at: &BlockRef, text: &str) -> Option<Range<usize>> {
         let flash = self.flash.as_mut().filter(|flash| flash.at == *at)?;
-        let range = first_match(text, &flash.text)?;
+        let Some(range) = shown_match(text, &flash.text) else {
+            flash.missed_row = true;
+            return None;
+        };
         flash.drawn = true;
         Some(range)
     }
+}
+
+/**
+ * Where `term` first is in `shown`, text as a view draws it, as search matches it: the
+ * zero-width spaces the sanitiser puts in tags and addresses are passed over, so a hit across
+ * one is found, and the range covers them.
+ */
+fn shown_match(shown: &str, term: &str) -> Option<Range<usize>> {
+    /* Each byte of the text without them, with where it is in `shown`. */
+    let mut bare = String::with_capacity(shown.len());
+    let mut places = Vec::with_capacity(shown.len());
+    for (at, c) in shown.char_indices().filter(|(_, c)| *c != '\u{200B}') {
+        bare.push(c);
+        places.extend(at..at + c.len_utf8());
+    }
+    let found = first_match(&bare, term)?;
+    Some(places[found.start]..places[found.end - 1] + 1)
 }
 
 /// Whether the block `at` holds `text` where search looks, as search matches it.
@@ -355,91 +414,96 @@ fn step(open: &OpenSession, read_at: &ReadAt, full_calls: bool, alone: Option<&A
         conversation: Arc::from(inside.item.as_str()),
         block: inside.block,
     };
+    /* It isn't where the index found it any more: the call, and the first match from there. */
+    let elsewhere = || call.clone().map_or(Step::Start, Step::Arrive);
     if alone == Some(&target.conversation) {
         return Step::Arrive(target);
     }
-    let mut unread = Vec::new();
-    let chain = roots
-        .iter()
-        .find_map(|root| walk(open, root, &inside.item, &mut HashSet::new(), &mut unread));
-    let Some(chain) = chain else {
-        let outer_closed = !open.is_open(&outer, full_calls);
-        return match (unread.is_empty(), call) {
-            /* Read what may hold it, under the call opened. */
-            (false, _) => Step::Open(outer_closed.then_some(outer).into_iter().collect(), unread),
-            /* It isn't under the call any more: the call, and the first match from there. */
-            (true, Some(call)) => Step::Arrive(call),
-            (true, None) => Step::Start,
-        };
+    let chain = match open.placement() {
+        None => return Step::Placement,
+        Some(Load::Loading) => return Step::Wait,
+        Some(Load::Failed(_)) => return elsewhere(),
+        Some(Load::Loaded(placement)) => match chain(&placement.parents, &target.conversation) {
+            Some(chain) if roots.contains(&chain[0]) => chain,
+            _ => return elsewhere(),
+        },
     };
-    if chain.len() > MAX_DEPTH {
-        let starter = chain.len().checked_sub(2).and_then(|parent| {
-            let (item, call) = &chain[parent];
-            call.map(|block| BlockRef {
-                conversation: item.clone(),
-                block,
-            })
-        });
-        return Step::Alone(target.conversation, starter.or(call));
+    /* Only the subagents on the way are read, all at once. */
+    let unread: Vec<Arc<str>> = (chain.iter())
+        .filter(|item| open.subagent(item).is_none())
+        .cloned()
+        .collect();
+    if !unread.is_empty() {
+        let outer = Some(outer).filter(|outer| !open.is_open(outer, full_calls));
+        return Step::Open(outer.into_iter().collect(), unread);
     }
-    let mut toggles = vec![outer];
-    for (item, starts) in &chain {
-        toggles.push(Toggle::AllCalls(item.clone()));
-        if let Some(block) = starts {
-            toggles.push(Toggle::Call(BlockRef {
-                conversation: item.clone(),
-                block: *block,
-            }));
+    let mut reads = Vec::with_capacity(chain.len());
+    for item in &chain {
+        match open.subagent(item) {
+            Some(Load::Loaded(read)) => reads.push(read),
+            Some(Load::Failed(_)) => return elsewhere(),
+            Some(Load::Loading) | None => return Step::Wait,
         }
     }
-    toggles.retain(|toggle| !open.is_open(toggle, full_calls));
-    let read: Vec<Arc<str>> = (chain.iter())
-        .map(|(item, _)| item.clone())
-        .filter(|item| open.subagent(item).is_none())
+    /* The call of each subagent on the way that starts the next. */
+    let mut starters = Vec::with_capacity(chain.len());
+    for (at, read) in reads.iter().enumerate().take(chain.len() - 1) {
+        let next = &chain[at + 1];
+        let starts = read
+            .conversation
+            .calls()
+            .find(|(_, call)| (call.subagents.iter()).any(|subagent| subagent.item() == next));
+        match starts {
+            Some((block, _)) => starters.push(BlockRef {
+                conversation: chain[at].clone(),
+                block,
+            }),
+            None => return elsewhere(),
+        }
+    }
+    if chain.len() > MAX_DEPTH {
+        return Step::Alone(target.conversation, starters.pop().or(call));
+    }
+    let toggles: Vec<Toggle> = std::iter::once(outer)
+        .chain(chain.iter().map(|item| Toggle::AllCalls(item.clone())))
+        .chain(starters.into_iter().map(Toggle::Call))
+        .filter(|toggle| !open.is_open(toggle, full_calls))
         .collect();
-    match (
-        toggles.is_empty() && read.is_empty(),
-        open.subagent(&target.conversation),
-    ) {
-        (false, _) => Step::Open(toggles, read),
-        (true, Some(Load::Loaded(_))) => Step::Arrive(target),
-        (true, Some(Load::Loading)) => Step::Wait,
-        /* It couldn't be read: the call, and the first match from there. */
-        (true, _) => call.map_or(Step::Start, Step::Arrive),
+    if toggles.is_empty() {
+        Step::Arrive(target)
+    } else {
+        Step::Open(toggles, Vec::new())
     }
 }
 
 /**
- * The way from the subagent `item` down to the subagent `target`, through the calls that
- * start each next one; `None` when it isn't under `item`, or not as far as what is read shows,
- * the subagents not read yet on the way added to `unread`.
+ * The subagents from the outermost down to `target`, by which started which: walked up from
+ * `target`, one step at a time, at most as many steps as there are subagents placed.
  */
-fn walk(
-    open: &OpenSession,
-    item: &Arc<str>,
-    target: &str,
-    seen: &mut HashSet<Arc<str>>,
-    unread: &mut Vec<Arc<str>>,
-) -> Option<Chain> {
-    if !seen.insert(item.clone()) {
-        return None;
-    }
-    if **item == *target {
-        return Some(vec![(item.clone(), None)]);
-    }
-    match open.subagent(item) {
-        Some(Load::Loaded(read)) => {
-            for (block, call) in read.conversation.calls() {
-                for subagent in &call.subagents {
-                    if let Some(mut chain) = walk(open, subagent.item(), target, seen, unread) {
-                        chain.insert(0, (item.clone(), Some(block)));
-                        return Some(chain);
-                    }
-                }
-            }
+fn chain(parents: &HashMap<Arc<str>, Arc<str>>, target: &Arc<str>) -> Option<Vec<Arc<str>>> {
+    let mut chain = vec![target.clone()];
+    while let Some(parent) = parents.get(chain.last()?) {
+        if chain.len() > parents.len() {
+            return None;
         }
-        Some(Load::Failed(_)) => {}
-        Some(Load::Loading) | None => unread.push(item.clone()),
+        chain.push(parent.clone());
     }
-    None
+    chain.reverse();
+    Some(chain)
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::shown_match;
+
+    #[test]
+    fn a_hit_across_a_zero_width_space_is_found_and_covers_it() {
+        let shown = "see https:\u{200B}//example.com now";
+        let found = shown_match(shown, "https://example").expect("found");
+        assert_eq!(&shown[found], "https:\u{200B}//example");
+        assert_eq!(shown_match("Café crème", "cafe CREME"), Some(0..12));
+        assert_eq!(shown_match("nothing", "quokka"), None);
+    }
 }

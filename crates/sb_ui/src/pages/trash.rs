@@ -269,7 +269,7 @@ impl TrashView {
         let was_in = match session.filed {
             Filed::ByRule(folder) | Filed::ByHand(folder) => library
                 .folder(folder)
-                .map_or_else(|| "Unsorted".to_string(), |it| hostile::label(&it.name)),
+                .map_or_else(|| "Unsorted".to_string(), |it| it.name.clone()),
             Filed::Unsorted => "Unsorted".to_string(),
         };
         let size = library

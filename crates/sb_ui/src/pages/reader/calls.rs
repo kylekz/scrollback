@@ -214,16 +214,29 @@ fn activity(
     let label = hostile::label(&agents::tool_label(&provider, &call.name, cx));
     /* A search match opened at flashes in the command or path (`super::place`). */
     let aim = hostile::label(&shape::target(&call, root.as_deref()));
-    let aim = match view.flash_in(at, &aim) {
+    /* So does Find's (`super::find`), whose search read the target as the row draws it. */
+    let found: Vec<(std::ops::Range<usize>, HighlightStyle)> = view
+        .finds(&Spot::Target(at.clone()))
+        .into_iter()
+        .filter(|(range, _)| aim.get(range.clone()).is_some())
+        .map(|(range, current)| (range, kinds::found_style(current, &theme)))
+        .collect();
+    let flash = view.flash_in(at, &aim).map(|flash| {
+        (
+            flash,
+            HighlightStyle {
+                background_color: Some(c.accent),
+                color: Some(c.accent_ink),
+                ..HighlightStyle::default()
+            },
+        )
+    });
+    let aim = match flash {
         Some(flash) => gpui::StyledText::new(aim)
-            .with_highlights([(
-                flash,
-                HighlightStyle {
-                    background_color: Some(c.accent),
-                    color: Some(c.accent_ink),
-                    ..HighlightStyle::default()
-                },
-            )])
+            .with_highlights([flash])
+            .into_any_element(),
+        None if !found.is_empty() => gpui::StyledText::new(aim)
+            .with_highlights(found)
             .into_any_element(),
         None => aim.into_any_element(),
     };

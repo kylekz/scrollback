@@ -190,7 +190,7 @@ impl Catalogue {
     ) -> Result<FolderId> {
         let name = named(name)?;
         self.db.write(|tx| {
-            let folder = create(tx, &free_name(tx, name, parent, None)?, parent)?;
+            let folder = create(tx, &free_name(tx, &name, parent, None)?, parent)?;
             for id in sessions {
                 archived(tx, id)?;
                 set_state(tx, id, &[("folder_id", &folder.0), ("by_hand", &true)])?;

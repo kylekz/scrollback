@@ -367,9 +367,10 @@ impl Shell {
                 }
             }
         });
-        /* Its project's path and its model are a transcript's: drawn as a label. */
+        /* Its project's path is a transcript's: drawn as a label, as its model is. */
         let summary = [
-            session.project_path.clone().map(|path| format::path(&path)),
+            (session.project_path.as_deref())
+                .map(|path| crate::hostile::label(&format::path(path))),
             agents::model(&session.id.provider, &session.models, cx),
             session
                 .ended
@@ -379,7 +380,6 @@ impl Shell {
         ]
         .into_iter()
         .flatten()
-        .map(|part| crate::hostile::label(&part))
         .collect::<Vec<_>>()
         .join(" · ");
         let ready = deletion.is_some();

@@ -36,6 +36,7 @@ pub mod query;
 mod tests;
 
 use std::cell::Cell;
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -699,9 +700,10 @@ impl Palette {
 
     /// What `offer`'s menu lists: its values as they read, with the chip each makes.
     fn menu_values(&self, offer: Offer, cx: &App) -> Vec<(String, Chip)> {
+        /* Each value is a label already: a model as `agents` writes it, the others below. */
         let chip = |filter, what: &str, label: &str| {
             (
-                hostile::label(label),
+                label.to_string(),
                 Chip {
                     filter,
                     label: format!("{what}: {label}"),
@@ -714,7 +716,7 @@ impl Palette {
                     chip(
                         Filter::Location(location.id.clone()),
                         "Location",
-                        &location.name,
+                        &hostile::label(&location.name),
                     )
                 })
                 .collect(),
@@ -739,7 +741,13 @@ impl Palette {
                 .collect(),
             Offer::Branch => (self.search.read(cx).values().1.iter())
                 .take(MENU_VALUES)
-                .map(|branch| chip(Filter::Branch(branch.clone()), "Branch", branch))
+                .map(|branch| {
+                    chip(
+                        Filter::Branch(branch.clone()),
+                        "Branch",
+                        &hostile::label(branch),
+                    )
+                })
                 .collect(),
             Offer::Date => {
                 let now = format::now();
@@ -758,10 +766,6 @@ impl Palette {
     }
 }
 
-/**
- * The row the keys start on in `view`: a command whose name is the whole query, else the
- * first session found, else the first row (a command, when there is one).
- */
 /// The row the keys were on, as an answer to the same query finds it again.
 enum Kept {
     Command(usize),
@@ -789,6 +793,10 @@ impl Kept {
     }
 }
 
+/**
+ * The row the keys start on in `view`: a command whose name is the whole query, else the
+ * first session found, else the first row (a command, when there is one).
+ */
 fn start(view: &View) -> usize {
     let exact = (view.commands.iter())
         .position(|command| command.name.eq_ignore_ascii_case(view.asked.find.trim()));
@@ -827,8 +835,8 @@ fn counted(results: &Results) -> String {
 /**
  * A match's text with each hit marked (`hl`: `yellow-soft` under a 1px `yellow` underline),
  * in the code face for a command or a path. It is a transcript's text, drawn as a label
- * ([`hostile::label`]: line breaks read as spaces, controls shown), each part of it on its own
- * so that the hits stay where they are.
+ * ([`hostile::label`]: line breaks read as spaces, controls shown), the hits marked where they
+ * fall in it ([`hostile::label_ranges`]).
  */
 fn marked(found: &Match, theme: &SbTheme) -> StyledText {
     let c = &theme.colors;
@@ -839,20 +847,17 @@ fn marked(found: &Match, theme: &SbTheme) -> StyledText {
         theme.fonts.ui.clone()
     };
     let snippet = &found.snippet.text;
-    let mut text = String::with_capacity(snippet.len());
-    let mut hits = Vec::new();
-    let mut at = 0;
-    for hit in &found.snippet.hits {
-        if hit.start < at || hit.end > snippet.len() {
-            continue;
-        }
-        text.push_str(&hostile::label(&snippet[at..hit.start]));
-        let start = text.len();
-        text.push_str(&hostile::label(&snippet[hit.clone()]));
-        hits.push(start..text.len());
-        at = hit.end;
-    }
-    text.push_str(&hostile::label(&snippet[at..]));
+    let in_order: Vec<Range<usize>> = (found.snippet.hits.iter())
+        .scan(0, |at, hit| {
+            let kept = hit.start >= *at && hit.end <= snippet.len();
+            if kept {
+                *at = hit.end;
+            }
+            Some(kept.then(|| hit.clone()))
+        })
+        .flatten()
+        .collect();
+    let (text, hits) = hostile::label_ranges(snippet, &in_order);
     let run = |len: usize, hit: bool| TextRun {
         len,
         font: font(family.clone()),
@@ -867,7 +872,7 @@ fn marked(found: &Match, theme: &SbTheme) -> StyledText {
     };
     let mut runs = Vec::new();
     let mut at = 0;
-    for hit in hits {
+    for hit in hits.into_iter().filter(|hit| !hit.is_empty()) {
         if hit.start > at {
             runs.push(run(hit.start - at, false));
         }
@@ -958,14 +963,13 @@ impl Palette {
                     .items_center()
                     .gap(theme.spacing.sm)
                     .children(self.chips.iter().enumerate().map(|(at, chip)| {
-                        let label = hostile::label(&chip.label);
                         chip_base(("palette-chip", at), true, theme)
-                            .aria_label(format!("{label}, remove"))
+                            .aria_label(format!("{}, remove", chip.label))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.clicked(window, cx, |this, cx| this.remove_chip(at, cx));
                             }))
                             .children(self.chip_glyph(chip, theme, cx))
-                            .child(label)
+                            .child(chip.label.clone())
                             .child(icon(SbIcon::X, theme.sizes.icon_xs, c.accent_text))
                             .automation_target_with(move || format!("palette/chip/{at}").into())
                             .into_any_element()
@@ -995,7 +999,7 @@ impl Palette {
                         } else {
                             this.child(kbd(keymap::label("tab"), theme)).children(
                                 view.completions.iter().enumerate().map(|(at, completion)| {
-                                    let label = hostile::label(&completion.label());
+                                    let label = completion.label();
                                     let completion = completion.clone();
                                     chip_base(("palette-completion", at), false, theme)
                                         .when(at == 0, |this| this.border_color(c.accent))
@@ -1064,7 +1068,7 @@ impl Palette {
                 SbIcon::Folder,
                 library
                     .folder(folder)
-                    .map_or_else(String::new, |it| hostile::label(&it.name)),
+                    .map_or_else(String::new, |it| it.name.clone()),
             ),
             Filed::Unsorted => (SbIcon::Inbox, "Unsorted".to_string()),
         };

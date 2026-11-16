@@ -12,7 +12,7 @@ use gpui::{
 };
 use sb_core::transcript::Content;
 
-use super::rows::{CHUNK_LINES, Ended, FIRST_LINES, PanelPart, ProsePart, Row, RowKind};
+use super::rows::{Ended, FIRST_LINES, PanelPart, ProsePart, Row, RowKind};
 use super::{Piece, ReaderView, message_text};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
@@ -520,7 +520,19 @@ fn prose(
                             reader.read(cx).full_calls(),
                         )
                     });
-                let lines = expand_tabs(&text_rows(text, *chunk, all)).into_owned();
+                /* A thought's is the text Find searched (`super::find`); a reply's piece is
+                only a part of what it searched. */
+                let finds = if thinking {
+                    view.finds(&crate::services::reader::find::Spot::Prose(at.clone()))
+                } else {
+                    Vec::new()
+                };
+                let lines = super::kinds::styled(
+                    text,
+                    super::kinds::chunk(*chunk, all, FIRST_LINES, text.line_count()),
+                    &finds,
+                    theme,
+                );
                 let spec = if thinking {
                     &theme.text.thought_open
                 } else {
@@ -649,17 +661,6 @@ fn code_view(
                 .child(gpui::StyledText::new(code).with_highlights(runs)),
         )
         .into_any_element()
-}
-
-/// The lines of the `chunk`th row of `text`: its first [`FIRST_LINES`] until all are shown,
-/// then [`CHUNK_LINES`] a row.
-pub fn text_rows(text: &Text, chunk: usize, all: bool) -> String {
-    let count = text.line_count();
-    if all {
-        text.lines(chunk * CHUNK_LINES..((chunk + 1) * CHUNK_LINES).min(count))
-    } else {
-        text.lines(0..FIRST_LINES.min(count))
-    }
 }
 
 /// Under lines that have more than their first: how many more (in bytes when `text` is only

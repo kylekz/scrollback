@@ -432,6 +432,86 @@ pub fn with_subagents(
     }
 }
 
+/// What [`nested_subagents`] wrote: the keys of the session's items.
+pub struct NestedSubagents {
+    /// The session's own transcript.
+    pub key: String,
+    /// The subagents from the one the session's call started down to the innermost, each
+    /// started by the one before.
+    pub chain: Vec<String>,
+    /// The subagents the outermost started besides the next of the chain.
+    pub siblings: Vec<String>,
+}
+
+/**
+ * A session in `project` called `title` whose call starts a chain of `depth` subagents, each
+ * started by the one before; the outermost also starts `siblings` subagents of its own, before
+ * the next of the chain. The innermost answers "The needle is a quillwort.", each sibling
+ * "Leaf n.".
+ */
+pub fn nested_subagents(
+    tree: &mut ProjectsTree,
+    project: &str,
+    title: &str,
+    depth: usize,
+    siblings: usize,
+) -> NestedSubagents {
+    let mut session = tree.session(project, 0);
+    let ask = |description: &str| json!({ "subagent_type": "expert", "description": description, "prompt": "Go." });
+    let meta = |call: &Call| {
+        Some(json!({ "agentType": "expert", "description": "Go", "toolUseId": call.id }))
+    };
+    let started = |records: &Records| json!({ "agentId": records.agent, "status": "completed" });
+    session.transcript.prompt("Go down the chain.");
+    let mut call = session.transcript.call("Agent", ask("Level 1"));
+    let mut chain: Vec<(String, Records, Call)> = Vec::new();
+    let mut leaves = Vec::new();
+    for level in 1..=depth {
+        let (key, mut records) = session.subagent_transcript("", meta(&call));
+        records.prompt(&format!("Level {level}."));
+        if level == 1 {
+            for leaf in 0..siblings {
+                let asked = records.call("Agent", ask(&format!("Leaf {leaf}")));
+                let (key, mut sibling) = session.subagent_transcript("", meta(&asked));
+                sibling.prompt("Look.");
+                sibling.reply(&format!("Leaf {leaf}."));
+                records.result_with(&asked, json!("Looked."), false, started(&sibling));
+                leaves.push(key);
+            }
+        }
+        if level == depth {
+            records.reply("The needle is a quillwort.");
+        } else {
+            let next = records.call("Agent", ask(&format!("Level {}", level + 1)));
+            chain.push((key, records, call));
+            call = next;
+            continue;
+        }
+        chain.push((key, records, call.clone()));
+    }
+    /* Each call's result names the subagent it started, from the innermost out. */
+    for at in (1..chain.len()).rev() {
+        let inner = started(&chain[at].1);
+        let starting = chain[at].2.clone();
+        chain[at - 1]
+            .1
+            .result_with(&starting, json!("Done."), false, inner);
+    }
+    if let Some((_, outermost, first)) = chain.first() {
+        let outer = started(outermost);
+        session
+            .transcript
+            .result_with(first, json!("Done."), false, outer);
+    }
+    session.transcript.reply("The chain is done.");
+    session.title(title);
+    NestedSubagents {
+        key: session.key,
+        chain: chain.into_iter().map(|(key, ..)| key).collect(),
+        siblings: leaves,
+    }
+}
+
 /// A tool call written to a transcript.
 #[derive(Clone, Debug)]
 pub struct Call {

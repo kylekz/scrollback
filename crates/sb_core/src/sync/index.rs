@@ -247,10 +247,12 @@ fn searchable(
             });
         }
     }
-    report.searchable += record(archive, &batch)?;
-    progress(&Progress::Searchable {
-        sessions: report.searchable,
-    });
+    if !batch.is_empty() {
+        report.searchable += record(archive, &batch)?;
+        progress(&Progress::Searchable {
+            sessions: report.searchable,
+        });
+    }
     Ok(())
 }
 

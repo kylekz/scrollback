@@ -6,10 +6,13 @@ use std::time::Duration;
 
 use gpui::{Entity, TestAppContext, VisualTestContext};
 use pretty_assertions::assert_eq;
-use sb_test_support::{WithSubagents, with_subagents};
+use sb_core::catalogue::SessionId;
+use sb_core::transcript::{At, BlockId};
+use sb_test_support::{NestedSubagents, WithSubagents, nested_subagents, with_subagents};
 
 use super::ReaderSnapshot;
 use crate::services::ActiveServices as _;
+use crate::services::reader::Load;
 use crate::shell::Shell;
 use crate::test_support::{open_shell, write_with};
 
@@ -131,8 +134,9 @@ fn a_match_in_a_nested_subagent_opens_each_subagent_on_the_way(cx: &mut TestAppC
         ))
     );
 
-    /* The outer subagent's own text opens it alone. */
+    /* The outer subagent's own text: its panel, open under the session's call. */
     let reader = open_at("frobnicator", &shell, cx);
+    assert!(!reader.alone);
     let place = reader.read_at.clone().and_then(|it| it.subagent);
     assert_eq!(place.map(|it| it.item), Some(made.subagent.clone()));
     assert_eq!(
@@ -177,4 +181,142 @@ fn the_same_match_opened_again_moves_the_reader_again(cx: &mut TestAppContext) {
         first.read_at.map(|it| it.request + 1)
     );
     assert_eq!(flashed(&again).map(|it| it.2), Some(true));
+}
+
+/// The library of [`open_shell`] with the session of [`nested_subagents`] synced into it.
+fn open_nested(
+    depth: usize,
+    siblings: usize,
+    cx: &mut TestAppContext,
+) -> (Entity<Shell>, &mut VisualTestContext, NestedSubagents) {
+    let (shell, cx) = open_shell(cx);
+    let mut made = None;
+    write_with(
+        |tree| {
+            made = Some(nested_subagents(
+                tree,
+                "/home/user/code/app",
+                "Chain",
+                depth,
+                siblings,
+            ));
+        },
+        cx,
+    );
+    let sync = cx.update(|_, cx| cx.services().sync.clone());
+    sync.update(cx, |sync, cx| sync.sync_all(cx));
+    cx.run_until_parked();
+    (shell, cx, made.expect("the session was written"))
+}
+
+/// Whether the open session has read each of `items`: `None` not asked for, `Some(true)` read.
+fn read_of(items: &[String], cx: &mut VisualTestContext) -> Vec<Option<bool>> {
+    cx.update(|_, cx| {
+        let reader = cx.services().reader.read(cx);
+        let open = reader.open_session().expect("a session is open");
+        (items.iter())
+            .map(|item| (open.subagent(item)).map(|load| matches!(load, Load::Loaded(_))))
+            .collect()
+    })
+}
+
+#[gpui::test]
+fn a_match_nested_deeper_than_panels_go_is_read_on_its_own_and_flashed(cx: &mut TestAppContext) {
+    let (shell, cx, made) = open_nested(4, 0, cx);
+    let reader = open_at("quillwort", &shell, cx);
+    assert!(reader.alone, "{reader:?}");
+    assert_eq!(focused(&reader).0, "reply");
+    assert!(focused(&reader).1.contains("quillwort"));
+    let innermost = made.chain.last().expect("a chain");
+    assert_eq!(
+        flashed(&reader),
+        Some((stem(innermost).to_string(), "quillwort".to_string(), true))
+    );
+}
+
+/**
+ * Going to a match reads only the subagents on the way to it: of a subagent that started
+ * hundreds, none of the others, however deep the chain.
+ */
+#[gpui::test]
+fn only_the_subagents_on_the_way_to_a_match_are_read(cx: &mut TestAppContext) {
+    let (shell, cx, made) = open_nested(12, 300, cx);
+    let reader = open_at("quillwort", &shell, cx);
+    assert!(reader.alone);
+    assert_eq!(flashed(&reader).map(|it| it.2), Some(true));
+    assert!(read_of(&made.chain, cx).iter().all(|it| *it == Some(true)));
+    assert!(read_of(&made.siblings, cx).iter().all(Option::is_none));
+}
+
+/// A place the session no longer holds the text at: the first block that does is gone to.
+#[gpui::test]
+fn a_stale_place_falls_back_to_the_first_block_that_holds_the_text(cx: &mut TestAppContext) {
+    let (shell, cx, _) = open_with_subagents(cx);
+    let reader = open_at("zanzibar", &shell, cx);
+    let mut stale = reader.read_at.expect("the reader took the request");
+    /* The first turn's prompt, which says nothing of quokkas. */
+    stale.at = Some(At::Block {
+        turn: 0,
+        block: BlockId(0),
+    });
+    stale.flash = Some("quokka".to_string());
+    let library = cx.update(|_, cx| cx.services().library.clone());
+    library.update(cx, |library, cx| {
+        let session = library.open_session().cloned().expect("open");
+        library.open_at(session, Some(stale), cx);
+    });
+    draw(cx);
+    let reader = snapshot(&shell, cx);
+    assert_eq!(focused(&reader).0, "reply");
+    assert!(focused(&reader).1.contains("quokka"));
+    assert_eq!(flashed(&reader).map(|it| it.1), Some("quokka".to_string()));
+}
+
+/// A request for a session left before it is parsed goes with it, and moves no other.
+#[gpui::test]
+fn a_request_is_dropped_with_a_session_left_before_it_is_parsed(cx: &mut TestAppContext) {
+    let (shell, cx, _) = open_with_subagents(cx);
+    let asked = open_at("zanzibar", &shell, cx)
+        .read_at
+        .expect("the reader took the request");
+    let library = cx.update(|_, cx| cx.services().library.clone());
+    cx.simulate_keystrokes("alt-left");
+    cx.run_until_parked();
+    let session = |id: &SessionId, same: bool, cx: &mut VisualTestContext| {
+        library.read_with(cx, |library, _| {
+            (library.sessions().unwrap().sessions.iter())
+                .find(|it| (it.id == *id) == same)
+                .cloned()
+                .expect("a session")
+        })
+    };
+
+    // Closed before the parse lands.
+    let asked_for = session(&asked.session, true, cx);
+    library.update(cx, |library, cx| {
+        library.open_at(asked_for.clone(), Some(asked.clone()), cx);
+    });
+    library.update(cx, |library, cx| library.close(cx));
+    /* Its parse still reads the archive: the reader isn't settled until it lands. */
+    let settled =
+        |cx: &mut VisualTestContext| cx.update(|_, cx| cx.services().reader.read(cx).is_settled());
+    assert!(!settled(cx));
+    draw(cx);
+    assert!(settled(cx));
+    assert!(library.read_with(cx, |it, _| it.read_at().is_none()));
+    assert_eq!(snapshot(&shell, cx).read_at, None);
+
+    // Another opened before it lands: that one opens at its start.
+    let other = session(&asked.session, false, cx);
+    library.update(cx, |library, cx| {
+        library.open_at(asked_for, Some(asked.clone()), cx);
+        library.open(other.clone(), cx);
+    });
+    draw(cx);
+    let reader = snapshot(&shell, cx);
+    assert_eq!((reader.read_at, reader.flash, reader.top), (None, None, 0));
+    assert_eq!(
+        library.read_with(cx, |it, _| it.open_session().map(|it| it.id.clone())),
+        Some(other.id)
+    );
 }

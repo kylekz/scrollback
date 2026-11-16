@@ -15,6 +15,7 @@
 //!   anyway. Every string from a transcript drawn outside prose goes through it.
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory as _};
 
@@ -89,9 +90,33 @@ fn is_combining(c: char) -> bool {
 /// `text` as one line of at most [`LABEL_CHARS`] characters, its controls shown (the module
 /// docs): transcript text drawn outside prose.
 pub fn label(text: &str) -> String {
+    labelled(text, |_, _| {})
+}
+
+/**
+ * [`label`] of `text`, and `ranges` of `text` (on its character boundaries) as they fall in the
+ * label: what a hit marks is found in the label of the whole, with the combining marks and the
+ * cut counted across it. A range in what the label cuts off runs to its end.
+ */
+pub fn label_ranges(text: &str, ranges: &[Range<usize>]) -> (String, Vec<Range<usize>>) {
+    let mut places = Vec::new();
+    let label = labelled(text, |input, output| places.push((input, output)));
+    let place = |at: usize| {
+        (places.binary_search_by_key(&at, |(input, _)| *input))
+            .map_or(label.len(), |found| places[found].1)
+    };
+    let ranges = (ranges.iter())
+        .map(|range| place(range.start)..place(range.end))
+        .collect();
+    (label, ranges)
+}
+
+/// [`label`], telling `place` where each character of `text` it reaches starts in the label.
+fn labelled(text: &str, mut place: impl FnMut(usize, usize)) -> String {
     let mut out = String::with_capacity(text.len().min(LABEL_CHARS * 4));
     let (mut kept, mut marks) = (0, 0);
-    for c in text.chars() {
+    for (at, c) in text.char_indices() {
+        place(at, out.len());
         if kept == LABEL_CHARS {
             out.push('…');
             break;
@@ -125,6 +150,21 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn ranges_follow_their_text_into_the_label() {
+        let text = "a\u{202E}b\nhit";
+        let (label, ranges) = label_ranges(text, &[1..5, 6..9]);
+        assert_eq!(label, "a⟦U+202E⟧b hit");
+        assert_eq!(&label[ranges[0].clone()], "⟦U+202E⟧b");
+        assert_eq!(&label[ranges[1].clone()], "hit");
+        /* The stack of marks is counted across a hit's edge, as in the label of the whole. */
+        let stacked = format!("e{}", "\u{301}".repeat(6));
+        let hit = 3..stacked.len();
+        let (label, ranges) = label_ranges(&stacked, std::slice::from_ref(&hit));
+        assert_eq!(label.chars().count(), 1 + COMBINING_MARKS);
+        assert_eq!(ranges[0].end, label.len());
+    }
 
     #[test]
     fn a_control_that_reorders_text_is_shown_and_right_to_left_text_is_left_alone() {

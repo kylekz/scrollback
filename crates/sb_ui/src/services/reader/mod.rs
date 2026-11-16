@@ -61,7 +61,7 @@ mod tests;
 pub mod text;
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -72,7 +72,7 @@ use sb_core::archive::{Archive, ArchivedSession, Pinned, SegmentCache};
 use sb_core::catalogue::{History, SessionId};
 use sb_core::provider::{ItemKind, Provider, SessionItems};
 use sb_core::transcript::{
-    BlockId, Content, Conversation, Outline, Output, Stored, Subagent, ToolCall, ToolKind,
+    BlockId, Content, Conversation, Outline, Output, Stored, Subagent, ToolCall, ToolKind, place,
 };
 
 use super::{ArchiveService, LibraryService, Providers};
@@ -456,6 +456,11 @@ impl OpenSession {
         }
     }
 
+    /// Which subagent started which, once it is asked for ([`ReaderService::want_placement`]).
+    pub fn placement(&self) -> Option<&Load<Arc<Placement>>> {
+        self.placement.as_ref()
+    }
+
     /// What the subagent `item` says it is, once read or placed.
     pub fn names(&self, item: &str) -> Names {
         if let Some(Load::Loaded(read)) = self.subagents.get(item) {
@@ -652,6 +657,8 @@ pub struct ReaderService {
     generation: u64,
     /// The loads of this generation not landed yet.
     loading: usize,
+    /// The parses and loads not landed yet, of any generation: what still reads the archive.
+    reads: usize,
     /**
      * Cleared when the session closes: a load of it that hasn't started by then never does,
      * so that a closed session's queue doesn't keep the background threads from the next.
@@ -707,6 +714,7 @@ impl ReaderService {
             viewing: None,
             generation: 0,
             loading: 0,
+            reads: 0,
             alive: Arc::new(AtomicBool::new(true)),
             decoding: Arc::default(),
             queued: HashMap::new(),
@@ -732,12 +740,15 @@ impl ReaderService {
         self.full_calls
     }
 
-    /// Nothing is being parsed or loaded.
+    /**
+     * Nothing is being parsed or loaded, nor read for a session closed or passed over before
+     * its read landed: nothing reads the archive (`super::reopen` waits for this).
+     */
     pub fn is_settled(&self) -> bool {
         !matches!(self.state, ReaderState::Opening(_))
-            && self.loading == 0
+            && self.reads == 0
+            && self.busy == 0
             && self.queued.is_empty()
-            && self.running.is_empty()
     }
 
     /// Shows every call open, or each as the owner left it. Rows closed by hand in Full calls
@@ -944,6 +955,7 @@ impl ReaderService {
         closed, its flag cleared, before its turn on the background comes. */
         let alive = self.alive.clone();
         let viewing = self.viewing.clone();
+        self.reads += 1;
         let job = cx.background_spawn({
             let id = id.clone();
             async move {
@@ -956,6 +968,7 @@ impl ReaderService {
         cx.spawn(async move |this, cx| {
             let parsed = job.await;
             this.update(cx, |this, cx| {
+                this.reads -= 1;
                 if this.generation != generation {
                     cx.background_spawn(async move { drop(parsed) }).detach();
                     return;
@@ -1002,6 +1015,7 @@ impl ReaderService {
         let generation = self.generation;
         let alive = self.alive.clone();
         self.loading += 1;
+        self.reads += 1;
         let job = cx.background_spawn(async move {
             alive.load(Ordering::Relaxed).then(|| {
                 guarded(|| {
@@ -1013,6 +1027,7 @@ impl ReaderService {
         cx.spawn(async move |this, cx| {
             let value = job.await;
             this.update(cx, |this, cx| {
+                this.reads -= 1;
                 if this.generation != generation {
                     /* Dropped; but its end may free a decode's place, which a row of the
                     session open now waits for (`want_image`). */
@@ -1465,21 +1480,18 @@ impl ReaderService {
 
     /**
      * Works out which subagent started which (the module docs), from the provider's outlines
-     * of them: wanted once those no call of the session's own started come into view. Each is
-     * placed under the first subagent found to start it, walking from those the session's own
-     * calls started and then from the rest in turn, so that a subagent claimed by one it
-     * started, or by itself, is still reached: such a claim is passed over.
+     * of them: wanted once those no call of the session's own started come into view, or when a
+     * search match in a subagent is gone to. They are placed by the rule the index places them
+     * by ([`sb_core::transcript::place`]), so the subagents left unattached are the index's,
+     * in its order.
      */
     pub fn want_placement(&mut self, cx: &mut Context<Self>) {
         let Some(open) = self.open_session() else {
             return;
         };
         let roots = open.unattached.clone();
-        let first: Vec<Arc<str>> = open
-            .main
-            .iter()
-            .flat_map(|main| main.calls())
-            .flat_map(|(_, call)| call.subagents.iter().map(|it| it.item().clone()))
+        let first: Vec<Arc<str>> = (open.main.iter())
+            .flat_map(|main| main.claims().cloned())
             .collect();
         self.load(
             |open| {
@@ -1495,25 +1507,13 @@ impl ReaderService {
                     .into_iter()
                     .map(|outline| (outline.item.clone(), outline))
                     .collect();
-                let mut placement = Placement::default();
-                let mut seen: HashSet<Arc<str>> = first.iter().cloned().collect();
-                let mut queue: VecDeque<Arc<str>> = first.into();
-                let mut roots = roots.into_iter();
-                while let Some(item) = queue.pop_front().or_else(|| {
-                    let root = roots.find(|root| !seen.contains(root))?;
-                    seen.insert(root.clone());
-                    Some(root)
-                }) {
-                    let Some(outline) = outlines.get(&item) else {
-                        continue;
-                    };
-                    for child in &outline.started {
-                        if seen.insert(child.clone()) {
-                            placement.parents.insert(child.clone(), item.clone());
-                            queue.push_back(child.clone());
-                        }
-                    }
-                }
+                let placed = place(&first, &roots, |item| {
+                    (outlines.get(item)).map_or_else(Vec::new, |outline| outline.started.clone())
+                });
+                let mut placement = Placement {
+                    parents: placed.parents,
+                    names: HashMap::new(),
+                };
                 placement.names = outlines
                     .into_iter()
                     .map(|(item, outline)| {
