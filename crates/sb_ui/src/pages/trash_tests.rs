@@ -516,8 +516,11 @@ fn a_long_title_is_cut_in_the_middle_in_its_toast(cx: &mut TestAppContext) {
     trash(SESSIONS[0].title, cx);
     let mut long = session(SESSIONS[0].title, cx).unwrap();
     long.title = Some(format!("start {} end", "of a very long title ".repeat(12)));
-    library(cx).update(cx, |library, cx| library.ask_delete_for_good(long, cx));
+    library(cx).update(cx, |library, cx| {
+        library.ask_delete_for_good(long.clone(), cx)
+    });
     cx.run_until_parked();
+    let deletion = asked(cx).and_then(|(_, deletion, _)| deletion).unwrap();
     library(cx).update(cx, |library, cx| library.answer_delete_for_good(true, cx));
     cx.run_until_parked();
     let (text, _) = toast(cx).expect("a toast");
@@ -528,6 +531,21 @@ fn a_long_title_is_cut_in_the_middle_in_its_toast(cx: &mut TestAppContext) {
         "{text}"
     );
     assert!(text.chars().count() < 150, "{text}");
+
+    // A refusal, said in a toast over another session's confirmation, cuts it shorter, so
+    // that why it was refused shows in a narrow window.
+    trash(SESSIONS[1].title, cx);
+    ask(SESSIONS[1].title, cx);
+    cx.run_until_parked();
+    library(cx).update(cx, |library, cx| {
+        let syncing = ArchiveError::Syncing(long.id.location.clone());
+        library.refused_for_good(deletion, long, syncing, cx);
+    });
+    cx.run_until_parked();
+    let (text, _) = toast(cx).expect("a toast");
+    let (title, why) = text.split_once("” ").unwrap_or_else(|| panic!("{text}"));
+    assert!(title.chars().count() <= 33, "{text}");
+    assert!(why.contains("wasn't deleted"), "{text}");
 }
 
 #[gpui::test]

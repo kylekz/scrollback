@@ -529,6 +529,9 @@ impl Refusal {
 
 /// The most characters of a title a toast says: a longer one is cut in its middle.
 const TOAST_TITLE: usize = 60;
+/// The most a toast that says why something was refused says of a title: its reason, which
+/// follows, is what matters.
+const REFUSAL_TITLE: usize = 32;
 
 /// A session's title as a toast says it.
 fn toast_title(session: &Session) -> String {
@@ -1555,9 +1558,9 @@ impl LibraryService {
                         log::warn!(
                             "what deleting a session would remove couldn't be read: {error}"
                         );
-                        let title = toast_title(&asked.session);
+                        let session = asked.session.clone();
                         this.for_good = None;
-                        let said = this.not_deleted(&title, &error.into());
+                        let said = this.not_deleted(&session, &error.into());
                         this.show_toast(
                             Toast {
                                 text: said,
@@ -2014,7 +2017,7 @@ impl LibraryService {
             }
             (Change::DeleteForGood { session, .. }, Err(error)) => {
                 log::warn!("{} was refused: {error}", change.what());
-                let said = self.not_deleted(&toast_title(session), &error);
+                let said = self.not_deleted(session, &error);
                 self.show_toast(
                     Toast {
                         text: said,
@@ -2187,8 +2190,12 @@ impl LibraryService {
         }
     }
 
-    /// Why deleting the session titled `title` for good was refused, as the owner knows it.
-    fn not_deleted(&self, title: &str, error: &ArchiveError) -> String {
+    /**
+     * Why deleting `session` for good was refused, as the owner knows it. Its title is cut to
+     * [`REFUSAL_TITLE`] characters, so that why still shows in a narrow window's toast.
+     */
+    fn not_deleted(&self, session: &Session, error: &ArchiveError) -> String {
+        let title = crate::components::middle_cut(&title_of(session), REFUSAL_TITLE);
         match error {
             ArchiveError::Catalogue(CatalogueError::NotInTrash(_)) => {
                 format!("“{title}” was restored, so it wasn't deleted")
