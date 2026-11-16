@@ -106,7 +106,10 @@
 //!   `open_calls`, `markdown_states` and `held` (how many parsed bodies, and how many prepared
 //!   things of the service's, are kept), `alone` (a subagent read on its own), `loads`
 //!   (`bodies`, `subagents`, `prose`, `images`, `raws`, `wholes`: how many are `loading` and
-//!   `loaded`) and `fault` (a read that failed for a reason other than the stored bytes).
+//!   `loaded`), `fault` (a read that failed for a reason other than the stored bytes), the
+//!   last request to open the session at a search match it took (`read_at`, as the library's),
+//!   and what `flash`es: its `block` (`conversation/block`), its `text` and whether it was
+//!   `drawn`.
 //!
 //! Commands. An argument a command doesn't have is an error, so a misspelt one never passes
 //! for a change. These reply with `state.appearance` after the change:
@@ -159,7 +162,7 @@ use sb_ui::services::sync::{Refetch, TestFailure, TestState};
 use sb_ui::services::upkeep::{Fix, Standing};
 use sb_ui::services::{
     ActiveServices as _, Answer as Searched, ArchiveState, Dragged, DropTarget, Failure, Held,
-    LocationStatus, Page, Reach, ReaderState, Verdict,
+    LocationStatus, Page, Reach, ReadAt, ReaderState, Verdict,
 };
 use sb_ui::system::{self, SystemRequest};
 use serde::Deserialize;
@@ -484,17 +487,7 @@ fn library(cx: &App) -> Value {
             "at_location": asked.deletion.as_ref().map(|it| it.at_location),
             "refused": asked.refused.map(|why| why.said()),
         })),
-        "read_at": library.read_at().map(|at| json!({
-            "kind": format!("{:?}", at.kind).to_lowercase(),
-            "turn": match at.at {
-                Some(At::Block { turn, .. }) => Some(turn),
-                _ => None,
-            },
-            "request": at.request,
-            "subagent": at.subagent.as_ref().map(|it| &it.item),
-            "find": at.find,
-            "flash": at.flash,
-        })),
+        "read_at": library.read_at().map(read_at),
         "folders": folders,
         "sessions": sessions,
         "groups": groups,
@@ -677,6 +670,12 @@ fn reader(shell: &Shell, cx: &App) -> Value {
         "markdown_states": view.states,
         "held": view.held,
         "alone": view.alone,
+        "read_at": view.read_at.as_ref().map(read_at),
+        "flash": view.flash.map(|(block, text, drawn)| json!({
+            "block": block,
+            "text": text,
+            "drawn": drawn,
+        })),
         "loads": open.map(|open| {
             open.loads()
                 .into_iter()
@@ -686,6 +685,21 @@ fn reader(shell: &Shell, cx: &App) -> Value {
                 .collect::<serde_json::Map<_, _>>()
         }),
         "fault": open.and_then(|open| open.fault()),
+    })
+}
+
+/// A request to open a session at a search match, as `state.library` and `state.reader` show it.
+fn read_at(at: &ReadAt) -> Value {
+    json!({
+        "kind": format!("{:?}", at.kind).to_lowercase(),
+        "turn": match at.at {
+            Some(At::Block { turn, .. }) => Some(turn),
+            _ => None,
+        },
+        "request": at.request,
+        "subagent": at.subagent.as_ref().map(|it| &it.item),
+        "find": at.find,
+        "flash": at.flash,
     })
 }
 

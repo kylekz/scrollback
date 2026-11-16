@@ -33,7 +33,10 @@ use sb_core::transport::{
 use toolbox_store::rusqlite::Connection;
 use toolbox_store::rusqlite::types::ValueRef;
 
-pub use claude_code::{Call, FileAgent, Outline, ProjectsTree, Records, Session, image_block};
+pub use claude_code::{
+    Call, FileAgent, Outline, ProjectsTree, Records, Session, WithSubagents, image_block,
+    with_subagents,
+};
 pub use db_agent::{DbAgent, DbProvider};
 
 /// The environment variable that names a shell (`sh`, `dash`) to read every fixture location

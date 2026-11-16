@@ -72,7 +72,7 @@
 {"cmd": "settle", "expect": {"pointer": "/palette/answer/sessions/1", "equals": "Throttle yt-dlp metadata backfill"}}
 {"cmd": "key", "keystroke": "down"}
 {"cmd": "key", "keystroke": "enter"}
-{"cmd": "settle", "expect": [{"pointer": "/palette", "equals": null}, {"pointer": "/page", "equals": "session"}, {"pointer": "/library/open", "equals": "Back off on 429 only, not on 403"}, {"pointer": "/library/read_at/find", "equals": "backoff 429"}, {"pointer": "/library/read_at/turn", "equals": 0}]}
+{"cmd": "settle", "expect": [{"pointer": "/palette", "equals": null}, {"pointer": "/page", "equals": "session"}, {"pointer": "/library/open", "equals": "Back off on 429 only, not on 403"}, {"pointer": "/reader/read_at/find", "equals": "backoff 429"}, {"pointer": "/reader/read_at/turn", "equals": 0}]}
 
 // With nothing typed, the palette lists the session opened and the search it came from.
 {"cmd": "key", "keystroke": "alt-left"}

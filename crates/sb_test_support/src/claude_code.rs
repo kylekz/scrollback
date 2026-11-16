@@ -364,6 +364,74 @@ impl Session {
     }
 }
 
+/// What [`with_subagents`] wrote: the keys of the session's items, for a test to find them by.
+pub struct WithSubagents {
+    /// The session's own transcript.
+    pub key: String,
+    /// The subagent the session's first call started, the subagent that one started, and the
+    /// subagent no call is known to have started.
+    pub subagent: String,
+    pub nested: String,
+    pub lone: String,
+}
+
+/**
+ * A session in `project` called `title`, whose subagents hold words to find. Its first turn asks
+ * a subagent, which answers "A widget holds a frobnicator." and asks another, which answers
+ * "Deep inside sits a gizmotron."; then come `turns` turns that say nothing of note, and a last
+ * one that asks "Where is the zanzibar setting?" and is answered "It sits in the quokka file.".
+ * One subagent no call is known to have started answers "The quuxifier hums.".
+ */
+pub fn with_subagents(
+    tree: &mut ProjectsTree,
+    project: &str,
+    title: &str,
+    turns: usize,
+) -> WithSubagents {
+    let mut session = tree.session(project, 0);
+    let ask = |description: &str| json!({ "subagent_type": "expert", "description": description, "prompt": "Explain." });
+    session.transcript.prompt("Ask the widget expert.");
+    let call = session.transcript.call("Agent", ask("Ask"));
+    let (subagent, mut first) = session.subagent_transcript(
+        "",
+        Some(json!({ "agentType": "expert", "description": "Ask", "toolUseId": call.id })),
+    );
+    first.prompt("Explain widgets.");
+    first.reply("A widget holds a frobnicator.");
+    let inner = first.call("Agent", ask("Look deeper"));
+    let (nested, mut second) = session.subagent_transcript(
+        "",
+        Some(json!({ "agentType": "expert", "description": "Look deeper", "toolUseId": inner.id })),
+    );
+    second.prompt("Look deeper.");
+    second.reply("Deep inside sits a gizmotron.");
+    let started = |records: &Records| json!({ "agentId": records.agent, "status": "completed" });
+    first.result_with(&inner, json!("Looked."), false, started(&second));
+    first.reply("Widgets explained.");
+    session
+        .transcript
+        .result_with(&call, json!("Explained."), false, started(&first));
+    session.transcript.reply("The expert explained widgets.");
+    for turn in 1..=turns {
+        session
+            .transcript
+            .prompt(&format!("Carry on with step {turn}."));
+        session.transcript.reply(&format!("Step {turn} is done."));
+    }
+    session.transcript.prompt("Where is the zanzibar setting?");
+    session.transcript.reply("It sits in the quokka file.");
+    let (lone, mut alone) = session.subagent_transcript("", None);
+    alone.prompt("Nobody asked.");
+    alone.reply("The quuxifier hums.");
+    session.title(title);
+    WithSubagents {
+        key: session.key,
+        subagent,
+        nested,
+        lone,
+    }
+}
+
 /// A tool call written to a transcript.
 #[derive(Clone, Debug)]
 pub struct Call {

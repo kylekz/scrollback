@@ -28,9 +28,14 @@
 //! `Ctrl C` copies the text selected, else the message the keyboard is on. The keyboard's row
 //! is held by what it is, not where, so it stays on that row when rows open or load above it,
 //! and goes to the row before when its own goes away. Its ring shows once a key is used.
+//!
+//! **Opened at a search match**, it goes to the match and flashes it ([`place`]).
 
 pub(crate) mod blocks;
 mod calls;
+mod place;
+#[cfg(test)]
+mod place_tests;
 pub mod rows;
 #[cfg(test)]
 mod tests;
@@ -62,7 +67,7 @@ use crate::markdown::Sanitized;
 use crate::services::reader::{
     BlockRef, Changed, Code, Held, Highlights, OpenSession, Rank, ReaderService, ReaderState,
 };
-use crate::services::{ActiveServices as _, LibraryService};
+use crate::services::{ActiveServices as _, LibraryService, ReadAt};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 use rows::{Row, RowKind, Space};
 
@@ -105,6 +110,11 @@ pub struct ReaderSnapshot {
     pub held: usize,
     /// Whether a subagent is read on its own.
     pub alone: bool,
+    /// The last request to open the session at a search match the reader took.
+    pub read_at: Option<ReadAt>,
+    /// What flashes: the row name of its block ([`blocks::row_name`]'s, without the row's
+    /// kind), its text, and whether it has been drawn.
+    pub flash: Option<(String, String, bool)>,
 }
 
 pub struct ReaderView {
@@ -139,12 +149,17 @@ pub struct ReaderView {
     /// the bounds of DESIGN §4.2.3; and the widest drawn this frame so far.
     label_width: Pixels,
     label_width_next: Cell<Pixels>,
-    _observers: [Subscription; 2],
+    /// The request to open the session at a search match being gone to, until it is there
+    /// ([`place`]), and the last one taken.
+    placing: Option<ReadAt>,
+    read_at: Option<ReadAt>,
+    flash: Option<place::Flash>,
+    _observers: [Subscription; 3],
 }
 
 impl ReaderView {
     pub fn new(focus_handle: FocusHandle, cx: &mut Context<Self>) -> Self {
-        let reader = cx.services().reader.clone();
+        let (reader, library) = (cx.services().reader.clone(), cx.services().library.clone());
         let label = cx.sb_theme().sizes.activity_name_width;
         let mut this = Self {
             focus_handle,
@@ -163,9 +178,14 @@ impl ReaderView {
             drawn: Rc::default(),
             label_width: label,
             label_width_next: Cell::new(label),
+            placing: None,
+            read_at: None,
+            flash: None,
             _observers: [
                 cx.observe(&reader, |this, _, cx| this.refresh(cx)),
                 cx.subscribe(&reader, |this, _, changed, cx| this.changed(changed, cx)),
+                // The same session opened at a match again: no parse, a new request.
+                cx.observe(&library, |this, _, cx| this.take_read_at(cx)),
             ],
         };
         this.list.set_scroll_handler({
@@ -218,6 +238,17 @@ impl ReaderView {
             states: self.states.len(),
             held: self.held.len(),
             alone: self.alone.is_some(),
+            read_at: self.read_at.clone(),
+            flash: self.flash().map(|(at, text, drawn)| {
+                let name = open.map_or_else(String::new, |open| {
+                    format!(
+                        "{}/{}",
+                        blocks::conversation_name(&at.conversation, open),
+                        at.block.0
+                    )
+                });
+                (name, text.to_string(), drawn)
+            }),
         }
     }
 
@@ -245,6 +276,9 @@ impl ReaderView {
             self.alone = None;
             self.focused = None;
             self.keyboard = false;
+            self.placing = None;
+            self.read_at = None;
+            self.flash = None;
             self.states.clear();
             self.held.clear();
             self.rows = rows;
@@ -254,6 +288,8 @@ impl ReaderView {
         } else {
             self.replace(0..self.rows.len(), rows);
         }
+        self.take_read_at(cx);
+        self.place(cx);
         cx.notify();
     }
 
@@ -577,12 +613,18 @@ impl ReaderView {
         text: impl FnOnce() -> Option<Sanitized>,
         cx: &mut App,
     ) -> Option<Entity<TextViewState>> {
-        if let Some((state, row)) = self.states.get_mut(&piece) {
-            *row = at;
-            return Some(state.clone());
-        }
-        let state = crate::markdown::state(&text()?, cx);
-        self.states.insert(piece, (state.clone(), at));
+        let state = match self.states.get_mut(&piece) {
+            Some((state, row)) => {
+                *row = at;
+                state.clone()
+            }
+            None => {
+                let state = crate::markdown::state(&text()?, cx);
+                self.states.insert(piece.clone(), (state.clone(), at));
+                state
+            }
+        };
+        self.light_prose(&piece, &state, cx);
         Some(state)
     }
 

@@ -11,9 +11,9 @@
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, ClickEvent, Context, ImageSource, InteractiveElement as _, IntoElement, ObjectFit,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
-    StyledImage as _, Window, div, img, prelude::FluentBuilder as _, px,
+    AnyElement, ClickEvent, Context, HighlightStyle, ImageSource, InteractiveElement as _,
+    IntoElement, ObjectFit, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    Styled as _, StyledImage as _, Window, div, img, prelude::FluentBuilder as _, px,
 };
 use gpui_component::tooltip::Tooltip;
 use sb_core::transcript::{
@@ -286,6 +286,21 @@ fn activity(
         .open_session()
         .and_then(|session| session.project_path.clone());
     let label = hostile::label(&agents::tool_label(&provider, &call.name, cx));
+    /* A search match opened at flashes in the command or path (`super::place`). */
+    let aim = hostile::label(&call_target(&call, root.as_deref()));
+    let aim = match view.flash_in(at, &aim) {
+        Some(flash) => gpui::StyledText::new(aim)
+            .with_highlights([(
+                flash,
+                HighlightStyle {
+                    background_color: Some(c.accent),
+                    color: Some(c.accent_ink),
+                    ..HighlightStyle::default()
+                },
+            )])
+            .into_any_element(),
+        None => aim.into_any_element(),
+    };
     let label_width = text_width(&label, &theme.text.activity_name, window);
     view.label_width_next
         .set(view.label_width_next.get().max(label_width));
@@ -335,7 +350,7 @@ fn activity(
                 .overflow_hidden()
                 .text_ellipsis()
                 .text_color(c.fg2)
-                .child(hostile::label(&call_target(&call, root.as_deref()))),
+                .child(aim),
         )
         .children(status)
         .children(said.map(|said| {

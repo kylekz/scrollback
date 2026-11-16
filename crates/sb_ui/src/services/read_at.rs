@@ -12,18 +12,23 @@
 //!    session open. Taking it is what makes it one-shot: a parse again (a sync appended to the
 //!    session, the version read changed) never moves the reader back to it.
 //! 2. It scrolls to [`ReadAt::at`] in the session's own conversation: the block at its turn,
-//!    or the subagent at that place of `Transcript::unattached`. For a match in a subagent's
+//!    or the subagent at that place of `Transcript::unattached` once every subagent is read
+//!    (those no call is known to start, as the index read them). For a match in a subagent's
 //!    text it expands the call at `at`, then the subagent whose conversation is the item
 //!    [`InSubagent::item`] (found by that key among the subagents under the call, at any
-//!    depth), and scrolls to the turn and block there.
+//!    depth), each subagent on the way to it expanded too, and scrolls to the turn and block
+//!    there.
 //! 3. It fills Find in session with [`ReadAt::find`], without stepping to its first match.
+//!    Until Find in session is built (PLAN §13, phase 4b) the reader keeps the request it took
+//!    for it.
 //! 4. It flashes [`ReadAt::flash`] (`hl.cur` for a second) in the block it scrolled to.
 //!
 //! **The places are positional.** `at` and the subagent's turn and block are places in the
 //! conversation as the search index parsed it. When the session was synced or re-parsed since,
 //! they may point elsewhere. So the reader first checks that the block at the place holds
 //! `flash` (as Find matches: any case, Latin accents folded); when it doesn't, it falls back
-//! to Find's first match of `find`, and flashes that.
+//! to Find's first match of `flash` (not of `find`, which joins all the terms), and flashes
+//! that.
 
 use sb_core::catalogue::SessionId;
 use sb_core::search::{Match, MatchKind};

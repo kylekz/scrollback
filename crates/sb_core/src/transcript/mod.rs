@@ -36,7 +36,9 @@ use thiserror::Error;
 use crate::provider::{Provider, ProviderId, SessionItems};
 
 pub use build::Builder;
-pub use index::{At, INDEX_VERSION, InSubagent, SessionIndex, Span, SpanKind, Totals, index};
+pub use index::{
+    At, INDEX_VERSION, InSubagent, SessionIndex, Span, SpanKind, Totals, index, searchable,
+};
 
 /// A session as its provider parsed it.
 #[derive(Clone, Debug, PartialEq, Eq)]

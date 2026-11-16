@@ -35,6 +35,29 @@ pub(super) fn holds(text: &str, term: &str) -> bool {
     folded(text).contains(term)
 }
 
+/**
+ * Where in `text` the first match of `term` is, as search matches (any case, Latin accents
+ * folded): the bytes of `text` it covers. `None` for an empty term, or one `text` doesn't hold.
+ */
+pub fn first_match(text: &str, term: &str) -> Option<Range<usize>> {
+    let term: Vec<char> = folded(term).chars().collect();
+    if term.is_empty() {
+        return None;
+    }
+    /* Each folded character of `text`, with where the character it was starts and ends. */
+    let chars: Vec<(char, Range<usize>)> = text
+        .char_indices()
+        .filter_map(|(at, char)| fold(char).map(|folded| (folded, at..at + char.len_utf8())))
+        .collect();
+    let found = chars.windows(term.len()).position(|window| {
+        window
+            .iter()
+            .map(|(char, _)| *char)
+            .eq(term.iter().copied())
+    })?;
+    Some(chars[found].1.start..chars[found + term.len() - 1].1.end)
+}
+
 /// The part of `text` about the first match of the rarest of `terms` ([`folded`] already) in
 /// it, the whole of that match always, with every match in that part marked.
 pub(super) fn snippet(text: &str, terms: &[String]) -> Snippet {
@@ -119,6 +142,14 @@ mod tests {
     use toolbox_store::rusqlite::{Connection, params};
 
     use super::*;
+
+    #[test]
+    fn a_first_match_is_found_in_any_case_and_with_accents_folded() {
+        assert_eq!(first_match("Retry the Upload", "upload"), Some(10..16));
+        assert_eq!(first_match("un café crème", "CAFE CREME"), Some(3..15));
+        assert_eq!(first_match("nothing here", "upload"), None);
+        assert_eq!(first_match("anything", ""), None);
+    }
 
     /**
      * The fold is the index's own, for every code point: what the bundled SQLite's `trigram`

@@ -8,14 +8,13 @@ use pretty_assertions::assert_eq;
 use sb_core::catalogue::Shelf;
 use sb_core::search::{MatchKind, Query};
 use sb_core::transcript::At;
-use serde_json::json;
 
 use super::*;
 use crate::services::SyncEvent;
 use crate::services::{ActiveServices as _, LibraryService};
 use crate::shell::Shell;
 use crate::test_support::{SESSIONS, archive_dir, bounds, open_shell, write_session, write_with};
-use sb_test_support::Outline;
+use sb_test_support::{Outline, with_subagents};
 
 fn library(cx: &mut VisualTestContext) -> Entity<LibraryService> {
     cx.update(|_, cx| cx.services().library.clone())
@@ -276,24 +275,18 @@ fn the_arrows_wrap_and_enter_opens_the_session_at_the_match(cx: &mut TestAppCont
     cx.run_until_parked();
     assert!(shown(&shell, cx).is_none());
     assert!(main_focused(&shell, cx));
-    let (open, at) = library(cx).read_with(cx, |library, _| {
-        (
-            library.open_session().and_then(|it| it.title.clone()),
-            library.read_at().cloned(),
-        )
+    let open = library(cx).read_with(cx, |library, _| {
+        library.open_session().and_then(|it| it.title.clone())
     });
     assert_eq!(open.as_deref(), Some(SESSIONS[1].title));
-    let at = at.expect("it opens at the match");
+    let at = taken(&shell, cx).expect("it opens at the match");
     assert_eq!(at.kind, MatchKind::Prompt);
     assert!(matches!(at.at, Some(At::Block { turn: 0, .. })));
     assert_eq!(at.subagent, None);
     assert_eq!(at.find, "three times backoff", "the terms, without quotes");
     assert_eq!(at.flash.as_deref(), Some("three times"));
     let first = at.request;
-
-    // The reader takes it once; asking again is a new request.
-    let taken = library(cx).update(cx, |library, _| library.take_read_at());
-    assert_eq!(taken.map(|it| it.request), Some(first));
+    // The reader took it, once.
     assert!(library(cx).read_with(cx, |it, _| it.read_at().is_none()));
 
     // Back on the page, the session and the search are the recent ones.
@@ -309,37 +302,19 @@ fn the_arrows_wrap_and_enter_opens_the_session_at_the_match(cx: &mut TestAppCont
     assert_eq!(text(&palette, cx), "\"three times\" backoff");
     cx.simulate_keystrokes("down enter");
     cx.run_until_parked();
-    let again = library(cx).read_with(cx, |it, _| it.read_at().map(|it| it.request));
+    let again = taken(&shell, cx).map(|it| it.request);
     assert_eq!(again, Some(first + 1));
 }
 
 #[gpui::test]
 fn a_match_in_a_subagent_says_where_in_it_and_an_unattached_one_its_place(cx: &mut TestAppContext) {
     let (shell, cx) = open_shell(cx);
+    let mut made = None;
     write_with(
-        |tree| {
-            let mut session = tree.session("/home/user/code/app", 0);
-            session.transcript.prompt("Ask the widget expert.");
-            let call = session.transcript.call(
-                "Agent",
-                json!({ "subagent_type": "expert", "description": "Ask", "prompt": "Explain." }),
-            );
-            let mut subagent = session.subagent_of(&call, "expert", "Ask");
-            subagent.prompt("Explain widgets.");
-            subagent.reply("A widget holds a frobnicator.");
-            session.transcript.result_with(
-                &call,
-                json!("Explained."),
-                false,
-                json!({ "agentId": subagent.agent, "status": "completed" }),
-            );
-            let mut lone = session.subagent_without_meta();
-            lone.prompt("Nobody asked.");
-            lone.reply("The quuxifier hums.");
-            session.transcript.title("Widgets");
-        },
+        |tree| made = Some(with_subagents(tree, "/home/user/code/app", "Widgets", 0)),
         cx,
     );
+    let made = made.expect("the session was written");
     let sync = cx.update(|_, cx| cx.services().sync.clone());
     sync.update(cx, |sync, cx| sync.sync_all(cx));
     cx.run_until_parked();
@@ -349,19 +324,29 @@ fn a_match_in_a_subagent_says_where_in_it_and_an_unattached_one_its_place(cx: &m
         typed(term, cx);
         cx.simulate_keystrokes("down enter");
         cx.run_until_parked();
-        let at = library(cx).read_with(cx, |it, _| it.read_at().cloned());
+        let at = taken(&shell, cx);
         cx.simulate_keystrokes("alt-left");
         at.expect("it opens at the match")
     };
     let inside = open_at("frobnicator", cx);
     assert!(matches!(inside.at, Some(At::Block { turn: 0, .. })));
     let place = inside.subagent.expect("the text is the subagent's");
-    assert!(place.item.contains("agent-"), "{}", place.item);
+    assert_eq!(place.item, made.subagent);
     assert_eq!(inside.flash.as_deref(), Some("frobnicator"));
+
+    /* Nested: the call of the session's own that started the outer one, and the inner one. */
+    let nested = open_at("gizmotron", cx);
+    assert_eq!(nested.at, inside.at);
+    assert_eq!(nested.subagent.map(|it| it.item), Some(made.nested));
 
     let lone = open_at("quuxifier", cx);
     assert_eq!(lone.at, Some(At::Unattached(0)));
-    assert!(lone.subagent.is_some());
+    assert_eq!(lone.subagent.map(|it| it.item), Some(made.lone));
+}
+
+/// The last request to open the session at a match the reader took.
+fn taken(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> Option<ReadAt> {
+    cx.update(|_, cx| shell.read(cx).reader(cx).read_at)
 }
 
 #[gpui::test]
