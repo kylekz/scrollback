@@ -1,0 +1,39 @@
+{"scenario": {"window_size": "1440x900", "fixture": "archive-gone", "description": "The archive-unavailable page (DESIGN §4.14): the settings name an archive whose folder isn't there, as on a drive unplugged; the page says so, with what the archive held when it was last open, makes nothing in its place, and moves on to a folder the owner chooses, asking first; the first run there keeps the way back to Settings"}}
+{"cmd": "wait_ready", "timeout_ms": 20000}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "archive-failed"}, {"pointer": "/archive/state", "equals": "failed"}, {"pointer": "/archive/failure", "equals": "missing"}, {"pointer": "/archive/dir", "contains": "Archive"}, {"pointer": "/sync/locations", "equals": []}]}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+
+// The page names the folder and what the archive held then; Try again, Locate the archive… and Use a different folder… are its ways on.
+{"cmd": "bounds", "target": "archive/known", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "archive/retry", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "archive/locate", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "archive/use-folder", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "archive-gone-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "archive-gone-light"}
+
+// Settings has no archive to show, and Try again finds the folder still missing: nothing is made in its place.
+{"cmd": "key", "keystroke": "secondary-,", "expect": {"pointer": "/page", "equals": "archive-failed"}}
+{"cmd": "click", "target": "archive/retry"}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "archive-failed"}, {"pointer": "/archive/failure", "equals": "missing"}]}
+
+// A folder that holds nothing: the page asks before making an archive there, and Esc answers no.
+{"cmd": "answer_picker", "folder": "${out_dir}/new-archive"}
+{"cmd": "click", "target": "archive/use-folder"}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "archive/question", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "make-question-light"}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": {"pointer": "/page", "equals": "archive-failed"}}
+{"cmd": "bounds", "target": "archive/question", "expect_error": "no target"}
+
+// Asked again and confirmed: the app moves onto the new archive, at its first run, which keeps the way back to Settings.
+{"cmd": "answer_picker", "folder": "${out_dir}/new-archive"}
+{"cmd": "click", "target": "archive/use-folder"}
+{"cmd": "settle"}
+{"cmd": "click", "target": "archive/question/ok"}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "first-run"}, {"pointer": "/archive/state", "equals": "open"}, {"pointer": "/settings/archive", "contains": "new-archive"}]}
+{"cmd": "bounds", "target": "titlebar/settings", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "click", "target": "titlebar/settings", "expect": {"pointer": "/page", "equals": "settings"}}

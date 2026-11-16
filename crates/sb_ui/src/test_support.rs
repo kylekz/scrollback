@@ -133,6 +133,7 @@ pub fn init_reaching(
         services::init(
             ServicesConfig {
                 settings,
+                mode_override: None,
                 providers: sb_core::provider::builtin(),
                 reach: Reach {
                     connect: Arc::new(move |kind, cancel| match kind {

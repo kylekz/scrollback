@@ -311,9 +311,9 @@ fn an_archive_that_doesnt_open_is_a_failure_and_none_is_made_in_its_place(cx: &m
         let ArchiveState::Failed(failure) = archive.state() else {
             panic!("the archive is locked");
         };
-        assert!(failure.locked);
+        assert!(matches!(failure, super::Failure::Locked(_)));
         assert!(
-            failure.why.contains("open in another scrollback"),
+            failure.why().contains("open in another scrollback"),
             "{failure:?}"
         );
     });
@@ -345,7 +345,7 @@ fn a_folder_that_holds_what_is_left_of_an_archive_gets_no_new_one(cx: &mut TestA
         let ArchiveState::Failed(failure) = archive.state() else {
             panic!("no archive is made over what is left of one");
         };
-        assert!(!failure.locked);
+        assert!(matches!(failure, super::Failure::Other(_)), "{failure:?}");
     });
     assert!(!dir.join("archive.json").exists());
 }

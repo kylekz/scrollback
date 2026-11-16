@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{Archive, ArchiveError, Result, io_error, layout};
 use crate::catalogue::{self, Totals};
@@ -67,24 +67,33 @@ fn size(path: &Path) -> u64 {
 }
 
 /// What a folder holds, as the place to open an archive in or to make one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Holds {
     /// An archive, by its `archive.json`: it is opened.
     Archive,
     /// Nothing, or the folder is not there yet: an archive is made in it.
     Nothing,
+    /// It is inside the archive in this folder, which no archive is made in (PLAN §4.4).
+    InsideAnArchive(PathBuf),
     /// Something else, which a new archive is never made beside.
     Other,
 }
 
-/// The files an operating system leaves in any folder it has shown (Finder's, Explorer's), which
-/// don't make a folder hold something.
-const SYSTEM_FILES: [&str; 3] = [".DS_Store", "Thumbs.db", "desktop.ini"];
+/// Whether `name` is a file an operating system leaves in any folder it has shown (Finder's,
+/// with the AppleDouble `._` files of a drive formatted for Windows, and Explorer's), which
+/// doesn't make a folder hold something.
+fn is_system_file(name: &str) -> bool {
+    matches!(name, ".DS_Store" | "Thumbs.db" | "desktop.ini") || name.starts_with("._")
+}
 
 /// What `dir` holds (see [`Holds`]).
 pub fn what_is_in(dir: &Path) -> Result<Holds> {
+    let dir = &std::path::absolute(dir).map_err(io_error("resolve", dir))?;
     if dir.join(layout::MANIFEST).is_file() {
         return Ok(Holds::Archive);
+    }
+    if let Some(other) = archive_around(dir) {
+        return Ok(Holds::InsideAnArchive(other));
     }
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -93,22 +102,67 @@ pub fn what_is_in(dir: &Path) -> Result<Holds> {
     };
     for entry in entries {
         let entry = entry.map_err(io_error("list", dir))?;
-        if !SYSTEM_FILES.contains(&entry.file_name().to_string_lossy().as_ref()) {
+        if !is_system_file(&entry.file_name().to_string_lossy()) {
             return Ok(Holds::Other);
         }
     }
     Ok(Holds::Nothing)
 }
 
+/// The archive `dir`, absolute, is inside, if it is inside one: the nearest folder above it
+/// that holds an `archive.json`.
+pub(super) fn archive_around(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .skip(1)
+        .find(|folder| folder.join(layout::MANIFEST).is_file())
+        .map(Path::to_path_buf)
+}
+
+/// An archive somewhere below `dir`, if one is: a folder there that holds an `archive.json`.
+pub(super) fn archive_within(dir: &Path) -> Option<PathBuf> {
+    let mut folders = vec![dir.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        for entry in fs::read_dir(&folder).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                if path.join(layout::MANIFEST).is_file() {
+                    return Some(path);
+                }
+                folders.push(path);
+            }
+        }
+    }
+    None
+}
+
+/// The id the archive in `dir` was made with, from its `archive.json`; `None` when the folder
+/// holds no archive (DESIGN §4.14: locating an archive accepts only the one that was open).
+pub fn id_in(dir: &Path) -> Result<Option<String>> {
+    let path = dir.join(layout::MANIFEST);
+    let json = match fs::read(&path) {
+        Ok(json) => json,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error("read", &path)(error)),
+    };
+    let manifest: super::Manifest =
+        serde_json::from_slice(&json).map_err(|source| ArchiveError::Manifest { path, source })?;
+    Ok(Some(manifest.id))
+}
+
 /**
  * Opens the archive in `dir`, or makes one there when it holds nothing: what pointing the app
  * at another folder does (PLAN §4.4). A folder that holds something else is refused with
- * [`ArchiveError::NotAnArchive`], and nothing is made in it.
+ * [`ArchiveError::NotAnArchive`], one inside another archive with [`ArchiveError::Nested`],
+ * and nothing is made in either.
  */
 pub fn open_or_make(dir: &Path) -> Result<Archive> {
     match what_is_in(dir)? {
         Holds::Archive => Archive::open(dir),
         Holds::Nothing => Archive::create(dir),
+        Holds::InsideAnArchive(other) => Err(ArchiveError::Nested {
+            dir: dir.to_path_buf(),
+            other,
+        }),
         Holds::Other => Err(ArchiveError::NotAnArchive(dir.to_path_buf())),
     }
 }

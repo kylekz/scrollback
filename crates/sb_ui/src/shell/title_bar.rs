@@ -56,6 +56,9 @@ impl Shell {
         let showing = Showing::now(cx);
         let first_run = showing == Showing::FirstRun;
         let has_library = showing.is_library();
+        /* A first run shows only the gear, and that only in a folder the owner chose, to choose
+        another. */
+        let gear = !first_run || showing.has_settings(cx);
         let syncing = cx.services().sync.read(cx).is_syncing();
         let traffic_lights = cfg!(target_os = "macos") && !window.is_fullscreen();
         let captions = CaptionButton::row(window);
@@ -71,8 +74,14 @@ impl Shell {
         } + px(18.)
             + theme.spacing.md
             + text_width("scrollback", &theme.text.title, window);
-        let buttons = (!first_run).then(|| {
-            sync_all_width(has_library && syncing, theme, window) + GAP + theme.sizes.control_height
+        let buttons = gear.then(|| {
+            if first_run {
+                theme.sizes.control_height
+            } else {
+                sync_all_width(has_library && syncing, theme, window)
+                    + GAP
+                    + theme.sizes.control_height
+            }
         });
         let right = match (buttons, captions) {
             (Some(buttons), Some(_)) => buttons + GAP + theme.sizes.caption_button_width * 3.,
@@ -134,12 +143,14 @@ impl Shell {
                             .gap(GAP)
                             .when(!first_run, |this| {
                                 this.child(sync_all_button(has_library, syncing, theme, cx))
-                                    .child(settings_button(
-                                        has_library,
-                                        showing == Showing::Settings,
-                                        theme,
-                                        cx,
-                                    ))
+                            })
+                            .when(gear, |this| {
+                                this.child(settings_button(
+                                    has_library || first_run,
+                                    showing == Showing::Settings,
+                                    theme,
+                                    cx,
+                                ))
                             })
                             // The caption buttons sit side by side, flush with the window's edge.
                             .map(|this| match captions {

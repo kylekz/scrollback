@@ -357,7 +357,7 @@ impl SyncService {
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return;
         };
-        if days == self.stale_after {
+        if days == self.stale_after || self.closed {
             return;
         }
         self.stale_after = days;
@@ -594,12 +594,13 @@ impl SyncService {
         Ok(())
     }
 
-    /// Removes a location (module docs): its pass, if one runs, is stopped first.
+    /// Removes a location (module docs): its pass or its refetch, if one runs, is stopped
+    /// first.
     pub fn remove(&mut self, id: &LocationId, cx: &mut Context<Self>) {
         if self.archive.read(cx).archive().is_none() || !self.removing.insert(id.clone()) {
             return;
         }
-        if self.passes.contains_key(id) {
+        if self.passes.contains_key(id) || self.refetching.contains_key(id) {
             self.stop(id);
         } else {
             self.waiting.remove(id);

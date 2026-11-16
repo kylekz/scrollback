@@ -99,6 +99,7 @@ fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
     sb_ui::services::init(
         ServicesConfig {
             settings,
+            mode_override: cli.theme,
             providers: sb_core::provider::builtin(),
             reach,
         },

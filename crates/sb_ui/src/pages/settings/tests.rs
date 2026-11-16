@@ -1,6 +1,6 @@
 //! Settings' sections (DESIGN §4.13), each through the shell as the owner uses it.
 
-use gpui::{Entity, Focusable as _, Modifiers, TestAppContext, VisualTestContext, size};
+use gpui::{Entity, Focusable as _, Modifiers, TestAppContext, VisualTestContext, px, size};
 use pretty_assertions::assert_eq;
 use sb_core::catalogue::Shelf;
 
@@ -10,7 +10,9 @@ use crate::pages::Showing;
 use crate::services::SyncEvery;
 use crate::shell::Shell;
 use crate::system::{self, SystemRequest, SystemShell};
-use crate::test_support::{archive_dir, bounds, open_shell, open_shell_sized};
+use crate::test_support::{
+    archive_dir, bounds, init, machine, open_shell, open_shell_sized, open_window,
+};
 
 fn showing(cx: &mut VisualTestContext) -> Showing {
     cx.update(|_, cx| Showing::now(cx))
@@ -81,6 +83,21 @@ fn the_list_picks_the_section_at_the_top_of_the_column(cx: &mut TestAppContext) 
     let top = bounds(cx, "settings-nav-appearance").unwrap();
     assert!(top.size.height > px(0.));
 
+    /* A section in the middle sits where the first one does, below the column's top padding,
+    and the list still picks it once the column is scrolled by hand. */
+    let column = bounds(cx, "settings-column").unwrap();
+    click(cx, "settings-nav-sync");
+    assert_eq!(current(cx), Section::Sync);
+    let sync = bounds(cx, "settings-section-sync").unwrap();
+    assert_eq!(sync.top() - column.top(), px(24.));
+    page.update(cx, |page, cx| {
+        page.picked = None;
+        cx.notify();
+    });
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    assert_eq!(current(cx), Section::Sync);
+
     /* Scrolled by hand, the list follows the column: at its end, the last section. */
     page.update(cx, |page, cx| {
         page.picked = None;
@@ -148,11 +165,70 @@ fn a_different_folder_is_confirmed_before_the_app_moves_onto_it(cx: &mut TestApp
             std::path::absolute(&new).unwrap()
         );
     });
-    /* The shell drew the other archive's sidebar and page: nothing of the last one shows. */
-    assert!(
-        bounds(cx, "titlebar-settings").is_none(),
-        "the first run has no Settings"
-    );
+
+    /* The first run in a folder the owner chose keeps the way back to Settings, to choose
+    another: the gear and Ctrl ,. */
+    assert!(bounds(cx, "titlebar-settings").is_some());
+    assert!(bounds(cx, "titlebar-sync-all").is_none());
+    click(cx, "titlebar-settings");
+    assert_eq!(showing(cx), Showing::Settings);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(showing(cx), Showing::FirstRun);
+    cx.simulate_keystrokes("secondary-,");
+    cx.run_until_parked();
+    assert_eq!(showing(cx), Showing::Settings);
+}
+
+/// Another folder chosen while a sync and a verify run on the archive open: both are stopped,
+/// the window's pages and sidebar move onto the new archive, and nothing keeps the one left
+/// open.
+#[gpui::test]
+fn a_switch_while_a_sync_and_a_verify_run_lets_the_archive_left_go(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_settings(cx);
+    let left = cx.update(|_, cx| {
+        std::sync::Arc::downgrade(cx.services().archive.read(cx).archive().unwrap())
+    });
+    let elsewhere = tempfile::tempdir().unwrap();
+    let new = elsewhere.path().join("archive");
+    cx.update(|_, cx| {
+        let services = cx.services();
+        let (sync, upkeep, settings) = (
+            services.sync.clone(),
+            services.upkeep.clone(),
+            services.settings.clone(),
+        );
+        sync.update(cx, |sync, cx| sync.sync_all(cx));
+        upkeep.update(cx, |upkeep, cx| upkeep.verify(cx));
+        assert!(sync.read(cx).is_syncing());
+        assert!(upkeep.read(cx).verifying().is_some());
+        settings.update(cx, |settings, cx| settings.use_folder(new.clone(), cx));
+    });
+    for _ in 0..20 {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+    }
+    assert!(new.join("archive.json").is_file());
+    assert_eq!(showing(cx), Showing::FirstRun);
+    assert!(left.upgrade().is_none(), "the archive left is still open");
+    /* The window still draws, over the new archive. */
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    assert!(bounds(cx, "titlebar-settings").is_some());
+}
+
+/// The first run in the data folder's archive offers no Settings: there is nothing to choose
+/// yet, and the first run says where the archive goes.
+#[gpui::test]
+fn the_first_run_in_the_data_folder_has_no_settings(cx: &mut TestAppContext) {
+    init(machine(), cx);
+    let (_shell, cx) = open_window(size(px(1440.), px(900.)), cx);
+    assert_eq!(showing(cx), Showing::FirstRun);
+    assert!(bounds(cx, "titlebar-settings").is_none());
+    cx.simulate_keystrokes("secondary-,");
+    cx.run_until_parked();
+    assert_eq!(showing(cx), Showing::FirstRun);
 }
 
 #[gpui::test]
@@ -240,6 +316,39 @@ fn stale_after_takes_whole_days_within_its_range(cx: &mut TestAppContext) {
             shown
         );
     }
+
+    /* Typed and left without Enter: by Back and `Esc`, and by losing the keyboard. (`Alt ←`
+    moves by a word in the field.) */
+    let mut typed = 20;
+    /* Focus is lost only in a window that is active. */
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+    for leave in ["blur", "back", "escape"] {
+        typed += 1;
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.set_value(typed.to_string(), window, cx)
+            });
+            input.read(cx).focus_handle(cx).focus(window, cx);
+        });
+        cx.run_until_parked();
+        match leave {
+            "back" => click(cx, "settings-back"),
+            "blur" => {
+                cx.update(|window, cx| window.blur(cx));
+                cx.run_until_parked();
+            }
+            keys => {
+                cx.simulate_keystrokes(keys);
+                cx.run_until_parked();
+            }
+        }
+        assert_eq!(days(cx), typed, "{leave}");
+        if showing(cx) != Showing::Settings {
+            cx.simulate_keystrokes("secondary-,");
+            cx.run_until_parked();
+        }
+    }
 }
 
 #[gpui::test]
@@ -321,8 +430,8 @@ fn a_dialog_over_settings_keeps_the_keyboard(cx: &mut TestAppContext) {
     let page = page(&shell, cx);
     cx.update(|window, cx| {
         assert!(
-            page.read(cx).confirm_focus.is_focused(window),
-            "the dialog has the keyboard"
+            page.read(cx).cancel_focus.is_focused(window),
+            "the dialog has the keyboard, on Cancel"
         );
     });
     cx.simulate_keystrokes("secondary-l");

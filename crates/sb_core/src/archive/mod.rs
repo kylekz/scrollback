@@ -48,8 +48,12 @@ pub use items::ArchivedSession;
 pub(crate) use layout::item_folder;
 pub use segment::{Problem, SEGMENT_BYTES, VersionReader};
 pub(crate) use segment::{RangeWriter, Sealed};
-pub use stats::{ArchiveStats, Holds, open_or_make, what_is_in};
-pub use verify::{Damage, LastVerify, Unread, VerifyProgress, VerifyReport};
+pub use stats::{ArchiveStats, Holds, id_in, open_or_make, what_is_in};
+pub(crate) use verify::LAST_VERIFY_VERSION;
+pub use verify::{
+    Damage, DamageKind, DamageRecord, KEPT_DAMAGES, LastVerify, Unread, VerifyProgress,
+    VerifyReport,
+};
 
 /// The layout this build writes, in `archive.json`.
 const FORMAT: u32 = 1;
@@ -129,9 +133,14 @@ pub enum ArchiveError {
     UnknownVersion(i64),
     #[error("verify was cancelled")]
     Cancelled,
-    /// A session is not deleted for good while its location is being synced.
+    /// A session is not deleted for good, nor its tombstone put back, while its location is
+    /// being synced.
     #[error("location {0} is being synced")]
     Syncing(LocationId),
+    /// An archive is not made inside another, nor around one (PLAN §4.4): opening the outer
+    /// would empty the inner's `tmp/`, and a sync of either could reach the other's files.
+    #[error("{} is inside the archive in {}, or holds one", .dir.display(), .other.display())]
+    Nested { dir: PathBuf, other: PathBuf },
     #[error(transparent)]
     Catalogue(#[from] CatalogueError),
     #[error(transparent)]
@@ -201,6 +210,12 @@ impl Archive {
     /// nor what is left of one.
     pub fn create(dir: &Path) -> Result<Self> {
         let dir = &absolute(dir)?;
+        if let Some(other) = stats::archive_around(dir).or_else(|| stats::archive_within(dir)) {
+            return Err(ArchiveError::Nested {
+                dir: dir.to_path_buf(),
+                other,
+            });
+        }
         fs::create_dir_all(dir).map_err(io_error("create", dir))?;
         let lock = lock(dir)?;
         let manifest_path = dir.join(layout::MANIFEST);

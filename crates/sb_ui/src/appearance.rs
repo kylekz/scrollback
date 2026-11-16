@@ -19,23 +19,34 @@ pub use gpui_appearance::{MaterialSupport, Mode};
 
 use crate::theme::{self, Material};
 
-/// The material scrollback asks for (DESIGN §3): Mica on Windows, None on macOS, where vibrancy
-/// is a choice.
-pub fn default_material() -> Material {
-    if cfg!(windows) {
+/**
+ * The material scrollback asks for until the owner chooses one (DESIGN §3): on Windows Mica,
+ * or Acrylic where the build has no Mica, or None where it has neither; None on macOS, where
+ * vibrancy is a choice.
+ */
+pub fn default_material(support: MaterialSupport) -> Material {
+    if !cfg!(windows) {
+        Material::Opaque
+    } else if support.mica {
         Material::Mica
+    } else if support.acrylic {
+        Material::Acrylic
     } else {
         Material::Opaque
     }
 }
 
-/// Starts following the OS in `mode` with `material` asked for, with `support` as the
-/// platform's abilities (from [`MaterialSupport::probe`]), and installs the resolved theme.
-pub fn init(support: MaterialSupport, mode: Mode, material: Material, cx: &mut App) {
+/// Starts following the OS in `mode` with `material` asked for (the platform's default when
+/// `None`), with `support` as the platform's abilities (from [`MaterialSupport::probe`]), and
+/// installs the resolved theme.
+pub fn init(support: MaterialSupport, mode: Mode, material: Option<Material>, cx: &mut App) {
     gpui_appearance::init(
         Setup {
             support,
-            preferences: Preferences { mode, material },
+            preferences: Preferences {
+                mode,
+                material: material.unwrap_or_else(|| default_material(support)),
+            },
             vibrancy: Vibrancy::default(),
         },
         cx,
@@ -67,14 +78,39 @@ mod tests {
         })
     }
 
+    /// Until the owner chooses, the material asked for is one the platform shows.
+    #[test]
+    fn the_default_material_is_one_the_platform_shows() {
+        let without_mica = MaterialSupport {
+            mica: false,
+            ..MaterialSupport::ALL
+        };
+        let expected = if cfg!(windows) {
+            [Material::Mica, Material::Acrylic, Material::Opaque]
+        } else {
+            [Material::Opaque; 3]
+        };
+        assert_eq!(
+            [
+                default_material(MaterialSupport::ALL),
+                default_material(without_mica),
+                default_material(MaterialSupport::OPAQUE_ONLY),
+            ],
+            expected
+        );
+    }
+
     #[gpui::test]
     fn system_mode_follows_the_os(cx: &mut TestAppContext) {
         cx.update(|cx| {
             crate::init(cx).unwrap();
-            init(MaterialSupport::ALL, Mode::System, default_material(), cx);
+            init(MaterialSupport::ALL, Mode::System, None, cx);
             gpui_appearance::set_system(Appearance::Light, cx);
         });
-        assert_eq!(on_screen(cx), (Appearance::Light, default_material()));
+        assert_eq!(
+            on_screen(cx),
+            (Appearance::Light, default_material(MaterialSupport::ALL))
+        );
         cx.update(|cx| gpui_appearance::set_system(Appearance::Dark, cx));
         assert_eq!(on_screen(cx).0, Appearance::Dark);
     }
@@ -83,7 +119,7 @@ mod tests {
     fn a_forced_mode_ignores_the_os(cx: &mut TestAppContext) {
         cx.update(|cx| {
             crate::init(cx).unwrap();
-            init(MaterialSupport::ALL, Mode::Light, default_material(), cx);
+            init(MaterialSupport::ALL, Mode::Light, None, cx);
             gpui_appearance::set_system(Appearance::Dark, cx);
         });
         assert_eq!(on_screen(cx).0, Appearance::Light);
@@ -93,12 +129,7 @@ mod tests {
     fn the_platform_narrows_the_material(cx: &mut TestAppContext) {
         cx.update(|cx| {
             crate::init(cx).unwrap();
-            init(
-                MaterialSupport::OPAQUE_ONLY,
-                Mode::System,
-                default_material(),
-                cx,
-            );
+            init(MaterialSupport::OPAQUE_ONLY, Mode::System, None, cx);
             gpui_appearance::set_preferences(
                 Preferences {
                     mode: Mode::System,

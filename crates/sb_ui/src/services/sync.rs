@@ -16,7 +16,9 @@
 //! whatever Settings says; the owner ([`SyncService::sync`], [`SyncService::sync_all`]); and
 //! while the app is open, every so often as Settings › Sync every says ([`SyncEvery`], every
 //! [`SYNC_INTERVAL`] until the owner says otherwise). A new interval counts from when it is
-//! chosen; "Only when I ask" leaves the start and the owner.
+//! chosen; "Only when I ask" leaves the start and the owner. When the next round is due is a
+//! time of the wall clock, looked at every [`ROUND_TICK`], so a round the machine slept
+//! through runs as soon as it wakes.
 //!
 //! **Stale** ([`SyncService::stale`]): after how many days without a good sync a location is
 //! stale is the archive's, kept in its catalogue's `kv`, and read with the locations.
@@ -45,6 +47,7 @@
 //! and index is told to stop.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
 #[cfg(any(test, feature = "automation"))]
 use std::sync::{Condvar, MutexGuard};
@@ -74,6 +77,9 @@ pub use sb_core::location::host_problem;
 /// How often every location is synced while the app is open until the owner chooses
 /// otherwise in Settings ([`SyncEvery`]'s default).
 pub const SYNC_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// How often the rounds look whether one is due (the module docs).
+pub const ROUND_TICK: Duration = Duration::from_secs(60);
 
 /// How often a running pass's progress is read.
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
@@ -367,7 +373,16 @@ pub struct SyncService {
     /// After how many days without a good sync a location is stale (the module docs).
     stale_after: u32,
     /// The items being fetched again, or last fetched again, and how that went.
-    refetches: HashMap<(LocationId, String, String), Refetch>,
+    refetches: HashMap<refetch::RefetchKey, Refetch>,
+    /// The locations fetching an item again, with what stops it.
+    refetching: HashMap<LocationId, CancelToken>,
+    /// Fetch all again, while it runs.
+    fetch_all: Option<refetch::FetchAll>,
+    /**
+     * Now, in Unix milliseconds, as the rounds count it: the wall clock, which goes on while
+     * the machine sleeps. In tests, gpui's clock, which they move.
+     */
+    clock: Rc<dyn Fn() -> i64>,
     /// Background jobs other than passes and indexes: reading and adding locations, looking
     /// at this machine.
     jobs: usize,
@@ -429,6 +444,9 @@ impl SyncService {
             closed: false,
             stale_after: STALE_AFTER_DAYS,
             refetches: HashMap::new(),
+            refetching: HashMap::new(),
+            fetch_all: None,
+            clock: clock(cx),
             jobs: 0,
             stop_index: CancelToken::new(),
             #[cfg(any(test, feature = "automation"))]
@@ -538,7 +556,7 @@ impl SyncService {
 
     /// Syncs every location `every` so often from now on, the first round that long from now.
     fn set_every(&mut self, every: SyncEvery, cx: &mut Context<Self>) {
-        if self.every != every {
+        if self.every != every && !self.closed {
             self.every = every;
             if self.started {
                 self.schedule(cx);
@@ -555,16 +573,22 @@ impl SyncService {
             self._interval = None;
             return;
         };
-        let next = move || Some(format::now() + interval.as_millis() as i64);
-        self.next_round = next();
+        let every = interval.as_millis() as i64;
+        self.next_round = Some((self.clock)() + every);
         self._interval = Some(cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(interval).await;
-                let synced = this.update(cx, |this, cx| {
-                    this.next_round = next();
-                    this.sync_all(cx);
+                cx.background_executor()
+                    .timer(ROUND_TICK.min(interval))
+                    .await;
+                let alive = this.update(cx, |this, cx| {
+                    let now = (this.clock)();
+                    if this.next_round.is_some_and(|due| now >= due) {
+                        this.next_round = Some(now + every);
+                        this.sync_all(cx);
+                        cx.notify();
+                    }
                 });
-                if synced.is_err() {
+                if alive.is_err() {
                     break;
                 }
             }
@@ -670,7 +694,7 @@ impl SyncService {
         if self.passes.contains_key(id) || self.removing.contains(id) || self.closed {
             return;
         }
-        if self.indexes.contains_key(&Some(id.clone())) {
+        if self.indexes.contains_key(&Some(id.clone())) || self.refetching.contains_key(id) {
             self.waiting.insert(id.clone());
             return;
         }
@@ -750,6 +774,11 @@ impl SyncService {
                         }
                         /* A stop before the plan was made left nothing that can be counted:
                         the location is as it was before the pass. */
+                        /* Something else held the location a moment (a delete for good): the
+                        pass didn't run, and the location is as it was. */
+                        Err(SyncError::Busy(_)) => {
+                            whole = false;
+                        }
                         Err(SyncError::Cancelled) => {
                             this.errors.remove(&id);
                             let left = *stopped_at.lock().unwrap_or_else(PoisonError::into_inner);
@@ -916,6 +945,10 @@ impl SyncService {
         for running in self.passes.values() {
             running.cancel.cancel();
         }
+        for cancel in self.refetching.values() {
+            cancel.cancel();
+        }
+        self.fetch_all = None;
         self.waiting.clear();
         #[cfg(any(test, feature = "automation"))]
         self.hold.release();
@@ -923,6 +956,7 @@ impl SyncService {
 
     /// Stops a location's pass at its next step. What it committed stays (PLAN §5).
     pub fn stop(&mut self, id: &LocationId) {
+        self.stop_refetch(id);
         if let Some(running) = self.passes.get(id) {
             running.cancel.cancel();
             #[cfg(any(test, feature = "automation"))]
@@ -988,6 +1022,20 @@ impl SyncService {
         })
         .detach();
     }
+}
+
+/// What the rounds take for now (`SyncService::clock`).
+#[cfg(not(test))]
+fn clock(_: &mut Context<SyncService>) -> Rc<dyn Fn() -> i64> {
+    Rc::new(format::now)
+}
+
+/// What the rounds take for now in tests: gpui's clock, from the wall clock's now.
+#[cfg(test)]
+fn clock(cx: &mut Context<SyncService>) -> Rc<dyn Fn() -> i64> {
+    let executor = cx.background_executor().clone();
+    let (start, base) = (executor.now(), format::now());
+    Rc::new(move || base + (executor.now() - start).as_millis() as i64)
 }
 
 impl Drop for SyncService {

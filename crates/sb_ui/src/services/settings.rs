@@ -5,14 +5,17 @@
 //! soon a location is stale, what verify found) is in its catalogue's `kv` instead and goes
 //! with the archive.
 //!
-//! **The file** is `{"v": 1, "archive": …, "mode": …, "material": …, "sync_every": …}`, as
-//! dv keeps its own (`archive` only once another folder was chosen). It is read leniently: a
-//! missing key takes its default, a value that can't be read is logged and takes its default,
-//! and keys this version doesn't know are written back as they were. A file that is there
-//! and can't be read at all is never written over this session: it may be a newer
-//! scrollback's. A change is written at once in the background through a temporary file and a
-//! rename, so a crash never leaves half a file; one made while a write runs is written after
-//! it, and what is unwritten when the app quits is written then.
+//! **The file** is `{"v": 1, "archive": …, "mode": …, "material": …, "sync_every": …,
+//! "last_archive": {"id", "opened", "sessions", "bytes"}}`, as dv keeps its own (`archive`
+//! and `material` only once the owner chose them). A missing key takes its default, a value
+//! that can't be read is logged and takes its default, and keys this version doesn't know are
+//! written back as they were. But a file that is there and can't be read at all (not JSON, a
+//! newer version's, an archive folder that isn't a full path) is not guessed at: no archive is
+//! opened or made, the archive-unavailable page says why (DESIGN §4.14), and the file is not
+//! written until the owner chooses an archive there. The folder is always written in full. A
+//! change is written at once in the background through a temporary file and a rename, so a
+//! crash never leaves half a file; one made while a write runs is written after it. A write
+//! that fails is said in Settings and tried again with the next change and when the app quits.
 //!
 //! **The service** also says whether Settings is shown in the main area, and carries out
 //! **Use a different folder…** ([`SettingsService::use_folder`]): the archive there is opened,
@@ -20,7 +23,7 @@
 //! moved onto it ([`super::reopen`]); a folder that holds anything else is refused. Nothing is
 //! moved, and the archive left stays as it is.
 
-use std::io::Write as _;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +33,7 @@ use sb_core::archive::{self, Archive};
 use serde_json::{Map, Value, json};
 
 use super::ActiveServices as _;
-use crate::appearance::{Mode, default_material};
+use crate::appearance::Mode;
 use crate::theme::Material;
 
 /// The settings file in the data dir.
@@ -101,48 +104,84 @@ impl SyncEvery {
     }
 }
 
+/// The archive the app last had open (DESIGN §4.14: what the archive-unavailable page shows):
+/// its id, when it was opened, and what it held then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastArchive {
+    pub id: String,
+    /// In Unix milliseconds.
+    pub opened: i64,
+    pub sessions: usize,
+    /// Its size on disk, once Settings has measured it.
+    pub bytes: Option<u64>,
+}
+
+impl LastArchive {
+    fn parse(value: &Value) -> Option<Self> {
+        Some(Self {
+            id: value.get("id")?.as_str()?.to_string(),
+            opened: value.get("opened")?.as_i64()?,
+            sessions: usize::try_from(value.get("sessions")?.as_u64()?).ok()?,
+            bytes: value.get("bytes").and_then(Value::as_u64),
+        })
+    }
+
+    fn to_json(&self) -> Value {
+        let mut object = json!({
+            "id": self.id,
+            "opened": self.opened,
+            "sessions": self.sessions,
+        });
+        if let (Some(bytes), Some(fields)) = (self.bytes, object.as_object_mut()) {
+            fields.insert("bytes".to_string(), json!(bytes));
+        }
+        object
+    }
+}
+
 /// The settings file's contents.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct AppSettings {
     /// The archive's folder, once the owner chose one; until then the data dir's.
     pub archive: Option<PathBuf>,
     pub mode: Mode,
-    /// The material asked for; the platform may show None instead (`crate::appearance`).
-    pub material: Material,
+    /// The material asked for, once the owner chose one; until then the platform's best
+    /// (`crate::appearance::default_material`). The platform may show None instead.
+    pub material: Option<Material>,
     pub sync_every: SyncEvery,
+    /// The archive last opened.
+    pub last: Option<LastArchive>,
     /// Keys this version doesn't know, written back as they were read.
     extra: Map<String, Value>,
 }
 
-impl Default for AppSettings {
-    fn default() -> Self {
-        Self {
-            archive: None,
-            mode: Mode::System,
-            material: default_material(),
-            sync_every: SyncEvery::default(),
-            extra: Map::new(),
-        }
-    }
-}
-
 impl AppSettings {
-    /// Reads `text` leniently (the module docs): the settings, and a line for each thing that
-    /// couldn't be read.
-    pub fn parse(text: &str) -> (Self, Vec<String>) {
+    /**
+     * Reads `text` (the module docs): the settings, and a line for each value that couldn't be
+     * read and takes its default. `Err` says why the file can't be read at all: it isn't a JSON
+     * object, it is a newer version's, or its archive folder can't be read.
+     */
+    pub fn parse(text: &str) -> Result<(Self, Vec<String>), String> {
         let mut settings = Self::default();
         let mut problems = Vec::new();
-        let mut object = match serde_json::from_str::<Value>(text) {
-            Ok(Value::Object(object)) => object,
-            _ => {
-                problems.push("the file isn't a JSON object; using the defaults".to_string());
-                return (settings, problems);
-            }
+        let Ok(Value::Object(mut object)) = serde_json::from_str::<Value>(text) else {
+            return Err("it isn't a JSON object".to_string());
         };
-        if let Some(v) = object.remove("v")
-            && v.as_u64().is_none_or(|v| v > VERSION)
-        {
-            problems.push(format!("\"v\" is {v}; reading the keys this version knows"));
+        match object.remove("v").map(|v| (v.as_u64(), v)) {
+            None | Some((Some(VERSION), _)) => {}
+            Some((Some(v), _)) if v > VERSION => {
+                return Err(format!(
+                    "it was written by a newer scrollback (version {v})"
+                ));
+            }
+            Some((_, v)) => return Err(format!("its version, {v}, isn't one")),
+        }
+        if let Some(archive) = object.remove("archive") {
+            /* A relative folder would be found from wherever the app was started. */
+            match archive.as_str().map(PathBuf::from) {
+                Some(path) if path.is_absolute() => settings.archive = Some(path),
+                _ => return Err(format!("its archive folder, {archive}, isn't a full path")),
+            }
         }
         let mut read = |key: &str, ok: &mut dyn FnMut(&str) -> bool| {
             if let Some(value) = object.remove(key)
@@ -151,10 +190,6 @@ impl AppSettings {
                 problems.push(format!("\"{key}\" is {value}; using its default"));
             }
         };
-        read("archive", &mut |path| {
-            settings.archive = (!path.is_empty()).then(|| PathBuf::from(path));
-            settings.archive.is_some()
-        });
         read("mode", &mut |key| {
             Mode::from_key(key)
                 .map(|mode| settings.mode = mode)
@@ -162,7 +197,7 @@ impl AppSettings {
         });
         read("material", &mut |key| {
             Material::from_key(key)
-                .map(|material| settings.material = material)
+                .map(|material| settings.material = Some(material))
                 .is_some()
         });
         read("sync_every", &mut |key| {
@@ -170,8 +205,14 @@ impl AppSettings {
                 .map(|every| settings.sync_every = every)
                 .is_some()
         });
+        if let Some(last) = object.remove("last_archive") {
+            settings.last = LastArchive::parse(&last);
+            if settings.last.is_none() {
+                problems.push(format!("\"last_archive\" is {last}; forgetting it"));
+            }
+        }
         settings.extra = object;
-        (settings, problems)
+        Ok((settings, problems))
     }
 
     /// The file's text: pretty JSON with a trailing newline, `v` and the known keys first.
@@ -182,8 +223,13 @@ impl AppSettings {
             object.insert("archive".to_string(), json!(archive.display().to_string()));
         }
         object.insert("mode".to_string(), json!(self.mode.key()));
-        object.insert("material".to_string(), json!(self.material.key()));
+        if let Some(material) = self.material {
+            object.insert("material".to_string(), json!(material.key()));
+        }
         object.insert("sync_every".to_string(), json!(self.sync_every.key()));
+        if let Some(last) = &self.last {
+            object.insert("last_archive".to_string(), last.to_json());
+        }
         object.extend(self.extra.clone());
         let mut text = serde_json::to_string_pretty(&Value::Object(object))
             .expect("a map of text always serializes");
@@ -197,49 +243,51 @@ impl AppSettings {
 pub struct Loaded {
     pub data_dir: PathBuf,
     pub settings: AppSettings,
-    /// Set when a file is there that couldn't be read: it is not written over this session,
-    /// and this says why.
-    pub unsaveable: Option<String>,
+    /**
+     * Set when a file is there that can't be read, and why: no archive is opened or made, and
+     * the file is not written, until the owner chooses one (the module docs).
+     */
+    pub unreadable: Option<String>,
 }
 
-/// Reads the settings in `data_dir`: the defaults when there is no file, or one that can't be
-/// read (each problem logged).
+/// Reads the settings in `data_dir`: the defaults when there is no file. Each value that
+/// can't be read is logged.
 pub fn load(data_dir: &Path) -> Loaded {
     let path = data_dir.join(SETTINGS_FILE);
-    let loaded = |settings, unsaveable| Loaded {
+    let read = match std::fs::read_to_string(&path) {
+        Ok(text) => AppSettings::parse(&text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok((AppSettings::default(), Vec::new()))
+        }
+        Err(error) => Err(error.to_string()),
+    };
+    let (settings, unreadable) = match read {
+        Ok((settings, problems)) => {
+            for problem in problems {
+                log::warn!("{}: {problem}", path.display());
+            }
+            (settings, None)
+        }
+        Err(why) => {
+            log::error!("{} can't be read: {why}", path.display());
+            (
+                AppSettings::default(),
+                Some(format!("{}: {why}.", path.display())),
+            )
+        }
+    };
+    Loaded {
         data_dir: data_dir.to_path_buf(),
         settings,
-        unsaveable,
-    };
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return loaded(AppSettings::default(), None);
-        }
-        Err(error) => {
-            log::warn!("{} couldn't be read: {error}", path.display());
-            return loaded(
-                AppSettings::default(),
-                Some(format!("{} couldn't be read ({error})", path.display())),
-            );
-        }
-    };
-    let unsaveable = match serde_json::from_str::<Value>(&text) {
-        Ok(Value::Object(_)) => None,
-        _ => Some(format!(
-            "{} isn't a settings file this scrollback can read",
-            path.display()
-        )),
-    };
-    let (settings, problems) = AppSettings::parse(&text);
-    for problem in problems {
-        log::warn!("{}: {problem}", path.display());
+        unreadable,
     }
-    loaded(settings, unsaveable)
 }
 
-/// Writes `contents` to `path` through a temporary file beside it and a rename, so a reader sees
-/// the old file or the new one, never part of one.
+/**
+ * Writes `contents` to `path` through a temporary file beside it and a rename, so a reader sees
+ * the old file or the new one, never part of one; on Unix the folder is flushed after, so the
+ * rename itself survives a crash.
+ */
 fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
@@ -247,6 +295,8 @@ fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
     temporary.as_file().write_all(contents.as_bytes())?;
     temporary.as_file().sync_all()?;
     temporary.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
@@ -270,13 +320,17 @@ pub struct SettingsService {
     settings: AppSettings,
     path: PathBuf,
     data_dir: PathBuf,
-    unsaveable: Option<String>,
-    /// Bumped by every change; the write in flight takes the newest.
+    /// Why the file can't be read, until the owner chooses an archive ([`Loaded::unreadable`]).
+    unreadable: Option<String>,
+    /// Light or dark for this run, whatever the settings say (`--theme`).
+    mode_override: Option<Mode>,
+    /// Bumped by every change; a write takes the newest.
     generation: u64,
-    /// The newest generation written, or that failed to be.
+    /// The newest generation written.
     written: u64,
     saving: Option<Task<()>>,
-    /// Why the last write failed, until one succeeds.
+    /// Why the last write failed, until one succeeds. What is unwritten is tried again with
+    /// the next change, and at quit.
     save_failure: Option<String>,
     /// Whether Settings is shown in the main area.
     shown: bool,
@@ -287,12 +341,14 @@ pub struct SettingsService {
 impl EventEmitter<SettingsEvent> for SettingsService {}
 
 impl SettingsService {
-    pub fn new(loaded: Loaded, cx: &mut Context<Self>) -> Self {
+    /// The settings `loaded`, with `mode_override` for light or dark this run, if any.
+    pub fn new(loaded: Loaded, mode_override: Option<Mode>, cx: &mut Context<Self>) -> Self {
         Self {
             path: loaded.data_dir.join(SETTINGS_FILE),
             data_dir: loaded.data_dir,
             settings: loaded.settings,
-            unsaveable: loaded.unsaveable,
+            unreadable: loaded.unreadable,
+            mode_override,
             generation: 0,
             written: 0,
             saving: None,
@@ -315,14 +371,25 @@ impl SettingsService {
         self.data_dir.join(ARCHIVE_FOLDER)
     }
 
+    /// Whether the owner chose the archive's folder in Settings: then Settings can be opened
+    /// on a first run too, to choose another (DESIGN §4.13).
+    pub fn is_chosen(&self) -> bool {
+        self.settings.archive.is_some()
+    }
+
     /// Whether `dir` is the archive's default folder, however it is spelt.
     pub fn is_default(&self, dir: &Path) -> bool {
         resolved(dir) == resolved(&self.default_archive())
     }
 
-    /// Why the settings aren't being saved, when they aren't.
+    /// Why the settings file can't be read, while nothing has been chosen in its place.
+    pub fn unreadable(&self) -> Option<&str> {
+        self.unreadable.as_deref()
+    }
+
+    /// Why the last change to the settings wasn't saved, until one is.
     pub fn save_failure(&self) -> Option<&str> {
-        self.unsaveable.as_deref().or(self.save_failure.as_deref())
+        self.save_failure.as_deref()
     }
 
     pub fn is_shown(&self) -> bool {
@@ -341,9 +408,14 @@ impl SettingsService {
         self.switch.as_ref()
     }
 
+    /// Whether the app is moving onto another archive: nothing else is to be started.
+    pub fn is_switching(&self) -> bool {
+        matches!(self.switch, Some(Switch::Opening(_)))
+    }
+
     /// Nothing is being written or switched to: automation's `settled`.
     pub fn is_settled(&self) -> bool {
-        self.saving.is_none() && !matches!(self.switch, Some(Switch::Opening(_)))
+        self.saving.is_none() && !self.is_switching()
     }
 
     pub fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
@@ -354,20 +426,20 @@ impl SettingsService {
     }
 
     pub fn set_material(&mut self, material: Material, cx: &mut Context<Self>) {
-        if self.settings.material != material {
-            self.settings.material = material;
+        if self.settings.material != Some(material) {
+            self.settings.material = Some(material);
             self.apply_appearance(cx);
         }
     }
 
+    /// Puts the appearance asked for in place, `--theme`'s mode over the setting's, and keeps it.
     fn apply_appearance(&mut self, cx: &mut Context<Self>) {
-        gpui_appearance::set_preferences(
-            gpui_appearance::Preferences {
-                mode: self.settings.mode,
-                material: self.settings.material,
-            },
-            cx,
-        );
+        let mut preferences = gpui_appearance::state(cx).preferences();
+        preferences.mode = self.mode_override.unwrap_or(self.settings.mode);
+        if let Some(material) = self.settings.material {
+            preferences.material = material;
+        }
+        gpui_appearance::set_preferences(preferences, cx);
         self.changed(cx);
     }
 
@@ -378,31 +450,66 @@ impl SettingsService {
         }
     }
 
+    /// Keeps what the archive just opened is, for the archive-unavailable page (DESIGN §4.14).
+    pub fn remember(&mut self, id: String, sessions: usize, cx: &mut Context<Self>) {
+        let bytes = self
+            .settings
+            .last
+            .as_ref()
+            .filter(|last| last.id == id)
+            .and_then(|last| last.bytes);
+        self.settings.last = Some(LastArchive {
+            id,
+            opened: crate::format::now(),
+            sessions,
+            bytes,
+        });
+        self.changed(cx);
+    }
+
+    /// Keeps how big the archive open now is, once Settings has measured it.
+    pub fn remember_size(&mut self, id: &str, bytes: u64, cx: &mut Context<Self>) {
+        if let Some(last) = self.settings.last.as_mut().filter(|last| last.id == id)
+            && last.bytes != Some(bytes)
+        {
+            last.bytes = Some(bytes);
+            self.changed(cx);
+        }
+    }
+
+    /**
+     * Why `folder` can't be the archive's at all, before it is looked into: the archive open
+     * now, or a folder inside it. With no archive open, any folder may be tried.
+     */
+    pub fn refusal(&self, folder: &Path, cx: &gpui::App) -> Option<&'static str> {
+        let archive = cx.services().archive.read(cx);
+        archive.archive()?;
+        let (current, chosen) = (resolved(archive.dir()), resolved(folder));
+        if chosen == current {
+            Some("That is the archive open now.")
+        } else if chosen.starts_with(&current) {
+            Some("That folder is inside the archive open now. Choose one outside it.")
+        } else {
+            None
+        }
+    }
+
     /**
      * Opens the archive in `folder`, or makes one there when it holds nothing, and moves the
      * app onto it (the module docs). The folder the app is on already, and one inside it, are
-     * refused; so is one that holds anything but an archive, and one whose archive doesn't
-     * open: the app then stays where it is.
+     * refused ([`Self::refusal`]); so is one that holds anything but an archive, and one whose
+     * archive doesn't open: the app then stays where it is. It works with no archive open too:
+     * that is how the archive-unavailable page moves on (DESIGN §4.14).
      */
     pub fn use_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
-        if matches!(self.switch, Some(Switch::Opening(_))) {
+        if self.is_switching() {
             return;
         }
-        let current = resolved(cx.services().archive.read(cx).dir());
-        let refused = |why: &str| Switch::Refused {
-            folder: folder.clone(),
-            why: why.to_string(),
-        };
-        let chosen = resolved(&folder);
-        if chosen == current {
-            self.switch = Some(refused("That is the archive open now."));
-            cx.notify();
-            return;
-        }
-        if chosen.starts_with(&current) {
-            self.switch = Some(refused(
-                "That folder is inside the archive open now. Choose one outside it.",
-            ));
+        if let Some(why) = self.refusal(&folder, cx) {
+            self.switch = Some(Switch::Refused {
+                folder,
+                why: why.to_string(),
+            });
             cx.notify();
             return;
         }
@@ -415,11 +522,11 @@ impl SettingsService {
         cx.spawn(async move |this, cx| {
             let opened = opening.await;
             this.update(cx, |this, cx| match opened {
-                Ok(archive) => this.reopen(folder, archive, cx),
+                Ok(archive) => this.reopen(archive, cx),
                 Err(error) => {
                     log::warn!("{} wasn't opened as the archive: {error}", folder.display());
                     this.switch = Some(Switch::Refused {
-                        why: refusal(&folder, &error),
+                        why: why_refused(&folder, &error),
                         folder,
                     });
                     cx.notify();
@@ -431,14 +538,16 @@ impl SettingsService {
     }
 
     /// Moves the app onto `archive`, opened in `folder`, and keeps that as the archive's
-    /// folder once it is there.
-    fn reopen(&mut self, folder: PathBuf, archive: Archive, cx: &mut Context<Self>) {
+    /// folder once it is there: the settings file is written from then on, whatever it held.
+    fn reopen(&mut self, archive: Archive, cx: &mut Context<Self>) {
+        let folder = archive.dir().to_path_buf();
         let moving = super::reopen(Arc::new(archive), cx);
         cx.spawn(async move |this, cx| {
             moving.await;
             this.update(cx, |this, cx| {
                 this.switch = None;
                 this.shown = false;
+                this.unreadable = None;
                 this.settings.archive = (!this.is_default(&folder)).then_some(folder);
                 this.changed(cx);
             })
@@ -463,9 +572,9 @@ impl SettingsService {
     }
 
     /// Writes the settings as they are now unless a write runs; that one writes again when it
-    /// ends, if they changed meanwhile.
+    /// ends, if they changed meanwhile. One that fails is tried again with the next change.
     fn save(&mut self, cx: &mut Context<Self>) {
-        if self.saving.is_some() || self.written == self.generation || self.unsaveable.is_some() {
+        if self.saving.is_some() || self.written == self.generation || self.unreadable.is_some() {
             return;
         }
         let (path, generation, text) =
@@ -475,12 +584,17 @@ impl SettingsService {
             let written = write.await;
             this.update(cx, |this, cx| {
                 this.saving = None;
-                this.written = generation;
-                this.save_failure = written.err().map(|error| {
-                    log::error!("the settings couldn't be saved: {error}");
-                    format!("Settings couldn't be saved: {error}.")
-                });
-                this.save(cx);
+                match written {
+                    Ok(()) => {
+                        this.written = generation;
+                        this.save_failure = None;
+                        this.save(cx);
+                    }
+                    Err(error) => {
+                        log::error!("the settings couldn't be saved: {error}");
+                        this.save_failure = Some(error.to_string());
+                    }
+                }
                 cx.notify();
             })
             .ok();
@@ -489,11 +603,11 @@ impl SettingsService {
 
     /// Writes what is unwritten, now: the app is quitting.
     fn flush(&mut self) {
-        if self.written != self.generation && self.unsaveable.is_none() {
-            if let Err(error) = write_atomically(&self.path, &self.settings.to_json()) {
-                log::error!("the settings couldn't be saved at quit: {error}");
+        if self.written != self.generation && self.unreadable.is_none() {
+            match write_atomically(&self.path, &self.settings.to_json()) {
+                Ok(()) => self.written = self.generation,
+                Err(error) => log::error!("the settings couldn't be saved at quit: {error}"),
             }
-            self.written = self.generation;
         }
     }
 }
@@ -522,15 +636,35 @@ fn resolved(path: &Path) -> PathBuf {
 }
 
 /// Why `folder` wasn't taken as the archive, for the owner.
-fn refusal(folder: &Path, error: &archive::ArchiveError) -> String {
+pub fn why_refused(folder: &Path, error: &archive::ArchiveError) -> String {
     match error {
         archive::ArchiveError::NotAnArchive(_) => format!(
             "{} holds other files, so no archive is made there. Choose an archive's folder or \
              an empty one.",
             folder.display()
         ),
+        archive::ArchiveError::Nested { other, .. } => format!(
+            "{} is inside the archive in {}, or holds one, so no archive is made there.",
+            folder.display(),
+            other.display()
+        ),
         archive::ArchiveError::Locked(_) => {
             "The archive there is open in another scrollback window.".to_string()
+        }
+        /* The system's own words stay in the log. */
+        archive::ArchiveError::Io { .. } if folder.is_file() => {
+            "That's a file, not a folder.".to_string()
+        }
+        archive::ArchiveError::Io { source, .. }
+            if matches!(
+                source.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            "scrollback can't write to that folder.".to_string()
+        }
+        archive::ArchiveError::Io { action, path, .. } => {
+            format!("scrollback couldn't {action} {}.", path.display())
         }
         error => format!("It couldn't be opened: {error}."),
     }
@@ -545,44 +679,74 @@ mod tests {
     #[test]
     fn the_file_round_trips_and_keeps_what_it_doesnt_know() {
         let settings = AppSettings {
-            archive: Some(PathBuf::from("D:/Archive")),
+            archive: Some(PathBuf::from(if cfg!(windows) {
+                r"D:\Archive"
+            } else {
+                "/home/user/Archive"
+            })),
             mode: Mode::Dark,
-            material: Material::Acrylic,
+            material: Some(Material::Acrylic),
             sync_every: SyncEvery::Sixty,
+            last: Some(LastArchive {
+                id: "a3f061c2".to_string(),
+                opened: 1_791_115_200_000,
+                sessions: 2318,
+                bytes: Some(4_400_000_000),
+            }),
             ..AppSettings::default()
         };
-        let (read, problems) = AppSettings::parse(&settings.to_json());
-        assert_eq!((read, problems), (settings, Vec::<String>::new()));
+        assert_eq!(
+            AppSettings::parse(&settings.to_json()),
+            Ok((settings, Vec::new()))
+        );
 
         let (read, _) =
-            AppSettings::parse(r#"{"v": 1, "mode": "light", "window": {"x": 4}, "newer": true}"#);
+            AppSettings::parse(r#"{"v": 1, "mode": "light", "window": {"x": 4}, "newer": true}"#)
+                .unwrap();
         assert_eq!(read.mode, Mode::Light);
         let written: Value = serde_json::from_str(&read.to_json()).unwrap();
         assert_eq!(written["window"], json!({"x": 4}));
         assert_eq!(written["newer"], json!(true));
-        /* The default folder isn't written: it is the data dir's wherever that is. */
+        /* Neither the default folder nor the platform's material is written down as chosen. */
         assert_eq!(written.get("archive"), None);
+        assert_eq!(written.get("material"), None);
     }
 
     #[test]
-    fn what_cant_be_read_takes_its_default() {
+    fn a_value_that_cant_be_read_takes_its_default() {
         let (read, problems) = AppSettings::parse(
-            r#"{"v": 1, "mode": "sepia", "material": 3, "sync_every": "hourly", "archive": ""}"#,
-        );
+            r#"{"v": 1, "mode": "sepia", "material": 3, "sync_every": "hourly", "last_archive": 7}"#,
+        )
+        .unwrap();
         assert_eq!(read, AppSettings::default());
         assert_eq!(problems.len(), 4, "{problems:?}");
-        let (read, problems) = AppSettings::parse("[1, 2]");
-        assert_eq!(read, AppSettings::default());
-        assert_eq!(problems.len(), 1);
+    }
+
+    /// What says where the archive is, or what the file is, is never guessed at: an archive
+    /// folder given relative would be found from wherever the app was started.
+    #[test]
+    fn a_file_whose_archive_or_version_cant_be_read_is_not_read_at_all() {
+        for text in [
+            "[1, 2]",
+            "not json",
+            r#"{"v": 2, "mode": "dark"}"#,
+            r#"{"v": "one"}"#,
+            r#"{"v": 1, "archive": ""}"#,
+            r#"{"v": 1, "archive": 3}"#,
+            r#"{"v": 1, "archive": "Archive"}"#,
+            r#"{"v": 1, "archive": "../scrollback/archive"}"#,
+        ] {
+            assert!(AppSettings::parse(text).is_err(), "{text}");
+        }
     }
 
     #[test]
     fn a_file_that_cant_be_read_is_never_written_over() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load(dir.path()).unsaveable, None);
-        std::fs::write(dir.path().join(SETTINGS_FILE), "not json").unwrap();
+        assert_eq!(load(dir.path()).unreadable, None);
+        std::fs::write(dir.path().join(SETTINGS_FILE), r#"{"v": 1, "archive": 3}"#).unwrap();
         let loaded = load(dir.path());
-        assert!(loaded.unsaveable.is_some());
+        assert!(loaded.unreadable.is_some());
         assert_eq!(loaded.settings, AppSettings::default());
     }
 

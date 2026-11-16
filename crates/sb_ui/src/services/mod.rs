@@ -47,7 +47,7 @@ use sb_core::provider::Provider;
 use sb_core::transport::wsl::Distro;
 use sb_core::transport::{Launcher, Probe, ShellTransport, Transport, TransportError};
 
-pub use archive::{ArchiveService, ArchiveState};
+pub use archive::{ArchiveService, ArchiveState, Failure};
 pub use drag::{DragState, Dragged, DropTarget, Verdict};
 pub use library::{
     Leave, LibraryService, Month, Page, PathChip, SessionsPage, Stats, Toast, TypedPath,
@@ -94,6 +94,8 @@ pub struct ServicesConfig {
     /// The app's settings, read from its data dir ([`settings::load`]): they say where the
     /// archive is (PLAN §4.4).
     pub settings: settings::Loaded,
+    /// Light or dark for this run whatever the settings say (`--theme`), if asked for.
+    pub mode_override: Option<crate::appearance::Mode>,
     /// The providers of the agents to archive (`sb_core::provider::builtin`).
     pub providers: Vec<Box<dyn Provider>>,
     /// How each kind of location is reached and tested, and how WSL's distros are listed.
@@ -132,16 +134,19 @@ impl Services {
 
 /// Builds the services, which starts opening the archive, and installs them as a global.
 pub fn init(config: ServicesConfig, cx: &mut App) {
-    let (chosen, default) = (
+    let (chosen, default, unreadable) = (
         config.settings.settings.archive.clone(),
         config.settings.data_dir.join(settings::ARCHIVE_FOLDER),
+        config.settings.unreadable.clone(),
     );
-    let settings = cx.new(|cx| SettingsService::new(config.settings, cx));
+    let settings = cx.new(|cx| SettingsService::new(config.settings, config.mode_override, cx));
     /* An archive is made without asking only in its default place (PLAN D3): a folder the
-    owner chose that holds none now is one that can't be reached (PLAN §4.4). */
-    let archive = cx.new(|cx| match chosen {
-        Some(dir) => ArchiveService::new(dir, false, cx),
-        None => ArchiveService::new(default, true, cx),
+    owner chose that holds none now is one that can't be reached (PLAN §4.4). Settings that
+    can't be read say neither, so nothing is opened. */
+    let archive = cx.new(|cx| match (unreadable, chosen) {
+        (Some(why), _) => ArchiveService::unavailable(default, Failure::Settings(why)),
+        (None, Some(dir)) => ArchiveService::new(dir, false, cx),
+        (None, None) => ArchiveService::new(default, true, cx),
     });
     let services = build(
         settings,
@@ -188,10 +193,12 @@ const QUIET_TICK: Duration = Duration::from_millis(20);
 
 /**
  * Moves the app onto `archive`, open already (Settings › Use a different folder…, PLAN §4.4):
- * every pass, index and verify on the archive open now is stopped, and once nothing runs on
- * it, the services are made anew over `archive` and installed, which the views follow. The
- * archive left closes as the last of the services over it goes, and nothing writes to it
- * after. The task ends once the new services are in place.
+ * every pass, index, refetch and verify on the archive open now is stopped and nothing new
+ * starts on it; once nothing runs on it, and its background removal of deleted files is over
+ * (off the UI thread, so that closing it never waits there), the services are made anew over
+ * `archive` and installed, which the views follow. The archive left closes as the last of the
+ * services over it goes, and nothing writes to it after. The task ends once the new services
+ * are in place.
  */
 pub fn reopen(archive: Arc<Archive>, cx: &mut App) -> Task<()> {
     let services = cx.services();
@@ -201,11 +208,16 @@ pub fn reopen(archive: Arc<Archive>, cx: &mut App) -> Task<()> {
         services.reach.clone(),
     );
     let (sync, upkeep) = (services.sync.clone(), services.upkeep.clone());
+    let left = services.archive.read(cx).archive().cloned();
     sync.update(cx, |sync, cx| sync.close(cx));
-    upkeep.update(cx, |upkeep, _| upkeep.stop());
+    upkeep.update(cx, |upkeep, cx| upkeep.close(cx));
     cx.spawn(async move |cx| {
         while !cx.update(|cx| cx.services().is_quiet(cx)) {
             cx.background_executor().timer(QUIET_TICK).await;
+        }
+        if let Some(left) = left {
+            cx.background_spawn(async move { left.wait_for_removals() })
+                .await;
         }
         cx.update(|cx| {
             let archive = cx.new(|cx| ArchiveService::opened(archive, cx));

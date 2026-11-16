@@ -2,26 +2,36 @@
 //! what the last one found, and the sessions deleted for good.
 //!
 //! **Reads.** What Settings shows is read in one background job ([`UpkeepService::refresh`]):
-//! the archive's size, its last verify with what the archive holds now of each damaged item
-//! ([`Problem`]), and the tombstones ([`Deleted`]). It is read when Settings is shown, after a
-//! verify, and while Settings shows, whenever sync says the archive changed. Measuring walks
-//! the whole archive, so nothing reads it while Settings is not shown.
+//! the archive's size, its last verify with what the archive holds now of the damaged items
+//! shown ([`Problem`], [`PROBLEMS_PAGE`] at a time, so a verify that found thousands costs no
+//! more than one that found a few), and the tombstones ([`Deleted`]). It is read when Settings
+//! is shown, after a verify, and while Settings shows, whenever sync says the archive changed.
+//! Measuring walks the whole archive, so nothing reads it while Settings is not shown. The size
+//! measured is kept in the app's settings, for the page that says when the archive can't be
+//! reached (DESIGN §4.14).
 //!
 //! **Verify** runs on a background job with its progress read a few times a second, and
 //! stops at the next version when asked; a verify stopped keeps nothing (`sb_core`).
 //!
 //! **Deleted for good.** Allowing a session to be archived again removes its tombstone at once;
 //! the row stays, saying so, with Undo, until Settings is shown again. Undo puts the tombstone
-//! back, unless a sync has archived the session again since.
+//! back, unless a sync has archived the session again since, or its location is syncing now.
+//! Once a sync has archived it, the row says so, and offers no Undo. A row takes one change at
+//! a time.
+//!
+//! **Closing** ([`UpkeepService::close`]): when the app moves onto another archive, the
+//! verify running stops and nothing more is read, verified or written on this one.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use gpui::{AppContext as _, Context, Entity, Subscription, Task};
 use sb_core::CancelToken;
-use sb_core::archive::{Archive, ArchiveError, ArchiveStats, Damage, LastVerify, VerifyProgress};
+use sb_core::archive::{
+    Archive, ArchiveError, ArchiveStats, DamageRecord, LastVerify, VerifyProgress,
+};
 use sb_core::catalogue::{
-    AllowedAgain, CatalogueError, Filed, Reason, Session, SessionId, Tombstone,
+    AllowedAgain, CatalogueError, Filed, Folder, Reason, Session, SessionId, Tombstone,
 };
 use sb_core::location::Location;
 
@@ -31,13 +41,18 @@ use super::{ArchiveService, SyncEvent, SyncService};
 /// How often a running verify's progress is read.
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
 
+/// How many of the last verify's problems are shown at first, and how many more each time
+/// the owner asks.
+pub const PROBLEMS_PAGE: usize = 20;
+
 /// What can be done for an item verify found damaged (DESIGN §4.13, decision 5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fix {
     /// Its newest version is the damaged one and its location still has it: fetch it again.
     FetchAgain,
-    /// It was fetched again since, as this version.
-    Fetched(u32),
+    /// It was fetched again since, as `version`. `held` is the version still read in its place
+    /// when the new one is held back as shorter (PLAN §4.2): the owner chooses which to read.
+    Fetched { version: u32, held: Option<u32> },
     /// Its location no longer has the damaged bytes: they are gone there, the source changed
     /// since, or the location was removed. The version stays marked, readable as far as it
     /// decodes.
@@ -49,7 +64,7 @@ pub enum Fix {
 /// One problem the last verify found, with what the archive holds of it now.
 #[derive(Clone, Debug)]
 pub struct Problem {
-    pub damage: Damage,
+    pub damage: DamageRecord,
     /// The session it is of, as the library shows it.
     pub session: Option<Session>,
     /// The name of the folder that session is in; `None` for Unsorted.
@@ -58,13 +73,26 @@ pub struct Problem {
     pub fix: Fix,
 }
 
+/// Where a session deleted for good stands now.
+#[derive(Clone, Debug)]
+pub enum Standing {
+    /// Deleted for good: syncs skip it.
+    Deleted,
+    /// The owner allowed it to be archived again: what to put back on Undo.
+    Allowed(AllowedAgain),
+    /// A sync has archived it again, the one that started at `at` (Unix milliseconds) if it is
+    /// known.
+    ArchivedAgain { at: Option<i64> },
+}
+
 /// A session deleted for good, with where it was from.
 #[derive(Clone, Debug)]
 pub struct Deleted {
     pub tombstone: Tombstone,
     pub location: Option<Location>,
-    /// The owner allowed it to be archived again: what to put back on Undo.
-    pub allowed: Option<AllowedAgain>,
+    pub standing: Standing,
+    /// A change to it is being written: it takes no other until then.
+    pub writing: bool,
     /// Why the owner's last change to it couldn't be made.
     pub refused: Option<String>,
 }
@@ -75,80 +103,108 @@ struct Loaded {
     last: Option<LastVerify>,
     problems: Vec<Problem>,
     deleted: Vec<Deleted>,
+    /// Of the sessions the owner allowed, those a sync has archived again, with when that
+    /// sync of their location started.
+    again: Vec<(SessionId, Option<i64>)>,
 }
 
-/// Reads what Settings › Archive shows (the module docs).
-fn load(archive: &Archive) -> Result<Loaded, String> {
+/// What the archive holds now of the damaged item `damage`.
+fn problem(
+    archive: &Archive,
+    damage: &DamageRecord,
+    folders: &[Folder],
+) -> Result<Problem, CatalogueError> {
+    let catalogue = archive.catalogue();
+    let location = catalogue.location(&damage.location)?;
+    let Some(item) = catalogue.item(&damage.location, &damage.provider, &damage.key)? else {
+        return Ok(Problem {
+            damage: damage.clone(),
+            session: None,
+            folder: None,
+            location,
+            fix: Fix::Deleted,
+        });
+    };
+    let versions = catalogue.versions(item.id)?;
+    let refetched = versions
+        .iter()
+        .find(|it| it.number > damage.version && it.reason == Reason::Refetched);
+    let newest = versions.last().map_or(damage.version, |it| it.number);
+    let reachable =
+        item.gone_since.is_none() && location.as_ref().is_some_and(|it| it.removed.is_none());
+    let fix = match refetched {
+        Some(version) => Fix::Fetched {
+            version: version.number,
+            held: version.held_back.map(|_| damage.version),
+        },
+        None if newest == damage.version && reachable => Fix::FetchAgain,
+        None => Fix::Damaged,
+    };
+    let session = match &item.session {
+        Some(key) => catalogue.session(&SessionId {
+            location: damage.location.clone(),
+            provider: damage.provider.clone(),
+            key: key.clone(),
+        })?,
+        None => None,
+    };
+    let folder = session.as_ref().and_then(|session| match session.filed {
+        Filed::Unsorted => None,
+        Filed::ByRule(id) | Filed::ByHand(id) => folders
+            .iter()
+            .find(|folder| folder.id == id)
+            .map(|folder| folder.name.clone()),
+    });
+    Ok(Problem {
+        damage: damage.clone(),
+        session,
+        folder,
+        location,
+        fix,
+    })
+}
+
+/// Reads what Settings › Archive shows (the module docs): the first `shown` problems, and
+/// which of the sessions `allowed` are archived again.
+fn load(archive: &Archive, shown: usize, allowed: Vec<SessionId>) -> Result<Loaded, String> {
     let catalogue = archive.catalogue();
     let read = || -> Result<_, CatalogueError> {
         let last = catalogue.last_verify()?;
         let folders = catalogue.folders()?;
-        let mut problems = Vec::new();
-        for damage in last.iter().flat_map(|last| &last.damaged) {
-            let location = catalogue.location(&damage.location)?;
-            let Some(item) = catalogue.item(&damage.location, &damage.provider, &damage.key)?
-            else {
-                problems.push(Problem {
-                    damage: damage.clone(),
-                    session: None,
-                    folder: None,
-                    location,
-                    fix: Fix::Deleted,
-                });
-                continue;
-            };
-            let versions = catalogue.versions(item.id)?;
-            let refetched = versions
-                .iter()
-                .find(|it| it.number > damage.version && it.reason == Reason::Refetched);
-            let newest = versions.last().map_or(damage.version, |it| it.number);
-            let reachable = item.gone_since.is_none()
-                && location.as_ref().is_some_and(|it| it.removed.is_none());
-            let fix = match refetched {
-                Some(version) => Fix::Fetched(version.number),
-                None if newest == damage.version && reachable => Fix::FetchAgain,
-                None => Fix::Damaged,
-            };
-            let session = match &item.session {
-                Some(key) => catalogue.session(&SessionId {
-                    location: damage.location.clone(),
-                    provider: damage.provider.clone(),
-                    key: key.clone(),
-                })?,
-                None => None,
-            };
-            let folder = session.as_ref().and_then(|session| match session.filed {
-                Filed::Unsorted => None,
-                Filed::ByRule(id) | Filed::ByHand(id) => folders
-                    .iter()
-                    .find(|folder| folder.id == id)
-                    .map(|folder| folder.name.clone()),
-            });
-            problems.push(Problem {
-                damage: damage.clone(),
-                session,
-                folder,
-                location,
-                fix,
-            });
-        }
+        let problems = last
+            .iter()
+            .flat_map(|last| &last.damaged)
+            .take(shown)
+            .map(|damage| problem(archive, damage, &folders))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut deleted = Vec::new();
         for tombstone in catalogue.tombstones()? {
             deleted.push(Deleted {
                 location: catalogue.location(&tombstone.session.location)?,
                 tombstone,
-                allowed: None,
+                standing: Standing::Deleted,
+                writing: false,
                 refused: None,
             });
         }
-        Ok((last, problems, deleted))
+        let mut again = Vec::new();
+        for id in allowed {
+            if catalogue.session(&id)?.is_some() {
+                let at = catalogue
+                    .location(&id.location)?
+                    .and_then(|location| location.last_attempt);
+                again.push((id, at));
+            }
+        }
+        Ok((last, problems, deleted, again))
     };
-    let (last, problems, deleted) = read().map_err(|error| error.to_string())?;
+    let (last, problems, deleted, again) = read().map_err(|error| error.to_string())?;
     Ok(Loaded {
         stats: archive.stats().map_err(|error| error.to_string())?,
         last,
         problems,
         deleted,
+        again,
     })
 }
 
@@ -165,6 +221,8 @@ pub struct UpkeepService {
     stats: Option<ArchiveStats>,
     last: Option<LastVerify>,
     problems: Vec<Problem>,
+    /// How many of the last verify's problems are read and shown.
+    shown: usize,
     deleted: Vec<Deleted>,
     verifying: Option<Verifying>,
     /// Why the last read, or the last verify, failed.
@@ -174,6 +232,8 @@ pub struct UpkeepService {
     stale: bool,
     /// Writes in flight.
     jobs: usize,
+    /// The app is moving onto another archive: nothing more starts on this one.
+    closed: bool,
     _observers: [Subscription; 1],
 }
 
@@ -195,12 +255,14 @@ impl UpkeepService {
             stats: None,
             last: None,
             problems: Vec::new(),
+            shown: PROBLEMS_PAGE,
             deleted: Vec::new(),
             verifying: None,
             failure: None,
             loading: false,
             stale: false,
             jobs: 0,
+            closed: false,
         }
     }
 
@@ -214,8 +276,16 @@ impl UpkeepService {
         self.last.as_ref()
     }
 
+    /// The first of the last verify's problems, as many as are shown.
     pub fn problems(&self) -> &[Problem] {
         &self.problems
+    }
+
+    /// How many problems the last verify found that aren't shown.
+    pub fn more_problems(&self) -> usize {
+        self.last.as_ref().map_or(0, |last| {
+            last.damaged_total.saturating_sub(self.problems.len())
+        })
     }
 
     pub fn deleted(&self) -> &[Deleted] {
@@ -235,14 +305,33 @@ impl UpkeepService {
         !self.loading && self.verifying.is_none() && self.jobs == 0
     }
 
+    /// How many sessions are deleted for good now: not those allowed again since.
+    pub fn still_deleted(&self) -> usize {
+        self.deleted
+            .iter()
+            .filter(|deleted| matches!(deleted.standing, Standing::Deleted))
+            .count()
+    }
+
     /// Settings is shown: what was allowed before is history, and everything is read again.
     pub fn shown(&mut self, cx: &mut Context<Self>) {
-        self.deleted.retain(|deleted| deleted.allowed.is_none());
+        self.deleted
+            .retain(|deleted| matches!(deleted.standing, Standing::Deleted));
+        self.shown = PROBLEMS_PAGE;
+        self.refresh(cx);
+    }
+
+    /// Shows [`PROBLEMS_PAGE`] more of the last verify's problems.
+    pub fn show_more_problems(&mut self, cx: &mut Context<Self>) {
+        self.shown += PROBLEMS_PAGE;
         self.refresh(cx);
     }
 
     /// Reads what Settings › Archive shows again, now or once the read running is over.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.closed {
+            return;
+        }
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return;
         };
@@ -251,26 +340,29 @@ impl UpkeepService {
             return;
         }
         self.loading = true;
-        let job = cx.background_spawn(async move { load(&archive) });
+        let shown = self.shown;
+        let id = archive.id().to_string();
+        let allowed = self
+            .deleted
+            .iter()
+            .filter(|deleted| matches!(deleted.standing, Standing::Allowed(_)))
+            .map(|deleted| deleted.tombstone.session.clone())
+            .collect();
+        let job = cx.background_spawn(async move { load(&archive, shown, allowed) });
         cx.spawn(async move |this, cx| {
             let loaded = job.await;
             this.update(cx, |this, cx| {
                 this.loading = false;
                 match loaded {
                     Ok(loaded) => {
+                        let on_disk = loaded.stats.on_disk;
+                        this.settings.update(cx, |settings, cx| {
+                            settings.remember_size(&id, on_disk, cx);
+                        });
                         this.stats = Some(loaded.stats);
                         this.last = loaded.last;
                         this.problems = loaded.problems;
-                        /* The rows the owner allowed stay, with their Undo. */
-                        let allowed: Vec<Deleted> = this
-                            .deleted
-                            .drain(..)
-                            .filter(|deleted| deleted.allowed.is_some())
-                            .collect();
-                        this.deleted = loaded.deleted;
-                        this.deleted.extend(allowed);
-                        this.deleted
-                            .sort_by_key(|deleted| std::cmp::Reverse(deleted.tombstone.deleted));
+                        this.take_deleted(loaded.deleted, loaded.again);
                         this.failure = None;
                     }
                     Err(why) => {
@@ -288,14 +380,48 @@ impl UpkeepService {
         .detach();
     }
 
+    /**
+     * Takes the tombstones read as the rows, keeping the rows the owner allowed (which have no
+     * tombstone now) and any row being written as it is: one row per session, the latest
+     * deleted first.
+     */
+    fn take_deleted(&mut self, read: Vec<Deleted>, again: Vec<(SessionId, Option<i64>)>) {
+        let kept: Vec<Deleted> = self
+            .deleted
+            .drain(..)
+            .filter(|deleted| !matches!(deleted.standing, Standing::Deleted) || deleted.writing)
+            .map(|mut deleted| {
+                if let Some((_, at)) = again
+                    .iter()
+                    .find(|(id, _)| *id == deleted.tombstone.session)
+                {
+                    deleted.standing = Standing::ArchivedAgain { at: *at };
+                }
+                deleted
+            })
+            .collect();
+        let mut rows: Vec<Deleted> = read
+            .into_iter()
+            .filter(|row| {
+                !kept
+                    .iter()
+                    .any(|it| it.tombstone.session == row.tombstone.session)
+            })
+            .collect();
+        rows.extend(kept);
+        self.deleted = rows;
+        self.deleted
+            .sort_by_key(|deleted| std::cmp::Reverse(deleted.tombstone.deleted));
+    }
+
     /// Re-hashes the archive against its catalogue (PLAN §4.4), unless a verify runs.
     pub fn verify(&mut self, cx: &mut Context<Self>) {
+        if self.closed || self.verifying.is_some() {
+            return;
+        }
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return;
         };
-        if self.verifying.is_some() {
-            return;
-        }
         let cancel = CancelToken::new();
         let reported = Arc::new(Mutex::new(VerifyProgress::default()));
         let job = cx.background_spawn({
@@ -358,6 +484,13 @@ impl UpkeepService {
         }
     }
 
+    /// Stops the verify running, and starts nothing more (the module docs).
+    pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.stop();
+        self.closed = true;
+        cx.notify();
+    }
+
     /// Lets the session `id` deleted for good be archived again by the next sync of its
     /// location (PLAN §4.5).
     pub fn allow(&mut self, id: &SessionId, cx: &mut Context<Self>) {
@@ -365,46 +498,52 @@ impl UpkeepService {
             archive
                 .catalogue()
                 .remove_tombstone(&deleted.tombstone.session)
-                .map(Some)
+                .map(Standing::Allowed)
+                .map_err(ArchiveError::from)
         });
     }
 
     /// Takes back allowing the session `id` to be archived again, unless a sync has archived it
-    /// since.
+    /// since, or its location is syncing now.
     pub fn undo_allow(&mut self, id: &SessionId, cx: &mut Context<Self>) {
-        self.write(id, cx, |archive, deleted| {
-            let Some(allowed) = &deleted.allowed else {
-                return Ok(None);
-            };
-            archive
-                .catalogue()
+        self.write(id, cx, |archive, deleted| match &deleted.standing {
+            Standing::Allowed(allowed) => archive
                 .restore_tombstone(allowed)
-                .map(|()| None)
+                .map(|()| Standing::Deleted),
+            standing => Ok(standing.clone()),
         });
     }
 
-    /// Writes a change to the row of `id` off the UI thread: `change` returns what the row is
-    /// allowed with after it.
+    /// Writes a change to the row of `id` off the UI thread, unless one is being written:
+    /// `change` returns where the row stands after it.
     fn write(
         &mut self,
         id: &SessionId,
         cx: &mut Context<Self>,
-        change: impl FnOnce(&Archive, &Deleted) -> Result<Option<AllowedAgain>, CatalogueError>
-        + Send
-        + 'static,
+        change: impl FnOnce(&Archive, &Deleted) -> Result<Standing, ArchiveError> + Send + 'static,
     ) {
+        if self.closed {
+            return;
+        }
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return;
         };
         let Some(row) = self
             .deleted
-            .iter()
-            .find(|deleted| deleted.tombstone.session == *id)
-            .cloned()
+            .iter_mut()
+            .find(|deleted| deleted.tombstone.session == *id && !deleted.writing)
         else {
             return;
         };
+        row.writing = true;
+        let (row, place) = (
+            row.clone(),
+            row.location
+                .as_ref()
+                .map_or_else(|| "its location".to_string(), |it| it.name.clone()),
+        );
         self.jobs += 1;
+        cx.notify();
         let job = cx.background_spawn(async move { change(&archive, &row) });
         let id = id.clone();
         cx.spawn(async move |this, cx| {
@@ -416,17 +555,23 @@ impl UpkeepService {
                     .iter_mut()
                     .find(|deleted| deleted.tombstone.session == id)
                 {
+                    row.writing = false;
                     match written {
-                        Ok(allowed) => {
-                            row.allowed = allowed;
+                        Ok(standing) => {
+                            row.standing = standing;
                             row.refused = None;
                         }
-                        Err(CatalogueError::ArchivedAgain(_)) => {
+                        Err(ArchiveError::Catalogue(CatalogueError::ArchivedAgain(_))) => {
+                            row.standing = Standing::ArchivedAgain {
+                                at: row.location.as_ref().and_then(|it| it.last_attempt),
+                            };
                             row.refused = Some(
-                                "A sync has archived it again already. To remove it again, \
-                                 move it to Trash and delete it for good."
+                                "To remove it again, move it to Trash and delete it for good."
                                     .to_string(),
                             );
+                        }
+                        Err(ArchiveError::Syncing(_)) => {
+                            row.refused = Some(format!("Try again once the sync of {place} ends."));
                         }
                         Err(error) => {
                             log::warn!("a tombstone couldn't be changed: {error}");

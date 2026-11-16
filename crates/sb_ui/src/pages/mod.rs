@@ -23,6 +23,7 @@ pub mod settings;
 mod states;
 #[cfg(test)]
 mod tests;
+pub mod unavailable;
 pub mod unsorted;
 
 use gpui::{
@@ -44,6 +45,7 @@ use crate::theme::{ActiveTheme as _, SbTheme};
 use first_run::FirstRun;
 use sessions::SessionsView;
 use settings::SettingsPage;
+use unavailable::UnavailablePage;
 use unsorted::UnsortedView;
 
 /// What the main area shows.
@@ -79,8 +81,8 @@ impl Showing {
         match sync.locations() {
             None if sync.failure().is_some() => Self::LocationsFailed,
             None => Self::Starting,
-            Some(_) if sync.is_first_run() => Self::FirstRun,
             Some(_) if services.settings.read(cx).is_shown() => Self::Settings,
+            Some(_) if sync.is_first_run() => Self::FirstRun,
             Some(_) if library.open_session().is_some() => Self::Session,
             Some(_) if library.shelf() == Shelf::Unsorted => Self::Unsorted,
             Some(_) => Self::Sessions,
@@ -113,6 +115,12 @@ impl Showing {
         }
     }
 
+    /// Whether Settings can be opened over what shows: a page of the library, or a first run
+    /// in a folder the owner chose (`SettingsService::is_chosen`).
+    pub fn has_settings(self, cx: &App) -> bool {
+        self.is_library() || self == Self::FirstRun && cx.services().settings.read(cx).is_chosen()
+    }
+
     /// Whether a page of the library shows, or Settings over one.
     pub fn is_library(self) -> bool {
         matches!(
@@ -139,6 +147,8 @@ pub struct MainArea {
     unsorted: Entity<UnsortedView>,
     first_run: Entity<FirstRun>,
     settings: Entity<SettingsPage>,
+    /// What shows while no archive is open (DESIGN §4.14).
+    unavailable: Entity<UnavailablePage>,
     _observers: [Subscription; 3],
 }
 
@@ -163,6 +173,7 @@ impl MainArea {
             focus_handle,
             first_run: cx.new(FirstRun::new),
             settings: cx.new(|cx| SettingsPage::new(window, cx)),
+            unavailable: cx.new(UnavailablePage::new),
             _observers: [
                 cx.observe(&archive, |_, _, cx| cx.notify()),
                 cx.observe(&sync, |_, _, cx| cx.notify()),
@@ -190,6 +201,11 @@ impl MainArea {
 
     pub fn settings_page(&self) -> &Entity<SettingsPage> {
         &self.settings
+    }
+
+    /// What shows while no archive is open.
+    pub fn unavailable_page(&self) -> &Entity<UnavailablePage> {
+        &self.unavailable
     }
 
     /// The page of All sessions, Starred or a folder.
@@ -378,18 +394,7 @@ impl Render for MainArea {
         };
         let page = match showing {
             Showing::Starting => None,
-            Showing::ArchiveFailed => {
-                let archive = services.archive.read(cx);
-                match archive.state() {
-                    ArchiveState::Failed(failure) => Some(states::archive_failed(
-                        archive.dir().display().to_string(),
-                        failure,
-                        &theme,
-                        cx,
-                    )),
-                    _ => None,
-                }
-            }
+            Showing::ArchiveFailed => Some(self.unavailable.clone().into_any_element()),
             Showing::LocationsFailed => services
                 .sync
                 .read(cx)

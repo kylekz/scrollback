@@ -10,7 +10,8 @@ use std::fs;
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::archive::{
-    Archive, ArchiveError, Holds, Problem, VerifyProgress, open_or_make, what_is_in,
+    Archive, ArchiveError, DamageKind, DamageRecord, Holds, Problem, VerifyProgress, id_in,
+    open_or_make, what_is_in,
 };
 use sb_core::catalogue::{CatalogueError, Reason};
 use sb_core::sync::{SyncError, refetch};
@@ -104,13 +105,41 @@ fn a_verify_that_runs_to_its_end_is_kept_with_what_it_found() {
         (last.versions, last.segments, last.unread),
         (report.versions, segments, 0)
     );
-    assert_eq!(last.damaged, report.damaged);
+    assert_eq!(last.damaged_total, 1);
+    let kept: Vec<DamageRecord> = report.damaged.iter().map(DamageRecord::from).collect();
+    assert_eq!(last.damaged, kept);
     let damage = &last.damaged[0];
+    assert!(matches!(
+        damage.kind,
+        DamageKind::SegmentChanged | DamageKind::SegmentUnreadable
+    ));
     /* The file the problem is in, as the archive lays it out (PLAN §4.1). */
-    let file = damage.file();
-    assert!(bench.dir().join(&file).is_file(), "{}", file.display());
-    assert!(file.starts_with("files"));
-    assert!(file.ends_with("v0001/0000000000000000.zst"));
+    assert!(bench.dir().join(&damage.file).is_file(), "{}", damage.file);
+    assert!(damage.file.starts_with("files/"));
+    assert!(damage.file.ends_with("v0001/0000000000000000.zst"));
+}
+
+#[test]
+fn a_last_verify_kept_by_another_version_reads_as_none_and_a_stop_at_the_end_keeps_nothing() {
+    let (bench, _) = synced::<FileAgent>();
+    let catalogue = bench.archive().catalogue();
+    bench.archive().verify(&CancelToken::new()).unwrap();
+    let kept = catalogue.setting("verify.last").unwrap().unwrap();
+    assert!(kept.contains(r#""v":1"#), "{kept}");
+    catalogue
+        .set_setting("verify.last", &kept.replace(r#""v":1"#, r#""v":2"#))
+        .unwrap();
+    assert_eq!(catalogue.last_verify().unwrap(), None);
+
+    /* Stopped as it read its last version: nothing kept. */
+    let cancel = CancelToken::new();
+    let stopped = bench.archive().verify_reporting(&cancel, &mut |progress| {
+        if progress.segments_done == progress.segments && progress.segments > 0 {
+            cancel.cancel();
+        }
+    });
+    assert!(matches!(stopped, Err(ArchiveError::Cancelled)));
+    assert_eq!(catalogue.last_verify().unwrap(), None);
 }
 
 #[test]
@@ -232,18 +261,24 @@ fn allowing_a_session_again_can_be_undone_until_a_sync_archives_it() {
     let allowed = catalogue.remove_tombstone(&id).unwrap();
     assert_eq!(allowed.tombstone, tombstones[0]);
     assert_eq!(catalogue.tombstones().unwrap(), []);
-    catalogue.restore_tombstone(&allowed).unwrap();
+    bench.archive().restore_tombstone(&allowed).unwrap();
     assert_eq!(catalogue.tombstones().unwrap(), tombstones);
     let synced = bench.sync();
     assert_eq!((synced.deleted, synced.new_items), (1, 0));
 
-    /* Allowed, then synced: the session is archived again, and the undo is refused. */
+    /* Allowed, then synced: not put back while the sync runs, which archives the session
+    again; after it, the undo is refused. */
     let allowed = catalogue.remove_tombstone(&id).unwrap();
-    let synced = bench.sync();
-    assert_eq!((synced.deleted, synced.new_items), (0, 1));
+    let mut refused = None;
+    bench
+        .try_sync(&CancelToken::new(), &mut |_| {
+            refused.get_or_insert_with(|| bench.archive().restore_tombstone(&allowed));
+        })
+        .unwrap();
+    assert!(matches!(refused, Some(Err(ArchiveError::Syncing(_)))));
     assert!(matches!(
-        catalogue.restore_tombstone(&allowed),
-        Err(CatalogueError::ArchivedAgain(_))
+        bench.archive().restore_tombstone(&allowed),
+        Err(ArchiveError::Catalogue(CatalogueError::ArchivedAgain(_)))
     ));
     assert_eq!(catalogue.tombstones().unwrap(), []);
     bench.assert_mirrors(&keys);
@@ -297,12 +332,39 @@ fn a_folder_opens_its_archive_gets_a_new_one_when_empty_and_refuses_anything_els
     fs::create_dir(&shown).unwrap();
     fs::write(shown.join(".DS_Store"), b"x").unwrap();
     fs::write(shown.join("desktop.ini"), b"x").unwrap();
+    fs::write(shown.join("._notes.txt"), b"x").unwrap();
     assert_eq!(what_is_in(&shown).unwrap(), Holds::Nothing);
     drop(open_or_make(&shown).unwrap());
 
-    /* An archive opens as itself. */
+    /* An archive opens as itself, and says who it is without being opened. */
     assert_eq!(what_is_in(&missing).unwrap(), Holds::Archive);
+    assert_eq!(id_in(&missing).unwrap().as_deref(), Some(id.as_str()));
+    assert_eq!(id_in(root.path()).unwrap(), None);
     assert_eq!(open_or_make(&missing).unwrap().id(), id);
+
+    /* No archive is made inside another, its tmp/ included, nor around one. */
+    for inside in [missing.join("tmp"), missing.join("files").join("new")] {
+        assert_eq!(
+            what_is_in(&inside).unwrap(),
+            Holds::InsideAnArchive(missing.clone())
+        );
+        assert!(matches!(
+            open_or_make(&inside),
+            Err(ArchiveError::Nested { .. })
+        ));
+        assert!(matches!(
+            Archive::create(&inside),
+            Err(ArchiveError::Nested { .. })
+        ));
+    }
+    let around = root.path().join("around");
+    fs::create_dir(&around).unwrap();
+    drop(Archive::create(&around.join("inner")).unwrap());
+    assert!(matches!(
+        Archive::create(&around),
+        Err(ArchiveError::Nested { .. })
+    ));
+    assert!(!around.join("archive.json").exists());
 
     /* Anything else is refused, and nothing is made in it. */
     let documents = root.path().join("documents");

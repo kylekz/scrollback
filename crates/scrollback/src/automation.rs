@@ -27,14 +27,17 @@
 //!   dir's), `switch` (`null`, `{"opening": folder}` or `{"refused": why}`), `sync_every`
 //!   (`5m`, `15m`, `30m`, `60m` or `asked`), `next_round` (whether a round is due),
 //!   `stale_after` (days), `stats` (`sessions`, `items`, `versions`, or `null` before they are
-//!   measured), `verify` (`running` with its `progress`, and the `last` one's `segments` and
+//!   measured), `verify` (`running` with its `progress`, the `last` one's `segments` and
 //!   `problems`, each with its `file` and `fix`: `fetch_again`, `fetched`, `damaged` or
-//!   `deleted`, and `refetch`: `null`, `running`, `done` or the failure's words), `deleted`
-//!   (each session deleted for good's `location` and whether it is `allowed` again), and
-//!   `saved` (why the settings aren't being saved, or `null`).
+//!   `deleted`, and `refetch`: `null`, `running`, `done`, `skipped: …` or the failure's words;
+//!   and `fetch_all`, Fetch all again's `done` and `total` while it runs, or `null`), `deleted`
+//!   (each session deleted for good's `location`, whether it is `allowed` again, and its
+//!   `standing`: `deleted`, `allowed` or `archived_again`), and `saved` (why the settings
+//!   aren't being saved, or `null`).
 //! - `system`: what the app asked of the operating system, never done in a scripted run: each
 //!   request's `kind` (`reveal`, `pick_folder`) and its `path`.
-//! - `archive`: `dir`, and `state` (`opening`, `open` or `failed`, then with `error`).
+//! - `archive`: `dir`, and `state` (`opening`, `open` or `failed`, then with `error` and
+//!   `failure`: `missing`, `empty`, `locked`, `settings` or `other`).
 //! - `sync`: `syncing`, `indexing` (an index runs outside a pass), `held` (a pass waits at
 //!   `hold_sync`'s hold), and `locations`, each with its `name`, `kind` (`local`, `wsl` or
 //!   `ssh`) and `state` (`syncing` with `progress`: the `items` to fetch and `items_done`, the
@@ -87,7 +90,8 @@
 //! - `pin_appearance {appearance}` pins `light` or `dark` whatever the mode and the OS say, so
 //!   a scenario looks the same on every machine; `null` lifts the pin.
 //! - `set_appearance {mode?, material?}` changes what scrollback asks for, as Settings ›
-//!   Appearance will (DESIGN §4.13).
+//!   Appearance does (DESIGN §4.13), and keeps it in the app's settings; `--theme` still wins
+//!   for the run.
 //!
 //! And this with `state.system`:
 //! - `answer_picker {folder}` answers the next folder picker with `folder`, or cancels it
@@ -127,10 +131,10 @@ use sb_ui::Shell;
 use sb_ui::pages::sessions::LineMeasure;
 use sb_ui::services::settings::Switch;
 use sb_ui::services::sync::{Refetch, TestFailure, TestState};
-use sb_ui::services::upkeep::Fix;
+use sb_ui::services::upkeep::{Fix, Standing};
 use sb_ui::services::{
-    ActiveServices as _, ArchiveState, Dragged, DropTarget, Held, LocationStatus, Page, Reach,
-    Verdict,
+    ActiveServices as _, ArchiveState, Dragged, DropTarget, Failure, Held, LocationStatus, Page,
+    Reach, Verdict,
 };
 use sb_ui::system::{self, SystemRequest};
 use serde::Deserialize;
@@ -220,10 +224,15 @@ impl AutomationHost for ScrollbackAutomation {
             }),
             "set_appearance" => {
                 serde_json::from_value(args).map(|SetAppearance { mode, material }| {
-                    let mut preferences = gpui_appearance::state(cx).preferences();
-                    preferences.mode = mode.unwrap_or(preferences.mode);
-                    preferences.material = material.unwrap_or(preferences.material);
-                    gpui_appearance::set_preferences(preferences, cx);
+                    let settings = cx.services().settings.clone();
+                    settings.update(cx, |settings, cx| {
+                        if let Some(mode) = mode {
+                            settings.set_mode(mode, cx);
+                        }
+                        if let Some(material) = material {
+                            settings.set_material(material, cx);
+                        }
+                    });
                     self::appearance(cx)
                 })
             }
@@ -275,9 +284,20 @@ fn archive(cx: &App) -> Value {
     let (state, error) = match archive.state() {
         ArchiveState::Opening => ("opening", None),
         ArchiveState::Open(_) => ("open", None),
-        ArchiveState::Failed(failure) => ("failed", Some(&failure.why)),
+        ArchiveState::Failed(failure) => ("failed", Some(failure)),
     };
-    json!({ "dir": archive.dir().display().to_string(), "state": state, "error": error })
+    json!({
+        "dir": archive.dir().display().to_string(),
+        "state": state,
+        "error": error.map(Failure::why),
+        "failure": error.map(|failure| match failure {
+            Failure::Missing { there: false } => "missing",
+            Failure::Missing { there: true } => "empty",
+            Failure::Locked(_) => "locked",
+            Failure::Settings(_) => "settings",
+            Failure::Other(_) => "other",
+        }),
+    })
 }
 
 /// `state.sync`.
@@ -447,16 +467,17 @@ fn settings(shell: &Shell, cx: &App) -> Value {
         .iter()
         .map(|problem| {
             json!({
-                "file": problem.damage.file().display().to_string().replace('\\', "/"),
+                "file": problem.damage.file,
                 "fix": match problem.fix {
                     Fix::FetchAgain => "fetch_again",
-                    Fix::Fetched(_) => "fetched",
+                    Fix::Fetched { .. } => "fetched",
                     Fix::Damaged => "damaged",
                     Fix::Deleted => "deleted",
                 },
                 "refetch": sync.refetch_of(&problem.damage).map(|refetch| match refetch {
                     Refetch::Running => "running".to_string(),
                     Refetch::Done(_) => "done".to_string(),
+                    Refetch::Skipped(why) => format!("skipped: {why}"),
                     Refetch::Failed(why) => why.clone(),
                 }),
             })
@@ -488,10 +509,19 @@ fn settings(shell: &Shell, cx: &App) -> Value {
                 "segments": last.segments,
                 "problems": problems,
             })),
+            "fetch_all": sync.fetch_all_progress().map(|(done, total)| json!({
+                "done": done,
+                "total": total,
+            })),
         },
         "deleted": upkeep.deleted().iter().map(|deleted| json!({
             "location": deleted.location.as_ref().map(|location| &location.name),
-            "allowed": deleted.allowed.is_some(),
+            "allowed": matches!(deleted.standing, Standing::Allowed(_)),
+            "standing": match deleted.standing {
+                Standing::Deleted => "deleted",
+                Standing::Allowed(_) => "allowed",
+                Standing::ArchivedAgain { .. } => "archived_again",
+            },
         })).collect::<Vec<_>>(),
         "saved": settings.save_failure(),
     })

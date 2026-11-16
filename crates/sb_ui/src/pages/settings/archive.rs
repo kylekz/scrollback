@@ -2,9 +2,11 @@
 //! Explorer or Finder and Use a different folder…, its size, Verify with the last result and
 //! what can be done for each problem, and the sessions deleted for good.
 //!
-//! **Use a different folder…** opens the folder picker; a folder that holds anything but an
-//! archive is refused at once, and any other asks to confirm, saying whether its archive opens
-//! or a new one is made there. Confirmed, the app moves onto it (`SettingsService::use_folder`).
+//! **Use a different folder…** opens the folder picker; the archive open now, a folder inside
+//! it or inside another archive, and a folder that holds anything but an archive are refused
+//! at once, and any other asks to confirm, saying whether its archive opens or a new one is made
+//! there. Confirmed, the app moves onto it (`SettingsService::use_folder`). While it does, every
+//! action on the page is disabled: nothing more is to start on the archive being left.
 
 use gpui::{
     AnyElement, AppContext as _, Context, InteractiveElement as _, IntoElement, ParentElement as _,
@@ -12,14 +14,14 @@ use gpui::{
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::FocusTrapElement as _;
-use sb_core::archive::{self, Holds, Problem};
+use sb_core::archive::{self, DamageKind, Holds};
 use sb_core::catalogue::Tombstone;
 
 use super::{Chosen, SettingsPage, section_head};
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
-    ButtonKind, Tone, button, card, chip, icon, info_banner, kv, location_tag, middle_cut,
-    progress_bar, tag, with_numbers,
+    ButtonKind, Tone, button, card, chip, icon, info_banner, kv, location_tag, progress_bar, tag,
+    with_numbers,
 };
 use crate::format;
 use crate::icons::SbIcon;
@@ -27,18 +29,18 @@ use crate::overlay::{self, Layer};
 use crate::services::ActiveServices as _;
 use crate::services::settings::Switch;
 use crate::services::sync::Refetch;
-use crate::services::upkeep::{Deleted, Fix};
+use crate::services::upkeep::{Deleted, Fix, PROBLEMS_PAGE, Standing};
 use crate::system;
 use crate::theme::{SbTheme, StyledText as _};
 
 /// What a stored file's problem is, in the owner's words.
-fn what_is_wrong(problem: &Problem) -> &'static str {
-    match problem {
-        Problem::SegmentMissing { .. } => "The file is missing",
-        Problem::SegmentUnreadable { .. } => "The file can't be decompressed",
-        Problem::SegmentChanged { .. } => "Hash doesn't match the catalogue",
-        Problem::Gap { .. } => "Part of the version has no file",
-        Problem::VersionChanged => "The version doesn't match the catalogue",
+fn what_is_wrong(kind: DamageKind) -> &'static str {
+    match kind {
+        DamageKind::SegmentMissing => "The file is missing",
+        DamageKind::SegmentUnreadable => "The file can't be decompressed",
+        DamageKind::SegmentChanged => "Hash doesn't match the catalogue",
+        DamageKind::Gap => "Part of the version has no file",
+        DamageKind::VersionChanged => "The version doesn't match the catalogue",
     }
 }
 
@@ -47,19 +49,17 @@ fn what_is_wrong(problem: &Problem) -> &'static str {
  * location's and the agent's folders, which the row's session names, and the item's folder cut
  * to its start: `files/2f/2f91c0…/v0001/0000000000184467.zst`.
  */
-fn shown_file(file: &std::path::Path) -> String {
-    let parts: Vec<String> = file
-        .iter()
-        .map(|part| part.to_string_lossy().into_owned())
-        .collect();
+fn shown_file(file: &str) -> String {
+    let parts: Vec<&str> = file.split('/').collect();
     match parts.as_slice() {
         [files, _location, _agent, shard, item, rest @ ..] => {
             let item: String = item.chars().take(6).collect();
-            let mut shown = vec![files.clone(), shard.clone(), format!("{item}\u{2026}")];
-            shown.extend(rest.iter().cloned());
+            let item = format!("{item}\u{2026}");
+            let mut shown = vec![*files, *shard, item.as_str()];
+            shown.extend(rest);
             shown.join("/")
         }
-        _ => parts.join("/"),
+        _ => file.to_string(),
     }
 }
 
@@ -98,7 +98,7 @@ impl SettingsPage {
         let settings = services.settings.read(cx);
         let default = settings.is_default(&dir);
         let switch = settings.switch().cloned();
-        let opening = matches!(switch, Some(Switch::Opening(_)));
+        let opening = settings.is_switching();
         card(theme)
             .gap(theme.spacing.md)
             .py(theme.spacing.lg)
@@ -115,9 +115,9 @@ impl SettingsPage {
                             .text_spec(&theme.text.path)
                             .text_color(c.fg)
                             .overflow_hidden()
-                            .text_ellipsis()
+                            .text_ellipsis_middle()
                             .whitespace_nowrap()
-                            .child(middle_cut(&dir.display().to_string(), 96))
+                            .child(dir.display().to_string())
                             .automation_target("settings/archive/folder"),
                     )
                     .when(default, |this| {
@@ -133,9 +133,13 @@ impl SettingsPage {
                     .items_center()
                     .gap(theme.spacing.md)
                     .child(
-                        button("settings-reveal", ButtonKind::Plain, true, true, theme)
+                        button("settings-reveal", ButtonKind::Plain, true, !opening, theme)
                             .debug_selector(|| "settings-reveal".into())
-                            .on_click(cx.listener(move |_, _, _, cx| system::reveal(&dir, cx)))
+                            .when(!opening, |this| {
+                                this.on_click(
+                                    cx.listener(move |_, _, _, cx| system::reveal(&dir, cx)),
+                                )
+                            })
                             .child(icon(SbIcon::ExternalLink, theme.sizes.icon_xs, c.fg2))
                             .child(system::REVEAL_LABEL)
                             .automation_target("settings/archive/reveal"),
@@ -215,15 +219,16 @@ impl SettingsPage {
                     async move { archive::what_is_in(&folder) }
                 })
                 .await;
-            this.update(cx, |this, cx| match looked {
-                Ok(holds @ (Holds::Archive | Holds::Nothing)) => {
-                    this.chosen = Some(Chosen { folder, holds });
-                    cx.notify();
-                }
-                /* What can't be made an archive's goes the way a refusal does. */
-                _ => {
-                    let settings = cx.services().settings.clone();
-                    settings.update(cx, |settings, cx| settings.use_folder(folder, cx));
+            this.update(cx, |this, cx| {
+                let settings = cx.services().settings.clone();
+                let refused = settings.read(cx).refusal(&folder, cx).is_some();
+                match looked {
+                    Ok(holds @ (Holds::Archive | Holds::Nothing)) if !refused => {
+                        this.chosen = Some(Chosen { folder, holds });
+                        cx.notify();
+                    }
+                    /* What can't be the archive's goes the way a refusal does, without asking. */
+                    _ => settings.update(cx, |settings, cx| settings.use_folder(folder, cx)),
                 }
             })
             .ok();
@@ -313,6 +318,7 @@ impl SettingsPage {
                             theme,
                         )
                         .debug_selector(|| "settings-confirm-cancel".into())
+                        .track_focus(&self.cancel_focus)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.chosen = None;
                             cx.notify();
@@ -436,7 +442,9 @@ impl SettingsPage {
     /// result, with each problem's row.
     fn verify(&self, theme: &SbTheme, cx: &mut Context<Self>) -> AnyElement {
         let c = &theme.colors;
-        let upkeep = cx.services().upkeep.read(cx);
+        let services = cx.services();
+        let opening = services.settings.read(cx).is_switching();
+        let upkeep = services.upkeep.read(cx);
         let running = upkeep.verifying().map(|verifying| verifying.progress);
         let failure = upkeep.failure().map(str::to_string);
         div()
@@ -468,15 +476,23 @@ impl SettingsPage {
                                 .child("Stop")
                                 .automation_target("settings/verify/stop")
                         }
-                        None => button("settings-verify-run", ButtonKind::Plain, true, true, theme)
-                            .debug_selector(|| "settings-verify-run".into())
-                            .on_click(cx.listener(|_, _, _, cx| {
+                        None => button(
+                            "settings-verify-run",
+                            ButtonKind::Plain,
+                            true,
+                            !opening,
+                            theme,
+                        )
+                        .debug_selector(|| "settings-verify-run".into())
+                        .when(!opening, |this| {
+                            this.on_click(cx.listener(|_, _, _, cx| {
                                 let upkeep = cx.services().upkeep.clone();
                                 upkeep.update(cx, |upkeep, cx| upkeep.verify(cx));
                             }))
-                            .child(icon(SbIcon::ShieldCheck, theme.sizes.icon_xs, c.fg2))
-                            .child("Verify now")
-                            .automation_target("settings/verify/run"),
+                        })
+                        .child(icon(SbIcon::ShieldCheck, theme.sizes.icon_xs, c.fg2))
+                        .child("Verify now")
+                        .automation_target("settings/verify/run"),
                     }),
             )
             .child(
@@ -527,8 +543,9 @@ impl SettingsPage {
         let upkeep = cx.services().upkeep.read(cx);
         let last = upkeep.last()?.clone();
         let problems = upkeep.problems().to_vec();
+        let more = upkeep.more_problems();
         let now = format::now();
-        let count = problems.len();
+        let count = last.damaged_total;
         let (glyph, color, says) = if count == 0 {
             (SbIcon::CircleCheck, c.green, "No problems".to_string())
         } else {
@@ -594,12 +611,52 @@ impl SettingsPage {
                         ))
                         .automation_target("settings/verify/result"),
                 )
+                .children(self.fetch_all(&problems, theme, cx))
                 .children(
                     problems
                         .iter()
                         .enumerate()
                         .map(|(at, problem)| self.problem_row(at, problem, theme, cx)),
                 )
+                .when(more > 0, |this| {
+                    this.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(theme.spacing.md)
+                            .py(theme.spacing.md)
+                            .px(theme.spacing.lg)
+                            .border_t_1()
+                            .border_color(c.line_subtle)
+                            .text_spec(&theme.text.secondary)
+                            .text_color(c.fg3)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(format!("and {} more", format::count(more as u64))),
+                            )
+                            .when(problems.len() < last.damaged.len(), |this| {
+                                this.child(
+                                    button(
+                                        "settings-more-problems",
+                                        ButtonKind::Plain,
+                                        true,
+                                        true,
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        let upkeep = cx.services().upkeep.clone();
+                                        upkeep.update(cx, |upkeep, cx| {
+                                            upkeep.show_more_problems(cx);
+                                        });
+                                    }))
+                                    .child(format!("Show {PROBLEMS_PAGE} more"))
+                                    .automation_target("settings/verify/more"),
+                                )
+                            })
+                            .automation_target("settings/verify/more-problems"),
+                    )
+                })
                 .children(notes.into_iter().map(|note| {
                     div()
                         .py(theme.spacing.md)
@@ -614,6 +671,97 @@ impl SettingsPage {
         )
     }
 
+    /**
+     * Fetch all again, over the problems listed that their locations can still give, once
+     * there are two or more of them; while it runs, how far it is, with Stop.
+     */
+    fn fetch_all(
+        &self,
+        problems: &[crate::services::upkeep::Problem],
+        theme: &SbTheme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let c = &theme.colors;
+        let services = cx.services();
+        let opening = services.settings.read(cx).is_switching();
+        let sync = services.sync.read(cx);
+        let progress = sync.fetch_all_progress();
+        let fetchable: Vec<_> = problems
+            .iter()
+            .filter(|problem| {
+                problem.fix == Fix::FetchAgain
+                    && !matches!(
+                        sync.refetch_of(&problem.damage),
+                        Some(Refetch::Running | Refetch::Done(_))
+                    )
+            })
+            .map(|problem| problem.damage.clone())
+            .collect();
+        if progress.is_none() && fetchable.len() < 2 {
+            return None;
+        }
+        let row = div()
+            .flex()
+            .items_center()
+            .gap(theme.spacing.md)
+            .py(theme.spacing.md)
+            .px(theme.spacing.lg)
+            .border_b_1()
+            .border_color(c.line_subtle)
+            .text_spec(&theme.text.secondary);
+        Some(
+            match progress {
+                Some((done, total)) => row
+                    .child(div().flex_1().child(with_numbers(
+                        format!("Fetching again · {} of {total}", done + 1),
+                        c.accent_text,
+                        &theme.text.secondary,
+                        theme,
+                    )))
+                    .child(
+                        button(
+                            "settings-fetch-all-stop",
+                            ButtonKind::Plain,
+                            true,
+                            true,
+                            theme,
+                        )
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            let sync = cx.services().sync.clone();
+                            sync.update(cx, |sync, cx| sync.stop_fetch_all(cx));
+                        }))
+                        .child("Stop")
+                        .automation_target("settings/verify/fetch-all/stop"),
+                    ),
+                None => row
+                    .child(div().flex_1().text_color(c.fg3).child(format!(
+                        "{} of the problems listed can be fetched again from their locations.",
+                        format::count(fetchable.len() as u64)
+                    )))
+                    .child(
+                        button(
+                            "settings-fetch-all",
+                            ButtonKind::Plain,
+                            true,
+                            !opening,
+                            theme,
+                        )
+                        .when(!opening, |this| {
+                            this.on_click(cx.listener(move |_, _, _, cx| {
+                                let sync = cx.services().sync.clone();
+                                let damages = fetchable.clone();
+                                sync.update(cx, |sync, cx| sync.refetch_all(damages, cx));
+                            }))
+                        })
+                        .child("Fetch all again")
+                        .automation_target("settings/verify/fetch-all/start"),
+                    ),
+            }
+            .automation_target("settings/verify/fetch-all")
+            .into_any_element(),
+        )
+    }
+
     /// One problem: the stored file, what is wrong and the session it is in; then Fetch again
     /// from its location, or the damaged chip where its location no longer has it; and Open
     /// session (decision 5).
@@ -625,17 +773,19 @@ impl SettingsPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &theme.colors;
-        let sync = cx.services().sync.read(cx);
-        let refetch = sync.refetch_of(&problem.damage).cloned();
-        let wrong = problem
-            .damage
-            .problems
-            .first()
-            .map_or("Damaged", what_is_wrong);
+        let services = cx.services();
+        let opening = services.settings.read(cx).is_switching();
+        let refetch = services.sync.read(cx).refetch_of(&problem.damage).cloned();
+        let wrong = what_is_wrong(problem.damage.kind);
+        /* A session's title comes from its transcript, which may be what is damaged. */
         let session = problem.session.as_ref().map(|session| {
             format!(
-                " · in “{}” ({}{})",
-                session.title.as_deref().unwrap_or("Untitled"),
+                " · in {} ({}{})",
+                match (&session.title, &session.project_path) {
+                    (Some(title), _) => format!("“{title}”"),
+                    (None, Some(path)) => format!("a session in {}", format::path(path)),
+                    (None, None) => "a session whose transcript is damaged".to_string(),
+                },
                 problem.folder.as_deref().unwrap_or("Unsorted"),
                 problem
                     .location
@@ -647,7 +797,7 @@ impl SettingsPage {
         let target = move |what: &str| -> SharedString {
             format!("settings/verify/problem/{at}/{what}").into()
         };
-        let file = shown_file(&problem.damage.file());
+        let file = shown_file(&problem.damage.file);
         let fix: AnyElement = match (problem.fix, refetch) {
             (Fix::FetchAgain, Some(Refetch::Running)) => div()
                 .text_spec(&theme.text.secondary)
@@ -668,6 +818,13 @@ impl SettingsPage {
                                 .text_color(c.red)
                                 .child(why),
                         ),
+                        Some(Refetch::Skipped(why)) => Some(
+                            div()
+                                .max_w(px(220.))
+                                .text_spec(&theme.text.small)
+                                .text_color(c.fg3)
+                                .child(why),
+                        ),
                         _ => None,
                     })
                     .child(
@@ -675,22 +832,31 @@ impl SettingsPage {
                             SharedString::from(format!("settings-fetch-{at}")),
                             ButtonKind::Plain,
                             true,
-                            true,
+                            !opening,
                             theme,
                         )
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            let sync = cx.services().sync.clone();
-                            sync.update(cx, |sync, cx| sync.refetch(&damage, cx));
-                        }))
+                        .when(!opening, |this| {
+                            this.on_click(cx.listener(move |_, _, _, cx| {
+                                let sync = cx.services().sync.clone();
+                                sync.update(cx, |sync, cx| sync.refetch(&damage, cx));
+                            }))
+                        })
                         .child("Fetch again from its location")
                         .automation_target(target("fetch")),
                     )
                     .into_any_element()
             }
-            (Fix::Fetched(version), _) => div()
+            (Fix::Fetched { version, held }, _) => div()
                 .text_spec(&theme.text.secondary)
                 .text_color(c.green)
-                .child(format!("Fetched again as v{version}"))
+                .child(match held {
+                    /* PLAN §4.2: a shorter version is held back; the owner chooses which to read
+                    (the versions popover). */
+                    Some(reading) => {
+                        format!("Fetched again as v{version} · held back, shorter than v{reading}")
+                    }
+                    None => format!("Fetched again as v{version}"),
+                })
                 .automation_target(target("fetched")),
             (Fix::Damaged, _) => div()
                 .flex()
@@ -707,7 +873,7 @@ impl SettingsPage {
             (Fix::Deleted, _) => div()
                 .text_spec(&theme.text.small)
                 .text_color(c.fg3)
-                .child("Deleted for good since")
+                .child("Its session was deleted for good since")
                 .into_any_element(),
         };
         let open = problem.session.clone().map(|session| {
@@ -715,14 +881,16 @@ impl SettingsPage {
                 SharedString::from(format!("settings-open-{at}")),
                 ButtonKind::Plain,
                 true,
-                true,
+                !opening,
                 theme,
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.back(cx);
-                let library = cx.services().library.clone();
-                library.update(cx, |library, cx| library.open(session.clone(), cx));
-            }))
+            .when(!opening, |this| {
+                this.on_click(cx.listener(move |this, _, _, cx| {
+                    this.back(cx);
+                    let library = cx.services().library.clone();
+                    library.update(cx, |library, cx| library.open(session.clone(), cx));
+                }))
+            })
             .child("Open session")
             .automation_target(target("open"))
         });
@@ -747,7 +915,7 @@ impl SettingsPage {
                             .text_spec(&theme.text.path_small)
                             .text_color(c.fg2)
                             .overflow_hidden()
-                            .text_ellipsis()
+                            .text_ellipsis_middle()
                             .whitespace_nowrap()
                             .child(file),
                     )
@@ -766,7 +934,10 @@ impl SettingsPage {
     /// then reads as allowed, with Undo.
     fn deleted_for_good(&self, theme: &SbTheme, cx: &mut Context<Self>) -> AnyElement {
         let c = &theme.colors;
-        let deleted = cx.services().upkeep.read(cx).deleted().to_vec();
+        let services = cx.services();
+        let opening = services.settings.read(cx).is_switching();
+        let upkeep = services.upkeep.read(cx);
+        let (deleted, still) = (upkeep.deleted().to_vec(), upkeep.still_deleted());
         let now = format::now();
         div()
             .flex()
@@ -778,11 +949,12 @@ impl SettingsPage {
             .child(
                 div()
                     .text_spec(&theme.text.control)
-                    .child(if deleted.is_empty() {
+                    .child(if still == 0 {
                         "Deleted for good".to_string()
                     } else {
-                        format!("Deleted for good · {}", deleted.len())
-                    }),
+                        format!("Deleted for good · {still}")
+                    })
+                    .automation_target("settings/deleted/head"),
             )
             .child(
                 div()
@@ -809,7 +981,7 @@ impl SettingsPage {
                         deleted
                             .iter()
                             .enumerate()
-                            .map(|(at, row)| deleted_row(at, row, now, theme, cx)),
+                            .map(|(at, row)| deleted_row(at, row, now, !opening, theme, cx)),
                     )
                     .automation_target("settings/deleted")
             })
@@ -831,6 +1003,7 @@ fn deleted_row(
     at: usize,
     row: &Deleted,
     now: i64,
+    enabled: bool,
     theme: &SbTheme,
     cx: &mut Context<SettingsPage>,
 ) -> AnyElement {
@@ -844,8 +1017,10 @@ fn deleted_row(
         .unwrap_or_default();
     let target =
         move |what: &str| -> SharedString { format!("settings/deleted/{at}/{what}").into() };
-    let (line, action): (String, AnyElement) = match &row.allowed {
-        Some(_) => (
+    /* One change at a time to a row, and none while the app moves onto another archive. */
+    let enabled = enabled && !row.writing;
+    let (line, action): (String, Option<AnyElement>) = match &row.standing {
+        Standing::Allowed(_) => (
             format!(
                 "Allowed · archived again on the next sync of {}",
                 location.map_or("its location", |it| it.name.as_str())
@@ -854,17 +1029,30 @@ fn deleted_row(
                 SharedString::from(format!("settings-undo-{at}")),
                 ButtonKind::Plain,
                 true,
-                true,
+                enabled,
                 theme,
             )
-            .on_click(cx.listener(move |_, _, _, cx| {
-                let upkeep = cx.services().upkeep.clone();
-                upkeep.update(cx, |upkeep, cx| upkeep.undo_allow(&id, cx));
-            }))
+            .when(enabled, |this| {
+                this.on_click(cx.listener(move |_, _, _, cx| {
+                    let upkeep = cx.services().upkeep.clone();
+                    upkeep.update(cx, |upkeep, cx| upkeep.undo_allow(&id, cx));
+                }))
+            })
             .child("Undo")
-            .automation_target(target("undo")),
+            .automation_target(target("undo"))
+            .into_any_element()
+            .into(),
         ),
-        None => (
+        Standing::ArchivedAgain { at } => (
+            format!(
+                "Archived again by the sync of {}{}",
+                location.map_or("its location", |it| it.name.as_str()),
+                at.map(|at| format!(" at {}", format::clock(at)))
+                    .unwrap_or_default()
+            ),
+            None,
+        ),
+        Standing::Deleted => (
             format!(
                 "{ran}deleted for good {}",
                 format::day(tombstone.deleted, now)
@@ -873,15 +1061,19 @@ fn deleted_row(
                 SharedString::from(format!("settings-allow-{at}")),
                 ButtonKind::Plain,
                 true,
-                true,
+                enabled,
                 theme,
             )
-            .on_click(cx.listener(move |_, _, _, cx| {
-                let upkeep = cx.services().upkeep.clone();
-                upkeep.update(cx, |upkeep, cx| upkeep.allow(&id, cx));
-            }))
+            .when(enabled, |this| {
+                this.on_click(cx.listener(move |_, _, _, cx| {
+                    let upkeep = cx.services().upkeep.clone();
+                    upkeep.update(cx, |upkeep, cx| upkeep.allow(&id, cx));
+                }))
+            })
             .child("Allow archiving again")
-            .automation_target(target("allow")),
+            .automation_target(target("allow"))
+            .into_any_element()
+            .into(),
         ),
     };
     div()
@@ -904,17 +1096,16 @@ fn deleted_row(
                         .text_spec(&theme.text.path)
                         .text_color(c.fg)
                         .overflow_hidden()
-                        .text_ellipsis()
+                        .text_ellipsis_middle()
                         .whitespace_nowrap()
                         .child(named(tombstone)),
                 )
                 .child(
                     div()
                         .text_spec(&theme.text.small)
-                        .text_color(if row.allowed.is_some() {
-                            c.accent_text
-                        } else {
-                            c.fg3
+                        .text_color(match row.standing {
+                            Standing::Deleted => c.fg3,
+                            Standing::Allowed(_) | Standing::ArchivedAgain { .. } => c.accent_text,
                         })
                         .child(line),
                 )
@@ -926,7 +1117,7 @@ fn deleted_row(
                 })),
         )
         .children(location.map(|it| location_tag(it.name.clone(), &it.kind, false, theme)))
-        .child(action)
+        .children(action)
         .automation_target(target("row"))
 }
 
@@ -936,19 +1127,8 @@ mod tests {
 
     #[test]
     fn a_stored_file_is_named_as_the_board_does() {
-        let file: std::path::PathBuf = [
-            "files",
-            "6f0c2b8e",
-            "agent",
-            "2f",
-            "2f91c0aa55",
-            "v0001",
-            "0000000000184467.zst",
-        ]
-        .iter()
-        .collect();
         assert_eq!(
-            shown_file(&file),
+            shown_file("files/6f0c2b8e/agent/2f/2f91c0aa55/v0001/0000000000184467.zst"),
             "files/2f/2f91c0\u{2026}/v0001/0000000000184467.zst"
         );
     }

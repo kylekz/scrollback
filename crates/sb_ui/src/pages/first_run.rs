@@ -418,10 +418,17 @@ impl FirstRun {
         .automation_target(target)
     }
 
-    /// Where the archive goes, its folder in the code font inside the sentence.
+    /// Where the archive goes, its folder in the code font inside the sentence: the data
+    /// folder's, or the one the owner chose in Settings.
     fn archive_line(&self, theme: &SbTheme, cx: &App) -> AnyElement {
-        const BEFORE: &str = "The archive goes in scrollback's data folder, ";
-        const AFTER: &str = ". Settings can point it somewhere else later.";
+        let (before, after) = if cx.services().settings.read(cx).is_chosen() {
+            ("The archive is in ", ".")
+        } else {
+            (
+                "The archive goes in scrollback's data folder, ",
+                ". Settings can point it somewhere else later.",
+            )
+        };
         let c = &theme.colors;
         let folder = unbroken(&self.archive.read(cx).dir().display().to_string());
         let run = |len: usize, family: &gpui::SharedString| TextRun {
@@ -433,9 +440,9 @@ impl FirstRun {
             strikethrough: None,
         };
         let runs = vec![
-            run(BEFORE.len(), &theme.fonts.ui),
+            run(before.len(), &theme.fonts.ui),
             run(folder.len(), &theme.fonts.mono),
-            run(AFTER.len(), &theme.fonts.ui),
+            run(after.len(), &theme.fonts.ui),
         ];
         div()
             .flex_1()
@@ -449,7 +456,7 @@ impl FirstRun {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(StyledText::new(format!("{BEFORE}{folder}{AFTER}")).with_runs(runs)),
+                    .child(StyledText::new(format!("{before}{folder}{after}")).with_runs(runs)),
             )
             .into_any_element()
     }

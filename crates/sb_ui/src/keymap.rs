@@ -192,7 +192,7 @@ const fn row(does: &'static str, actions: &'static [&'static str]) -> ShortcutRo
 /// built yet has no row until it is.
 pub const SHORTCUT_ROWS: &[ShortcutRow] = &[
     row(
-        "Back to the page the session was opened from",
+        "Back to the page the session was opened from, or leave Settings",
         &["library::Back"],
     ),
     row("Star or unstar the selected session", &["sessions::Star"]),

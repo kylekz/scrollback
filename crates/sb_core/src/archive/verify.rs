@@ -18,7 +18,10 @@
 //!
 //! A verify that runs to its end is kept in the catalogue as the archive's last
 //! ([`LastVerify`]), so Settings shows what it found after the app is started again
-//! (DESIGN §4.13). One that is cancelled leaves the last as it was.
+//! (DESIGN §4.13). One that is cancelled, even as it ends, leaves the last as it was. The
+//! record is a type of its own with a version, apart from the archive's own types, so that a
+//! change to those never reads as no verify at all; it keeps the first [`KEPT_DAMAGES`]
+//! damaged versions and how many there were.
 
 use std::fs;
 use std::io::{self, Read as _};
@@ -34,7 +37,7 @@ use crate::catalogue::{self, Stored};
 use crate::location::LocationId;
 
 /// A version whose stored bytes are not the ones that were archived.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Damage {
     pub location: LocationId,
     pub provider: String,
@@ -67,15 +70,86 @@ pub struct VerifyProgress {
     pub segments: usize,
 }
 
-/// What the archive's last verify that ran to its end found, as the catalogue keeps it.
+/// How many damaged versions the record of the last verify keeps.
+pub const KEPT_DAMAGES: usize = 200;
+
+/// The version of the record of the last verify this build writes and reads.
+pub(crate) const LAST_VERIFY_VERSION: u32 = 1;
+
+/// What is wrong with a damaged version, as the record of the last verify names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DamageKind {
+    #[serde(rename = "segment_missing")]
+    SegmentMissing,
+    #[serde(rename = "segment_unreadable")]
+    SegmentUnreadable,
+    #[serde(rename = "segment_changed")]
+    SegmentChanged,
+    #[serde(rename = "gap")]
+    Gap,
+    #[serde(rename = "version_changed")]
+    VersionChanged,
+}
+
+impl From<&Problem> for DamageKind {
+    fn from(problem: &Problem) -> Self {
+        match problem {
+            Problem::SegmentMissing { .. } => Self::SegmentMissing,
+            Problem::SegmentUnreadable { .. } => Self::SegmentUnreadable,
+            Problem::SegmentChanged { .. } => Self::SegmentChanged,
+            Problem::Gap { .. } => Self::Gap,
+            Problem::VersionChanged => Self::VersionChanged,
+        }
+    }
+}
+
+/// A damaged version as the record of the last verify keeps it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DamageRecord {
+    pub location: LocationId,
+    pub provider: String,
+    pub key: String,
+    pub version: u32,
+    /// The stored file its first problem is in, relative to the archive, with `/` between
+    /// its names ([`Damage::file`]).
+    pub file: String,
+    pub kind: DamageKind,
+}
+
+impl From<&Damage> for DamageRecord {
+    fn from(damage: &Damage) -> Self {
+        Self {
+            location: damage.location.clone(),
+            provider: damage.provider.clone(),
+            key: damage.key.clone(),
+            version: damage.version,
+            file: damage
+                .file()
+                .iter()
+                .map(|name| name.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/"),
+            kind: damage
+                .problems
+                .first()
+                .map_or(DamageKind::VersionChanged, DamageKind::from),
+        }
+    }
+}
+
+/// What the archive's last verify that ran to its end found, as the catalogue keeps it (the
+/// module docs).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastVerify {
-    /// When it ended, in Unix milliseconds, and how long it took.
+    /// When it ended, in Unix milliseconds.
     pub at: i64,
+    /// How long it took.
     pub took_ms: u64,
     pub versions: usize,
     pub segments: usize,
-    pub damaged: Vec<Damage>,
+    /// How many versions it found damaged; the first [`KEPT_DAMAGES`] are in `damaged`.
+    pub damaged_total: usize,
+    pub damaged: Vec<DamageRecord>,
     /// How many versions could not be read to the end, for a reason that isn't their bytes.
     pub unread: usize,
     /// How many paths under `files/` the catalogue doesn't record.
@@ -249,12 +323,22 @@ impl Archive {
             .zip(there)
             .filter_map(|((_, damage), there)| there.then_some(damage))
             .collect();
+        /* A stop asked for as it ended is a stop: what it found is not kept. */
+        if cancel.is_cancelled() {
+            return Err(ArchiveError::Cancelled);
+        }
         self.catalogue.record_verify(&LastVerify {
             at: catalogue::now_ms(),
             took_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             versions: report.versions,
             segments: report.segments,
-            damaged: report.damaged.clone(),
+            damaged_total: report.damaged.len(),
+            damaged: report
+                .damaged
+                .iter()
+                .take(KEPT_DAMAGES)
+                .map(DamageRecord::from)
+                .collect(),
             unread: report.unread.len(),
             uncatalogued: report.uncatalogued.len(),
             removing: report.removing.len(),

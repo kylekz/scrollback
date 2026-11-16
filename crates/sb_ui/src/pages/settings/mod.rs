@@ -8,7 +8,8 @@
 //!
 //! **Leaving.** Back, `Esc` and `Alt ←` go back to the page Settings was opened from, which is
 //! as it was; so does picking a page in the sidebar, which shows that page. `Esc` first closes
-//! what is open on the page: the confirmation of another folder, then a menu.
+//! what is open on the page: the confirmation of another folder, then a menu. Stale after keeps
+//! what was typed in it when it loses the keyboard, on `Enter`, and when Settings is left.
 //!
 //! The sections are drawn in [`archive`], [`sync`], [`appearance`] and [`shortcuts`]. What they
 //! show comes from the services: the app's settings ([`crate::services::SettingsService`]), the
@@ -35,9 +36,9 @@ use sb_core::archive::Holds;
 use sb_core::catalogue::Shelf;
 
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{icon, icon_button};
+use crate::components::{bad_banner, icon, icon_button};
 use crate::icons::SbIcon;
-use crate::services::ActiveServices as _;
+use crate::services::{ActiveServices as _, SyncService};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
 /// Settings' sections, in their order.
@@ -98,40 +99,62 @@ pub struct SettingsPage {
     menu: bool,
     /// The Stale after field.
     stale_after: Entity<InputState>,
+    /// The sync service the field was filled from, and keeps what is typed to: once the app
+    /// has moved onto another archive, that one is closed and takes nothing.
+    stale_sync: Entity<SyncService>,
+    /// Whether Settings was shown when the app's settings last changed.
+    was_shown: bool,
     /// A folder chosen as the archive's, being looked at or waiting to be confirmed.
     chosen: Option<Chosen>,
     /// Where the keyboard rests in the confirmation, and where it was before.
     confirm_focus: FocusHandle,
+    /// The confirmation's Cancel, which has the keyboard as it opens.
+    cancel_focus: FocusHandle,
     /// While the confirmation is open: where the keyboard was before it.
     confirm_back: Option<Option<FocusHandle>>,
-    _subscriptions: [Subscription; 1],
+    _subscriptions: [Subscription; 2],
 }
 
 impl SettingsPage {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let days = cx.services().sync.read(cx).stale_after_days();
+        let services = cx.services();
+        let (stale_sync, settings) = (services.sync.clone(), services.settings.clone());
+        let days = stale_sync.read(cx).stale_after_days();
         let stale_after = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(days.to_string())
                 .validate(|text, _| text.len() <= 2 && text.chars().all(|c| c.is_ascii_digit()))
         });
         Self {
-            _subscriptions: [cx.subscribe_in(
-                &stale_after,
-                window,
-                |this, _, event, window, cx| match event {
-                    InputEvent::Blur | InputEvent::PressEnter { .. } => {
+            _subscriptions: [
+                cx.subscribe_in(
+                    &stale_after,
+                    window,
+                    |this, _, event, window, cx| match event {
+                        InputEvent::Blur | InputEvent::PressEnter { .. } => {
+                            this.take_stale_after(window, cx);
+                        }
+                        _ => {}
+                    },
+                ),
+                /* Leaving Settings takes the field off the screen without it losing the
+                keyboard. */
+                cx.observe_in(&settings, window, |this, settings, window, cx| {
+                    let shown = settings.read(cx).is_shown();
+                    if std::mem::replace(&mut this.was_shown, shown) && !shown {
                         this.take_stale_after(window, cx);
                     }
-                    _ => {}
-                },
-            )],
+                }),
+            ],
             scroll: ScrollHandle::new(),
             picked: None,
             menu: false,
             stale_after,
+            stale_sync,
+            was_shown: false,
             chosen: None,
             confirm_focus: cx.focus_handle(),
+            cancel_focus: cx.focus_handle(),
             confirm_back: None,
         }
     }
@@ -142,7 +165,8 @@ impl SettingsPage {
         self.picked = None;
         self.menu = false;
         self.chosen = None;
-        let days = cx.services().sync.read(cx).stale_after_days();
+        self.stale_sync = cx.services().sync.clone();
+        let days = self.stale_sync.read(cx).stale_after_days();
         self.stale_after.update(cx, |input, cx| {
             input.set_value(days.to_string(), window, cx)
         });
@@ -158,15 +182,15 @@ impl SettingsPage {
     }
 
     /**
-     * Gives the keyboard to the confirmation as it opens, and back to where it was as it
-     * closes. Called as the page draws, so that what has the keyboard is drawn in the same
-     * frame.
+     * Gives the keyboard to the confirmation's Cancel as it opens, and back to where it was as
+     * it closes, as `crate::shell`'s dialogs do. Called as the page draws, so that what has the
+     * keyboard is drawn in the same frame.
      */
     fn follow_confirmation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match (self.chosen.is_some(), self.confirm_back.is_some()) {
             (true, false) => {
                 self.confirm_back = Some(window.focused(cx));
-                self.confirm_focus.focus(window, cx);
+                self.cancel_focus.focus(window, cx);
             }
             (false, true) => {
                 if let Some(Some(back)) = self.confirm_back.take() {
@@ -206,10 +230,16 @@ impl SettingsPage {
         Section::ALL[index.min(Section::ALL.len() - 1)]
     }
 
-    /// Scrolls the column to `section`.
+    /// Scrolls the column to `section`, which then sits below the column's top padding as the
+    /// first does, or as near as the column scrolls.
     pub fn go_to(&mut self, section: Section, cx: &mut Context<Self>) {
-        if let Some(index) = Section::ALL.iter().position(|it| *it == section) {
-            self.scroll.scroll_to_top_of_item(index);
+        let index = Section::ALL.iter().position(|it| *it == section);
+        if let (Some(first), Some(item)) = (
+            self.scroll.bounds_for_item(0),
+            index.and_then(|index| self.scroll.bounds_for_item(index)),
+        ) {
+            let below = (item.top() - first.top()).min(self.scroll.max_offset().y);
+            self.scroll.set_offset(gpui::point(px(0.), -below));
         }
         self.picked = Some(section);
         cx.notify();
@@ -219,7 +249,7 @@ impl SettingsPage {
     /// was.
     fn take_stale_after(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let typed: Option<u32> = self.stale_after.read(cx).value().trim().parse().ok();
-        let sync = cx.services().sync.clone();
+        let sync = self.stale_sync.clone();
         if let Some(days) = typed {
             sync.update(cx, |sync, cx| sync.set_stale_after_days(days, cx));
         }
@@ -449,7 +479,8 @@ fn segments<T: Copy + PartialEq + 'static>(
         .children(choices.into_iter().map(|(value, label, target, enabled)| {
             let chosen = value == on;
             let pick = pick.clone();
-            crate::components::tab_stop(div().id(target), theme)
+            div()
+                .id(target)
                 .role(Role::Button)
                 .debug_selector(move || target.to_string())
                 .aria_label(label)
@@ -464,8 +495,10 @@ fn segments<T: Copy + PartialEq + 'static>(
                 .text_color(if chosen { c.fg } else { c.fg2 })
                 .when(chosen, |this| this.bg(c.active).border_color(c.line_subtle))
                 .map(|this| {
+                    /* A choice that can't be made is no stop for Tab. */
                     if enabled {
-                        this.cursor_pointer()
+                        crate::components::tab_stop(this, theme)
+                            .cursor_pointer()
                             .on_click(move |_, _, cx| pick(value, cx))
                     } else {
                         this.opacity(crate::components::DISABLED_OPACITY)
@@ -488,6 +521,18 @@ impl Render for SettingsPage {
             self.appearance_section(&theme, cx),
             shortcuts::section(&theme),
         ];
+        let unsaved = cx.services().settings.read(cx).save_failure().map(|why| {
+            bad_banner(&theme)
+                .mx(px(32.))
+                .mt(theme.spacing.lg)
+                .max_w(column)
+                .child(div().flex_1().min_w_0().child(format!(
+                    "Your last change to Settings wasn't saved, and is lost when scrollback \
+                         quits unless a later change saves it: {}.",
+                    why.trim_end_matches('.')
+                )))
+                .automation_target("settings/unsaved")
+        });
         div()
             .id("settings")
             .size_full()
@@ -503,35 +548,47 @@ impl Render for SettingsPage {
                     .child(self.nav(&theme, cx))
                     .child(
                         div()
-                            .id("settings-column")
                             .flex_1()
                             .min_w_0()
-                            .h_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll)
-                            .on_scroll(cx.listener(|this, _, _, cx| {
-                                this.picked = None;
-                                cx.notify();
-                            }))
                             .flex()
                             .flex_col()
-                            .gap(px(26.))
-                            .pt(theme.spacing.xxl)
-                            .px(px(32.))
-                            .pb(px(40.))
-                            .children(sections.into_iter().zip(Section::ALL).map(
-                                |(section, which)| {
-                                    div()
-                                        .flex_none()
-                                        .w_full()
-                                        .max_w(column)
-                                        .child(section)
-                                        .automation_target_with(move || {
-                                            format!("settings/section/{}", which.key()).into()
-                                        })
-                                },
-                            ))
-                            .automation_target("settings/column"),
+                            .children(unsaved)
+                            .child(
+                                div()
+                                    .id("settings-column")
+                                    .debug_selector(|| "settings-column".into())
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.scroll)
+                                    .on_scroll(cx.listener(|this, _, _, cx| {
+                                        this.picked = None;
+                                        cx.notify();
+                                    }))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(26.))
+                                    .pt(theme.spacing.xxl)
+                                    .px(px(32.))
+                                    .pb(px(40.))
+                                    .children(sections.into_iter().zip(Section::ALL).map(
+                                        |(section, which)| {
+                                            div()
+                                                .flex_none()
+                                                .w_full()
+                                                .max_w(column)
+                                                .debug_selector(move || {
+                                                    format!("settings-section-{}", which.key())
+                                                })
+                                                .child(section)
+                                                .automation_target_with(move || {
+                                                    format!("settings/section/{}", which.key())
+                                                        .into()
+                                                })
+                                        },
+                                    ))
+                                    .automation_target("settings/column"),
+                            ),
                     ),
             )
             .children(self.confirmation(window, &theme, cx))

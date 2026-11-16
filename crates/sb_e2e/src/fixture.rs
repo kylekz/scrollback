@@ -181,8 +181,8 @@ fn damage(archive_dir: &Path, key: &str) -> Result<()> {
  * (which a scripted run reads as the distro), and the host `user@macbook`, synced from a tree of
  * its own under `scratch` (removed again), whose two sessions were deleted for good on the
  * board's days. Two of the distro's transcripts have a damaged segment: "Day 9: disk
- * compaction", which the distro still has, so it can be fetched again; and "Summarise this
- * week's notes", which the agent has deleted since, as the start's sync finds.
+ * compaction", which the distro still has, so it can be fetched again; and "Tidy the notes
+ * folder", which the agent has deleted since, as the start's sync finds.
  */
 pub fn settings(tree: &mut ProjectsTree, archive_dir: &Path, scratch: &Path) -> Result<()> {
     agent(tree);
@@ -261,5 +261,43 @@ pub fn settings(tree: &mut ProjectsTree, archive_dir: &Path, scratch: &Path) -> 
             [*deleted, at as i64],
         )?;
     }
+    Ok(())
+}
+
+/// The settings file in the data dir (`sb_ui::services::settings`).
+const SETTINGS_FILE: &str = "settings.json";
+
+/**
+ * Settings that name the archive `Archive` under `drive`, which isn't there, as on a drive
+ * unplugged; they remember the archive by its id, when it was last opened (the board's day)
+ * and what it held.
+ */
+pub fn archive_gone(data_dir: &Path, drive: &Path) -> Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    let settings = serde_json::json!({
+        "v": 1,
+        "archive": std::path::absolute(drive.join("Archive"))?,
+        "last_archive": {
+            "id": "a3f061c2-7b1e-4c2a-9d4f-0e5b8c1d2f30",
+            "opened": 1_794_758_400_000_i64,
+            "sessions": 2318,
+            "bytes": 4_400_000_000_u64,
+        },
+    });
+    std::fs::write(
+        data_dir.join(SETTINGS_FILE),
+        serde_json::to_string_pretty(&settings)?,
+    )?;
+    Ok(())
+}
+
+/// A settings file cut short, so not JSON, that names the archive `Archive` under `drive`.
+pub fn settings_unreadable(data_dir: &Path, drive: &Path) -> Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    let archive = serde_json::json!(std::path::absolute(drive.join("Archive"))?);
+    std::fs::write(
+        data_dir.join(SETTINGS_FILE),
+        format!("{{\n  \"v\": 1,\n  \"archive\": {archive},\n  \"mode\": \"da"),
+    )?;
     Ok(())
 }

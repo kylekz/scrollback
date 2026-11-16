@@ -274,9 +274,13 @@ impl Shell {
         self.main.read(cx).settings_page().read(cx).current()
     }
 
-    /// Whether a dialog is open over the window: the library's, or Settings' confirmation.
+    /// Whether a dialog is open over the window: the library's, Settings' confirmation, or
+    /// the question of the archive-unavailable page.
     fn asking(&self, cx: &App) -> bool {
-        self.dialog.is_some() || self.main.read(cx).settings_page().read(cx).is_confirming()
+        let main = self.main.read(cx);
+        self.dialog.is_some()
+            || main.settings_page().read(cx).is_confirming()
+            || main.unavailable_page().read(cx).is_asking()
     }
 
     /// The material applied to the window.
@@ -352,12 +356,16 @@ impl Shell {
             cx.notify();
         } else if Showing::now(cx) == Showing::Settings {
             self.main.update(cx, MainArea::leave_settings);
+        } else {
+            let unavailable = self.main.read(cx).unavailable_page().clone();
+            unavailable.update(cx, |page, cx| page.dismiss(cx));
         }
     }
 
-    /// Shows Settings in the main area, while a library page shows (module docs).
+    /// Shows Settings in the main area, while a library page shows, or a first run in a folder
+    /// the owner chose (module docs).
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !Showing::now(cx).is_library() {
+        if !Showing::now(cx).has_settings(cx) {
             return;
         }
         self.sidebar_open = false;
@@ -537,6 +545,12 @@ impl Render for Shell {
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.keep_name_left_behind(window, cx));
         self.follow_dialogs(window, cx);
+        /* Settings show over a library page or a first run only: one that leaves (the archive
+        is lost) takes them with it, so they don't come back when a library does. */
+        let settings = cx.services().settings.clone();
+        if settings.read(cx).is_shown() && !Showing::now(cx).is_library() {
+            settings.update(cx, |settings, cx| settings.show(false, cx));
+        }
         // A sidebar that isn't shown can't keep the keyboard.
         if placement == SidebarPlacement::Collapsed
             && self.sidebar.focus_handle(cx).contains_focused(window, cx)

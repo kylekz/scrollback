@@ -11,13 +11,13 @@ use std::time::{Duration, SystemTime};
 use gpui::{Entity, TestAppContext};
 use pretty_assertions::assert_eq;
 use sb_core::archive::Archive;
-use sb_core::catalogue::Shelf;
+use sb_core::catalogue::{SessionId, Shelf};
 use sb_core::location::LocationKind;
 use sb_test_support::Outline;
 
 use super::settings::{Switch, load};
 use super::sync::Refetch;
-use super::upkeep::Fix;
+use super::upkeep::{Fix, Standing, UpkeepService};
 use super::*;
 use crate::test_support::{
     SESSIONS, archive_dir, init_in, init_library, machine, machine_file, write_session,
@@ -146,14 +146,167 @@ fn settings_are_kept_beside_the_archive_in_the_data_dir(cx: &mut TestAppContext)
         );
     });
     let read = load(&data);
-    assert_eq!(read.unsaveable, None);
+    assert_eq!(read.unreadable, None);
     assert_eq!(read.settings.mode, crate::appearance::Mode::Light);
-    assert_eq!(read.settings.material, crate::theme::Material::Opaque);
+    assert_eq!(read.settings.material, Some(crate::theme::Material::Opaque));
     assert_eq!(read.settings.sync_every, SyncEvery::Thirty);
     let text = std::fs::read_to_string(data.join(settings::SETTINGS_FILE)).unwrap();
     assert!(text.contains(r#""kept": "as it was""#), "{text}");
     /* The archive holds nothing of the app's settings. */
     assert!(!archive_dir(cx).join(settings::SETTINGS_FILE).exists());
+}
+
+/// Why the archive didn't open.
+fn failure(cx: &mut TestAppContext) -> Option<Failure> {
+    cx.update(|cx| match cx.services().archive.read(cx).state() {
+        ArchiveState::Failed(failure) => Some(failure.clone()),
+        _ => None,
+    })
+}
+
+/// A folder chosen in Settings that isn't there at the start (a drive unplugged): nothing is
+/// made in its place, and the page says it isn't there.
+#[gpui::test]
+fn a_chosen_folder_missing_at_the_start_is_not_made_again(cx: &mut TestAppContext) {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let gone = elsewhere.path().join("Archive");
+    let json = serde_json::json!({ "v": 1, "archive": gone }).to_string();
+    let data = data_dir_with(&json);
+    let path = data.path().join(settings::SETTINGS_FILE);
+    init_in(data, machine(), cx);
+    assert_eq!(failure(cx), Some(Failure::Missing { there: false }));
+    assert!(!gone.exists());
+    /* Trying again finds the same, and makes nothing either. */
+    cx.update(|cx| {
+        let archive = cx.services().archive.clone();
+        archive.update(cx, |archive, cx| archive.retry(cx));
+    });
+    settle(cx);
+    assert_eq!(failure(cx), Some(Failure::Missing { there: false }));
+    assert!(!gone.exists());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), json);
+}
+
+/// A settings file that can't be read, though it names an archive: nothing is opened or made,
+/// neither there nor in the data folder, and the file is kept as it is until the owner
+/// chooses an archive.
+#[gpui::test]
+fn a_settings_file_that_cant_be_read_opens_nothing_until_the_owner_chooses(
+    cx: &mut TestAppContext,
+) {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let named = elsewhere.path().join("Archive");
+    let json = format!(r#"{{"v": 1, "archive": {}"#, serde_json::json!(named));
+    let data = data_dir_with(&json);
+    let (path, default) = (
+        data.path().join(settings::SETTINGS_FILE),
+        data.path().join(settings::ARCHIVE_FOLDER),
+    );
+    init_in(data, machine(), cx);
+    assert!(matches!(failure(cx), Some(Failure::Settings(_))));
+    assert!(!named.exists());
+    /* Retry is the owner's choice of an archive only. */
+    cx.update(|cx| {
+        let archive = cx.services().archive.clone();
+        archive.update(cx, |archive, cx| archive.retry(cx));
+    });
+    settle(cx);
+    assert!(matches!(failure(cx), Some(Failure::Settings(_))));
+    /* A change made meanwhile isn't written over the file either. */
+    let settings = settings(cx);
+    settings.update(cx, |settings, cx| {
+        settings.set_mode(crate::appearance::Mode::Dark, cx)
+    });
+    settle(cx);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), json);
+
+    /* Use the default archive: it opens, and the file is written from then on. */
+    settings.update(cx, |settings, cx| settings.use_folder(default.clone(), cx));
+    settle(cx);
+    assert_eq!(failure(cx), None);
+    assert_eq!(sessions(cx), SESSIONS.len());
+    let read = load(path.parent().unwrap());
+    assert_eq!(read.unreadable, None);
+    assert_eq!(read.settings.archive, None);
+    assert_eq!(read.settings.mode, crate::appearance::Mode::Dark);
+}
+
+/// A change that can't be written is said, kept, and written with the next one.
+#[cfg(unix)]
+#[gpui::test]
+fn a_change_that_cant_be_saved_is_said_and_tried_again(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt as _;
+    init_library(cx);
+    let data = archive_dir(cx).parent().unwrap().to_path_buf();
+    let settings = settings(cx);
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o555)).unwrap();
+    /* Root writes anywhere: then there is no failure to see. */
+    if std::fs::write(data.join("probe"), "").is_ok() {
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    settings.update(cx, |settings, cx| {
+        settings.set_mode(crate::appearance::Mode::Dark, cx)
+    });
+    settle(cx);
+    assert!(settings.read_with(cx, |settings, _| settings.save_failure().is_some()));
+    assert_ne!(load(&data).settings.mode, crate::appearance::Mode::Dark);
+
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    settings.update(cx, |settings, cx| {
+        settings.set_sync_every(SyncEvery::Thirty, cx)
+    });
+    settle(cx);
+    assert_eq!(
+        settings.read_with(cx, |settings, _| settings
+            .save_failure()
+            .map(str::to_string)),
+        None
+    );
+    let read = load(&data).settings;
+    assert_eq!(
+        (read.mode, read.sync_every),
+        (crate::appearance::Mode::Dark, SyncEvery::Thirty)
+    );
+}
+
+/// A location's sync and its refetch never run together: a refetch asked for while it syncs
+/// is skipped, saying so, and a sync asked for while it refetches waits for it. Neither is an
+/// error.
+#[gpui::test]
+fn a_refetch_and_a_sync_of_one_location_take_turns(cx: &mut TestAppContext) {
+    let damages = two_fetchable(cx);
+    let sync = cx.update(|cx| cx.services().sync.clone());
+    let location = damages[0].location.clone();
+
+    /* The refetch first: the sync waits, then runs. */
+    sync.update(cx, |sync, cx| {
+        sync.refetch(&damages[0], cx);
+        sync.sync(&location, cx);
+        assert!(sync.is_refetching(&location));
+        assert!(!sync.is_syncing());
+    });
+    settle(cx);
+    sync.read_with(cx, |sync, _| {
+        assert_eq!(sync.refetch_of(&damages[0]), Some(&Refetch::Done(2)));
+        assert!(matches!(
+            sync.status(sync.location(&location).unwrap()),
+            super::LocationStatus::Synced(_)
+        ));
+    });
+
+    /* The sync first: its pass hasn't run yet, and the refetch is skipped, its sync fetching
+    the item again itself. */
+    sync.update(cx, |sync, cx| {
+        sync.sync(&location, cx);
+        sync.refetch(&damages[1], cx);
+    });
+    sync.read_with(cx, |sync, _| {
+        assert!(matches!(
+            sync.refetch_of(&damages[1]),
+            Some(Refetch::Skipped(why)) if why.contains("is syncing now")
+        ));
+    });
 }
 
 #[gpui::test]
@@ -323,6 +476,52 @@ fn a_folder_that_holds_something_else_is_refused_and_the_app_stays(cx: &mut Test
     assert_eq!(load(current.parent().unwrap()).settings.archive, None);
 }
 
+/// Why using `folder` was refused, if it was.
+fn refused(folder: &Path, cx: &mut TestAppContext) -> Option<String> {
+    let settings = settings(cx);
+    settings.update(cx, |settings, cx| {
+        settings.use_folder(folder.to_path_buf(), cx)
+    });
+    settle(cx);
+    settings.read_with(cx, |settings, _| match settings.switch() {
+        Some(Switch::Refused { why, .. }) => Some(why.clone()),
+        _ => None,
+    })
+}
+
+/// The system's own words for why a folder can't be used stay in the log; the refusal says it
+/// in scrollback's.
+#[gpui::test]
+fn a_refusal_says_why_in_words(cx: &mut TestAppContext) {
+    init_library(cx);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let file = elsewhere.path().join("notes.txt");
+    std::fs::write(&file, "mine").unwrap();
+    assert_eq!(
+        refused(&file, cx).as_deref(),
+        Some("That's a file, not a folder.")
+    );
+}
+
+#[cfg(unix)]
+#[gpui::test]
+fn a_folder_that_cant_be_written_to_is_refused_in_words(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt as _;
+    init_library(cx);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let locked = elsewhere.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    /* Root writes anywhere: then there is nothing to refuse. */
+    if std::fs::write(locked.join("probe"), "").is_err() {
+        assert_eq!(
+            refused(&locked.join("archive"), cx).as_deref(),
+            Some("scrollback can't write to that folder.")
+        );
+    }
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// Damages the first segment of the item `key` of this machine in the archive.
 fn damage(key: &str, cx: &mut TestAppContext) {
     let folder = &sb_core::hash::Hash::of(key.as_bytes()).to_hex()[..32];
@@ -407,11 +606,76 @@ fn verify_finds_damage_and_an_item_still_at_its_location_is_fetched_again(cx: &m
     upkeep.update(cx, |upkeep, cx| upkeep.refresh(cx));
     settle(cx);
     let problems = upkeep.read_with(cx, |upkeep, _| upkeep.problems().to_vec());
-    assert_eq!(fix(&kept, &problems).0, Fix::Fetched(2));
+    assert_eq!(
+        fix(&kept, &problems).0,
+        Fix::Fetched {
+            version: 2,
+            held: None
+        }
+    );
+}
+
+/// Damages the first two items of this machine and verifies: two problems their location
+/// can still give.
+fn two_fetchable(cx: &mut TestAppContext) -> Vec<sb_core::archive::DamageRecord> {
+    init_library(cx);
+    damage(&machine_file(0, cx), cx);
+    damage(&machine_file(1, cx), cx);
+    let upkeep = cx.update(|cx| cx.services().upkeep.clone());
+    upkeep.update(cx, |upkeep, cx| upkeep.verify(cx));
+    settle(cx);
+    upkeep.read_with(cx, |upkeep, _| {
+        upkeep
+            .problems()
+            .iter()
+            .filter(|problem| problem.fix == Fix::FetchAgain)
+            .map(|problem| problem.damage.clone())
+            .collect()
+    })
 }
 
 #[gpui::test]
-fn a_session_allowed_again_can_be_undone_from_settings(cx: &mut TestAppContext) {
+fn fetch_all_again_fetches_each_in_turn(cx: &mut TestAppContext) {
+    let damages = two_fetchable(cx);
+    assert_eq!(damages.len(), 2);
+    let sync = cx.update(|cx| cx.services().sync.clone());
+    sync.update(cx, |sync, cx| sync.refetch_all(damages.clone(), cx));
+    sync.read_with(cx, |sync, _| {
+        assert_eq!(sync.fetch_all_progress(), Some((0, 2)));
+        /* One at a time. */
+        assert_eq!(sync.refetch_of(&damages[0]), Some(&Refetch::Running));
+        assert_eq!(sync.refetch_of(&damages[1]), None);
+    });
+    settle(cx);
+    sync.read_with(cx, |sync, _| {
+        assert_eq!(sync.fetch_all_progress(), None);
+        for damage in &damages {
+            assert_eq!(sync.refetch_of(damage), Some(&Refetch::Done(2)));
+        }
+    });
+}
+
+#[gpui::test]
+fn fetch_all_again_stops_with_the_one_fetching(cx: &mut TestAppContext) {
+    let damages = two_fetchable(cx);
+    let sync = cx.update(|cx| cx.services().sync.clone());
+    sync.update(cx, |sync, cx| {
+        sync.refetch_all(damages.clone(), cx);
+        sync.stop_fetch_all(cx);
+    });
+    settle(cx);
+    sync.read_with(cx, |sync, _| {
+        assert_eq!(sync.fetch_all_progress(), None);
+        assert_eq!(
+            sync.refetch_of(&damages[0]),
+            Some(&Refetch::Skipped("Stopped.".to_string()))
+        );
+        assert_eq!(sync.refetch_of(&damages[1]), None);
+    });
+}
+
+/// A row deleted for good: who to delete, and the upkeep service, having read the rows.
+fn deleted_for_good(cx: &mut TestAppContext) -> (Arc<Archive>, SessionId, Entity<UpkeepService>) {
     init_library(cx);
     let archive = cx.update(|cx| cx.services().archive.read(cx).archive().cloned().unwrap());
     let id = archive.catalogue().sessions(Shelf::All).unwrap()[0]
@@ -423,42 +687,87 @@ fn a_session_allowed_again_can_be_undone_from_settings(cx: &mut TestAppContext) 
     let upkeep = cx.update(|cx| cx.services().upkeep.clone());
     upkeep.update(cx, |upkeep, cx| upkeep.shown(cx));
     settle(cx);
-    let allowed = |cx: &mut TestAppContext| {
-        upkeep.read_with(cx, |upkeep, _| {
-            upkeep
-                .deleted()
-                .iter()
-                .map(|deleted| deleted.allowed.is_some())
-                .collect::<Vec<_>>()
-        })
-    };
-    assert_eq!(allowed(cx), [false]);
+    (archive, id, upkeep)
+}
 
-    upkeep.update(cx, |upkeep, cx| upkeep.allow(&id, cx));
-    settle(cx);
-    assert_eq!(allowed(cx), [true]);
-    assert_eq!(archive.catalogue().tombstones().unwrap(), []);
-    upkeep.update(cx, |upkeep, cx| upkeep.undo_allow(&id, cx));
-    settle(cx);
-    assert_eq!(allowed(cx), [false]);
-    assert_eq!(archive.catalogue().tombstones().unwrap().len(), 1);
+/// Where each row deleted for good stands, and the count the section's head shows.
+fn standing(upkeep: &Entity<UpkeepService>, cx: &mut TestAppContext) -> (Vec<&'static str>, usize) {
+    upkeep.read_with(cx, |upkeep, _| {
+        let rows = upkeep
+            .deleted()
+            .iter()
+            .map(|deleted| match deleted.standing {
+                Standing::Deleted => "deleted",
+                Standing::Allowed(_) => "allowed",
+                Standing::ArchivedAgain { .. } => "archived again",
+            })
+            .collect();
+        (rows, upkeep.still_deleted())
+    })
+}
 
-    /* Allowed and synced: archived again, and the undo is refused, saying why. */
-    upkeep.update(cx, |upkeep, cx| upkeep.allow(&id, cx));
-    settle(cx);
+fn sync_all(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let sync = cx.services().sync.clone();
         sync.update(cx, |sync, cx| sync.sync_all(cx));
     });
     settle(cx);
-    assert_eq!(sessions(cx), SESSIONS.len());
+}
+
+#[gpui::test]
+fn a_session_allowed_again_can_be_undone_from_settings(cx: &mut TestAppContext) {
+    let (archive, id, upkeep) = deleted_for_good(cx);
+    assert_eq!(standing(&upkeep, cx), (vec!["deleted"], 1));
+
+    upkeep.update(cx, |upkeep, cx| upkeep.allow(&id, cx));
+    settle(cx);
+    assert_eq!(standing(&upkeep, cx), (vec!["allowed"], 0));
+    assert_eq!(archive.catalogue().tombstones().unwrap(), []);
     upkeep.update(cx, |upkeep, cx| upkeep.undo_allow(&id, cx));
     settle(cx);
+    assert_eq!(standing(&upkeep, cx), (vec!["deleted"], 1));
+    assert_eq!(archive.catalogue().tombstones().unwrap().len(), 1);
+
+    /* Allowed, and synced while Settings isn't shown, so the row hasn't been read again: the
+    undo is refused, saying why, and the row says the sync archived it. */
+    upkeep.update(cx, |upkeep, cx| upkeep.allow(&id, cx));
+    settle(cx);
+    sync_all(cx);
+    assert_eq!(sessions(cx), SESSIONS.len());
+    assert_eq!(standing(&upkeep, cx), (vec!["allowed"], 0));
+    upkeep.update(cx, |upkeep, cx| upkeep.undo_allow(&id, cx));
+    settle(cx);
+    assert_eq!(standing(&upkeep, cx), (vec!["archived again"], 0));
     upkeep.read_with(cx, |upkeep, _| {
         assert!(upkeep.deleted()[0].refused.is_some());
     });
+    assert_eq!(archive.catalogue().tombstones().unwrap(), []);
     /* Shown again, Settings lists none: the session is archived. */
     upkeep.update(cx, |upkeep, cx| upkeep.shown(cx));
     settle(cx);
-    assert_eq!(allowed(cx), Vec::<bool>::new());
+    assert_eq!(standing(&upkeep, cx), (Vec::<&str>::new(), 0));
+}
+
+/// While Settings is shown, a sync that archives an allowed session turns its row into
+/// "Archived again by the sync of …", with when, and no Undo.
+#[gpui::test]
+fn a_sync_archiving_an_allowed_session_says_so_in_its_row(cx: &mut TestAppContext) {
+    let (archive, id, upkeep) = deleted_for_good(cx);
+    settings(cx).update(cx, |settings, cx| settings.show(true, cx));
+    upkeep.update(cx, |upkeep, cx| upkeep.allow(&id, cx));
+    settle(cx);
+    sync_all(cx);
+    assert_eq!(standing(&upkeep, cx), (vec!["archived again"], 0));
+    upkeep.read_with(cx, |upkeep, _| {
+        let row = &upkeep.deleted()[0];
+        assert!(matches!(
+            row.standing,
+            Standing::ArchivedAgain { at: Some(_) }
+        ));
+        assert_eq!(row.refused, None);
+    });
+    upkeep.update(cx, |upkeep, cx| upkeep.undo_allow(&id, cx));
+    settle(cx);
+    assert_eq!(standing(&upkeep, cx), (vec!["archived again"], 0));
+    assert_eq!(archive.catalogue().tombstones().unwrap(), []);
 }
