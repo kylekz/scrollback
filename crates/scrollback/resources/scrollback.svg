@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18" width="1024" height="1024">
+  <!-- A placeholder app icon: the title bar's mark (DESIGN §2), the dark theme's accent tile
+       with three accent-ink bars at 100, 70 and 45% of its inner width. windows/scrollback.ico
+       (16 to 256 px, full bleed) and macos/scrollback.icns (16 to 1024 px, the tile 824 of
+       1024 on macOS's grid) are drawn from it. -->
+  <rect width="18" height="18" rx="5" fill="#4fc4bd"/>
+  <rect x="4" y="4" width="10" height="2" rx="1" fill="#062120"/>
+  <rect x="4" y="8" width="7" height="2" rx="1" fill="#062120"/>
+  <rect x="4" y="12" width="4.5" height="2" rx="1" fill="#062120"/>
+</svg>

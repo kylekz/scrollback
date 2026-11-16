@@ -44,6 +44,8 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 dirs = "6"
+# Windows only: the scrollback binary's icon and version resource (`crates/scrollback/build.rs`).
+embed-resource = "3.0"
 env_logger = "0.11"
 log = "0.4"
 pretty_assertions = "1.4"
@@ -58,6 +60,10 @@ tempfile = "3"
 thiserror = "2"
 # Archive and location ids.
 uuid = { version = "1", features = ["v4"] }
+# The installer's hooks and an installed copy's updates, on Windows and macOS (`crates/scrollback`:
+# `installer`, `updates`). Pinned to the `vpk` that packs the releases (`script/package`): the
+# crate and the CLI go together, and are bumped together.
+velopack = "=1.2.161"
 # Windows only: the rename that puts a segment in place (`sb_core::archive`). toolbox-rs's pin.
 windows-sys = "0.61"
 # Segments are zstd frames (PLAN §4.1).
@@ -76,3 +82,9 @@ debug = false
 debug = "limited"
 lto = "thin"
 codegen-units = 16
+
+# A packaged release (`script/package`): release's settings in a folder of its own,
+# `target/dist`, so packaging never touches `target/release`. Its limited debug info stays there
+# (`.pdb` files on Windows, which `vpk pack` leaves out).
+[profile.dist]
+inherits = "release"

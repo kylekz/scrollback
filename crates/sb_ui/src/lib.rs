@@ -36,6 +36,8 @@ pub mod sidebar;
 #[cfg(test)]
 mod test_support;
 pub mod theme;
+pub mod updates;
+pub mod version;
 
 pub use assets::Assets;
 pub use icons::SbIcon;

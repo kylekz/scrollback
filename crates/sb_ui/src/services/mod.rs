@@ -6,6 +6,7 @@
 //! - [`SyncService`] (`Sync`): the locations, the passes that sync them and their progress.
 //! - [`LibraryService`] (`Library`): the page shown, what is selected on it, and what the
 //!   sidebar and the pages read from the catalogue.
+//! - [`UpdatesService`]: scrollback's own updates, in an installed copy.
 //!
 //! Nothing here blocks the UI thread: the archive is opened, synced and read in
 //! `background_spawn` jobs (in tests, gpui's deterministic scheduler), and a service's state
@@ -23,6 +24,7 @@ mod scale;
 pub mod sync;
 #[cfg(test)]
 mod tests;
+pub mod updates;
 pub mod view;
 
 use std::path::PathBuf;
@@ -44,6 +46,7 @@ pub use library::{
 #[cfg(any(test, feature = "automation"))]
 pub use sync::Held;
 pub use sync::{LocationStatus, PassProgress, Reach, SyncEvent, SyncService};
+pub use updates::{CheckResult, Off, Updater, UpdatesService};
 pub use view::{DateRange, Facets, GroupSort, PageView, UnsortedView};
 
 /// The providers of the agents scrollback archives, as the services and the views share them.
@@ -83,6 +86,8 @@ pub struct ServicesConfig {
     pub providers: Vec<Box<dyn Provider>>,
     /// How each kind of location is reached and tested, and how WSL's distros are listed.
     pub reach: Reach,
+    /// What looks for scrollback's own updates: an installed copy's, or why there is none.
+    pub updater: Updater,
 }
 
 /// The app's services.
@@ -90,6 +95,7 @@ pub struct Services {
     pub archive: Entity<ArchiveService>,
     pub sync: Entity<SyncService>,
     pub library: Entity<LibraryService>,
+    pub updates: Entity<UpdatesService>,
     pub providers: Providers,
 }
 
@@ -110,10 +116,12 @@ pub fn init(config: ServicesConfig, cx: &mut App) {
     let archive = cx.new(|cx| ArchiveService::new(config.archive_dir, cx));
     let sync = cx.new(|cx| SyncService::new(archive.clone(), providers.clone(), config.reach, cx));
     let library = cx.new(|cx| LibraryService::new(archive.clone(), sync.clone(), cx));
+    let updates = cx.new(|cx| UpdatesService::new(config.updater, cx));
     cx.set_global(Services {
         archive,
         sync,
         library,
+        updates,
         providers,
     });
 }

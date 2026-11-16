@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# A release of scrollback (docs/PLAN.md §13, phase 7; dv's D9 and script/package): the shipped
+# shape built with its own profile, then `vpk pack` making the installer and the update feed an
+# installed copy updates from. From Git Bash on Windows, the Windows release; on a Mac, the
+# macOS one. Never run by script/check.
+#
+#   script/package                    a trial: the next local version (below), into
+#                                     target/package/try, which no installed copy reads
+#   script/package --publish          the same into the local feed, target/package/releases,
+#                                     which a locally packaged copy updates from: the owner's
+#                                     alone, never an agent's
+#   script/package --version <semver> that version instead
+#
+# The release workflow (.github/workflows/release.yml) adds two:
+#   --feed <url or folder>            the feed baked into the build instead of the local one
+#                                     (the workflow's: https://github.com/<owner>/<repo>)
+#   --out <dir>                       the release into <dir> instead of the trial folder; never
+#                                     the local feed, which only --publish writes
+#
+# 1. the version: the workspace's with the UTC time, `0.1.0-local.20261117093012`, or
+#    --version's. Velopack updates only to a newer version, and `vpk pack` refuses one that
+#    isn't newer than every release already in the folder it writes
+# 2. the app, `cargo build -p scrollback --no-default-features --profile dist` (no automation),
+#    with SCROLLBACK_CHANNEL=release, SCROLLBACK_VERSION=<version> and
+#    SCROLLBACK_UPDATE_FEED=<the feed> baked in (the local feed target/package/releases, a
+#    trial's too, unless --feed names another): target/dist, never target/release; its
+#    `--version` must say that version
+# 3. the binary staged alone in target/package/stage
+# 4. `vpk pack` into the output folder, with the pack id below:
+#    Windows: <pack id>-win-Setup.exe (a per-user install, no wizard, no admin, into
+#      %LOCALAPPDATA%\<pack id>, a Start menu shortcut and no desktop one, no portable zip),
+#      <pack id>-<version>-full.nupkg, from the second release there on its -delta.nupkg,
+#      releases.win.json, assets.win.json and the older RELEASES
+#    macOS: <pack id>-osx-Setup.pkg (the app bundle inside, titled scrollback),
+#      <pack id>-<version>-osx-full.nupkg (and its delta), releases.osx.json, assets.osx.json;
+#      for this Mac's architecture (osx-arm64 on Apple silicon). Sealed with an ad-hoc
+#      signature unless SCROLLBACK_SIGN_APP_IDENTITY names a certificate (below)
+#
+# The pack id is not `scrollback`: on Windows the installer owns %LOCALAPPDATA%\<pack id> and
+# deletes it on uninstall, and the data folder, with the archive in it, is
+# %LOCALAPPDATA%\scrollback (crates/scrollback's installer tests hold the two apart).
+#
+# Signing, macOS only, from the environment (the release workflow's signed job sets them from
+# the `release` environment's secrets; nothing of the kind is in the repository):
+#   SCROLLBACK_SIGN_APP_IDENTITY      the Developer ID Application identity; without it, ad hoc
+#   SCROLLBACK_SIGN_INSTALL_IDENTITY  the Developer ID Installer identity, for the .pkg
+#   SCROLLBACK_NOTARY_PROFILE         a `notarytool store-credentials` profile: notarizes
+#   SCROLLBACK_KEYCHAIN               the keychain that holds them
+#
+# It never runs the installer, Update.exe or the app but `scrollback --version`. vpk is a .NET
+# tool: without it this exits 2 saying how to install it.
+set -euo pipefail
+
+pack_id=scrollback-app
+title=scrollback
+bundle_id=io.github.kylekz.scrollback
+
+usage() {
+    cat <<'EOF'
+usage: script/package [--publish] [--version <semver>] [--feed <url or folder>] [--out <dir>]
+
+  builds a release of scrollback (the installer and an update feed) into target/package/try:
+  from Git Bash on Windows the Windows release, on a Mac the macOS one
+  --publish           into target/package/releases instead, the local feed a locally packaged
+                      copy updates from (the owner's alone)
+  --version <semver>  the release's version [default: the workspace's, -local.<UTC time>]
+  --feed <url|dir>    the feed baked into the build [default: target/package/releases]
+  --out <dir>         the release into <dir> instead of target/package/try (never the feed)
+EOF
+}
+
+explicit=""
+feed_arg=""
+out_arg=""
+publish=0
+while [[ $# -gt 0 ]]; do
+    arg="$1"
+    shift
+    case "$arg" in
+        --version | --feed | --out)
+            if [[ $# -eq 0 || -z "$1" ]]; then
+                echo "script/package: $arg needs a value" >&2
+                exit 2
+            fi
+            case "$arg" in
+                --version) explicit="$1" ;;
+                --feed) feed_arg="$1" ;;
+                --out) out_arg="$1" ;;
+            esac
+            shift
+            ;;
+        --publish) publish=1 ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "script/package: unknown argument: $arg" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+if [[ -n "$out_arg" && "$publish" -eq 1 ]]; then
+    echo "script/package: --out and --publish name two different folders; pick one" >&2
+    exit 2
+fi
+
+on_windows=0
+case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*) on_windows=1 ;;
+    Darwin) ;;
+    *)
+        echo "script/package: packages the Windows app from Git Bash on Windows, or the macOS" \
+            "app on a Mac" >&2
+        exit 2
+        ;;
+esac
+
+# A path as vpk and the other native tools take it: Windows-style under Git Bash.
+native() {
+    if [[ "$on_windows" -eq 1 ]]; then cygpath -w "$1"; else printf '%s\n' "$1"; fi
+}
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+step() {
+    printf '\n==> [%s] %s\n' "$1" "$2"
+}
+
+# vpk: on PATH, else where `dotnet tool install -g` puts it.
+vpk="$(command -v vpk 2> /dev/null || true)"
+if [[ -z "$vpk" && "$on_windows" -eq 1 && -n "${USERPROFILE:-}" ]]; then
+    candidate="$(cygpath -u "$USERPROFILE")/.dotnet/tools/vpk.exe"
+    if [[ -x "$candidate" ]]; then
+        vpk="$candidate"
+    fi
+fi
+if [[ -z "$vpk" && "$on_windows" -eq 0 && -x "$HOME/.dotnet/tools/vpk" ]]; then
+    vpk="$HOME/.dotnet/tools/vpk"
+fi
+if [[ -z "$vpk" ]]; then
+    cat >&2 <<'EOF'
+script/package: vpk (Velopack's packaging tool) isn't installed. It is a .NET tool, pinned to
+the velopack crate's version (Cargo.toml):
+  the .NET SDK 8 (winget install Microsoft.DotNet.SDK.8; on a Mac, Microsoft's installer)
+  dotnet tool install -g vpk --version 1.2.161
+then open a new terminal and run script/package again.
+EOF
+    exit 2
+fi
+
+package="$root/target/package"
+# The local feed (SCROLLBACK_UPDATE_FEED unless --feed names another), which a locally
+# packaged copy reads; only --publish writes it. A trial writes its own folder, which nothing
+# reads.
+feed="$package/releases"
+if [[ "$publish" -eq 1 ]]; then
+    out="$feed"
+elif [[ -n "$out_arg" ]]; then
+    mkdir -p "$out_arg"
+    out="$(cd "$out_arg" && pwd -P)"
+    if [[ -d "$feed" && "$out" == "$(cd "$feed" && pwd -P)" ]]; then
+        echo "script/package: --out names the local feed, which only --publish writes" >&2
+        exit 2
+    fi
+else
+    out="$package/try"
+fi
+baked_feed="$(native "$feed")"
+if [[ -n "$feed_arg" ]]; then
+    baked_feed="$feed_arg"
+fi
+stage="$package/stage"
+dist="$root/target/dist"
+
+step 1 "the version"
+base="$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+if [[ -z "$base" ]]; then
+    echo "script/package: Cargo.toml has no [workspace.package] version" >&2
+    exit 2
+fi
+version="${explicit:-$base-local.$(date -u +%Y%m%d%H%M%S)}"
+echo "scrollback $version"
+
+export SCROLLBACK_CHANNEL=release
+export SCROLLBACK_VERSION="$version"
+export SCROLLBACK_UPDATE_FEED="$baked_feed"
+
+exe=scrollback
+if [[ "$on_windows" -eq 1 ]]; then
+    exe=scrollback.exe
+fi
+
+step 2 "cargo build -p scrollback --no-default-features --profile dist  (target/dist)"
+echo "the feed: $SCROLLBACK_UPDATE_FEED"
+cargo build --locked -p scrollback --no-default-features --profile dist
+said="$("$dist/$exe" --version)"
+if [[ "$said" != "scrollback $version" ]]; then
+    echo "script/package: target/dist/$exe --version says \"$said\", not \"scrollback $version\"" >&2
+    exit 1
+fi
+echo "ok: $said"
+
+step 3 "staging in target/package/stage"
+rm -rf "$stage"
+mkdir -p "$stage" "$out"
+cp "$dist/$exe" "$stage/"
+ls -l "$stage"
+
+common=(
+    --packId "$pack_id"
+    --packVersion "$version"
+    --packTitle "$title"
+    --packAuthors "$title"
+    --packDir "$(native "$stage")"
+    --mainExe "$exe"
+    --noPortable
+    --outputDir "$(native "$out")"
+)
+
+if [[ "$on_windows" -eq 1 ]]; then
+    step 4 "vpk pack for win-x64  (${out#"$root/"})"
+    # `--skipVeloAppCheck`: vpk can't read a Rust binary's startup code (installer::run is the
+    # first thing main does). Shortcuts: the Start menu's alone.
+    "$vpk" pack --skip-updates "${common[@]}" \
+        --icon "$(native "$root/crates/scrollback/resources/windows/scrollback.ico")" \
+        --runtime win-x64 \
+        --shortcuts StartMenuRoot \
+        --skipVeloAppCheck
+else
+    case "$(uname -m)" in
+        arm64) runtime=osx-arm64 ;;
+        x86_64) runtime=osx-x64 ;;
+        *)
+            echo "script/package: no macOS runtime for $(uname -m)" >&2
+            exit 2
+            ;;
+    esac
+    # `--signAppIdentity -` is codesign's ad-hoc identity: no certificate, but the bundle is
+    # sealed as a whole, so it verifies (`codesign --verify --deep --strict`); a Developer ID
+    # identity signs it for Gatekeeper, and a notary profile has Apple notarize it.
+    signing=(--signAppIdentity "${SCROLLBACK_SIGN_APP_IDENTITY:--}")
+    if [[ -n "${SCROLLBACK_SIGN_INSTALL_IDENTITY:-}" ]]; then
+        signing+=(--signInstallIdentity "$SCROLLBACK_SIGN_INSTALL_IDENTITY")
+    fi
+    if [[ -n "${SCROLLBACK_NOTARY_PROFILE:-}" ]]; then
+        signing+=(--notaryProfile "$SCROLLBACK_NOTARY_PROFILE")
+    fi
+    if [[ -n "${SCROLLBACK_KEYCHAIN:-}" ]]; then
+        signing+=(--keychain "$SCROLLBACK_KEYCHAIN")
+    fi
+    step 4 "vpk pack for $runtime  (${out#"$root/"})"
+    "$vpk" pack --skip-updates "${common[@]}" \
+        --icon "$root/crates/scrollback/resources/macos/scrollback.icns" \
+        --bundleId "$bundle_id" \
+        --runtime "$runtime" \
+        "${signing[@]}"
+fi
+
+echo
+ls -l "$out"
+if [[ "$publish" -eq 1 ]]; then
+    printf '\nscript/package: scrollback %s published in %s\n' "$version" "$(native "$out")"
+elif [[ -n "$out_arg" ]]; then
+    printf '\nscript/package: scrollback %s in %s\n' "$version" "$(native "$out")"
+else
+    printf '\nscript/package: scrollback %s in %s (a trial; installed copies read only --publish'"'"'s)\n' \
+        "$version" "$(native "$out")"
+fi

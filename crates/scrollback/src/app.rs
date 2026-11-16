@@ -11,7 +11,7 @@ use sb_core::location::LocationKind;
 use sb_core::transport::wsl;
 use sb_ui::ActiveTheme as _;
 use sb_ui::appearance::MaterialSupport;
-use sb_ui::services::{Reach, ServicesConfig};
+use sb_ui::services::{Reach, ServicesConfig, Updater};
 
 use crate::cli::Cli;
 
@@ -36,11 +36,12 @@ pub fn run(cli: Cli) -> Result<()> {
         place.dir.display(),
         place.source.as_str()
     );
+    let updater = crate::updates::updater(automation, place.source);
     gpui_platform::application()
         .with_assets(sb_ui::Assets)
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(move |cx| {
-            if let Err(error) = start(cli, place.dir, cx) {
+            if let Err(error) = start(cli, place.dir, updater, cx) {
                 log::error!("scrollback couldn't start: {error:#}");
                 std::process::exit(1);
             }
@@ -51,10 +52,13 @@ pub fn run(cli: Cli) -> Result<()> {
 /// The archive's folder in the data dir (PLAN §4.4, DESIGN §4.10).
 const ARCHIVE: &str = "archive";
 
-/// Opens the main window as `cli` asks. `data_dir` is where this run keeps its files: the
-/// archive is opened in it, and made there on the first run (PLAN D3).
+/**
+ * Opens the main window as `cli` asks. `data_dir` is where this run keeps its files: the
+ * archive is opened in it, and made there on the first run (PLAN D3). `updater` looks for
+ * scrollback's own updates, in an installed copy (`crate::updates`).
+ */
 #[cfg_attr(not(feature = "automation"), expect(unused_variables))]
-fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
+fn start(cli: Cli, data_dir: PathBuf, updater: Updater, cx: &mut App) -> Result<()> {
     sb_ui::init(cx)?;
     // Before anything writes a date.
     #[cfg(feature = "automation")]
@@ -83,6 +87,7 @@ fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
             archive_dir: data_dir.join(ARCHIVE),
             providers: sb_core::provider::builtin(),
             reach,
+            updater,
         },
         cx,
     );

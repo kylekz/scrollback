@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 
+/**
+ * The data folder's name in the platform's local data folder. On Windows the installer's folder
+ * sits beside it, under another name (`script/package`'s pack id).
+ */
+pub const FOLDER: &str = "scrollback";
+
 /// How the data dir was chosen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -74,7 +80,7 @@ fn choose(
          SCROLLBACK_DATA_DIR",
     )?;
     Ok(Place {
-        dir: data.join("scrollback"),
+        dir: data.join(FOLDER),
         source: Source::Platform,
     })
 }
@@ -87,7 +93,7 @@ fn choose(
  */
 #[cfg(feature = "automation")]
 pub fn for_development(place: &Place) -> Result<()> {
-    let own = dirs::data_local_dir().map(|data| data.join("scrollback"));
+    let own = dirs::data_local_dir().map(|data| data.join(FOLDER));
     let paths = if cfg!(windows) {
         Paths::Windows
     } else {

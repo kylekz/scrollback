@@ -69,6 +69,9 @@
 //!   `spare`; and `without_calls`, past `inner` the tags give way past their caps), `tags`
 //!   (each location's and subfolder's tag: `name`, `whole` and `capped` widths), the widest
 //!   `day` and the largest `calls` (each `text` and `width`), in logical pixels.
+//! - `update`: scrollback's own updates, `off` under automation with the reason
+//!   (`development`, or `automation` for a packaged build): a scripted run never looks for
+//!   one (`crate::updates`).
 //!
 //! Commands. An argument a command doesn't have is an error, so a misspelt one never passes
 //! for a change. These reply with `state.appearance` after the change:
@@ -159,6 +162,9 @@ impl AutomationHost for ScrollbackAutomation {
                     "dialog": sheet.dialog(),
                 })
             }),
+            "update": {
+                "off": cx.services().updates.read(cx).off().map(|off| off.key()),
+            },
         })
     }
 

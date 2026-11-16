@@ -1,6 +1,7 @@
-# cargo-deny: every crate comes from crates.io or the owner's toolbox-rs, carries a license on
-# the list below, and has no open security advisory. A change to Cargo.lock that brings in a
-# crate from anywhere else, or a crate RustSec flags, fails `cargo deny check`.
+# cargo-deny, CI's dependencies job (.github/workflows/ci.yml): every crate comes from crates.io
+# or the owner's toolbox-rs, carries a license on the list below, and has no open security
+# advisory. A change to Cargo.lock that brings in a crate from anywhere else, or a crate RustSec
+# flags, fails `cargo deny check` and so CI, and can't reach a release.
 
 [graph]
 all-features = true
@@ -11,7 +12,19 @@ all-features = true
 # gpui and its platform crates, which scrollback doesn't choose.
 yanked = "deny"
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # zip 8 through velopack (=1.2.161, pinned to vpk; the installer's updates, PLAN §13):
+    # extracting an attacker's archive can keep setuid bits or follow links out of the folder.
+    # Velopack extracts only the update package it downloaded from scrollback's own release feed
+    # and checked against the feed's SHA256. `ZipArchive::extract` can also abort the process on
+    # a symlink entry that declares a huge size; velopack never calls it (it reads entries with
+    # `by_index`), and the archives it opens are those same checked packages. dv ignores the
+    # same four for the same reason. Goes when velopack moves to zip 9.
+    { id = "RUSTSEC-2026-0367", reason = "zip via velopack: extracts only scrollback's own checked packages" },
+    { id = "RUSTSEC-2026-0368", reason = "zip via velopack: extracts only scrollback's own checked packages" },
+    { id = "RUSTSEC-2026-0369", reason = "zip via velopack: extracts only scrollback's own checked packages" },
+    { id = "RUSTSEC-2026-0429", reason = "zip via velopack: never calls ZipArchive::extract" },
+]
 
 [licenses]
 confidence-threshold = 0.9
@@ -23,6 +36,8 @@ allow = [
     "BSD-3-Clause",
     "BSL-1.0",
     "CC0-1.0",
+    # webpki-roots, Mozilla's root certificates, through velopack's HTTP client (ureq).
+    "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "MIT-0",

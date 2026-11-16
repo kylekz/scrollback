@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 description = "scrollback: backs up, archives and reads coding-agent transcripts (docs/PLAN.md)"
+build = "build.rs"
 
 [[bin]]
 name = "scrollback"
@@ -49,6 +50,15 @@ serde_json = { workspace = true, optional = true }
 # Metal toolchain (Xcode's is a separate download).
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_platform = { workspace = true, features = ["font-kit", "runtime_shaders"] }
+
+# Velopack, where scrollback is packaged: the installer's hooks and an installed copy's updates
+# (`installer.rs`, `updates.rs`).
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+velopack.workspace = true
+
+# scrollback.exe's icon and version resource on Windows (`build.rs`); a no-op elsewhere.
+[build-dependencies]
+embed-resource.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true

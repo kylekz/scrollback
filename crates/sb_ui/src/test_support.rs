@@ -137,6 +137,7 @@ pub fn init_reaching(
                     launcher: elsewhere.launcher,
                     development_home: elsewhere.development_home,
                 },
+                updater: services::Updater::Off(services::Off::Development),
             },
             cx,
         );
