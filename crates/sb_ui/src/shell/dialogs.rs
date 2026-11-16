@@ -1,32 +1,45 @@
-//! The library's dialogs over its pages: Delete folder… (DESIGN §4.1) and the question leaving
-//! the paths editor with changes to save asks (DESIGN §4.7). The library says when each is
-//! asked ([`LibraryService::deleting`], [`LibraryService::asked`]); the shell draws it beside
-//! the main area, not inside it, so that the page's keys (`Delete`, `Enter`, `S`) never reach
-//! the page behind it. While one is open it has the keyboard, which `Tab` keeps inside it
-//! (the overlay contract, `crate::overlay`), and when it closes the keyboard goes back to
-//! where it was.
+//! The library's dialogs over its pages: Delete folder… (DESIGN §4.1), Delete for good…
+//! (DESIGN §4.8) and the question leaving the paths editor with changes to save asks (DESIGN
+//! §4.7). The library says when each is asked ([`LibraryService::deleting`],
+//! [`LibraryService::for_good`], [`LibraryService::asked`]); the shell draws it beside the main
+//! area, not inside it, so that the page's keys (`Delete`, `Enter`, `S`) never reach the page
+//! behind it. While one is open it has the keyboard, which `Tab` keeps inside it (the overlay
+//! contract, `crate::overlay`), and when it closes the keyboard goes back to where it was.
+//!
+//! **Delete for good** is the one act that can't be undone, so its `alertdialog` puts the
+//! keyboard on Cancel, and `Enter` presses only the button that has it: Delete for good is
+//! clicked, or reached with `Tab`.
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, FocusHandle, Focusable as _, InteractiveElement as _,
-    IntoElement as _, ParentElement as _, Role, StatefulInteractiveElement as _, Styled as _,
-    Window, div,
+    AnyElement, App, ClickEvent, Context, FocusHandle, Focusable as _, FontWeight,
+    InteractiveElement as _, IntoElement as _, ParentElement as _, Pixels, Role,
+    StatefulInteractiveElement as _, Styled as _, StyledText, TextRun, Window, div, font,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::FocusTrapElement as _;
+use sb_core::catalogue::SessionId;
 use sb_core::filing::FolderId;
 
 use super::Shell;
+use crate::agents;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{ButtonKind, button};
+use crate::components::{ButtonKind, button, icon, location_tag};
 use crate::format;
+use crate::icons::SbIcon;
 use crate::keymap;
 use crate::overlay::{self, Layer};
 use crate::services::ActiveServices as _;
+use crate::services::ForGood;
+use crate::services::library::Refusal;
+use crate::services::library::title_of;
 use crate::theme::{SbTheme, StyledText as _};
 
 /// Which dialog is open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Asking {
     Delete(FolderId),
+    /// Delete for good, of the session, with why its last confirmation was refused.
+    DeleteForGood(SessionId, Option<Refusal>),
     Save,
 }
 
@@ -34,7 +47,14 @@ pub(super) enum Asking {
 pub(super) struct Dialog {
     pub(super) asking: Asking,
     back: Option<FocusHandle>,
+    /// Where the keyboard goes first in it: Delete for good's Cancel.
+    pub(super) cancel: FocusHandle,
 }
+
+/// Delete for good's width (DESIGN §4.8), its tile and its title.
+const FOR_GOOD_WIDTH: Pixels = px(540.);
+const FOR_GOOD_TILE: Pixels = px(32.);
+const FOR_GOOD_TITLE: Pixels = px(16.);
 
 impl Shell {
     /**
@@ -44,19 +64,39 @@ impl Shell {
      */
     pub(super) fn follow_dialogs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let library = cx.services().library.read(cx);
-        let asking = match (library.deleting(), library.asked()) {
-            (Some(folder), _) => Some(Asking::Delete(folder)),
-            (None, Some(_)) => Some(Asking::Save),
-            (None, None) => None,
+        let asking = match (library.deleting(), library.for_good(), library.asked()) {
+            (Some(folder), ..) => Some(Asking::Delete(folder)),
+            (None, Some(asked), _) => Some(Asking::DeleteForGood(
+                asked.session.id.clone(),
+                asked.refused,
+            )),
+            (None, None, Some(_)) => Some(Asking::Save),
+            (None, None, None) => None,
         };
         match (asking, &mut self.dialog) {
-            (Some(asking), Some(open)) => open.asking = asking,
+            /* Another session asked about, or a refusal to read: Cancel has the keyboard
+            again, so Enter never confirms what the owner hasn't seen. */
+            (Some(asking), Some(open)) => {
+                if open.asking != asking && matches!(asking, Asking::DeleteForGood(..)) {
+                    open.cancel.focus(window, cx);
+                }
+                open.asking = asking;
+            }
             (Some(asking), None) => {
+                // Cancel is a stop of the trap's `Tab` order like the dialog's other buttons.
+                let (back, cancel) = (
+                    window.focused(cx),
+                    cx.focus_handle().tab_index(0).tab_stop(true),
+                );
+                match asking {
+                    Asking::DeleteForGood(..) => cancel.focus(window, cx),
+                    Asking::Delete(_) | Asking::Save => self.dialog_focus.focus(window, cx),
+                }
                 self.dialog = Some(Dialog {
                     asking,
-                    back: window.focused(cx),
+                    back,
+                    cancel,
                 });
-                self.dialog_focus.focus(window, cx);
             }
             (None, Some(_)) => {
                 if let Some(Dialog { back, .. }) = self.dialog.take() {
@@ -68,6 +108,14 @@ impl Shell {
         }
     }
 
+    /// Delete for good's Cancel, while its dialog is open.
+    #[cfg(test)]
+    pub(crate) fn for_good_cancel(&self) -> Option<&FocusHandle> {
+        (self.dialog.as_ref())
+            .filter(|dialog| matches!(dialog.asking, Asking::DeleteForGood(..)))
+            .map(|dialog| &dialog.cancel)
+    }
+
     /// The dialog open, over the scrim.
     pub(super) fn dialog(
         &self,
@@ -75,8 +123,10 @@ impl Shell {
         theme: &SbTheme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let content = match self.dialog.as_ref()?.asking {
-            Asking::Delete(folder) => self.delete_folder(folder, theme, cx)?,
+        let dialog = self.dialog.as_ref()?;
+        let content = match &dialog.asking {
+            Asking::Delete(folder) => self.delete_folder(*folder, theme, cx)?,
+            Asking::DeleteForGood(..) => self.delete_for_good(&dialog.cancel, theme, cx)?,
             Asking::Save => self.save_paths(theme, cx)?,
         };
         Some(overlay::modal(
@@ -88,6 +138,7 @@ impl Shell {
                 let library = cx.services().library.clone();
                 library.update(cx, |library, cx| {
                     library.answer_delete(false, cx);
+                    library.answer_delete_for_good(false, cx);
                     library.answer(false, cx);
                 });
             },
@@ -181,6 +232,221 @@ impl Shell {
                 .focus_trap("delete-folder-trap", &self.dialog_focus)
                 .debug_selector(|| "delete-folder".into())
                 .automation_target("delete-folder")
+                .into_any_element(),
+        )
+    }
+
+    /**
+     * Delete for good… (DESIGN §4.8, `E-Trash`): the session's title, what deleting it
+     * removes (its files, versions and size) and whether its location still has it, then its
+     * project path, model, date and calls. Cancel has the keyboard first; Delete for good is
+     * the app's only filled red, and waits until what it removes is read.
+     */
+    fn delete_for_good(
+        &self,
+        cancel: &FocusHandle,
+        theme: &SbTheme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let c = &theme.colors;
+        let accent = c.accent;
+        let ForGood {
+            session,
+            deletion,
+            refused,
+        } = cx.services().library.read(cx).for_good()?.clone();
+        let location = cx
+            .services()
+            .sync
+            .read(cx)
+            .location(&session.id.location)
+            .cloned();
+        let answer = |delete: bool| {
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                let library = cx.services().library.clone();
+                library.update(cx, |library, cx| library.answer_delete_for_good(delete, cx));
+            }
+        };
+        let removes = match &deletion {
+            Some(deletion) => {
+                // A session with no transcript of its own has no versions to count.
+                let held = [
+                    Some(format::plural(deletion.files, "file")),
+                    (deletion.versions > 0).then(|| format::plural(deletion.versions, "version")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(", ");
+                format!(
+                    "This removes the session from the archive: its {held} and {}. It can't be \
+                     restored.",
+                    format::fine_size(deletion.bytes)
+                )
+            }
+            None => "Reading what it holds…".to_string(),
+        };
+        let tag = location
+            .as_ref()
+            .map(|location| location_tag(location.name.clone(), &location.kind, false, theme));
+        let elsewhere = deletion.as_ref().map(|deletion| {
+            let line = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(theme.spacing.xs);
+            if deletion.at_location {
+                let rest = "Nothing is deleted there. Later syncs will skip it, so it won't come \
+                            back; you can allow it again in Settings › Archive.";
+                let bold = "Nothing is deleted there.".len();
+                let run = |len, weight, color| TextRun {
+                    len,
+                    font: gpui::Font {
+                        weight,
+                        ..font(theme.fonts.ui.clone())
+                    },
+                    color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let there = match tag {
+                    Some(tag) => div()
+                        .flex()
+                        .items_center()
+                        .gap(theme.spacing.xs)
+                        .child("The session still exists on")
+                        .child(div().flex().items_center().child(tag).child(".")),
+                    None => div().child("The session still exists at its location."),
+                };
+                line.child(there)
+                    // A line of its own, so that it wraps inside the dialog.
+                    .child(div().w_full().child(StyledText::new(rest).with_runs(vec![
+                        run(bold, FontWeight::SEMIBOLD, c.fg),
+                        run(rest.len() - bold, FontWeight::NORMAL, c.fg2),
+                    ])))
+            } else {
+                match tag {
+                    Some(tag) => line
+                        .child("It is no longer on")
+                        .child(tag)
+                        .child("either, so this removes the last copy."),
+                    None => line.child(
+                        "It is no longer at its location either, so this removes the last copy.",
+                    ),
+                }
+            }
+        });
+        let summary = [
+            session.project_path.clone().map(|path| format::path(&path)),
+            agents::model(&session.id.provider, &session.models, cx),
+            session
+                .ended
+                .or(session.started)
+                .map(|at| format::day(at, format::now())),
+            Some(format::plural(session.all.calls as usize, "call")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+        let ready = deletion.is_some();
+        Some(
+            self.surface("Delete for good", theme)
+                .role(Role::AlertDialog)
+                .w(FOR_GOOD_WIDTH)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(theme.spacing.lg)
+                        .pt(px(18.))
+                        .pb(theme.spacing.xl)
+                        .px(px(20.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(10.))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .size(FOR_GOOD_TILE)
+                                        .rounded(px(9.))
+                                        .bg(c.red_soft)
+                                        .child(icon(SbIcon::Trash, theme.sizes.icon, c.red)),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .text_size(FOR_GOOD_TITLE)
+                                        .line_height(px(22.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(format!("Delete “{}” for good?", title_of(&session)))
+                                        .automation_target("for-good/title"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(theme.spacing.md)
+                                .text_color(c.fg2)
+                                .line_height(px(20.))
+                                .child(div().child(removes).automation_target("for-good/removes"))
+                                .children(
+                                    elsewhere.map(|it| it.automation_target("for-good/elsewhere")),
+                                )
+                                .children(refused.map(|why| {
+                                    div()
+                                        .text_color(c.yellow)
+                                        .child(why.said())
+                                        .automation_target("for-good/refused")
+                                })),
+                        )
+                        .child(
+                            div()
+                                .py(px(10.))
+                                .px(theme.spacing.lg)
+                                .rounded(theme.radii.row)
+                                .border_1()
+                                .border_color(c.line_subtle)
+                                .bg(c.s1)
+                                .text_color(c.fg3)
+                                .text_spec(&theme.text.path_small)
+                                .child(summary),
+                        ),
+                )
+                .child(
+                    footer(theme)
+                        .child(
+                            button("for-good-cancel", ButtonKind::Plain, false, true, theme)
+                                .track_focus(cancel)
+                                // Its ring shows from the start: the keyboard is on it.
+                                .focus(move |style| style.border_color(accent))
+                                .on_click(answer(false))
+                                .child("Cancel")
+                                .automation_target("for-good/cancel"),
+                        )
+                        .child(
+                            button(
+                                "for-good-confirm",
+                                ButtonKind::DangerFill,
+                                false,
+                                ready,
+                                theme,
+                            )
+                            .when(ready, |this| this.on_click(answer(true)))
+                            .child("Delete for good")
+                            .automation_target("for-good/confirm"),
+                        ),
+                )
+                .focus_trap("for-good-trap", &self.dialog_focus)
+                .debug_selector(|| "for-good".into())
+                .automation_target("for-good")
                 .into_any_element(),
         )
     }

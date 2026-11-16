@@ -221,6 +221,11 @@ pub fn machine_file(at: usize, cx: &mut TestAppContext) -> String {
     })
 }
 
+/// Has the agent on this machine write what `write` writes, for the next sync to find.
+pub fn write_with(write: impl FnOnce(&mut ProjectsTree), cx: &mut TestAppContext) {
+    cx.update(|cx| write(&mut cx.global_mut::<Scratch>().machine));
+}
+
 /// The folder the services' archive is in.
 pub fn archive_dir(cx: &mut TestAppContext) -> std::path::PathBuf {
     cx.update(|cx| cx.global::<Scratch>().archive.path().join("archive"))

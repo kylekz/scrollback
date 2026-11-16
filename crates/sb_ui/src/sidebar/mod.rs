@@ -9,8 +9,7 @@
 //! below, `←` and `→` close and open a folder, and `Enter` hands the keyboard to the page.
 //! A folder whose page is shown may have no row, when a folder it is in was closed: then `↑`,
 //! `↓` and `←` go to the row that hides it, and `→` opens the folders it is in. `Tab` goes on
-//! from the rows to the sections' buttons. Trash has no page until the phase that builds it
-//! (PLAN §13), so its row is drawn disabled and can't be picked.
+//! from the rows to the sections' buttons.
 //!
 //! **Renaming** (`F2` wherever the keyboard is, and every new folder) happens in the folder's
 //! row: `Enter` keeps the name and so does taking the keyboard elsewhere or starting to rename
@@ -68,27 +67,22 @@ const INDENTED_LEVELS: usize = 6;
 const TOP_PADDING: gpui::Pixels = px(10.);
 
 /// The library rows, top to bottom (DESIGN §4.1): icon, name, automation target and the page
-/// each shows. Trash has none yet (module docs).
-const LIBRARY_ROWS: [(SbIcon, &str, &str, Option<Shelf>); 4] = [
+/// each shows.
+const LIBRARY_ROWS: [(SbIcon, &str, &str, Shelf); 4] = [
     (
         SbIcon::Layers,
         "All sessions",
         "sidebar/all-sessions",
-        Some(Shelf::All),
+        Shelf::All,
     ),
-    (
-        SbIcon::Star,
-        "Starred",
-        "sidebar/starred",
-        Some(Shelf::Starred),
-    ),
+    (SbIcon::Star, "Starred", "sidebar/starred", Shelf::Starred),
     (
         SbIcon::Inbox,
         "Unsorted",
         "sidebar/unsorted",
-        Some(Shelf::Unsorted),
+        Shelf::Unsorted,
     ),
-    (SbIcon::Trash, "Trash", "sidebar/trash", None),
+    (SbIcon::Trash, "Trash", "sidebar/trash", Shelf::Trash),
 ];
 
 /// What the Folders and Locations sections say while they have no rows (DESIGN §4.10, §4.14).
@@ -186,7 +180,9 @@ impl Sidebar {
                     LibraryEvent::FolderCreated(folder) | LibraryEvent::Rename(folder) => {
                         this.rename(*folder, window, cx);
                     }
-                    LibraryEvent::EditPaths(_) | LibraryEvent::Leave(_) => {}
+                    LibraryEvent::EditPaths(_)
+                    | LibraryEvent::Leave(_)
+                    | LibraryEvent::DeletedForGood(_) => {}
                 }),
             ],
             _clock: cx.spawn(async move |this, cx| {
@@ -225,7 +221,7 @@ impl Sidebar {
         let folders = self.library.read(cx).folders();
         LIBRARY_ROWS
             .iter()
-            .filter_map(|(_, _, _, shelf)| *shelf)
+            .map(|(_, _, _, shelf)| *shelf)
             .chain(
                 self.tree
                     .iter()
@@ -532,7 +528,7 @@ impl Sidebar {
     /// keyboard is on the rows.
     fn library_row(
         &self,
-        (glyph, name, target, shelf): (SbIcon, &'static str, &'static str, Option<Shelf>),
+        (glyph, name, target, shelf): (SbIcon, &'static str, &'static str, Shelf),
         (enabled, known, keyboard): (bool, bool, bool),
         theme: &SbTheme,
         cx: &mut Context<Self>,
@@ -541,23 +537,21 @@ impl Sidebar {
         let library = self.library.read(cx);
         let counts = library.counts();
         let value = match shelf {
-            Some(Shelf::All) => counts.all,
-            Some(Shelf::Starred) => counts.starred,
-            Some(Shelf::Unsorted) => counts.unsorted,
-            // Trash's row counts what is there, though it has no page yet.
-            Some(Shelf::Trash) => counts.trash,
-            None if target == "sidebar/trash" => counts.trash,
-            Some(Shelf::Folder(_)) | None => 0,
+            Shelf::All => counts.all,
+            Shelf::Starred => counts.starred,
+            Shelf::Unsorted => counts.unsorted,
+            Shelf::Trash => counts.trash,
+            Shelf::Folder(_) => 0,
         };
-        let selected = enabled && shelf == Some(library.highlighted());
-        // Trash takes sessions dropped on it (DESIGN §4.1), though it has no page yet.
-        let trash = target == "sidebar/trash" && enabled;
+        let selected = enabled && shelf == library.highlighted();
+        // Trash takes sessions dropped on it (DESIGN §4.1).
+        let trash = shelf == Shelf::Trash && enabled;
         let targeted = trash
             && library
                 .drag()
                 .is_some_and(|drag| drag.targets(DropTarget::Trash, library));
         // Unsorted's count is an accent while there is something to file, selected or not.
-        let count_color = if known && shelf == Some(Shelf::Unsorted) && value > 0 {
+        let count_color = if known && shelf == Shelf::Unsorted && value > 0 {
             c.accent_text
         } else if selected {
             c.fg2
@@ -571,10 +565,6 @@ impl Sidebar {
             .id(target)
             .debug_selector(move || target.replace('/', "-"))
             .role(Role::ListItem)
-            // A row with no page yet is drawn as the rows that can't be opened are.
-            .when(enabled && shelf.is_none() && !targeted, |this| {
-                this.opacity(DISABLED_ROWS_OPACITY)
-            })
             .when(targeted, |this| {
                 this.bg(c.accent_soft)
                     .text_color(c.accent_text)
@@ -587,7 +577,7 @@ impl Sidebar {
                     this
                 }
             })
-            .when_some(shelf.filter(|_| enabled), |this, shelf| {
+            .when(enabled, |this| {
                 this.cursor_pointer()
                     .when(!selected, |this| this.hover(|style| style.bg(c.s2)))
                     .on_click(cx.listener(move |this, _, _, cx| {

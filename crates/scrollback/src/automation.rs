@@ -20,8 +20,8 @@
 //!   (what was applied to the window) and `window_native` (macOS: what AppKit reports, `forced`
 //!   light or dark or `null`, `opaque` and `vibrancy_view`; `null` elsewhere).
 //! - `page`: what the main area shows: `starting`, `archive-failed`, `locations-failed`,
-//!   `first-run`, `settings`, `sessions` (All sessions, Starred or a folder), `unsorted` or
-//!   `session` (an opened session).
+//!   `first-run`, `settings`, `sessions` (All sessions, Starred or a folder), `unsorted`, `trash`
+//!   or `session` (an opened session).
 //! - `settings` (DESIGN §4.13): `section` (the one picked in Settings' list: `archive`, `sync`,
 //!   `appearance` or `shortcuts`), `archive` (its folder), `default` (whether that is the data
 //!   dir's), `switch` (`null`, `{"opening": folder}` or `{"refused": why}`), `sync_every`
@@ -52,7 +52,7 @@
 //! - `sheet`: the locations sheet while it is open (`null` otherwise): the name of its
 //!   `selected` location, and its `dialog` (`add`, `remove` or `null`).
 //! - `library`: `shelf` (`all`, `starred`, `unsorted`, `trash`, or `{"folder": name}`), `counts`
-//!   (`all`, `starred`, `unsorted`), `folders` (each with its `name`, its `parent`'s name and its
+//!   (`all`, `starred`, `unsorted`, `trash`), `folders` (each with its `name`, its `parent`'s name and its
 //!   `sessions`, in the catalogue's order), `sessions` and `groups` (how many the shown page
 //!   lists, `null` while it loads or is of the other kind), the titles of the `selected` and
 //!   the `open` session, and `error` (why the library couldn't be read, or `null`).
@@ -64,8 +64,20 @@
 //!   button, which shows the sidebar after 500 ms); and the `verdict` there: `takes`, with the
 //!   ghost's `result` and `note`, or the `note` saying why not); the `toast` (`text` and
 //!   whether it can `undo`); whether leaving, closing the window or quitting `asked` to save
-//!   the paths editor's changes, and the folder `held` by them; and the folder whose deletion
-//!   is being asked about (`deleting`).
+//!   the paths editor's changes, and the folder `held` by them; the folder whose deletion
+//!   is being asked about (`deleting`); the session being asked about deleting for good
+//!   (`for_good`: `null`, or its `title`, and once read what it removes, `files`, `versions`,
+//!   `bytes` and whether its location still has it, `at_location`, with why the last
+//!   confirmation was `refused`); and where the open session was opened at (`read_at`: `null`,
+//!   or its `request` number, the match's `kind`, its `turn` from 0, the `subagent` item it is
+//!   in, the `find` text and the hit to `flash`), until the reader takes it.
+//! - `palette`: the search palette while it is open (`null` otherwise): its query's `text`, the
+//!   labels of its `chips`, its `completions`, how many `rows` the keys move over and the one
+//!   `highlighted`, the `commands` it lists, the finished token that names nothing and so
+//!   holds the results (`unresolved`), whether it is `searching`, how many sessions are
+//!   `unsearchable` yet, and the `answer` to the last search: `null` with no terms, `"keep-typing"`,
+//!   `{"unavailable": why}`, or the `sessions` found (their titles, the best first),
+//!   `total_sessions`, `total_matches`, the query's `terms` and how long it `took_ms`.
 //!
 //!   A drag is driven with `drag` (`release: false` to hold it), `mouse_up`, and keys between:
 //!   no key but `Esc` acts while one is held. Where it is over is read from what the last frame
@@ -122,6 +134,7 @@ use gpui_appearance::{Appearance, Material, Mode};
 use gpui_automation::AutomationHost;
 use sb_core::catalogue::{SessionId, Shelf};
 use sb_core::location::LocationKind;
+use sb_core::transcript::At;
 use sb_core::transport::wsl::Distro;
 use sb_core::transport::{
     Env, FileStat, Hashed, Launcher, Listing, LocalTransport, PrefixRequest, Probe, RangeFailure,
@@ -129,12 +142,13 @@ use sb_core::transport::{
 };
 use sb_ui::Shell;
 use sb_ui::pages::sessions::LineMeasure;
+use sb_ui::search::Palette;
 use sb_ui::services::settings::Switch;
 use sb_ui::services::sync::{Refetch, TestFailure, TestState};
 use sb_ui::services::upkeep::{Fix, Standing};
 use sb_ui::services::{
-    ActiveServices as _, ArchiveState, Dragged, DropTarget, Failure, Held, LocationStatus, Page,
-    Reach, Verdict,
+    ActiveServices as _, Answer as Searched, ArchiveState, Dragged, DropTarget, Failure, Held,
+    LocationStatus, Page, Reach, Verdict,
 };
 use sb_ui::system::{self, SystemRequest};
 use serde::Deserialize;
@@ -178,6 +192,7 @@ impl AutomationHost for ScrollbackAutomation {
             })).collect::<Vec<_>>(),
             "cards": cards(shell.main().read(cx).sessions().read(cx).line_measure()),
             "page_view": page_view(shell, cx),
+            "palette": shell.palette().map(|palette| self::palette(palette.read(cx), cx)),
             "menu": sb_ui::menu::items(cx).map(|(items, submenu)| json!({
                 "items": items,
                 "submenu": submenu,
@@ -445,7 +460,27 @@ fn library(cx: &App) -> Value {
             "all": counts.all,
             "starred": counts.starred,
             "unsorted": counts.unsorted,
+            "trash": counts.trash,
         },
+        "for_good": library.for_good().map(|asked| json!({
+            "title": asked.session.title,
+            "files": asked.deletion.as_ref().map(|it| it.files),
+            "versions": asked.deletion.as_ref().map(|it| it.versions),
+            "bytes": asked.deletion.as_ref().map(|it| it.bytes),
+            "at_location": asked.deletion.as_ref().map(|it| it.at_location),
+            "refused": asked.refused.map(|why| why.said()),
+        })),
+        "read_at": library.read_at().map(|at| json!({
+            "kind": format!("{:?}", at.kind).to_lowercase(),
+            "turn": match at.at {
+                Some(At::Block { turn, .. }) => Some(turn),
+                _ => None,
+            },
+            "request": at.request,
+            "subagent": at.subagent.as_ref().map(|it| &it.item),
+            "find": at.find,
+            "flash": at.flash,
+        })),
         "folders": folders,
         "sessions": sessions,
         "groups": groups,
@@ -524,6 +559,38 @@ fn settings(shell: &Shell, cx: &App) -> Value {
             },
         })).collect::<Vec<_>>(),
         "saved": settings.save_failure(),
+    })
+}
+
+/// `state.palette`: the search palette, while it is open.
+fn palette(palette: &Palette, cx: &App) -> Value {
+    let search = cx.services().search.read(cx);
+    let answer = search.answer().map(|answered| match &answered.answer {
+        Searched::KeepTyping => json!("keep-typing"),
+        Searched::Unavailable(why) => json!({ "unavailable": why }),
+        Searched::Found(results) => json!({
+            "sessions": results
+                .sessions
+                .iter()
+                .map(|found| found.session.title.clone())
+                .collect::<Vec<_>>(),
+            "total_sessions": results.total_sessions,
+            "total_matches": results.total_matches,
+            "terms": answered.query.terms,
+            "took_ms": answered.took.as_millis() as u64,
+        }),
+    });
+    json!({
+        "text": palette.text(cx),
+        "chips": palette.chips().iter().map(|chip| &chip.label).collect::<Vec<_>>(),
+        "completions": palette.completion_labels(cx),
+        "rows": palette.rows(cx).len(),
+        "highlighted": palette.highlight(),
+        "commands": palette.command_names(cx),
+        "unresolved": palette.unresolved(cx),
+        "searching": search.is_searching(),
+        "unsearchable": search.unsearchable(),
+        "answer": answer,
     })
 }
 

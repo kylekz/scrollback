@@ -3,9 +3,8 @@
 //! › Shortcuts lists what [`SHORTCUT_ROWS`] says each action does, with the keys these rows
 //! bind it to.
 //!
-//! One keycap is ahead of the table: the title bar shows DESIGN §5's key for the palette, whose
-//! action arrives with it in phase 6 (PLAN §13). Its keys are [`SEARCH_KEYS`] until then; it
-//! becomes a row with its action.
+//! The palette's Commands group ([`crate::commands`]) is made from these rows, so a command
+//! always shows the key that does it.
 //!
 //! `secondary` is gpui's platform modifier: `Ctrl` on Windows, `Cmd` on macOS (DESIGN §5:
 //! "macOS uses Cmd for every Ctrl").
@@ -27,6 +26,14 @@ pub const FOLDER_RENAME: &str = "FolderRename";
 pub const SESSIONS: &str = "Sessions";
 /// Key context of the main area while it shows Unsorted.
 pub const UNSORTED: &str = "Unsorted";
+/// Key context of the main area while it shows Trash (DESIGN §4.8). `Delete` is bound to
+/// nothing in it: no key deletes anything on that page.
+pub const TRASH_PAGE: &str = "Trash";
+/// Key context of the search palette (DESIGN §4.9). Its own keys are its query field's, which
+/// it takes over: `↑` and `↓` move over the results, `Enter` and `Ctrl Enter` open, `Tab` adds
+/// the highlighted completion, `Backspace` on an empty query takes the last chip away and
+/// `Esc` closes it (`crate::search`).
+pub const PALETTE: &str = "Palette";
 /// Key context of the main area while it shows the first run.
 pub const FIRST_RUN: &str = "FirstRun";
 /// Key context of the locations sheet (DESIGN §4.11), and of its list while it has the
@@ -111,6 +118,12 @@ pub const STAR: Shortcut = shortcut!("s", SESSIONS, sessions::Star);
 pub const LOCATIONS: Shortcut = shortcut!("secondary-l", SHELL, shell::OpenLocations);
 /// `Ctrl ,`. Named, because the title bar's Settings button says it.
 pub const OPEN_SETTINGS: Shortcut = shortcut!("secondary-,", SHELL, shell::OpenSettings);
+/// `Ctrl K`. Named, because the title bar's search field says it.
+pub const SEARCH: Shortcut = shortcut!("secondary-k", SHELL, shell::Search);
+/// `F2`, `F6` and `Ctrl A`. Named, because the palette's commands say them.
+pub const RENAME: Shortcut = shortcut!("f2", SHELL, sidebar::Rename);
+pub const FOCUS_OTHER: Shortcut = shortcut!("f6", SHELL, shell::FocusOther);
+pub const SELECT_ALL: Shortcut = shortcut!("secondary-a", SESSIONS, sessions::SelectAll);
 /// `Delete`, `M`, `Enter` and `Shift F10` on a page of sessions. Named, because the session
 /// menu and the hover bar say them.
 pub const TRASH: Shortcut = shortcut!("delete", SESSIONS, sessions::Trash);
@@ -121,10 +134,10 @@ pub const MENU_KEY: Shortcut = shortcut!("shift-f10", SESSIONS, sessions::Menu);
 /// Every binding scrollback defines.
 pub const SHORTCUTS: &[Shortcut] = &[
     TOGGLE_SIDEBAR,
-    shortcut!("f6", SHELL, shell::FocusOther),
+    FOCUS_OTHER,
     shortcut!("escape", SHELL, shell::Dismiss),
     NEW_FOLDER,
-    shortcut!("f2", SHELL, sidebar::Rename),
+    RENAME,
     SYNC_ALL,
     BACK,
     shortcut!("up", SIDEBAR, sidebar::Previous),
@@ -143,7 +156,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     TRASH,
     MOVE,
     MENU_KEY,
-    shortcut!("secondary-a", SESSIONS, sessions::SelectAll),
+    SELECT_ALL,
     shortcut!("up", UNSORTED, sessions::Up),
     shortcut!("down", UNSORTED, sessions::Down),
     shortcut!("enter", UNSORTED, sessions::Open),
@@ -151,6 +164,11 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut!("delete", UNSORTED, sessions::Trash),
     shortcut!("m", UNSORTED, sessions::Move),
     shortcut!("shift-f10", UNSORTED, sessions::Menu),
+    shortcut!("up", TRASH_PAGE, sessions::Up),
+    shortcut!("down", TRASH_PAGE, sessions::Down),
+    shortcut!("enter", TRASH_PAGE, sessions::Open),
+    shortcut!("secondary-a", TRASH_PAGE, sessions::SelectAll),
+    SEARCH,
     shortcut!("up", MENU, menu::Previous),
     shortcut!("down", MENU, menu::Next),
     shortcut!("enter", MENU, menu::Choose),
@@ -171,9 +189,6 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut!("enter", LOCATION_DIALOG, locations::Confirm),
 ];
 
-/// `Ctrl K`, the palette's key (module docs).
-pub const SEARCH_KEYS: &str = "secondary-k";
-
 /// A row of Settings › Shortcuts (DESIGN §5, §4.13): what it does, and the actions whose keys
 /// it shows, by their names (`sidebar::Rename`). The keys are whatever [`SHORTCUTS`] binds
 /// those actions to.
@@ -191,6 +206,10 @@ const fn row(does: &'static str, actions: &'static [&'static str]) -> ShortcutRo
 /// in the window, then the keys of lists and pages. A key DESIGN §5 lists whose action isn't
 /// built yet has no row until it is.
 pub const SHORTCUT_ROWS: &[ShortcutRow] = &[
+    row(
+        "Search the archive, or close the palette",
+        &["shell::Search"],
+    ),
     row(
         "Back to the page the session was opened from, or leave Settings",
         &["library::Back"],

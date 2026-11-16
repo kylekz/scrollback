@@ -115,6 +115,33 @@ impl Catalogue {
         })
     }
 
+    /**
+     * The models and the branches of the sessions not in Trash, each once, the one most
+     * sessions have first: what the palette offers for `model:` and `branch:` (DESIGN §4.9).
+     */
+    pub fn models_and_branches(&self) -> Result<(Vec<String>, Vec<String>)> {
+        const LIVE: &str = "FROM session s LEFT JOIN session_state st
+                              ON st.location_id = s.location_id AND st.provider = s.provider
+                             AND st.session = s.session";
+        self.db.read(|c| {
+            let values = |sql: String| -> Result<Vec<String>> {
+                Ok(c.prepare(&sql)?
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?)
+            };
+            Ok((
+                values(format!(
+                    "SELECT m.value {LIVE}, json_each(s.models) m WHERE st.trashed_at IS NULL
+                     GROUP BY m.value ORDER BY count(*) DESC, m.value"
+                ))?,
+                values(format!(
+                    "SELECT s.branch {LIVE} WHERE st.trashed_at IS NULL AND s.branch IS NOT NULL
+                     GROUP BY s.branch ORDER BY count(*) DESC, s.branch"
+                ))?,
+            ))
+        })
+    }
+
     /// Every session `filters` let through (PLAN §10), the one that did something last first.
     pub(crate) fn filtered(&self, filters: &Filters) -> Result<Vec<SessionId>> {
         let (shelf, folder) = on_shelf(filters.shelf, ":folder");

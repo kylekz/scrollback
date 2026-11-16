@@ -34,6 +34,14 @@ const MONTHS: [&str; 12] = [
     "December",
 ];
 
+/// The calendar dates are written in, which a date typed in a search is read in too.
+pub fn calendar() -> sb_core::search::Calendar {
+    match PINNED_YEAR.get() {
+        Some(_) => sb_core::search::Calendar::Utc,
+        None => sb_core::search::Calendar::Local,
+    }
+}
+
 /// Now, in Unix milliseconds.
 pub fn now() -> i64 {
     Local::now().timestamp_millis()
@@ -153,13 +161,33 @@ pub fn size(bytes: u64) -> String {
     format!("{} {unit}", amount(bytes))
 }
 
-/// The unit that suits `total` bytes, and how an amount reads in it.
-fn scaled(total: u64) -> (&'static str, impl Fn(u64) -> String) {
-    const UNITS: [(&str, u64); 3] = [("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)];
-    let (unit, size) = UNITS
+/// `bytes` in the unit that suits it, with a tenth below ten of it: `9.8 MB`, `18 KB`,
+/// `412 MB` (DESIGN §4.8's sizes).
+pub fn fine_size(bytes: u64) -> String {
+    let (unit, size) = unit_of(bytes);
+    // Rounded first, so that 9.96 MB reads "10 MB" and not "10.0 MB".
+    let tenths = (bytes as f64 / size as f64 * 10.).round() / 10.;
+    if tenths < 10. && unit != "KB" {
+        format!("{tenths:.1} {unit}")
+    } else {
+        format!("{tenths:.0} {unit}")
+    }
+}
+
+/// The units sizes are written in, the largest first.
+const UNITS: [(&str, u64); 3] = [("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)];
+
+/// The unit that suits `total` bytes, and its size.
+fn unit_of(total: u64) -> (&'static str, u64) {
+    UNITS
         .into_iter()
         .find(|(_, size)| total >= *size)
-        .unwrap_or(("KB", 1 << 10));
+        .unwrap_or(("KB", 1 << 10))
+}
+
+/// The unit that suits `total` bytes, and how an amount reads in it.
+fn scaled(total: u64) -> (&'static str, impl Fn(u64) -> String) {
+    let (unit, size) = unit_of(total);
     let amount = move |bytes: u64| {
         let value = bytes as f64 / size as f64;
         if unit == "GB" {
@@ -193,6 +221,16 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn a_fine_size_has_a_tenth_below_ten_once_rounded() {
+        let mb = 1 << 20;
+        assert_eq!(fine_size(9 * mb + mb * 8 / 10), "9.8 MB");
+        assert_eq!(fine_size(mb * 996 / 100), "10 MB");
+        assert_eq!(fine_size(412 * mb), "412 MB");
+        assert_eq!(fine_size(18 * 1024), "18 KB");
+        assert_eq!(fine_size(0), "0 KB");
+    }
 
     /// Noon, local time, on the day given.
     fn at(year: i32, month: u32, day: u32) -> i64 {

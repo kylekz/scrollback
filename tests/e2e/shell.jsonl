@@ -65,7 +65,8 @@
 {"cmd": "key", "keystroke": "secondary-b", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
 {"cmd": "click", "x": 600, "y": 300, "button": "right", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
 {"cmd": "key", "keystroke": "secondary-b", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
-{"cmd": "click", "target": "titlebar/search", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+{"cmd": "click", "target": "titlebar/search", "expect": [{"pointer": "/shell/sidebar", "equals": "collapsed"}, {"pointer": "/palette/text", "equals": ""}]}
+{"cmd": "key", "keystroke": "escape", "expect": {"pointer": "/palette", "equals": null}}
 // A press on the overlay's empty space leaves it open, picking a row closes it (DESIGN §2), and its own button toggles it.
 {"cmd": "click", "target": "titlebar/sidebar", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
 {"cmd": "click", "x": 100, "y": 420, "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}

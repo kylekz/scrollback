@@ -44,7 +44,7 @@ use sb_core::archive::{Archive, ArchiveError};
 use sb_core::catalogue::{Catalogue, Session, Shelf};
 use sb_core::location::LocationKind;
 use sb_core::provider;
-use sb_core::search::{self, Limit, Names, Searched};
+use sb_core::search::{self, Calendar, Limit, Names, Searched};
 use sb_core::sync::{IndexReport, Progress, SyncError, index, sync_location};
 use sb_core::transcript::Ending;
 use sb_core::transport::{Launcher, ShellTransport, Transport, wsl};
@@ -235,6 +235,7 @@ fn find(archive: &Archive, input: &str) -> Result<(), Box<dyn Error>> {
             folders: &catalogue.folders()?,
             locations: &catalogue.locations()?,
             agents: &agents,
+            calendar: Calendar::Local,
         },
     );
     let results = match archive.search(&query, Limit::default(), &CancelToken::new())? {
@@ -277,7 +278,11 @@ fn find(archive: &Archive, input: &str) -> Result<(), Box<dyn Error>> {
             println!(
                 "  {:?}{} at {:?}: {}",
                 found.kind,
-                if found.subagent { " in a subagent" } else { "" },
+                if found.subagent.is_some() {
+                    " in a subagent"
+                } else {
+                    ""
+                },
                 found.at,
                 text.replace('\n', " ")
             );

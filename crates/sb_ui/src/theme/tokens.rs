@@ -122,6 +122,11 @@ pub struct TokenSet {
     pub blue: Rgba,
     pub green_soft: Rgba,
     pub red_soft: Rgba,
+    /**
+     * The app's one filled red (`danger-fill`, DESIGN §4.8: Delete for good), under white
+     * text. Dark's is `red` darkened at its hue until white on it is past 4.5:1.
+     */
+    pub danger_fill: Rgba,
     pub yellow_soft: Rgba,
     pub blue_soft: Rgba,
     /// Under sheets, dialogs and the palette.
@@ -164,6 +169,8 @@ pub const DARK: TokenSet = TokenSet {
     blue: hex(0x8ab8f0),
     green_soft: rgba(143, 214, 148, 0.13),
     red_soft: rgba(240, 138, 126, 0.13),
+    /* `red` in OKLCH (27.6°, chroma 0.126) at lightness 0.58, from 0.74: white on it is 4.56:1. */
+    danger_fill: hex(0xb9594f),
     yellow_soft: rgba(242, 196, 130, 0.14),
     blue_soft: rgba(138, 184, 240, 0.14),
     scrim: rgba(5, 6, 8, 0.58),
@@ -213,6 +220,7 @@ pub const LIGHT: TokenSet = TokenSet {
     blue: hex(0x1d5f9e),
     green_soft: rgba(23, 112, 63, 0.10),
     red_soft: rgba(180, 42, 42, 0.09),
+    danger_fill: hex(0xb42a2a),
     yellow_soft: rgba(132, 84, 0, 0.10),
     blue_soft: rgba(29, 95, 158, 0.10),
     scrim: rgba(40, 36, 28, 0.30),

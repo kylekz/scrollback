@@ -36,7 +36,7 @@ use crate::provider::{ItemKind, ScannedItem};
 use crate::search::Log;
 use crate::transport::Probe;
 
-pub use batch::{Before, Undone};
+pub use batch::{Before, Restored, Undone};
 pub use folder::{Folder, FolderPath, ProjectPath};
 pub use library::{LibraryCounts, PathGroup, Shelf};
 pub(crate) use session::{Derived, Indexed, Reading, fingerprint};

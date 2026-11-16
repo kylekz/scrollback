@@ -23,14 +23,14 @@ mod text;
 
 use std::ops::Range;
 
-use chrono::{Local, NaiveDate, TimeZone as _};
+use chrono::{Local, NaiveDate, TimeZone as _, Utc};
 use thiserror::Error;
 use toolbox_store::rusqlite;
 
 use crate::catalogue::{CatalogueError, Folder, Session, Shelf};
 use crate::location::{Location, LocationId};
 use crate::provider::ProviderId;
-use crate::transcript::{At, SpanKind};
+use crate::transcript::{At, InSubagent, SpanKind};
 
 pub use run::{MOST_TERMS, TERM_CHARS};
 pub(crate) use store::{Log, SEARCH_DATABASE, SearchIndex, Text};
@@ -213,7 +213,8 @@ pub struct Parsed {
 
 /**
  * Splits what was typed into terms and filter tokens. Terms are separated by white space; text
- * in double quotes is one term, spaces and all, and a quote with no partner runs to the end. A
+ * in double quotes is one term, spaces and all, and a quote with no partner runs to the end.
+ * Inside quotes `\"` is a quote of the text (`branch:"say \"hi\""`). A
  * word `key:value` whose key is one of [`Key`]'s, in any case, is a token, and with no value
  * an incomplete one; any other word with a colon (`C:\Users`, `https://…`) is a term. A NUL is
  * no character of any term. Nothing typed is an error: whatever it holds, it is text to look
@@ -237,15 +238,12 @@ pub fn parse(input: &str) -> Parsed {
             Some((*key, unquote(value)))
         });
         match token {
-            Some((key, "")) => parsed.incomplete.push(key),
-            Some((key, value)) => parsed.tokens.push(Token {
-                key,
-                value: value.to_string(),
-            }),
+            Some((key, value)) if value.is_empty() => parsed.incomplete.push(key),
+            Some((key, value)) => parsed.tokens.push(Token { key, value }),
             None => {
                 let term = unquote(word);
                 if !term.trim().is_empty() {
-                    parsed.terms.push(term.to_string());
+                    parsed.terms.push(term);
                 }
             }
         }
@@ -253,31 +251,54 @@ pub fn parse(input: &str) -> Parsed {
 }
 
 /// The first word of `text`, which starts with no white space, and what follows it. White
-/// space inside double quotes is part of the word.
-fn word(text: &str) -> (&str, &str) {
+/// space inside double quotes is part of the word, and so is a quote escaped there (`\"`).
+pub fn word(text: &str) -> (&str, &str) {
     let mut quoted = false;
+    let mut escaped = false;
     for (at, char) in text.char_indices() {
         match char {
+            '"' if escaped => {}
             '"' => quoted = !quoted,
             char if char.is_whitespace() && !quoted => return (&text[..at], &text[at..]),
             _ => {}
         }
+        escaped = quoted && char == '\\' && !escaped;
     }
     (text, "")
 }
 
-/// `text` without the quotes around it, or after the colon of a token: `"a b"` is `a b`, and
-/// so is `"a b` that a quote opened and nothing closed.
-fn unquote(text: &str) -> &str {
-    let text = text.strip_prefix('"').unwrap_or(text);
-    text.strip_suffix('"').unwrap_or(text)
+/**
+ * `text` without the quotes around it, or after the colon of a token: `"a b"` is `a b`, and
+ * so is `"a b` that a quote opened and nothing closed. Inside quotes `\"` is a quote.
+ */
+fn unquote(text: &str) -> String {
+    match text.strip_prefix('"') {
+        Some(inside) => {
+            let inside = match inside.strip_suffix('"') {
+                Some(closed) if !closed.ends_with('\\') || closed.ends_with("\\\\") => closed,
+                _ => inside,
+            };
+            inside.replace("\\\"", "\"")
+        }
+        None => text.to_string(),
+    }
 }
 
-/// What a token's value can name.
+/// Which calendar a date in a token is read in: the one the app shows dates in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Calendar {
+    /// This machine's time zone.
+    #[default]
+    Local,
+    Utc,
+}
+
+/// What a token's value can name, and how its dates are read.
 pub struct Names<'a> {
     pub folders: &'a [Folder],
     pub locations: &'a [Location],
     pub agents: &'a [ProviderId],
+    pub calendar: Calendar,
 }
 
 impl Token {
@@ -322,8 +343,8 @@ impl Token {
                 .map(|agent| Filter::Agent(*agent)),
             Key::Model => Some(Filter::Model(value.to_string())),
             Key::Branch => Some(Filter::Branch(value.to_string())),
-            Key::After => start_of(value).map(Filter::After),
-            Key::Before => start_of(value).map(Filter::Before),
+            Key::After => start_of(value, names.calendar).map(Filter::After),
+            Key::Before => start_of(value, names.calendar).map(Filter::Before),
         }
     }
 }
@@ -345,9 +366,9 @@ pub fn query(input: &str, names: &Names<'_>) -> (Query, Vec<Token>) {
     (query, unresolved)
 }
 
-/// The start, in local time and Unix milliseconds, of the day, month or year `value` names:
-/// `YYYY-MM-DD`, `YYYY-MM` or `YYYY`.
-fn start_of(value: &str) -> Option<i64> {
+/// The start, in `calendar`'s time and Unix milliseconds, of the day, month or year `value`
+/// names: `YYYY-MM-DD`, `YYYY-MM` or `YYYY`.
+fn start_of(value: &str, calendar: Calendar) -> Option<i64> {
     let parts: Vec<&str> = value.split('-').collect();
     let widths = [4, 2, 2];
     if parts.len() > widths.len()
@@ -360,6 +381,9 @@ fn start_of(value: &str) -> Option<i64> {
     let number = |at: usize| parts.get(at).map_or(Some(1), |part| part.parse().ok());
     let midnight = NaiveDate::from_ymd_opt(parts[0].parse().ok()?, number(1)?, number(2)?)?
         .and_hms_opt(0, 0, 0)?;
+    if calendar == Calendar::Utc {
+        return Some(Utc.from_utc_datetime(&midnight).timestamp_millis());
+    }
     /* A midnight that a clock change skips is no time: the first instant after it is. */
     Local
         .from_local_datetime(&midnight)
@@ -427,8 +451,8 @@ pub struct Found {
 pub struct Match {
     pub kind: MatchKind,
     /// The text is a subagent's: opening the match opens the session at the call that started
-    /// it, expanded (DESIGN §4.9).
-    pub subagent: bool,
+    /// it, expanded (DESIGN §4.9), at this place in the subagent's own conversation.
+    pub subagent: Option<InSubagent>,
     /// Where the match opens the session; `None` for its title, which opens it at its start.
     pub at: Option<At>,
     /// Only the start of the span's text is searched: it is longer than search indexes.

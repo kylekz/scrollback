@@ -34,12 +34,15 @@
 //! **The locations sheet** ([`LocationsSheet`], DESIGN §4.11) opens over the scrim from a
 //! sidebar location row, the Locations overline or `Ctrl L`, while a library page shows. It
 //! keeps the keyboard while it is open, and gives it back to where it was when it closes. So
-//! do the library's dialogs ([`dialogs`]).
+//! do the library's dialogs ([`dialogs`]) and the search palette ([`palette`], `Ctrl K` or the
+//! title bar's search field), which gives it to the main area instead once it has opened a
+//! session or run a command.
 //!
 //! **Settings** (DESIGN §4.13) open in the main area from the title bar's gear or `Ctrl ,`,
 //! while a library page shows; `Esc`, `Alt ←` and Back go back to the page they were opened
 //! from. While a library dialog, or Settings' own confirmation, is open, `Esc` answers it and
-//! the shell's other keys do nothing.
+//! the shell's other keys do nothing. They don't open over the locations sheet. The palette
+//! opens over them, and opening a session or a page from it leaves them for it.
 //!
 //! **Another archive.** When the app moves onto another archive (Settings › Use a different
 //! folder…, `crate::services::reopen`), the shell makes its sidebar and main area anew over
@@ -56,6 +59,7 @@
 //! has answered.
 
 mod dialogs;
+mod palette;
 pub mod title_bar;
 
 #[cfg(test)]
@@ -123,6 +127,8 @@ pub struct Shell {
         Option<FocusHandle>,
         [Subscription; 2],
     )>,
+    /// The search palette while it is open ([`palette`]).
+    palette: Option<palette::Open>,
     /// The library's dialog while one is open, and where the keyboard rests in it.
     dialog: Option<dialogs::Dialog>,
     dialog_focus: FocusHandle,
@@ -157,6 +163,7 @@ impl Shell {
             appearance: gpui_appearance::track_window(Backing::Solid, window, cx),
             sidebar_open: false,
             locations: None,
+            palette: None,
             dialog: None,
             dialog_focus: cx.focus_handle(),
             springing: None,
@@ -182,6 +189,7 @@ impl Shell {
                 // Another archive's services (module docs).
                 cx.observe_global_in::<Services>(window, |this, window, cx| {
                     this.locations = None;
+                    this.palette = None;
                     this.dialog = None;
                     this.sidebar_open = false;
                     this.springing = None;
@@ -225,7 +233,7 @@ impl Shell {
                     match leave {
                         Leave::Close => window.remove_window(),
                         Leave::Quit => cx.quit(),
-                        Leave::Show(_) | Leave::Open(_) | Leave::Edit(_) => {}
+                        Leave::Show(_) | Leave::Open(..) | Leave::Edit(_) => {}
                     }
                 }
             }),
@@ -336,11 +344,12 @@ impl Shell {
 
     fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
         let library = cx.services().library.clone();
-        let (dragging, deleting, asked) = {
+        let (dragging, deleting, for_good, asked) = {
             let library = library.read(cx);
             (
                 library.drag().is_some(),
                 library.deleting().is_some(),
+                library.for_good().is_some(),
                 library.asked().is_some(),
             )
         };
@@ -348,8 +357,12 @@ impl Shell {
             crate::drag::end(window, cx);
         } else if deleting {
             library.update(cx, |library, cx| library.answer_delete(false, cx));
+        } else if for_good {
+            library.update(cx, |library, cx| library.answer_delete_for_good(false, cx));
         } else if asked {
             library.update(cx, |library, cx| library.answer(false, cx));
+        } else if self.palette.is_some() {
+            self.close_palette(false, window, cx);
         } else if self.sidebar_open {
             self.sidebar_open = false;
             self.main.focus_handle(cx).focus(window, cx);
@@ -365,7 +378,7 @@ impl Shell {
     /// Shows Settings in the main area, while a library page shows, or a first run in a folder
     /// the owner chose (module docs).
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !Showing::now(cx).has_settings(cx) {
+        if self.locations.is_some() || !Showing::now(cx).has_settings(cx) {
             return;
         }
         self.sidebar_open = false;
@@ -576,6 +589,7 @@ impl Render for Shell {
                     .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                         this.open_settings(window, cx);
                     }))
+                    .on_action(cx.listener(Self::toggle_palette))
             })
             // A drag is measured from its press, and ends wherever it is let go (`crate::drag`).
             .capture_any_mouse_down(|event, _, cx| crate::drag::pressed(event.position, cx))
@@ -629,6 +643,7 @@ impl Render for Shell {
                     .map(|(sheet, ..)| sheet.clone())
                     .and_then(|sheet| sheet.update(cx, |sheet, cx| sheet.dialog_layer(window, cx))),
             )
+            .children(self.palette_layer(window, &theme, cx))
             .children(self.dialog(window, &theme, cx))
             .children(crate::menu::layer(window, cx))
     }

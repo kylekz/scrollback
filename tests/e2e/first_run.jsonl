@@ -28,7 +28,7 @@
 
 // Adding the location starts its first sync; when it has settled the three sessions are archived, indexed and shown, all in Unsorted.
 {"cmd": "click", "target": "first-run/add"}
-{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/sync/syncing", "equals": false}, {"pointer": "/sync/locations", "len": 1}, {"pointer": "/sync/locations/0/kind", "equals": "local"}, {"pointer": "/sync/locations/0/state", "equals": "synced"}, {"pointer": "/library/shelf", "equals": "all"}, {"pointer": "/library/counts", "equals": {"all": 3, "starred": 0, "unsorted": 3}}, {"pointer": "/library/sessions", "equals": 3}, {"pointer": "/library/folders", "equals": []}]}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/sync/syncing", "equals": false}, {"pointer": "/sync/locations", "len": 1}, {"pointer": "/sync/locations/0/kind", "equals": "local"}, {"pointer": "/sync/locations/0/state", "equals": "synced"}, {"pointer": "/library/shelf", "equals": "all"}, {"pointer": "/library/counts", "equals": {"all": 3, "starred": 0, "unsorted": 3, "trash": 0}}, {"pointer": "/library/sessions", "equals": 3}, {"pointer": "/library/folders", "equals": []}]}
 {"cmd": "bounds", "target": "titlebar/search", "expect_result": [{"pointer": "/x", "equals": 490}, {"pointer": "/w", "equals": 460}]}
 {"cmd": "bounds", "target": "titlebar/sync-all", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "query", "prefix": "sidebar/location/", "expect_result": {"pointer": "", "len": 1}}
@@ -121,8 +121,8 @@
 
 // Sync all (F5) syncs every location again; nothing changed at the source, so the library is as it was.
 {"cmd": "key", "keystroke": "f5"}
-{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/sync/locations/0/state", "equals": "synced"}, {"pointer": "/library/counts", "equals": {"all": 3, "starred": 0, "unsorted": 1}}]}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/sync/locations/0/state", "equals": "synced"}, {"pointer": "/library/counts", "equals": {"all": 3, "starred": 0, "unsorted": 1, "trash": 0}}]}
 
 // A restart opens the same archive: no first run, the folders and their sessions as they were.
 {"restart": {}, "expect": {"pointer": "/archive/state", "not_equals": "failed"}}
-{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/library/counts", "equals": {"all": 3, "starred": 0, "unsorted": 1}}, {"pointer": "/library/folders/0", "equals": {"name": "uploads", "parent": null, "sessions": 2}}, {"pointer": "/sync/locations", "len": 1}]}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/library/counts", "equals": {"all": 3, "starred": 0, "unsorted": 1, "trash": 0}}, {"pointer": "/library/folders/0", "equals": {"name": "uploads", "parent": null, "sessions": 2}}, {"pointer": "/sync/locations", "len": 1}]}

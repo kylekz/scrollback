@@ -23,6 +23,9 @@ pub mod settings;
 mod states;
 #[cfg(test)]
 mod tests;
+pub mod trash;
+#[cfg(test)]
+mod trash_tests;
 pub mod unavailable;
 pub mod unsorted;
 
@@ -45,6 +48,7 @@ use crate::theme::{ActiveTheme as _, SbTheme};
 use first_run::FirstRun;
 use sessions::SessionsView;
 use settings::SettingsPage;
+use trash::TrashView;
 use unavailable::UnavailablePage;
 use unsorted::UnsortedView;
 
@@ -64,6 +68,7 @@ pub enum Showing {
     Unsorted,
     /// All sessions, Starred or a folder.
     Sessions,
+    Trash,
 }
 
 impl Showing {
@@ -85,12 +90,13 @@ impl Showing {
             Some(_) if sync.is_first_run() => Self::FirstRun,
             Some(_) if library.open_session().is_some() => Self::Session,
             Some(_) if library.shelf() == Shelf::Unsorted => Self::Unsorted,
+            Some(_) if library.shelf() == Shelf::Trash => Self::Trash,
             Some(_) => Self::Sessions,
         }
     }
 
     /// `"starting"`, `"archive-failed"`, `"locations-failed"`, `"first-run"`, `"settings"`,
-    /// `"session"`, `"unsorted"` or `"sessions"`, as automation's `state` spells it.
+    /// `"session"`, `"unsorted"`, `"sessions"` or `"trash"`, as automation's `state` spells it.
     pub fn key(self) -> &'static str {
         match self {
             Self::Starting => "starting",
@@ -101,14 +107,16 @@ impl Showing {
             Self::Session => "session",
             Self::Unsorted => "unsorted",
             Self::Sessions => "sessions",
+            Self::Trash => "trash",
         }
     }
 
     /// The key context of the main area while this shows.
-    fn key_context(self) -> &'static str {
+    pub fn key_context(self) -> &'static str {
         match self {
             Self::Sessions => keymap::SESSIONS,
             Self::Unsorted => keymap::UNSORTED,
+            Self::Trash => keymap::TRASH_PAGE,
             Self::FirstRun => keymap::FIRST_RUN,
             Self::Settings => keymap::SETTINGS,
             Self::Starting | Self::ArchiveFailed | Self::LocationsFailed | Self::Session => "Main",
@@ -125,7 +133,7 @@ impl Showing {
     pub fn is_library(self) -> bool {
         matches!(
             self,
-            Self::Sessions | Self::Unsorted | Self::Session | Self::Settings
+            Self::Sessions | Self::Unsorted | Self::Trash | Self::Session | Self::Settings
         )
     }
 }
@@ -145,6 +153,7 @@ pub struct MainArea {
     focus_handle: FocusHandle,
     sessions: Entity<SessionsView>,
     unsorted: Entity<UnsortedView>,
+    trash: Entity<TrashView>,
     first_run: Entity<FirstRun>,
     settings: Entity<SettingsPage>,
     /// What shows while no archive is open (DESIGN §4.14).
@@ -170,6 +179,7 @@ impl MainArea {
         Self {
             sessions: cx.new(|cx| SessionsView::new(focus_handle.clone(), cx)),
             unsorted: cx.new(|cx| UnsortedView::new(focus_handle.clone(), cx)),
+            trash: cx.new(|cx| TrashView::new(focus_handle.clone(), cx)),
             focus_handle,
             first_run: cx.new(FirstRun::new),
             settings: cx.new(|cx| SettingsPage::new(window, cx)),
@@ -222,6 +232,7 @@ impl MainArea {
             Showing::Unsorted => self
                 .unsorted
                 .update(cx, |unsorted, cx| unsorted.step(lines, cx)),
+            Showing::Trash => self.trash.update(cx, |trash, cx| trash.step(lines, cx)),
             _ => {}
         }
     }
@@ -290,6 +301,7 @@ impl MainArea {
             Showing::Unsorted => self
                 .unsorted
                 .update(cx, |unsorted, cx| unsorted.open_selected(cx)),
+            Showing::Trash => self.trash.update(cx, |trash, cx| trash.open_selected(cx)),
             _ => {}
         }
     }
@@ -419,6 +431,7 @@ impl Render for MainArea {
             }
             Showing::Unsorted => Some(self.unsorted.clone().into_any_element()),
             Showing::Sessions => Some(self.sessions.clone().into_any_element()),
+            Showing::Trash => Some(self.trash.clone().into_any_element()),
         };
         div()
             .id("main-area")
@@ -456,7 +469,9 @@ impl Render for MainArea {
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectAll, window, cx| {
-                if !this.typing(window, cx) {
+                if Showing::now(cx) == Showing::Trash {
+                    this.trash.update(cx, TrashView::select_all);
+                } else if !this.typing(window, cx) {
                     this.each_page(cx, SessionsView::select_all, |_, _| {});
                 }
             }))
@@ -504,11 +519,16 @@ impl MainArea {
                 .bottom(TOAST_BOTTOM)
                 .left_0()
                 .right_0()
+                .px(theme.sizes.page_side)
                 .flex()
                 .justify_center()
                 .child(
                     div()
                         .id("toast")
+                        // As wide as the main area allows, its text giving way, never its
+                        // buttons.
+                        .max_w_full()
+                        .min_w_0()
                         .debug_selector(|| "toast".into())
                         // Its time stops running out while the pointer rests on it.
                         .on_hover(|hovered, _, cx| {
@@ -528,6 +548,10 @@ impl MainArea {
                         .shadow(theme.shadows.pop.clone())
                         .child(
                             div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
                                 .child(toast.text.clone())
                                 .automation_target("toast/text"),
                         )
@@ -535,6 +559,7 @@ impl MainArea {
                             this.child(
                                 div()
                                     .id("toast-undo")
+                                    .flex_none()
                                     .role(Role::Button)
                                     .text_color(c.accent_text)
                                     .font_weight(theme.text.control.weight)

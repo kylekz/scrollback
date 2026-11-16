@@ -10,6 +10,7 @@
 //!   others are over, and whether Settings is shown.
 //! - [`UpkeepService`]: the archive's size, verify and the sessions deleted for good, for
 //!   Settings › Archive.
+//! - [`SearchService`]: the palette's searches, and its recent sessions and searches.
 //!
 //! **Another archive** ([`reopen`]): the services over an archive are made anew over the
 //! other one, once nothing runs on the first, and the views follow the new [`Services`].
@@ -25,8 +26,10 @@ pub mod library;
 mod location_tests;
 #[cfg(test)]
 mod owner_tests;
+pub mod read_at;
 #[cfg(test)]
 mod scale;
+pub mod search;
 pub mod settings;
 #[cfg(test)]
 mod settings_tests;
@@ -50,9 +53,11 @@ use sb_core::transport::{Launcher, Probe, ShellTransport, Transport, TransportEr
 pub use archive::{ArchiveService, ArchiveState, Failure};
 pub use drag::{DragState, Dragged, DropTarget, Verdict};
 pub use library::{
-    Leave, LibraryService, Month, Page, PathChip, SessionsPage, Stats, Toast, TypedPath,
+    ForGood, Leave, LibraryService, Month, Page, PathChip, SessionsPage, Stats, Toast, TypedPath,
     can_attach, group_key, group_path,
 };
+pub use read_at::ReadAt;
+pub use search::{Answer, Answered, SearchService};
 pub use settings::{SettingsService, SyncEvery};
 #[cfg(any(test, feature = "automation"))]
 pub use sync::Held;
@@ -109,6 +114,7 @@ pub struct Services {
     pub sync: Entity<SyncService>,
     pub library: Entity<LibraryService>,
     pub upkeep: Entity<UpkeepService>,
+    pub search: Entity<SearchService>,
     pub providers: Providers,
     /// What the sync service was made with, for the services over another archive.
     reach: Reach,
@@ -129,6 +135,7 @@ impl Services {
             && self.sync.read(cx).is_settled()
             && self.library.read(cx).is_settled()
             && self.upkeep.read(cx).is_settled()
+            && self.search.read(cx).is_settled()
     }
 }
 
@@ -177,12 +184,14 @@ fn build(
     });
     let library = cx.new(|cx| LibraryService::new(archive.clone(), sync.clone(), cx));
     let upkeep = cx.new(|cx| UpkeepService::new(archive.clone(), sync.clone(), &settings, cx));
+    let search = cx.new(|cx| SearchService::new(archive.clone(), library.clone(), cx));
     Services {
         settings,
         archive,
         sync,
         library,
         upkeep,
+        search,
         providers,
         reach,
     }
@@ -206,10 +215,15 @@ pub fn reopen(archive: Arc<Archive>, cx: &mut App) -> Task<()> {
         services.providers.clone(),
         services.reach.clone(),
     );
-    let (sync, upkeep) = (services.sync.clone(), services.upkeep.clone());
+    let (sync, upkeep, search) = (
+        services.sync.clone(),
+        services.upkeep.clone(),
+        services.search.clone(),
+    );
     let left = services.archive.clone();
     sync.update(cx, |sync, cx| sync.close(cx));
     upkeep.update(cx, |upkeep, cx| upkeep.close(cx));
+    search.update(cx, |search, cx| search.close(cx));
     cx.spawn(async move |cx| {
         while !cx.update(|cx| cx.services().is_quiet(cx)) {
             cx.background_executor().timer(QUIET_TICK).await;

@@ -64,6 +64,7 @@ fn colours(c: SbColors) -> Vec<(&'static str, (u32, u32))> {
         blue,
         green_soft,
         red_soft,
+        danger_fill,
         yellow_soft,
         blue_soft,
         scrim,
@@ -116,6 +117,7 @@ fn colours(c: SbColors) -> Vec<(&'static str, (u32, u32))> {
         ("blue", blue),
         ("green-soft", green_soft),
         ("red-soft", red_soft),
+        ("danger-fill", danger_fill),
         ("yellow-soft", yellow_soft),
         ("blue-soft", blue_soft),
         ("scrim", scrim),
@@ -182,6 +184,7 @@ fn dark_tokens_match_design() {
         // rgba(138,184,240,.14)
         ("green-soft", (0x8fd694, 130)),
         ("red-soft", (0xf08a7e, 130)),
+        ("danger-fill", (0xb9594f, 1000)),
         ("yellow-soft", (0xf2c482, 140)),
         ("blue-soft", (0x8ab8f0, 140)),
         // rgba(5,6,8,.58)
@@ -249,6 +252,7 @@ fn light_tokens_match_design() {
         // rgba(29,95,158,.10)
         ("green-soft", (0x17703f, 100)),
         ("red-soft", (0xb42a2a, 90)),
+        ("danger-fill", (0xb42a2a, 1000)),
         ("yellow-soft", (0x845400, 100)),
         ("blue-soft", (0x1d5f9e, 100)),
         // rgba(40,36,28,.30)
@@ -368,6 +372,16 @@ fn the_lowest_text_tier_meets_the_contrast_floor() {
                 "{appearance:?} fg3 on {name} now passes: drop its exemption"
             );
         }
+    }
+}
+
+#[test]
+fn white_on_the_danger_fill_meets_the_contrast_floor() {
+    /* DESIGN §4.8's Delete for good: white text on `danger-fill`, in both appearances. */
+    for appearance in [Appearance::Dark, Appearance::Light] {
+        let fill = SbColors::new(appearance, Material::Opaque).danger_fill;
+        let ratio = contrast_ratio(gpui::white(), fill);
+        assert!(ratio >= 4.5, "{appearance:?}: {ratio:.2}");
     }
 }
 

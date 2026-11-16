@@ -1350,7 +1350,8 @@ fn an_undo_quiets_the_toasts_of_changes_made_before_it(cx: &mut TestAppContext) 
         library.undo(cx);
     });
     cx.run_until_parked();
-    assert_eq!(toast(cx), None);
+    // The Undo has the last word: no "Filed in other", only that it is undone.
+    assert_eq!(toast(cx).as_deref(), Some("Undone"));
     assert_eq!(filed(SESSIONS[0].title, cx), Filed::Unsorted);
 }
 

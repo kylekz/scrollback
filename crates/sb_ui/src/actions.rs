@@ -43,6 +43,8 @@ pub mod shell {
             OpenLocations,
             /// Open Settings in the main area (`Ctrl ,`, DESIGN §4.13).
             OpenSettings,
+            /// Open the search palette, or close it (`Ctrl K`, DESIGN §4.9).
+            Search,
         ]
     );
 }

@@ -11,9 +11,8 @@
 //! **States** (DESIGN §4.1). The first run shows the mark alone: no search, Sync all or
 //! Settings (DESIGN §4.10). With a library, Sync all syncs every location, and while a pass
 //! runs its glyph turns, it reads "Syncing…", and neither a click nor `Tab` stops on it.
-//! While the archive is opening or didn't open, it is drawn disabled (DESIGN §4.14), and so is
-//! Settings. Search needs the index (PLAN §13 phase 6): until then it is drawn disabled and
-//! takes no clicks.
+//! While the archive is opening or didn't open, it is drawn disabled (DESIGN §4.14), and so are
+//! Settings and the search field, which otherwise opens the palette.
 //!
 //! **Caption buttons** (Windows). Each is a 46px-wide box, the bar's height, marked with gpui's
 //! `WindowControlArea` (`Min`, `Max`, `Close`), so Windows itself answers the hit test and
@@ -31,7 +30,7 @@ use gpui::{
 
 use super::{Shell, SidebarPlacement};
 use crate::actions::library::SyncAll;
-use crate::actions::shell::{Dismiss, ToggleSidebar};
+use crate::actions::shell::{Dismiss, Search, ToggleSidebar};
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{DISABLED_OPACITY, icon, kbd, sync_glyph, tab_stop, text_width};
 use crate::icons::SbIcon;
@@ -130,7 +129,9 @@ impl Shell {
                         .child(mark(theme)),
                 ),
             )
-            .when(!first_run, |this| this.child(search_field(theme)))
+            .when(!first_run, |this| {
+                this.child(search_field(has_library, theme, cx))
+            })
             .child(
                 div()
                     .flex_1()
@@ -252,16 +253,26 @@ fn mark(theme: &SbTheme) -> AnyElement {
 }
 
 /// The search field (DESIGN §4.1): a 460-wide button in the `field` style that opens the
-/// palette (`Ctrl K`). Disabled (module docs).
-fn search_field(theme: &SbTheme) -> AnyElement {
+/// palette (`Ctrl K`). Disabled without a library (module docs).
+fn search_field(enabled: bool, theme: &SbTheme, cx: &mut Context<Shell>) -> AnyElement {
     let c = &theme.colors;
     div()
         .id("titlebar-search")
         .role(Role::Button)
-        .aria_label(format!(
-            "Search the archive ({})",
-            keymap::label(keymap::SEARCH_KEYS)
-        ))
+        .aria_label(format!("Search the archive ({})", keymap::SEARCH.label()))
+        // A control inside the drag region.
+        .occlude()
+        .map(|this| {
+            if enabled {
+                tab_stop(this, theme).cursor_pointer().on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.toggle_palette(&Search, window, cx);
+                    },
+                ))
+            } else {
+                this.opacity(DISABLED_OPACITY)
+            }
+        })
         .flex_shrink(1.)
         .min_w_0()
         .flex()
@@ -275,7 +286,6 @@ fn search_field(theme: &SbTheme) -> AnyElement {
         .border_color(c.line)
         .bg(c.s1)
         .text_color(c.fg3)
-        .opacity(DISABLED_OPACITY)
         .debug_selector(|| "titlebar-search".into())
         .child(icon(SbIcon::Search, theme.sizes.icon_sm, c.fg3))
         .child(
@@ -285,7 +295,7 @@ fn search_field(theme: &SbTheme) -> AnyElement {
                 .whitespace_nowrap()
                 .child("Search titles, prompts, replies and commands"),
         )
-        .child(kbd(keymap::label(keymap::SEARCH_KEYS), theme))
+        .child(kbd(keymap::SEARCH.label(), theme))
         .automation_target("titlebar/search")
 }
 
