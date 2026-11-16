@@ -18,7 +18,8 @@ use sb_core::sync::sync_location;
 use sb_core::transport::{
     Env, FileStat, Listing, PrefixRequest, RangeRequest, RangeSink, Transport, TransportError,
 };
-use sb_test_support::{Agent, DbAgent, FileAgent, HomeTransport, read_catalogue};
+use sb_test_support::{Agent, DbAgent, FileAgent, HomeTransport, ProjectsTree, read_catalogue};
+use serde_json::json;
 
 use common::{Bench, Meddle};
 
@@ -691,6 +692,51 @@ fn the_library_lists_sessions_by_when_they_last_did_something() {
     assert_eq!(listed(catalogue, Shelf::Starred), ids[..1]);
     let counts = catalogue.library_counts().unwrap();
     assert_eq!((counts.all, counts.starred, counts.unsorted), (3, 1, 3));
+}
+
+#[test]
+fn the_models_and_branches_offered_are_those_outside_trash_the_commonest_first() {
+    let mut tree = ProjectsTree::new();
+    let mut keys = Vec::new();
+    for (model, branch) in [
+        ("model-b", "main"),
+        ("model-a", "work"),
+        ("model-b", "work"),
+        ("model-c", "trashed"),
+    ] {
+        let mut session = tree.session("/home/user/code/app", 0);
+        let on = json!({ "gitBranch": branch });
+        session.transcript.user(json!("Go on."), on.clone());
+        session
+            .transcript
+            .assistant(1, model, json!([{ "type": "text", "text": "Done." }]), on);
+        keys.push(session.key);
+    }
+    let bench = Bench::new(FileAgent::on(tree));
+    bench.sync();
+    let catalogue = bench.archive().catalogue();
+    let named = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>()
+    };
+    /* Ties go by name. */
+    assert_eq!(
+        catalogue.models_and_branches().unwrap(),
+        (
+            named(&["model-b", "model-a", "model-c"]),
+            named(&["work", "main", "trashed"])
+        )
+    );
+
+    /* A session in Trash offers nothing. */
+    catalogue.trash(&bench.session_id(&keys[3])).unwrap();
+    catalogue.trash(&bench.session_id(&keys[2])).unwrap();
+    assert_eq!(
+        catalogue.models_and_branches().unwrap(),
+        (named(&["model-a", "model-b"]), named(&["main", "work"]))
+    );
 }
 
 #[test]

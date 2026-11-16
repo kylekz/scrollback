@@ -6,7 +6,7 @@
 
 mod common;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +24,7 @@ use common::{Bench, Meddle, When, for_both_agents};
 for_both_agents!(
     a_session_in_trash_is_on_no_page_but_trash_and_is_still_synced,
     a_restored_session_goes_back_to_its_folder_or_to_the_rules,
+    trash_sizes_each_session_as_deleting_it_would_count_it,
     deleting_for_good_removes_the_sessions_files_and_rows_and_nothing_else,
     only_a_session_in_trash_is_deleted_for_good_and_not_while_its_location_syncs,
     a_session_deleted_for_good_stays_gone_until_its_tombstone_is_removed,
@@ -265,6 +266,28 @@ fn a_restored_session_goes_back_to_its_folder_or_to_the_rules<A: Agent + Default
         catalogue.restore(&ids[1]),
         Err(CatalogueError::NotInTrash(_))
     ));
+}
+
+fn trash_sizes_each_session_as_deleting_it_would_count_it<A: Agent + Default>() {
+    let mut agent = A::default();
+    let keys = [
+        agent.add_session(2),
+        agent.add_session(6),
+        agent.add_session(4),
+    ];
+    let bench = Bench::new(agent);
+    bench.sync();
+    let catalogue = bench.archive().catalogue();
+    assert_eq!(catalogue.trash_sizes().unwrap(), HashMap::new());
+    let ids = [trashed(&bench, &keys[0]), trashed(&bench, &keys[1])];
+    let sizes = catalogue.trash_sizes().unwrap();
+    assert_eq!(
+        sizes,
+        ids.iter()
+            .map(|id| (id.clone(), catalogue.deletion(id).unwrap().bytes))
+            .collect::<HashMap<_, _>>()
+    );
+    assert!(sizes[&ids[1]] > sizes[&ids[0]] && sizes[&ids[0]] > 0);
 }
 
 fn deleting_for_good_removes_the_sessions_files_and_rows_and_nothing_else<A: Agent + Default>() {

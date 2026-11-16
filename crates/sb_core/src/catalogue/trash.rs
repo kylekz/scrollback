@@ -185,6 +185,33 @@ impl Catalogue {
         self.db.read(|c| deletion(c, id))
     }
 
+    /// How much each session in Trash holds, as [`Deletion::bytes`] counts it: Trash's Size
+    /// column (DESIGN §4.8). A session with nothing archived is left out.
+    pub fn trash_sizes(&self) -> Result<HashMap<SessionId, u64>> {
+        self.db.read(|c| {
+            Ok(c.prepare(
+                "SELECT st.location_id, st.provider, st.session,
+                        COALESCE(sum((SELECT sum(length) FROM version WHERE item_id = i.id)), 0)
+                 FROM session_state st
+                 JOIN item i ON i.location_id = st.location_id AND i.provider = st.provider
+                            AND i.session = st.session
+                 WHERE st.trashed_at IS NOT NULL
+                 GROUP BY st.location_id, st.provider, st.session",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    SessionId {
+                        location: row.get(0)?,
+                        provider: row.get(1)?,
+                        key: row.get(2)?,
+                    },
+                    row.get(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
     /**
      * Deletes the session in Trash that `shown` is of for good, in one transaction (PLAN §4.5):
      * its items' rows and its own, with what the owner decided about it; a tombstone in their
