@@ -170,7 +170,10 @@ impl Sidebar {
                     cx.notify();
                 }),
                 cx.subscribe_in(&library, window, |this, _, event, window, cx| match event {
-                    LibraryEvent::FolderCreated(folder) => this.rename(*folder, window, cx),
+                    LibraryEvent::FolderCreated(folder) | LibraryEvent::Rename(folder) => {
+                        this.rename(*folder, window, cx);
+                    }
+                    LibraryEvent::EditPaths(_) => {}
                 }),
             ],
             _clock: cx.spawn(async move |this, cx| {

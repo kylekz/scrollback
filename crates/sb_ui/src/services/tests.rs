@@ -5,6 +5,7 @@ use gpui::{Entity, TestAppContext};
 use pretty_assertions::assert_eq;
 use sb_core::archive::Archive;
 use sb_core::catalogue::{Filed, SessionId, Shelf};
+use sb_core::filing::NormalPath;
 use sb_core::location::Location;
 use sb_core::sync::Progress;
 use sb_test_support::{Outline, ProjectsTree, break_segment_commits, mend_segment_commits};
@@ -616,8 +617,10 @@ fn a_folder_made_from_an_unsorted_path_files_the_paths_sessions(cx: &mut TestApp
     let created = Rc::new(RefCell::new(Vec::new()));
     let _heard = cx.update(|cx| {
         let created = created.clone();
-        cx.subscribe(&library, move |_, event, _| match event {
-            LibraryEvent::FolderCreated(folder) => created.borrow_mut().push(*folder),
+        cx.subscribe(&library, move |_, event, _| {
+            if let LibraryEvent::FolderCreated(folder) = event {
+                created.borrow_mut().push(*folder);
+            }
         })
     });
     // A second click before the first has landed makes no second folder.
@@ -655,6 +658,7 @@ fn a_folder_made_from_an_unsorted_path_files_the_paths_sessions(cx: &mut TestApp
             page.paths,
             [PathChip {
                 typed: "/home/user/code/app".to_string(),
+                path: NormalPath::new("/home/user/code/app", None).unwrap(),
                 location: Some(location),
                 sessions: 2,
             }]

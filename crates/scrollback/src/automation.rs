@@ -41,6 +41,10 @@
 //!   `sessions`, in the catalogue's order), `sessions` and `groups` (how many the shown page
 //!   lists, `null` while it loads or is of the other kind), the titles of the `selected` and
 //!   the `open` session, and `error` (why the library couldn't be read, or `null`).
+//! - `cards`: what the page of cards last decided its cards' last lines from (DESIGN §4.4):
+//!   `shows_calls`, `tags_past_caps`, `inner` (a card's width inside its padding and border),
+//!   `tags` (each location's and subfolder's tag: `name`, `whole` and `capped` widths), the
+//!   widest `day` and the largest `calls` (each `text` and `width`), in logical pixels.
 //!
 //! Commands. An argument a command doesn't have is an error, so a misspelt one never passes
 //! for a change. These reply with `state.appearance` after the change:
@@ -80,6 +84,7 @@ use sb_core::transport::{
     RangeRequest, RangeSink, ShellTransport, Transport, TransportError,
 };
 use sb_ui::Shell;
+use sb_ui::pages::sessions::LineMeasure;
 use sb_ui::services::sync::{TestFailure, TestState, stale};
 use sb_ui::services::{ActiveServices as _, ArchiveState, Held, LocationStatus, Page, Reach};
 use serde::Deserialize;
@@ -113,6 +118,7 @@ impl AutomationHost for ScrollbackAutomation {
             "archive": archive(cx),
             "sync": sync(cx),
             "library": library(cx),
+            "cards": cards(shell.main().read(cx).sessions().read(cx).line_measure()),
             "sheet": shell.locations_sheet().map(|sheet| {
                 let sheet = sheet.read(cx);
                 let sync = cx.services().sync.read(cx);
@@ -337,6 +343,23 @@ fn library(cx: &App) -> Value {
         "selected": library.selected().and_then(title_of),
         "open": library.open_session().and_then(|session| session.title.clone()),
         "error": library.failure(),
+    })
+}
+
+/// `state.cards`: what the page of cards last decided its cards' last lines from.
+fn cards(measure: &LineMeasure) -> Value {
+    let px = |width: gpui::Pixels| (f32::from(width) * 100.).round() / 100.;
+    json!({
+        "shows_calls": measure.shows_calls,
+        "tags_past_caps": measure.tags_past_caps,
+        "inner": px(measure.inner),
+        "tags": measure.tags.iter().map(|(name, whole, capped)| json!({
+            "name": name,
+            "whole": px(*whole),
+            "capped": px(*capped),
+        })).collect::<Vec<_>>(),
+        "day": { "text": measure.day.0, "width": px(measure.day.1) },
+        "calls": { "text": measure.calls.0, "width": px(measure.calls.1) },
     })
 }
 

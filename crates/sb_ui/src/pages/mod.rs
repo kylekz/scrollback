@@ -155,6 +155,11 @@ impl MainArea {
         }
     }
 
+    /// The page of All sessions, Starred or a folder.
+    pub fn sessions(&self) -> &Entity<SessionsView> {
+        &self.sessions
+    }
+
     /// Moves a page's selection: `by` along the reading order, or `lines` up or down.
     fn step(&mut self, by: isize, lines: isize, cx: &mut Context<Self>) {
         match Showing::now(cx) {

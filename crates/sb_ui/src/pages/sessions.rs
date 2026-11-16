@@ -191,6 +191,22 @@ fn widest_day(stats: &Stats, now: i64) -> String {
     format!("28{month}")
 }
 
+/**
+ * What the page's decision on its cards' last lines was made from (DESIGN §4.4), for
+ * automation's `state` to report: a card's width inside its padding and border, each tag's
+ * width whole and at its cap, the widest day and count, and what was decided.
+ */
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LineMeasure {
+    pub inner: Pixels,
+    /// Each location's and subfolder's tag: its name, its width whole, and at its cap.
+    pub tags: Vec<(String, Pixels, Pixels)>,
+    pub day: (String, Pixels),
+    pub calls: (String, Pixels),
+    pub shows_calls: bool,
+    pub tags_past_caps: bool,
+}
+
 /// One item of the list of cards.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Row {
@@ -337,6 +353,7 @@ pub struct SessionsView {
     tag_widths: HashMap<String, Pixels>,
     /// How wide the "held back" chip is.
     held_width: Pixels,
+    measure: LineMeasure,
     /// The card under the pointer.
     hovered: Option<SessionId>,
     /// The rows are of what the library held before it last changed.
@@ -372,6 +389,7 @@ impl SessionsView {
             tags_past_caps: false,
             tag_widths: HashMap::new(),
             held_width: px(0.),
+            measure: LineMeasure::default(),
             hovered: None,
             stale: true,
             focus,
@@ -408,31 +426,32 @@ impl SessionsView {
         // The locations may arrive, or be renamed, after the sessions; and so may the folders.
         let (sync, library) = (self.sync.read(cx), self.library.read(cx));
         self.tag_widths.clear();
-        let mut measure = |name: &str| {
+        let mut tags = Vec::new();
+        let mut measure = |name: &str, cap: Pixels| {
             let width = tag_width(name, theme, window);
             self.tag_widths.insert(name.to_string(), width);
+            tags.push((name.to_string(), width, width.min(cap)));
             width
         };
         let locations = (self.line.locations.iter())
             .filter_map(|id| sync.location(id))
-            .map(|location| measure(&location.name))
+            .map(|location| measure(&location.name, theme.sizes.location_tag_max_width))
             .collect();
         let subfolders = (self.line.subfolders.iter())
             .filter_map(|id| library.folder(*id))
-            .map(|folder| measure(&folder.name))
+            .map(|folder| measure(&folder.name, theme.sizes.tag_max_width))
             .collect();
         self.held_width = text_width(HELD_BACK, &theme.text.small, window) + theme.spacing.sm * 2.;
+        let calls = format::count(u64::from(self.line.most_calls));
+        let day = text_width(&self.line.day, &theme.text.count, window);
+        let calls_width = text_width(&calls, &theme.text.count, window);
         let pieces = LinePieces {
             locations,
             subfolders,
             held: self.line.held.then_some(self.held_width),
             by_hand: self.line.by_hand,
-            day: text_width(&self.line.day, &theme.text.count, window),
-            calls: Some(text_width(
-                &format::count(u64::from(self.line.most_calls)),
-                &theme.text.count,
-                window,
-            )),
+            day,
+            calls: Some(calls_width),
         };
         let inner = self.card_width - CARD_PADDING * 2. - px(2.);
         /* The page's cards show their counts when an ordinary card's line has room for them:
@@ -456,6 +475,19 @@ impl SessionsView {
             },
             theme,
         );
+        self.measure = LineMeasure {
+            inner,
+            tags,
+            day: (self.line.day.clone(), day),
+            calls: (calls, calls_width),
+            shows_calls: self.shows_calls,
+            tags_past_caps: self.tags_past_caps,
+        };
+    }
+
+    /// What the cards' last lines were last decided from.
+    pub fn line_measure(&self) -> &LineMeasure {
+        &self.measure
     }
 
     /// Moves the selection (see [`moved`]); with nothing selected, selects the first session.

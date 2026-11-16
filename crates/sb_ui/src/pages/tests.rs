@@ -7,6 +7,7 @@ use sb_core::catalogue::Shelf;
 use sb_test_support::{break_segment_commits, mend_segment_commits};
 
 use super::*;
+use crate::pages::sessions::LineMeasure;
 use crate::services::LibraryService;
 use crate::shell::{Shell, SidebarPlacement};
 use crate::test_support::{
@@ -510,6 +511,67 @@ fn a_long_location_name_leaves_the_counts_in_a_wide_window(cx: &mut TestAppConte
 #[gpui::test]
 fn a_long_location_name_leaves_the_counts_in_a_narrow_window(cx: &mut TestAppContext) {
     a_long_location_name_leaves_the_counts(size(px(960.), px(600.)), cx);
+}
+
+/**
+ * A page whose oldest session is of another year, and a location whose tag reaches its cap:
+ * the page's decision on counts measures the widest day with its year ("28 Dec 2025") and its
+ * largest count, and reports what it measured (DESIGN §4.4).
+ */
+fn cards_of_a_page_spanning_two_years(window_width: f32, cx: &mut TestAppContext) -> LineMeasure {
+    let (shell, cx) = open_shell_sized(size(px(window_width), px(900.)), cx);
+    crate::test_support::write_session(
+        &sb_test_support::Outline {
+            project: "/home/user/notes",
+            title: "Last year's notes",
+            prompt: "Tidy last year's notes.",
+            model: "model-a",
+            day: (2025, 12, 3),
+            calls: 412,
+        },
+        cx,
+    );
+    let sync = cx.update(|_, cx| cx.services().sync.clone());
+    sync.update(cx, |sync, cx| sync.sync_all(cx));
+    cx.run_until_parked();
+    let here = sync.read_with(cx, |sync, _| sync.locations().unwrap()[0].id.clone());
+    sync.update(cx, |sync, cx| {
+        sync.rename(&here, &"a".repeat(80), cx).unwrap();
+    });
+    cx.run_until_parked();
+    bounds(cx, "card-0");
+    let measure = cx.update(|_, cx| {
+        let main = shell.read(cx).main().read(cx);
+        main.sessions().read(cx).line_measure().clone()
+    });
+    assert_eq!(measure.day.0, "28 Dec 2025");
+    assert_eq!(measure.tags[0].2, px(80.));
+    measure
+}
+
+/**
+ * The line such a card must hold: the mark (12), a model's least (12), the tag at its cap (80),
+ * the day (72.6 in Geist Mono at 11px), the glyph, 4 and a three-digit count (35.8), and four
+ * gaps of 6: 236.4. A card of 277 (1440 wide) and one of 276 (Windows at 1440 and a fractional
+ * scale) both hold it, with their 4 spare, by 5.6 or more.
+ */
+#[gpui::test]
+fn a_card_of_277_holds_a_capped_tag_a_day_with_its_year_and_the_count(cx: &mut TestAppContext) {
+    let measure = cards_of_a_page_spanning_two_years(1440., cx);
+    assert_eq!(measure.inner, px(247.));
+    assert_eq!(
+        (measure.calls.0.as_str(), measure.day.1.round()),
+        ("412", px(73.))
+    );
+    assert!(measure.shows_calls);
+}
+
+#[gpui::test]
+fn a_card_of_276_holds_them_too(cx: &mut TestAppContext) {
+    let measure = cards_of_a_page_spanning_two_years(1436., cx);
+    assert_eq!(measure.inner, px(246.));
+    assert!(measure.shows_calls);
+    assert!(!measure.tags_past_caps);
 }
 
 #[gpui::test]

@@ -14,7 +14,7 @@ use crate::search::Filters;
 
 /// The sessions one page of the library lists. Every page but Trash leaves out the sessions
 /// in Trash (PLAN §4.5).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Shelf {
     #[default]
     All,

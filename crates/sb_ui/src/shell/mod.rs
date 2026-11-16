@@ -168,6 +168,11 @@ impl Shell {
         &self.sidebar
     }
 
+    /// The main area.
+    pub fn main(&self) -> &Entity<MainArea> {
+        &self.main
+    }
+
     /// The material applied to the window.
     pub fn applied_material(&self) -> Material {
         self.appearance.applied().material
