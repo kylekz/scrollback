@@ -272,6 +272,21 @@ CREATE TABLE removal (
 ) STRICT;
 
 CREATE INDEX removal_item ON removal (location_id, provider, folder);
+
+-- searchable: the session's text in search.db (crate::search) is of the row as it is. A row
+-- made again is not, until the second step of an index says it is. Only those that are not are
+-- indexed, so an index with nothing to do reads none.
+ALTER TABLE session ADD COLUMN searchable INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX session_unsearchable ON session (location_id, provider) WHERE searchable = 0;
+
+-- Sessions whose text is to be taken out of search.db: their rows went (deleted for good, no
+-- session any more, or the index emptied), in the transaction that took them.
+CREATE TABLE text_gone (
+    location_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    session TEXT NOT NULL,
+    PRIMARY KEY (location_id, provider, session)
+) STRICT, WITHOUT ROWID;
 ";
 
 #[cfg(test)]

@@ -465,10 +465,11 @@ fn the_search_text_is_made_again_when_it_is_missing_or_unreadable<A: Agent + Def
         }
         spoil(&search);
         bench.reopen();
-        /* The library is all there; its text is to be made again, and then is. */
+        /* The library is all there; its text is to be made again, once the search index is
+        found missing or unreadable, and then is. */
         assert_eq!(bench.sessions().len(), 2);
-        assert_eq!(bench.archive().unsearchable().unwrap(), 2);
         assert_eq!(find(&bench, "parse_args").total_sessions, 0);
+        assert_eq!(bench.archive().unsearchable().unwrap(), 2);
         assert_eq!(bench.index().searchable, 2);
         assert_eq!(find(&bench, "parse_args"), before);
     }

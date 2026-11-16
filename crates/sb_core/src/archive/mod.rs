@@ -171,15 +171,27 @@ pub struct Archive {
     dir: PathBuf,
     id: String,
     catalogue: Catalogue,
-    /// The search text, in a database of its own (`crate::search`), once it could be opened:
-    /// a derived file never stops the archive opening ([`Archive::search_index`]).
-    search: Mutex<Option<Arc<SearchIndex>>>,
+    /// The search text, in a database of its own (`crate::search`), once it is first wanted
+    /// and could be opened: a derived file never stops, nor slows, the archive opening
+    /// ([`Archive::search_index`]).
+    search: Arc<Mutex<Option<Arc<SearchIndex>>>>,
     /// The locations a sync is running on.
     syncing: Mutex<HashSet<LocationId>>,
     /// Held shared from a segment's move into place until its commit, and exclusively by
-    /// whoever has to tell the files the catalogue doesn't record from those it is about to.
-    placing: RwLock<()>,
+    /// whoever has to tell the files the catalogue doesn't record from those it is about to,
+    /// or removes a deleted item's.
+    placing: Arc<RwLock<()>>,
+    /// The background removal of deleted items' files ([`delete`]).
+    removals: Arc<delete::Removals>,
     _lock: File,
+}
+
+impl Drop for Archive {
+    /// Stops the background removal before its next item, and waits for it: what is left
+    /// is the next start's.
+    fn drop(&mut self) {
+        self.removals.stop();
+    }
 }
 
 impl Archive {
@@ -264,19 +276,13 @@ impl Archive {
             });
         }
         let archive = Self::opened(dir, lock, manifest.id, catalogue)?;
-        /* A delete for good that was cut short between its commit and the removal of its
-        files and its text; finished before today's backup, which so holds no pending removal
-        a restore could take for one still to do. */
-        archive.remove_deleted()?;
-        if let Err(error) = archive.forget_deleted_text() {
-            log::warn!("the search text of sessions deleted for good is left for later: {error}");
+        /* A search index that is gone holds no session's text. */
+        if !dir.join(crate::search::SEARCH_DATABASE).exists() {
+            archive.catalogue.none_searchable()?;
         }
-        /* What a write before took out of either database is in no file once this is done. */
-        archive.catalogue.empty_log();
-        if let Ok(search) = archive.search_index() {
-            search.empty_log();
-        }
-        archive.catalogue.daily_backup();
+        /* What a delete for good left to remove, and then today's backup, which so holds no
+        removal still to do; in the background, as nothing else waits for them. */
+        archive.start_removals(true);
         Ok(archive)
     }
 
@@ -307,51 +313,25 @@ impl Archive {
             dir: dir.to_path_buf(),
             id,
             catalogue,
-            search: Mutex::new(
-                SearchIndex::open(dir)
-                    .inspect_err(|error| log::warn!("search is not available: {error}"))
-                    .map(Arc::new)
-                    .ok(),
-            ),
+            search: Arc::default(),
             syncing: Mutex::default(),
-            placing: RwLock::default(),
+            placing: Arc::default(),
+            removals: Arc::default(),
             _lock: lock,
         })
     }
 
-    /// The search text (`crate::search`), opened now if it could not be before; or why it
-    /// can't be, which is also said in the log.
+    /// The search text (`crate::search`), opened now if it was not before ([`open_search`]).
     pub(crate) fn search_index(&self) -> Result<Arc<SearchIndex>, SearchError> {
-        let mut search = self.search.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(search) = &*search {
-            return Ok(Arc::clone(search));
-        }
-        let opened = Arc::new(SearchIndex::open(&self.dir).map_err(|error| {
-            log::warn!("search is not available: {error}");
-            SearchError::Unavailable(error.to_string())
-        })?);
-        *search = Some(Arc::clone(&opened));
-        Ok(opened)
+        open_search(&self.dir, &self.search, &self.catalogue)
     }
 
-    /// Takes out of the search text every session that has no row in the catalogue: one
-    /// deleted for good whose text was not taken out before the app stopped.
-    fn forget_deleted_text(&self) -> Result<()> {
-        let rows: HashSet<_> = self
-            .catalogue
-            .made(None, None)?
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        let search = self.search_index()?;
-        let docs = search.docs()?;
-        let all = docs.len();
-        let gone: Vec<_> = docs.into_keys().filter(|id| !rows.contains(id)).collect();
-        /* The index was emptied: so is the text, at once. */
-        if !gone.is_empty() && gone.len() == all {
-            return Ok(search.clear()?);
-        }
-        Ok(search.forget(&gone)?)
+    /// The search text, if it was opened already: opening it costs a check of the whole file.
+    pub(crate) fn search_index_if_open(&self) -> Option<Arc<SearchIndex>> {
+        self.search
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub fn dir(&self) -> &Path {
@@ -663,6 +643,35 @@ impl Archive {
         }
         Ok(uncatalogued)
     }
+}
+
+/**
+ * The search text of the archive in `dir` (`crate::search`), from `slot` once it is open, and
+ * opened into it if it is not; or why it can't be, which is also said in the log. One opened
+ * anew holds no session's text, which the catalogue is told.
+ */
+fn open_search(
+    dir: &Path,
+    slot: &Mutex<Option<Arc<SearchIndex>>>,
+    catalogue: &Catalogue,
+) -> Result<Arc<SearchIndex>, SearchError> {
+    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(search) = &*slot {
+        return Ok(Arc::clone(search));
+    }
+    let (search, anew) = SearchIndex::open(dir).map_err(|error| {
+        log::warn!("search is not available: {error}");
+        match error {
+            SearchError::Unavailable(_) => error,
+            error => SearchError::Unavailable(error.to_string()),
+        }
+    })?;
+    if anew {
+        catalogue.none_searchable()?;
+    }
+    let search = Arc::new(search);
+    *slot = Some(Arc::clone(&search));
+    Ok(search)
 }
 
 /// The paths under `files/`, relative to the archive, that `stored` accounts for: the folders
@@ -1266,6 +1275,7 @@ mod tests {
         drop(archive);
 
         let archive = Archive::open(dir.path()).unwrap();
+        archive.wait_for_removals();
         assert!(!doomed_file.exists());
         assert!(!doomed_file.parent().unwrap().parent().unwrap().exists());
         assert!(kept_file.is_file() && again_file.is_file() && !other_file.exists());
@@ -1368,7 +1378,7 @@ mod tests {
                 .unwrap();
         }
         let texts: Vec<Text> = catalogue
-            .made(None, None)
+            .unsearchable(None, None)
             .unwrap()
             .into_iter()
             .map(|(id, made)| Text {
@@ -1379,7 +1389,7 @@ mod tests {
             })
             .collect();
         let search = archive.search_index().unwrap();
-        assert_eq!(search.record(&texts, |_| Ok(true)).unwrap(), 2);
+        assert_eq!(search.record(&texts, |_| Ok(true)).unwrap().len(), 2);
         catalogue.trash(&sessions[0]).unwrap();
         catalogue
             .delete_for_good(&catalogue.deletion(&sessions[0]).unwrap())
@@ -1387,6 +1397,7 @@ mod tests {
         drop((search, archive));
 
         let archive = Archive::open(dir.path()).unwrap();
+        archive.wait_for_removals();
         let docs = archive.search_index().unwrap().docs().unwrap();
         assert_eq!(docs.into_keys().collect::<Vec<_>>(), [sessions[1].clone()]);
     }

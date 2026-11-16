@@ -37,13 +37,7 @@ impl Archive {
     /// not be read for when its text was to be made is counted until an index of a start
     /// reads it.
     pub fn unsearchable(&self) -> Result<usize, SearchError> {
-        let docs = self.search_index()?.docs()?;
-        Ok(self
-            .catalogue()
-            .made(None, None)?
-            .into_iter()
-            .filter(|(id, made)| docs.get(id) != Some(made))
-            .count())
+        Ok(self.catalogue().count_unsearchable()?)
     }
 
     /**

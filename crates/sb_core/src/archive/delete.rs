@@ -1,7 +1,7 @@
 //! Deleting a session for good (PLAN §4.5): what the archive does once the catalogue has
-//! committed the delete ([`crate::catalogue::Catalogue::delete_for_good`]): the files its items
-//! had leave `files/`, what of them was set aside in `orphans/` before goes too (those are the
-//! session's bytes all the same), and its text leaves the search index.
+//! committed the delete ([`crate::catalogue::Catalogue::delete_for_good`]): its text leaves
+//! the search index, and in the background the files its items had leave `files/`, with what of
+//! them was set aside in `orphans/` before (those are the session's bytes all the same).
 //!
 //! What is removed is decided by the catalogue. A deleted item's folder is named by its key,
 //! which the tombstone says the owner deleted: while the catalogue records no item in that
@@ -9,42 +9,99 @@
 //! the session's). Once the catalogue records an item there again (the session was archived
 //! anew, or a catalogue from before was restored that holds the removal still to do), only a
 //! file it does not record, and that holds the very bytes deleted, goes. Nothing is removed
-//! through a link: such an item stays to be removed, and verify reports it. What can't be
-//! removed now stays pending, and every start tries again; until then verify counts it as what
-//! it is, not as a stray, and nothing sets it aside.
+//! through a link: such an item stays to be removed, and verify reports it. An item is removed
+//! with no segment between its place and its commit ([`Archive::store`] holds `placing`), so a
+//! store into the same folder is never removed with it.
+//!
+//! **In the background.** Removing a large session's files takes seconds, so neither a delete
+//! nor a start waits for it: a thread of the archive's removes what is pending, and goes on
+//! with what a delete adds meanwhile. What is still to be removed stays pending until it is
+//! gone, and every start tries again; until then verify counts it as what it is, not as a
+//! stray, and nothing sets it aside. The day's backup of the catalogue is taken by the thread a
+//! start begins, once nothing is pending, so no backup holds a removal still to do.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::slice;
-use std::sync::PoisonError;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::thread::{self, JoinHandle};
 
-use super::{Archive, ArchiveError, Result, accounted, layout, segment};
-use crate::catalogue::{Deletion, ItemFile, Removal, Stored};
+use super::{Archive, ArchiveError, Result, accounted, layout, open_search, segment};
+use crate::catalogue::{Catalogue, Deletion, ItemFile, Removal, Stored};
+use crate::search::SearchIndex;
 
 /// What deleting a session for good did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Deleted {
     /// What was deleted: what the confirmation showed.
     pub deletion: Deletion,
-    /// How many of the archive's files of it are still to be removed, as removing them failed
-    /// (another program holds them) or would go through a link. Every start tries again.
+    /// How many of the archive's items' folders are still to be removed, by the archive's
+    /// background removal: the session's, and any another delete left.
+    /// [`Archive::pending_removals`] says how many are left later.
     pub pending: usize,
+}
+
+/// The archive's background removal of deleted items' files.
+#[derive(Debug, Default)]
+pub(super) struct Removals {
+    job: Mutex<Job>,
+    /// The archive is closing: the removal stops before its next item.
+    stop: AtomicBool,
+}
+
+#[derive(Debug, Default)]
+struct Job {
+    running: bool,
+    /// More was deleted while it ran: it goes round again before it ends.
+    again: bool,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Removals {
+    /// Stops the removal before its next item, and waits for it.
+    pub(super) fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.wait();
+    }
+
+    /// Waits for the removal under way, if one is.
+    fn wait(&self) {
+        let handle = self
+            .job
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .handle
+            .take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// What the background removal works with: the archive's, shared.
+struct Remover {
+    dir: PathBuf,
+    catalogue: Catalogue,
+    placing: Arc<RwLock<()>>,
+    search: Arc<Mutex<Option<Arc<SearchIndex>>>>,
+    removals: Arc<Removals>,
 }
 
 impl Archive {
     /**
      * Deletes a session in Trash for good (PLAN §4.5): `shown` is what the confirmation showed
      * the owner, and only that is deleted ([`crate::catalogue::CatalogueError::DeletionChanged`]
-     * otherwise). Its rows go and a tombstone takes their place, in one transaction; then the
-     * files the catalogue had for its items, and any of them set aside in `orphans/`, are
-     * removed, its text leaves the search index, and both databases' logs are emptied. Its
-     * location is not synced, and nothing under `files/` is stored or set aside, while its
-     * files are removed. Nothing at a location is touched: the archive has no way to.
+     * otherwise). Its rows go and a tombstone takes their place, in one transaction; its text
+     * leaves the search index and both databases' logs are emptied; and the files the catalogue
+     * had for its items, and any of them set aside in `orphans/`, are removed in the background
+     * (the module docs). Its location is not being synced when it is committed. Nothing at a
+     * location is touched: the archive has no way to.
      *
-     * Once the delete is committed this returns `Ok`, whatever is left to do: what could not
-     * be removed is counted in [`Deleted::pending`], said in the log, and done at a start.
+     * Once the delete is committed this returns `Ok`, whatever is left to do: what is still to
+     * be removed is counted in [`Deleted::pending`], and what went wrong is said in the log.
      */
     pub fn delete_for_good(&self, shown: &Deletion) -> Result<Deleted> {
         let id = &shown.session;
@@ -52,37 +109,155 @@ impl Archive {
             let _syncing = self
                 .begin_sync(&id.location)
                 .ok_or_else(|| ArchiveError::Syncing(id.location.clone()))?;
-            let _quiet = self.placing.write().unwrap_or_else(PoisonError::into_inner);
             self.catalogue.delete_for_good(shown)?;
-            if let Err(error) = self.remove_deleted() {
-                log::warn!("files of a deleted session are left for the next start: {error}");
-            }
         }
-        /* With no lock held: emptying a log may wait a moment on a read. */
-        match self.search_index() {
-            Ok(search) => {
-                if let Err(error) = search.forget(slice::from_ref(id)) {
-                    log::warn!("the text of a deleted session is left for the next start: {error}");
+        let forgotten = self
+            .search_index()
+            .and_then(|search| search.forget(slice::from_ref(id)));
+        match forgotten {
+            Ok(()) => {
+                if let Err(error) = self.catalogue.text_forgotten(slice::from_ref(id)) {
+                    log::warn!("{error}");
                 }
             }
-            Err(error) => {
-                log::warn!("the text of a deleted session is left for the next start: {error}");
-            }
+            Err(error) => log::warn!("the text of a deleted session is left for later: {error}"),
         }
         self.catalogue.empty_log();
         let pending = self.catalogue.pending_removals().unwrap_or_else(|error| {
             log::warn!("{error}");
             shown.files
         });
+        self.start_removals(false);
         Ok(Deleted {
             deletion: shown.clone(),
             pending,
         })
     }
 
-    /// Removes the files of deleted items that are pending (the module docs).
-    pub(super) fn remove_deleted(&self) -> Result<()> {
+    /// How many deleted items' folders are still to be removed (the module docs).
+    pub fn pending_removals(&self) -> Result<usize> {
+        Ok(self.catalogue.pending_removals()?)
+    }
+
+    /// Waits for the background removal (the module docs) to end, if it is under way.
+    pub fn wait_for_removals(&self) {
+        self.removals.wait();
+    }
+
+    /**
+     * Starts the background removal, or has the one under way go round again. With `backup`,
+     * as a start does, it then takes the day's backup of the catalogue, once nothing is left to
+     * remove.
+     */
+    pub(super) fn start_removals(&self, backup: bool) {
+        let mut job = self
+            .removals
+            .job
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if job.running {
+            job.again = true;
+            return;
+        }
+        if let Some(ended) = job.handle.take() {
+            let _ = ended.join();
+        }
+        let remover = Remover {
+            dir: self.dir.clone(),
+            catalogue: self.catalogue.clone(),
+            placing: Arc::clone(&self.placing),
+            search: Arc::clone(&self.search),
+            removals: Arc::clone(&self.removals),
+        };
+        job.running = true;
+        job.handle = Some(thread::spawn(move || remover.run(backup)));
+    }
+
+    /// The folders of deleted items still to be removed, relative to the archive.
+    pub(super) fn removing(&self) -> Result<HashSet<PathBuf>> {
+        Ok(self
+            .catalogue
+            .removals()?
+            .into_iter()
+            .map(|removal| layout::item_dir(&removal.location, &removal.provider, &removal.folder))
+            .collect())
+    }
+
+    /// The paths under `files/` that `stored` accounts for, and the folders of deleted items
+    /// still to be removed with the folders they are in: none of them is a stray.
+    pub(super) fn accounted(&self, stored: &[Stored]) -> Result<HashSet<PathBuf>> {
+        let mut accounted = accounted(stored);
+        for item in self.removing()? {
+            accounted.extend(
+                item.ancestors()
+                    .take_while(|folder| !folder.as_os_str().is_empty())
+                    .map(Path::to_path_buf),
+            );
+        }
+        Ok(accounted)
+    }
+}
+
+impl Remover {
+    /// Removes what is pending, and what is added while it does; takes the text of sessions
+    /// whose rows went out of the search index; and with `backup`, then the day's backup.
+    fn run(self, mut backup: bool) {
+        loop {
+            if let Err(error) = self.remove_deleted() {
+                log::warn!("files of deleted sessions are left for later: {error}");
+            }
+            if let Err(error) = self.forget_gone_text() {
+                log::warn!("the text of deleted sessions is left for later: {error}");
+            }
+            if backup && !self.removals.stop.load(Ordering::Relaxed) {
+                backup = false;
+                match self.catalogue.pending_removals() {
+                    Ok(0) => {
+                        /* What a write before took out is in no file, nor in the backup. */
+                        self.catalogue.empty_log();
+                        self.catalogue.daily_backup();
+                    }
+                    Ok(_) => log::warn!(
+                        "files of deleted sessions are still to be removed: today's backup \
+                         waits for the next start"
+                    ),
+                    Err(error) => log::warn!("{error}"),
+                }
+            }
+            let mut job = self
+                .removals
+                .job
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !job.again || self.removals.stop.load(Ordering::Relaxed) {
+                job.running = false;
+                return;
+            }
+            job.again = false;
+        }
+    }
+
+    /// Takes the text of the sessions whose rows went (and have not come back) out of the
+    /// search index, when there are any.
+    fn forget_gone_text(&self) -> Result<()> {
+        let gone = self.catalogue.text_gone()?;
+        if gone.is_empty() {
+            return Ok(());
+        }
+        let search = open_search(&self.dir, &self.search, &self.catalogue)?;
+        search.forget(&gone)?;
+        Ok(self.catalogue.text_forgotten(&gone)?)
+    }
+
+    /// Removes the files of deleted items that are pending, one item at a time (the module
+    /// docs).
+    fn remove_deleted(&self) -> Result<()> {
         for removal in self.catalogue.removals()? {
+            if self.removals.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            /* No segment is between its place and its commit meanwhile. */
+            let _quiet = self.placing.write().unwrap_or_else(PoisonError::into_inner);
             let done = if self.catalogue.has_item_in(
                 &removal.location,
                 &removal.provider,
@@ -127,7 +302,7 @@ impl Archive {
         .and_then(|()| remove_set_aside(&self.dir.join(layout::ORPHANS), &relative));
         if let Err(error) = removed {
             log::warn!(
-                "could not remove {}: {error}; a start tries again",
+                "could not remove {}: {error}; it is tried again",
                 item.display()
             );
             return Vec::new();
@@ -184,30 +359,6 @@ impl Archive {
             }
         }
         Ok(done)
-    }
-
-    /// The folders of deleted items still to be removed, relative to the archive.
-    pub(super) fn removing(&self) -> Result<HashSet<PathBuf>> {
-        Ok(self
-            .catalogue
-            .removals()?
-            .into_iter()
-            .map(|removal| layout::item_dir(&removal.location, &removal.provider, &removal.folder))
-            .collect())
-    }
-
-    /// The paths under `files/` that `stored` accounts for, and the folders of deleted items
-    /// still to be removed with the folders they are in: none of them is a stray.
-    pub(super) fn accounted(&self, stored: &[Stored]) -> Result<HashSet<PathBuf>> {
-        let mut accounted = accounted(stored);
-        for item in self.removing()? {
-            accounted.extend(
-                item.ancestors()
-                    .take_while(|folder| !folder.as_os_str().is_empty())
-                    .map(Path::to_path_buf),
-            );
-        }
-        Ok(accounted)
     }
 }
 

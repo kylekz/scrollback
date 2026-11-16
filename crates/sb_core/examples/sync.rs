@@ -253,6 +253,10 @@ fn find(archive: &Archive, input: &str) -> Result<(), Box<dyn Error>> {
         results.total_sessions,
         started.elapsed()
     );
+    let unsearchable = archive.unsearchable()?;
+    if unsearchable > 0 {
+        println!("{unsearchable} sessions are not searchable yet: an index makes them so");
+    }
     for token in unresolved {
         println!(
             "{}:{} names nothing; it is left out",
@@ -341,6 +345,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             "set aside {} files or folders the catalogue doesn't record, in orphans/",
             archive.set_aside_uncatalogued()?.len()
         );
+        archive.wait_for_removals();
+        println!(
+            "{} folders of sessions deleted for good are still to be removed; they are not set \
+             aside",
+            archive.pending_removals()?
+        );
         return Ok(());
     }
     if action == "verify" {
@@ -369,6 +379,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         /* What the catalogue doesn't record is no damage: every archived byte is as it was. */
         for unrecorded in &report.uncatalogued {
             println!("not recorded by the catalogue: {}", unrecorded.display());
+        }
+        for removing in &report.removing {
+            println!(
+                "of a session deleted for good, still to be removed: {}",
+                removing.display()
+            );
         }
         if !(report.damaged.is_empty() && report.unread.is_empty()) {
             return Err(format!(

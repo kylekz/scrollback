@@ -114,10 +114,18 @@ pub(crate) struct SearchIndex {
 }
 
 impl SearchIndex {
-    /// Opens `search.db` in the archive folder `dir`, making it anew when it is missing, or is
-    /// not a file this build can read: the archive has everything it holds.
-    pub(crate) fn open(dir: &Path) -> Result<Self, SearchError> {
+    /**
+     * Opens `search.db` in the archive folder `dir`, making it anew when it is missing, or is
+     * not a file this build can read: the archive has everything it holds. Returns it, and
+     * whether it is new, and so holds no session's text. A file another program holds is
+     * [`SearchError::Unavailable`] after a second at most, and is left as it is.
+     */
+    pub(crate) fn open(dir: &Path) -> Result<(Self, bool), SearchError> {
         let path = dir.join(SEARCH_DATABASE);
+        let mut anew = !path.exists();
+        if !anew {
+            in_use(&path)?;
+        }
         let options = OpenOptions::new(&SCHEMA);
         let db = match Database::open(&path, &options) {
             Err(
@@ -133,22 +141,21 @@ impl SearchIndex {
                     file.push(suffix);
                     let _ = std::fs::remove_file(file);
                 }
+                anew = true;
                 Database::open(&path, &options)?
             }
             opened => opened?,
         };
         /* What a write frees is overwritten, on the one connection that writes. */
         db.write(|tx| Ok::<_, SearchError>(tx.pragma_update(None, "secure_delete", true)?))?;
-        Ok(Self {
-            db,
-            log: Log::new(path),
-            writing: Mutex::default(),
-        })
-    }
-
-    /// Empties the database's write-ahead log ([`Log::empty`]).
-    pub(crate) fn empty_log(&self) {
-        self.log.empty();
+        Ok((
+            Self {
+                db,
+                log: Log::new(path),
+                writing: Mutex::default(),
+            },
+            anew,
+        ))
     }
 
     /// Empties the log, if a read held it the last time it was to be emptied.
@@ -184,13 +191,13 @@ impl SearchIndex {
     /**
      * Replaces the text of each of `texts`' sessions with its own, in one transaction: of each
      * that `still` says, once nothing else writes or forgets, the catalogue still has the row
-     * the text was made of. Returns how many were written.
+     * the text was made of. Returns those written, each session with what its text was made of.
      */
     pub(crate) fn record(
         &self,
         texts: &[Text],
         still: impl Fn(&Text) -> Result<bool, SearchError>,
-    ) -> Result<usize, SearchError> {
+    ) -> Result<Vec<(SessionId, String)>, SearchError> {
         let written = self.write_texts(texts, still);
         self.log.retry();
         written
@@ -200,7 +207,7 @@ impl SearchIndex {
         &self,
         texts: &[Text],
         still: impl Fn(&Text) -> Result<bool, SearchError>,
-    ) -> Result<usize, SearchError> {
+    ) -> Result<Vec<(SessionId, String)>, SearchError> {
         let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
         let mut kept = Vec::new();
         for text in texts {
@@ -209,7 +216,7 @@ impl SearchIndex {
             }
         }
         if kept.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         self.db.write(|tx| {
             let mut doc = tx.prepare(
@@ -263,7 +270,10 @@ impl SearchIndex {
                     index.execute(params![id, kept])?;
                 }
             }
-            Ok(kept.len())
+            Ok(kept
+                .iter()
+                .map(|text| (text.id.clone(), text.made.clone()))
+                .collect())
         })
     }
 
@@ -272,6 +282,13 @@ impl SearchIndex {
     pub(crate) fn forget(&self, sessions: &[SessionId]) -> Result<(), SearchError> {
         if sessions.is_empty() {
             return Ok(());
+        }
+        /* Every session's, as when the index was emptied: all of it at once. */
+        let docs: usize = self.db.read(|c| {
+            Ok::<_, SearchError>(c.query_row("SELECT count(*) FROM doc", [], |row| row.get(0))?)
+        })?;
+        if sessions.len() >= docs {
+            return self.clear();
         }
         {
             let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
@@ -296,7 +313,7 @@ impl SearchIndex {
     }
 
     /// Takes out every session's text.
-    pub(crate) fn clear(&self) -> Result<(), SearchError> {
+    fn clear(&self) -> Result<(), SearchError> {
         {
             let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
             self.db.write(|tx| {
@@ -341,6 +358,40 @@ impl SearchIndex {
             })?;
         }
         Ok(matches)
+    }
+}
+
+/**
+ * Fails when another program holds the database at `path`: it is tried for a second, without
+ * the busy wait of a connection to it that would otherwise go on far longer, and is said to
+ * be in use, which is not damage.
+ */
+fn in_use(path: &Path) -> Result<(), SearchError> {
+    let tried = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .and_then(|connection| {
+            connection.busy_timeout(Duration::from_secs(1))?;
+            connection.query_row("SELECT count(*) FROM sqlite_schema", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        });
+    match tried {
+        Err(rusqlite::Error::SqliteFailure(failure, _))
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy
+                    | rusqlite::ErrorCode::DatabaseLocked
+                    | rusqlite::ErrorCode::CannotOpen
+                    | rusqlite::ErrorCode::PermissionDenied
+                    | rusqlite::ErrorCode::SystemIoFailure
+            ) =>
+        {
+            Err(SearchError::Unavailable(format!(
+                "{} is in use by another program, or can't be read: {failure}",
+                path.display()
+            )))
+        }
+        /* Anything else is for the open to judge: a file that is no database is made anew. */
+        _ => Ok(()),
     }
 }
 

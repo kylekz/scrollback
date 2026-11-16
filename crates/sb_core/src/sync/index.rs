@@ -41,7 +41,7 @@ use crate::archive::{Archive, ArchivedSession};
 use crate::catalogue::{Derived, Held, Indexed, Reading, SessionId, fingerprint};
 use crate::location::LocationId;
 use crate::provider::{ItemKind, Provider};
-use crate::search::Text;
+use crate::search::{SEARCH_DATABASE, Text};
 use crate::transcript::{self, Content, Conversation, Ending, SessionIndex, Subagent, Transcript};
 
 /// What an index did.
@@ -173,7 +173,7 @@ fn run(
     searchable(archive, location, providers, cancel, &mut report)?;
     /* A log a read held when a delete for good was to empty it is emptied now. */
     catalogue.retry_empty_log();
-    if let Ok(search) = archive.search_index() {
+    if let Some(search) = archive.search_index_if_open() {
         search.retry_empty_log();
     }
     Ok(report)
@@ -188,7 +188,8 @@ const TEXTS: usize = 256;
  * The second step of an index (the module docs): makes the text of each session of
  * `providers` at `location` (or at every location) searchable, where it is not of the
  * session's row as it is now, the session that did something last first, some sessions at a
- * time; and takes out the text of each that has no row any more.
+ * time; and takes out the text of each whose row went. With nothing to do it reads only the
+ * catalogue's index of what is to do, and does not open the search index.
  */
 fn searchable(
     archive: &Archive,
@@ -197,47 +198,68 @@ fn searchable(
     cancel: &CancelToken,
     report: &mut IndexReport,
 ) -> Result<(), SyncError> {
+    let catalogue = archive.catalogue();
+    /* A search index that is gone is made again, and holds no session's text. */
+    if !archive.dir().join(SEARCH_DATABASE).exists() {
+        let _ = archive.search_index();
+    }
+    let gone = catalogue.text_gone()?;
+    let mut rows = Vec::new();
+    for provider in providers {
+        rows.extend(
+            catalogue
+                .unsearchable(location, Some(provider.id().as_str()))?
+                .into_iter()
+                .map(|row| (*provider, row)),
+        );
+    }
+    if gone.is_empty() && rows.is_empty() {
+        return Ok(());
+    }
     /* Search that is not available is left to the next index; the library is not. */
     let Ok(search) = archive.search_index() else {
         return Ok(());
     };
-    let mut docs = search.docs()?;
+    if !gone.is_empty() {
+        search.forget(&gone)?;
+        catalogue.text_forgotten(&gone)?;
+    }
+    if rows.is_empty() {
+        return Ok(());
+    }
+    /* Text made of a row as it is now, before its flag said so (the index emptied and built
+    again, or stopped between the two): it stays. */
+    let docs = search.docs()?;
+    let (kept, rows): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .partition(|(_, (id, made))| docs.get(id) == Some(made));
+    catalogue.set_searchable(&kept.into_iter().map(|(_, row)| row).collect::<Vec<_>>())?;
     let mut batch: Vec<Text> = Vec::new();
-    for provider in providers {
-        let rows = archive
-            .catalogue()
-            .made(location, Some(provider.id().as_str()))?;
-        for (id, made) in rows {
-            if docs.remove(&id).as_ref() == Some(&made) {
-                continue;
-            }
-            if cancel.is_cancelled() {
-                return Err(SyncError::Cancelled);
-            }
-            batch.extend(text(archive, *provider, id, made)?);
-            if batch.len() >= TEXTS || batch.iter().map(Text::bytes).sum::<usize>() >= TEXT_BYTES {
-                report.searchable += record(archive, &std::mem::take(&mut batch))?;
-            }
+    for (provider, (id, made)) in rows {
+        if cancel.is_cancelled() {
+            return Err(SyncError::Cancelled);
+        }
+        batch.extend(text(archive, provider, id, made)?);
+        if batch.len() >= TEXTS || batch.iter().map(Text::bytes).sum::<usize>() >= TEXT_BYTES {
+            report.searchable += record(archive, &std::mem::take(&mut batch))?;
         }
     }
     report.searchable += record(archive, &batch)?;
-    let gone: Vec<SessionId> = docs
-        .into_keys()
-        .filter(|id| {
-            location.is_none_or(|location| id.location == *location)
-                && providers
-                    .iter()
-                    .any(|provider| provider.id().as_str() == id.provider)
-        })
-        .collect();
-    Ok(search.forget(&gone)?)
+    Ok(())
 }
 
-/// Writes `texts`, of those sessions whose rows are still what the texts were made of.
+/// Writes `texts`, of those sessions whose rows are still what the texts were made of, and
+/// says so of their rows. Returns how many were written.
 fn record(archive: &Archive, texts: &[Text]) -> Result<usize, SyncError> {
-    Ok(archive.search_index()?.record(texts, |text| {
-        Ok(archive.catalogue().made_of(&text.id)?.as_deref() == Some(&*text.made))
-    })?)
+    if texts.is_empty() {
+        return Ok(0);
+    }
+    let catalogue = archive.catalogue();
+    let written = archive.search_index()?.record(texts, |text| {
+        Ok(catalogue.made_of(&text.id)?.as_deref() == Some(&*text.made))
+    })?;
+    catalogue.set_searchable(&written)?;
+    Ok(written.len())
 }
 
 /**

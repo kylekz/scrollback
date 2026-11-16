@@ -314,7 +314,13 @@ fn deleting_for_good_removes_the_sessions_files_and_rows_and_nothing_else<A: Age
     );
 
     let deleted = bench.archive().delete_for_good(&deletion).unwrap();
-    assert_eq!((deleted.deletion, deleted.pending), (deletion.clone(), 0));
+    /* Its items are removed in the background, and are pending until they are. */
+    assert_eq!(
+        (deleted.deletion, deleted.pending),
+        (deletion.clone(), deletion.files)
+    );
+    bench.archive().wait_for_removals();
+    assert_eq!(bench.archive().pending_removals().unwrap(), 0);
 
     /* Of files/, exactly the deleted items' folders are gone; the folder they shared with
     another session's is not. */
@@ -745,8 +751,8 @@ fn a_removal_that_fails_stays_pending_and_is_no_stray<A: Agent + Default>() {
     fs::remove_dir_all(&item).unwrap();
     fs::write(&item, b"held").unwrap();
 
-    let deleted = bench.delete_for_good(&id).unwrap();
-    assert!(deleted.pending > 0);
+    bench.delete_for_good(&id).unwrap();
+    assert_eq!(bench.archive().pending_removals().unwrap(), 1);
     let report = bench
         .archive()
         .verify(&sb_core::CancelToken::new())
@@ -778,8 +784,8 @@ fn a_removal_that_fails_stays_pending_and_is_no_stray<A: Agent + Default>() {
         let segment = bench.segment_files_of(&keys[0]).remove(0);
         let folder = segment.parent().unwrap().to_path_buf();
         fs::set_permissions(&folder, fs::Permissions::from_mode(0o500)).unwrap();
-        let deleted = bench.delete_for_good(&trashed(&bench, &keys[0])).unwrap();
-        assert!(deleted.pending > 0 && segment.exists());
+        bench.delete_for_good(&trashed(&bench, &keys[0])).unwrap();
+        assert!(bench.archive().pending_removals().unwrap() == 1 && segment.exists());
         assert_eq!(
             bench.archive().set_aside_uncatalogued().unwrap(),
             Vec::<PathBuf>::new()
@@ -795,8 +801,8 @@ fn a_removal_that_fails_stays_pending_and_is_no_stray<A: Agent + Default>() {
         let target = elsewhere.path().join("v0001");
         fs::rename(&folder, &target).unwrap();
         std::os::unix::fs::symlink(&target, &folder).unwrap();
-        let deleted = bench.delete_for_good(&trashed(&bench, &keys[1])).unwrap();
-        assert!(deleted.pending > 0);
+        bench.delete_for_good(&trashed(&bench, &keys[1])).unwrap();
+        assert_eq!(bench.archive().pending_removals().unwrap(), 1);
         assert!(target.join(segment.file_name().unwrap()).is_file());
         let report = bench
             .archive()
@@ -823,8 +829,8 @@ fn a_damaged_segment_of_a_deleted_session_goes_too<A: Agent + Default>() {
     let mut bytes = fs::read(&segment).unwrap();
     *bytes.last_mut().unwrap() ^= 1;
     fs::write(&segment, bytes).unwrap();
-    let deleted = bench.delete_for_good(&trashed(&bench, &key)).unwrap();
-    assert_eq!(deleted.pending, 0);
+    bench.delete_for_good(&trashed(&bench, &key)).unwrap();
+    assert_eq!(bench.archive().pending_removals().unwrap(), 0);
     assert!(!segment.exists() && bench.orphans().is_empty());
     bench.assert_verifies();
     assert_eq!(
@@ -902,6 +908,7 @@ fn a_session_that_changed_since_it_was_shown_is_not_deleted<A: Agent + Default>(
     assert!(bench.archive().catalogue().tombstones().unwrap().is_empty());
     let shown = bench.archive().catalogue().deletion(&id).unwrap();
     assert!(bench.archive().delete_for_good(&shown).is_ok());
+    bench.archive().wait_for_removals();
     assert!(bench.segment_files().is_empty());
 }
 

@@ -282,12 +282,13 @@ const DERIVED: [&str; 26] = [
 
 /// What a row says of the index that made it, after [`DERIVED`]. These are all that an index
 /// that could not parse the session sets of a row that is there.
-const MADE: [&str; 5] = [
+const MADE: [&str; 6] = [
     "failure",
     "retry",
     "parser_version",
     "index_version",
     "indexed_from",
+    "searchable",
 ];
 
 impl Catalogue {
@@ -418,11 +419,12 @@ impl Catalogue {
     }
 
     /**
-     * What the row of each session of `provider` at `location` (or at every location, or of
-     * every provider) was made from: its items' fingerprint, the parser's version and the
-     * index's. A session's search text is of the row it was made with ([`crate::search`]).
+     * The sessions of `provider` (or of every provider) at `location` (or at every location)
+     * whose text in the search index is not of their rows as they are now
+     * (`session.searchable`), the one that did something last first, each with what its row
+     * was made from: its items' fingerprint, the parser's version and the index's.
      */
-    pub(crate) fn made(
+    pub(crate) fn unsearchable(
         &self,
         location: Option<&LocationId>,
         provider: Option<&str>,
@@ -430,7 +432,8 @@ impl Catalogue {
         self.db.read(|c| {
             Ok(c.prepare(&format!(
                 "SELECT s.location_id, s.provider, s.session, {MADE_FROM} FROM session s
-                 WHERE (?1 IS NULL OR s.location_id = ?1) AND (?2 IS NULL OR s.provider = ?2)
+                 WHERE s.searchable = 0
+                   AND (?1 IS NULL OR s.location_id = ?1) AND (?2 IS NULL OR s.provider = ?2)
                  {BY_ACTIVITY}"
             ))?
             .query_map(params![location, provider], |row| {
@@ -442,6 +445,76 @@ impl Catalogue {
                 Ok((id, row.get(3)?))
             })?
             .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// How many sessions' text is not of their rows as they are ([`Catalogue::unsearchable`]).
+    pub(crate) fn count_unsearchable(&self) -> Result<usize> {
+        self.db.read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM session INDEXED BY session_unsearchable
+                 WHERE searchable = 0",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
+    /// Says the text of each of `made` is of its session's row, where that row is still made
+    /// from what is given with it.
+    pub(crate) fn set_searchable(&self, made: &[(SessionId, String)]) -> Result<()> {
+        if made.is_empty() {
+            return Ok(());
+        }
+        self.db.write(|tx| {
+            let mut set = tx.prepare(&format!(
+                "UPDATE session AS s SET searchable = 1
+                 WHERE s.location_id = ?1 AND s.provider = ?2 AND s.session = ?3
+                   AND {MADE_FROM} = ?4"
+            ))?;
+            for (id, made) in made {
+                set.execute(params![id.location, id.provider, id.key, made])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Says no session's text is of its row: the search index is new.
+    pub(crate) fn none_searchable(&self) -> Result<()> {
+        self.db.write(|tx| {
+            tx.execute_batch("UPDATE session SET searchable = 0; DELETE FROM text_gone;")?;
+            Ok(())
+        })
+    }
+
+    /// The sessions whose text is to be taken out of the search index: their rows went, and
+    /// have not come back (a row made again takes its session off the list).
+    pub(crate) fn text_gone(&self) -> Result<Vec<SessionId>> {
+        self.db.read(|c| {
+            Ok(
+                c.prepare("SELECT location_id, provider, session FROM text_gone")?
+                    .query_map([], |row| {
+                        Ok(SessionId {
+                            location: row.get(0)?,
+                            provider: row.get(1)?,
+                            key: row.get(2)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<_>>()?,
+            )
+        })
+    }
+
+    /// The text of `sessions` is out of the search index.
+    pub(crate) fn text_forgotten(&self, sessions: &[SessionId]) -> Result<()> {
+        self.db.write(|tx| {
+            let mut done = tx.prepare(
+                "DELETE FROM text_gone WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+            )?;
+            for id in sessions {
+                done.execute(params![id.location, id.provider, id.key])?;
+            }
+            Ok(())
         })
     }
 
@@ -467,8 +540,13 @@ impl Catalogue {
             let mut forget = tx.prepare(
                 "DELETE FROM session WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
             )?;
+            let mut text = tx.prepare(
+                "INSERT OR IGNORE INTO text_gone (location_id, provider, session)
+                 VALUES (?1, ?2, ?3)",
+            )?;
             for id in sessions {
                 forget.execute(params![id.location, id.provider, id.key])?;
+                text.execute(params![id.location, id.provider, id.key])?;
             }
             Ok(())
         })
@@ -566,8 +644,14 @@ impl Catalogue {
                     retry,
                     parser_version,
                     INDEX_VERSION,
-                    from
+                    from,
+                    false
                 ],
+            )?;
+            /* Its text is to be made again, not taken out. */
+            tx.execute(
+                "DELETE FROM text_gone WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+                params![id.location, id.provider, id.key],
             )?;
             Ok(derived.is_some() && folder::file_by_rule(tx, id, project.as_ref())?)
         })
@@ -708,7 +792,15 @@ impl Catalogue {
     /// Empties the derived tables (PLAN §2.2). The next index fills them again from the
     /// archive; what the owner decided about each session stays.
     pub fn drop_index(&self) -> Result<()> {
-        self.execute("DELETE FROM session", [])
+        self.db.write(|tx| {
+            /* Their text goes from the search index too, unless their rows come back. */
+            tx.execute_batch(
+                "INSERT OR IGNORE INTO text_gone (location_id, provider, session)
+                     SELECT location_id, provider, session FROM session;
+                 DELETE FROM session;",
+            )?;
+            Ok(())
+        })
     }
 
     /**

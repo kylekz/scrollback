@@ -104,6 +104,8 @@ impl<A: Agent> Bench<A> {
     pub fn reopen(&mut self) {
         self.close();
         self.archive = Some(Archive::open(self.dir.path()).unwrap());
+        /* What a start removes in the background is done before a test looks. */
+        self.archive().wait_for_removals();
     }
 
     /// A sync of the fixture's location with the fixture's provider.
@@ -323,7 +325,9 @@ impl<A: Agent> Bench<A> {
     /// that removes.
     pub fn delete_for_good(&self, id: &SessionId) -> Result<Deleted, ArchiveError> {
         let shown = self.archive().catalogue().deletion(id)?;
-        self.archive().delete_for_good(&shown)
+        let deleted = self.archive().delete_for_good(&shown);
+        self.archive().wait_for_removals();
+        deleted
     }
 
     /// Every segment file under the archive's `files/`.

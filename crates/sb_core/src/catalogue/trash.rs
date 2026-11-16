@@ -235,6 +235,11 @@ impl Catalogue {
                     ended
                 ],
             )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO text_gone (location_id, provider, session)
+                 VALUES (?1, ?2, ?3)",
+                identity,
+            )?;
             for forget in [
                 "DELETE FROM session WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
                 "DELETE FROM session_state
@@ -411,10 +416,15 @@ impl Catalogue {
         Ok(removals)
     }
 
-    /// How many files of deleted items are still to be removed.
+    /// How many deleted items' folders are still to be removed.
     pub(crate) fn pending_removals(&self) -> Result<usize> {
-        self.db
-            .read(|c| Ok(c.query_row("SELECT count(*) FROM removal", [], |row| row.get(0))?))
+        self.db.read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM (SELECT DISTINCT location_id, provider, folder FROM removal)",
+                [],
+                |row| row.get(0),
+            )?)
+        })
     }
 
     /// Whether the catalogue records an item in the folder `folder` of `provider` at

@@ -33,7 +33,7 @@ use crate::provider::ProviderId;
 use crate::transcript::{At, SpanKind};
 
 pub use run::{MOST_TERMS, TERM_CHARS};
-pub(crate) use store::{Log, SearchIndex, Text};
+pub(crate) use store::{Log, SEARCH_DATABASE, SearchIndex, Text};
 
 #[derive(Debug, Error)]
 pub enum SearchError {
