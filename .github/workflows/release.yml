@@ -5,12 +5,16 @@
 # the owner to approve the `release` environment before anything is published to GitHub Releases.
 # Only a version tag starts it.
 #
+# macOS: Apple silicon alone (`osx-arm64`, the macos-15 runner's); an Intel Mac isn't built.
+#
 # Signing: Windows' installer and executable carry no certificate's signature (SmartScreen asks
 # once). The macOS app is sealed with an ad-hoc signature, unless the repository variable
 # MACOS_SIGNING is `true`: then the `macos-signed` job, in the `release` environment (so it
 # waits for the owner's approval too, and only it sees the secrets), signs the app and the .pkg
-# with a Developer ID and has Apple notarize them. Its secrets, all of the `release`
-# environment, none of them in the repository:
+# with a Developer ID and has Apple notarize them. It compiles nothing: the app is built in the
+# unprivileged `macos-build` job, so no dependency's build script runs while the keychain is
+# open, and the keychain is deleted when the job ends, however it ends. Its secrets, all of
+# the `release` environment, none of them in the repository:
 #   MACOS_CERTIFICATES_P12             base64 of a .p12 holding the Developer ID Application and
 #                                      Developer ID Installer certificates and their keys
 #   MACOS_CERTIFICATES_PASSWORD        the .p12's password
@@ -31,8 +35,10 @@
 # - the one job that can write (publish) checks out no code and runs nothing from the repository:
 #   it takes the built files, writes their SHA256SUMS, attests their build provenance (Sigstore,
 #   `gh attestation verify`) and creates the release; releases are immutable once published
-# - the only job that reads a secret (macos-signed) runs the tagged commit's own scripts, after
-#   the owner approved it, with a token that can only read
+# - the only job that reads a secret (macos-signed) runs the tagged commit's own scripts and
+#   vpk (pinned by version; NuGet's tool install takes no hash), never cargo, after the owner
+#   approved it, with a token that can only read
+# - vpk 1.2.161 is installed by version from NuGet in each packing job
 
 name: Release
 
@@ -183,11 +189,10 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # The macOS release with an ad-hoc signature (MACOS_SIGNING isn't `true`).
-  macos:
-    name: macOS release
+  # The macOS app, built once for both packing jobs below: unprivileged, no secret.
+  macos-build:
+    name: macOS app (arm64)
     needs: verify
-    if: ${{ vars.MACOS_SIGNING != 'true' }}
     runs-on: macos-15
     timeout-minutes: 120
     permissions:
@@ -200,6 +205,37 @@ jobs:
           persist-credentials: false
       - name: Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
+      - name: script/package --build-only
+        run: |
+          set -euo pipefail
+          bash script/package --version "$VERSION" --feed "https://github.com/$GITHUB_REPOSITORY" \
+            --build-only target/package/app
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-app
+          path: target/package/app/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The macOS release with an ad-hoc signature (MACOS_SIGNING isn't `true`).
+  macos:
+    name: macOS release (arm64)
+    needs: [verify, macos-build]
+    if: ${{ vars.MACOS_SIGNING != 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: macos-app
+          path: target/package/app
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: 8.0.x
@@ -208,14 +244,14 @@ jobs:
       - name: The latest release's full macOS package, for the delta
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash script/release-feed previous osx target/package/out
-      - name: script/package (on macOS, the macOS release)
+        run: bash script/release-feed previous osx-arm64 target/package/out
+      - name: script/package --prebuilt (the macOS release)
         run: |
           set -euo pipefail
-          bash script/package --version "$VERSION" --feed "https://github.com/$GITHUB_REPOSITORY" \
+          bash script/package --version "$VERSION" --prebuilt target/package/app \
             --out target/package/out
-      - name: This release's files (vpk's assets.osx.json and the feed)
-        run: bash script/release-feed files osx target/package/out target/package/upload
+      - name: This release's files (vpk's assets.osx-arm64.json and the feed)
+        run: bash script/release-feed files osx-arm64 target/package/out target/package/upload
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-macos
@@ -225,13 +261,13 @@ jobs:
 
   # The macOS release signed with a Developer ID and notarized (MACOS_SIGNING is `true`): in the
   # `release` environment, whose secrets only this job and publish can read, so it waits for the
-  # owner's approval before it builds.
+  # owner's approval before it runs. It packs the app macos-build built and compiles nothing.
   macos-signed:
-    name: macOS release (signed, after the owner approves)
-    needs: verify
+    name: macOS release (arm64, signed, after the owner approves)
+    needs: [verify, macos-build]
     if: ${{ vars.MACOS_SIGNING == 'true' }}
     runs-on: macos-15
-    timeout-minutes: 120
+    timeout-minutes: 60
     environment:
       name: release
     permissions:
@@ -242,8 +278,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Rust toolchain (rust-toolchain.toml)
-        run: rustup toolchain install && rustc --version
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: macos-app
+          path: target/package/app
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: 8.0.x
@@ -252,8 +290,8 @@ jobs:
       - name: The latest release's full macOS package, for the delta
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash script/release-feed previous osx target/package/out
-      # A keychain of this run's own, removed when the job ends with the runner.
+        run: bash script/release-feed previous osx-arm64 target/package/out
+      # A keychain of this run's own, deleted by the last step however the job ends.
       - name: The signing certificates and the notary's credentials, in a keychain of the run's
         env:
           P12: ${{ secrets.MACOS_CERTIFICATES_P12 }}
@@ -266,7 +304,7 @@ jobs:
           keychain="$RUNNER_TEMP/signing.keychain-db"
           password="$(uuidgen)"
           security create-keychain -p "$password" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
           security unlock-keychain -p "$password" "$keychain"
           printf '%s' "$P12" | base64 --decode > "$RUNNER_TEMP/certificates.p12"
           security import "$RUNNER_TEMP/certificates.p12" -k "$keychain" -P "$P12_PASSWORD" \
@@ -277,7 +315,7 @@ jobs:
           security list-keychains -d user -s "$keychain" login.keychain-db
           xcrun notarytool store-credentials scrollback-notary --apple-id "$APPLE_ID" \
             --team-id "$TEAM_ID" --password "$NOTARY_PASSWORD" --keychain "$keychain"
-      - name: script/package (on macOS, the macOS release, signed and notarized)
+      - name: script/package --prebuilt (the macOS release, signed and notarized)
         env:
           SCROLLBACK_SIGN_APP_IDENTITY: ${{ secrets.MACOS_SIGN_APP_IDENTITY }}
           SCROLLBACK_SIGN_INSTALL_IDENTITY: ${{ secrets.MACOS_SIGN_INSTALL_IDENTITY }}
@@ -285,20 +323,25 @@ jobs:
         run: |
           set -euo pipefail
           export SCROLLBACK_KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
-          bash script/package --version "$VERSION" --feed "https://github.com/$GITHUB_REPOSITORY" \
+          bash script/package --version "$VERSION" --prebuilt target/package/app \
             --out target/package/out
-      - name: This release's files (vpk's assets.osx.json and the feed)
-        run: bash script/release-feed files osx target/package/out target/package/upload
+      - name: This release's files (vpk's assets.osx-arm64.json and the feed)
+        run: bash script/release-feed files osx-arm64 target/package/out target/package/upload
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-macos
           path: target/package/upload/
           if-no-files-found: error
           retention-days: 7
+      - name: The keychain deleted, with what it holds
+        if: ${{ always() }}
+        run: |
+          security list-keychains -d user -s login.keychain-db
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2> /dev/null || true
 
   publish:
     name: Publish (after the owner approves)
-    needs: [verify, main-ci, ci, windows, macos, macos-signed]
+    needs: [verify, main-ci, ci, windows, macos-build, macos, macos-signed]
     # Every build (one of the two macOS jobs), and the gates either on main or here (`ci` is
     # skipped when main's run passed).
     if: >-

@@ -138,6 +138,18 @@ jobs:
         run: |
           export TMP="$RUNNER_TEMP" TEMP="$RUNNER_TEMP"
           bash script/check "$CHECK"
+      # The shipped shape is a windows-subsystem program: its --version must still reach a pipe
+      # (script/package reads it so), never a message box, which would hang here.
+      - name: The shipped shape's --version through a pipe
+        if: ${{ matrix.check == '--fast' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p scrollback --no-default-features
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          said="$(target/debug/scrollback.exe --version)"
+          echo "said: $said"
+          test "$said" = "scrollback $version (development build)"
       - name: The e2e scenarios' screenshots and logs
         if: ${{ failure() && matrix.check == '--e2e-only' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
