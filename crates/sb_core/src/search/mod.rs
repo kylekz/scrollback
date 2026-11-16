@@ -252,52 +252,64 @@ pub fn parse(input: &str) -> Parsed {
 }
 
 /// The first word of `text`, which starts with no white space, and what follows it. White
-/// space inside double quotes is part of the word, and so is a quote escaped there (`\"`); a
-/// backslash escaped there (`\\`) escapes nothing, so a quoted path can end in one.
+/// space inside double quotes is part of the word, read by [`quoted`]'s rules.
 pub fn word(text: &str) -> (&str, &str) {
-    let mut quoted = false;
-    let mut escaped = false;
-    for (at, char) in text.char_indices() {
+    let mut at = 0;
+    while let Some(char) = text[at..].chars().next() {
         match char {
-            '"' if escaped => {}
-            '"' => quoted = !quoted,
-            char if char.is_whitespace() && !quoted => return (&text[..at], &text[at..]),
-            _ => {}
+            '"' => match quoted(&text[at + 1..]).1 {
+                Some(close) => at += 1 + close + 1,
+                None => return (text, ""),
+            },
+            char if char.is_whitespace() => return (&text[..at], &text[at..]),
+            char => at += char.len_utf8(),
         }
-        escaped = quoted && char == '\\' && !escaped;
     }
     (text, "")
 }
 
 /**
- * `text` without the quotes around it, or after the colon of a token: `"a b"` is `a b`, and
- * so is `"a b` that a quote opened and nothing closed. Inside quotes, read as [`word`] reads
- * them in one pass, `\"` is a quote and `\\` a backslash (`"D:\app\\"` is `D:\app\`); any
- * other backslash is itself. What follows the closing quote is taken as it is.
+ * What a quote opened before `inside` holds, and where in `inside` its closing quote is, if
+ * one closes it. Inside quotes `\"` is a quote, and `\\"` a backslash that ends the quotes, so
+ * a quoted path can end in one (`"D:\app\\"` is `D:\app\`); every other backslash is itself,
+ * so a network path keeps its two (`"\\host\share"`).
  */
-fn unquote(text: &str) -> String {
-    let Some(inside) = text.strip_prefix('"') else {
-        return text.to_string();
-    };
+fn quoted(inside: &str) -> (String, Option<usize>) {
     let mut out = String::with_capacity(inside.len());
     let mut chars = inside.char_indices();
     while let Some((at, char)) = chars.next() {
         match char {
-            '"' => {
-                out.push_str(&inside[at + 1..]);
-                break;
+            '"' => return (out, Some(at)),
+            '\\' if inside[at + 1..].starts_with("\\\"") => {
+                out.push('\\');
+                chars.next();
             }
-            '\\' => match chars.clone().next() {
-                Some((_, next @ ('\\' | '"'))) => {
-                    out.push(next);
-                    chars.next();
-                }
-                _ => out.push(char),
-            },
+            '\\' if inside[at + 1..].starts_with('"') => {
+                out.push('"');
+                chars.next();
+            }
             char => out.push(char),
         }
     }
-    out
+    (out, None)
+}
+
+/**
+ * `text` without the quotes around it, or after the colon of a token: `"a b"` is `a b`, and
+ * so is `"a b` that a quote opened and nothing closed, read by [`quoted`]'s rules. What
+ * follows the closing quote is taken as it is.
+ */
+pub fn unquote(text: &str) -> String {
+    let Some(inside) = text.strip_prefix('"') else {
+        return text.to_string();
+    };
+    match quoted(inside) {
+        (mut out, Some(close)) => {
+            out.push_str(&inside[close + 1..]);
+            out
+        }
+        (out, None) => out,
+    }
 }
 
 /// Which calendar a date in a token is read in: the one the app shows dates in.

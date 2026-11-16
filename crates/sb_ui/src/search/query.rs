@@ -286,7 +286,7 @@ pub fn completions(text: &str, known: &Known<'_>) -> Vec<Completion> {
             let Some(key) = KEYS.iter().find(|it| it.as_str().eq_ignore_ascii_case(key)) else {
                 return Vec::new();
             };
-            let typed = typed.trim_matches('"').to_lowercase();
+            let typed = sb_core::search::unquote(typed).to_lowercase();
             known
                 .values(*key)
                 .into_iter()
