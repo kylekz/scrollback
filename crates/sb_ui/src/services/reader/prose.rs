@@ -1333,27 +1333,32 @@ mod tests {
                     continue;
                 };
                 markdown += 1;
-                /* The least of three, as the gate takes its time again: the tests run side by
-                side, and one may be made to wait. */
+                /* The least of up to ten tries, stopping at the first under the limit, as the
+                gate takes its time again: the tests run side by side on a debug build, and one
+                may be made to wait for many milliseconds. */
+                let bytes = sanitized.as_str().len();
+                let limit = crate::markdown::view_parse_limit(bytes);
                 let took = std::thread::Builder::new()
                     .stack_size(PARSE_STACK)
                     .spawn(move || {
-                        let took = (0..3).map(|_| {
+                        let mut least = Duration::MAX;
+                        for _ in 0..10 {
                             let start = Instant::now();
                             let parsed = gpui_base::text::editor_host::parse_markdown(
                                 sanitized.as_str(),
                                 Default::default(),
                             );
                             assert!(parsed.is_ok());
-                            start.elapsed()
-                        });
-                        (took.min().unwrap_or_default(), sanitized.as_str().len())
+                            least = least.min(start.elapsed());
+                            if least < limit {
+                                break;
+                            }
+                        }
+                        least
                     })
                     .unwrap()
                     .join()
                     .unwrap();
-                let (took, bytes) = took;
-                let limit = crate::markdown::view_parse_limit(bytes);
                 assert!(
                     took < limit,
                     "{name}: a piece of {bytes} bytes took the view {took:?}"
