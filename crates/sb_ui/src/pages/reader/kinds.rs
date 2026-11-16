@@ -13,7 +13,7 @@ use gpui::{
     IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
     StyledText, UnderlineStyle, div, prelude::FluentBuilder as _, px,
 };
-use sb_core::transcript::{TodoState, ToolCall, ToolInput};
+use sb_core::transcript::{TodoState, ToolCall, ToolInput, ToolKind};
 
 use super::rows::{CHUNK_LINES, FIRST_DIFF_LINES, FIRST_LINES, FIRST_WRITTEN_LINES};
 use super::{Piece, ReaderView};
@@ -121,6 +121,9 @@ pub fn styled(
     StyledText::new(drawn).with_highlights(highlights)
 }
 
+/// What the header over a tool of no kind scrollback knows says (DESIGN §4.2.4).
+pub const UNKNOWN_TOOL: &str = "Tool scrollback doesn't know yet, shown as sent and received";
+
 /// A call body's own header (DESIGN §4.2.4 `callhd`, 26): what the kind says of the call, and
 /// Copy where it copies something.
 pub fn head(ix: usize, at: &BlockRef, call: &ToolCall, first: bool, theme: &SbTheme) -> AnyElement {
@@ -206,6 +209,14 @@ pub fn head(ix: usize, at: &BlockRef, call: &ToolCall, first: bool, theme: &SbTh
         ToolInput::Mcp { server, .. } => vec![
             mono(call.name.clone(), c.fg2).into_any_element(),
             said(format!("server {}", hostile::label(server))).into_any_element(),
+        ],
+        _ if call.kind == ToolKind::Other => vec![
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(UNKNOWN_TOOL)
+                .into_any_element(),
         ],
         _ => vec![mono(call.name.clone(), c.fg2).into_any_element()],
     };

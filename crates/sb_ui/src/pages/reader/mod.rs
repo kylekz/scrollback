@@ -55,7 +55,7 @@ use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _,
-    IntoElement, ListAlignment, ListState, ParentElement as _, Pixels, Render, SharedString,
+    IntoElement, ListAlignment, ListState, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription,
     UniformListScrollHandle, Window, div, list, prelude::FluentBuilder as _, px,
 };
@@ -164,10 +164,6 @@ pub struct ReaderView {
     held: HashMap<Held, usize>,
     /// The first and last rows drawn in the last frame.
     drawn: Rc<Cell<Option<(usize, usize)>>>,
-    /// How wide the activity rows' labels are: the widest of those drawn last frame, within
-    /// the bounds of DESIGN §4.2.3; and the widest drawn this frame so far.
-    label_width: Pixels,
-    label_width_next: Cell<Pixels>,
     /// The request to open the session at a search match being gone to, until it is there
     /// ([`place`]), and the last one taken.
     placing: Option<ReadAt>,
@@ -197,7 +193,6 @@ pub struct ReaderView {
 impl ReaderView {
     pub fn new(focus_handle: FocusHandle, cx: &mut Context<Self>) -> Self {
         let (reader, library) = (cx.services().reader.clone(), cx.services().library.clone());
-        let label = cx.sb_theme().sizes.activity_name_width;
         let mut this = Self {
             focus_handle,
             list: ListState::new(0, ListAlignment::Top, px(OVERDRAW)),
@@ -213,8 +208,6 @@ impl ReaderView {
             top: 0,
             held: HashMap::new(),
             drawn: Rc::default(),
-            label_width: label,
-            label_width_next: Cell::new(label),
             placing: None,
             read_at: None,
             flash: None,
@@ -1586,13 +1579,6 @@ impl Render for ReaderView {
         self.top = self.list.logical_scroll_top().item_ix;
         self.let_go_of_far(cx);
         self.drawn.set(None);
-        let widest = self
-            .label_width_next
-            .replace(theme.sizes.activity_name_width);
-        self.label_width = widest.clamp(
-            theme.sizes.activity_name_width,
-            theme.sizes.activity_name_max,
-        );
         self.ensure_find(window, cx);
         if let Some((query, flash)) = self.filling.take() {
             self.fill(&query, flash, window, cx);

@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, ClickEvent, Context, HighlightStyle, ImageSource, InteractiveElement as _,
+    AnyElement, App, ClickEvent, Context, HighlightStyle, ImageSource, InteractiveElement as _,
     IntoElement, ObjectFit, ParentElement as _, SharedString, StatefulInteractiveElement as _,
     Styled as _, StyledImage as _, Window, div, img, prelude::FluentBuilder as _, px,
 };
@@ -72,6 +72,9 @@ pub fn render(
         element
     }
 }
+
+/// How an activity row labels a tool of no kind scrollback knows (DESIGN §4.2.3).
+const UNKNOWN: &str = "unknown";
 
 /// A kind's glyph (DESIGN §1.5): told apart by glyph and name, never by colour.
 pub fn kind_icon(kind: ToolKind) -> SbIcon {
@@ -165,9 +168,21 @@ fn short_result(
 }
 
 /**
+ * The label of `call`'s activity row (DESIGN §4.2.3), a call in a session of the provider
+ * `provider`: as the provider labels the tool, or by its own name; `unknown` for a tool of no
+ * kind scrollback knows, whose own name is then the target ([`shape::target`]).
+ */
+pub(super) fn label(call: &ToolCall, provider: &str, cx: &App) -> String {
+    if call.kind == ToolKind::Other {
+        return UNKNOWN.to_string();
+    }
+    hostile::label(&agents::tool_label(provider, &call.name, cx))
+}
+
+/**
  * An activity row (DESIGN §4.2.3): glyph, label, target, status, short result, chevron. The
- * label column is as wide as the widest label drawn, up to a bound past which a label ends in
- * an ellipsis with the tool's name in a tooltip, so that the targets line up.
+ * label column is 44 wide in every row, so that the targets line up; a label may run on into
+ * the gap after it, and one longer still ends in an ellipsis with the tool's name in a tooltip.
  */
 #[allow(clippy::too_many_arguments)]
 fn activity(
@@ -211,7 +226,7 @@ fn activity(
         .read(cx)
         .open_session()
         .and_then(|session| session.project_path.clone());
-    let label = hostile::label(&agents::tool_label(&provider, &call.name, cx));
+    let label = label(&call, &provider, cx);
     /* A search match opened at flashes in the command or path (`super::place`). */
     let aim = hostile::label(&shape::target(&call, root.as_deref()));
     /* So does Find's (`super::find`), whose search read the target as the row draws it. */
@@ -240,10 +255,9 @@ fn activity(
             .into_any_element(),
         None => aim.into_any_element(),
     };
-    let label_width = text_width(&label, &theme.text.activity_name, window);
-    view.label_width_next
-        .set(view.label_width_next.get().max(label_width));
-    let clipped = label_width > view.label_width;
+    /* The label may run on into the gap before the target, as `unknown` does on the boards. */
+    let room = theme.sizes.activity_name_width + theme.spacing.md;
+    let clipped = text_width(&label, &theme.text.activity_name, window) > room;
     let tool = hostile::label(&call.name);
     let height = if row.depth > 0 {
         theme.sizes.activity_row_nested
@@ -269,18 +283,19 @@ fn activity(
         .on_click(on_toggle(ix, row, cx))
         .child(icon(kind_icon(call.kind), theme.sizes.icon_sm, c.fg3))
         .child(
-            div()
-                .id(("label", ix))
-                .flex_none()
-                .w(view.label_width)
-                .overflow_hidden()
-                .text_ellipsis()
-                .text_color(c.fg)
-                .text_spec(&theme.text.activity_name)
-                .when(clipped, |this| {
-                    this.tooltip(move |window, cx| Tooltip::new(tool.clone()).build(window, cx))
-                })
-                .child(label),
+            div().flex_none().w(theme.sizes.activity_name_width).child(
+                div()
+                    .id(("label", ix))
+                    .w(room)
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_color(c.fg)
+                    .text_spec(&theme.text.activity_name)
+                    .when(clipped, |this| {
+                        this.tooltip(move |window, cx| Tooltip::new(tool.clone()).build(window, cx))
+                    })
+                    .child(label),
+            ),
         )
         .child(
             div()

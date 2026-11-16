@@ -80,8 +80,12 @@ fn relative<'a>(path: &'a str, root: Option<&str>) -> &'a str {
 
 /// What the call was about, from its typed input, as its activity row shows it: the command,
 /// the path, the pattern. Paths under the session's project folder `root` are written from
-/// there.
+/// there. A tool of no kind scrollback knows is about itself: its own name, since its row's
+/// label reads `unknown` (DESIGN §4.2.3).
 pub fn target(call: &ToolCall, root: Option<&str>) -> String {
+    if call.kind == ToolKind::Other {
+        return call.name.clone();
+    }
     let path = |path: &str| relative(path, root).to_string();
     match &call.input {
         ToolInput::Shell { command, .. } => command.lines().next().unwrap_or("").to_string(),

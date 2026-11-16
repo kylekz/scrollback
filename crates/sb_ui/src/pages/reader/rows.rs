@@ -773,8 +773,8 @@ impl Rows<'_> {
      * footer; a read's header and the file's lines; an edit's diff; a search's header and what
      * it found; a list of todos; a web search's results; a web fetch's prompt and its result
      * as Markdown; an MCP call's input and output side by side. A kind whose input isn't in
-     * its shape, and a tool no provider knows, show the input as sent and each part of the
-     * output. What failed shows what the tool said; a footer says which versions of the files
+     * its shape, and a tool of no kind scrollback knows, show the input as sent and each part
+     * of the output, the latter under a header that says so. What failed shows what the tool said; a footer says which versions of the files
      * it saved to are read, when they have more than one.
      */
     fn body_parts(&self, at: &BlockRef, body: &CallBody) -> Vec<BodyPart> {
@@ -870,6 +870,9 @@ impl Rows<'_> {
                 );
             }
             _ => {
+                if call.kind == ToolKind::Other {
+                    parts.push(BodyPart::Head);
+                }
                 parts.push(BodyPart::InputHead);
                 self.lines(at, None, body.input.as_ref(), &mut parts);
                 parts.push(BodyPart::OutputHead);

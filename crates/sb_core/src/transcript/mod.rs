@@ -389,6 +389,8 @@ pub enum ToolKind {
     WebSearch,
     WebFetch,
     Mcp,
+    /// A tool its provider doesn't map onto a kind. The call still carries the tool's own
+    /// name; the reader decides how to show it (DESIGN §4.2.3).
     Other,
 }
 

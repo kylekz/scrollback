@@ -438,8 +438,6 @@ pub struct Sizes {
     pub activity_row: Pixels,
     pub activity_row_nested: Pixels,
     pub activity_name_width: Pixels,
-    /// The widest an activity row's label column grows to fit the labels on screen.
-    pub activity_name_max: Pixels,
     pub call_indent: Pixels,
     /// A call body's header and footer.
     pub call_header: Pixels,
@@ -544,7 +542,6 @@ impl Default for Sizes {
             activity_row: px(26.),
             activity_row_nested: px(24.),
             activity_name_width: px(44.),
-            activity_name_max: px(96.),
             call_indent: px(30.),
             call_header: px(26.),
             call_footer: px(24.),

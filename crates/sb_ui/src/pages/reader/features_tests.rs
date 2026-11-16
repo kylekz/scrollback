@@ -136,8 +136,29 @@ fn each_kind_of_tool_draws_its_own_body(cx: &mut TestAppContext) {
         of("mcp__github__search_issues"),
         [BodyPart::Head, BodyPart::Pair { chunk: 0 }]
     );
-    /* A tool no provider knows: as sent and as answered. */
-    assert_eq!(of("PlaylistProbe").first(), Some(&BodyPart::InputHead));
+    /* A tool of no kind scrollback knows: a header that says so, then as sent and answered. */
+    assert_eq!(
+        of("PlaylistProbe")[..2],
+        [BodyPart::Head, BodyPart::InputHead]
+    );
+    /* Its row reads `unknown`, the tool's own name the target; a mapped tool, its label. */
+    cx.update(|_, cx| {
+        let reader = cx.services().reader.read(cx);
+        let open = reader.open_session().unwrap();
+        let main = open.main().unwrap();
+        let shown = |name: &str| {
+            let (_, call) = main.calls().find(|(_, call)| call.name == name).unwrap();
+            (
+                super::calls::label(call, &open.id.provider, cx),
+                crate::services::reader::shape::target(call, None),
+            )
+        };
+        assert_eq!(
+            shown("PlaylistProbe"),
+            ("unknown".to_string(), "PlaylistProbe".to_string())
+        );
+        assert_eq!(shown("Bash").0, "bash");
+    });
     /* The diff is the edit's own, numbered, its words marked. */
     cx.update(|_, cx| {
         let reader = cx.services().reader.read(cx);

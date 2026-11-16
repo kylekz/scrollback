@@ -664,13 +664,12 @@ fn sizes_radii_and_spacing_match_design() {
             sizes.activity_row,
             sizes.activity_row_nested,
             sizes.activity_name_width,
-            sizes.activity_name_max,
             sizes.call_indent,
             sizes.call_header,
             sizes.call_footer,
             sizes.thought_row,
         ],
-        [26., 24., 44., 96., 30., 26., 24., 22.].map(px)
+        [26., 24., 44., 30., 26., 24., 22.].map(px)
     );
     assert_eq!(
         [

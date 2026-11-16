@@ -209,8 +209,8 @@ pub trait Provider: Send + Sync {
     }
 
     /// The short label an activity row gives a call of the tool `name` (DESIGN §4.2.3: `bash`,
-    /// `todos`, `fetch`); `None` for a tool the provider doesn't label, which is shown by its
-    /// own name.
+    /// `todos`, `fetch`); `None` for a tool the provider doesn't label. The call keeps the
+    /// tool's own name either way, and the reader decides how to show one without a label.
     fn tool_label(&self, _name: &str) -> Option<&'static str> {
         None
     }
