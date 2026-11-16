@@ -4,8 +4,12 @@
 //! library, which has no key.
 //!
 //! **It can't drift from the keymap.** A command holds the keymap's own row, and a test checks
-//! that every row of the shell's and the pages' contexts is a command or is listed as moving
-//! the keyboard, which no command does ([`NOT_COMMANDS`]).
+//! that the action of every row of the shell's and the pages' contexts is a command's or is
+//! listed as moving the keyboard, which no command does ([`NOT_COMMANDS`]).
+//!
+//! **A command shows only where it does something:** one of the shell's anywhere, one of a
+//! page's only while a page whose key context binds its action shows ([`Command::available`]),
+//! so Move to Trash is not offered on Trash's page, nor any page's command over the reader.
 
 use gpui::{App, SharedString};
 use sb_core::catalogue::Shelf;
@@ -34,6 +38,23 @@ impl Command {
         match self.run {
             Run::Key(shortcut) => Some(shortcut.label()),
             Run::Show(_) => None,
+        }
+    }
+
+    /**
+     * Whether it does something with the main area in the key context `page` (the shown
+     * page's, [`crate::pages::Showing`]): the shell's commands and the pages do everywhere,
+     * a page's only where that context binds its action too.
+     */
+    pub fn available(&self, page: &str) -> bool {
+        match self.run {
+            Run::Show(_) => true,
+            Run::Key(shortcut) if shortcut.context == keymap::SHELL => true,
+            Run::Key(shortcut) => {
+                let name = (shortcut.action)().name();
+                (keymap::SHORTCUTS.iter())
+                    .any(|row| row.context == page && (row.action)().name() == name)
+            }
         }
     }
 
@@ -129,24 +150,25 @@ pub const COMMANDS: &[Command] = &[
 ];
 
 /**
- * The rows of the shell's and the pages' contexts that are no command: the palette's own key,
+ * The actions of the shell's and the pages' rows that are no command: the palette's own key,
  * `Esc`, and the arrows, which move over what has the keyboard and so mean nothing from the
- * palette. Each is its keys and its context.
+ * palette. Each is its action's name.
  */
-pub const NOT_COMMANDS: &[(&str, &str)] = &[
-    ("secondary-k", keymap::SHELL),
-    ("escape", keymap::SHELL),
-    ("left", keymap::SESSIONS),
-    ("right", keymap::SESSIONS),
-    ("up", keymap::SESSIONS),
-    ("down", keymap::SESSIONS),
+pub const NOT_COMMANDS: &[&str] = &[
+    "shell::Search",
+    "shell::Dismiss",
+    "sessions::Left",
+    "sessions::Right",
+    "sessions::Up",
+    "sessions::Down",
 ];
 
-/// The commands whose names `terms` ask for.
-pub fn matching(terms: &[String]) -> Vec<&'static Command> {
+/// The commands whose names `terms` ask for that do something on the page whose key context
+/// is `page`.
+pub fn matching(terms: &[String], page: &str) -> Vec<&'static Command> {
     COMMANDS
         .iter()
-        .filter(|command| command.matches(terms))
+        .filter(|command| command.matches(terms) && command.available(page))
         .collect()
 }
 
@@ -174,21 +196,30 @@ mod tests {
         text.split_whitespace().map(str::to_string).collect()
     }
 
-    fn names(text: &str) -> Vec<&'static str> {
-        matching(&terms(text)).iter().map(|it| it.name).collect()
+    fn names(text: &str, page: &str) -> Vec<&'static str> {
+        (matching(&terms(text), page).iter())
+            .map(|it| it.name)
+            .collect()
     }
 
     #[test]
     fn every_key_of_the_shell_and_the_pages_is_a_command() {
+        let pages = [
+            keymap::SHELL,
+            keymap::SESSIONS,
+            keymap::UNSORTED,
+            keymap::TRASH_PAGE,
+        ];
         for shortcut in keymap::SHORTCUTS {
-            if ![keymap::SHELL, keymap::SESSIONS].contains(&shortcut.context) {
+            if !pages.contains(&shortcut.context) {
                 continue;
             }
+            let action = (shortcut.action)().name();
             let named = COMMANDS.iter().any(|command| match command.run {
-                Run::Key(it) => (it.keys, it.context) == (shortcut.keys, shortcut.context),
+                Run::Key(it) => (it.action)().name() == action,
                 Run::Show(_) => false,
             });
-            let excused = NOT_COMMANDS.contains(&(shortcut.keys, shortcut.context));
+            let excused = NOT_COMMANDS.contains(&action);
             assert!(
                 named != excused,
                 "{shortcut:?} is {}",
@@ -203,13 +234,29 @@ mod tests {
 
     #[test]
     fn a_command_is_found_by_the_starts_of_its_words() {
-        assert_eq!(names("sync"), ["Sync all locations"]);
+        let page = keymap::SESSIONS;
+        assert_eq!(names("sync", page), ["Sync all locations"]);
         assert_eq!(
-            names("trash"),
+            names("trash", page),
             ["Show Trash", "Move the selected sessions to Trash"]
         );
-        assert_eq!(names("NEW fol"), ["New folder"]);
-        assert_eq!(names("rash"), Vec::<&str>::new());
-        assert_eq!(names(""), Vec::<&str>::new());
+        assert_eq!(names("NEW fol", page), ["New folder"]);
+        assert_eq!(names("rash", page), Vec::<&str>::new());
+        assert_eq!(names("", page), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_pages_command_shows_only_where_it_does_something() {
+        assert_eq!(names("trash", keymap::TRASH_PAGE), ["Show Trash"]);
+        assert_eq!(
+            names("selected", keymap::TRASH_PAGE),
+            ["Open the selected session"]
+        );
+        assert_eq!(
+            names("star", keymap::UNSORTED),
+            ["Show Starred", "Star or unstar the selected sessions"]
+        );
+        assert_eq!(names("star", "Main"), ["Show Starred"], "over the reader");
+        assert_eq!(names("sync", "Main"), ["Sync all locations"]);
     }
 }

@@ -5,42 +5,48 @@
 //! opened from as the first (a folder page's "Folder: fc"), a `key:value` token turned into one
 //! once a space follows it, and those chosen from the offered menus (Location, Agent, Model,
 //! Branch, Date). While a word is being typed its completions show where the menus were, and
-//! `Tab` takes the first. `Backspace` in an empty query takes the last chip away. The query is
-//! parsed by [`query`] and run by [`crate::services::SearchService`], off the UI thread, each
-//! keystroke's search superseding the one before.
+//! `Tab` takes the first. `Backspace` in an empty query takes the last chip away. A finished
+//! token that names nothing holds the results until it is mended ([`query`]). The query is
+//! run by [`crate::services::SearchService`], off the UI thread, each keystroke's search
+//! superseding the one before.
 //!
 //! **Results** are grouped by session, the best first, each with up to four of its matches and
 //! "+n more in this session"; a match's hits are marked (`hl`). When the query names a command
-//! ([`crate::commands`]) a Commands group heads them, each with its key. With no query the
-//! palette lists the sessions opened last and the searches a result was opened from.
+//! that does something on the page shown ([`crate::commands`]) a Commands group heads them,
+//! each with its key. With no query the palette lists the sessions opened last and the
+//! searches a result was opened from.
 //!
 //! **Keys** are its query field's, which it takes over: `↑` and `↓` move over the rows,
 //! wrapping; `Enter` opens the highlighted session at its match (or at its first match, on a
 //! session's row), runs a command or searches a recent search again; `Ctrl Enter` shows the
 //! session's folder page instead; `Esc` closes it, as do `Ctrl K` and a press on the scrim. No
-//! key of the shell or a page acts behind it.
+//! key of the shell or a page acts behind it. A new answer puts the keys back on its first row.
 //!
-//! **Opening at a match** hands the reader a [`ReadAt`]: the session, the turn and block (for
-//! a subagent's text, the call that started it), the text for Find and the hit to flash.
+//! **Opening at a match** asks the reader for a [`ReadAt`] made of what the answer was asked
+//! with, not of what has been typed since.
 
 pub mod query;
 #[cfg(test)]
 mod tests;
 
+use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, Role,
-    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, StyledText,
-    Subscription, TextRun, UnderlineStyle, Window, div, font, prelude::FluentBuilder as _, px,
+    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
+    Render, Role, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
+    StyledText, Subscription, TextRun, UnderlineStyle, Window, div, font, point,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::FocusTrapElement as _;
 use gpui_component::input::{
     Backspace, Escape, IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp,
 };
-use sb_core::catalogue::{Filed, Session, Shelf};
-use sb_core::search::{Filter, Found, Match, MatchKind, Results, Token, parse};
+use sb_core::catalogue::{Filed, Folder, Session, Shelf};
+use sb_core::provider::ProviderId;
+use sb_core::search::{Filter, Found, Key, Match, MatchKind, Query, Results, Token};
 use sb_core::transcript::At;
 
 use crate::actions::library::{Back, NewFolder, SyncAll};
@@ -58,12 +64,14 @@ use crate::icons::SbIcon;
 use crate::keymap;
 use crate::menu::{self, Entry, Item};
 use crate::overlay;
+use crate::pages::Showing;
 use crate::services::library::title_of;
+use crate::services::view::{DateRange, RECENT_DAYS};
 use crate::services::{
-    ActiveServices as _, Answer, LibraryService, ReadAt, SearchService, SyncService,
+    ActiveServices as _, Answer, Answered, LibraryService, ReadAt, SearchService, SyncService,
 };
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
-use query::{Chip, Completion, Known};
+use query::{Asked, Chip, Completion, Known};
 
 /// The panel's measures (DESIGN §1.4, §4.9).
 const WIDTH: Pixels = px(840.);
@@ -77,17 +85,10 @@ const BAR_HEIGHT: Pixels = px(2.);
 const CHIP_MENU_WIDTH: Pixels = px(240.);
 /// How many values a chip's menu offers.
 const MENU_VALUES: usize = 30;
-/// The Date menu's spans, in days.
-const RECENT_DAYS: [(u32, &str); 4] = [
-    (7, "Last 7 days"),
-    (30, "Last 30 days"),
-    (90, "Last 90 days"),
-    (365, "Last 12 months"),
-];
 
 /// What the footer says (DESIGN §4.9).
-const FOOTER: &str = "Searches titles, prompts, replies, and tool calls' commands and paths. Tool output isn't \
-     searched.";
+const FOOTER: &str = "Searches titles, prompts, replies, and tool calls' commands and paths. \
+                      Tool output isn't searched.";
 const PLACEHOLDER: &str = "Search titles, prompts, replies and commands";
 const KEEP_TYPING: &str = "Keep typing: a letter or two of English is in nearly every session.";
 
@@ -113,13 +114,114 @@ pub enum Row {
     RecentSearch(usize),
 }
 
+/// A filter the palette offers as a menu while it isn't applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Offer {
+    Location,
+    Agent,
+    Model,
+    Branch,
+    Date,
+}
+
+impl Offer {
+    const ALL: [Self; 5] = [
+        Self::Location,
+        Self::Agent,
+        Self::Model,
+        Self::Branch,
+        Self::Date,
+    ];
+
+    /// Its name for automation (`palette/offer/<name>`) and its menu's items.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Location => "location",
+            Self::Agent => "agent",
+            Self::Model => "model",
+            Self::Branch => "branch",
+            Self::Date => "date",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Location => "Location",
+            Self::Agent => "Agent",
+            Self::Model => "Model",
+            Self::Branch => "Branch",
+            Self::Date => "Date",
+        }
+    }
+
+    fn glyph(self) -> Option<SbIcon> {
+        match self {
+            Self::Branch => Some(SbIcon::GitBranch),
+            Self::Date => Some(SbIcon::Calendar),
+            Self::Location | Self::Agent | Self::Model => None,
+        }
+    }
+
+    /// Whether `filter` is of the kind it sets.
+    fn sets(self, filter: &Filter) -> bool {
+        matches!(
+            (self, filter),
+            (Self::Location, Filter::Location(_))
+                | (Self::Agent, Filter::Agent(_))
+                | (Self::Model, Filter::Model(_))
+                | (Self::Branch, Filter::Branch(_))
+                | (Self::Date, Filter::After(_) | Filter::Before(_))
+        )
+    }
+}
+
+/// What the palette shows now: worked out once from its query, chips and answer, for a frame
+/// or a key.
+struct View {
+    text: String,
+    asked: Asked,
+    completions: Vec<Completion>,
+    commands: Vec<&'static Command>,
+    answer: Option<Arc<Answered>>,
+    rows: Vec<Row>,
+}
+
+impl View {
+    /// The results of the answer, while they are the query's: a token that names nothing
+    /// holds them, and without terms there are none.
+    fn results(&self) -> Option<&Results> {
+        match self.answer.as_deref() {
+            Some(Answered {
+                answer: Answer::Found(results),
+                ..
+            }) if self.searches() => Some(results),
+            _ => None,
+        }
+    }
+
+    /// Whether the query asks for a search: it has terms and no token that names nothing.
+    fn searches(&self) -> bool {
+        !self.asked.query.terms.is_empty() && self.asked.unresolved.is_none()
+    }
+
+    /// Whether the palette lists what was opened last: nothing is typed to search.
+    fn lists_recent(&self) -> bool {
+        self.asked.query.terms.is_empty() && self.asked.unresolved.is_none()
+    }
+}
+
 pub struct Palette {
     input: Entity<InputState>,
     chips: Vec<Chip>,
-    /// The row the keys are on, among [`Self::rows`].
+    /// The row the keys are on, among [`View::rows`].
     highlight: usize,
     /// Each row's place among the results' children as last drawn, to scroll it into view.
     drawn_rows: Vec<usize>,
+    /// The answer last shown, to tell a new one when it lands.
+    shown_answer: Option<Arc<Answered>>,
+    /// The folders as the rows last named them: a change in the library redraws the palette
+    /// only when they changed.
+    folders: Vec<Folder>,
     scroll: ScrollHandle,
     focus: FocusHandle,
     library: Entity<LibraryService>,
@@ -150,7 +252,7 @@ impl Palette {
         input.update(cx, |input, cx| input.focus(window, cx));
         search.update(cx, |search, cx| {
             search.refresh(cx);
-            search.search(Default::default(), cx);
+            search.search(Query::default(), String::new(), String::new(), cx);
         });
         let mut this = Self {
             _subscriptions: [
@@ -161,16 +263,33 @@ impl Palette {
                     }
                     _ => {}
                 }),
-                cx.observe(&search, |this, _, cx| {
-                    this.highlight = this.highlight.min(this.rows(cx).len().saturating_sub(1));
+                cx.observe(&search, |this, search, cx| {
+                    let answer = search.read(cx).answer().cloned();
+                    let new = match (&answer, &this.shown_answer) {
+                        (Some(now), Some(before)) => !Arc::ptr_eq(now, before),
+                        (now, before) => now.is_some() != before.is_some(),
+                    };
+                    if new {
+                        this.highlight = 0;
+                        this.scroll.set_offset(point(px(0.), px(0.)));
+                        this.shown_answer = answer;
+                    }
                     cx.notify();
                 }),
-                cx.observe(&library, |_, _, cx| cx.notify()),
+                cx.observe(&library, |this, library, cx| {
+                    let folders = library.read(cx).folders();
+                    if this.folders != folders {
+                        this.folders = folders.to_vec();
+                        cx.notify();
+                    }
+                }),
             ],
+            folders: library.read(cx).folders().to_vec(),
             input,
             chips: Vec::new(),
             highlight: 0,
             drawn_rows: Vec::new(),
+            shown_answer: None,
             scroll: ScrollHandle::new(),
             focus: cx.focus_handle(),
             library,
@@ -188,7 +307,7 @@ impl Palette {
         let token = match shelf {
             Shelf::All => return None,
             Shelf::Folder(folder) => Token {
-                key: sb_core::search::Key::Folder,
+                key: Key::Folder,
                 value: self.library.read(cx).folder(folder)?.name.clone(),
             },
             Shelf::Starred => page_token("starred"),
@@ -221,9 +340,11 @@ impl Palette {
     fn known<T>(&self, cx: &App, with: impl FnOnce(&Known<'_>) -> T) -> T {
         let library = self.library.read(cx);
         let sync = self.sync.read(cx);
-        let agents: Vec<_> = (cx.services().providers.iter())
+        let providers = &cx.services().providers;
+        let agents: Vec<(ProviderId, String)> = (providers.iter())
             .map(|provider| (provider.id(), provider.display().name.to_string()))
             .collect();
+        let agent_ids: Vec<ProviderId> = agents.iter().map(|(id, _)| *id).collect();
         let (models, branches) = self.search.read(cx).values();
         let dates = format::month_of(format::now()).map_or_else(Vec::new, |(year, month)| {
             vec![
@@ -237,11 +358,79 @@ impl Palette {
             folders: library.folders(),
             locations: sync.locations().unwrap_or_default(),
             agents: &agents,
+            agent_ids: &agent_ids,
             models: &models,
-            model_name: &|model| agents::any_model(model, cx),
+            model_name: &|model| agents::any_model(model, None, cx),
             branches: &branches,
             dates: &dates,
         })
+    }
+
+    /// What the palette shows now (the docs of [`View`]).
+    fn view(&self, cx: &App) -> View {
+        let text = self.text(cx);
+        let (asked, completions) = self.known(cx, |known| {
+            (
+                query::asked(&self.chips, &text, known),
+                query::completions(&text, known),
+            )
+        });
+        let page = Showing::now(cx).key_context();
+        let commands = commands::matching(&asked.query.terms, page);
+        let search = self.search.read(cx);
+        let mut view = View {
+            text,
+            asked,
+            completions,
+            commands,
+            answer: search.answer().cloned(),
+            rows: Vec::new(),
+        };
+        view.rows = if view.lists_recent() {
+            (0..search.recent_sessions().count())
+                .map(Row::RecentSession)
+                .chain((0..search.recent_searches().count()).map(Row::RecentSearch))
+                .collect()
+        } else if view.asked.unresolved.is_some() {
+            Vec::new()
+        } else {
+            let found = view.results().into_iter().flat_map(|results| {
+                results.sessions.iter().enumerate().flat_map(|(at, found)| {
+                    std::iter::once(Row::Session(at))
+                        .chain((0..found.shown.len()).map(move |shown| Row::Match(at, shown)))
+                })
+            });
+            (0..view.commands.len())
+                .map(Row::Command)
+                .chain(found)
+                .collect()
+        };
+        view
+    }
+
+    /// The rows the keys move over, top to bottom.
+    pub fn rows(&self, cx: &App) -> Vec<Row> {
+        self.view(cx).rows
+    }
+
+    /// The names of the commands the query names, as the Commands group lists them.
+    pub fn command_names(&self, cx: &App) -> Vec<&'static str> {
+        (self.view(cx).commands.iter())
+            .map(|command| command.name)
+            .collect()
+    }
+
+    /// What the completions of the word being typed read as, the one `Tab` takes first.
+    pub fn completion_labels(&self, cx: &App) -> Vec<String> {
+        (self.view(cx).completions.iter())
+            .map(Completion::label)
+            .collect()
+    }
+
+    /// The token that names nothing, which holds the results, as typed.
+    pub fn unresolved(&self, cx: &App) -> Option<String> {
+        (self.view(cx).asked.unresolved)
+            .map(|token| format!("{}:{}", token.key.as_str(), token.value))
     }
 
     /// The query field changed: its finished tokens become chips, and the query is searched.
@@ -258,13 +447,25 @@ impl Palette {
         self.run(cx);
     }
 
-    /// Searches for what the chips and the query field say now.
+    /**
+     * Searches for what the chips and the query field say now. A query a token holds (it
+     * names nothing) searches nothing; nor does one whose terms are as before, as when only a
+     * token is being typed.
+     */
     fn run(&mut self, cx: &mut Context<Self>) {
-        let text = self.text(cx);
-        let (query, _) = self.known(cx, |known| query::query(&self.chips, &text, known));
+        let view = self.view(cx);
+        let View { text, asked, .. } = view;
+        let query = match asked.unresolved {
+            Some(_) => Query::default(),
+            None => asked.query,
+        };
+        let answered = self.search.read(cx).answer().map(|it| &it.query);
+        if answered == Some(&query) && self.search.read(cx).is_settled() {
+            return;
+        }
         self.highlight = 0;
         self.search
-            .update(cx, |search, cx| search.search(query, cx));
+            .update(cx, |search, cx| search.search(query, text, asked.find, cx));
         cx.notify();
     }
 
@@ -300,16 +501,8 @@ impl Palette {
         self.changed(window, cx);
     }
 
-    /// What `Tab` takes: the first completion of the word being typed.
-    fn completions(&self, cx: &App) -> Vec<Completion> {
-        let text = self.text(cx);
-        self.known(cx, |known| query::completions(&text, known))
-    }
-
-    fn complete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(completion) = self.completions(cx).into_iter().next() else {
-            return;
-        };
+    /// Takes `completion` for the word being typed.
+    fn take(&mut self, completion: Completion, window: &mut Window, cx: &mut Context<Self>) {
         let text = query::complete(&self.text(cx), &completion);
         self.input
             .update(cx, |input, cx| input.set_value(text, window, cx));
@@ -317,56 +510,6 @@ impl Palette {
             Completion::Chip(chip) => self.add_chip(chip, cx),
             Completion::Key(_) => self.run(cx),
         }
-    }
-
-    /// The commands the query names.
-    fn commands(&self, cx: &App) -> Vec<&'static Command> {
-        commands::matching(&parse(&self.text(cx)).terms)
-    }
-
-    /// The names of the commands the query names, as the Commands group lists them.
-    pub fn command_names(&self, cx: &App) -> Vec<&'static str> {
-        self.commands(cx)
-            .iter()
-            .map(|command| command.name)
-            .collect()
-    }
-
-    /// What the completions of the word being typed read as, the one `Tab` takes first.
-    pub fn completion_labels(&self, cx: &App) -> Vec<String> {
-        self.completions(cx).iter().map(Completion::label).collect()
-    }
-
-    /// The results of the last search, while its answer is some.
-    fn results<'a>(&self, cx: &'a App) -> Option<&'a Results> {
-        match self.search.read(cx).answer() {
-            Some((_, Answer::Found(results), _)) => Some(results),
-            _ => None,
-        }
-    }
-
-    /// Whether the query has terms: without, the palette lists what was opened last.
-    fn has_terms(&self, cx: &App) -> bool {
-        !parse(&self.text(cx)).terms.is_empty()
-    }
-
-    /// The rows the keys move over, top to bottom.
-    pub fn rows(&self, cx: &App) -> Vec<Row> {
-        if !self.has_terms(cx) {
-            let search = self.search.read(cx);
-            return (0..search.recent_sessions().count())
-                .map(Row::RecentSession)
-                .chain((0..search.recent_searches().count()).map(Row::RecentSearch))
-                .collect();
-        }
-        let commands = (0..self.commands(cx).len()).map(Row::Command);
-        let found = self.results(cx).into_iter().flat_map(|results| {
-            results.sessions.iter().enumerate().flat_map(|(at, found)| {
-                std::iter::once(Row::Session(at))
-                    .chain((0..found.shown.len()).map(move |shown| Row::Match(at, shown)))
-            })
-        });
-        commands.chain(found).collect()
     }
 
     /// Moves the keys' row by `by`, wrapping.
@@ -383,8 +526,8 @@ impl Palette {
     }
 
     /**
-     * Does what the row at `at` is for (module docs); `folder_page`, with `Ctrl Enter`, shows
-     * a session's folder page instead of opening it.
+     * Does what the row at `at` is for (module docs), as the answer shown was asked;
+     * `folder_page`, with `Ctrl Enter`, shows a session's folder page instead of opening it.
      */
     fn activate(
         &mut self,
@@ -393,14 +536,14 @@ impl Palette {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(row) = self.rows(cx).get(at).copied() else {
+        let view = self.view(cx);
+        let Some(row) = view.rows.get(at).copied() else {
             return;
         };
-        let text = self.text(cx);
-        let find = query::free_text(&text);
+        let found = |at: usize| Some((view.answer.as_deref()?, view.results()?.sessions.get(at)?));
         let opening: Option<(Session, Option<ReadAt>)> = match row {
             Row::Command(at) => {
-                if let Some(command) = self.commands(cx).get(at) {
+                if let Some(command) = view.commands.get(at) {
                     cx.emit(PaletteEvent::Run(command.run));
                 }
                 return;
@@ -414,25 +557,23 @@ impl Palette {
             }
             Row::RecentSession(at) => (self.search.read(cx).recent_sessions().nth(at))
                 .map(|session| (session.clone(), None)),
-            Row::Session(at) => self.results(cx).and_then(|results| {
-                let found = results.sessions.get(at)?;
-                Some((
+            Row::Session(at) | Row::Match(at, _) => found(at).map(|(answered, found)| {
+                let shown = match row {
+                    Row::Match(_, shown) => found.shown.get(shown),
+                    _ => found.shown.first(),
+                };
+                let id = found.session.id.clone();
+                (
                     found.session.clone(),
-                    found.shown.first().map(|it| ReadAt::of(it, &find)),
-                ))
-            }),
-            Row::Match(at, shown) => self.results(cx).and_then(|results| {
-                let found = results.sessions.get(at)?;
-                Some((
-                    found.session.clone(),
-                    found.shown.get(shown).map(|it| ReadAt::of(it, &find)),
-                ))
+                    shown.map(|it| ReadAt::of(id, it, &answered.find)),
+                )
             }),
         };
         let Some((session, at)) = opening else {
             return;
         };
-        if matches!(row, Row::Session(_) | Row::Match(..)) {
+        if let (Row::Session(_) | Row::Match(..), Some(answered)) = (row, &view.answer) {
+            let text = answered.text.clone();
             self.search
                 .update(cx, |search, cx| search.remember(&text, cx));
         }
@@ -446,99 +587,92 @@ impl Palette {
         cx.emit(PaletteEvent::Close { to_main: true });
     }
 
-    /// The menu a chip offers, of the values of a filter that isn't applied.
+    /// Opens the menu of `offer`'s values, under its chip.
     fn offer(
         &self,
-        name: &'static str,
-        values: Vec<(String, Chip)>,
-        at: Rc<std::cell::Cell<gpui::Bounds<Pixels>>>,
+        offer: Offer,
+        at: &Cell<Bounds<Pixels>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let palette = cx.entity().downgrade();
-        let entries: Vec<Entry> = values
+        let entries: Vec<Entry> = self
+            .menu_values(offer, cx)
             .into_iter()
             .enumerate()
             .map(|(index, (label, chip))| {
                 let palette = palette.clone();
-                Entry::Item(
-                    Item::new(format!("{name}-{index}"), label).on(move |_, cx| {
+                Entry::Item(Item::new(format!("{}-{index}", offer.name()), label).on(
+                    move |_, cx| {
                         palette
                             .update(cx, |palette, cx| palette.add_chip(chip.clone(), cx))
                             .ok();
-                    }),
-                )
+                    },
+                ))
             })
             .collect();
         if !entries.is_empty() {
-            menu::open(entries, below(&at), CHIP_MENU_WIDTH, window, cx);
+            menu::open(entries, below(at), CHIP_MENU_WIDTH, window, cx);
         }
     }
 
-    /// What each offered menu lists: its values as they read, with the chip each makes.
-    fn menu_values(&self, name: &'static str, cx: &App) -> Vec<(String, Chip)> {
-        let now = format::now();
-        match name {
-            "location" => (self.sync.read(cx).locations().unwrap_or_default().iter())
+    /// What `offer`'s menu lists: its values as they read, with the chip each makes.
+    fn menu_values(&self, offer: Offer, cx: &App) -> Vec<(String, Chip)> {
+        let chip = |filter, what: &str, label: &str| {
+            (
+                label.to_string(),
+                Chip {
+                    filter,
+                    label: format!("{what}: {label}"),
+                },
+            )
+        };
+        match offer {
+            Offer::Location => (self.sync.read(cx).locations().unwrap_or_default().iter())
                 .map(|location| {
-                    (
-                        location.name.clone(),
-                        Chip {
-                            filter: Filter::Location(location.id.clone()),
-                            label: format!("Location: {}", location.name),
-                        },
+                    chip(
+                        Filter::Location(location.id.clone()),
+                        "Location",
+                        &location.name,
                     )
                 })
                 .collect(),
-            "agent" => (cx.services().providers.iter())
+            Offer::Agent => (cx.services().providers.iter())
                 .map(|provider| {
-                    let name = provider.display().name.to_string();
-                    (
-                        name.clone(),
-                        Chip {
-                            filter: Filter::Agent(provider.id()),
-                            label: format!("Agent: {name}"),
-                        },
+                    chip(
+                        Filter::Agent(provider.id()),
+                        "Agent",
+                        provider.display().name,
                     )
                 })
                 .collect(),
-            "model" => (self.search.read(cx).values().0.iter())
+            Offer::Model => (self.search.read(cx).values().0.iter())
                 .take(MENU_VALUES)
                 .map(|model| {
-                    let named = agents::any_model(model, cx);
-                    (
-                        named.clone(),
-                        Chip {
-                            filter: Filter::Model(model.clone()),
-                            label: format!("Model: {named}"),
-                        },
+                    chip(
+                        Filter::Model(model.clone()),
+                        "Model",
+                        &agents::any_model(model, None, cx),
                     )
                 })
                 .collect(),
-            "branch" => (self.search.read(cx).values().1.iter())
+            Offer::Branch => (self.search.read(cx).values().1.iter())
                 .take(MENU_VALUES)
-                .map(|branch| {
-                    (
-                        branch.clone(),
-                        Chip {
-                            filter: Filter::Branch(branch.clone()),
-                            label: format!("Branch: {branch}"),
-                        },
-                    )
-                })
+                .map(|branch| chip(Filter::Branch(branch.clone()), "Branch", branch))
                 .collect(),
-            _ => RECENT_DAYS
-                .iter()
-                .map(|(days, label)| {
-                    (
-                        label.to_string(),
-                        Chip {
-                            filter: Filter::After(now - i64::from(*days) * 24 * 60 * 60 * 1000),
-                            label: format!("Date: {label}"),
-                        },
-                    )
-                })
-                .collect(),
+            Offer::Date => {
+                let now = format::now();
+                RECENT_DAYS
+                    .iter()
+                    .map(|days| {
+                        chip(
+                            Filter::After(now - i64::from(*days) * 24 * 60 * 60 * 1000),
+                            "Date",
+                            &DateRange::Within(*days).label(),
+                        )
+                    })
+                    .collect()
+            }
         }
     }
 }
@@ -546,19 +680,24 @@ impl Palette {
 /// The token of a page of the library.
 fn page_token(name: &str) -> Token {
     Token {
-        key: sb_core::search::Key::In,
+        key: Key::In,
         value: name.to_string(),
+    }
+}
+
+/// "1 match", "11 matches".
+fn matches(n: usize) -> String {
+    match n {
+        1 => "1 match".to_string(),
+        n => format!("{} matches", format::count(n as u64)),
     }
 }
 
 /// "11 matches in 4 sessions".
 fn counted(results: &Results) -> String {
-    let matches = match results.total_matches {
-        1 => "1 match".to_string(),
-        n => format!("{} matches", format::count(n as u64)),
-    };
     format!(
-        "{matches} in {}",
+        "{} in {}",
+        matches(results.total_matches),
         format::plural(results.total_sessions, "session")
     )
 }
@@ -610,7 +749,7 @@ fn marked(found: &Match, theme: &SbTheme) -> StyledText {
 fn kind_of(found: &Match, provider: &str, theme: &SbTheme, cx: &App) -> (AnyElement, &'static str) {
     let c = &theme.colors;
     let glyph = |glyph| icon(glyph, theme.sizes.icon_xs, c.fg3).into_any_element();
-    if found.subagent {
+    if found.subagent.is_some() {
         return (glyph(SbIcon::Bot), "subagent");
     }
     match found.kind {
@@ -624,55 +763,31 @@ fn kind_of(found: &Match, provider: &str, theme: &SbTheme, cx: &App) -> (AnyElem
 
 impl Palette {
     /// The query row, the chips and the count (`E-Search`'s head).
-    fn head(&self, theme: &SbTheme, cx: &mut Context<Self>) -> AnyElement {
+    fn head(&self, view: &View, theme: &SbTheme, cx: &mut Context<Self>) -> AnyElement {
         let c = &theme.colors;
-        let completions = self.completions(cx);
-        let text = self.text(cx);
-        let unresolved: Vec<Token> =
-            self.known(cx, |known| query::query(&self.chips, &text, known).1);
-        let applied = |kind: fn(&Filter) -> bool| self.chips.iter().any(|chip| kind(&chip.filter));
-        let agents = cx.services().providers.len();
-        let locations = self.sync.read(cx).locations().map_or(0, <[_]>::len);
-        let offered: Vec<(&'static str, &'static str, Option<SbIcon>)> = [
-            (
-                "location",
-                "Location",
-                None,
-                locations > 1 && !applied(|it| matches!(it, Filter::Location(_))),
+        let several = |count: usize| count > 1;
+        let offered: Vec<Offer> = Offer::ALL
+            .into_iter()
+            .filter(|offer| !self.chips.iter().any(|chip| offer.sets(&chip.filter)))
+            .filter(|offer| match offer {
+                Offer::Location => several(self.sync.read(cx).locations().map_or(0, <[_]>::len)),
+                Offer::Agent => several(cx.services().providers.len()),
+                Offer::Model | Offer::Branch | Offer::Date => true,
+            })
+            .collect();
+        let said = match (&view.asked.unresolved, view.results()) {
+            (Some(token), _) => Some(
+                div()
+                    .text_color(c.yellow)
+                    .child(format!(
+                        "“{}:{}” names nothing",
+                        token.key.as_str(),
+                        token.value
+                    ))
+                    .into_any_element(),
             ),
-            (
-                "agent",
-                "Agent",
-                None,
-                agents > 1 && !applied(|it| matches!(it, Filter::Agent(_))),
-            ),
-            (
-                "model",
-                "Model",
-                None,
-                !applied(|it| matches!(it, Filter::Model(_))),
-            ),
-            (
-                "branch",
-                "Branch",
-                Some(SbIcon::GitBranch),
-                !applied(|it| matches!(it, Filter::Branch(_))),
-            ),
-            (
-                "date",
-                "Date",
-                Some(SbIcon::Calendar),
-                !applied(|it| matches!(it, Filter::After(_) | Filter::Before(_))),
-            ),
-        ]
-        .into_iter()
-        .filter(|(.., offered)| *offered)
-        .map(|(name, label, glyph, _)| (name, label, glyph))
-        .collect();
-        let count = match self.search.read(cx).answer() {
-            _ if !self.has_terms(cx) => None,
-            Some((_, Answer::Found(results), _)) => Some(counted(results)),
-            _ => None,
+            (None, Some(results)) => Some(div().child(counted(results)).into_any_element()),
+            (None, None) => None,
         };
         div()
             .flex_none()
@@ -720,44 +835,38 @@ impl Palette {
                             .into_any_element()
                     }))
                     .map(|this| {
-                        if completions.is_empty() {
-                            this.children(offered.into_iter().map(|(name, label, glyph)| {
-                                let at = Rc::new(std::cell::Cell::new(gpui::Bounds::default()));
+                        if view.completions.is_empty() {
+                            this.children(offered.into_iter().map(|offer| {
+                                let at = Rc::new(Cell::new(Bounds::default()));
                                 chip_base(
-                                    SharedString::from(format!("palette-offer-{name}")),
+                                    SharedString::from(format!("palette-offer-{}", offer.name())),
                                     false,
                                     theme,
                                 )
                                 .child(bounds_of(at.clone()))
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    let values = this.menu_values(name, cx);
-                                    this.offer(name, values, at.clone(), window, cx);
+                                    this.offer(offer, &at, window, cx);
                                 }))
                                 .children(
-                                    glyph.map(|glyph| icon(glyph, theme.sizes.icon_xs, c.fg2)),
+                                    (offer.glyph())
+                                        .map(|glyph| icon(glyph, theme.sizes.icon_xs, c.fg2)),
                                 )
-                                .child(label)
+                                .child(offer.label())
                                 .child(icon(SbIcon::ChevronDown, theme.sizes.icon_xs, c.fg2))
-                                .automation_target(format!("palette/offer/{name}"))
+                                .automation_target(format!("palette/offer/{}", offer.name()))
                                 .into_any_element()
                             }))
                         } else {
                             this.child(kbd(keymap::label("tab"), theme)).children(
-                                completions.iter().enumerate().map(|(at, completion)| {
+                                view.completions.iter().enumerate().map(|(at, completion)| {
                                     let label = completion.label();
                                     let completion = completion.clone();
                                     chip_base(("palette-completion", at), false, theme)
                                         .when(at == 0, |this| this.border_color(c.accent))
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            let text = query::complete(&this.text(cx), &completion);
-                                            this.input.update(cx, |input, cx| {
-                                                input.set_value(text, window, cx);
-                                                input.focus(window, cx);
-                                            });
-                                            match completion.clone() {
-                                                Completion::Chip(chip) => this.add_chip(chip, cx),
-                                                Completion::Key(_) => this.run(cx),
-                                            }
+                                            this.take(completion.clone(), window, cx);
+                                            this.input
+                                                .update(cx, |input, cx| input.focus(window, cx));
                                         }))
                                         .child(label)
                                         .automation_target_with(move || {
@@ -776,17 +885,7 @@ impl Palette {
                             .text_color(c.fg3)
                             .text_spec(&theme.text.secondary)
                             .whitespace_nowrap()
-                            .children(unresolved.first().map(|token| {
-                                div()
-                                    .text_color(c.yellow)
-                                    .child(format!(
-                                        "“{}:{}” names nothing",
-                                        token.key.as_str(),
-                                        token.value
-                                    ))
-                                    .into_any_element()
-                            }))
-                            .children(count.filter(|_| unresolved.is_empty()))
+                            .children(said)
                             .automation_target("palette/count"),
                     ),
             )
@@ -817,7 +916,7 @@ impl Palette {
         &self,
         (id, row): (SharedString, usize),
         session: &Session,
-        matches: Option<usize>,
+        found: Option<usize>,
         theme: &SbTheme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -880,16 +979,13 @@ impl Palette {
                             .unwrap_or_default(),
                     ),
             )
-            .children(matches.map(|matches| {
+            .children(found.map(|found| {
                 div()
                     .flex_none()
                     .ml_auto()
                     .text_color(c.fg3)
                     .text_spec(&theme.text.count)
-                    .child(match matches {
-                        1 => "1 match".to_string(),
-                        n => format!("{} matches", format::count(n as u64)),
-                    })
+                    .child(matches(found))
             }))
             .automation_target_with(move || format!("palette/row/{row}").into())
     }
@@ -930,12 +1026,11 @@ impl Palette {
         &self,
         row: usize,
         found: &Found,
-        at: usize,
+        shown: &Match,
         theme: &SbTheme,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    ) -> AnyElement {
         let c = &theme.colors;
-        let shown = found.shown.get(at)?;
         let (glyph, kind) = kind_of(shown, &found.session.id.provider, theme, cx);
         let turn = match shown.at {
             Some(At::Block { turn, .. }) => format!("turn {}", turn + 1),
@@ -943,55 +1038,54 @@ impl Palette {
             None => String::new(),
         };
         let mono = matches!(shown.kind, MatchKind::Command | MatchKind::Path);
-        Some(
-            self.row_base(
-                SharedString::from(format!("palette-match-{row}")),
-                row,
-                theme,
-                cx,
-            )
-            .flex()
-            .items_start()
-            .gap(theme.spacing.md)
-            .py(px(5.))
-            .pl(MATCH_INDENT)
-            .pr(px(10.))
-            .text_size(px(12.5))
-            .line_height(px(19.))
-            .child(
-                div()
-                    .flex_none()
-                    .w(KIND_WIDTH)
-                    .flex()
-                    .items_center()
-                    .gap(theme.spacing.xs)
-                    .pt(px(1.))
-                    .text_color(c.fg3)
-                    .child(glyph)
-                    .child(div().text_spec(&theme.text.small).child(kind)),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .when(mono, |this| this.text_size(px(12.)))
-                    .child(marked(shown, theme)),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(c.fg3)
-                    .text_spec(&theme.text.count)
-                    .child(turn),
-            )
-            .automation_target_with(move || format!("palette/row/{row}").into()),
+        self.row_base(
+            SharedString::from(format!("palette-match-{row}")),
+            row,
+            theme,
+            cx,
         )
+        .flex()
+        .items_start()
+        .gap(theme.spacing.md)
+        .py(px(5.))
+        .pl(MATCH_INDENT)
+        .pr(px(10.))
+        .text_size(px(12.5))
+        .line_height(px(19.))
+        .child(
+            div()
+                .flex_none()
+                .w(KIND_WIDTH)
+                .flex()
+                .items_center()
+                .gap(theme.spacing.xs)
+                .pt(px(1.))
+                .text_color(c.fg3)
+                .child(glyph)
+                .child(div().text_spec(&theme.text.small).child(kind)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .when(mono, |this| this.text_size(px(12.)))
+                .child(marked(shown, theme)),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_color(c.fg3)
+                .text_spec(&theme.text.count)
+                .child(turn),
+        )
+        .automation_target_with(move || format!("palette/row/{row}").into())
+        .into_any_element()
     }
 
     /// What shows under the head: the rows, or what the answer says when there are none.
-    fn body(&mut self, theme: &SbTheme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn body(&mut self, view: &View, theme: &SbTheme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let c = &theme.colors;
         let mut children: Vec<AnyElement> = Vec::new();
         let mut drawn_rows = Vec::new();
@@ -1005,6 +1099,7 @@ impl Palette {
                         "Still indexing {}; results may be missing",
                         format::plural(unsearchable, "session")
                     ))
+                    .debug_selector(|| "palette-indexing".into())
                     .automation_target("palette/indexing")
                     .into_any_element(),
             );
@@ -1017,9 +1112,8 @@ impl Palette {
                 .child(overline(label, theme))
                 .into_any_element()
         };
-        let rows = self.rows(cx);
         let mut row = 0;
-        if !self.has_terms(cx) {
+        if view.lists_recent() {
             let search = self.search.read(cx);
             let sessions: Vec<Session> = search.recent_sessions().cloned().collect();
             let searches: Vec<String> = search.recent_searches().cloned().collect();
@@ -1060,7 +1154,7 @@ impl Palette {
                     row += 1;
                 }
             }
-            if rows.is_empty() {
+            if view.rows.is_empty() {
                 children.push(said(
                     "Type to search every session's titles, prompts, replies and tool calls.",
                     theme,
@@ -1069,10 +1163,13 @@ impl Palette {
             self.drawn_rows = drawn_rows;
             return children;
         }
-        let commands = self.commands(cx);
-        if !commands.is_empty() {
+        if view.asked.unresolved.is_some() {
+            self.drawn_rows = drawn_rows;
+            return children;
+        }
+        if !view.commands.is_empty() {
             children.push(group("Commands"));
-            for command in commands {
+            for command in &view.commands {
                 drawn_rows.push(children.len());
                 children.push(
                     self.row_base(
@@ -1093,12 +1190,7 @@ impl Palette {
                 row += 1;
             }
         }
-        let answer = self
-            .search
-            .read(cx)
-            .answer()
-            .map(|(_, answer, _)| answer.clone());
-        match answer {
+        match view.answer.as_deref().map(|it| &it.answer) {
             Some(Answer::Found(results)) => {
                 for found in &results.sessions {
                     let mut section = Vec::new();
@@ -1111,23 +1203,21 @@ impl Palette {
                         cx,
                     ));
                     row += 1;
-                    for at in 0..found.shown.len() {
+                    for shown in &found.shown {
                         drawn_rows.push(children.len());
-                        section.extend(self.match_row(row, found, at, theme, cx));
+                        section.push(self.match_row(row, found, shown, theme, cx));
                         row += 1;
                     }
                     if found.matches > found.shown.len() {
                         section.push(
-                            div()
-                                .pl(MATCH_INDENT + px(10.))
-                                .py(px(3.))
-                                .text_color(c.fg3)
-                                .text_spec(&theme.text.small)
-                                .child(format!(
+                            more(
+                                format!(
                                     "+{} more in this session",
                                     format::count((found.matches - found.shown.len()) as u64)
-                                ))
-                                .into_any_element(),
+                                ),
+                                theme,
+                            )
+                            .into_any_element(),
                         );
                     }
                     children.push(
@@ -1137,6 +1227,21 @@ impl Palette {
                             .py(theme.spacing.xs)
                             .children(section)
                             .into_any_element(),
+                    );
+                }
+                if results.total_sessions > results.sessions.len() {
+                    children.push(
+                        more(
+                            format!(
+                                "+{} more sessions: add a term or a filter to find them",
+                                format::count(
+                                    (results.total_sessions - results.sessions.len()) as u64
+                                )
+                            ),
+                            theme,
+                        )
+                        .automation_target("palette/more-sessions")
+                        .into_any_element(),
                     );
                 }
                 if results.sessions.is_empty() {
@@ -1178,6 +1283,7 @@ impl Palette {
             })
             .children(scoped.map(|at| {
                 button("palette-everywhere", ButtonKind::Plain, true, true, theme)
+                    .debug_selector(|| "palette-everywhere".into())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.clicked(window, cx, |this, cx| this.remove_chip(at, cx));
                     }))
@@ -1196,8 +1302,19 @@ fn said(text: impl Into<SharedString>, theme: &SbTheme) -> AnyElement {
         .px(px(10.))
         .text_color(theme.colors.fg2)
         .child(text.into())
+        .debug_selector(|| "palette-said".into())
         .automation_target("palette/said")
         .into_any_element()
+}
+
+/// A line under results that says how many more there are.
+fn more(text: String, theme: &SbTheme) -> gpui::Div {
+    div()
+        .pl(MATCH_INDENT + px(10.))
+        .py(px(3.))
+        .text_color(theme.colors.fg3)
+        .text_spec(&theme.text.small)
+        .child(text)
 }
 
 impl Render for Palette {
@@ -1206,8 +1323,9 @@ impl Render for Palette {
         let c = &theme.colors;
         let searching = self.search.read(cx).is_searching();
         let room = overlay::room(window.viewport_size(), &theme);
-        let head = self.head(&theme, cx);
-        let body = self.body(&theme, cx);
+        let view = self.view(cx);
+        let head = self.head(&view, &theme, cx);
+        let body = self.body(&view, &theme, cx);
         let keys = |caps: &[&str], what: &'static str| {
             div()
                 .flex()
@@ -1224,20 +1342,32 @@ impl Render for Palette {
             .track_focus(&self.focus)
             .w(WIDTH.min(room.width))
             .max_h(MAX_HEIGHT.min(room.height))
-            .capture_action(cx.listener(|this, _: &MoveUp, _, cx| this.step(-1, cx)))
-            .capture_action(cx.listener(|this, _: &MoveDown, _, cx| this.step(1, cx)))
+            /* Its query field's keys, taken before the field has them: a listener in this
+            phase goes on to the field unless it stops the action. */
+            .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
+                cx.stop_propagation();
+                this.step(-1, cx);
+            }))
+            .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
+                cx.stop_propagation();
+                this.step(1, cx);
+            }))
             .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
-                this.complete(window, cx);
+                // `Tab` completes, and never takes the keyboard out of the field.
+                cx.stop_propagation();
+                if let Some(completion) = this.view(cx).completions.into_iter().next() {
+                    this.take(completion, window, cx);
+                }
             }))
             .capture_action(cx.listener(|this, _: &Backspace, _, cx| {
                 if this.text(cx).is_empty() && !this.chips.is_empty() {
+                    cx.stop_propagation();
                     let last = this.chips.len() - 1;
                     this.remove_chip(last, cx);
-                } else {
-                    cx.propagate();
                 }
             }))
             .capture_action(cx.listener(|_, _: &Escape, _, cx| {
+                cx.stop_propagation();
                 cx.emit(PaletteEvent::Close { to_main: false });
             }))
             // The shell's keys don't act behind the palette.

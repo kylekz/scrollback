@@ -5976,6 +5976,7 @@ dependencies = [
  "pretty_assertions",
  "sb_core",
  "sb_test_support",
+ "serde_json",
  "tempfile",
 ]
 

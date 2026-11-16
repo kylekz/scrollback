@@ -277,7 +277,11 @@ fn find(archive: &Archive, input: &str) -> Result<(), Box<dyn Error>> {
             println!(
                 "  {:?}{} at {:?}: {}",
                 found.kind,
-                if found.subagent { " in a subagent" } else { "" },
+                if found.subagent.is_some() {
+                    " in a subagent"
+                } else {
+                    ""
+                },
                 found.at,
                 text.replace('\n', " ")
             );

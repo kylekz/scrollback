@@ -45,7 +45,7 @@ pub use library::{
     can_attach, group_key, group_path,
 };
 pub use read_at::ReadAt;
-pub use search::{Answer, SearchService};
+pub use search::{Answer, Answered, SearchService};
 #[cfg(any(test, feature = "automation"))]
 pub use sync::Held;
 pub use sync::{LocationStatus, PassProgress, Reach, SyncEvent, SyncService};

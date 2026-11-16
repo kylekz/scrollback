@@ -17,6 +17,7 @@ use crate::format;
 use crate::icons::SbIcon;
 use crate::keymap;
 use crate::services::archive::Failure;
+use crate::services::library::title_of;
 use crate::services::{ActiveServices as _, SyncService};
 use crate::theme::{SbTheme, StyledText as _};
 
@@ -166,11 +167,7 @@ pub fn session(
     cx: &Context<MainArea>,
 ) -> AnyElement {
     let c = &theme.colors;
-    let title: SharedString = session
-        .title
-        .clone()
-        .unwrap_or_else(|| "Untitled session".to_string())
-        .into();
+    let title: SharedString = title_of(session).into();
     let agent = agents::name(&session.id.provider, cx);
     let model = agents::model(&session.id.provider, &session.models, cx);
     let when = session

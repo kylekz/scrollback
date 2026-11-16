@@ -54,11 +54,12 @@
 //!   (`for_good`: `null`, or its `title`, and once read what it removes, `files`, `versions`,
 //!   `bytes` and whether its location still has it, `at_location`, with why the last
 //!   confirmation was `refused`); and where the open session was opened at (`read_at`: `null`,
-//!   or the match's `kind`, its `turn` from 0, whether it is a `subagent`'s, the `find` text and
-//!   the hit to `flash`).
+//!   or its `request` number, the match's `kind`, its `turn` from 0, the `subagent` item it is
+//!   in, the `find` text and the hit to `flash`), until the reader takes it.
 //! - `palette`: the search palette while it is open (`null` otherwise): its query's `text`, the
 //!   labels of its `chips`, its `completions`, how many `rows` the keys move over and the one
-//!   `highlighted`, the `commands` it lists, whether it is `searching`, how many sessions are
+//!   `highlighted`, the `commands` it lists, the finished token that names nothing and so
+//!   holds the results (`unresolved`), whether it is `searching`, how many sessions are
 //!   `unsearchable` yet, and the `answer` to the last search: `null` with no terms, `"keep-typing"`,
 //!   `{"unavailable": why}`, or the `sessions` found (their titles, the best first),
 //!   `total_sessions`, `total_matches`, the query's `terms` and how long it `took_ms`.
@@ -421,7 +422,8 @@ fn library(cx: &App) -> Value {
                 Some(At::Block { turn, .. }) => Some(turn),
                 _ => None,
             },
-            "subagent": at.subagent,
+            "request": at.request,
+            "subagent": at.subagent.as_ref().map(|it| &it.item),
             "find": at.find,
             "flash": at.flash,
         })),
@@ -438,7 +440,7 @@ fn library(cx: &App) -> Value {
 /// `state.palette`: the search palette, while it is open.
 fn palette(palette: &Palette, cx: &App) -> Value {
     let search = cx.services().search.read(cx);
-    let answer = search.answer().map(|(query, answer, took)| match answer {
+    let answer = search.answer().map(|answered| match &answered.answer {
         Searched::KeepTyping => json!("keep-typing"),
         Searched::Unavailable(why) => json!({ "unavailable": why }),
         Searched::Found(results) => json!({
@@ -449,8 +451,8 @@ fn palette(palette: &Palette, cx: &App) -> Value {
                 .collect::<Vec<_>>(),
             "total_sessions": results.total_sessions,
             "total_matches": results.total_matches,
-            "terms": query.terms,
-            "took_ms": took.as_millis() as u64,
+            "terms": answered.query.terms,
+            "took_ms": answered.took.as_millis() as u64,
         }),
     });
     json!({
@@ -460,6 +462,7 @@ fn palette(palette: &Palette, cx: &App) -> Value {
         "rows": palette.rows(cx).len(),
         "highlighted": palette.highlight(),
         "commands": palette.command_names(cx),
+        "unresolved": palette.unresolved(cx),
         "searching": search.is_searching(),
         "unsearchable": search.unsearchable(),
         "answer": answer,

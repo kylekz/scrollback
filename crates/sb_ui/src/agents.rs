@@ -52,11 +52,17 @@ pub fn model(id: &str, models: &[String], cx: &App) -> Option<String> {
     Some(provider(id, cx).map_or_else(|| model.clone(), |provider| provider.model_name(model)))
 }
 
-/// A model of whichever agent's it is, as that agent's provider writes it: for a model seen
-/// apart from its sessions (the palette's Model menu). Written as it is when no provider
-/// writes it otherwise.
-pub fn any_model(model: &str, cx: &App) -> String {
-    (cx.services().providers.iter())
+/**
+ * A model of whichever agent's it is, as that agent's provider writes it: for a model seen
+ * apart from its sessions (the palette's Model menu). The provider `first`, when given, is
+ * asked first, then the others in the order the app has them, and the first that writes it
+ * otherwise than it is wins; with none, it is written as it is.
+ */
+pub fn any_model(model: &str, first: Option<&str>, cx: &App) -> String {
+    let providers = &cx.services().providers;
+    let first = first.and_then(|id| provider(id, cx));
+    (first.into_iter())
+        .chain(providers.iter().map(Box::as_ref))
         .map(|provider| provider.model_name(model))
         .find(|named| named != model)
         .unwrap_or_else(|| model.to_string())

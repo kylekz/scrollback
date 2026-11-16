@@ -30,7 +30,7 @@ use toolbox_store::rusqlite;
 use crate::catalogue::{CatalogueError, Folder, Session, Shelf};
 use crate::location::{Location, LocationId};
 use crate::provider::ProviderId;
-use crate::transcript::{At, SpanKind};
+use crate::transcript::{At, InSubagent, SpanKind};
 
 pub use run::{MOST_TERMS, TERM_CHARS};
 pub(crate) use store::{Log, SEARCH_DATABASE, SearchIndex, Text};
@@ -427,8 +427,8 @@ pub struct Found {
 pub struct Match {
     pub kind: MatchKind,
     /// The text is a subagent's: opening the match opens the session at the call that started
-    /// it, expanded (DESIGN §4.9).
-    pub subagent: bool,
+    /// it, expanded (DESIGN §4.9), at this place in the subagent's own conversation.
+    pub subagent: Option<InSubagent>,
     /// Where the match opens the session; `None` for its title, which opens it at its start.
     pub at: Option<At>,
     /// Only the start of the span's text is searched: it is longer than search indexes.

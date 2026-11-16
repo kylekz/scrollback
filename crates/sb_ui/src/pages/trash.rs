@@ -393,6 +393,8 @@ impl TrashView {
                             .on_click(cx.listener({
                                 let id = id.clone();
                                 move |this, _, _, cx| {
+                                    // The button's alone: the row neither selects nor opens.
+                                    cx.stop_propagation();
                                     this.library.update(cx, |library, cx| {
                                         let ids = library.acted_on(&id);
                                         library.restore(ids, cx);
@@ -411,6 +413,8 @@ impl TrashView {
                             .on_click(cx.listener({
                                 let session = session.clone();
                                 move |this, _, _, cx| {
+                                    // The button's alone: the row neither selects nor opens.
+                                    cx.stop_propagation();
                                     let session = session.clone();
                                     this.library.update(cx, |library, cx| {
                                         library.ask_delete_for_good(session, cx);

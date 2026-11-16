@@ -104,7 +104,7 @@ impl Showing {
     }
 
     /// The key context of the main area while this shows.
-    fn key_context(self) -> &'static str {
+    pub fn key_context(self) -> &'static str {
         match self {
             Self::Sessions => keymap::SESSIONS,
             Self::Unsorted => keymap::UNSORTED,

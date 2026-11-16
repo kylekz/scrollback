@@ -17,7 +17,7 @@ use gpui_component::v_virtual_list;
 use sb_core::catalogue::{Filed, Session, Shelf};
 use sb_core::filing::FolderId;
 
-use super::{LIFTED_OPACITY, SessionsView, UNTITLED, month_name, subfolder_of};
+use super::{LIFTED_OPACITY, SessionsView, month_name, subfolder_of};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{focus_ring, icon, location_tag, overline};
@@ -25,6 +25,7 @@ use crate::drag;
 use crate::format;
 use crate::icons::SbIcon;
 use crate::services::Month;
+use crate::services::library::title_of;
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
 /// The columns' widths (DESIGN §4.5). The date has room for a year and the hand glyph.
@@ -394,12 +395,7 @@ impl SessionsView {
                             .overflow_hidden()
                             .text_ellipsis()
                             .text_spec(&theme.text.row_title)
-                            .child(
-                                session
-                                    .title
-                                    .clone()
-                                    .unwrap_or_else(|| UNTITLED.to_string()),
-                            ),
+                            .child(title_of(session)),
                     )
                     .child(
                         div()
@@ -516,7 +512,7 @@ impl SessionsView {
                     .text_spec(&theme.text.number)
                     .child(format::count(u64::from(session.all.calls))),
             );
-        let title = (session.title.clone()).unwrap_or_else(|| UNTITLED.to_string());
+        let title = title_of(session);
         self.draggable(row, (session.id.clone(), index), (title, None), cx)
             .automation_target_with(move || format!("list/row/{place}").into())
     }

@@ -64,9 +64,22 @@ pub struct Span {
     pub at: At,
     pub kind: SpanKind,
     /// The text is a subagent's, which opens the session at the call that started it (or, for
-    /// one no call is known to have started, at [`At::Unattached`]).
-    pub subagent: bool,
+    /// one no call is known to have started, at [`At::Unattached`]): where in the subagent's
+    /// own conversation it is.
+    pub subagent: Option<InSubagent>,
     pub text: String,
+}
+
+/**
+ * Where in a subagent's conversation a piece of text is: the item that conversation is, and
+ * the turn and block in it. For a subagent started inside another, the innermost one's; the
+ * outermost call is the span's [`At`].
+ */
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InSubagent {
+    pub item: String,
+    pub turn: usize,
+    pub block: BlockId,
 }
 
 /// Where a match opens the session.
@@ -177,7 +190,11 @@ fn collect(conversation: &Conversation, within: Option<At>, index: &mut SessionI
                     index.spans.push(Span {
                         at,
                         kind,
-                        subagent: within.is_some(),
+                        subagent: within.map(|_| InSubagent {
+                            item: conversation.item.to_string(),
+                            turn,
+                            block: *block,
+                        }),
                         text: text.to_string(),
                     });
                 }

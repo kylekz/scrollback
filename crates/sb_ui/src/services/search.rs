@@ -4,10 +4,14 @@
 //! **One search at a time.** Each query asked for supersedes the one before: that one is
 //! cancelled ([`sb_core::archive::Archive::search`] checks between its steps), and whatever it
 //! found is dropped when it comes back, so the answer shown is always the last query's. While
-//! a search runs, the answer to the one before stays shown under the palette's bar.
+//! a search runs, the answer to the one before stays shown under the palette's bar. The answer
+//! keeps what was typed for it, so what a row of it opens is what was asked, whatever has been
+//! typed since.
 //!
 //! **What shows before anything is typed:** the sessions the owner opened last and the
-//! searches they opened a result of, the latest first, for as long as the app runs.
+//! searches they opened a result of, the latest first, for as long as the app runs. A session
+//! deleted for good leaves the list at once; each time the palette opens, the others are read
+//! again, so they show as they are now and those moved to Trash leave it.
 //!
 //! **Completions** for `model:` and `branch:` are read when the palette opens, with how many
 //! sessions are not searchable yet (the palette's "Still indexing" banner).
@@ -22,6 +26,7 @@ use sb_core::archive::Archive;
 use sb_core::catalogue::{Session, SessionId};
 use sb_core::search::{Limit, Query, Results, SearchError, Searched};
 
+use super::library::LibraryEvent;
 use super::{ArchiveService, LibraryService};
 
 /// How many recent sessions and searches are kept.
@@ -37,22 +42,36 @@ pub enum Answer {
     Unavailable(String),
 }
 
+/// An answer, and what it answers.
+#[derive(Debug)]
+pub struct Answered {
+    pub query: Query,
+    /// What was typed for it, as the recent searches keep it.
+    pub text: String,
+    /// Its terms as Find in session is filled with them.
+    pub find: String,
+    pub answer: Answer,
+    /// How long the search took.
+    pub took: Duration,
+}
+
 pub struct SearchService {
     archive: Entity<ArchiveService>,
     /// Counts the queries asked for: a search's answer is taken only while its number is the
     /// last one.
     asked: u64,
+    /// Counts the reads of what the palette shows before anything is typed, likewise.
+    refreshed: u64,
     /// The search running, while one is.
     cancel: Option<CancelToken>,
-    /// The last answer, the query it answers, and how long it took.
-    answer: Option<(Query, Answer, Duration)>,
+    answer: Option<Arc<Answered>>,
     /// How many sessions' text is not searchable yet, as last read.
     unsearchable: usize,
     /// The models and the branches the archive's sessions have, the commonest first.
     values: (Arc<[String]>, Arc<[String]>),
     recent_sessions: VecDeque<Session>,
     recent_searches: VecDeque<String>,
-    _observers: [Subscription; 1],
+    _observers: [Subscription; 2],
 }
 
 impl SearchService {
@@ -62,21 +81,29 @@ impl SearchService {
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
-            // Every session opened, from the palette or a page, is a recent one.
-            _observers: [cx.observe(&library, |this, library, cx| {
-                let Some(open) = library.read(cx).open_session() else {
-                    return;
-                };
-                if this.recent_sessions.front().map(|it| &it.id) != Some(&open.id) {
-                    let open = open.clone();
-                    this.recent_sessions.retain(|it| it.id != open.id);
-                    this.recent_sessions.push_front(open);
-                    this.recent_sessions.truncate(RECENT);
-                    cx.notify();
-                }
-            })],
+            _observers: [
+                // Every session opened, from the palette or a page, is a recent one.
+                cx.observe(&library, |this, library, cx| {
+                    let Some(open) = library.read(cx).open_session() else {
+                        return;
+                    };
+                    if this.recent_sessions.front().map(|it| &it.id) != Some(&open.id) {
+                        let open = open.clone();
+                        this.recent_sessions.retain(|it| it.id != open.id);
+                        this.recent_sessions.push_front(open);
+                        this.recent_sessions.truncate(RECENT);
+                        cx.notify();
+                    }
+                }),
+                cx.subscribe(&library, |this, _, event, cx| {
+                    if let LibraryEvent::DeletedForGood(id) = event {
+                        this.forget(id, cx);
+                    }
+                }),
+            ],
             archive,
             asked: 0,
+            refreshed: 0,
             cancel: None,
             answer: None,
             unsearchable: 0,
@@ -96,8 +123,8 @@ impl SearchService {
         self.cancel.is_some()
     }
 
-    /// The last answer, the query it is of, and how long the search took.
-    pub fn answer(&self) -> Option<&(Query, Answer, Duration)> {
+    /// The last answer, and what it answers.
+    pub fn answer(&self) -> Option<&Arc<Answered>> {
         self.answer.as_ref()
     }
 
@@ -134,7 +161,7 @@ impl SearchService {
     }
 
     /// Forgets a session deleted for good, which is no recent session any more.
-    pub fn forget(&mut self, id: &SessionId, cx: &mut Context<Self>) {
+    fn forget(&mut self, id: &SessionId, cx: &mut Context<Self>) {
         self.recent_sessions.retain(|it| it.id != *id);
         cx.notify();
     }
@@ -143,25 +170,55 @@ impl SearchService {
         self.archive.read(cx).archive().cloned()
     }
 
-    /// Reads the completions and how many sessions are not searchable yet: the palette is
-    /// opening.
+    /**
+     * Reads what the palette shows before anything is typed, as it is now: the completions,
+     * how many sessions are not searchable yet, and the recent sessions, which a rename or a
+     * refiling shows and which leave the list once in Trash or deleted. The palette is
+     * opening; a read asked for since supersedes this one.
+     */
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(archive) = self.archive(cx) else {
             return;
         };
+        self.refreshed += 1;
+        let refreshed = self.refreshed;
+        let recent: Vec<SessionId> = self
+            .recent_sessions
+            .iter()
+            .map(|it| it.id.clone())
+            .collect();
         let job = cx.background_spawn(async move {
-            let values = archive.catalogue().models_and_branches();
-            (values, archive.unsearchable())
+            let catalogue = archive.catalogue();
+            let sessions: Result<Vec<Option<Session>>, _> =
+                recent.iter().map(|id| catalogue.session(id)).collect();
+            (
+                catalogue.models_and_branches(),
+                archive.unsearchable(),
+                sessions,
+            )
         });
         cx.spawn(async move |this, cx| {
-            let (values, unsearchable) = job.await;
+            let (values, unsearchable, sessions) = job.await;
             this.update(cx, |this, cx| {
+                if this.refreshed != refreshed {
+                    return;
+                }
                 match values {
                     Ok((models, branches)) => this.values = (models.into(), branches.into()),
                     Err(error) => log::warn!("the palette's completions couldn't be read: {error}"),
                 }
                 if let Ok(unsearchable) = unsearchable {
                     this.unsearchable = unsearchable;
+                }
+                match sessions {
+                    Ok(sessions) => {
+                        this.recent_sessions = sessions
+                            .into_iter()
+                            .flatten()
+                            .filter(|session| session.trashed.is_none())
+                            .collect();
+                    }
+                    Err(error) => log::warn!("the recent sessions couldn't be read: {error}"),
                 }
                 cx.notify();
             })
@@ -171,20 +228,20 @@ impl SearchService {
     }
 
     /**
-     * Searches for `query` off the UI thread, in place of the search running (module docs). A
-     * query with no terms has no answer: the palette shows the recent sessions and searches.
+     * Searches for `query` off the UI thread, in place of the search running (module docs),
+     * keeping `text`, what was typed for it, and `find`, its terms for Find in session. A
+     * query with no terms, or with no archive to search, has no answer: the palette shows
+     * the recent sessions and searches.
      */
-    pub fn search(&mut self, query: Query, cx: &mut Context<Self>) {
+    pub fn search(&mut self, query: Query, text: String, find: String, cx: &mut Context<Self>) {
         if let Some(cancel) = self.cancel.take() {
             cancel.cancel();
         }
         self.asked += 1;
-        if query.terms.is_empty() {
+        let archive = self.archive(cx).filter(|_| !query.terms.is_empty());
+        let Some(archive) = archive else {
             self.answer = None;
             cx.notify();
-            return;
-        }
-        let Some(archive) = self.archive(cx) else {
             return;
         };
         let (asked, cancel) = (self.asked, CancelToken::new());
@@ -217,12 +274,25 @@ impl SearchService {
                     }
                 };
                 log::debug!("searched {:?} in {took:?}", query.terms);
-                this.answer = Some((query, answer, took));
+                this.answer = Some(Arc::new(Answered {
+                    query,
+                    text,
+                    find,
+                    answer,
+                    took,
+                }));
                 cx.notify();
             })
             .ok();
         })
         .detach();
+        cx.notify();
+    }
+
+    /// Takes `answer` as the last one: what a test shows the palette.
+    #[cfg(test)]
+    pub(crate) fn answered(&mut self, answer: Answered, cx: &mut Context<Self>) {
+        self.answer = Some(Arc::new(answer));
         cx.notify();
     }
 }

@@ -276,7 +276,7 @@ mod tests {
         );
         let throttle = &results.sessions[1];
         let kinds: Vec<(MatchKind, bool)> = (throttle.shown.iter())
-            .map(|it| (it.kind, it.subagent))
+            .map(|it| (it.kind, it.subagent.is_some()))
             .collect();
         assert!(kinds.contains(&(MatchKind::Prompt, false)), "{kinds:?}");
         assert!(kinds.contains(&(MatchKind::Command, false)), "{kinds:?}");

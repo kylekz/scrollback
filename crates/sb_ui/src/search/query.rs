@@ -2,6 +2,11 @@
 //! the text typed, whose finished `key:value` tokens turn into chips and whose last word, while
 //! it is being typed, is completed. The syntax is `sb_core`'s ([`sb_core::search::parse`]):
 //! this only says where in the text each word is, so a token can leave it for its chip.
+//!
+//! **Only finished tokens count.** A token is finished once white space follows it: one being
+//! typed (`branch:ma`) is no filter and no term yet, so the results don't change under every
+//! letter of it. A finished token that names nothing holds the results: the palette says so
+//! and searches nothing until it is mended or taken away.
 
 use std::ops::Range;
 
@@ -63,7 +68,10 @@ impl Chip {
 pub struct Known<'a> {
     pub folders: &'a [Folder],
     pub locations: &'a [Location],
+    /// Each agent's provider, and the agent's name.
     pub agents: &'a [(ProviderId, String)],
+    /// The same providers alone, as tokens name them.
+    pub agent_ids: &'a [ProviderId],
     pub models: &'a [String],
     /// How a model is written: as its agent's provider writes it.
     pub model_name: &'a dyn Fn(&str) -> String,
@@ -72,7 +80,7 @@ pub struct Known<'a> {
     pub dates: &'a [String],
 }
 
-impl Known<'_> {
+impl<'a> Known<'a> {
     fn chip(&self, filter: Filter, typed: &str) -> Chip {
         match &filter {
             Filter::Shelf(Shelf::Folder(id)) => {
@@ -110,32 +118,30 @@ impl Known<'_> {
 
     /// The chip `token` makes, when it names something.
     pub fn resolve(&self, token: &Token) -> Option<Chip> {
-        let agents: Vec<ProviderId> = self.agents.iter().map(|(id, _)| *id).collect();
         let names = Names {
             folders: self.folders,
             locations: self.locations,
-            agents: &agents,
+            agents: self.agent_ids,
         };
         token
             .resolve(&names)
             .map(|filter| self.chip(filter, &token.value))
     }
 
-    /// What `key:` can be followed by: each value as typed, and what its chip says.
-    fn values(&self, key: Key) -> Vec<String> {
-        let folders = || self.folders.iter().map(|folder| folder.name.clone());
+    /// What `key:` can be followed by, as typed.
+    fn values(&self, key: Key) -> Vec<&str> {
+        let folders = || self.folders.iter().map(|folder| folder.name.as_str());
+        let all = |values: &'a [String]| values.iter().map(String::as_str).collect();
         match key {
-            Key::In => (PAGES.iter().map(|(name, ..)| name.to_string()))
+            Key::In => (PAGES.iter().map(|(name, ..)| *name))
                 .chain(folders())
                 .collect(),
             Key::Folder => folders().collect(),
-            Key::From => self.locations.iter().map(|it| it.name.clone()).collect(),
-            Key::Agent => (self.agents.iter())
-                .map(|(id, _)| id.as_str().to_string())
-                .collect(),
-            Key::Model => self.models.to_vec(),
-            Key::Branch => self.branches.to_vec(),
-            Key::After | Key::Before => self.dates.to_vec(),
+            Key::From => self.locations.iter().map(|it| it.name.as_str()).collect(),
+            Key::Agent => self.agent_ids.iter().map(|id| id.as_str()).collect(),
+            Key::Model => all(self.models),
+            Key::Branch => all(self.branches),
+            Key::After | Key::Before => all(self.dates),
         }
     }
 }
@@ -226,40 +232,52 @@ pub fn add(chips: &mut Vec<Chip>, chip: Chip) {
     }
 }
 
-/**
- * The query the palette runs: the text's terms, the chips' filters, and the filters of the
- * tokens still in the text (the one being typed). Also the tokens in it that name nothing.
- */
-pub fn query(chips: &[Chip], text: &str, known: &Known<'_>) -> (Query, Vec<Token>) {
-    let parsed = parse(text);
+/// What the chips and the query field ask for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Asked {
+    /// The terms of the text and the filters of the chips and its finished tokens.
+    pub query: Query,
+    /// The terms as Find in session is filled with them: no quotes, no tokens.
+    pub find: String,
+    /// The first finished token that names nothing, which holds the results (module docs).
+    pub unresolved: Option<Token>,
+}
+
+/// What `chips` and the query field's `text` ask for (module docs).
+pub fn asked(chips: &[Chip], text: &str, known: &Known<'_>) -> Asked {
+    /* A token or a key being typed is left out until it is finished. */
+    let end = match words(text).pop() {
+        Some(last)
+            if last.end == text.len()
+                && (token(&text[last.clone()]).is_some()
+                    || !parse(&text[last.clone()]).incomplete.is_empty()) =>
+        {
+            last.start
+        }
+        _ => text.len(),
+    };
+    let parsed = parse(&text[..end]);
     let mut filters = Filters::default();
     for chip in chips {
         filters.set(chip.filter.clone());
     }
-    let mut unresolved = Vec::new();
+    let mut unresolved = None;
     for token in parsed.tokens {
         match known.resolve(&token) {
             Some(chip) => filters.set(chip.filter),
-            None => unresolved.push(token),
+            None => {
+                unresolved.get_or_insert(token);
+            }
         }
     }
-    (
-        Query {
+    Asked {
+        find: parsed.terms.join(" "),
+        query: Query {
             terms: parsed.terms,
             filters,
         },
         unresolved,
-    )
-}
-
-/// The free text of `text`, without its tokens: what Find in session is filled with.
-pub fn free_text(text: &str) -> String {
-    words(text)
-        .into_iter()
-        .map(|word| &text[word])
-        .filter(|word| token(word).is_none() && parse(word).incomplete.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+    }
 }
 
 /// The completions of the last word of `text`, while it is being typed (no white space after
@@ -279,7 +297,12 @@ pub fn completions(text: &str, known: &Known<'_>) -> Vec<Completion> {
                 .values(*key)
                 .into_iter()
                 .filter(|value| value.to_lowercase().contains(&typed))
-                .filter_map(|value| known.resolve(&Token { key: *key, value }))
+                .filter_map(|value| {
+                    known.resolve(&Token {
+                        key: *key,
+                        value: value.to_string(),
+                    })
+                })
                 .take(COMPLETIONS)
                 .map(Completion::Chip)
                 .collect()
@@ -322,6 +345,7 @@ mod tests {
             folders: &folders,
             locations: &[],
             agents: &[],
+            agent_ids: &[],
             models: &["model-opus".to_string(), "model-haiku".to_string()],
             model_name: &|model| model.replace("model-", "Model "),
             branches: &["main".to_string()],
@@ -360,19 +384,28 @@ mod tests {
     }
 
     #[test]
-    fn the_query_has_the_chips_and_the_token_being_typed() {
+    fn only_finished_tokens_count_and_one_that_names_nothing_is_said() {
         known_with(|known| {
             let chips = [Chip {
                 filter: Filter::Shelf(Shelf::Trash),
                 label: "In: Trash".to_string(),
             }];
-            let (query, unresolved) =
-                query(&chips, "backoff \"rate limit\" model:op from:x", known);
-            assert_eq!(query.terms, ["backoff", "rate limit"]);
-            assert_eq!(query.filters.shelf, Shelf::Trash);
-            assert_eq!(query.filters.model.as_deref(), Some("op"));
-            assert_eq!(unresolved.len(), 1);
-            assert_eq!(free_text("backoff model:op in: 429"), "backoff 429");
+            /* The token being typed is no filter and no term yet. */
+            let typing = asked(&chips, "backoff \"rate limit\" model:op", known);
+            assert_eq!(typing.query.terms, ["backoff", "rate limit"]);
+            assert_eq!(typing.query.filters.shelf, Shelf::Trash);
+            assert_eq!(typing.query.filters.model, None);
+            assert_eq!(typing.find, "backoff rate limit");
+            assert_eq!(typing.unresolved, None);
+            assert_eq!(asked(&chips, "backoff in:", known).query.terms, ["backoff"]);
+            /* Once finished, it filters; one that names nothing is said. */
+            let finished = asked(&chips, "backoff model:op from:x 429 ", known);
+            assert_eq!(finished.query.filters.model.as_deref(), Some("op"));
+            assert_eq!(finished.query.terms, ["backoff", "429"]);
+            assert_eq!(
+                finished.unresolved.map(|it| it.value),
+                Some("x".to_string())
+            );
         });
     }
 

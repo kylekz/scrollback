@@ -2,15 +2,18 @@
 //! [`crate::test_support`]: restoring, into a folder that is gone too, its Undo, and the
 //! confirmation that deletes for good, whose `Enter` never confirms.
 
-use gpui::{Entity, KeyUpEvent, Keystroke, TestAppContext, VisualTestContext};
+use gpui::{
+    Entity, KeyUpEvent, Keystroke, Modifiers, TestAppContext, VisualTestContext, point, px,
+};
 use pretty_assertions::assert_eq;
-use sb_core::catalogue::{Filed, Session, SessionId, Shelf};
+use sb_core::archive::ArchiveError;
+use sb_core::catalogue::{Deletion, Filed, Session, SessionId, Shelf};
 use sb_core::filing::FolderId;
 
 use super::Showing;
 use crate::services::{ActiveServices as _, LibraryService};
 use crate::shell::Shell;
-use crate::test_support::{SESSIONS, bounds, open_shell};
+use crate::test_support::{SESSIONS, bounds, open_shell, write_with};
 
 fn library(cx: &mut VisualTestContext) -> Entity<LibraryService> {
     cx.update(|_, cx| cx.services().library.clone())
@@ -236,4 +239,219 @@ fn deleting_for_good_asks_with_cancel_first_and_enter_never_confirms(cx: &mut Te
     );
     assert!(!undo, "deleting for good can't be undone");
     assert_eq!(library(cx).read_with(cx, |it, _| it.counts().trash), 0);
+}
+
+/// What deleting the session asked about would remove, once read.
+fn asked(cx: &mut VisualTestContext) -> Option<(String, Option<Deletion>, Option<String>)> {
+    library(cx).read_with(cx, |it, _| {
+        it.for_good().map(|asked| {
+            (
+                asked.session.title.clone().unwrap_or_default(),
+                asked.deletion.clone(),
+                asked.refused.clone(),
+            )
+        })
+    })
+}
+
+fn ask(title: &str, cx: &mut VisualTestContext) {
+    let session = session(title, cx).expect("the session");
+    library(cx).update(cx, |library, cx| library.ask_delete_for_good(session, cx));
+}
+
+#[gpui::test]
+fn confirming_waits_for_what_it_removes_and_the_scrim_cancels(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    trash(SESSIONS[0].title, cx);
+    // Asked, and confirmed before what it removes is read: nothing happens yet.
+    ask(SESSIONS[0].title, cx);
+    library(cx).update(cx, |library, cx| library.answer_delete_for_good(true, cx));
+    assert!(asked(cx).is_some_and(|(_, deletion, _)| deletion.is_none()));
+    cx.run_until_parked();
+    assert!(asked(cx).is_some_and(|(_, deletion, _)| deletion.is_some()));
+    assert_eq!(in_trash(cx), [SESSIONS[0].title]);
+
+    // A press on the scrim cancels.
+    cx.simulate_click(point(px(200.), px(850.)), Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(asked(cx), None);
+    assert_eq!(in_trash(cx), [SESSIONS[0].title]);
+}
+
+#[gpui::test]
+fn a_session_changed_since_it_was_shown_asks_again_with_its_numbers_now(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    trash(SESSIONS[0].title, cx);
+    ask(SESSIONS[0].title, cx);
+    cx.run_until_parked();
+    let shown = asked(cx)
+        .and_then(|(_, deletion, _)| deletion)
+        .expect("read");
+
+    // The agent writes on in it, and a sync archives that while the confirmation is open.
+    let item = cx.update(|_, cx| {
+        let archive = cx.services().archive.read(cx).archive().cloned().unwrap();
+        let id = &shown.session;
+        let items = archive
+            .catalogue()
+            .items(&id.location, &id.provider)
+            .unwrap();
+        let main = archive.catalogue().session(id).unwrap().unwrap().main_item;
+        items
+            .into_iter()
+            .find(|it| Some(it.id) == main)
+            .unwrap()
+            .key
+    });
+    write_with(
+        |tree| {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(tree.path(&item))
+                .unwrap();
+            file.write_all(b"{\"type\":\"mode\"}\n").unwrap();
+        },
+        cx,
+    );
+    let sync = cx.update(|_, cx| cx.services().sync.clone());
+    sync.update(cx, |sync, cx| sync.sync_all(cx));
+    cx.run_until_parked();
+
+    library(cx).update(cx, |library, cx| library.answer_delete_for_good(true, cx));
+    cx.run_until_parked();
+    let (title, now, refused) = asked(cx).expect("asked again");
+    assert_eq!(title, SESSIONS[0].title);
+    assert!(
+        now.expect("read again").bytes > shown.bytes,
+        "its numbers now"
+    );
+    assert!(refused.is_some_and(|why| why.contains("changed")));
+    assert!(
+        cx.update(|window, cx| {
+            shell
+                .read(cx)
+                .for_good_cancel()
+                .is_some_and(|cancel| cancel.is_focused(window))
+        }),
+        "Cancel has the keyboard again"
+    );
+    assert_eq!(in_trash(cx), [SESSIONS[0].title], "nothing was deleted");
+}
+
+#[gpui::test]
+fn a_refusal_while_its_location_syncs_shows_again_or_says_so_over_another(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    let ids: Vec<SessionId> = SESSIONS.iter().map(|it| id(it.title, cx)).collect();
+    library(cx).update(cx, |library, cx| library.trash(ids, cx));
+    cx.run_until_parked();
+    show(Shelf::Trash, cx);
+    ask(SESSIONS[0].title, cx);
+    cx.run_until_parked();
+    let deletion = asked(cx).and_then(|(_, deletion, _)| deletion).unwrap();
+    let syncing = || ArchiveError::Syncing(deletion.session.location.clone());
+
+    // Its own confirmation shows again, with why.
+    let first = session(SESSIONS[0].title, cx).unwrap();
+    library(cx).update(cx, |library, cx| {
+        library.answer_delete_for_good(false, cx);
+        library.refused_for_good(deletion.clone(), first.clone(), syncing(), cx);
+    });
+    cx.run_until_parked();
+    let (title, _, refused) = asked(cx).expect("asked again");
+    assert_eq!(title, SESSIONS[0].title);
+    assert!(refused.is_some_and(|why| why.contains("being synced")));
+
+    // Over another session's confirmation it never takes that one's place: a toast says it.
+    library(cx).update(cx, |library, cx| library.answer_delete_for_good(false, cx));
+    ask(SESSIONS[1].title, cx);
+    cx.run_until_parked();
+    library(cx).update(cx, |library, cx| {
+        library.refused_for_good(deletion.clone(), first, syncing(), cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        asked(cx).map(|it| it.0),
+        Some(SESSIONS[1].title.to_string())
+    );
+    let (text, undo) = toast(cx).expect("a toast");
+    assert!(
+        text.starts_with(&format!("“{}” wasn't deleted", SESSIONS[0].title)),
+        "{text}"
+    );
+    assert!(!undo);
+}
+
+#[gpui::test]
+fn a_session_restored_before_its_delete_is_written_is_said_in_words(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    trash(SESSIONS[0].title, cx);
+    ask(SESSIONS[0].title, cx);
+    cx.run_until_parked();
+    // Restored first, in the queue the delete then waits in.
+    let id = id(SESSIONS[0].title, cx);
+    library(cx).update(cx, |library, cx| {
+        library.restore(vec![id], cx);
+        library.answer_delete_for_good(true, cx);
+    });
+    cx.run_until_parked();
+    assert!(session(SESSIONS[0].title, cx).is_some(), "not deleted");
+    assert_eq!(
+        toast(cx).map(|it| it.0),
+        Some(format!(
+            "“{}” was restored, so it wasn't deleted",
+            SESSIONS[0].title
+        ))
+    );
+}
+
+#[gpui::test]
+fn a_rows_buttons_neither_select_nor_open_it_and_its_reader_highlights_trash(
+    cx: &mut TestAppContext,
+) {
+    let (_shell, cx) = open_shell(cx);
+    let ids: Vec<SessionId> = SESSIONS[..2].iter().map(|it| id(it.title, cx)).collect();
+    library(cx).update(cx, |library, cx| library.trash(ids, cx));
+    cx.run_until_parked();
+    show(Shelf::Trash, cx);
+    cx.simulate_keystrokes("down down");
+    let selected = library(cx).read_with(cx, |it, _| it.selected().cloned());
+    assert!(selected.is_some());
+    // Delete for good… on the other row: the selection stays, and nothing opens.
+    click("trash-delete-0", cx);
+    assert_eq!(
+        library(cx).read_with(cx, |it, _| it.selected().cloned()),
+        selected
+    );
+    library(cx).update(cx, |library, cx| library.answer_delete_for_good(false, cx));
+    cx.run_until_parked();
+    let at = bounds(cx, "trash-restore-0").expect("Restore").center();
+    cx.simulate_event(gpui::MouseDownEvent {
+        position: at,
+        button: gpui::MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui::MouseUpEvent {
+        position: at,
+        button: gpui::MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 2,
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| Showing::now(cx)),
+        Showing::Trash,
+        "a double click opens nothing"
+    );
+
+    // A session read from Trash highlights Trash in the sidebar, not its old folder.
+    let id = selected.unwrap();
+    library(cx).update(cx, |library, cx| library.open_session_at(&id, 0, cx));
+    assert_eq!(cx.update(|_, cx| Showing::now(cx)), Showing::Session);
+    assert_eq!(
+        library(cx).read_with(cx, |it, _| it.highlighted()),
+        Shelf::Trash
+    );
 }

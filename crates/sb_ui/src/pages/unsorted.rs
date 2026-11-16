@@ -47,6 +47,7 @@ use crate::format;
 use crate::icons::SbIcon;
 use crate::menu::{self, Entry, Item as MenuItem, NESTED_INDENT};
 use crate::services::drag::verdict;
+use crate::services::library::title_of;
 use crate::services::view::{GroupSort, UnsortedView as GroupsView, shown_groups};
 use crate::services::{
     ActiveServices as _, Dragged, DropTarget, LibraryService, SyncService, TypedPath, Verdict,
@@ -817,11 +818,7 @@ impl UnsortedView {
                     .is_some_and(|(it, _)| it == *path),
             });
         let drawn = self.drawn.clone();
-        let title: SharedString = session
-            .title
-            .clone()
-            .unwrap_or_else(|| "Untitled session".to_string())
-            .into();
+        let title: SharedString = title_of(session).into();
         let model = agents::model(&session.id.provider, &session.models, cx)
             .unwrap_or_else(|| agents::name(&session.id.provider, cx));
         let id = session.id.clone();

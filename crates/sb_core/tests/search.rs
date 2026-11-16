@@ -137,7 +137,7 @@ fn a_sessions_text_is_found_where_it_is_and_tool_output_is_not<A: Agent + Defaul
     let transcript = bench.agent.provider().parse(&items);
     let conversation = transcript.conversation.unwrap();
     for found in shown {
-        assert!(!found.subagent && !found.cut);
+        assert!(found.subagent.is_none() && !found.cut);
         assert_eq!(found.snippet.hits.len(), 1, "{found:?}");
         let hit = found.snippet.hits[0].clone();
         assert_eq!(&found.snippet.text[hit], "parse_args");
@@ -601,17 +601,34 @@ fn a_subagents_text_opens_its_session_at_the_call_and_a_title_comes_first() {
     );
     let title = &results.sessions[0].shown[0];
     assert_eq!(
-        (title.kind, title.at, title.subagent),
-        (MatchKind::Title, None, false)
+        (title.kind, title.at, &title.subagent),
+        (MatchKind::Title, None, &None)
     );
     let inside = &results.sessions[1].shown[0];
-    assert_eq!((inside.kind, inside.subagent), (MatchKind::Reply, true));
+    assert_eq!(inside.kind, MatchKind::Reply);
     let items = Items::of(&bench.agent, &said.key);
-    let conversation = bench.agent.provider().parse(&items).conversation.unwrap();
+    let provider = bench.agent.provider();
+    let conversation = provider.parse(&items).conversation.unwrap();
     let Some(At::Block { block, .. }) = inside.at else {
         panic!("{inside:?}");
     };
     assert!(matches!(conversation[block].content, Content::ToolCall(_)));
+    /* And where in the subagent's own conversation the text is: its reply. */
+    let place = inside
+        .subagent
+        .as_ref()
+        .expect("the text is the subagent's");
+    let Some(own) = provider
+        .subagent(&items, &place.item)
+        .conversation()
+        .cloned()
+    else {
+        panic!("{place:?} is no subagent's conversation");
+    };
+    assert_eq!(place.turn, 0);
+    assert!(
+        matches!(&own[place.block].content, Content::Reply { text } if text.contains("frobnicator"))
+    );
     bench.assert_verifies();
 }
 

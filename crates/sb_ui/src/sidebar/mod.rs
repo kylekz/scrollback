@@ -180,7 +180,9 @@ impl Sidebar {
                     LibraryEvent::FolderCreated(folder) | LibraryEvent::Rename(folder) => {
                         this.rename(*folder, window, cx);
                     }
-                    LibraryEvent::EditPaths(_) | LibraryEvent::Leave(_) => {}
+                    LibraryEvent::EditPaths(_)
+                    | LibraryEvent::Leave(_)
+                    | LibraryEvent::DeletedForGood(_) => {}
                 }),
             ],
             _clock: cx.spawn(async move |this, cx| {

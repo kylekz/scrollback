@@ -41,9 +41,10 @@ pub(super) const SPANS: i64 = 1 << 24;
 const SPAN_BYTES: usize = 64 * 1024;
 
 /// The layout of `search.db`. A change to it is a new step, or a new domain, which makes the
-/// file again from the archive.
+/// file again from the archive: the second domain is the one whose spans say where in a
+/// subagent's conversation they are.
 const SCHEMA: Schema = Schema {
-    domain: "scrollback-search",
+    domain: "scrollback-search-2",
     steps: &[TEXT],
 };
 
@@ -60,14 +61,17 @@ CREATE TABLE doc (
     UNIQUE (location_id, provider, session)
 ) STRICT;
 
--- kind is title, prompt, reply, command or path; subagent: the text is a subagent's. A match
--- opens the session at turn and block (for a subagent's text, the call it ran under), or at
--- the subagent unattached that no call is known to have started; a title, at its start. cut:
--- only the start of the span's text is here.
+-- kind is title, prompt, reply, command or path. A match opens the session at turn and block
+-- (for a subagent's text, the call it ran under), or at the subagent unattached that no call
+-- is known to have started; a title, at its start. subagent: the item of the subagent's
+-- conversation the text is in, and its turn and block there (sub_turn, sub_block). cut: only
+-- the start of the span's text is here.
 CREATE TABLE span (
     id INTEGER PRIMARY KEY,
     kind TEXT NOT NULL,
-    subagent INTEGER NOT NULL,
+    subagent TEXT,
+    sub_turn INTEGER,
+    sub_block INTEGER,
     turn INTEGER,
     block INTEGER,
     unattached INTEGER,
@@ -225,8 +229,9 @@ impl SearchIndex {
                  RETURNING id",
             )?;
             let mut span = tx.prepare(
-                "INSERT INTO span (id, kind, subagent, turn, block, unattached, cut, text)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO span (id, kind, subagent, sub_turn, sub_block, turn, block,
+                                   unattached, cut, text)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             let mut index = tx.prepare("INSERT INTO span_text (rowid, text) VALUES (?1, ?2)")?;
             for text in &kept {
@@ -239,12 +244,12 @@ impl SearchIndex {
                 let title = text
                     .title
                     .as_deref()
-                    .map(|title| (0, MatchKind::Title, false, None, title));
+                    .map(|title| (0, MatchKind::Title, None, None, title));
                 let spans = (1..SPANS).zip(&text.spans).map(|(place, span)| {
                     (
                         place,
                         span.kind.into(),
-                        span.subagent,
+                        span.subagent.as_ref(),
                         Some(span.at),
                         &*span.text,
                     )
@@ -260,7 +265,9 @@ impl SearchIndex {
                     span.execute(params![
                         id,
                         kind.as_str(),
-                        subagent,
+                        subagent.map(|it| &it.item),
+                        subagent.map(|it| it.turn),
+                        subagent.map(|it| it.block.0),
                         turn,
                         block,
                         unattached,

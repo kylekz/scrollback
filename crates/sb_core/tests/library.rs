@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
-use sb_core::catalogue::{Catalogue, CatalogueError, Filed, Folder, SessionId, Shelf, Undone};
+use sb_core::catalogue::{
+    Catalogue, CatalogueError, Filed, Folder, Restored, SessionId, Shelf, Undone,
+};
 use sb_core::filing::{AttachedPath, FolderId, NormalPath};
 use sb_core::location::{LocationId, LocationKind};
 use sb_core::provider::{Hashed, RangeFailure};
@@ -1457,12 +1459,18 @@ fn a_selection_is_filed_starred_and_trashed_in_one_step_and_undone_as_far_as_it_
     );
     assert_eq!(catalogue.library_counts().unwrap().trash, 2);
     catalogue.restore(&two).unwrap();
-    assert!(catalogue.restore_all(&both).unwrap().is_whole());
+    let restored = catalogue.restore_all(&both).unwrap();
+    assert_eq!(restored.gone, 0);
+    /* The one still in Trash, back in the folder it was in. */
+    let [(moved, Filed::ByRule(was), Some(now))] = &restored.moved[..] else {
+        panic!("{:?}", restored.moved);
+    };
+    assert_eq!((moved, was), (&one, now));
     assert_eq!(
         catalogue.restore_all(std::slice::from_ref(&gone)).unwrap(),
-        Undone {
+        Restored {
             gone: 1,
-            refiled: 0
+            moved: Vec::new()
         }
     );
     assert_eq!(catalogue.library_counts().unwrap().trash, 0);

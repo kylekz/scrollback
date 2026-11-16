@@ -33,8 +33,8 @@ use std::time::Duration;
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 use sb_core::archive::{Archive, ArchiveError, Deleted};
 use sb_core::catalogue::{
-    Before, CatalogueError, Deletion, Filed, Folder, FolderPath, LibraryCounts, PathGroup, Session,
-    SessionId, Shelf, Undone,
+    Before, CatalogueError, Deletion, Filed, Folder, FolderPath, LibraryCounts, PathGroup,
+    Restored, Session, SessionId, Shelf, Undone,
 };
 use sb_core::filing::{self, AttachedPath, FolderId, NormalPath};
 use sb_core::location::LocationId;
@@ -277,6 +277,9 @@ pub enum LibraryEvent {
     /// The owner closed the window, or quit, and the paths editor's changes were saved or
     /// dropped: it closes, or the app quits, now.
     Leave(Leave),
+    /// A session was deleted for good: whatever keeps it (the palette's recent sessions)
+    /// forgets it.
+    DeletedForGood(SessionId),
 }
 
 /// A project path on a folder as the owner typed it, and the one location it is for: how the
@@ -377,9 +380,8 @@ enum Written {
     Trashed(Vec<SessionId>),
     /// An Undo, and what it could not put back.
     Undone(Undone),
-    /// Sessions were taken out of Trash: how each was filed in it, and the folder it is in
-    /// now; and how many were deleted for good meanwhile.
-    Restored(Vec<(SessionId, Filed, Option<FolderId>)>, usize),
+    /// Sessions were taken out of Trash: where each went.
+    Restored(Restored),
     /// A session was deleted for good.
     DeletedForGood(Deleted),
 }
@@ -421,27 +423,11 @@ impl Change {
             }
             Self::Refile { before } => Written::Undone(catalogue.refile_as(before)?),
             Self::Trash { ids } => Written::Trashed(catalogue.trash_all(ids)?),
-            Self::Restore { ids } => Written::Undone(catalogue.restore_all(ids)?),
-            Self::RestoreFromTrash { ids } => {
-                let mut before = Vec::new();
-                for id in ids {
-                    if let Some(session) = catalogue.session(id)? {
-                        before.push((session.id, session.filed));
-                    }
-                }
-                let gone = catalogue.restore_all(ids)?.gone;
-                let mut restored = Vec::new();
-                for (id, was) in before {
-                    let now = catalogue
-                        .session(&id)?
-                        .and_then(|session| match session.filed {
-                            Filed::ByRule(folder) | Filed::ByHand(folder) => Some(folder),
-                            Filed::Unsorted => None,
-                        });
-                    restored.push((id, was, now));
-                }
-                Written::Restored(restored, gone)
-            }
+            Self::Restore { ids } => Written::Undone(Undone {
+                gone: catalogue.restore_all(ids)?.gone,
+                refiled: 0,
+            }),
+            Self::RestoreFromTrash { ids } => Written::Restored(catalogue.restore_all(ids)?),
             Self::DeleteForGood { deletion, .. } => {
                 Written::DeletedForGood(archive.delete_for_good(deletion)?)
             }
@@ -634,6 +620,8 @@ pub struct LibraryService {
     /// The session whose reader is open, and where it opened when it opened at a match.
     open: Option<Session>,
     read_at: Option<ReadAt>,
+    /// How many requests to open at a match there were.
+    read_requests: u64,
     loading: bool,
     /// A load was asked for while one ran or while changes were written.
     stale: bool,
@@ -727,6 +715,7 @@ impl LibraryService {
             anchor: None,
             open: None,
             read_at: None,
+            read_requests: 0,
             loading: false,
             stale: false,
             failure: None,
@@ -820,9 +809,13 @@ impl LibraryService {
     /// The sidebar's selected row (DESIGN §4.1): the page shown, or the folder of the session
     /// being read.
     pub fn highlighted(&self) -> Shelf {
-        match self.open.as_ref().map(|session| session.filed) {
-            Some(Filed::ByRule(folder) | Filed::ByHand(folder)) => Shelf::Folder(folder),
-            Some(Filed::Unsorted) | None => self.shelf,
+        match self.open.as_ref() {
+            Some(session) if session.trashed.is_some() => Shelf::Trash,
+            Some(Session {
+                filed: Filed::ByRule(folder) | Filed::ByHand(folder),
+                ..
+            }) => Shelf::Folder(*folder),
+            Some(_) | None => self.shelf,
         }
     }
 
@@ -1066,20 +1059,36 @@ impl LibraryService {
         self.open_at(session, None, cx);
     }
 
-    /// Opens a session's reader at `at`, a search match ([`ReadAt`]), or at its start.
+    /**
+     * Opens a session's reader at `at`, a search match, or at its start. Each request is
+     * numbered anew ([`ReadAt::request`]), so that opening the same match again moves the
+     * reader again.
+     */
     pub fn open_at(&mut self, session: Session, at: Option<ReadAt>, cx: &mut Context<Self>) {
         if self.hold.is_some() {
             self.asked = Some(Leave::Open(Box::new(session), at));
         } else {
             self.open = Some(session);
-            self.read_at = at;
+            self.read_at = at.map(|at| {
+                self.read_requests += 1;
+                ReadAt {
+                    request: self.read_requests,
+                    ..at
+                }
+            });
         }
         cx.notify();
     }
 
-    /// Where the open session was opened at, when it was opened at a search match.
+    /// The request to open the open session at a match, until the reader takes it (the docs
+    /// of [`ReadAt`]): what automation and the tests look at.
     pub fn read_at(&self) -> Option<&ReadAt> {
         self.read_at.as_ref()
+    }
+
+    /// Takes the request to open the open session at a match: once, by the reader.
+    pub fn take_read_at(&mut self) -> Option<ReadAt> {
+        self.read_at.take()
     }
 
     /**
@@ -1440,11 +1449,16 @@ impl LibraryService {
                         log::warn!(
                             "what deleting a session would remove couldn't be read: {error}"
                         );
+                        let title = title_of(&asked.session);
                         this.for_good = None;
-                        this.write_failure = Some(format!(
-                            "The session couldn't be deleted for good: {}.",
-                            this.why(&error.into())
-                        ));
+                        let said = this.not_deleted(&title, &error.into());
+                        this.show_toast(
+                            Toast {
+                                text: said,
+                                undo: None,
+                            },
+                            cx,
+                        );
                     }
                 }
                 cx.notify();
@@ -1454,8 +1468,38 @@ impl LibraryService {
         .detach();
     }
 
-    /// Deletes the session asked about for good (`delete`), or leaves it in Trash.
+    /**
+     * Takes in a delete for good of `session` refused with `error`, as its write would: what
+     * a test can't make the archive do at the moment it wants, such as a location syncing.
+     */
+    #[cfg(test)]
+    pub(crate) fn refused_for_good(
+        &mut self,
+        deletion: Deletion,
+        session: Session,
+        error: ArchiveError,
+        cx: &mut Context<Self>,
+    ) {
+        let change = Change::DeleteForGood {
+            deletion,
+            session: Box::new(session),
+        };
+        self.written(change, Err(error), cx);
+    }
+
+    /**
+     * Deletes the session asked about for good (`delete`), or leaves it in Trash. Deleting
+     * waits for what it removes to be read: until then the confirmation stays as it is.
+     */
     pub fn answer_delete_for_good(&mut self, delete: bool, cx: &mut Context<Self>) {
+        if delete
+            && self
+                .for_good
+                .as_ref()
+                .is_some_and(|it| it.deletion.is_none())
+        {
+            return;
+        }
         let Some(asked) = self.for_good.take() else {
             return;
         };
@@ -1834,14 +1878,19 @@ impl LibraryService {
                 self.refused = Some((group.clone(), error.to_string()));
                 return;
             }
-            /* The confirmation shows again, with why: nothing was deleted (PLAN §4.5). */
+            /* Nothing was deleted (PLAN §4.5). The confirmation shows again, with why and the
+            numbers as they are now; or, while another session's is open, a toast says it. */
             (
                 Change::DeleteForGood { session, .. },
                 Err(
                     error @ (ArchiveError::Syncing(_)
                     | ArchiveError::Catalogue(CatalogueError::DeletionChanged(_))),
                 ),
-            ) => {
+            ) if self
+                .for_good
+                .as_ref()
+                .is_none_or(|open| open.session.id == session.id) =>
+            {
                 self.for_good = Some(ForGood {
                     session: (**session).clone(),
                     deletion: None,
@@ -1856,6 +1905,18 @@ impl LibraryService {
                     ),
                 });
                 self.read_deletion(cx);
+                return;
+            }
+            (Change::DeleteForGood { session, .. }, Err(error)) => {
+                log::warn!("{} was refused: {error}", change.what());
+                let said = self.not_deleted(&title_of(session), &error);
+                self.show_toast(
+                    Toast {
+                        text: said,
+                        undo: None,
+                    },
+                    cx,
+                );
                 return;
             }
             (change, Err(error)) => {
@@ -1911,10 +1972,10 @@ impl LibraryService {
                 text: undone_text(undone),
                 undo: None,
             }),
-            Written::Restored(restored, gone) => Some(Toast {
-                text: self.restored(&restored, gone),
-                undo: (!restored.is_empty()).then(|| Change::Trash {
-                    ids: restored.into_iter().map(|(id, ..)| id).collect(),
+            Written::Restored(restored) => Some(Toast {
+                text: self.restored(&restored),
+                undo: (!restored.moved.is_empty()).then(|| Change::Trash {
+                    ids: restored.moved.into_iter().map(|(id, ..)| id).collect(),
                 }),
             }),
             Written::DeletedForGood(deleted) => Some(Toast {
@@ -1931,6 +1992,9 @@ impl LibraryService {
                 undo: None,
             }),
         };
+        if let Change::DeleteForGood { deletion, .. } = &change {
+            cx.emit(LibraryEvent::DeletedForGood(deletion.session.clone()));
+        }
         // Toasts of changes queued before an Undo say nothing: the Undo has the last word.
         if let Some(toast) = toast.filter(|_| number >= self.quiet_before) {
             self.show_toast(toast, cx);
@@ -1975,27 +2039,27 @@ impl LibraryService {
      * gone, so its path filed it in work", "3 sessions restored", with those deleted for good
      * meanwhile counted.
      */
-    fn restored(&self, restored: &[(SessionId, Filed, Option<FolderId>)], gone: usize) -> String {
+    fn restored(&self, restored: &Restored) -> String {
         let place = |folder: Option<FolderId>| match folder {
             Some(folder) => self.folder_path(folder),
             None => "Unsorted".to_string(),
         };
-        let said = match restored {
+        let gone = restored.gone;
+        let said = match &restored.moved[..] {
             [] => String::new(),
-            [(_, was, now)] => match (was, now) {
-                (Filed::ByRule(was) | Filed::ByHand(was), Some(now)) if was == now => {
-                    format!("Restored to {}", place(Some(*now)))
+            [(_, Filed::ByRule(was) | Filed::ByHand(was), now)] if self.folder(*was).is_none() => {
+                match now {
+                    Some(now) => format!(
+                        "Restored: its folder is gone, so its path filed it in {}",
+                        place(Some(*now))
+                    ),
+                    None => {
+                        "Restored to Unsorted: its folder is gone, and no folder's path claims it"
+                            .to_string()
+                    }
                 }
-                (Filed::ByRule(_) | Filed::ByHand(_), None) => {
-                    "Restored to Unsorted: its folder is gone, and no folder's path claims it"
-                        .to_string()
-                }
-                (Filed::ByRule(_) | Filed::ByHand(_), Some(now)) => format!(
-                    "Restored: its folder is gone, so its path filed it in {}",
-                    place(Some(*now))
-                ),
-                (Filed::Unsorted, now) => format!("Restored to {}", place(*now)),
-            },
+            }
+            [(_, _, now)] => format!("Restored to {}", place(*now)),
             several => format!("{} restored", format::plural(several.len(), "session")),
         };
         match (said.is_empty(), gone) {
@@ -2005,6 +2069,30 @@ impl LibraryService {
             (false, n) => format!(
                 "{said}; {} deleted for good meanwhile",
                 format::plural(n, "session")
+            ),
+        }
+    }
+
+    /// Why deleting the session titled `title` for good was refused, as the owner knows it.
+    fn not_deleted(&self, title: &str, error: &ArchiveError) -> String {
+        match error {
+            ArchiveError::Catalogue(CatalogueError::NotInTrash(_)) => {
+                format!("“{title}” was restored, so it wasn't deleted")
+            }
+            ArchiveError::Catalogue(CatalogueError::NoSession(_)) => {
+                format!("“{title}” is deleted already")
+            }
+            ArchiveError::Syncing(_) => format!(
+                "“{title}” wasn't deleted: its location is being synced. Try again once the \
+                 sync is done"
+            ),
+            ArchiveError::Catalogue(CatalogueError::DeletionChanged(_)) => format!(
+                "“{title}” wasn't deleted: it changed since it was shown. Ask again to see what \
+                 it holds now"
+            ),
+            error => format!(
+                "“{title}” couldn't be deleted for good: {}",
+                self.why(error)
             ),
         }
     }

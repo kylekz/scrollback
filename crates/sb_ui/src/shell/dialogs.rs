@@ -17,6 +17,7 @@ use gpui::{
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::FocusTrapElement as _;
+use sb_core::catalogue::SessionId;
 use sb_core::filing::FolderId;
 
 use super::Shell;
@@ -33,10 +34,11 @@ use crate::services::library::title_of;
 use crate::theme::{SbTheme, StyledText as _};
 
 /// Which dialog is open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Asking {
     Delete(FolderId),
-    DeleteForGood,
+    /// Delete for good, of the session, with why its last confirmation was refused.
+    DeleteForGood(SessionId, Option<String>),
     Save,
 }
 
@@ -63,16 +65,26 @@ impl Shell {
         let library = cx.services().library.read(cx);
         let asking = match (library.deleting(), library.for_good(), library.asked()) {
             (Some(folder), ..) => Some(Asking::Delete(folder)),
-            (None, Some(_), _) => Some(Asking::DeleteForGood),
+            (None, Some(asked), _) => Some(Asking::DeleteForGood(
+                asked.session.id.clone(),
+                asked.refused.clone(),
+            )),
             (None, None, Some(_)) => Some(Asking::Save),
             (None, None, None) => None,
         };
         match (asking, &mut self.dialog) {
-            (Some(asking), Some(open)) => open.asking = asking,
+            /* Another session asked about, or a refusal to read: Cancel has the keyboard
+            again, so Enter never confirms what the owner hasn't seen. */
+            (Some(asking), Some(open)) => {
+                if open.asking != asking && matches!(asking, Asking::DeleteForGood(..)) {
+                    open.cancel.focus(window, cx);
+                }
+                open.asking = asking;
+            }
             (Some(asking), None) => {
                 let (back, cancel) = (window.focused(cx), cx.focus_handle());
                 match asking {
-                    Asking::DeleteForGood => cancel.focus(window, cx),
+                    Asking::DeleteForGood(..) => cancel.focus(window, cx),
                     Asking::Delete(_) | Asking::Save => self.dialog_focus.focus(window, cx),
                 }
                 self.dialog = Some(Dialog {
@@ -95,7 +107,7 @@ impl Shell {
     #[cfg(test)]
     pub(crate) fn for_good_cancel(&self) -> Option<&FocusHandle> {
         (self.dialog.as_ref())
-            .filter(|dialog| dialog.asking == Asking::DeleteForGood)
+            .filter(|dialog| matches!(dialog.asking, Asking::DeleteForGood(..)))
             .map(|dialog| &dialog.cancel)
     }
 
@@ -107,9 +119,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let dialog = self.dialog.as_ref()?;
-        let content = match dialog.asking {
-            Asking::Delete(folder) => self.delete_folder(folder, theme, cx)?,
-            Asking::DeleteForGood => self.delete_for_good(&dialog.cancel, theme, cx)?,
+        let content = match &dialog.asking {
+            Asking::Delete(folder) => self.delete_folder(*folder, theme, cx)?,
+            Asking::DeleteForGood(..) => self.delete_for_good(&dialog.cancel, theme, cx)?,
             Asking::Save => self.save_paths(theme, cx)?,
         };
         Some(overlay::modal(
@@ -250,13 +262,22 @@ impl Shell {
             }
         };
         let removes = match &deletion {
-            Some(deletion) => format!(
-                "This removes the session from the archive: its {}, {} and {}. It can't be \
-                 restored.",
-                format::plural(deletion.files, "file"),
-                format::plural(deletion.versions, "version"),
-                format::fine_size(deletion.bytes)
-            ),
+            Some(deletion) => {
+                // A session with no transcript of its own has no versions to count.
+                let held = [
+                    Some(format::plural(deletion.files, "file")),
+                    (deletion.versions > 0).then(|| format::plural(deletion.versions, "version")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(", ");
+                format!(
+                    "This removes the session from the archive: its {held} and {}. It can't be \
+                     restored.",
+                    format::fine_size(deletion.bytes)
+                )
+            }
             None => "Reading what it holds…".to_string(),
         };
         let tag = location
@@ -283,17 +304,31 @@ impl Shell {
                     underline: None,
                     strikethrough: None,
                 };
-                line.child("The session still exists on")
-                    .child(div().flex().items_center().children(tag).child("."))
+                let there = match tag {
+                    Some(tag) => div()
+                        .flex()
+                        .items_center()
+                        .gap(theme.spacing.xs)
+                        .child("The session still exists on")
+                        .child(div().flex().items_center().child(tag).child(".")),
+                    None => div().child("The session still exists at its location."),
+                };
+                line.child(there)
                     // A line of its own, so that it wraps inside the dialog.
                     .child(div().w_full().child(StyledText::new(rest).with_runs(vec![
                         run(bold, FontWeight::SEMIBOLD, c.fg),
                         run(rest.len() - bold, FontWeight::NORMAL, c.fg2),
                     ])))
             } else {
-                line.child("It is no longer on")
-                    .children(tag)
-                    .child("either, so this removes the last copy.")
+                match tag {
+                    Some(tag) => line
+                        .child("It is no longer on")
+                        .child(tag)
+                        .child("either, so this removes the last copy."),
+                    None => line.child(
+                        "It is no longer at its location either, so this removes the last copy.",
+                    ),
+                }
             }
         });
         let summary = [

@@ -1,16 +1,19 @@
 //! The search palette (DESIGN §4.9) over the test library of [`crate::test_support`]: three
 //! sessions, two started in one project and one in another, all in Unsorted.
 
+use std::time::Duration;
+
 use gpui::{Entity, Focusable as _, Modifiers, TestAppContext, VisualTestContext, point, px};
 use pretty_assertions::assert_eq;
 use sb_core::catalogue::Shelf;
 use sb_core::search::{MatchKind, Query};
 use sb_core::transcript::At;
+use serde_json::json;
 
 use super::*;
 use crate::services::{ActiveServices as _, LibraryService};
 use crate::shell::Shell;
-use crate::test_support::{SESSIONS, bounds, open_shell};
+use crate::test_support::{SESSIONS, archive_dir, bounds, open_shell, write_with};
 
 fn library(cx: &mut VisualTestContext) -> Entity<LibraryService> {
     cx.update(|_, cx| cx.services().library.clone())
@@ -37,6 +40,12 @@ fn typed(text: &str, cx: &mut VisualTestContext) {
     cx.run_until_parked();
 }
 
+fn set_text(palette: &Entity<Palette>, text: &str, cx: &mut VisualTestContext) {
+    let text = text.to_string();
+    palette.update_in(cx, |palette, window, cx| palette.set_text(text, window, cx));
+    cx.run_until_parked();
+}
+
 fn chips(palette: &Entity<Palette>, cx: &mut VisualTestContext) -> Vec<String> {
     palette.read_with(cx, |palette, _| {
         palette
@@ -51,10 +60,15 @@ fn text(palette: &Entity<Palette>, cx: &mut VisualTestContext) -> String {
     palette.read_with(cx, |palette, cx| palette.text(cx))
 }
 
+/// The last answer.
+fn answer(cx: &mut VisualTestContext) -> Option<Answer> {
+    service(cx).read_with(cx, |search, _| search.answer().map(|it| it.answer.clone()))
+}
+
 /// The titles of the sessions the last search found.
 fn found(cx: &mut VisualTestContext) -> Option<Vec<String>> {
-    service(cx).read_with(cx, |search, _| match search.answer()? {
-        (_, Answer::Found(results), _) => Some(
+    match answer(cx)? {
+        Answer::Found(results) => Some(
             results
                 .sessions
                 .iter()
@@ -62,7 +76,7 @@ fn found(cx: &mut VisualTestContext) -> Option<Vec<String>> {
                 .collect(),
         ),
         _ => None,
-    })
+    }
 }
 
 fn rows(palette: &Entity<Palette>, cx: &mut VisualTestContext) -> Vec<Row> {
@@ -75,6 +89,14 @@ fn highlight(palette: &Entity<Palette>, cx: &mut VisualTestContext) -> usize {
 
 fn main_focused(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> bool {
     cx.update(|window, cx| shell.read(cx).focus_handle(cx).is_focused(window))
+}
+
+fn recent(cx: &mut VisualTestContext) -> Vec<String> {
+    service(cx).read_with(cx, |search, _| {
+        (search.recent_sessions())
+            .filter_map(|it| it.title.clone())
+            .collect()
+    })
 }
 
 #[gpui::test]
@@ -114,7 +136,7 @@ fn typing_searches_and_each_keystroke_supersedes_the_search_before(cx: &mut Test
     typed("upload", cx);
     assert_eq!(found(cx), Some(vec![SESSIONS[0].title.to_string()]));
     assert_eq!(
-        palette.read_with(cx, |palette, cx| palette.results(cx).map(counted)),
+        palette.read_with(cx, |palette, cx| palette.view(cx).results().map(counted)),
         Some("2 matches in 1 session".to_string()),
         "its title and its prompt"
     );
@@ -125,25 +147,22 @@ fn typing_searches_and_each_keystroke_supersedes_the_search_before(cx: &mut Test
         ..Query::default()
     };
     service(cx).update(cx, |search, cx| {
-        search.search(query("notes"), cx);
-        search.search(query("backoff"), cx);
+        search.search(query("notes"), "notes".into(), "notes".into(), cx);
+        search.search(query("backoff"), "backoff".into(), "backoff".into(), cx);
     });
     assert!(service(cx).read_with(cx, |search, _| search.is_searching()));
     cx.run_until_parked();
     assert_eq!(found(cx), Some(vec![SESSIONS[1].title.to_string()]));
-    let asked = service(cx).read_with(cx, |search, _| search.answer().unwrap().0.terms.clone());
-    assert_eq!(asked, ["backoff"]);
+    let asked = service(cx).read_with(cx, |search, _| {
+        let answered = search.answer().unwrap();
+        (answered.query.terms.clone(), answered.text.clone())
+    });
+    assert_eq!(asked, (vec!["backoff".to_string()], "backoff".to_string()));
     assert!(service(cx).read_with(cx, |search, _| !search.is_searching()));
 
-    // A letter or two asks for more; text no session holds finds nothing.
-    palette.update_in(cx, |palette, window, cx| {
-        palette.set_text("ok".into(), window, cx)
-    });
-    cx.run_until_parked();
-    assert!(matches!(
-        service(cx).read_with(cx, |search, _| search.answer().map(|it| it.1.clone())),
-        Some(Answer::KeepTyping)
-    ));
+    // A letter or two asks for more.
+    set_text(&palette, "ok", cx);
+    assert_eq!(answer(cx), Some(Answer::KeepTyping));
 }
 
 #[gpui::test]
@@ -170,20 +189,41 @@ fn tokens_turn_into_chips_tab_completes_and_backspace_takes_the_last_away(cx: &m
     assert_eq!(found(cx), Some(vec![SESSIONS[0].title.to_string()]));
 
     // A key's start completes to the key.
-    palette.update_in(cx, |palette, window, cx| {
-        palette.set_text("bran".into(), window, cx)
-    });
+    set_text(&palette, "bran", cx);
     cx.simulate_keystrokes("tab");
     assert_eq!(text(&palette, cx), "branch:");
 
     // `Backspace` in an empty query takes the last chip away, one at a time.
-    palette.update_in(cx, |palette, window, cx| {
-        palette.set_text(String::new(), window, cx)
-    });
+    set_text(&palette, "", cx);
     cx.simulate_keystrokes("backspace");
     assert_eq!(chips(&palette, cx), ["In: Unsorted"]);
     cx.simulate_keystrokes("backspace");
     assert_eq!(chips(&palette, cx), Vec::<String>::new());
+}
+
+#[gpui::test]
+fn a_token_being_typed_filters_nothing_and_one_that_names_nothing_holds_the_results(
+    cx: &mut TestAppContext,
+) {
+    let (shell, cx) = open_shell(cx);
+    let palette = open_palette(&shell, cx);
+    typed("the from:nowh", cx);
+    let asked = service(cx).read_with(cx, |search, _| search.answer().unwrap().query.clone());
+    assert_eq!(
+        (asked.terms, asked.filters.location),
+        (vec!["the".to_string()], None),
+        "the token being typed is no filter yet"
+    );
+    assert_eq!(found(cx).map(|it| it.len()), Some(3));
+
+    // Finished, it names nothing: the palette says so, and shows and searches nothing.
+    typed("ere ", cx);
+    assert_eq!(
+        palette.read_with(cx, |palette, cx| palette.unresolved(cx)),
+        Some("from:nowhere".to_string())
+    );
+    assert_eq!(rows(&palette, cx), []);
+    assert_eq!(answer(cx), None);
 }
 
 #[gpui::test]
@@ -199,14 +239,14 @@ fn the_scope_is_the_page_it_opened_over_and_search_everywhere_drops_it(cx: &mut 
     let palette = open_palette(&shell, cx);
     assert_eq!(chips(&palette, cx), ["In: Unsorted"]);
 
-    // In Trash only: nothing in Unsorted holds it.
+    // In Trash only: nothing in Unsorted holds it, and Search everywhere drops the scope.
     typed("backoff", cx);
     assert_eq!(found(cx), Some(vec![]));
-    assert!(bounds(cx, "palette").is_some());
-    let everywhere = palette.read_with(cx, |palette, cx| palette.rows(cx).len());
-    assert_eq!(everywhere, 0);
-    palette.update(cx, |palette, cx| palette.remove_chip(0, cx));
+    assert_eq!(rows(&palette, cx), []);
+    let search_everywhere = bounds(cx, "palette-everywhere").expect("Search everywhere");
+    cx.simulate_click(search_everywhere.center(), Modifiers::none());
     cx.run_until_parked();
+    assert_eq!(chips(&palette, cx), Vec::<String>::new());
     assert_eq!(
         found(cx),
         Some(vec![]),
@@ -220,7 +260,7 @@ fn the_scope_is_the_page_it_opened_over_and_search_everywhere_drops_it(cx: &mut 
 fn the_arrows_wrap_and_enter_opens_the_session_at_the_match(cx: &mut TestAppContext) {
     let (shell, cx) = open_shell(cx);
     let palette = open_palette(&shell, cx);
-    typed("backoff", cx);
+    typed("\"three times\" backoff", cx);
     assert_eq!(rows(&palette, cx), [Row::Session(0), Row::Match(0, 0)]);
     assert_eq!(highlight(&palette, cx), 0);
     cx.simulate_keystrokes("down");
@@ -244,9 +284,15 @@ fn the_arrows_wrap_and_enter_opens_the_session_at_the_match(cx: &mut TestAppCont
     let at = at.expect("it opens at the match");
     assert_eq!(at.kind, MatchKind::Prompt);
     assert!(matches!(at.at, Some(At::Block { turn: 0, .. })));
-    assert!(!at.subagent);
-    assert_eq!(at.find, "backoff");
-    assert_eq!(at.flash.as_deref(), Some("backoff"));
+    assert_eq!(at.subagent, None);
+    assert_eq!(at.find, "three times backoff", "the terms, without quotes");
+    assert_eq!(at.flash.as_deref(), Some("three times"));
+    let first = at.request;
+
+    // The reader takes it once; asking again is a new request.
+    let taken = library(cx).update(cx, |library, _| library.take_read_at());
+    assert_eq!(taken.map(|it| it.request), Some(first));
+    assert!(library(cx).read_with(cx, |it, _| it.read_at().is_none()));
 
     // Back on the page, the session and the search are the recent ones.
     cx.simulate_keystrokes("alt-left");
@@ -255,11 +301,65 @@ fn the_arrows_wrap_and_enter_opens_the_session_at_the_match(cx: &mut TestAppCont
         rows(&palette, cx),
         [Row::RecentSession(0), Row::RecentSearch(0)]
     );
-    // Enter on a recent search searches it again.
+    // Enter on a recent search searches it again, and the same match opens again, anew.
     cx.simulate_keystrokes("down enter");
     cx.run_until_parked();
-    assert_eq!(text(&palette, cx), "backoff");
-    assert_eq!(found(cx), Some(vec![SESSIONS[1].title.to_string()]));
+    assert_eq!(text(&palette, cx), "\"three times\" backoff");
+    cx.simulate_keystrokes("down enter");
+    cx.run_until_parked();
+    let again = library(cx).read_with(cx, |it, _| it.read_at().map(|it| it.request));
+    assert_eq!(again, Some(first + 1));
+}
+
+#[gpui::test]
+fn a_match_in_a_subagent_says_where_in_it_and_an_unattached_one_its_place(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    write_with(
+        |tree| {
+            let mut session = tree.session("/home/user/code/app", 0);
+            session.transcript.prompt("Ask the widget expert.");
+            let call = session.transcript.call(
+                "Agent",
+                json!({ "subagent_type": "expert", "description": "Ask", "prompt": "Explain." }),
+            );
+            let mut subagent = session.subagent_of(&call, "expert", "Ask");
+            subagent.prompt("Explain widgets.");
+            subagent.reply("A widget holds a frobnicator.");
+            session.transcript.result_with(
+                &call,
+                json!("Explained."),
+                false,
+                json!({ "agentId": subagent.agent, "status": "completed" }),
+            );
+            let mut lone = session.subagent_without_meta();
+            lone.prompt("Nobody asked.");
+            lone.reply("The quuxifier hums.");
+            session.transcript.title("Widgets");
+        },
+        cx,
+    );
+    let sync = cx.update(|_, cx| cx.services().sync.clone());
+    sync.update(cx, |sync, cx| sync.sync_all(cx));
+    cx.run_until_parked();
+
+    let open_at = |term: &str, cx: &mut VisualTestContext| {
+        open_palette(&shell, cx);
+        typed(term, cx);
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        let at = library(cx).read_with(cx, |it, _| it.read_at().cloned());
+        cx.simulate_keystrokes("alt-left");
+        at.expect("it opens at the match")
+    };
+    let inside = open_at("frobnicator", cx);
+    assert!(matches!(inside.at, Some(At::Block { turn: 0, .. })));
+    let place = inside.subagent.expect("the text is the subagent's");
+    assert!(place.item.contains("agent-"), "{}", place.item);
+    assert_eq!(inside.flash.as_deref(), Some("frobnicator"));
+
+    let lone = open_at("quuxifier", cx);
+    assert_eq!(lone.at, Some(At::Unattached(0)));
+    assert!(lone.subagent.is_some());
 }
 
 #[gpui::test]
@@ -303,6 +403,15 @@ fn the_commands_group_heads_the_results_and_enter_runs_one(cx: &mut TestAppConte
         "Show Trash"
     );
 
+    // On Trash's page, moving to Trash is no command.
+    let palette = open_palette(&shell, cx);
+    typed("trash", cx);
+    assert_eq!(
+        palette.read_with(cx, |palette, cx| palette.command_names(cx)),
+        ["Show Trash"]
+    );
+    cx.simulate_keystrokes("escape");
+
     // A command with a key runs that key's action where the keyboard rests: the main area.
     open_palette(&shell, cx);
     typed("new folder", cx);
@@ -327,4 +436,70 @@ fn no_key_of_the_shell_acts_behind_the_palette(cx: &mut TestAppContext) {
         cx.update(|window, cx| palette.read(cx).input.focus_handle(cx).is_focused(window)),
         "the query field keeps the keyboard"
     );
+}
+
+#[gpui::test]
+fn the_index_being_made_and_a_search_that_cant_run_are_said(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    let dir = archive_dir(cx);
+    sb_test_support::edit_catalogue(&dir, "UPDATE session SET searchable = 0");
+    let palette = open_palette(&shell, cx);
+    assert_eq!(service(cx).read_with(cx, |it, _| it.unsearchable()), 3);
+    assert!(bounds(cx, "palette-indexing").is_some(), "Still indexing");
+
+    typed("upload", cx);
+    service(cx).update(cx, |search, cx| {
+        search.answered(
+            Answered {
+                query: Query {
+                    terms: vec!["upload".to_string()],
+                    ..Query::default()
+                },
+                text: "upload".to_string(),
+                find: "upload".to_string(),
+                answer: Answer::Unavailable("the index is held by another program".to_string()),
+                took: Duration::ZERO,
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert!(bounds(cx, "palette-said").is_some());
+    assert_eq!(rows(&palette, cx), []);
+}
+
+#[gpui::test]
+fn the_recent_sessions_leave_once_in_trash_or_deleted_for_good(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    let ids: Vec<_> = library(cx).read_with(cx, |library, _| {
+        (library.sessions().unwrap().sessions.iter())
+            .map(|it| it.id.clone())
+            .collect()
+    });
+    for at in [0, 1] {
+        library(cx).update(cx, |library, cx| library.open_session_at(&ids[at], at, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("alt-left");
+    }
+    assert_eq!(recent(cx), [SESSIONS[1].title, SESSIONS[0].title]);
+
+    // Moved to Trash: it leaves the list when the palette opens again.
+    library(cx).update(cx, |library, cx| library.trash(vec![ids[0].clone()], cx));
+    cx.run_until_parked();
+    open_palette(&shell, cx);
+    assert_eq!(recent(cx), [SESSIONS[1].title]);
+    cx.simulate_keystrokes("escape");
+
+    // Deleted for good: it leaves the list at once.
+    library(cx).update(cx, |library, cx| library.trash(vec![ids[1].clone()], cx));
+    cx.run_until_parked();
+    let session = cx.update(|_, cx| {
+        let archive = cx.services().archive.read(cx).archive().cloned().unwrap();
+        archive.catalogue().session(&ids[1]).unwrap().unwrap()
+    });
+    library(cx).update(cx, |library, cx| library.ask_delete_for_good(session, cx));
+    cx.run_until_parked();
+    library(cx).update(cx, |library, cx| library.answer_delete_for_good(true, cx));
+    cx.run_until_parked();
+    assert_eq!(recent(cx), Vec::<String>::new());
 }

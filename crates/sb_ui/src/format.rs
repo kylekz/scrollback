@@ -157,11 +157,12 @@ pub fn size(bytes: u64) -> String {
 /// `412 MB` (DESIGN §4.8's sizes).
 pub fn fine_size(bytes: u64) -> String {
     let (unit, size) = unit_of(bytes);
-    let value = bytes as f64 / size as f64;
-    if value < 10. && unit != "KB" {
-        format!("{value:.1} {unit}")
+    // Rounded first, so that 9.96 MB reads "10 MB" and not "10.0 MB".
+    let tenths = (bytes as f64 / size as f64 * 10.).round() / 10.;
+    if tenths < 10. && unit != "KB" {
+        format!("{tenths:.1} {unit}")
     } else {
-        format!("{value:.0} {unit}")
+        format!("{tenths:.0} {unit}")
     }
 }
 
@@ -212,6 +213,16 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn a_fine_size_has_a_tenth_below_ten_once_rounded() {
+        let mb = 1 << 20;
+        assert_eq!(fine_size(9 * mb + mb * 8 / 10), "9.8 MB");
+        assert_eq!(fine_size(mb * 996 / 100), "10 MB");
+        assert_eq!(fine_size(412 * mb), "412 MB");
+        assert_eq!(fine_size(18 * 1024), "18 KB");
+        assert_eq!(fine_size(0), "0 KB");
+    }
 
     /// Noon, local time, on the day given.
     fn at(year: i32, month: u32, day: u32) -> i64 {
