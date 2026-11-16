@@ -9,8 +9,9 @@
 {"cmd": "click", "target": "first-run/add"}
 {"cmd": "wait_for", "pointer": "/sync/held", "equals": true, "timeout_ms": 60000}
 
-// Settings, while the pass waits: the stats, the last verify (none yet) and the sessions deleted for good (none) are read and drawn.
+// Settings, while the pass waits: the stats, the last verify (none yet) and the sessions deleted for good (none) are read and drawn. The stats are a job of their own, measured from the folder, and may land a few tens of milliseconds after the catalogue's cards (on NTFS they always do), so each is waited for.
 {"cmd": "click", "target": "titlebar/settings"}
+{"cmd": "wait_for", "pointer": "/settings/stats/sessions", "gte": 0, "timeout_ms": 5000}
 {"cmd": "wait_for", "pointer": "/settings/deleted", "equals": [], "timeout_ms": 5000}
 {"cmd": "state", "expect": [{"pointer": "/page", "equals": "settings"}, {"pointer": "/sync/held", "equals": true}, {"pointer": "/settings/stats/sessions", "gte": 0}, {"pointer": "/settings/verify/last", "equals": null}]}
 {"cmd": "bounds", "target": "settings/archive/stats", "expect_result": {"pointer": "/visible", "not_equals": null}}
