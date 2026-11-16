@@ -8,6 +8,7 @@
 
 mod calls;
 mod conversation;
+mod display;
 mod session;
 mod shapes;
 

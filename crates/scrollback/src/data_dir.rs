@@ -5,7 +5,7 @@
 //! `C:\Users\user\AppData\Local\scrollback`, `/Users/user/Library/Application
 //! Support/scrollback`).
 //!
-//! Nothing is written there yet: the archive is created in it by phase 1 (PLAN §13).
+//! The archive is its `archive` folder, made on the first run (PLAN D3, §4.4).
 
 use std::path::{Path, PathBuf};
 
@@ -79,11 +79,53 @@ fn choose(
     })
 }
 
+/**
+ * Whether `place` may be the data dir of a run with the development override
+ * (`--dev-location-home`), which archives generated data under real distros and hosts: only
+ * a data dir named for it, and never scrollback's own data folder, so that nothing of the
+ * kind ever lands in the owner's archive.
+ */
+#[cfg(feature = "automation")]
+pub fn for_development(place: &Place) -> Result<()> {
+    let own = dirs::data_local_dir().map(|data| data.join("scrollback"));
+    refuse_own(place, own.as_deref())
+}
+
+#[cfg(feature = "automation")]
+fn refuse_own(place: &Place, own: Option<&Path>) -> Result<()> {
+    let same = |a: &Path, b: &Path| {
+        a == b
+            || a.canonicalize()
+                .ok()
+                .is_some_and(|a| b.canonicalize().ok() == Some(a))
+    };
+    anyhow::ensure!(
+        place.source == Source::Explicit && !own.is_some_and(|own| same(&place.dir, own)),
+        "--dev-location-home archives generated data: it needs a scratch --data-dir of its own, \
+         never scrollback's own data folder"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[cfg(feature = "automation")]
+    #[test]
+    fn the_development_override_needs_a_data_dir_that_is_not_the_owners() {
+        let own = Path::new("/Users/user/Library/Application Support/scrollback");
+        let at = |dir: &Path, source| Place {
+            dir: dir.to_path_buf(),
+            source,
+        };
+        assert!(refuse_own(&at(Path::new("/tmp/scratch"), Source::Explicit), Some(own)).is_ok());
+        assert!(refuse_own(&at(own, Source::Explicit), Some(own)).is_err());
+        assert!(refuse_own(&at(own, Source::Platform), Some(own)).is_err());
+        assert!(refuse_own(&at(Path::new("/tmp/x"), Source::Automation), Some(own)).is_err());
+    }
 
     #[test]
     fn an_explicit_dir_wins() {

@@ -126,20 +126,76 @@ pub struct PassReport {
 }
 
 impl PassReport {
-    /// Why the pass did not archive everything the agent has, if it did not: how many items it
-    /// could not read and the first reason. Items that only changed under the pass are not a
-    /// reason, the next pass has them, until they have waited too long and are among `failed`.
+    /// Why the pass did not archive everything the agent has, if it did not, as a clause the
+    /// owner reads: how many items it could not read and the first reason. Items that only
+    /// changed under the pass are not a reason, the next pass has them, until they have waited
+    /// too long and are among `failed`.
     fn shortfall(&self) -> Option<String> {
         let first = self
             .failed
             .first()
             .map(|failure| &failure.reason)
             .or(self.unlisted.first().map(|unlisted| &unlisted.reason))?;
-        Some(format!(
-            "{} could not be archived; first: {first}",
-            self.failed.len() + self.unlisted.len()
-        ))
+        Some(match self.failed.len() + self.unlisted.len() {
+            1 => format!("1 item was not archived, because: {first}"),
+            items => format!("{items} items were not archived; the first because: {first}"),
+        })
     }
+}
+
+/// What a provider's agent has at a location, before any of it is archived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Found {
+    pub provider: ProviderId,
+    /// Where the agent keeps it there ([`Source::root`]).
+    pub root: String,
+    /// How many sessions its items belong to.
+    pub sessions: usize,
+    /// How long its items are together: what a first sync copies.
+    pub bytes: u64,
+    /// How long the agent keeps transcripts there, when it says; `None` too when that could
+    /// not be read, which is no reason to doubt the rest.
+    pub retention_days: Option<u32>,
+}
+
+/**
+ * What each of `providers` finds at the location behind `transport`, by a scan alone: what a
+ * location offers before it is added (PLAN §6.4; DESIGN §4.10). A provider whose agent is not
+ * there is left out; one that could not look is there with why. Nothing is archived or
+ * recorded.
+ */
+pub fn survey(
+    archive: &Archive,
+    transport: &dyn Transport,
+    providers: &[Box<dyn Provider + '_>],
+) -> Vec<Result<Found, (ProviderId, ProviderError)>> {
+    let scratch = archive.tmp();
+    providers
+        .iter()
+        .filter_map(|provider| {
+            let found = provider
+                .detect(transport, &scratch)
+                .and_then(|source| {
+                    let Some(mut source) = source else {
+                        return Ok(None);
+                    };
+                    let items = source.scan()?.items;
+                    let sessions: HashSet<_> = items
+                        .iter()
+                        .filter_map(|item| item.session.as_ref())
+                        .collect();
+                    Ok(Some(Found {
+                        provider: provider.id(),
+                        root: source.root(),
+                        sessions: sessions.len(),
+                        bytes: items.iter().map(|item| item.length).sum(),
+                        retention_days: source.retention_days().ok().flatten(),
+                    }))
+                })
+                .map_err(|error| (provider.id(), error));
+            found.transpose()
+        })
+        .collect()
 }
 
 /// One provider's pass over a location.
@@ -315,7 +371,7 @@ fn pass(
         log::warn!("could not read how long {provider} keeps transcripts: {error}");
         None
     });
-    catalogue.record_provider(location, provider.as_str(), retention_days)?;
+    catalogue.record_provider(location, provider.as_str(), retention_days, &source.root())?;
 
     let scan = source.scan()?;
     let scanned = scan.items.len();

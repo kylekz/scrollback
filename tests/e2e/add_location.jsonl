@@ -1,0 +1,172 @@
+{"scenario": {"window_size": "1440x900", "fixture": "locations", "description": "Add a location (DESIGN §4.12, E-Add-Location) from the locations sheet, every step and outcome captured dark and light: WSL's distros as listed, one already a location, a running one tested as it is chosen, a stopped one added without a test; an SSH host that passes; one that can't be reached and is added anyway; one whose key isn't accepted, which can't be added and is offered no way to accept it; tools missing, no ssh, sign-in refused, a login shell that hung; a host ssh can't take; a host that is a location already. No scripted run reaches a real distro or host"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/sync/locations", "len": 3}]}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+{"cmd": "stand_in", "distros": [{"name": "Ubuntu-24.04", "running": true, "default": true}, {"name": "Debian"}, {"name": "Arch", "running": true}, {"name": "docker-desktop", "running": true, "utility": true}]}
+{"cmd": "key", "keystroke": "secondary-l"}
+{"cmd": "settle", "expect": {"pointer": "/sheet/dialog", "equals": null}}
+
+// WSL: the distros WSL lists, Docker's left out; the one that is a location can't be chosen. The dialog is 440 wide, 24 under the title bar.
+{"cmd": "click", "target": "sheet/add"}
+{"cmd": "settle", "expect": {"pointer": "/sheet/dialog", "equals": "add"}}
+{"cmd": "bounds", "target": "add", "expect_result": [{"pointer": "/w", "equals": 440}, {"pointer": "/y", "gte": 62}, {"pointer": "/y", "lte": 64}, {"pointer": "/x", "equals": 500}]}
+{"cmd": "query", "prefix": "add/distro/", "expect_result": [{"pointer": "", "len": 3}, {"pointer": "/0/target", "equals": "add/distro/Ubuntu-24.04"}]}
+// A running distro is tested as it is chosen.
+{"cmd": "click", "target": "add/distro/Arch"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "Arch", "state": "passed"}}}
+{"cmd": "bounds", "target": "add/result/passed", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "add-wsl-running-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "add-wsl-running-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+// A stopped one is not tested, so as not to start it, and says so.
+{"cmd": "click", "target": "add/distro/Debian"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": null}}
+{"cmd": "bounds", "target": "add/stopped", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "add-wsl-stopped-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "add-wsl-stopped-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+// Back to the running one, added and synced.
+{"cmd": "click", "target": "add/distro/Arch"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test/state", "equals": "passed"}}
+{"cmd": "click", "target": "add/add-sync"}
+{"cmd": "settle", "expect": [{"pointer": "/sheet", "equals": {"selected": "Arch", "dialog": null}}, {"pointer": "/sync/locations/3/name", "equals": "Arch"}, {"pointer": "/sync/locations/3/state", "equals": "synced"}, {"pointer": "/sync/test", "equals": null}]}
+
+// SSH: a host that answers. The name is the host's until one is typed.
+{"cmd": "stand_in", "places": {"user@studio": "passes"}}
+{"cmd": "click", "target": "sheet/add"}
+{"cmd": "click", "target": "add/kind/ssh"}
+{"cmd": "type", "text": "user@studio"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "user@studio", "state": "passed"}}}
+{"cmd": "bounds", "target": "add/name", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "add-ssh-passed-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "add-ssh-passed-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+// Esc closes the dialog and cancels its test; the sheet stays.
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": [{"pointer": "/sheet/dialog", "equals": null}, {"pointer": "/sync/test", "equals": null}, {"pointer": "/sync/locations", "len": 4}]}
+
+// A host that can't be reached: ssh's words, the command run, what to check, and Add anyway, which adds it unreachable.
+{"cmd": "click", "target": "sheet/add"}
+{"cmd": "click", "target": "add/kind/ssh"}
+{"cmd": "type", "text": "asleep-mac"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "asleep-mac", "state": "unreachable"}}}
+{"cmd": "bounds", "target": "add/result/unreachable", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "add/anyway", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "add-ssh-unreachable-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "add-ssh-unreachable-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+// Add and sync now is not to be pressed: Enter in the name field does nothing.
+{"cmd": "click", "target": "add/add-sync"}
+{"cmd": "settle", "expect": {"pointer": "/sheet/dialog", "equals": "add"}}
+{"cmd": "click", "target": "add/anyway"}
+{"cmd": "settle", "expect": [{"pointer": "/sheet", "equals": {"selected": "asleep-mac", "dialog": null}}, {"pointer": "/sync/locations/4/state", "equals": "unreachable"}]}
+
+// A host whose key isn't accepted can't be added, and nothing offers to accept the key.
+{"cmd": "stand_in", "places": {"changed-mac": "host_key", "bare-mac": "missing_tools", "locked-mac": "refused", "slow-mac": "login_hung", "far-mac": "no_ssh", "new-mac": "new_host_key"}}
+{"cmd": "click", "target": "sheet/add"}
+{"cmd": "click", "target": "add/kind/ssh"}
+{"cmd": "type", "text": "changed-mac"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "changed-mac", "state": "host_key"}}}
+{"cmd": "bounds", "target": "add/anyway", "expect_error": "no target"}
+{"cmd": "click", "target": "add/add-sync"}
+{"cmd": "settle", "expect": [{"pointer": "/sheet/dialog", "equals": "add"}, {"pointer": "/sync/locations", "len": 5}]}
+{"cmd": "screenshot", "name": "add-ssh-host-key-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "add-ssh-host-key-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "click", "target": "add/cancel"}
+
+// A host whose key ssh doesn't know yet is told apart from one whose key changed: the key is accepted outside scrollback, and it can't be added here either.
+{"cmd": "click", "target": "sheet/add"}
+{"cmd": "click", "target": "add/kind/ssh"}
+{"cmd": "type", "text": "new-mac"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "new-mac", "state": "host_key"}}}
+{"cmd": "bounds", "target": "add/anyway", "expect_error": "no target"}
+{"cmd": "screenshot", "name": "add-ssh-new-host-key-dark"}
+{"cmd": "click", "target": "add/cancel"}
+
+// Tools missing there: named, and it can't be added until it has them.
+{"cmd": "click", "target": "sheet/add"}
+{"cmd": "click", "target": "add/kind/ssh"}
+{"cmd": "type", "text": "bare-mac"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "bare-mac", "state": "missing"}}}
+{"cmd": "bounds", "target": "add/anyway", "expect_error": "no target"}
+{"cmd": "screenshot", "name": "add-ssh-missing-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "add-ssh-missing-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "click", "target": "add/cancel"}
+
+// No ssh on this machine.
+{"cmd": "click", "target": "sheet/add"}
+{"cmd": "click", "target": "add/kind/ssh"}
+{"cmd": "type", "text": "far-mac"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "far-mac", "state": "not_installed"}}}
+{"cmd": "bounds", "target": "add/anyway", "expect_error": "no target"}
+{"cmd": "screenshot", "name": "add-ssh-no-ssh-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "add-ssh-no-ssh-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "click", "target": "add/cancel"}
+
+// Sign-in refused, and a login shell that hung: both in the tool's words, both can be added anyway.
+{"cmd": "click", "target": "sheet/add"}
+{"cmd": "click", "target": "add/kind/ssh"}
+{"cmd": "type", "text": "locked-mac"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "locked-mac", "state": "refused"}}}
+{"cmd": "bounds", "target": "add/anyway", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "add-ssh-refused-dark"}
+{"cmd": "click", "target": "add/cancel"}
+{"cmd": "click", "target": "sheet/add"}
+{"cmd": "click", "target": "add/kind/ssh"}
+{"cmd": "type", "text": "slow-mac"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "slow-mac", "state": "login_hung"}}}
+{"cmd": "screenshot", "name": "add-ssh-login-hung-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "add-ssh-login-hung-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "click", "target": "add/cancel"}
+
+// A host ssh would take for an option is refused before anything runs; so is a host that is a location already.
+{"cmd": "click", "target": "sheet/add"}
+{"cmd": "click", "target": "add/kind/ssh"}
+{"cmd": "type", "text": "-oProxyCommand=x"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": null}}
+{"cmd": "bounds", "target": "add/host-problem", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "add-ssh-bad-host-dark"}
+{"cmd": "click", "target": "add/cancel"}
+{"cmd": "click", "target": "sheet/add"}
+{"cmd": "click", "target": "add/kind/ssh"}
+{"cmd": "type", "text": "user@macbook"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": null}}
+{"cmd": "bounds", "target": "add/already", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "add-ssh-already-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "add-ssh-already-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "click", "target": "add/cancel"}
+{"cmd": "settle", "expect": [{"pointer": "/sheet/dialog", "equals": null}, {"pointer": "/sync/locations", "len": 5}]}

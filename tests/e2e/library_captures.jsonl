@@ -1,0 +1,86 @@
+{"scenario": {"window_size": "1440x900", "fixture": "boards-held-back", "description": "The library pages of the boards' archive at the sizes the owner checks (1440x900, 1040x700, 960x600 and a very wide window), dark and light: a card's last line (DESIGN §4.4), the keyboard's ring on a sidebar row and on a card, a nested folder's indent, the row that marks a page whose folder is hidden, and the sidebar over a narrow window's page"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/library/sessions", "equals": 2318}]}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+{"cmd": "settle"}
+
+// One of the sessions is held back and filed by hand. The page decides on counts by what an ordinary card carries, so that one session takes nobody else's count; its own card drops its count when its line is short of room (DESIGN §4.4).
+{"cmd": "bounds", "target": "card/0/calls", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "all-sessions-1440-dark"}
+
+// fc's page holds a subfolder's sessions, one of them held back and filed by hand: the ordinary cards keep their counts.
+{"cmd": "click", "target": "sidebar/folder/fc"}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 488}}
+{"cmd": "bounds", "target": "card/1/calls", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "folder-1440-dark"}
+{"cmd": "scroll", "target": "page/cards", "dy": -600}
+{"cmd": "screenshot", "name": "folder-held-back-1440-dark"}
+
+// The tree opened two levels (DESIGN §4.1: 18 per level with a guide); player's page shown, then fc closed over it: fc's row marks where the page is.
+{"cmd": "click", "target": "sidebar/folder-chevron/fc"}
+{"cmd": "click", "target": "sidebar/folder-chevron/dv"}
+{"cmd": "click", "target": "sidebar/folder/player"}
+{"cmd": "settle", "expect": {"pointer": "/library/shelf", "equals": {"folder": "player"}}}
+{"cmd": "bounds", "target": "sidebar/folder/player", "expect_result": [{"pointer": "/x", "equals": 8}, {"pointer": "/h", "equals": 32}]}
+{"cmd": "screenshot", "name": "nested-tree-dark"}
+{"cmd": "click", "target": "sidebar/folder-chevron/fc", "expect": {"pointer": "/library/shelf", "equals": {"folder": "player"}}}
+{"cmd": "screenshot", "name": "hidden-subfolder-dark"}
+
+// The keyboard's ring: from the page, F6 to the sidebar's rows, where down goes to the row that hides the page (DESIGN §4.1); then F6 back to the page and an arrow to a card.
+{"cmd": "click", "target": "card/0"}
+{"cmd": "key", "keystroke": "f6"}
+{"cmd": "key", "keystroke": "down", "expect": {"pointer": "/library/shelf", "equals": {"folder": "fc"}}}
+{"cmd": "screenshot", "name": "sidebar-focus-dark"}
+{"cmd": "key", "keystroke": "f6"}
+{"cmd": "key", "keystroke": "right"}
+{"cmd": "screenshot", "name": "card-focus-dark"}
+
+// Light.
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "card-focus-light"}
+{"cmd": "click", "target": "sidebar/all-sessions"}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 2318}}
+{"cmd": "screenshot", "name": "all-sessions-1440-light"}
+{"cmd": "click", "target": "sidebar/unsorted"}
+{"cmd": "settle", "expect": {"pointer": "/library/groups", "equals": 6}}
+{"cmd": "screenshot", "name": "unsorted-1440-light"}
+
+// 1040x700: the sidebar docks; the paths line stays one line.
+{"cmd": "resize", "w": 1040, "h": 700, "expect": {"pointer": "/shell/sidebar", "equals": "docked"}}
+{"cmd": "click", "target": "sidebar/folder/fc"}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 488}}
+{"cmd": "bounds", "target": "page/paths", "expect_result": {"pointer": "/h", "equals": 28}}
+{"cmd": "screenshot", "name": "folder-1040-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "folder-1040-dark"}
+{"cmd": "click", "target": "sidebar/unsorted"}
+{"cmd": "settle", "expect": {"pointer": "/library/groups", "equals": 6}}
+{"cmd": "screenshot", "name": "unsorted-1040-dark"}
+
+// 960x600: the sidebar comes over the page with its shadow.
+{"cmd": "resize", "w": 960, "h": 600, "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+{"cmd": "screenshot", "name": "unsorted-960-dark"}
+{"cmd": "key", "keystroke": "secondary-b", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
+{"cmd": "screenshot", "name": "overlay-960-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "overlay-960-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "settle"}
+{"cmd": "click", "target": "sidebar/all-sessions", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 2318}}
+{"cmd": "screenshot", "name": "all-sessions-960-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "all-sessions-960-light"}
+
+// A very wide window has more columns, each card no wider than 320.
+{"cmd": "resize", "w": 2400, "h": 1000, "expect": {"pointer": "/shell/sidebar", "equals": "docked"}}
+{"cmd": "bounds", "target": "card/0", "expect_result": [{"pointer": "/w", "lte": 320}, {"pointer": "/w", "gte": 240}]}
+{"cmd": "screenshot", "name": "all-sessions-wide-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "all-sessions-wide-dark"}

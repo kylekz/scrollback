@@ -13,9 +13,27 @@
 //! closes it: on the main area or on the title bar, except on the title bar's own buttons (the
 //! sidebar's, which toggles, and Windows' caption buttons, which are the OS's).
 //!
-//! **Keyboard.** It rests on the main area, inside the shell's key context, until a view there
-//! takes it, so the shell's keys work at once. The main area is the window's `Main` landmark,
-//! which is what assistive technology announces while nothing in it has the keyboard.
+//! **Keyboard.** It rests on the main area ([`MainArea`]'s focus handle), inside the shell's key
+//! context, so the shell's keys and the shown page's work at once. `F6` moves it between the
+//! sidebar and the main area, and so does `Ctrl B` while the sidebar is docked (DESIGN §4.1);
+//! `Enter` in the sidebar hands it to the page. `Tab` walks the title bar's buttons, the
+//! sidebar and its buttons, then the main area and the page's buttons, in that order
+//! (DESIGN §4.1), and `Enter` or `Space` presses the button that has the keyboard. The main
+//! area is the window's `Main` landmark, which is what assistive technology announces while
+//! nothing in it has the keyboard.
+//!
+//! **The keyboard is always on something drawn.** When what had it leaves the window (a
+//! button of a group that was filed, a sidebar that was hidden), it goes to the nearest thing
+//! around it that is still there, or to the main area. A folder renamed while the sidebar is
+//! hidden shows the sidebar over the main area for its row.
+//!
+//! The library's own keys work wherever the keyboard is: `Ctrl Shift N` makes a folder, `F2`
+//! renames the folder whose page is shown, `F5` syncs every location, `Alt ←` goes back from
+//! an opened session, `Ctrl L` opens the locations sheet (DESIGN §5).
+//!
+//! **The locations sheet** ([`LocationsSheet`], DESIGN §4.11) opens over the scrim from a
+//! sidebar location row, the Locations overline or `Ctrl L`, while a library page shows. It
+//! keeps the keyboard while it is open, and gives it back to where it was when it closes.
 
 pub mod title_bar;
 
@@ -25,18 +43,23 @@ mod tests;
 use anyhow::{Context as _, Result};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, Role, Size,
-    StatefulInteractiveElement as _, Styled as _, Subscription, TitlebarOptions, Window,
-    WindowBounds, WindowHandle, WindowOptions, deferred, div, point, prelude::FluentBuilder as _,
-    px, size,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, Size, Styled as _,
+    Subscription, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions, deferred,
+    div, point, prelude::FluentBuilder as _, px, size,
 };
 use gpui_appearance::Backing;
 use gpui_component::Root;
 
-use crate::actions::shell::{Dismiss, ToggleSidebar};
+use crate::actions::library::{Back, NewFolder, SyncAll};
+use crate::actions::shell::{Dismiss, FocusOther, OpenLocations, ToggleSidebar};
+use crate::actions::sidebar::Rename;
 use crate::automation::AutomationTargetExt as _;
 use crate::keymap;
-use crate::sidebar::sidebar;
+use crate::locations_sheet::{LocationsSheet, LocationsSheetEvent};
+use crate::overlay::{self, Layer};
+use crate::pages::{MainArea, Showing};
+use crate::services::ActiveServices as _;
+use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::theme::{ActiveTheme as _, Material, SbTheme, StyledText as _};
 
 /// Where the sidebar is (module docs, "Narrow windows").
@@ -65,24 +88,84 @@ impl SidebarPlacement {
 pub struct Shell {
     /// Keeps the window's material and light/dark in step (module docs).
     appearance: gpui_appearance::WindowTracker,
-    /// The main area's, where the keyboard rests (module docs).
-    focus_handle: FocusHandle,
+    sidebar: Entity<Sidebar>,
+    /// Where the keyboard rests (module docs).
+    main: Entity<MainArea>,
     /// Whether a narrow window shows the sidebar over its main area.
     sidebar_open: bool,
-    _theme_changed: Subscription,
+    /// The locations sheet while it is open, with where the keyboard was before it.
+    locations: Option<(
+        Entity<LocationsSheet>,
+        Option<FocusHandle>,
+        [Subscription; 2],
+    )>,
+    _observers: [Subscription; 6],
 }
 
 impl Shell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let focus_handle = cx.focus_handle();
-        focus_handle.focus(window, cx);
+        let main = cx.new(MainArea::new);
+        main.focus_handle(cx).focus(window, cx);
+        let sidebar = cx.new(|cx| Sidebar::new(window, cx));
+        let services = cx.services();
+        let (archive, sync, library) = (
+            services.archive.clone(),
+            services.sync.clone(),
+            services.library.clone(),
+        );
         Self {
             // gpui opened the window light or dark as the OS is; the theme may say otherwise.
             appearance: gpui_appearance::track_window(Backing::Solid, window, cx),
-            focus_handle,
             sidebar_open: false,
-            _theme_changed: cx.observe_global_in::<SbTheme>(window, |_, _, cx| cx.notify()),
+            locations: None,
+            _observers: [
+                cx.observe_global_in::<SbTheme>(window, |_, _, cx| cx.notify()),
+                // The title bar follows the archive, the locations and the passes.
+                cx.observe(&archive, |_, _, cx| cx.notify()),
+                cx.observe(&sync, |_, _, cx| cx.notify()),
+                cx.observe(&library, |_, _, cx| cx.notify()),
+                cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+                    match event {
+                        // Picking a row closes a narrow window's overlay (DESIGN §2), and
+                        // the keyboard goes to the page with it.
+                        SidebarEvent::Picked => {
+                            if std::mem::take(&mut this.sidebar_open) {
+                                this.main.focus_handle(cx).focus(window, cx);
+                            }
+                        }
+                        SidebarEvent::Open => {
+                            this.sidebar_open = false;
+                            this.main.focus_handle(cx).focus(window, cx);
+                        }
+                        // The row that is renamed has the keyboard, so it must show.
+                        SidebarEvent::Renaming => {
+                            this.sidebar_open = this
+                                .sidebar_placement(window.viewport_size().width, cx)
+                                != SidebarPlacement::Docked;
+                        }
+                        SidebarEvent::Locations(selected) => {
+                            this.sidebar_open = false;
+                            this.open_locations(selected.clone(), window, cx);
+                        }
+                    }
+                    cx.notify();
+                }),
+                // What had the keyboard is gone from the window (module docs).
+                cx.on_focus_lost(window, |this, window, cx| {
+                    window
+                        .focus_lost_restore_target(cx)
+                        .unwrap_or_else(|| this.main.focus_handle(cx))
+                        .focus(window, cx);
+                }),
+            ],
+            sidebar,
+            main,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sidebar(&self) -> &Entity<Sidebar> {
+        &self.sidebar
     }
 
     /// The material applied to the window.
@@ -101,19 +184,105 @@ impl Shell {
         }
     }
 
+    /// What the main area shows.
+    pub fn showing(&self, cx: &App) -> Showing {
+        Showing::now(cx)
+    }
+
+    /// Shows or hides a narrow window's sidebar, the keyboard going with it. A docked
+    /// sidebar always shows, so there the keyboard alone moves.
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, window: &mut Window, cx: &mut Context<Self>) {
-        // A docked sidebar always shows.
-        if self.sidebar_placement(window.viewport_size().width, cx) != SidebarPlacement::Docked {
-            self.sidebar_open = !self.sidebar_open;
+        if self.sidebar_placement(window.viewport_size().width, cx) == SidebarPlacement::Docked {
+            return self.focus_other(&FocusOther, window, cx);
+        }
+        self.sidebar_open = !self.sidebar_open;
+        if self.sidebar_open {
+            self.sidebar.focus_handle(cx).focus(window, cx);
+        } else {
+            self.main.focus_handle(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Moves the keyboard between the sidebar and the main area. A narrow window shows its
+    /// sidebar to give it the keyboard, and hides it again when the keyboard leaves.
+    fn focus_other(&mut self, _: &FocusOther, window: &mut Window, cx: &mut Context<Self>) {
+        let sidebar = self.sidebar.focus_handle(cx);
+        if sidebar.contains_focused(window, cx) {
+            self.sidebar_open = false;
+            self.main.focus_handle(cx).focus(window, cx);
+        } else {
+            self.sidebar_open = self.sidebar_placement(window.viewport_size().width, cx)
+                != SidebarPlacement::Docked;
+            sidebar.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar_open {
+            self.sidebar_open = false;
+            self.main.focus_handle(cx).focus(window, cx);
             cx.notify();
         }
     }
 
-    fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
-        if self.sidebar_open {
-            self.sidebar_open = false;
+    /// Opens the locations sheet with `selected` selected, while a library page shows.
+    pub fn open_locations(
+        &mut self,
+        selected: Option<sb_core::location::LocationId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.locations.is_some() || !Showing::now(cx).is_library() {
+            return;
+        }
+        let back = window.focused(cx);
+        let sheet = cx.new(|cx| LocationsSheet::new(selected, window, cx));
+        let heard = [
+            cx.subscribe_in(&sheet, window, |this, _, event, window, cx| match event {
+                LocationsSheetEvent::Close => this.close_locations(window, cx),
+            }),
+            // The shell draws the sheet's dialogs, so it redraws with the sheet.
+            cx.observe(&sheet, |_, _, cx| cx.notify()),
+        ];
+        self.locations = Some((sheet, back, heard));
+        cx.notify();
+    }
+
+    /// Closes the locations sheet, and gives the keyboard back to where it was.
+    fn close_locations(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((sheet, back, _)) = self.locations.take() {
+            sheet.update(cx, |sheet, cx| sheet.closing(window, cx));
+            back.unwrap_or_else(|| self.main.focus_handle(cx))
+                .focus(window, cx);
             cx.notify();
         }
+    }
+
+    /// The locations sheet, while it is open.
+    pub fn locations_sheet(&self) -> Option<&Entity<LocationsSheet>> {
+        self.locations.as_ref().map(|(sheet, ..)| sheet)
+    }
+
+    fn new_folder(&mut self, _: &NewFolder, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.new_folder(false, cx));
+    }
+
+    fn rename(&mut self, _: &Rename, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.rename_shown(window, cx));
+    }
+
+    pub(super) fn sync_all(&mut self, _: &SyncAll, _: &mut Window, cx: &mut Context<Self>) {
+        let sync = cx.services().sync.clone();
+        sync.update(cx, |sync, cx| sync.sync_all(cx));
+    }
+
+    fn back(&mut self, _: &Back, _: &mut Window, cx: &mut Context<Self>) {
+        let library = cx.services().library.clone();
+        library.update(cx, |library, cx| library.close(cx));
     }
 
     /// The main area (DESIGN §2): where the pages and the reader go. Always solid, since
@@ -121,14 +290,29 @@ impl Shell {
     fn render_main(&self, theme: &SbTheme) -> AnyElement {
         div()
             .id("main")
-            .role(Role::Main)
-            .track_focus(&self.focus_handle)
             .flex_1()
             .min_w_0()
             .h_full()
             .bg(theme.colors.bg_app)
             .debug_selector(|| "main".into())
+            .child(self.main.clone())
             .automation_target("shell/main")
+    }
+
+    /// The sidebar on `background`: `bg-side` docked, its solid value as an overlay
+    /// (DESIGN §2).
+    fn render_sidebar(&self, background: gpui::Hsla, theme: &SbTheme) -> AnyElement {
+        div()
+            .id("sidebar")
+            .flex_none()
+            .w(theme.sizes.sidebar_width)
+            .h_full()
+            .bg(background)
+            .border_r_1()
+            .border_color(theme.colors.line_subtle)
+            .debug_selector(|| "sidebar".into())
+            .child(self.sidebar.clone())
+            .automation_target("shell/sidebar")
     }
 
     /// The sidebar over the main area of a narrow window, and under it a layer that takes the
@@ -154,7 +338,7 @@ impl Shell {
                         .shadow(theme.shadows.pop.clone())
                         // A press on the sidebar itself is not a press outside it.
                         .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
-                        .child(sidebar(theme.colors.bg_side_overlay, theme)),
+                        .child(self.render_sidebar(theme.colors.bg_side_overlay, theme)),
                 ),
         )
         .into_any_element()
@@ -162,8 +346,8 @@ impl Shell {
 }
 
 impl Focusable for Shell {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.main.focus_handle(cx)
     }
 }
 
@@ -176,11 +360,27 @@ impl Render for Shell {
         if placement == SidebarPlacement::Docked {
             self.sidebar_open = false;
         }
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.keep_name_left_behind(window, cx));
+        // A sidebar that isn't shown can't keep the keyboard.
+        if placement == SidebarPlacement::Collapsed
+            && self.sidebar.focus_handle(cx).contains_focused(window, cx)
+        {
+            self.main.focus_handle(cx).focus(window, cx);
+        }
         div()
             .id("shell")
             .key_context(keymap::SHELL)
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::focus_other))
             .on_action(cx.listener(Self::dismiss))
+            .on_action(cx.listener(Self::new_folder))
+            .on_action(cx.listener(Self::rename))
+            .on_action(cx.listener(Self::sync_all))
+            .on_action(cx.listener(Self::back))
+            .on_action(cx.listener(|this, _: &OpenLocations, window, cx| {
+                this.open_locations(None, window, cx);
+            }))
             .relative()
             .size_full()
             .flex()
@@ -199,13 +399,34 @@ impl Render for Shell {
                     .flex()
                     .flex_row()
                     .when(placement == SidebarPlacement::Docked, |this| {
-                        this.child(sidebar(c.bg_side, &theme))
+                        this.child(self.render_sidebar(c.bg_side, &theme))
                     })
                     .child(self.render_main(&theme)),
             )
             .when(placement == SidebarPlacement::Overlay, |this| {
                 this.child(self.render_sidebar_overlay(&theme, cx))
             })
+            .children(self.locations.as_ref().map(|(sheet, ..)| {
+                let shell = cx.entity().downgrade();
+                overlay::modal(
+                    sheet.clone(),
+                    Layer::Sheet,
+                    window,
+                    &theme,
+                    move |window, cx| {
+                        shell
+                            .update(cx, |shell, cx| shell.close_locations(window, cx))
+                            .ok();
+                    },
+                )
+            }))
+            // A dialog over the sheet, on its own layer above it (DESIGN §3).
+            .children(
+                self.locations
+                    .as_ref()
+                    .map(|(sheet, ..)| sheet.clone())
+                    .and_then(|sheet| sheet.update(cx, |sheet, cx| sheet.dialog_layer(window, cx))),
+            )
     }
 }
 

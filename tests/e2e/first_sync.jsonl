@@ -1,0 +1,44 @@
+{"scenario": {"window_size": "1440x900", "fixture": "agent-large", "description": "A first sync, held where the scenario says so that nothing depends on the machine's speed (DESIGN §4.14, E-Edge-First-Sync): All sessions says how far the location is, the title bar and the sidebar show the pass running, Stop keeps what was copied and indexes it, and the next sync carries on to the end; everything lands in Unsorted by its path (23 of them: one project is on a drive that two of its paths name)"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": {"pointer": "/page", "equals": "first-run"}}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+{"cmd": "screenshot", "name": "first-run-dark"}
+
+// The pass will wait once it has stored its first batch of 256 files: the engine commits that many at once (`BATCH_ITEMS` in crates/sb_core/src/sync/store.rs), which every 256 below relies on. It runs in the background: the page is All sessions at once, with the First sync card, and the location's row is its taller, syncing one.
+{"cmd": "hold_sync", "after": 256, "expect_result": {"pointer": "/held", "equals": false}}
+{"cmd": "click", "target": "first-run/add"}
+{"cmd": "wait_for", "pointer": "/sync/held", "equals": true, "timeout_ms": 60000}
+{"cmd": "wait_for", "pointer": "/sync/locations/0/progress/items_done", "equals": 256, "timeout_ms": 10000}
+{"cmd": "state", "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/sync/syncing", "equals": true}, {"pointer": "/sync/locations/0/state", "equals": "syncing"}, {"pointer": "/sync/locations/0/progress/items", "equals": 2318}, {"pointer": "/sync/locations/0/progress/sessions", "equals": 0}, {"pointer": "/library/counts/all", "equals": 0}]}
+{"cmd": "bounds", "target": "first-sync", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/w", "equals": 1144}]}
+{"cmd": "bounds", "target": "page/empty", "expect_error": "no target"}
+{"cmd": "query", "prefix": "sidebar/location/", "expect_result": {"pointer": "", "len": 1}}
+{"cmd": "screenshot", "name": "first-sync-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 3}
+{"cmd": "screenshot", "name": "first-sync-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// Stop ends the pass at its next step, and lets it go from the hold. The batch it stored stays and is indexed, so its sessions show; the location says it was stopped, with what it left, which is not a failure.
+{"cmd": "click", "target": "first-sync/stop"}
+{"cmd": "wait_for", "pointer": "/sync/syncing", "equals": false, "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 60000, "expect": [{"pointer": "/sync/held", "equals": false}, {"pointer": "/sync/indexing", "equals": false}, {"pointer": "/sync/locations/0/state", "equals": "stopped"}, {"pointer": "/sync/locations/0/error", "equals": null}, {"pointer": "/page", "equals": "sessions"}, {"pointer": "/library/counts", "equals": {"all": 256, "starred": 0, "unsorted": 256}}, {"pointer": "/library/sessions", "equals": 256}]}
+{"cmd": "bounds", "target": "first-sync", "expect_error": "no target"}
+{"cmd": "bounds", "target": "page/empty", "expect_error": "no target"}
+{"cmd": "query", "prefix": "main/sync-failed/", "expect_result": {"pointer": "", "len": 0}}
+{"cmd": "screenshot", "name": "stopped-dark"}
+
+// Sync all carries on from there, held again after its first batch. It is still the location's first sync, and its banner leads to Unsorted while there are no folders.
+{"cmd": "hold_sync", "after": 256}
+{"cmd": "click", "target": "titlebar/sync-all"}
+{"cmd": "wait_for", "pointer": "/sync/held", "equals": true, "timeout_ms": 60000}
+{"cmd": "bounds", "target": "first-sync", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "click", "target": "first-sync/open-unsorted", "expect": {"pointer": "/page", "equals": "unsorted"}}
+{"cmd": "release_sync", "expect_result": {"pointer": "/held", "equals": false}}
+{"cmd": "settle", "timeout_ms": 120000, "expect": [{"pointer": "/sync/syncing", "equals": false}, {"pointer": "/sync/locations/0/state", "equals": "synced"}, {"pointer": "/library/counts", "equals": {"all": 2318, "starred": 0, "unsorted": 2318}}, {"pointer": "/library/groups", "equals": 23}]}
+{"cmd": "screenshot", "name": "unsorted-dark"}
+{"cmd": "click", "target": "sidebar/all-sessions"}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 2318}}
+{"cmd": "bounds", "target": "first-sync", "expect_error": "no target"}
+{"cmd": "screenshot", "name": "synced-dark"}

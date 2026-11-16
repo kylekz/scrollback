@@ -44,6 +44,10 @@ pub(crate) use trash::{ItemFile, Removal};
 pub enum CatalogueError {
     #[error(transparent)]
     Database(#[from] toolbox_store::Error),
+    /// A host that is not one to hand ssh ([`crate::location::host_problem`]): nothing was
+    /// added.
+    #[error("{0}")]
+    BadHost(String),
     /// A range was to be recorded as the continuation of a version that is not as long as the
     /// pass that fetched the range found it. Nothing was recorded.
     #[error("version {version} is no longer {length} bytes long, so nothing is appended to it")]
@@ -303,6 +307,33 @@ pub struct Waiting {
     pub reason: String,
 }
 
+/// A provider whose agent was found at a location (DESIGN §4.11), as its last pass there read
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderAt {
+    pub provider: String,
+    /// How long the agent keeps transcripts there, when it says.
+    pub retention_days: Option<u32>,
+    /// Where the agent keeps its data there ([`crate::provider::Source::root`]); `None` until
+    /// a pass records it.
+    pub root: Option<String>,
+}
+
+/// What the archive holds from one agent at one location.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Holding {
+    pub location: LocationId,
+    pub provider: String,
+    /// Its sessions in the index, those in Trash among them.
+    pub sessions: usize,
+    /// Of those, the sessions in Trash.
+    pub trashed: usize,
+    /// Its items' lengths, each item's newest version once.
+    pub bytes: u64,
+    /// When the first of its versions was archived, in Unix milliseconds.
+    pub since: Option<i64>,
+}
+
 /// The catalogue's file in the archive's folder.
 pub(crate) const DATABASE: &str = "scrollback.db";
 
@@ -310,7 +341,7 @@ const ITEM: &str = "i.id, i.key, i.kind, i.session, i.seen_length, i.seen_stamp,
 const VERSION: &str = "v.id, v.number, v.reason, v.started_at, v.length, v.hash, v.held_back, \
                        v.held_by_parse, v.damaged, v.export_version";
 const LOCATION: &str = "id, kind, detail, name, last_attempt_at, last_success_at, last_error, \
-                        unreachable_since, unreachable_reason, drive_mount";
+                        unreachable_since, unreachable_reason, drive_mount, removed_at";
 
 /// The open catalogue: a cheap-to-clone handle. Every method blocks on disk I/O.
 #[derive(Clone, Debug)]
@@ -372,6 +403,11 @@ impl Catalogue {
 
     /// Adds a location to pull from.
     pub fn add_location(&self, kind: LocationKind, name: &str) -> Result<Location> {
+        if let LocationKind::Ssh { host } = &kind
+            && let Some(problem) = crate::location::host_problem(host)
+        {
+            return Err(CatalogueError::BadHost(problem));
+        }
         let id = LocationId::new();
         let (kind_name, detail) = kind.columns();
         self.execute(
@@ -388,7 +424,38 @@ impl Catalogue {
             last_error: None,
             unreachable: None,
             drive_mount: None,
+            removed: None,
         })
+    }
+
+    /// Names a location `name`. Its id, and with it everything archived from it, stays.
+    pub fn rename_location(&self, location: &LocationId, name: &str) -> Result<()> {
+        self.execute(
+            "UPDATE location SET name = ?2 WHERE id = ?1",
+            params![location, name],
+        )
+    }
+
+    /**
+     * Removes a location (FEATURES: Locations): it is synced no more, and [`Self::locations`]
+     * gives it with when it was removed. Nothing archived from it is touched: its items,
+     * versions and sessions stay, filed as they were, and so does its row, which they name.
+     * Nothing reaches the location itself.
+     */
+    pub fn remove_location(&self, location: &LocationId) -> Result<()> {
+        self.execute(
+            "UPDATE location SET removed_at = COALESCE(removed_at, ?2) WHERE id = ?1",
+            params![location, now_ms()],
+        )
+    }
+
+    /// Makes a removed location one of the owner's again, named `name`: adding its place
+    /// again carries on from what was archived from it, rather than archiving it twice.
+    pub fn restore_location(&self, location: &LocationId, name: &str) -> Result<()> {
+        self.execute(
+            "UPDATE location SET removed_at = NULL, name = ?2 WHERE id = ?1",
+            params![location, name],
+        )
     }
 
     /**
@@ -433,11 +500,12 @@ impl Catalogue {
         })
     }
 
-    /// Every location, oldest first.
+    /// Every location, oldest first, those the owner removed among them. Two added in the same
+    /// millisecond keep the order they were added in (the rowid), not their ids'.
     pub fn locations(&self) -> Result<Vec<Location>> {
         self.db.read(|c| {
             Ok(c.prepare(&format!(
-                "SELECT {LOCATION} FROM location ORDER BY created_at, id"
+                "SELECT {LOCATION} FROM location ORDER BY created_at, rowid"
             ))?
             .query_map([], location_from)?
             .collect::<rusqlite::Result<_>>()?)
@@ -503,18 +571,95 @@ impl Catalogue {
         )
     }
 
+    /// The providers whose agents were found at `location`, with where each keeps its data
+    /// there and for how long, as the last pass of each read them.
+    pub fn providers_at(&self, location: &LocationId) -> Result<Vec<ProviderAt>> {
+        self.db.read(|c| {
+            Ok(c.prepare(
+                "SELECT provider, retention_days, root FROM location_provider
+                 WHERE location_id = ?1 ORDER BY provider",
+            )?
+            .query_map([location], |row| {
+                Ok(ProviderAt {
+                    provider: row.get(0)?,
+                    retention_days: row.get(1)?,
+                    root: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /**
+     * What the archive holds from each agent at each location it holds anything from
+     * (DESIGN §4.11), by location and provider. Sessions in Trash are held, and counted, as
+     * well as among those in Trash; a session deleted for good is held no more, and neither
+     * its items nor its row are counted. Each item counts once, at the length of its newest
+     * version: what its source held when it was last archived.
+     */
+    pub fn holdings(&self) -> Result<Vec<Holding>> {
+        self.db.read(|c| {
+            let mut holdings: Vec<Holding> = c
+                .prepare(
+                    "SELECT i.location_id, i.provider,
+                         COALESCE(SUM((SELECT v.length FROM version v WHERE v.item_id = i.id
+                                       ORDER BY v.number DESC LIMIT 1)), 0),
+                         MIN((SELECT MIN(v.started_at) FROM version v WHERE v.item_id = i.id))
+                     FROM item i
+                     GROUP BY i.location_id, i.provider
+                     ORDER BY i.location_id, i.provider",
+                )?
+                .query_map([], |row| {
+                    Ok(Holding {
+                        location: row.get(0)?,
+                        provider: row.get(1)?,
+                        sessions: 0,
+                        trashed: 0,
+                        bytes: row.get(2)?,
+                        since: row.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut counts = c.prepare(
+                "SELECT s.location_id, s.provider, COUNT(*), COUNT(st.trashed_at) FROM session s
+                 LEFT JOIN session_state st ON st.location_id = s.location_id
+                     AND st.provider = s.provider AND st.session = s.session
+                 GROUP BY s.location_id, s.provider",
+            )?;
+            for counted in counts.query_map([], |row| {
+                Ok((
+                    row.get::<_, LocationId>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, usize>(2)?,
+                    row.get::<_, usize>(3)?,
+                ))
+            })? {
+                let (location, provider, sessions, trashed) = counted?;
+                if let Some(holding) = holdings
+                    .iter_mut()
+                    .find(|it| it.location == location && it.provider == provider)
+                {
+                    holding.sessions = sessions;
+                    holding.trashed = trashed;
+                }
+            }
+            Ok(holdings)
+        })
+    }
+
     pub(crate) fn record_provider(
         &self,
         location: &LocationId,
         provider: &str,
         retention_days: Option<u32>,
+        root: &str,
     ) -> Result<()> {
         self.execute(
-            "INSERT INTO location_provider (location_id, provider, retention_days)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO location_provider (location_id, provider, retention_days, root)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (location_id, provider)
-             DO UPDATE SET retention_days = excluded.retention_days",
-            params![location, provider, retention_days],
+             DO UPDATE SET retention_days = excluded.retention_days, root = excluded.root",
+            params![location, provider, retention_days, root],
         )
     }
 
@@ -938,6 +1083,7 @@ fn location_from(row: &Row<'_>) -> rusqlite::Result<Location> {
             _ => None,
         },
         drive_mount: row.get(9)?,
+        removed: row.get(10)?,
     })
 }
 

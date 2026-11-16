@@ -43,8 +43,8 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::{
-    FileClass, FileTree, Hashed, ItemKind, ItemPrefix, ItemRange, Provider, ProviderError,
-    ProviderId, RangeFailure, Scan, SessionItems, Source,
+    Display, FileClass, FileTree, Hashed, ItemKind, ItemPrefix, ItemRange, Mark, Provider,
+    ProviderError, ProviderId, RangeFailure, Scan, SessionItems, Source,
 };
 use crate::transcript::{Subagent, Transcript};
 use crate::transport::{Env, RangeSink, Transport};
@@ -61,12 +61,31 @@ const SUBTREE: &str = "projects";
 /// default).
 const DEFAULT_RETENTION_DAYS: u32 = 30;
 
+/// The mark Claude's models are shown with (DESIGN §1.5): eight rays, on the icons' 24 grid
+/// at their stroke.
+const MARK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4"/></svg>"#;
+
 /// Claude Code.
 pub struct Agent;
 
 impl Provider for Agent {
     fn id(&self) -> ProviderId {
         ID
+    }
+
+    fn display(&self) -> Display {
+        Display {
+            name: "Claude Code",
+            mark: Some(Mark {
+                svg: MARK,
+                dark: 0xd97757,
+                light: 0xc6613f,
+            }),
+        }
+    }
+
+    fn model_name(&self, model: &str) -> String {
+        model_name(model)
     }
 
     fn detect<'a>(
@@ -103,6 +122,40 @@ impl Provider for Agent {
     }
 }
 
+/**
+ * A model's id as people write the model: `claude-opus-4-6` is "Opus 4.6" and
+ * `claude-3-5-sonnet-20241022` "3.5 Sonnet". The maker's name and a release date are left out,
+ * and the numbers of a version are joined. An id that isn't one of Claude's stays as it is.
+ */
+fn model_name(model: &str) -> String {
+    let Some(rest) = model.strip_prefix("claude-") else {
+        return model.to_string();
+    };
+    let mut words: Vec<String> = Vec::new();
+    let mut after_number = false;
+    for part in rest.split('-') {
+        let number = !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+        if number && part.len() == 8 {
+            continue;
+        }
+        match words.last_mut() {
+            Some(version) if number && after_number => {
+                version.push('.');
+                version.push_str(part);
+            }
+            _ => {
+                let mut letters = part.chars();
+                words.push(match letters.next() {
+                    Some(first) => first.to_uppercase().chain(letters).collect(),
+                    None => String::new(),
+                });
+            }
+        }
+        after_number = number;
+    }
+    words.join(" ")
+}
+
 /// Where Claude Code keeps its data at a location with the environment `env`.
 fn root(mut env: Env) -> String {
     match env.vars.remove("CLAUDE_CONFIG_DIR") {
@@ -119,6 +172,10 @@ struct Data<'a> {
 }
 
 impl Source for Data<'_> {
+    fn root(&self) -> String {
+        self.tree.root()
+    }
+
     fn scan(&mut self) -> Result<Scan, ProviderError> {
         self.tree.scan()
     }

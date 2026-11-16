@@ -47,15 +47,38 @@ sb_icons! {
     WindowRestore => "window-restore",
     WindowClose => "window-close",
     // Lucide.
+    Archive => "archive",
+    ArrowLeft => "arrow-left",
+    Bot => "bot",
+    Box => "box",
+    Check => "check",
+    ChevronDown => "chevron-down",
+    ChevronRight => "chevron-right",
+    CircleAlert => "circle-alert",
+    CircleCheck => "circle-check",
+    Folder => "folder",
+    FolderPlus => "folder-plus",
+    Hand => "hand",
     Inbox => "inbox",
+    Info => "info",
+    Laptop => "laptop",
     Layers => "layers",
+    Link => "link",
+    Monitor => "monitor",
     PanelLeft => "panel-left",
+    Pause => "pause",
     Plus => "plus",
+    // A tool call of no kind in particular (DESIGN §1.5 "puzzle", as the boards draw it).
+    Puzzle => "puzzle",
     RefreshCw => "refresh-cw",
     Search => "search",
     Settings => "settings",
     Star => "star",
+    // The star of a starred session: filled (DESIGN §4.2.1).
+    StarFilled => "star-filled",
     Trash => "trash-2",
+    TriangleAlert => "triangle-alert",
+    X => "x",
 }
 
 #[cfg(test)]

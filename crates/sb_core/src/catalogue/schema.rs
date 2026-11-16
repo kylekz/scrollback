@@ -6,7 +6,7 @@ use toolbox_store::Schema;
 
 pub(super) const SCHEMA: Schema = Schema {
     domain: "scrollback",
-    steps: &[SYNC, LIBRARY, LOCATIONS, SEARCH_AND_DELETING],
+    steps: &[SYNC, LIBRARY, LOCATIONS, SEARCH_AND_DELETING, REMOVED],
 };
 
 /// What sync writes (PLAN §2.2): locations, items, versions and segments. Times are Unix
@@ -287,6 +287,16 @@ CREATE TABLE text_gone (
     session TEXT NOT NULL,
     PRIMARY KEY (location_id, provider, session)
 ) STRICT, WITHOUT ROWID;
+";
+
+/// Locations the owner removed (FEATURES: Locations), and where each agent keeps its data at a
+/// location (DESIGN §4.11).
+const REMOVED: &str = "
+-- When the owner removed the location: it is synced no more, and everything archived from it
+-- stays. NULL while it is one of the owner's locations.
+ALTER TABLE location ADD COLUMN removed_at INTEGER;
+-- Where the agent keeps its data there, as the provider names it, from the last pass.
+ALTER TABLE location_provider ADD COLUMN root TEXT;
 ";
 
 #[cfg(test)]

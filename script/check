@@ -19,7 +19,7 @@ usage: script/check [--fast | --e2e-only]
   3. gpui boundary: no gpui in the headless crates' dependency trees
   4. agent names: no agent is named in sb_core outside its provider, nor anywhere in sb_ui,
      in a file's contents or in its path
-  5. cargo test --workspace
+  5. cargo test in the same two shapes: --workspace, and -p scrollback --no-default-features
   6. e2e scenarios in tests/e2e through sb_e2e (background)   skipped with --fast
      (--e2e-only: this step alone)
 EOF
@@ -187,6 +187,8 @@ if [[ "$e2e_only" -eq 0 ]]; then
 
     step 5 "cargo test --workspace"
     cargo test --workspace
+    step 5 "cargo test -p scrollback --no-default-features  (the shipped app)"
+    cargo test -p scrollback --no-default-features
 fi
 
 if [[ "$fast" -eq 1 ]]; then

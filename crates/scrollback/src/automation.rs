@@ -4,6 +4,11 @@
 //! documents the protocol and the builtin commands; `gpui_automation` adds `window` and
 //! `windows` to `state` itself.
 //!
+//! A scripted run never reaches a real WSL distro or SSH host, nor runs `wsl.exe` or `ssh`
+//! ([`stand_ins`]): a distro or a host that answers is read from the folder
+//! `--automation-wsl-home` names (and can't be reached without one), a host the scenario has
+//! not named is unreachable, and WSL is not there until a scenario lists distros.
+//!
 //! `state`:
 //! - `app`: `"scrollback"`.
 //! - `data_dir`: where this run keeps its files (`crate::data_dir`).
@@ -14,23 +19,73 @@
 //! - `shell`: `sidebar` (`docked`, `collapsed` or `overlay`, DESIGN §2), `window_material`
 //!   (what was applied to the window) and `window_native` (macOS: what AppKit reports, `forced`
 //!   light or dark or `null`, `opaque` and `vibrancy_view`; `null` elsewhere).
+//! - `page`: what the main area shows: `starting`, `archive-failed`, `locations-failed`,
+//!   `first-run`, `sessions` (All sessions, Starred or a folder), `unsorted` or `session` (an
+//!   opened session).
+//! - `archive`: `dir`, and `state` (`opening`, `open` or `failed`, then with `error`).
+//! - `sync`: `syncing`, `indexing` (an index runs outside a pass), `held` (a pass waits at
+//!   `hold_sync`'s hold), and `locations`, each with its `name`, `kind` (`local`, `wsl` or
+//!   `ssh`) and `state` (`syncing` with `progress`: the `items` to fetch and `items_done`, the
+//!   `sessions` to index and `sessions_done`; `synced`; `failed` with `error`; `unreachable`;
+//!   or `never`), `stale` and `removing`; `removed` (the names of the locations the owner
+//!   removed); `refused` (why the owner's last change to them could not be made, or `null`);
+//!   `distros` (WSL's distros' names as listed, `null` without WSL or before they are
+//!   listed, or `{"error": …}`); and `test`, the connection test (`null`, or its `place` and
+//!   `state`: `running`, `passed`, or the failure: `unreachable`, `refused`, `host_key`,
+//!   `not_installed`, `missing`, `login_hung`, `other`). A location's `state` may also be
+//!   `stopped`: the owner stopped its last pass before it was done.
+//! - `sheet`: the locations sheet while it is open (`null` otherwise): the name of its
+//!   `selected` location, and its `dialog` (`add`, `remove` or `null`).
+//! - `library`: `shelf` (`all`, `starred`, `unsorted`, `trash`, or `{"folder": name}`), `counts`
+//!   (`all`, `starred`, `unsorted`), `folders` (each with its `name`, its `parent`'s name and its
+//!   `sessions`, in the catalogue's order), `sessions` and `groups` (how many the shown page
+//!   lists, `null` while it loads or is of the other kind), the titles of the `selected` and
+//!   the `open` session, and `error` (why the library couldn't be read, or `null`).
 //!
-//! Commands, each replying with `state.appearance` after the change. An argument a command
-//! doesn't have is an error, so a misspelt one never passes for a change:
+//! Commands. An argument a command doesn't have is an error, so a misspelt one never passes
+//! for a change. These reply with `state.appearance` after the change:
 //! - `pin_appearance {appearance}` pins `light` or `dark` whatever the mode and the OS say, so
 //!   a scenario looks the same on every machine; `null` lifts the pin.
 //! - `set_appearance {mode?, material?}` changes what scrollback asks for, as Settings ›
 //!   Appearance will (DESIGN §4.13).
+//!
+//! And these with `state.sync`, for a scenario that needs a pass in a known state whatever
+//! the machine's speed:
+//! - `hold_sync {after}` makes the next pass wait once it has stored `after` items. The app
+//!   is not settled while a pass waits: wait for `/sync/held` instead.
+//! - `release_sync {}` lets the waiting pass go on, and clears a hold no pass has reached.
+//!   Stopping the pass does too.
+//! - `stand_in {distros?, places?}` sets what the stand-ins answer from then on: `distros`,
+//!   WSL's installed distros (each `{name, running?, default?, utility?}`; `[]` is WSL with
+//!   none) or `{"error": …}` for a `wsl.exe` that fails, which are listed again at once; and
+//!   `places`, how each distro or host by its name answers a connection test and a sync:
+//!   `passes` (it is read from the stand-in home), `unreachable`, `refused`, `host_key` (a key
+//!   that changed), `new_host_key` (one not known yet), `missing_tools`, `no_ssh`,
+//!   `login_hung` or `fails`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Context, Entity, Window};
 use gpui_appearance::{Appearance, Material, Mode};
 use gpui_automation::AutomationHost;
+use sb_core::catalogue::{SessionId, Shelf};
+use sb_core::location::LocationKind;
+use sb_core::transport::wsl::Distro;
+use sb_core::transport::{
+    Env, FileStat, Hashed, Launcher, Listing, LocalTransport, PrefixRequest, Probe, RangeFailure,
+    RangeRequest, RangeSink, ShellTransport, Transport, TransportError,
+};
 use sb_ui::Shell;
+use sb_ui::services::sync::{TestFailure, TestState, stale};
+use sb_ui::services::{ActiveServices as _, ArchiveState, Held, LocationStatus, Page, Reach};
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+use crate::cli::Cli;
 
 /// The entity `gpui_automation` drives: the shell it describes.
 pub struct ScrollbackAutomation {
@@ -54,16 +109,34 @@ impl AutomationHost for ScrollbackAutomation {
                     "vibrancy_view": native.vibrancy_view,
                 })),
             },
+            "page": shell.showing(cx).key(),
+            "archive": archive(cx),
+            "sync": sync(cx),
+            "library": library(cx),
+            "sheet": shell.locations_sheet().map(|sheet| {
+                let sheet = sheet.read(cx);
+                let sync = cx.services().sync.read(cx);
+                json!({
+                    "selected": sheet.selected().and_then(|id| sync.location(id)).map(|it| &it.name),
+                    "dialog": sheet.dialog(),
+                })
+            }),
         })
     }
 
-    /// Nothing in the shell runs in the background yet.
-    fn settled(&self, _cx: &App) -> bool {
-        true
+    /// The archive is open or has failed to, and nothing is syncing, indexing or loading.
+    fn settled(&self, cx: &App) -> bool {
+        cx.services().is_settled(cx)
     }
 
     fn commands(&self) -> &'static [&'static str] {
-        &["pin_appearance", "set_appearance"]
+        &[
+            "pin_appearance",
+            "set_appearance",
+            "hold_sync",
+            "release_sync",
+            "stand_in",
+        ]
     }
 
     fn custom(
@@ -73,25 +146,198 @@ impl AutomationHost for ScrollbackAutomation {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Result<Value>> {
+        let service = cx.services().sync.clone();
         let result = match cmd {
-            "pin_appearance" => serde_json::from_value(args)
-                .map(|PinAppearance { appearance }| gpui_appearance::pin(appearance, cx)),
+            "pin_appearance" => serde_json::from_value(args).map(|PinAppearance { appearance }| {
+                gpui_appearance::pin(appearance, cx);
+                self::appearance(cx)
+            }),
             "set_appearance" => {
                 serde_json::from_value(args).map(|SetAppearance { mode, material }| {
                     let mut preferences = gpui_appearance::state(cx).preferences();
                     preferences.mode = mode.unwrap_or(preferences.mode);
                     preferences.material = material.unwrap_or(preferences.material);
                     gpui_appearance::set_preferences(preferences, cx);
+                    self::appearance(cx)
                 })
             }
+            "hold_sync" => serde_json::from_value(args).map(|HoldSync { after }| {
+                service.update(cx, |sync, _| sync.hold_after(after, Held::Pause));
+                sync(cx)
+            }),
+            "release_sync" => serde_json::from_value(args).map(|ReleaseSync {}| {
+                service.update(cx, |sync, _| sync.release());
+                sync(cx)
+            }),
+            "stand_in" => serde_json::from_value(args).map(|StandIn { distros, places }| {
+                stage().places.extend(places);
+                if let Some(distros) = distros {
+                    stage().distros = match distros {
+                        Distros::Listed(listed) => Ok(Some(
+                            listed
+                                .into_iter()
+                                .map(|it| Distro {
+                                    name: it.name,
+                                    running: it.running,
+                                    default: it.default,
+                                    utility: it.utility,
+                                })
+                                .collect(),
+                        )),
+                        Distros::Failed { error } => Err(error),
+                    };
+                    service.update(cx, |sync, cx| sync.list_distros(cx));
+                }
+                sync(cx)
+            }),
             _ => return None,
         };
-        Some(
-            result
-                .map(|()| appearance(cx))
-                .with_context(|| format!("{cmd}'s arguments")),
-        )
+        Some(result.with_context(|| format!("{cmd}'s arguments")))
     }
+}
+
+/// `state.archive`.
+fn archive(cx: &App) -> Value {
+    let archive = cx.services().archive.read(cx);
+    let (state, error) = match archive.state() {
+        ArchiveState::Opening => ("opening", None),
+        ArchiveState::Open(_) => ("open", None),
+        ArchiveState::Failed(failure) => ("failed", Some(&failure.why)),
+    };
+    json!({ "dir": archive.dir().display().to_string(), "state": state, "error": error })
+}
+
+/// `state.sync`.
+fn sync(cx: &App) -> Value {
+    let sync = cx.services().sync.read(cx);
+    let now = sb_ui::format::now();
+    let locations: Vec<Value> = sync
+        .locations()
+        .unwrap_or_default()
+        .iter()
+        .map(|location| {
+            let (state, error, progress) = match sync.status(location) {
+                LocationStatus::Syncing { progress, .. } => ("syncing", None, Some(progress)),
+                LocationStatus::Synced(_) => ("synced", None, None),
+                LocationStatus::Failed(error) => ("failed", Some(error), None),
+                LocationStatus::Unreachable { .. } => ("unreachable", None, None),
+                LocationStatus::Stopped { .. } => ("stopped", None, None),
+                LocationStatus::NeverSynced => ("never", None, None),
+            };
+            json!({
+                "name": location.name,
+                "kind": match location.kind {
+                    LocationKind::Local => "local",
+                    LocationKind::Wsl { .. } => "wsl",
+                    LocationKind::Ssh { .. } => "ssh",
+                },
+                "state": state,
+                "error": error,
+                "progress": progress.map(|progress| json!({
+                    "items": progress.items,
+                    "items_done": progress.items_done,
+                    "sessions": progress.sessions,
+                    "sessions_done": progress.sessions_done,
+                })),
+                "stale": stale(location.last_success, sync.details().found(&location.id), now)
+                    .is_some(),
+                "removing": sync.is_removing(&location.id),
+            })
+        })
+        .collect();
+    let test = sync.test().map(|test| {
+        let state = match &test.state {
+            TestState::Running(_) => "running",
+            TestState::Passed { .. } => "passed",
+            TestState::Failed(failure) => match failure {
+                TestFailure::Unreachable(_) => "unreachable",
+                TestFailure::Refused(_) => "refused",
+                TestFailure::HostKey(_) => "host_key",
+                TestFailure::NotInstalled(_) => "not_installed",
+                TestFailure::Missing(_) => "missing",
+                TestFailure::LoginHung(_) => "login_hung",
+                TestFailure::Other(_) => "other",
+            },
+        };
+        let place = match &test.kind {
+            LocationKind::Local => "local",
+            LocationKind::Wsl { distro } => distro,
+            LocationKind::Ssh { host } => host,
+        };
+        json!({ "place": place, "state": state })
+    });
+    let distros = sync.distros().map(|distros| match &distros.listed {
+        Ok(listed) => json!(listed.as_ref().map(|listed| {
+            listed
+                .iter()
+                .map(|distro| distro.name.clone())
+                .collect::<Vec<_>>()
+        })),
+        Err(error) => json!({ "error": error }),
+    });
+    json!({
+        "syncing": sync.is_syncing(),
+        "indexing": sync.is_indexing(),
+        "held": sync.is_held(),
+        "locations": locations,
+        "removed": sync.removed().iter().map(|it| it.name.clone()).collect::<Vec<_>>(),
+        "refused": sync.refused(),
+        "distros": distros,
+        "test": test,
+    })
+}
+
+/// `state.library`.
+fn library(cx: &App) -> Value {
+    let library = cx.services().library.read(cx);
+    let name = |folder| library.folder(folder).map(|folder| folder.name.clone());
+    let counts = library.counts();
+    let folders: Vec<Value> = library
+        .folders()
+        .iter()
+        .map(|folder| {
+            json!({
+                "name": folder.name,
+                "parent": folder.parent.and_then(name),
+                "sessions": counts.folders.get(&folder.id),
+            })
+        })
+        .collect();
+    let (sessions, groups) = match library.page() {
+        Some(Page::Sessions(page)) => (Some(page.sessions.len()), None),
+        Some(Page::Unsorted(groups)) => (None, Some(groups.len())),
+        None => (None, None),
+    };
+    // The selected session's title: on a page of sessions by its place, in Unsorted by its id.
+    let title_of = |id: &SessionId| match library.page()? {
+        Page::Sessions(page) => page.sessions.get(library.selected_index()?)?.title.clone(),
+        Page::Unsorted(groups) => groups
+            .iter()
+            .flat_map(|group| &group.sessions)
+            .find(|session| session.id == *id)?
+            .title
+            .clone(),
+    };
+    json!({
+        "shelf": match library.shelf() {
+            Shelf::All => json!("all"),
+            Shelf::Starred => json!("starred"),
+            Shelf::Unsorted => json!("unsorted"),
+            Shelf::Trash => json!("trash"),
+            Shelf::Folder(folder) => json!({ "folder": name(folder) }),
+        },
+        "counts": {
+            "all": counts.all,
+            "starred": counts.starred,
+            "unsorted": counts.unsorted,
+        },
+        "folders": folders,
+        "sessions": sessions,
+        "groups": groups,
+        "selected": library.selected().and_then(title_of),
+        "open": library.open_session().and_then(|session| session.title.clone()),
+        "error": library.failure(),
+    })
 }
 
 /// `state.appearance`.
@@ -133,6 +379,334 @@ struct PinAppearance {
 struct SetAppearance {
     mode: Option<Mode>,
     material: Option<Material>,
+}
+
+/// `hold_sync {"after": items}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HoldSync {
+    after: usize,
+}
+
+/// `release_sync {}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseSync {}
+
+/// `stand_in {distros?, places?}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StandIn {
+    distros: Option<Distros>,
+    #[serde(default)]
+    places: HashMap<String, Answer>,
+}
+
+/// WSL's distros as a scenario has them: listed, or `wsl.exe`'s failure.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Distros {
+    Listed(Vec<DistroArg>),
+    Failed { error: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DistroArg {
+    name: String,
+    #[serde(default)]
+    running: bool,
+    #[serde(default)]
+    default: bool,
+    #[serde(default)]
+    utility: bool,
+}
+
+/// How a distro or a host answers the stand-ins (the module docs, `stand_in`).
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Answer {
+    Passes,
+    Unreachable,
+    Refused,
+    HostKey,
+    NewHostKey,
+    MissingTools,
+    NoSsh,
+    LoginHung,
+    Fails,
+}
+
+impl Answer {
+    /// What the place `name` fails with when it answers so, in the words its launcher would
+    /// use. One that passes fails nothing; it is read as this machine.
+    fn error(self, name: &str) -> TransportError {
+        match self {
+            Self::Passes => TransportError::Failed(format!("{name} passes")),
+            Self::Unreachable => TransportError::Unreachable(format!(
+                "ssh: connect to host {name} port 22: Operation timed out"
+            )),
+            Self::Refused => {
+                TransportError::Refused(format!("{name}: Permission denied (publickey)."))
+            }
+            /* As sb_core reads ssh's words: its verdict first, then what it said before. */
+            Self::HostKey => TransportError::HostKey(format!(
+                "Host key verification failed.\n\
+                 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+                 @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n\
+                 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+                 Host key for {name} has changed and you have requested strict checking."
+            )),
+            Self::NewHostKey => TransportError::HostKey(format!(
+                "Host key verification failed.\n\
+                 No ED25519 host key is known for {name} and you have requested strict checking."
+            )),
+            Self::MissingTools => {
+                TransportError::MissingTools(vec!["sha256sum or shasum".to_string()])
+            }
+            Self::NoSsh => TransportError::Launch {
+                program: "ssh".to_string(),
+                source: std::io::ErrorKind::NotFound.into(),
+            },
+            Self::LoginHung => TransportError::LoginShellHung(5),
+            Self::Fails => TransportError::Failed(
+                "kex_exchange_identification: read: Connection reset by peer".to_string(),
+            ),
+        }
+    }
+}
+
+/// What the stand-ins answer, as the scenario set it.
+struct Stage {
+    distros: Result<Option<Vec<Distro>>, String>,
+    places: HashMap<String, Answer>,
+}
+
+static STAGE: LazyLock<Mutex<Stage>> = LazyLock::new(|| {
+    Mutex::new(Stage {
+        distros: Ok(None),
+        places: HashMap::new(),
+    })
+});
+
+fn stage() -> MutexGuard<'static, Stage> {
+    STAGE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/**
+ * The name a place of `kind` goes by and how it answers: as the scenario said, or else a
+ * distro passes when there is a stand-in home to read it from and a host is asleep. A place
+ * that would pass with no stand-in home can't be reached: it is never read as this machine.
+ * This machine is `None`: it is read as it is.
+ */
+fn answer<'a>(kind: &'a LocationKind, home: Option<&str>) -> Option<(&'a str, Answer)> {
+    let (name, otherwise) = match kind {
+        LocationKind::Local => return None,
+        LocationKind::Wsl { distro } => (distro, Answer::Passes),
+        LocationKind::Ssh { host } => (host, Answer::Unreachable),
+    };
+    let answered = stage()
+        .places
+        .get(name.as_str())
+        .copied()
+        .unwrap_or(otherwise);
+    Some((
+        name,
+        match (answered, home) {
+            (Answer::Passes, None) => Answer::Unreachable,
+            (answered, _) => answered,
+        },
+    ))
+}
+
+/**
+ * How a scripted run reaches its locations, or `None` for a run without the driver, which
+ * reaches them as their kinds say. Never the distro or the host a location names, which would
+ * be the machine's own and not the scenario's, and never through `wsl.exe` or `ssh`. This
+ * machine is read as it is, and the runner points it at the scenario's home. A place that
+ * passes is read from the folder `--automation-wsl-home` names ([`StandInHome`]); without one
+ * it can't be reached, so a distro or a host is never read as this machine. Any other place
+ * fails every call as the scenario said ([`Answer`]). The connection test answers the same
+ * way, and WSL's distros are the scenario's.
+ */
+pub fn stand_ins(cli: &Cli) -> Option<Reach> {
+    if !cli.automation_enabled() {
+        return None;
+    }
+    let home = cli
+        .automation_wsl_home
+        .as_ref()
+        .map(|home| home.display().to_string());
+    let tested = home.clone();
+    Some(Reach {
+        connect: Arc::new(move |kind, _| match answer(kind, home.as_deref()) {
+            None => Box::new(LocalTransport),
+            Some((_, Answer::Passes)) => Box::new(StandInHome {
+                home: home.clone().unwrap_or_default(),
+            }),
+            Some((name, answered)) => Box::new(Failing {
+                name: name.to_string(),
+                answered,
+            }),
+        }),
+        tester: Arc::new(move |launcher, _| {
+            let kind = match launcher {
+                Launcher::Wsl { distro } => LocationKind::Wsl {
+                    distro: distro.clone(),
+                },
+                Launcher::Ssh { host } => LocationKind::Ssh { host: host.clone() },
+                Launcher::Command { .. } => {
+                    return Err(TransportError::Failed("no command is run".to_string()));
+                }
+            };
+            match answer(&kind, tested.as_deref()) {
+                Some((_, answered @ (Answer::Passes | Answer::MissingTools))) => Ok(Probe {
+                    home: tested.clone().unwrap_or_default(),
+                    clock_ns: 0,
+                    clock_ahead_ns: 0,
+                    missing: if answered == Answer::MissingTools {
+                        vec!["sha256sum or shasum".to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    whole_seconds: false,
+                    shell: "/bin/sh".to_string(),
+                    login_shell: Some("/bin/bash".to_string()),
+                    drive_mount: None,
+                    took: Duration::from_millis(1400),
+                }),
+                Some((name, answered)) => Err(answered.error(name)),
+                None => Err(TransportError::Failed(
+                    "this machine has no shell".to_string(),
+                )),
+            }
+        }),
+        distros: Arc::new(|_| stage().distros.clone().map_err(TransportError::Failed)),
+        launcher: Arc::new(LocationKind::launcher),
+        development_home: None,
+    })
+}
+
+/**
+ * A distro or a host played by a folder of this machine: its files are this machine's and its
+ * home is that folder. Of this machine's environment it sees only the variables that point
+ * inside that folder (the runner's, which point an agent at the scenario's fixture), so
+ * nothing of the person's own setup is ever read through it.
+ */
+struct StandInHome {
+    home: String,
+}
+
+impl Transport for StandInHome {
+    fn env(&self, names: &[&str]) -> Result<Env, TransportError> {
+        let vars = names
+            .iter()
+            .filter_map(|name| {
+                let value = std::env::var(name).ok()?;
+                std::path::Path::new(&value)
+                    .starts_with(&self.home)
+                    .then(|| ((*name).to_string(), value))
+            })
+            .collect();
+        Ok(Env {
+            home: self.home.clone(),
+            vars,
+        })
+    }
+
+    fn stat(&self, paths: &[&str]) -> Result<Vec<Option<FileStat>>, TransportError> {
+        LocalTransport.stat(paths)
+    }
+
+    fn list(&self, root: &str) -> Result<Listing, TransportError> {
+        LocalTransport.list(root)
+    }
+
+    fn hash_prefixes(
+        &self,
+        requests: &[PrefixRequest],
+    ) -> Result<Vec<Result<Hashed, RangeFailure>>, TransportError> {
+        LocalTransport.hash_prefixes(requests)
+    }
+
+    fn read_ranges(
+        &self,
+        requests: &[RangeRequest],
+        sink: &mut dyn RangeSink,
+    ) -> Result<(), TransportError> {
+        LocalTransport.read_ranges(requests, sink)
+    }
+
+    fn read_small(&self, path: &str) -> Result<Option<Vec<u8>>, TransportError> {
+        LocalTransport.read_small(path)
+    }
+}
+
+/**
+ * The development override (`--dev-location-home`): every WSL and SSH location is reached
+ * through its own launcher, `wsl.exe` or `ssh`, with the far side's shell started with
+ * `home` for its home and nothing else of its environment ([`Launcher::reading_home`]), for
+ * its connection test, its survey and every pass. This machine is read as it is. Logged at
+ * the start, and said on the locations sheet, so that a build is never left in it unnoticed.
+ */
+pub fn development_override(home: &str) -> Reach {
+    log::warn!("development override: every WSL and SSH location is read with {home} for its home");
+    let launch = {
+        let home = home.to_string();
+        move |kind: &LocationKind| kind.launcher().map(|it| it.reading_home(&home))
+    };
+    let connect = launch.clone();
+    Reach {
+        connect: Arc::new(move |kind, cancel| match connect(kind) {
+            Some(launcher) => Box::new(ShellTransport::new(launcher).cancelled_by(cancel)),
+            None => Box::new(LocalTransport),
+        }),
+        tester: Arc::new(sb_ui::services::probe),
+        distros: Arc::new(sb_core::transport::wsl::distros),
+        launcher: Arc::new(launch),
+        development_home: Some(home.to_string()),
+    }
+}
+
+/// A place that fails every call as it answers.
+struct Failing {
+    name: String,
+    answered: Answer,
+}
+
+impl Failing {
+    fn fail<T>(&self) -> Result<T, TransportError> {
+        Err(self.answered.error(&self.name))
+    }
+}
+
+impl Transport for Failing {
+    fn env(&self, _: &[&str]) -> Result<Env, TransportError> {
+        self.fail()
+    }
+
+    fn stat(&self, _: &[&str]) -> Result<Vec<Option<FileStat>>, TransportError> {
+        self.fail()
+    }
+
+    fn list(&self, _: &str) -> Result<Listing, TransportError> {
+        self.fail()
+    }
+
+    fn hash_prefixes(
+        &self,
+        _: &[PrefixRequest],
+    ) -> Result<Vec<Result<Hashed, RangeFailure>>, TransportError> {
+        self.fail()
+    }
+
+    fn read_ranges(&self, _: &[RangeRequest], _: &mut dyn RangeSink) -> Result<(), TransportError> {
+        self.fail()
+    }
+
+    fn read_small(&self, _: &str) -> Result<Option<Vec<u8>>, TransportError> {
+        self.fail()
+    }
 }
 
 /// Starts automation on the main window.
@@ -184,5 +758,92 @@ mod tests {
         assert_eq!((neither.mode, neither.material), (None, None));
         assert!(parse(json!({"materail": "mica"})).is_err());
         assert!(parse(json!({"mode": "sepia"})).is_err());
+    }
+
+    use sb_core::CancelToken;
+
+    fn cli(args: &[&str]) -> Cli {
+        use clap::Parser as _;
+        Cli::try_parse_from(std::iter::once("scrollback").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn only_a_run_with_the_driver_reaches_its_locations_through_the_stand_ins() {
+        assert!(stand_ins(&cli(&[])).is_none());
+        assert!(stand_ins(&cli(&["--automation"])).is_some());
+        assert!(stand_ins(&cli(&["--automation-pipe", "e2e"])).is_some());
+    }
+
+    #[test]
+    fn a_distro_is_read_from_the_home_named_for_it_and_from_nowhere_else() {
+        let distro = LocationKind::Wsl {
+            distro: "Ubuntu-24.04".to_string(),
+        };
+        let cancel = CancelToken::new();
+        let unnamed = stand_ins(&cli(&["--automation"])).unwrap();
+        assert!(matches!(
+            (unnamed.connect)(&distro, &cancel).env(&["HOME"]),
+            Err(TransportError::Unreachable(_))
+        ));
+        let home = std::env::temp_dir().join("stand-in-home");
+        let named = stand_ins(&cli(&[
+            "--automation",
+            "--automation-wsl-home",
+            home.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let env = (named.connect)(&distro, &cancel).env(&["HOME"]).unwrap();
+        assert_eq!(env.home, home.display().to_string());
+        assert!(env.vars.is_empty(), "none of this machine's environment");
+        // A host is never reached, home or not.
+        let host = LocationKind::Ssh {
+            host: "user@macbook".to_string(),
+        };
+        assert!(matches!(
+            (named.connect)(&host, &cancel).env(&[]),
+            Err(TransportError::Unreachable(_))
+        ));
+    }
+
+    #[test]
+    fn the_development_override_reads_distros_and_hosts_from_its_home_and_nothing_else() {
+        let reach = development_override("/home/user/fixture");
+        assert_eq!(
+            reach.development_home.as_deref(),
+            Some("/home/user/fixture")
+        );
+        let distro = LocationKind::Wsl {
+            distro: "Ubuntu-24.04".to_string(),
+        };
+        let wsl = (reach.launcher)(&distro).unwrap().command_line();
+        assert!(
+            wsl.starts_with("wsl.exe -d Ubuntu-24.04 --cd / --exec env -i PATH=")
+                && wsl.ends_with(" HOME=/home/user/fixture sh -s"),
+            "{wsl}"
+        );
+        let host = LocationKind::Ssh {
+            host: "user@macbook".to_string(),
+        };
+        let ssh = (reach.launcher)(&host).unwrap().command_line();
+        assert!(
+            ssh.starts_with("ssh -T -o BatchMode=yes")
+                && ssh.contains(" -- user@macbook env -i PATH=")
+                && ssh.ends_with(" HOME=/home/user/fixture sh -s"),
+            "{ssh}"
+        );
+        /* This machine has no launcher, and is read as it is. */
+        assert!((reach.launcher)(&LocationKind::Local).is_none());
+    }
+
+    #[test]
+    fn a_hold_needs_how_many_items_and_a_release_takes_nothing() {
+        let hold = |args: Value| serde_json::from_value::<HoldSync>(args);
+        assert_eq!(hold(json!({"after": 40})).unwrap().after, 40);
+        assert!(hold(json!({})).is_err());
+        assert!(hold(json!({"after": -1})).is_err());
+        assert!(hold(json!({"after": 40, "then": "stop"})).is_err());
+        let release = |args: Value| serde_json::from_value::<ReleaseSync>(args);
+        assert!(release(json!({})).is_ok());
+        assert!(release(json!({"after": 1})).is_err());
     }
 }

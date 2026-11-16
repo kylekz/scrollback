@@ -1,0 +1,121 @@
+{"scenario": {"window_size": "1440x900", "fixture": "boards", "description": "The library the design boards draw (DESIGN §6: E-Folder, E-All-Sessions, E-Unsorted), from an archive built before the app starts: the sidebar's counts and folder tree, a folder's page with its path chips and cards, All sessions, Starred and Unsorted, each captured dark and light at the boards' size and at the minimum window size, with the keyboard moving between rows and cards"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/archive/state", "equals": "open"}, {"pointer": "/library/shelf", "equals": "all"}, {"pointer": "/library/counts", "equals": {"all": 2318, "starred": 14, "unsorted": 37}}, {"pointer": "/library/sessions", "equals": 2318}, {"pointer": "/library/folders", "len": 10}, {"pointer": "/sync/locations", "len": 3}, {"pointer": "/sync/syncing", "equals": false}]}
+// One location of each kind. Their agents are not on this machine, so the start's sync finds nothing to copy and nothing to mark gone; a scripted run reaches no host, so the one over SSH is unreachable, which is no failure and has no banner.
+{"cmd": "state", "expect": [{"pointer": "/sync/locations/0", "equals": {"name": "This PC", "kind": "local", "state": "synced", "error": null, "progress": null, "stale": false, "removing": false}}, {"pointer": "/sync/locations/1", "equals": {"name": "Ubuntu-24.04", "kind": "wsl", "state": "synced", "error": null, "progress": null, "stale": false, "removing": false}}, {"pointer": "/sync/locations/2", "equals": {"name": "user@macbook", "kind": "ssh", "state": "unreachable", "error": null, "progress": null, "stale": false, "removing": false}}]}
+{"cmd": "query", "prefix": "main/sync-failed/", "expect_result": {"pointer": "", "len": 0}}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+{"cmd": "settle"}
+
+// The sidebar (DESIGN §4.1): the top-level folders in their order, closed, each 32 high in the sidebar's 8px padding, and the three locations 40 high at its foot.
+{"cmd": "query", "prefix": "sidebar/folder/", "expect_result": [{"pointer": "", "len": 8}, {"pointer": "/0/target", "equals": "sidebar/folder/dv"}, {"pointer": "/1/target", "equals": "sidebar/folder/fc"}, {"pointer": "/7/target", "equals": "sidebar/folder/Scratch"}]}
+{"cmd": "bounds", "target": "sidebar/folder/dv", "expect_result": [{"pointer": "/x", "equals": 8}, {"pointer": "/w", "equals": 231}, {"pointer": "/h", "equals": 32}]}
+{"cmd": "query", "prefix": "sidebar/location/", "expect_result": {"pointer": "", "len": 3}}
+{"cmd": "bounds", "target": "sidebar/location/This PC", "expect_result": [{"pointer": "/x", "equals": 8}, {"pointer": "/w", "equals": 231}, {"pointer": "/h", "equals": 40}]}
+{"cmd": "bounds", "target": "sidebar/location/user@macbook", "expect_result": [{"pointer": "/h", "equals": 40}, {"pointer": "/y", "gte": 850}, {"pointer": "/y", "lte": 852}]}
+// At 1440 every card has room for its tool calls (DESIGN §4.4): the glyph and the count after the day.
+{"cmd": "bounds", "target": "card/0/calls", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "card/3/calls", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "all-sessions-dark"}
+
+// fc's page, as E-Folder draws it: 488 sessions with its subfolder's, three path chips, and the cards four to a row under each month's overline.
+// Where a position or a size below is a range, its upper end is the design's number: a fractional display scale (125%, 150%, 175%) rounds each 1px hairline and gap above a thing to whole device pixels, which takes a pixel or two off where it sits and sometimes one off its height. The ranges are what Windows reports at 100%, 125%, 150% and 175%.
+{"cmd": "click", "target": "sidebar/folder/fc"}
+{"cmd": "settle", "expect": [{"pointer": "/library/shelf", "equals": {"folder": "fc"}}, {"pointer": "/library/sessions", "equals": 488}, {"pointer": "/library/folders/1", "equals": {"name": "fc", "parent": null, "sessions": 488}}, {"pointer": "/library/folders/9", "equals": {"name": "player", "parent": "fc", "sessions": 41}}]}
+{"cmd": "bounds", "target": "page/header", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/y", "equals": 60}, {"pointer": "/w", "equals": 1144}, {"pointer": "/h", "gte": 71}, {"pointer": "/h", "lte": 72}]}
+{"cmd": "bounds", "target": "page/paths", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/y", "gte": 147}, {"pointer": "/y", "lte": 148}, {"pointer": "/h", "equals": 28}]}
+{"cmd": "bounds", "target": "card/0", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/y", "gte": 238}, {"pointer": "/y", "lte": 239}, {"pointer": "/w", "equals": 277}, {"pointer": "/h", "equals": 112}]}
+{"cmd": "bounds", "target": "card/3", "expect_result": [{"pointer": "/x", "equals": 1139}, {"pointer": "/y", "gte": 238}, {"pointer": "/y", "lte": 239}, {"pointer": "/w", "equals": 277}]}
+// October's four cards: 16 under November's, the overline, and 16 more.
+{"cmd": "bounds", "target": "card/4", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/y", "gte": 396}, {"pointer": "/y", "lte": 397}]}
+{"cmd": "bounds", "target": "page/month", "expect_error": "no target"}
+{"cmd": "screenshot", "name": "folder-dark"}
+
+// The chevron opens fc without leaving its page: player's row, one level in.
+{"cmd": "click", "target": "sidebar/folder-chevron/fc", "expect": {"pointer": "/library/shelf", "equals": {"folder": "fc"}}}
+{"cmd": "query", "prefix": "sidebar/folder/", "expect_result": [{"pointer": "", "len": 9}, {"pointer": "/2/target", "equals": "sidebar/folder/player"}]}
+{"cmd": "bounds", "target": "sidebar/folder/player", "expect_result": [{"pointer": "/x", "equals": 8}, {"pointer": "/w", "equals": 231}, {"pointer": "/h", "equals": 32}]}
+
+// The keyboard (DESIGN §4.4, §5): the arrows move between cards in reading order and keep the column across months.
+{"cmd": "click", "target": "card/1", "expect": {"pointer": "/library/selected", "equals": "libmpv hwdec fallback on AV1"}}
+{"cmd": "key", "keystroke": "right", "expect": {"pointer": "/library/selected", "equals": "Portrait layout for vertical cams"}}
+{"cmd": "key", "keystroke": "down", "expect": {"pointer": "/library/selected", "equals": "Inbox auto-accept threshold"}}
+{"cmd": "key", "keystroke": "left", "expect": {"pointer": "/library/selected", "equals": "Stickers as baked SVG, not rotated divs"}}
+{"cmd": "key", "keystroke": "up", "expect": {"pointer": "/library/selected", "equals": "libmpv hwdec fallback on AV1"}}
+{"cmd": "screenshot", "name": "folder-selected-dark"}
+// F6 moves the keyboard to the sidebar, where the arrows show the page of the row above or below, and left closes the folder.
+{"cmd": "key", "keystroke": "f6"}
+{"cmd": "key", "keystroke": "down"}
+{"cmd": "settle", "expect": [{"pointer": "/library/shelf", "equals": {"folder": "player"}}, {"pointer": "/library/sessions", "equals": 41}]}
+{"cmd": "screenshot", "name": "subfolder-dark"}
+{"cmd": "key", "keystroke": "left"}
+{"cmd": "settle", "expect": {"pointer": "/library/shelf", "equals": {"folder": "fc"}}}
+{"cmd": "key", "keystroke": "left"}
+{"cmd": "query", "prefix": "sidebar/folder/", "expect_result": {"pointer": "", "len": 8}}
+{"cmd": "key", "keystroke": "right"}
+{"cmd": "query", "prefix": "sidebar/folder/", "expect_result": {"pointer": "", "len": 9}}
+// Enter hands the keyboard back to the page.
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "key", "keystroke": "right", "expect": {"pointer": "/library/selected", "equals": "Downloads: paste a whole playlist"}}
+
+// The list is virtual: far down it, cards are still where the rows put them, and the first ones are gone.
+{"cmd": "scroll", "target": "page/cards", "dy": -6000}
+{"cmd": "bounds", "target": "card/0", "expect_error": "no target"}
+// The overline of the month at the top stays there while its cards scroll under it (DESIGN §4.4).
+{"cmd": "bounds", "target": "page/month", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/y", "gte": 208}, {"pointer": "/y", "lte": 209}, {"pointer": "/h", "gte": 29}, {"pointer": "/h", "lte": 30}]}
+{"cmd": "screenshot", "name": "folder-scrolled-dark"}
+
+// Unsorted, as E-Unsorted draws it: six paths, the one with the most sessions first, five sessions of each showing.
+{"cmd": "click", "target": "sidebar/unsorted"}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "unsorted"}, {"pointer": "/library/groups", "equals": 6}]}
+{"cmd": "bounds", "target": "unsorted/group/0", "expect_result": [{"pointer": "/x", "equals": 272}, {"pointer": "/w", "equals": 1144}, {"pointer": "/h", "gte": 44}, {"pointer": "/h", "lte": 45}]}
+{"cmd": "query", "prefix": "unsorted/row/0/", "expect_result": {"pointer": "", "len": 5}}
+{"cmd": "bounds", "target": "unsorted/group/1", "expect_result": [{"pointer": "/y", "gte": 437}, {"pointer": "/y", "lte": 439}]}
+{"cmd": "screenshot", "name": "unsorted-dark"}
+// Show all gives the group a row for each of its 14 sessions in place of the one that asked.
+{"cmd": "click", "target": "unsorted/group/0/show-all"}
+{"cmd": "query", "prefix": "unsorted/row/0/", "expect_result": {"pointer": "", "len": 14}}
+{"cmd": "bounds", "target": "unsorted/group/0/show-all", "expect_error": "no target"}
+{"cmd": "bounds", "target": "unsorted/group/1", "expect_result": [{"pointer": "/y", "gte": 709}, {"pointer": "/y", "lte": 711}]}
+// Its rows take the arrows, and Enter opens the selected one.
+{"cmd": "click", "target": "unsorted/row/0/1", "expect": {"pointer": "/library/selected", "equals": "Day 9: disk compaction"}}
+{"cmd": "key", "keystroke": "up", "expect": {"pointer": "/library/selected", "equals": "Day 12: garden fences, part two"}}
+{"cmd": "key", "keystroke": "enter", "expect": [{"pointer": "/page", "equals": "session"}, {"pointer": "/library/open", "equals": "Day 12: garden fences, part two"}]}
+{"cmd": "key", "keystroke": "alt-left", "expect": {"pointer": "/page", "equals": "unsorted"}}
+
+// Starred: the fourteen starred sessions, as cards.
+{"cmd": "click", "target": "sidebar/starred"}
+{"cmd": "settle", "expect": [{"pointer": "/library/shelf", "equals": "starred"}, {"pointer": "/library/sessions", "equals": 14}]}
+{"cmd": "screenshot", "name": "starred-dark"}
+
+// The same pages in light.
+{"cmd": "pin_appearance", "appearance": "light", "expect_result": {"pointer": "/resolved/appearance", "equals": "light"}}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "starred-light"}
+{"cmd": "click", "target": "sidebar/all-sessions"}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 2318}}
+{"cmd": "screenshot", "name": "all-sessions-light"}
+{"cmd": "click", "target": "sidebar/folder/fc"}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 488}}
+{"cmd": "screenshot", "name": "folder-light"}
+{"cmd": "click", "target": "sidebar/unsorted"}
+{"cmd": "settle", "expect": {"pointer": "/library/groups", "equals": 6}}
+{"cmd": "screenshot", "name": "unsorted-light"}
+
+// The minimum window size (DESIGN §2): the sidebar collapses, and the cards take three columns, the fewest that keep a card no wider than 320.
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "resize", "w": 960, "h": 600, "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+{"cmd": "screenshot", "name": "unsorted-960x600"}
+{"cmd": "key", "keystroke": "secondary-b", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
+{"cmd": "click", "target": "sidebar/folder/fc", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 488}}
+{"cmd": "bounds", "target": "card/0", "expect_result": [{"pointer": "/x", "equals": 24}, {"pointer": "/w", "equals": 296}, {"pointer": "/h", "equals": 112}]}
+{"cmd": "bounds", "target": "card/2", "expect_result": [{"pointer": "/x", "equals": 640}, {"pointer": "/w", "equals": 296}]}
+{"cmd": "bounds", "target": "card/3", "expect_result": {"pointer": "/x", "equals": 24}}
+{"cmd": "screenshot", "name": "folder-960x600"}
+// At 1040 the sidebar docks and leaves 744: three columns of 240.
+{"cmd": "resize", "w": 1040, "h": 700, "expect": {"pointer": "/shell/sidebar", "equals": "docked"}}
+{"cmd": "bounds", "target": "card/2", "expect_result": [{"pointer": "/x", "equals": 776}, {"pointer": "/w", "equals": 240}]}
+{"cmd": "bounds", "target": "card/3", "expect_result": {"pointer": "/x", "equals": 272}}
+{"cmd": "screenshot", "name": "folder-1040x700"}

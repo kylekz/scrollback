@@ -10,10 +10,27 @@
 
 use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, SharedString};
 
-use crate::actions::{app, shell};
+use crate::actions::{app, first_run, library, locations, sessions, shell, sidebar};
 
 /// Key context of the shell's root element: everything in the main window.
 pub const SHELL: &str = "Shell";
+/// Key context of the sidebar, while it has the keyboard.
+pub const SIDEBAR: &str = "Sidebar";
+/// Key context of a folder's row while the folder is renamed in it.
+pub const FOLDER_RENAME: &str = "FolderRename";
+/// Key context of the main area while it shows session cards: All sessions, Starred, a folder.
+pub const SESSIONS: &str = "Sessions";
+/// Key context of the main area while it shows Unsorted.
+pub const UNSORTED: &str = "Unsorted";
+/// Key context of the main area while it shows the first run.
+pub const FIRST_RUN: &str = "FirstRun";
+/// Key context of the locations sheet (DESIGN §4.11), and of its list while it has the
+/// keyboard.
+pub const LOCATIONS_SHEET: &str = "LocationsSheet";
+pub const LOCATIONS_LIST: &str = "LocationsList";
+/// Key context of a dialog over the sheet or the first run: adding a location (DESIGN
+/// §4.12), confirming a removal.
+pub const LOCATION_DIALOG: &str = "LocationDialog";
 
 /// One row of the keymap.
 #[derive(Clone, Copy)]
@@ -67,9 +84,50 @@ macro_rules! shortcut {
 
 /// `Ctrl B`: the sidebar of a narrow window (DESIGN §2). Named, because its button draws it.
 pub const TOGGLE_SIDEBAR: Shortcut = shortcut!("secondary-b", SHELL, shell::ToggleSidebar);
+/// `Ctrl Shift N` and `F5`. Named, because their buttons say them.
+pub const NEW_FOLDER: Shortcut = shortcut!("secondary-shift-n", SHELL, library::NewFolder);
+pub const SYNC_ALL: Shortcut = shortcut!("f5", SHELL, library::SyncAll);
+/// `Alt ←`. Named, because the reader's Back button says it.
+pub const BACK: Shortcut = shortcut!("alt-left", SHELL, library::Back);
+/// `S`. Named, because a card's star button says it.
+pub const STAR: Shortcut = shortcut!("s", SESSIONS, sessions::Star);
+/// `Ctrl L`. Named, because the Locations overline's label says it.
+pub const LOCATIONS: Shortcut = shortcut!("secondary-l", SHELL, shell::OpenLocations);
 
 /// Every binding scrollback defines.
-pub const SHORTCUTS: &[Shortcut] = &[TOGGLE_SIDEBAR, shortcut!("escape", SHELL, shell::Dismiss)];
+pub const SHORTCUTS: &[Shortcut] = &[
+    TOGGLE_SIDEBAR,
+    shortcut!("f6", SHELL, shell::FocusOther),
+    shortcut!("escape", SHELL, shell::Dismiss),
+    NEW_FOLDER,
+    shortcut!("f2", SHELL, sidebar::Rename),
+    SYNC_ALL,
+    BACK,
+    shortcut!("up", SIDEBAR, sidebar::Previous),
+    shortcut!("down", SIDEBAR, sidebar::Next),
+    shortcut!("left", SIDEBAR, sidebar::Collapse),
+    shortcut!("right", SIDEBAR, sidebar::Expand),
+    shortcut!("enter", SIDEBAR, sidebar::Open),
+    shortcut!("enter", FOLDER_RENAME, sidebar::KeepName),
+    shortcut!("escape", FOLDER_RENAME, sidebar::DropName),
+    shortcut!("left", SESSIONS, sessions::Left),
+    shortcut!("right", SESSIONS, sessions::Right),
+    shortcut!("up", SESSIONS, sessions::Up),
+    shortcut!("down", SESSIONS, sessions::Down),
+    shortcut!("enter", SESSIONS, sessions::Open),
+    STAR,
+    shortcut!("up", UNSORTED, sessions::Up),
+    shortcut!("down", UNSORTED, sessions::Down),
+    shortcut!("enter", UNSORTED, sessions::Open),
+    shortcut!("enter", FIRST_RUN, first_run::Add),
+    LOCATIONS,
+    shortcut!("escape", LOCATIONS_SHEET, locations::Close),
+    shortcut!("up", LOCATIONS_LIST, locations::Previous),
+    shortcut!("down", LOCATIONS_LIST, locations::Next),
+    shortcut!("enter", LOCATIONS_LIST, locations::Open),
+    shortcut!("escape", LOCATION_DIALOG, locations::Close),
+    shortcut!("enter", LOCATION_DIALOG, locations::Confirm),
+];
 
 /// `Ctrl K`, the palette's key (module docs).
 pub const SEARCH_KEYS: &str = "secondary-k";

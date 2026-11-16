@@ -26,7 +26,7 @@ use thiserror::Error;
 use crate::hash::Hash;
 
 pub use local::LocalTransport;
-pub use shell::{Launcher, Probe, ShellTransport};
+pub use shell::{Launcher, Probe, ShellTransport, quoted};
 
 /// Why a listing leaves something out on purpose ([`Listing::skipped`]), and why a name can't
 /// be listed: the same words from every transport.
@@ -169,6 +169,13 @@ pub enum TransportError {
     /// here ever accepts a key in the owner's place.
     #[error("the host's key was not accepted, and is never accepted on your behalf: {0}")]
     HostKey(String),
+    /// The user's login shell there was still starting after so many seconds, and was
+    /// stopped: its profile may be waiting for something.
+    #[error(
+        "the login shell there was still starting after {0} seconds and was stopped: its \
+         profile may be waiting for something"
+    )]
+    LoginShellHung(u32),
     /// The launcher or the shell at the location failed some other way.
     #[error("{0}")]
     Failed(String),
@@ -194,6 +201,7 @@ impl TransportError {
                 | Self::Unreachable(_)
                 | Self::Refused(_)
                 | Self::HostKey(_)
+                | Self::LoginShellHung(_)
                 | Self::Failed(_)
                 | Self::Stopped(_)
                 | Self::MissingTools(_)

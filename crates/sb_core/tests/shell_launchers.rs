@@ -339,7 +339,7 @@ fn a_login_shell_that_hangs_fails_the_call_and_is_killed_with_what_it_started() 
         let started = Instant::now();
         /* Not the bare environment, which may name another place than the profile would. */
         match transport.env(&["SB_BOTH"]) {
-            Err(TransportError::Failed(said)) => assert!(said.contains("login shell"), "{said}"),
+            Err(TransportError::LoginShellHung(seconds)) => assert_eq!(seconds, 5, "{shell}"),
             other => panic!("{shell}: {other:?}"),
         }
         assert!(started.elapsed() < Duration::from_secs(30), "{shell}");
@@ -370,7 +370,10 @@ fn a_login_shell_that_hangs_fails_the_call_and_is_killed_with_what_it_started() 
         }
         /* It is asked again by the next call, and what does not need it works. */
         if shell == "sh" {
-            assert!(matches!(transport.probe(), Err(TransportError::Failed(_))));
+            assert!(matches!(
+                transport.probe(),
+                Err(TransportError::LoginShellHung(_))
+            ));
             assert_eq!(transport.env(&[]).unwrap().home, text(home.path()));
         }
     }

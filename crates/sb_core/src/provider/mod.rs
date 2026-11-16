@@ -72,6 +72,25 @@ impl fmt::Display for ProviderId {
     }
 }
 
+/// How an agent is shown (PLAN §7.6): the views name no agent, and ask its provider for this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Display {
+    /// The agent's name, as its makers write it.
+    pub name: &'static str,
+    /// The agent's mark; an agent without one is shown with a generic glyph.
+    pub mark: Option<Mark>,
+}
+
+/// An agent's one-colour mark (DESIGN §1.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mark {
+    /// The mark as an SVG document. It is drawn in one colour, whatever its own.
+    pub svg: &'static str,
+    /// The mark's colour as `0xRRGGBB`, on a dark surface and on a light one.
+    pub dark: u32,
+    pub light: u32,
+}
+
 /// What an item is to its session (PLAN §4.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ItemKind {
@@ -175,6 +194,19 @@ impl From<Halt> for ProviderError {
 pub trait Provider: Send + Sync {
     fn id(&self) -> ProviderId;
 
+    /// How the agent is shown. One that brings nothing is shown by its id.
+    fn display(&self) -> Display {
+        Display {
+            name: self.id().as_str(),
+            mark: None,
+        }
+    }
+
+    /// The name to show for the model `model`, which is as the agent recorded it.
+    fn model_name(&self, model: &str) -> String {
+        model.to_string()
+    }
+
     /**
      * Whether the agent is present at the location behind `transport`; where it is, its data
      * there for one pass, which may borrow from the provider. `scratch` is a folder on this
@@ -240,6 +272,10 @@ pub fn audit(
  * length.
  */
 pub trait Source {
+    /// Where the agent keeps what is archived from here, as the location names it: a folder,
+    /// or a database file. It is only shown.
+    fn root(&self) -> String;
+
     /// Every item the agent has here.
     fn scan(&mut self) -> Result<Scan, ProviderError>;
 

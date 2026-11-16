@@ -1,5 +1,6 @@
-//! scrollback's views and services (docs/PLAN.md §11, docs/DESIGN.md): for now the concept E
-//! shell, empty, in the theme.
+//! scrollback's views and services (docs/PLAN.md §11, docs/DESIGN.md): the concept E shell,
+//! the services over the archive ([`services`]), the first run and the library's pages
+//! ([`pages`]) beside the sidebar ([`sidebar`]), in the theme.
 //!
 //! gpui: **yes**. Together with the `scrollback` binary this is the only crate that may depend
 //! on gpui (PLAN §3); everything it shows comes from `sb_core` through its headless API.
@@ -9,17 +10,25 @@
 //!
 //! Startup order (the `scrollback` binary): [`init`] (gpui-component, the keys, the fonts, a
 //! first theme), then [`appearance::init`] (which resolves the OS's light/dark and the material
-//! into the theme the first frame uses), then the main window with a [`shell::Shell`] as its
-//! root view, opened through [`automation::open_window`].
+//! into the theme the first frame uses), then [`services::init`] (which starts opening the
+//! archive), then the main window with a [`shell::Shell`] as its root view, opened through
+//! [`automation::open_window`].
 
 pub mod actions;
+pub mod add_location;
+pub mod agents;
 pub mod app_menu;
 pub mod appearance;
 pub mod assets;
 pub mod automation;
 pub mod components;
+pub mod format;
 pub mod icons;
 pub mod keymap;
+pub mod locations_sheet;
+pub mod overlay;
+pub mod pages;
+pub mod services;
 pub mod shell;
 pub mod sidebar;
 #[cfg(test)]

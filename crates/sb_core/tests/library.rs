@@ -353,6 +353,76 @@ fn a_path_is_attached_once_for_each_scope() {
 }
 
 #[test]
+fn a_folder_made_with_a_path_is_made_whole_or_not_at_all() {
+    let mut bench = Bench::new(DbAgent::new());
+    let key = started(&mut bench.agent, "/home/user/code/app");
+    bench.sync();
+    let catalogue = bench.archive().catalogue();
+    let names = || -> Vec<String> {
+        let folders = catalogue.folders().unwrap();
+        folders.into_iter().map(|folder| folder.name).collect()
+    };
+
+    /* The folder, its path, and the sessions the path claims, in one change. */
+    let location = Some(&bench.location);
+    let app = catalogue
+        .create_folder_with_path("app", None, " /home/user/code/app ", location)
+        .unwrap();
+    assert_eq!(names(), ["app"]);
+    let paths = catalogue.folder_paths(app).unwrap();
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].typed, "/home/user/code/app");
+    assert_eq!(paths[0].attached.location.as_ref(), location);
+    assert_eq!(bench.session(&key).filed, Filed::ByRule(app));
+
+    /* A path that is attached already, or names no directory, or does not say where it is
+    from the top, or a name that is none, leaves no folder behind. */
+    assert!(matches!(
+        catalogue.create_folder_with_path("again", None, "/home/user/code/app", location),
+        Err(CatalogueError::PathAttached { folder, .. }) if folder == app
+    ));
+    for refused in ["", "/", ".", "code/app", "~/code"] {
+        assert!(matches!(
+            catalogue.create_folder_with_path("stray", None, refused, None),
+            Err(CatalogueError::NoPath(_))
+        ));
+    }
+    assert!(matches!(
+        catalogue.create_folder_with_path(" ", None, "/home/user/other", None),
+        Err(CatalogueError::FolderName)
+    ));
+    assert!(matches!(
+        catalogue.create_folder_with_path("inside", Some(FolderId(9999)), "/home/user/x", None),
+        Err(CatalogueError::NoFolder(_))
+    ));
+    assert_eq!(names(), ["app"]);
+}
+
+#[test]
+fn sessions_with_no_path_are_a_group_apart_from_those_at_the_root() {
+    let mut bench = Bench::new(DbAgent::new());
+    let nowhere = [bench.agent.add_session(1), bench.agent.add_session(1)];
+    let at_root = started(&mut bench.agent, "/");
+    let here = started(&mut bench.agent, ".");
+    bench.sync();
+    let groups = bench.archive().catalogue().unsorted().unwrap();
+    let group = |key: &String| {
+        let id = bench.session_id(key);
+        let group = groups
+            .iter()
+            .find(|group| group.sessions.iter().any(|session| session.id == id))
+            .unwrap();
+        assert_eq!(group.project, None, "no folder can claim it");
+        (group.spellings.clone(), group.sessions.len())
+    };
+    assert_eq!(groups.len(), 3);
+    assert_eq!(group(&nowhere[0]), (Vec::new(), 2));
+    assert_eq!(group(&nowhere[1]), (Vec::new(), 2));
+    assert_eq!(group(&at_root), (vec!["/".to_string()], 1));
+    assert_eq!(group(&here), (vec![".".to_string()], 1));
+}
+
+#[test]
 fn a_session_filed_by_hand_stays_until_it_is_handed_back_to_the_rules() {
     let mut bench = Bench::new(DbAgent::new());
     let claimed = started(&mut bench.agent, "/home/user/code/app");
@@ -558,6 +628,35 @@ fn unsorted_is_grouped_by_where_its_sessions_started() {
     assert_eq!(spellings, ["/mnt/d/Projects/App", r"D:\Projects\App"]);
     assert_eq!(sessions.len(), 2);
     assert!(sessions.contains(&here[1]) && sessions.contains(&there[1]));
+    /* Its drive form is the one a session recorded; the paths that are no drive's have none. */
+    let drives: Vec<Option<&str>> = groups.iter().map(|group| group.drive.as_deref()).collect();
+    assert_eq!(drives.iter().filter(|drive| drive.is_none()).count(), 2);
+    assert!(drives.contains(&Some(r"D:\Projects\App")));
+}
+
+#[test]
+fn a_drives_group_recorded_only_under_a_distros_own_mount_has_its_drive_form() {
+    /* A WSL distro whose /etc/wsl.conf puts the Windows drives under /win/. */
+    let mut bench = Bench::new(DbAgent::new());
+    let catalogue = bench.archive().catalogue().clone();
+    catalogue
+        .set_drive_mount(&bench.location, Some("/win/"))
+        .unwrap();
+    let key = started(&mut bench.agent, "/win/d/Projects/fc");
+    bench.sync();
+    let groups = catalogue.unsorted().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].spellings, ["/win/d/Projects/fc"]);
+    assert_eq!(groups[0].drive.as_deref(), Some(r"D:\Projects\fc"));
+    /* Attached for that location, the drive form claims the group's session. */
+    let folder = catalogue
+        .create_folder_with_path("fc", None, r"D:\Projects\fc", Some(&bench.location))
+        .unwrap();
+    assert_eq!(
+        filed(&catalogue, &bench.session_id(&key)),
+        Filed::ByRule(folder)
+    );
+    assert_eq!(catalogue.unsorted().unwrap(), []);
 }
 
 #[test]

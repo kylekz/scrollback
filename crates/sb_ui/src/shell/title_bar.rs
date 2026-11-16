@@ -3,12 +3,17 @@
 //! window drag region; its controls occlude it.
 //!
 //! **Room.** The bar is three groups: the mark's, the search field, and the buttons'. The two
-//! outer groups share what the field leaves equally, which centres the field on the window; a
-//! group that needs more than its half keeps its own width and the field moves over by the
-//! difference. Each outer group's padding is on an inner box, so the two shares start equal.
+//! outer groups share what the field leaves equally, which centres the field on the window
+//! (DESIGN §2). Each is at least as wide as the wider of the two needs, so where the caption
+//! buttons leave too little room the field gives up width rather than its place. Each outer
+//! group's padding is on an inner box, so the two shares start equal.
 //!
-//! Search needs the index (PLAN §13 phase 6), Sync all a location (phase 3) and Settings its
-//! page (phase 7): until then each is drawn disabled and takes no clicks.
+//! **States** (DESIGN §4.1). The first run shows the mark alone: no search, Sync all or
+//! Settings (DESIGN §4.10). With a library, Sync all syncs every location, and while a pass
+//! runs its glyph turns, it reads "Syncing…", and neither a click nor `Tab` stops on it.
+//! While the archive is opening or didn't open, it is drawn disabled (DESIGN §4.14). Search
+//! needs the index (PLAN §13 phase 6) and Settings its page (phase 7): until then each is
+//! drawn disabled and takes no clicks.
 //!
 //! **Caption buttons** (Windows). Each is a 46px-wide box, the bar's height, marked with gpui's
 //! `WindowControlArea` (`Min`, `Max`, `Close`), so Windows itself answers the hit test and
@@ -25,11 +30,14 @@ use gpui::{
 };
 
 use super::{Shell, SidebarPlacement};
+use crate::actions::library::SyncAll;
 use crate::actions::shell::{Dismiss, ToggleSidebar};
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{DISABLED_OPACITY, icon, kbd};
+use crate::components::{DISABLED_OPACITY, icon, kbd, sync_glyph, tab_stop, text_width};
 use crate::icons::SbIcon;
 use crate::keymap;
+use crate::pages::Showing;
+use crate::services::ActiveServices as _;
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
 /// The gap between the bar's items (`design/project/sb.css`, `.titlebar`).
@@ -45,6 +53,34 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &theme.colors;
+        let showing = Showing::now(cx);
+        let first_run = showing == Showing::FirstRun;
+        let has_library = showing.is_library();
+        let syncing = cx.services().sync.read(cx).is_syncing();
+        let traffic_lights = cfg!(target_os = "macos") && !window.is_fullscreen();
+        let captions = CaptionButton::row(window);
+        // The room each outer group needs; both get the larger, so the field stays centred.
+        let left = if traffic_lights {
+            theme.sizes.traffic_lights_inset
+        } else {
+            theme.spacing.lg
+        } + if sidebar == SidebarPlacement::Docked {
+            px(0.)
+        } else {
+            theme.sizes.control_height + GAP
+        } + px(18.)
+            + theme.spacing.md
+            + text_width("scrollback", &theme.text.title, window);
+        let buttons = (!first_run).then(|| {
+            sync_all_width(has_library && syncing, theme, window) + GAP + theme.sizes.control_height
+        });
+        let right = match (buttons, captions) {
+            (Some(buttons), Some(_)) => buttons + GAP + theme.sizes.caption_button_width * 3.,
+            (None, Some(_)) => theme.sizes.caption_button_width * 3.,
+            (Some(buttons), None) => buttons + theme.spacing.lg,
+            (None, None) => theme.spacing.lg,
+        };
+        let side = left.max(right);
         div()
             .id("titlebar")
             .flex_none()
@@ -67,12 +103,12 @@ impl Shell {
             })
             .debug_selector(|| "titlebar".into())
             .child(
-                div().flex_1().flex().child(
+                div().flex_1().flex_basis(px(0.)).min_w(side).flex().child(
                     div()
                         .flex()
                         .items_center()
                         .gap(GAP)
-                        .pl(if cfg!(target_os = "macos") && !window.is_fullscreen() {
+                        .pl(if traffic_lights {
                             theme.sizes.traffic_lights_inset
                         } else {
                             theme.spacing.lg
@@ -83,21 +119,29 @@ impl Shell {
                         .child(mark(theme)),
                 ),
             )
-            .child(search_field(theme))
+            .when(!first_run, |this| this.child(search_field(theme)))
             .child(
-                div().flex_1().flex().justify_end().child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(GAP)
-                        .child(sync_all_button(theme))
-                        .child(settings_button(theme))
-                        // The caption buttons sit side by side, flush with the window's edge.
-                        .map(|this| match CaptionButton::row(window) {
-                            Some(buttons) => this.child(div().flex().children(buttons)),
-                            None => this.pr(theme.spacing.lg),
-                        }),
-                ),
+                div()
+                    .flex_1()
+                    .flex_basis(px(0.))
+                    .min_w(side)
+                    .flex()
+                    .justify_end()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(GAP)
+                            .when(!first_run, |this| {
+                                this.child(sync_all_button(has_library, syncing, theme, cx))
+                                    .child(settings_button(theme))
+                            })
+                            // The caption buttons sit side by side, flush with the window's edge.
+                            .map(|this| match captions {
+                                Some(buttons) => this.child(div().flex().children(buttons)),
+                                None => this.pr(theme.spacing.lg),
+                            }),
+                    ),
             )
             .automation_target("titlebar")
     }
@@ -114,8 +158,7 @@ fn sidebar_button(
     let open = sidebar == SidebarPlacement::Overlay;
     // Open, it is on (`s3`) whether or not the pointer is over it.
     let fill = if open { c.s3 } else { c.s2 };
-    div()
-        .id("titlebar-sidebar")
+    tab_stop(div().id("titlebar-sidebar"), theme)
         .debug_selector(|| "titlebar-sidebar".into())
         .role(Role::Button)
         .aria_label(format!(
@@ -129,6 +172,8 @@ fn sidebar_button(
         .justify_center()
         .size(theme.sizes.control_height)
         .rounded(theme.radii.control)
+        .border_1()
+        .border_color(gpui::transparent_black())
         // A control inside the drag region.
         .occlude()
         .cursor_pointer()
@@ -139,7 +184,7 @@ fn sidebar_button(
         )
         .child(icon(
             SbIcon::PanelLeft,
-            px(16.),
+            theme.sizes.icon,
             if open { c.fg } else { c.fg2 },
         ))
         .automation_target("titlebar/sidebar")
@@ -197,7 +242,8 @@ fn search_field(theme: &SbTheme) -> AnyElement {
             "Search the archive ({})",
             keymap::label(keymap::SEARCH_KEYS)
         ))
-        .flex_none()
+        .flex_shrink(1.)
+        .min_w_0()
         .flex()
         .items_center()
         .gap(theme.spacing.md)
@@ -211,7 +257,7 @@ fn search_field(theme: &SbTheme) -> AnyElement {
         .text_color(c.fg3)
         .opacity(DISABLED_OPACITY)
         .debug_selector(|| "titlebar-search".into())
-        .child(icon(SbIcon::Search, px(14.), c.fg3))
+        .child(icon(SbIcon::Search, theme.sizes.icon_sm, c.fg3))
         .child(
             div()
                 .flex_1()
@@ -223,12 +269,33 @@ fn search_field(theme: &SbTheme) -> AnyElement {
         .automation_target("titlebar/search")
 }
 
-/// Sync all (DESIGN §4.1): a small button that syncs every location. Disabled (module docs).
-fn sync_all_button(theme: &SbTheme) -> AnyElement {
+/// What Sync all says: whether a pass runs.
+fn sync_all_label(syncing: bool) -> &'static str {
+    if syncing { "Syncing…" } else { "Sync all" }
+}
+
+/// How wide [`sync_all_button`] is: its border, padding, glyph, gap and label.
+fn sync_all_width(syncing: bool, theme: &SbTheme, window: &Window) -> Pixels {
+    px(2.)
+        + theme.spacing.md * 2.
+        + theme.sizes.icon_sm
+        + theme.spacing.sm
+        + text_width(sync_all_label(syncing), &theme.text.control_small, window)
+}
+
+/// Sync all (DESIGN §4.1): a small button that syncs every location (`F5`). While a pass runs
+/// it says so and a click does nothing; without a library it is disabled (module docs).
+fn sync_all_button(
+    enabled: bool,
+    syncing: bool,
+    theme: &SbTheme,
+    cx: &mut Context<Shell>,
+) -> AnyElement {
     let c = &theme.colors;
     div()
         .id("titlebar-sync-all")
         .role(Role::Button)
+        .aria_label(format!("Sync all locations ({})", keymap::SYNC_ALL.label()))
         .flex_none()
         .flex()
         .items_center()
@@ -242,9 +309,25 @@ fn sync_all_button(theme: &SbTheme) -> AnyElement {
         .text_color(c.fg)
         .text_spec(&theme.text.control_small)
         .whitespace_nowrap()
-        .opacity(DISABLED_OPACITY)
-        .child(icon(SbIcon::RefreshCw, px(14.), c.fg))
-        .child("Sync all")
+        // A control inside the drag region.
+        .occlude()
+        .map(|this| {
+            if !enabled {
+                this.opacity(DISABLED_OPACITY)
+            } else if syncing {
+                // It does nothing while a pass runs, so `Tab` passes it by.
+                this
+            } else {
+                tab_stop(this, theme)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(c.s3))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.sync_all(&SyncAll, window, cx);
+                    }))
+            }
+        })
+        .child(sync_glyph(enabled && syncing, c.fg, theme))
+        .child(sync_all_label(enabled && syncing))
         .automation_target("titlebar/sync-all")
 }
 
@@ -265,7 +348,7 @@ fn settings_button(theme: &SbTheme) -> AnyElement {
         .size(theme.sizes.control_height)
         .rounded(theme.radii.control)
         .opacity(DISABLED_OPACITY)
-        .child(icon(SbIcon::Settings, px(16.), theme.colors.fg2))
+        .child(icon(SbIcon::Settings, theme.sizes.icon, theme.colors.fg2))
         .automation_target("titlebar/settings")
 }
 

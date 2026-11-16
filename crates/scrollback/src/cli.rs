@@ -46,6 +46,28 @@ pub struct Cli {
     #[arg(long, requires = "automation_mode")]
     pub automation_background: bool,
 
+    #[cfg(feature = "automation")]
+    /// Under automation, write every date in UTC and as seen from this year, so that what a
+    /// scripted run captures is the same on any day and any machine. The e2e runner passes
+    /// the year its fixtures are dated in. Needs `--automation` or `--automation-pipe`.
+    #[arg(long, value_name = "YEAR", requires = "automation_mode")]
+    pub automation_calendar: Option<i32>,
+
+    #[cfg(feature = "automation")]
+    /// Under automation, read a WSL distro's location from this home folder, as a stand-in
+    /// for the distro. Without it a scripted run reaches no distro. The e2e runner passes the
+    /// scenario's home. Needs `--automation` or `--automation-pipe`.
+    #[arg(long, value_name = "DIR", requires = "automation_mode")]
+    pub automation_wsl_home: Option<PathBuf>,
+
+    #[cfg(feature = "automation")]
+    /// DEVELOPMENT OVERRIDE: read every WSL and SSH location with this folder, on the far
+    /// side, for its home, in an environment of nothing else: for trying a real distro or
+    /// host on generated transcripts instead of its user's own. Not for scripted runs, which
+    /// reach no real distro or host. Not in a shipped build.
+    #[arg(long, value_name = "DIR", conflicts_with = "automation_mode")]
+    pub dev_location_home: Option<String>,
+
     /// Window size in logical pixels, e.g. 1440x900 (minimum 960x600) [default: 1440x900].
     #[arg(long, value_name = "WxH")]
     pub window_size: Option<WindowSize>,
@@ -115,6 +137,27 @@ mod tests {
 
     #[cfg(feature = "automation")]
     #[test]
+    fn the_development_override_takes_a_folder_and_never_a_scripted_run() {
+        let cli = parse(&["--dev-location-home", "/home/user/fixture"]).unwrap();
+        assert_eq!(cli.dev_location_home.as_deref(), Some("/home/user/fixture"));
+        assert!(parse(&["--dev-location-home"]).is_err(), "needs a folder");
+        for driver in [&["--automation"][..], &["--automation-pipe", "e2e"]] {
+            let mut args = vec!["--dev-location-home", "/home/user/fixture"];
+            args.extend(driver);
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
+
+    /// The shipped app has no development override (`cargo test -p scrollback
+    /// --no-default-features`).
+    #[cfg(not(feature = "automation"))]
+    #[test]
+    fn a_shipped_build_has_no_development_override() {
+        assert!(parse(&["--dev-location-home", "/home/user/fixture"]).is_err());
+    }
+
+    #[cfg(feature = "automation")]
+    #[test]
     fn automation_pipe_implies_automation() {
         assert!(!parse(&[]).unwrap().automation_enabled());
         let cli = parse(&["--automation-pipe", "scrollback-e2e"]).unwrap();
@@ -158,6 +201,20 @@ mod tests {
         assert!(parse(&["--automation-pipe", "p", "--automation-background"]).is_ok());
     }
 
+    #[cfg(feature = "automation")]
+    #[test]
+    fn a_pinned_calendar_is_a_year_and_needs_automation() {
+        assert_eq!(parse(&["--automation"]).unwrap().automation_calendar, None);
+        assert_eq!(
+            parse(&["--automation", "--automation-calendar", "2026"])
+                .unwrap()
+                .automation_calendar,
+            Some(2026)
+        );
+        assert!(parse(&["--automation-calendar", "2026"]).is_err());
+        assert!(parse(&["--automation", "--automation-calendar", "soon"]).is_err());
+    }
+
     #[cfg(not(feature = "automation"))]
     #[test]
     fn a_build_without_the_driver_has_no_automation_options() {
@@ -165,6 +222,7 @@ mod tests {
             assert!(parse(&[flag]).is_err(), "{flag}");
         }
         assert!(parse(&["--automation-pipe", "p"]).is_err());
+        assert!(parse(&["--automation-calendar", "2026"]).is_err());
     }
 
     #[test]

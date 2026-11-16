@@ -84,22 +84,132 @@ impl LocationKind {
             (Self::Wsl { distro }, Self::Wsl { distro: other }) => {
                 distro.eq_ignore_ascii_case(other)
             }
+            /* ssh lowercases a host's name; a user's is as typed. */
+            (Self::Ssh { host }, Self::Ssh { host: other }) => {
+                let split = |host: &str| match host.rsplit_once('@') {
+                    Some((user, host)) => (Some(user.to_string()), host.to_ascii_lowercase()),
+                    None => (None, host.to_ascii_lowercase()),
+                };
+                split(host) == split(other)
+            }
             _ => self == other,
+        }
+    }
+
+    /// What starts the shell of a WSL or SSH location: what its connection test runs, and
+    /// shows (DESIGN §4.12). `None` for this machine, which is read without one.
+    pub fn launcher(&self) -> Option<Launcher> {
+        match self {
+            Self::Local => None,
+            Self::Wsl { distro } => Some(Launcher::Wsl {
+                distro: distro.clone(),
+            }),
+            Self::Ssh { host } => Some(Launcher::Ssh { host: host.clone() }),
         }
     }
 
     /// The transport that reads a location of this kind. Cancelling `cancel` stops what a
     /// WSL or SSH location's transport is running.
     pub fn transport(&self, cancel: &CancelToken) -> Box<dyn Transport> {
-        let shell = |launcher| Box::new(ShellTransport::new(launcher).cancelled_by(cancel));
-        match self {
-            Self::Local => Box::new(LocalTransport),
-            Self::Wsl { distro } => shell(Launcher::Wsl {
-                distro: distro.clone(),
-            }),
-            Self::Ssh { host } => shell(Launcher::Ssh { host: host.clone() }),
+        match self.launcher() {
+            None => Box::new(LocalTransport),
+            Some(launcher) => Box::new(ShellTransport::new(launcher).cancelled_by(cancel)),
         }
     }
+}
+
+/// The most characters a host may have: a name as DNS allows it, with a user and brackets.
+const HOST_CHARS: usize = 320;
+
+/**
+ * What is wrong with `host` as a host to hand `ssh` (PLAN §6.4), if anything, in a sentence
+ * that names the character. Only what a host or an alias can hold is taken: `[A-Za-z0-9._-]`
+ * and `:` for the host, the same and `+` for a user before an `@`, and an IPv6 address in
+ * brackets with `%` only for its zone. Anything else could reach a shell through an older
+ * ssh's `ProxyCommand` and `%h`, or show the owner one host and connect to another (an
+ * invisible or right-to-left character). Every way to a host is checked by this: adding a
+ * location, and starting its launcher.
+ */
+pub fn host_problem(host: &str) -> Option<String> {
+    let refused = |c: char| {
+        Some(if c == ' ' {
+            "A host can't hold a space.".to_string()
+        } else if c.is_ascii_graphic() {
+            format!("A host can't hold \u{201c}{c}\u{201d}.")
+        } else {
+            format!("A host can't hold the character U+{:04X}.", u32::from(c))
+        })
+    };
+    let name = |c: char| c.is_ascii_alphanumeric() || "._-".contains(c);
+    if host.is_empty() {
+        return Some("Type a host, as you would after ssh.".to_string());
+    }
+    if host.chars().count() > HOST_CHARS {
+        return Some(format!("A host has at most {HOST_CHARS} characters."));
+    }
+    let (user, at) = match host.rsplit_once('@') {
+        Some((user, at)) => (Some(user), at),
+        None => (None, host),
+    };
+    if let Some(user) = user {
+        if user.is_empty() {
+            return Some("A user's name goes before the @.".to_string());
+        }
+        if let Some(c) = user.chars().find(|c| !(name(*c) || *c == '+')) {
+            return refused(c);
+        }
+    }
+    if host.starts_with('-') || at.starts_with('-') {
+        return Some("A host can't start with a dash.".to_string());
+    }
+    if at.is_empty() {
+        return Some("A host goes after the @.".to_string());
+    }
+    match at.strip_prefix('[') {
+        Some(inside) => {
+            let Some(inside) = inside.strip_suffix(']') else {
+                return Some("An address in brackets ends with ].".to_string());
+            };
+            let (address, zone) = inside.split_once('%').unwrap_or((inside, ""));
+            if address.is_empty() {
+                return Some("An address goes between the brackets.".to_string());
+            }
+            address
+                .chars()
+                .find(|c| !(c.is_ascii_hexdigit() || ":.".contains(*c)))
+                .or_else(|| zone.chars().find(|c| !name(*c)))
+                .and_then(refused)
+        }
+        None => at
+            .chars()
+            .find(|c| !(name(*c) || *c == ':'))
+            .and_then(refused),
+    }
+}
+
+/// The most characters a location's name may have.
+pub const NAME_CHARS: usize = 80;
+
+/**
+ * A location's name as the owner typed it, fit to keep: without control characters and the
+ * invisible ones that format text (a right-to-left override, a zero-width space), trimmed,
+ * and no longer than [`NAME_CHARS`]. `None` when nothing is left.
+ */
+pub fn clean_name(name: &str) -> Option<String> {
+    let invisible = |c: char| {
+        matches!(
+            u32::from(c),
+            0xAD | 0x61C | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064
+                | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB
+        )
+    };
+    let kept: String = name
+        .chars()
+        .filter(|c| !c.is_control() && !invisible(*c))
+        .collect();
+    let kept: String = kept.trim().chars().take(NAME_CHARS).collect();
+    let kept = kept.trim_end().to_string();
+    (!kept.is_empty()).then_some(kept)
 }
 
 /// A location that could not be connected to when it was last tried (PLAN §5): a machine that
@@ -132,6 +242,9 @@ pub struct Location {
     /// somewhere other than `/mnt/` (PLAN §6.3), as the last sync that reached it read
     /// there: its sessions' project paths under there are the drives' (PLAN §8).
     pub drive_mount: Option<String>,
+    /// When the owner removed it: it is synced no more, and what was archived from it stays
+    /// (FEATURES: Locations). `None` while it is one of the owner's locations.
+    pub removed: Option<i64>,
 }
 
 #[cfg(test)]
@@ -148,10 +261,69 @@ mod tests {
         };
         assert!(wsl("Ubuntu-24.04").same_place(&wsl("ubuntu-24.04")));
         assert!(!wsl("Ubuntu-24.04").same_place(&wsl("Ubuntu-22.04")));
-        /* A host is as it is typed: ssh's config tells names apart by case. */
         assert!(ssh("user@macbook").same_place(&ssh("user@macbook")));
-        assert!(!ssh("user@macbook").same_place(&ssh("user@MacBook")));
         assert!(!wsl("macbook").same_place(&ssh("macbook")));
         assert!(LocationKind::Local.same_place(&LocationKind::Local));
+        /* ssh lowercases a host's name, and takes a user's as typed. */
+        assert!(ssh("user@MacBook").same_place(&ssh("user@macbook")));
+        assert!(ssh("MacBook").same_place(&ssh("macbook")));
+        assert!(!ssh("User@macbook").same_place(&ssh("user@macbook")));
+        assert!(!ssh("macbook").same_place(&ssh("user@macbook")));
+    }
+
+    #[test]
+    fn a_host_holds_only_what_a_host_or_an_alias_can() {
+        for good in [
+            "macbook",
+            "user@macbook",
+            "user.name+tag@mac-book.local",
+            "build_box",
+            "10.0.0.7",
+            "fe80::1",
+            "user@[fe80::1%eth0]",
+            "[::1]",
+        ] {
+            assert_eq!(host_problem(good), None, "{good}");
+        }
+        for (bad, says) in [
+            ("", "Type a host, as you would after ssh."),
+            ("-oProxyCommand=x", "A host can't start with a dash."),
+            ("user@-x", "A host can't start with a dash."),
+            ("@macbook", "A user's name goes before the @."),
+            ("user@", "A host goes after the @."),
+            ("mac book", "A host can't hold a space."),
+            ("$(touch x)", "A host can't hold \u{201c}$\u{201d}."),
+            ("mac`id`", "A host can't hold \u{201c}`\u{201d}."),
+            ("a;b", "A host can't hold \u{201c};\u{201d}."),
+            ("a|b", "A host can't hold \u{201c}|\u{201d}."),
+            ("'mac'", "A host can't hold \u{201c}'\u{201d}."),
+            ("mac%h", "A host can't hold \u{201c}%\u{201d}."),
+            (
+                "user@\u{202e}koob\u{202c}cam",
+                "A host can't hold the character U+202E.",
+            ),
+            ("mac\u{200b}book", "A host can't hold the character U+200B."),
+            ("mac\tbook", "A host can't hold the character U+0009."),
+            ("[fe80::1", "An address in brackets ends with ]."),
+            ("[fe80::g]", "A host can't hold \u{201c}g\u{201d}."),
+        ] {
+            assert_eq!(host_problem(bad).as_deref(), Some(says), "{bad:?}");
+        }
+        assert!(host_problem(&"a".repeat(HOST_CHARS + 1)).is_some());
+    }
+
+    #[test]
+    fn a_name_is_kept_without_what_cant_be_seen_and_not_too_long() {
+        assert_eq!(clean_name("  Work Mac "), Some("Work Mac".to_string()));
+        assert_eq!(
+            clean_name("Work\u{202e}Mac\u{200b}"),
+            Some("WorkMac".to_string())
+        );
+        assert_eq!(clean_name("a\tb\n"), Some("ab".to_string()));
+        assert_eq!(clean_name(" \u{200b} "), None);
+        assert_eq!(
+            clean_name(&"x".repeat(400)).map(|it| it.len()),
+            Some(NAME_CHARS)
+        );
     }
 }

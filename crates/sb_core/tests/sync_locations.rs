@@ -15,7 +15,7 @@ use sb_core::location::LocationKind;
 use sb_core::provider::{
     Hashed, ItemKind, Provider, ProviderError, ProviderId, RangeFailure, SessionItems, Source,
 };
-use sb_core::sync::{Pass, SyncError, sync_location};
+use sb_core::sync::{Pass, SyncError, survey, sync_location};
 use sb_core::transcript::{Facts, Transcript};
 use sb_core::transport::{
     Env, FileStat, Listing, PrefixRequest, RangeRequest, RangeSink, Transport, TransportError,
@@ -112,6 +112,40 @@ fn each_agent_at_a_location_is_synced_in_turn() {
     bench.assert_verifies();
     let found = catalogue.providers_found(&bench.location).unwrap();
     assert_eq!(found.len(), 2);
+}
+
+#[test]
+fn a_survey_says_what_each_agent_has_there_and_archives_nothing() {
+    let (mut bench, database, _) = two_agents();
+    bench.agent.add_session(3);
+    let providers = [
+        Box::new(Unreachable),
+        bench.agent.provider(),
+        database.provider(),
+    ];
+    let found = survey(bench.archive(), &bench.agent.transport(), &providers);
+    let [Err((failed, _)), Ok(files), Ok(rows)] = &found[..] else {
+        panic!("one that could not look and two that found their agent: {found:?}");
+    };
+    assert_eq!(*failed, providers[0].id());
+    /* Each agent's sessions, and where it keeps them: a folder, and a database file. */
+    assert_eq!((files.provider, files.sessions), (providers[1].id(), 2));
+    assert_eq!(Path::new(&files.root), bench.agent.tree().path("projects"));
+    assert_eq!((rows.provider, rows.sessions), (providers[2].id(), 1));
+    assert_eq!(
+        Path::new(&rows.root),
+        bench.agent.tree().home().join(".dbagent/sessions.db")
+    );
+    /* Nothing was archived or recorded, and a provider whose agent is not there is left out. */
+    let catalogue = bench.archive().catalogue();
+    assert_eq!(catalogue.providers_found(&bench.location).unwrap(), []);
+    assert_eq!(bench.location().last_attempt, None);
+    let elsewhere = FileAgent::new();
+    std::fs::remove_dir_all(elsewhere.tree().path("projects")).unwrap();
+    assert_eq!(
+        survey(bench.archive(), &elsewhere.transport(), &providers[1..]).len(),
+        0
+    );
 }
 
 #[test]

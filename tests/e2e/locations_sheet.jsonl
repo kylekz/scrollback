@@ -1,0 +1,135 @@
+{"scenario": {"window_size": "1440x900", "fixture": "locations", "description": "The locations sheet (DESIGN §4.11, E-Locations, E-Locations-Failed) over a library of one location of each kind, the host's last good sync twelve days ago: opened from a sidebar row with that location selected, from the overline and with Ctrl L; each state's card (not reachable and stale, synced, failed with the host key's words, never synced, syncing) captured dark and light; Stop; renaming; removing, which asks first and keeps every archived session; Esc closing it"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/sync/locations", "len": 3}, {"pointer": "/sync/syncing", "equals": false}, {"pointer": "/sheet", "equals": null}]}
+// The start synced this machine and the distro (a scripted run reads both as the fixture's home) and could not reach the host, whose last good sync is twelve days old: unreachable, and stale.
+{"cmd": "state", "expect": [{"pointer": "/sync/locations/0/state", "equals": "synced"}, {"pointer": "/sync/locations/1/state", "equals": "synced"}, {"pointer": "/sync/locations/2", "equals": {"name": "user@macbook", "kind": "ssh", "state": "unreachable", "error": null, "progress": null, "stale": true, "removing": false}}, {"pointer": "/library/counts/all", "equals": 10}]}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+
+// A sidebar row opens the sheet with its location selected (DESIGN §4.1): 1200 × 790, centred, 24 under the title bar.
+{"cmd": "click", "target": "sidebar/location/user@macbook"}
+{"cmd": "settle", "expect": {"pointer": "/sheet", "equals": {"selected": "user@macbook", "dialog": null}}}
+{"cmd": "bounds", "target": "sheet", "expect_result": [{"pointer": "/x", "equals": 120}, {"pointer": "/y", "gte": 62}, {"pointer": "/y", "lte": 64}, {"pointer": "/w", "equals": 1200}, {"pointer": "/h", "gte": 788}, {"pointer": "/h", "lte": 790}]}
+{"cmd": "bounds", "target": "sheet/status/unreachable", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "sheet/stale/user@macbook", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "sheet/stale/This PC", "expect_error": "no target"}
+{"cmd": "bounds", "target": "sheet/host", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "sheet-unreachable-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "sheet-unreachable-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// ↑ and ↓ move through the list; Esc closes the sheet; Ctrl L opens it on the first location; so does the Locations overline.
+{"cmd": "key", "keystroke": "up"}
+{"cmd": "settle", "expect": {"pointer": "/sheet/selected", "equals": "Ubuntu-24.04"}}
+{"cmd": "key", "keystroke": "up"}
+{"cmd": "key", "keystroke": "up"}
+{"cmd": "settle", "expect": {"pointer": "/sheet/selected", "equals": "This PC"}}
+{"cmd": "bounds", "target": "sheet/status/synced", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "sheet-synced-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "sheet-synced-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": {"pointer": "/sheet", "equals": null}}
+{"cmd": "key", "keystroke": "secondary-l"}
+{"cmd": "settle", "expect": {"pointer": "/sheet", "equals": {"selected": "This PC", "dialog": null}}}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "click", "target": "sidebar/locations"}
+{"cmd": "settle", "expect": {"pointer": "/sheet/selected", "equals": "This PC"}}
+
+// Failed: the host answers now, but its key is not the one on record. The card shows ssh's words in full; nothing offers to accept the key.
+{"cmd": "stand_in", "places": {"user@macbook": "host_key"}}
+{"cmd": "click", "target": "sheet/row/user@macbook/action"}
+{"cmd": "settle", "expect": [{"pointer": "/sheet/selected", "equals": "user@macbook"}, {"pointer": "/sync/locations/2/state", "equals": "failed"}, {"pointer": "/sync/locations/2/error", "contains": "Host key verification failed."}, {"pointer": "/sync/locations/2/stale", "equals": true}]}
+{"cmd": "bounds", "target": "sheet/status/failed", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "sheet-failed-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "sheet-failed-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// Found on this machine and not added: a stopped distro, listed without starting it. Its Add opens the dialog on it; adding it doesn't start it, so it is not synced yet.
+{"cmd": "stand_in", "distros": [{"name": "Ubuntu-24.04", "running": true, "default": true}, {"name": "Debian"}, {"name": "docker-desktop", "running": true, "utility": true}]}
+{"cmd": "settle", "expect": {"pointer": "/sync/distros", "equals": ["Ubuntu-24.04", "Debian", "docker-desktop"]}}
+{"cmd": "query", "prefix": "sheet/found/", "expect_result": [{"pointer": "", "len": 2}, {"pointer": "/0/target", "equals": "sheet/found/Debian"}]}
+{"cmd": "screenshot", "name": "sheet-found-dark"}
+{"cmd": "click", "target": "sheet/found/Debian/add"}
+{"cmd": "settle", "expect": [{"pointer": "/sheet/dialog", "equals": "add"}, {"pointer": "/sync/test", "equals": null}]}
+{"cmd": "bounds", "target": "add/stopped", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "click", "target": "add/add"}
+{"cmd": "settle", "expect": [{"pointer": "/sheet", "equals": {"selected": "Debian", "dialog": null}}, {"pointer": "/sync/locations/3", "equals": {"name": "Debian", "kind": "wsl", "state": "never", "error": null, "progress": null, "stale": false, "removing": false}}]}
+{"cmd": "query", "prefix": "sheet/found/", "expect_result": {"pointer": "", "len": 0}}
+{"cmd": "bounds", "target": "sheet/status/never", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "sheet-never-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "sheet-never-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// Syncing: a host added and synced at once, its first sync held after one file. Stop keeps what it copied.
+{"cmd": "stand_in", "places": {"user@studio": "passes"}}
+{"cmd": "click", "target": "sheet/add"}
+{"cmd": "click", "target": "add/kind/ssh"}
+{"cmd": "type", "text": "user@studio"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "user@studio", "state": "passed"}}}
+{"cmd": "hold_sync", "after": 1}
+{"cmd": "click", "target": "add/add-sync"}
+{"cmd": "wait_for", "pointer": "/sync/held", "equals": true, "timeout_ms": 30000}
+{"cmd": "wait_for", "pointer": "/sync/locations/4/progress/items_done", "gte": 1, "timeout_ms": 10000}
+{"cmd": "state", "expect": [{"pointer": "/sheet", "equals": {"selected": "user@studio", "dialog": null}}, {"pointer": "/sync/locations/4/state", "equals": "syncing"}]}
+{"cmd": "bounds", "target": "sheet/status/syncing", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "sheet-syncing-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "screenshot", "name": "sheet-syncing-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "click", "target": "sheet/sync"}
+{"cmd": "wait_for", "pointer": "/sync/syncing", "equals": false, "timeout_ms": 30000}
+{"cmd": "settle", "expect": [{"pointer": "/sync/locations/4/state", "not_equals": "syncing"}, {"pointer": "/library/counts/all", "equals": 13}]}
+
+// Renaming: the name field takes the new name on Enter, and the keyboard goes back to the list.
+{"cmd": "click", "target": "sheet/name"}
+{"cmd": "key", "keystroke": "secondary-a"}
+{"cmd": "type", "text": "Studio Mac\n"}
+{"cmd": "settle", "expect": [{"pointer": "/sync/locations/4/name", "equals": "Studio Mac"}, {"pointer": "/sheet/selected", "equals": "Studio Mac"}]}
+{"cmd": "query", "prefix": "sidebar/location/Studio Mac", "expect_result": {"pointer": "", "len": 1}}
+
+// Removing asks first; Enter on the question removes nothing; Remove stops syncing the host and keeps its sessions.
+{"cmd": "click", "target": "sheet/row/user@macbook"}
+{"cmd": "click", "target": "sheet/remove"}
+{"cmd": "settle", "expect": {"pointer": "/sheet/dialog", "equals": "remove"}}
+{"cmd": "screenshot", "name": "sheet-remove-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "sheet-remove-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/sheet/dialog", "equals": "remove"}}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": [{"pointer": "/sheet/dialog", "equals": null}, {"pointer": "/sync/removed", "equals": []}]}
+{"cmd": "click", "target": "sheet/remove"}
+{"cmd": "click", "target": "remove/confirm"}
+{"cmd": "settle", "expect": [{"pointer": "/sync/removed", "equals": ["user@macbook"]}, {"pointer": "/sync/locations", "len": 4}, {"pointer": "/sheet/dialog", "equals": null}, {"pointer": "/library/counts/all", "equals": 13}]}
+{"cmd": "query", "prefix": "sidebar/location/user@macbook", "expect_result": {"pointer": "", "len": 0}}
+{"cmd": "query", "prefix": "sheet/stale/", "expect_result": {"pointer": "", "len": 0}}
+{"cmd": "screenshot", "name": "sheet-removed-dark"}
+
+// Adding the removed host again shows the name it comes back under, not a field to type in. Asleep now, it can be added anyway.
+{"cmd": "stand_in", "places": {"user@macbook": "unreachable"}}
+{"cmd": "click", "target": "sheet/add"}
+{"cmd": "click", "target": "add/kind/ssh"}
+{"cmd": "type", "text": "user@macbook"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "add/name-kept", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "add/name", "expect_error": "no target"}
+{"cmd": "screenshot", "name": "add-restore-dark"}
+{"cmd": "click", "target": "add/cancel"}
+{"cmd": "settle", "expect": {"pointer": "/sheet/dialog", "equals": null}}
+
+// Esc closes the sheet and the keyboard is back on the page.
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": [{"pointer": "/sheet", "equals": null}, {"pointer": "/page", "equals": "sessions"}]}

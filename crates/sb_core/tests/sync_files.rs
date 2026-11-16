@@ -744,7 +744,10 @@ mod unreadable {
         let location = bench.location();
         assert_eq!(location.last_success, succeeded);
         let error = location.last_error.unwrap();
-        assert!(error.contains("1 could not be archived"), "{error}");
+        assert!(
+            error.contains("1 item was not archived, because: "),
+            "{error}"
+        );
 
         assert_eq!(bench.sync().appended, 1);
         bench.assert_mirrors(&[locked, open]);
@@ -790,7 +793,7 @@ mod unreadable {
             assert_eq!((report.scanned, report.gone), (1, 0));
             assert_eq!(bench.item(&subagent).gone_since, None);
             let error = bench.location().last_error.unwrap();
-            assert!(error.contains("could not be archived"), "{error}");
+            assert!(error.contains("not archived"), "{error}");
 
             /* Readable again, and grown: it goes on in its version, as nothing happened. */
             bench.agent.append_raw(&subagent, "{\"type\":\"user\"}\n");

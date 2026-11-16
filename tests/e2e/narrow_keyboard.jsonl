@@ -1,0 +1,58 @@
+{"scenario": {"window_size": "1000x700", "fixture": "agent", "description": "The keyboard in a window too narrow to dock the sidebar (DESIGN §2, §4.1): a folder made with Ctrl Shift N is named in its row, so the sidebar shows over the page for it; F2 on a folder's page does the same; Tab walks the buttons and the page's keys go on working; and the keyboard is never left on something that isn't drawn"}}
+{"cmd": "wait_ready", "timeout_ms": 20000}
+{"cmd": "settle", "expect": {"pointer": "/page", "equals": "first-run"}}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+
+// Enter adds the checked location with no click at all; its sessions are on All sessions, the sidebar collapsed.
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/shell/sidebar", "equals": "collapsed"}, {"pointer": "/library/counts/all", "equals": 3}]}
+
+// A new folder is named in its row: the sidebar comes over the page with the row's field in it, and typing goes there.
+{"cmd": "key", "keystroke": "secondary-shift-n"}
+{"cmd": "settle", "expect": [{"pointer": "/shell/sidebar", "equals": "overlay"}, {"pointer": "/library/folders/0/name", "equals": "New folder"}]}
+{"cmd": "bounds", "target": "sidebar/folder-rename", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "naming-a-folder-dark"}
+{"cmd": "type", "text": "work"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": [{"pointer": "/library/folders/0/name", "equals": "work"}, {"pointer": "/shell/sidebar", "equals": "overlay"}]}
+{"cmd": "bounds", "target": "sidebar/folder-rename", "expect_error": "no target"}
+// The sidebar has the keyboard: the arrows walk its rows. Esc hides it and the page has the keyboard again.
+{"cmd": "key", "keystroke": "down", "expect": {"pointer": "/library/shelf", "equals": "starred"}}
+{"cmd": "key", "keystroke": "up", "expect": {"pointer": "/library/shelf", "equals": "all"}}
+{"cmd": "key", "keystroke": "escape", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+{"cmd": "settle"}
+{"cmd": "key", "keystroke": "right", "expect": {"pointer": "/library/selected", "equals": "Fix the flaky upload test"}}
+
+// F2 on the folder's page, the sidebar hidden: it shows for the row, and Esc leaves the name as it was.
+{"cmd": "key", "keystroke": "secondary-b"}
+{"cmd": "click", "target": "sidebar/folder/work"}
+{"cmd": "settle", "expect": [{"pointer": "/library/shelf", "equals": {"folder": "work"}}, {"pointer": "/shell/sidebar", "equals": "collapsed"}]}
+{"cmd": "key", "keystroke": "f2", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
+{"cmd": "bounds", "target": "sidebar/folder-rename", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "type", "text": "play"}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": {"pointer": "/library/folders/0/name", "equals": "work"}}
+{"cmd": "bounds", "target": "sidebar/folder-rename", "expect_error": "no target"}
+// And taking the keyboard to the page keeps what was typed, as Enter does.
+{"cmd": "key", "keystroke": "f2"}
+{"cmd": "type", "text": "play"}
+{"cmd": "key", "keystroke": "f6", "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+{"cmd": "settle", "expect": {"pointer": "/library/folders/0/name", "equals": "play"}}
+{"cmd": "bounds", "target": "sidebar/folder-rename", "expect_error": "no target"}
+
+// Tab goes round the window's buttons and back; wherever it stops, F6 and the page's keys still work.
+{"cmd": "click", "target": "titlebar/sidebar"}
+{"cmd": "click", "target": "sidebar/all-sessions"}
+{"cmd": "settle", "expect": [{"pointer": "/library/shelf", "equals": "all"}, {"pointer": "/shell/sidebar", "equals": "collapsed"}]}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "screenshot", "name": "after-three-tabs-dark"}
+{"cmd": "key", "keystroke": "right", "expect": {"pointer": "/library/selected", "equals": "Fix the flaky upload test"}}
+{"cmd": "key", "keystroke": "right", "expect": {"pointer": "/library/selected", "equals": "Add retries to the fetcher"}}
+{"cmd": "key", "keystroke": "enter", "expect": [{"pointer": "/page", "equals": "session"}, {"pointer": "/library/open", "equals": "Add retries to the fetcher"}]}
+// Back is a button Tab reaches, and Enter presses it.
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "key", "keystroke": "enter", "expect": {"pointer": "/page", "equals": "sessions"}}
+{"cmd": "key", "keystroke": "left", "expect": {"pointer": "/library/selected", "equals": "Fix the flaky upload test"}}

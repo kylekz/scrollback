@@ -5939,7 +5939,15 @@ dependencies = [
 name = "sb_e2e"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "gpui_automation_runner",
+ "pretty_assertions",
+ "sb_core",
+ "sb_test_support",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toolbox_store",
 ]
 
 [[package]]
@@ -5959,12 +5967,16 @@ name = "sb_ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "gpui-component",
  "gpui-pre",
  "gpui_appearance",
  "gpui_automation",
+ "log",
  "pretty_assertions",
  "sb_core",
+ "sb_test_support",
+ "tempfile",
 ]
 
 [[package]]
@@ -6045,6 +6057,7 @@ dependencies = [
  "gpui_automation",
  "log",
  "pretty_assertions",
+ "sb_core",
  "sb_ui",
  "serde",
  "serde_json",

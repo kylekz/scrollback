@@ -174,6 +174,7 @@ impl<'a> Reply<'a> {
         if cancel.is_cancelled() {
             return Err(TransportError::Cancelled);
         }
+        launcher.check()?;
         let (tx, events) = sync_channel(QUEUE);
         let process = spawn_streaming(&launcher.command(), move |event| {
             let _ = tx.send(event);

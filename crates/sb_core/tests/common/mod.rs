@@ -586,6 +586,10 @@ impl Provider for Meddling<'_> {
 }
 
 impl Source for MeddlingSource<'_, '_> {
+    fn root(&self) -> String {
+        self.inner.root()
+    }
+
     fn scan(&mut self) -> Result<Scan, ProviderError> {
         self.meddle.reached(When::BeforeScan);
         let mut scan = self.inner.scan();
