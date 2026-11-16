@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::{self, Read, Write as _};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use tempfile::{NamedTempFile, TempPath};
 use thiserror::Error;
 use zstd::stream::{read::Decoder, write::Encoder};
@@ -142,7 +143,8 @@ impl RangeWriter {
 }
 
 /// What is wrong with a version's stored bytes.
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Problem {
     #[error("the segment at {offset} is missing")]
     SegmentMissing { offset: u64 },

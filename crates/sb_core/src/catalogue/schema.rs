@@ -1,6 +1,6 @@
 //! The catalogue's schema (PLAN §4.3), as `toolbox_store` migrations: append-only, a shipped
-//! step is never edited. Tables that later phases own (settings) arrive as further steps with
-//! those phases.
+//! step is never edited. Tables that later phases own arrive as further steps with those
+//! phases.
 
 use toolbox_store::Schema;
 
@@ -13,6 +13,7 @@ pub(super) const SCHEMA: Schema = Schema {
         SEARCH_AND_DELETING,
         REMOVED,
         CHECKS,
+        SETTINGS,
     ],
 };
 
@@ -321,6 +322,16 @@ CREATE TABLE location_check (
 ) STRICT, WITHOUT ROWID;
 ";
 
+/// What belongs to the archive rather than to the app that opens it (PLAN §4.3 `kv`): the
+/// owner's settings for it, and what the last verify found.
+const SETTINGS: &str = "
+-- One row per key; the value is text that the code owning the key reads.
+CREATE TABLE kv (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) STRICT, WITHOUT ROWID;
+";
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -416,5 +427,46 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A catalogue from before the archive's own settings keeps what it holds, and takes them.
+    #[test]
+    fn a_catalogue_from_before_settings_keeps_its_locations_and_takes_settings() {
+        const BEFORE: Schema = Schema {
+            domain: SCHEMA.domain,
+            steps: &[
+                SYNC,
+                LIBRARY,
+                LOCATIONS,
+                SEARCH_AND_DELETING,
+                REMOVED,
+                CHECKS,
+            ],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        Database::open(&dir.path().join(DATABASE), &OpenOptions::new(&BEFORE))
+            .unwrap()
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO location (id, kind, name, created_at)
+                     VALUES ('a1', 'local', 'here', 1)",
+                    [],
+                )?;
+                Ok::<_, toolbox_store::Error>(())
+            })
+            .unwrap();
+
+        let catalogue = Catalogue::open(dir.path()).unwrap();
+        assert_eq!(catalogue.locations().unwrap().len(), 1);
+        assert_eq!(catalogue.setting("sync.stale_after_days").unwrap(), None);
+        catalogue.set_setting("sync.stale_after_days", "7").unwrap();
+        assert_eq!(
+            catalogue
+                .setting("sync.stale_after_days")
+                .unwrap()
+                .as_deref(),
+            Some("7")
+        );
+        assert_eq!(catalogue.last_verify().unwrap(), None);
     }
 }

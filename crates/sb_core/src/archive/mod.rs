@@ -24,6 +24,7 @@ mod disk;
 mod items;
 mod layout;
 mod segment;
+mod stats;
 mod verify;
 
 use std::collections::{BTreeSet, HashSet};
@@ -47,7 +48,8 @@ pub use items::ArchivedSession;
 pub(crate) use layout::item_folder;
 pub use segment::{Problem, SEGMENT_BYTES, VersionReader};
 pub(crate) use segment::{RangeWriter, Sealed};
-pub use verify::{Damage, Unread, VerifyReport};
+pub use stats::{ArchiveStats, Holds, open_or_make, what_is_in};
+pub use verify::{Damage, LastVerify, Unread, VerifyProgress, VerifyReport};
 
 /// The layout this build writes, in `archive.json`.
 const FORMAT: u32 = 1;

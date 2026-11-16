@@ -64,6 +64,14 @@ pub struct Tombstone {
     pub ended: Option<i64>,
 }
 
+/// A tombstone the owner removed, with the keys of the items it held, so that it can be put
+/// back ([`Catalogue::restore_tombstone`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllowedAgain {
+    pub tombstone: Tombstone,
+    keys: Vec<String>,
+}
+
 /// The files of one deleted item that are still to be removed, in its folder under `files/`.
 pub(crate) struct Removal {
     pub location: LocationId,
@@ -306,21 +314,92 @@ impl Catalogue {
     }
 
     /// Removes a tombstone: the next sync of its location archives the session again, if the
-    /// location still has it.
-    pub fn remove_tombstone(&self, id: &SessionId) -> Result<()> {
+    /// location still has it. Returns what was removed, to be put back if the owner undoes it.
+    pub fn remove_tombstone(&self, id: &SessionId) -> Result<AllowedAgain> {
         self.db.write(|tx| {
             let identity = params![id.location, id.provider, id.key];
+            let Some(tombstone) = tx
+                .query_row(
+                    "SELECT deleted_at, project_path, started_at, ended_at FROM tombstone
+                     WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+                    identity,
+                    |row| {
+                        Ok(Tombstone {
+                            session: id.clone(),
+                            deleted: row.get(0)?,
+                            project_path: row.get(1)?,
+                            started: row.get(2)?,
+                            ended: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()?
+            else {
+                return Err(CatalogueError::NoTombstone(id.clone()));
+            };
+            let keys = tx
+                .prepare(
+                    "SELECT key FROM tombstone_item
+                     WHERE location_id = ?1 AND provider = ?2 AND session = ?3 ORDER BY key",
+                )?
+                .query_map(identity, |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
             tx.execute(
                 "DELETE FROM tombstone_item
                  WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
                 identity,
             )?;
-            if tx.execute(
+            tx.execute(
                 "DELETE FROM tombstone WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
                 identity,
-            )? == 0
-            {
-                return Err(CatalogueError::NoTombstone(id.clone()));
+            )?;
+            Ok(AllowedAgain { tombstone, keys })
+        })
+    }
+
+    /**
+     * Puts back a tombstone the owner removed, as it was. Refused with
+     * [`CatalogueError::ArchivedAgain`] once a sync has archived anything of the session again,
+     * since it is then a live session of the archive.
+     */
+    pub fn restore_tombstone(&self, allowed: &AllowedAgain) -> Result<()> {
+        let tombstone = &allowed.tombstone;
+        let id = &tombstone.session;
+        self.db.write(|tx| {
+            let again: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM item WHERE location_id = ?1 AND provider = ?2
+                                AND (session = ?3 OR key IN (SELECT value FROM json_each(?4))))",
+                params![
+                    id.location,
+                    id.provider,
+                    id.key,
+                    serde_json::to_string(&allowed.keys).expect("keys always serialize")
+                ],
+                |row| row.get(0),
+            )?;
+            if again {
+                return Err(CatalogueError::ArchivedAgain(id.clone()));
+            }
+            tx.execute(
+                "INSERT INTO tombstone (location_id, provider, session, deleted_at, project_path,
+                                        started_at, ended_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id.location,
+                    id.provider,
+                    id.key,
+                    tombstone.deleted,
+                    tombstone.project_path,
+                    tombstone.started,
+                    tombstone.ended
+                ],
+            )?;
+            for key in &allowed.keys {
+                tx.execute(
+                    "INSERT INTO tombstone_item (location_id, provider, key, session)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![id.location, id.provider, key, id.key],
+                )?;
             }
             Ok(())
         })

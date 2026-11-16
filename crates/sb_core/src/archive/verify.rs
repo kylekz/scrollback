@@ -15,26 +15,73 @@
 //! marks a version only while its id is still of the version it read.
 //!
 //! And it checks the search index against the text it indexes, making it again if they differ.
+//!
+//! A verify that runs to its end is kept in the catalogue as the archive's last
+//! ([`LastVerify`]), so Settings shows what it found after the app is started again
+//! (DESIGN §4.13). One that is cancelled leaves the last as it was.
 
 use std::fs;
 use std::io::{self, Read as _};
 use std::path::PathBuf;
 use std::sync::PoisonError;
+use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
 use toolbox_process::CancelToken;
 
-use super::{Archive, ArchiveError, Problem, layout};
-use crate::catalogue::Stored;
+use super::{Archive, ArchiveError, Problem, item_folder, layout};
+use crate::catalogue::{self, Stored};
 use crate::location::LocationId;
 
 /// A version whose stored bytes are not the ones that were archived.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Damage {
     pub location: LocationId,
     pub provider: String,
     pub key: String,
     pub version: u32,
     pub problems: Vec<Problem>,
+}
+
+impl Damage {
+    /// The stored file its first problem is in, relative to the archive: a segment, or the
+    /// version's folder when the problem is not one segment's.
+    pub fn file(&self) -> PathBuf {
+        let version = layout::item_dir(&self.location, &self.provider, &item_folder(&self.key))
+            .join(layout::version_dir(self.version));
+        match self.problems.first() {
+            Some(
+                Problem::SegmentMissing { offset }
+                | Problem::SegmentUnreadable { offset, .. }
+                | Problem::SegmentChanged { offset },
+            ) => version.join(layout::segment_file(*offset)),
+            _ => version,
+        }
+    }
+}
+
+/// How far a verify is: the segments read back of all there are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VerifyProgress {
+    pub segments_done: usize,
+    pub segments: usize,
+}
+
+/// What the archive's last verify that ran to its end found, as the catalogue keeps it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastVerify {
+    /// When it ended, in Unix milliseconds, and how long it took.
+    pub at: i64,
+    pub took_ms: u64,
+    pub versions: usize,
+    pub segments: usize,
+    pub damaged: Vec<Damage>,
+    /// How many versions could not be read to the end, for a reason that isn't their bytes.
+    pub unread: usize,
+    /// How many paths under `files/` the catalogue doesn't record.
+    pub uncatalogued: usize,
+    /// How many folders of sessions deleted for good are still to be removed.
+    pub removing: usize,
 }
 
 /// A version that could not be read to the end, for a reason that isn't its bytes.
@@ -71,6 +118,16 @@ pub struct VerifyReport {
 impl Archive {
     /// Checks every stored byte against the catalogue (the module docs).
     pub fn verify(&self, cancel: &CancelToken) -> Result<VerifyReport, ArchiveError> {
+        self.verify_reporting(cancel, &mut |_| {})
+    }
+
+    /// [`Archive::verify`], telling `progress` how far it is after each version.
+    pub fn verify_reporting(
+        &self,
+        cancel: &CancelToken,
+        progress: &mut dyn FnMut(VerifyProgress),
+    ) -> Result<VerifyReport, ArchiveError> {
+        let started = Instant::now();
         /* What `files/` holds beyond what the catalogue records now, less what it records once
         no segment is between its place and its commit: every file found is then either
         recorded or not going to be. */
@@ -101,6 +158,11 @@ impl Archive {
         let mut damaged = Vec::new();
         let mut repaired = Vec::new();
         let mut buffer = vec![0; 128 * 1024];
+        let mut done = VerifyProgress {
+            segments_done: 0,
+            segments: stored.iter().map(|stored| stored.segments.len()).sum(),
+        };
+        progress(done);
         for stored in stored {
             let (number, was_damaged) = (stored.version.number, stored.version.damaged);
             let dir = self
@@ -173,6 +235,8 @@ impl Archive {
                     error,
                 });
             }
+            done.segments_done = report.segments;
+            progress(done);
         }
         let marks: Vec<(&Stored, bool)> = damaged
             .iter()
@@ -185,6 +249,16 @@ impl Archive {
             .zip(there)
             .filter_map(|((_, damage), there)| there.then_some(damage))
             .collect();
+        self.catalogue.record_verify(&LastVerify {
+            at: catalogue::now_ms(),
+            took_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            versions: report.versions,
+            segments: report.segments,
+            damaged: report.damaged.clone(),
+            unread: report.unread.len(),
+            uncatalogued: report.uncatalogued.len(),
+            removing: report.removing.len(),
+        })?;
         Ok(report)
     }
 }

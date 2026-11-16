@@ -3,6 +3,7 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use toolbox_process::CancelToken;
 use toolbox_store::rusqlite::types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef};
 use toolbox_store::rusqlite::{self, ToSql};
@@ -11,7 +12,8 @@ use crate::transport::{Launcher, LocalTransport, ShellTransport, Transport};
 
 /// A location's identity (PLAN §2.1): fixed when it is added, independent of its name. It names
 /// the location's folder under the archive's `files/`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct LocationId(String);
 
 impl LocationId {
