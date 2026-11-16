@@ -789,6 +789,24 @@ fn a_quote_inside_quotes_is_written_with_a_backslash() {
     assert_eq!(parsed.terms, [r#"a "b" c"#, "plain"]);
     /* Outside quotes a backslash is text, as in a Windows path. */
     assert_eq!(search::parse(r"C:\Users\user").terms, [r"C:\Users\user"]);
+    /* Inside quotes one before a quote escapes it, so a quoted path ending in a backslash
+    writes it twice; any other is text. */
+    assert_eq!(
+        search::parse(r#""D:\Projects\app\\" error"#).terms,
+        [r"D:\Projects\app\", "error"]
+    );
+    assert_eq!(
+        search::parse(r#""D:\Projects\app\" error"#).terms,
+        [r#"D:\Projects\app" error"#],
+        "the quote is escaped, and nothing closes the quotes"
+    );
+    /* Three in a row: an escaped backslash, then an escaped quote. */
+    assert_eq!(search::parse(r#""a\\\"b" c"#).terms, [r#"a\"b"#, "c"]);
+    assert_eq!(
+        search::parse(r#"folder:"x\\" y"#).tokens[0].value,
+        r"x\",
+        "a token's value reads the same"
+    );
 }
 
 #[test]

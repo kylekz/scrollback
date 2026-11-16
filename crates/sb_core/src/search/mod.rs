@@ -252,7 +252,8 @@ pub fn parse(input: &str) -> Parsed {
 }
 
 /// The first word of `text`, which starts with no white space, and what follows it. White
-/// space inside double quotes is part of the word, and so is a quote escaped there (`\"`).
+/// space inside double quotes is part of the word, and so is a quote escaped there (`\"`); a
+/// backslash escaped there (`\\`) escapes nothing, so a quoted path can end in one.
 pub fn word(text: &str) -> (&str, &str) {
     let mut quoted = false;
     let mut escaped = false;
@@ -270,19 +271,33 @@ pub fn word(text: &str) -> (&str, &str) {
 
 /**
  * `text` without the quotes around it, or after the colon of a token: `"a b"` is `a b`, and
- * so is `"a b` that a quote opened and nothing closed. Inside quotes `\"` is a quote.
+ * so is `"a b` that a quote opened and nothing closed. Inside quotes, read as [`word`] reads
+ * them in one pass, `\"` is a quote and `\\` a backslash (`"D:\app\\"` is `D:\app\`); any
+ * other backslash is itself. What follows the closing quote is taken as it is.
  */
 fn unquote(text: &str) -> String {
-    match text.strip_prefix('"') {
-        Some(inside) => {
-            let inside = match inside.strip_suffix('"') {
-                Some(closed) if !closed.ends_with('\\') || closed.ends_with("\\\\") => closed,
-                _ => inside,
-            };
-            inside.replace("\\\"", "\"")
+    let Some(inside) = text.strip_prefix('"') else {
+        return text.to_string();
+    };
+    let mut out = String::with_capacity(inside.len());
+    let mut chars = inside.char_indices();
+    while let Some((at, char)) = chars.next() {
+        match char {
+            '"' => {
+                out.push_str(&inside[at + 1..]);
+                break;
+            }
+            '\\' => match chars.clone().next() {
+                Some((_, next @ ('\\' | '"'))) => {
+                    out.push(next);
+                    chars.next();
+                }
+                _ => out.push(char),
+            },
+            char => out.push(char),
         }
-        None => text.to_string(),
     }
+    out
 }
 
 /// Which calendar a date in a token is read in: the one the app shows dates in.
