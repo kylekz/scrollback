@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
+use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 use sb_core::archive::{Archive, ArchiveError, Deleted};
 use sb_core::catalogue::{
     Before, CatalogueError, Deletion, Filed, Folder, FolderPath, LibraryCounts, PathGroup,
@@ -634,7 +634,7 @@ impl Drop for Unwritten {
 
 pub struct LibraryService {
     archive: Entity<ArchiveService>,
-    /// Whether a location syncs, for a confirmation refused while one did.
+    /// Whether a location is busy, for a confirmation refused while it was.
     sync: Entity<SyncService>,
     shelf: Shelf,
     counts: LibraryCounts,
@@ -742,12 +742,14 @@ impl LibraryService {
                     this.seen.news += 1;
                     this.reload(cx);
                 }),
-                // A confirmation refused while its location synced forgets it once none does.
-                cx.observe(&sync, |this, sync, cx| {
-                    let waited = (this.for_good.as_mut())
-                        .filter(|asked| asked.refused == Some(Refusal::Syncing));
-                    if let Some(asked) = waited
-                        && !sync.read(cx).is_syncing()
+                // A confirmation refused while its location synced forgets it once it doesn't.
+                cx.observe(&sync, |this, _, cx| {
+                    let waited = (this.for_good.as_ref())
+                        .filter(|asked| asked.refused == Some(Refusal::Syncing))
+                        .map(|asked| asked.session.id.location.clone());
+                    if let Some(location) = waited
+                        && !this.is_busy(&location, cx)
+                        && let Some(asked) = this.for_good.as_mut()
                     {
                         asked.refused = None;
                         asked.deletion = None;
@@ -907,6 +909,18 @@ impl LibraryService {
         if self.write_failure.take().is_some() {
             cx.notify();
         }
+    }
+
+    /**
+     * Whether `location` is busy: a pass or a fetch again runs there, or a change to one of its
+     * sessions deleted for good is being written. A delete for good there is refused then.
+     */
+    fn is_busy(&self, location: &LocationId, cx: &App) -> bool {
+        self.sync.read(cx).is_busy(location)
+            || super::ActiveServices::services(cx)
+                .upkeep
+                .read(cx)
+                .is_writing_at(location)
     }
 
     /// Nothing is being read or written.
@@ -2010,17 +2024,17 @@ impl LibraryService {
                 .as_ref()
                 .is_none_or(|open| open.session.id == session.id) =>
             {
-                /* Refused as its location synced, the confirmation says so only while a sync
-                runs: one that has ended since isn't waited for. */
-                let syncing = self.sync.read(cx).is_syncing();
+                /* Refused as its location was busy, the confirmation says so only while it still
+                is; otherwise it shows its numbers read again, Cancel taking the keyboard back,
+                as for a session that changed. */
+                let busy = self.is_busy(&session.id.location, cx);
                 self.for_good = Some(ForGood {
                     session: (**session).clone(),
                     deletion: None,
-                    refused: match error {
-                        ArchiveError::Syncing(_) if syncing => Some(Refusal::Syncing),
-                        ArchiveError::Syncing(_) => None,
-                        _ => Some(Refusal::Changed),
-                    },
+                    refused: Some(match error {
+                        ArchiveError::Syncing(_) if busy => Refusal::Syncing,
+                        _ => Refusal::Changed,
+                    }),
                 });
                 self.read_deletion(cx);
                 return;

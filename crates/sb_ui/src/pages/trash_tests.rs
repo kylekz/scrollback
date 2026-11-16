@@ -347,7 +347,7 @@ fn a_session_changed_since_it_was_shown_asks_again_with_its_numbers_now(cx: &mut
 
 #[gpui::test]
 fn a_refusal_while_its_location_syncs_shows_again_or_says_so_over_another(cx: &mut TestAppContext) {
-    let (_shell, cx) = open_shell(cx);
+    let (shell, cx) = open_shell(cx);
     let ids: Vec<SessionId> = SESSIONS.iter().map(|it| id(it.title, cx)).collect();
     library(cx).update(cx, |library, cx| library.trash(ids, cx));
     cx.run_until_parked();
@@ -357,20 +357,27 @@ fn a_refusal_while_its_location_syncs_shows_again_or_says_so_over_another(cx: &m
     let deletion = asked(cx).and_then(|(_, deletion, _)| deletion).unwrap();
     let syncing = || ArchiveError::Syncing(deletion.session.location.clone());
 
-    // Refused as a sync ran that has ended since: its own confirmation shows again, with no
-    // sync to wait for.
+    // Refused as its location was busy, which it is no longer (a fetch again, say, that has
+    // ended): the confirmation shows its numbers read again, as for a session that changed,
+    // and Cancel takes the keyboard back from Delete.
     let first = session(SESSIONS[0].title, cx).unwrap();
+    press(cx, "tab");
+    assert!(!cancel_focused(&shell, cx));
+    library(cx).update(cx, |library, cx| {
+        library.refused_for_good(deletion.clone(), first.clone(), syncing(), cx);
+    });
+    cx.run_until_parked();
+    assert!(bounds(cx, "for-good").is_some());
+    let (title, read, refused) = asked(cx).expect("asked again");
+    assert_eq!(title, SESSIONS[0].title);
+    assert_eq!((read.is_some(), refused), (true, Some(Refusal::Changed)));
+    assert!(cancel_focused(&shell, cx));
     let refuse = |cx: &mut VisualTestContext| {
         library(cx).update(cx, |library, cx| {
             library.answer_delete_for_good(false, cx);
             library.refused_for_good(deletion.clone(), first.clone(), syncing(), cx);
         });
     };
-    refuse(cx);
-    cx.run_until_parked();
-    let (title, read, refused) = asked(cx).expect("asked again");
-    assert_eq!(title, SESSIONS[0].title);
-    assert_eq!((read.is_some(), refused), (true, None));
 
     // Refused while a sync runs: it says so for as long as one does, whatever the sync says
     // meanwhile.

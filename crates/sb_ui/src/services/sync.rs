@@ -538,6 +538,11 @@ impl SyncService {
         !self.passes.is_empty()
     }
 
+    /// Whether a pass or a fetch again runs at the location `id`.
+    pub fn is_busy(&self, id: &LocationId) -> bool {
+        self.passes.contains_key(id) || self.refetching.contains_key(id)
+    }
+
     /// Whether an index is running outside a pass.
     pub fn is_indexing(&self) -> bool {
         !self.indexes.is_empty()

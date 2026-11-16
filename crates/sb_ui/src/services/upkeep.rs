@@ -33,7 +33,7 @@ use sb_core::archive::{
 use sb_core::catalogue::{
     AllowedAgain, CatalogueError, Filed, Folder, Held, Reason, Session, SessionId, Tombstone,
 };
-use sb_core::location::Location;
+use sb_core::location::{Location, LocationId};
 
 use super::settings::SettingsService;
 use super::{ArchiveService, SyncEvent, SyncService};
@@ -326,6 +326,13 @@ impl UpkeepService {
 
     pub fn deleted(&self) -> &[Deleted] {
         &self.deleted
+    }
+
+    /// Whether a change to one of the location `id`'s sessions deleted for good is being
+    /// written.
+    pub fn is_writing_at(&self, id: &LocationId) -> bool {
+        (self.deleted.iter())
+            .any(|deleted| deleted.writing && deleted.tombstone.session.location == *id)
     }
 
     pub fn verifying(&self) -> Option<&Verifying> {
