@@ -41,7 +41,7 @@ use crate::archive::{Archive, ArchivedSession};
 use crate::catalogue::{Derived, Held, Indexed, Reading, SessionId, fingerprint};
 use crate::location::LocationId;
 use crate::provider::{ItemKind, Provider};
-use crate::search::{SEARCH_DATABASE, Text};
+use crate::search::Text;
 use crate::transcript::{self, Content, Conversation, Ending, SessionIndex, Subagent, Transcript};
 
 /// What an index did.
@@ -188,8 +188,11 @@ const TEXTS: usize = 256;
  * The second step of an index (the module docs): makes the text of each session of
  * `providers` at `location` (or at every location) searchable, where it is not of the
  * session's row as it is now, the session that did something last first, some sessions at a
- * time; and takes out the text of each whose row went. With nothing to do it reads only the
- * catalogue's index of what is to do, and does not open the search index.
+ * time; and takes out the text of each whose row went. The search index is opened first: one
+ * made anew (gone, unreadable, or of another layout, as an older release left it) marks every
+ * session not searchable, so the first index after a start makes it all again rather than the
+ * first search finding it empty. It stays open, so later indexes only read the catalogue's
+ * index of what is to do when there is nothing.
  */
 fn searchable(
     archive: &Archive,
@@ -199,10 +202,10 @@ fn searchable(
     report: &mut IndexReport,
 ) -> Result<(), SyncError> {
     let catalogue = archive.catalogue();
-    /* A search index that is gone is made again, and holds no session's text. */
-    if !archive.dir().join(SEARCH_DATABASE).exists() {
-        let _ = archive.search_index();
-    }
+    /* Search that is not available is left to the next index; the library is not. */
+    let Ok(search) = archive.search_index() else {
+        return Ok(());
+    };
     let gone = catalogue.text_gone()?;
     let mut rows = Vec::new();
     for provider in providers {
@@ -216,10 +219,6 @@ fn searchable(
     if gone.is_empty() && rows.is_empty() {
         return Ok(());
     }
-    /* Search that is not available is left to the next index; the library is not. */
-    let Ok(search) = archive.search_index() else {
-        return Ok(());
-    };
     if !gone.is_empty() {
         search.forget(&gone)?;
         catalogue.text_forgotten(&gone)?;

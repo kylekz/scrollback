@@ -28,6 +28,7 @@ for_both_agents!(
     the_filters_narrow_what_is_found,
     the_index_emptied_and_built_again_finds_the_same,
     the_search_text_is_made_again_when_it_is_missing_or_unreadable,
+    a_search_file_of_an_older_layout_is_made_again_by_the_start_index,
     a_session_in_trash_is_found_only_there_and_one_deleted_for_good_nowhere,
     the_first_matches_of_a_session_are_given_and_the_rest_counted,
     a_term_in_any_script_is_found_as_the_index_folds_it,
@@ -484,6 +485,32 @@ fn the_search_text_is_made_again_when_it_is_missing_or_unreadable<A: Agent + Def
             .any(|run| run == b"parse_args")
     }));
     bench.assert_verifies();
+}
+
+/**
+ * A search file an older release left, of another layout, is made again by the first index
+ * after a start, before anything searches: the archive is searchable once the start index ends.
+ */
+fn a_search_file_of_an_older_layout_is_made_again_by_the_start_index<A: Agent + Default>() {
+    let (mut bench, _) = bench::<A>();
+    let before = find(&bench, "parse_args");
+    bench.close();
+    let search = bench.dir().join("search.db");
+    toolbox_store::rusqlite::Connection::open(&search)
+        .unwrap()
+        .execute(
+            "UPDATE migrations SET domain = 'scrollback-search' WHERE domain = 'scrollback-search-2'",
+            [],
+        )
+        .unwrap();
+    bench.reopen();
+    assert_eq!(
+        bench.index().searchable,
+        2,
+        "the start index makes it all again"
+    );
+    assert_eq!(bench.archive().unsearchable().unwrap(), 0);
+    assert_eq!(find(&bench, "parse_args"), before);
 }
 
 fn a_session_in_trash_is_found_only_there_and_one_deleted_for_good_nowhere<A: Agent + Default>() {
