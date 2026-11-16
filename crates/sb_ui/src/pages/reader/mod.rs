@@ -29,6 +29,8 @@
 mod blocks;
 mod calls;
 pub mod rows;
+#[cfg(test)]
+mod tests;
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -76,14 +78,16 @@ struct Piece {
 }
 
 /// What [`ReaderView`] tells automation (`scrollback`'s `state.reader`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReaderSnapshot {
     pub rows: usize,
     /// The row the keyboard is on, what kind of row it is, and the start of its text.
     pub focused: Option<(usize, &'static str, String)>,
-    /// The row at the top of the column, and its name ([`blocks::row_name`]).
+    /// The row at the top of the column, its name ([`blocks::row_name`]), and how far into it
+    /// the column is scrolled.
     pub top: usize,
     pub top_name: String,
+    pub top_offset: f32,
     /// The open activity rows.
     pub open_calls: usize,
     /// How many Markdown states, and how many prepared things of the service's, are kept.
@@ -144,7 +148,8 @@ impl ReaderView {
     pub fn snapshot(&self, cx: &App) -> ReaderSnapshot {
         let reader = cx.services().reader.read(cx);
         let open = reader.open_session();
-        let top = self.list.logical_scroll_top().item_ix;
+        let scroll_top = self.list.logical_scroll_top();
+        let top = scroll_top.item_ix;
         ReaderSnapshot {
             rows: self.rows.len(),
             focused: self.focused.as_ref().map(|(at, row)| {
@@ -163,6 +168,7 @@ impl ReaderView {
                 (Some(row), Some(open)) => blocks::row_name(row, open),
                 _ => String::new(),
             },
+            top_offset: scroll_top.offset_in_item.into(),
             open_calls: self
                 .rows
                 .iter()
@@ -210,63 +216,43 @@ impl ReaderView {
     }
 
     /**
-     * Puts `new` in the place of the rows (the module docs). Rows are matched by
-     * [`Row::key`]: one in both, in order, is kept, and measured again if it changed; one only
-     * in the old rows is spliced out, one only in the new spliced in. What is matched out of
-     * order is spliced out and in again.
+     * Puts `new` in the place of the rows (the module docs), by [`diff`]. The row at the top of
+     * the column stays there, as far into it as it was; when it is gone (a body or a panel
+     * closed under it), the row before it that is left takes its place, from its top: the call
+     * whose body it was.
      */
     fn set_rows(&mut self, new: Vec<Row>) {
         let old = self.rows.clone();
-        let old_keys: Vec<RowKind> = old.iter().map(Row::key).collect();
-        let new_keys: Vec<RowKind> = new.iter().map(Row::key).collect();
-        let in_new: HashMap<&RowKind, usize> = new_keys
+        let top = self.list.logical_scroll_top();
+        let (splices, changed) = diff(&old, &new);
+        let in_new: HashMap<RowKind, usize> = new
             .iter()
             .enumerate()
-            .map(|(at, key)| (key, at))
+            .map(|(at, row)| (row.key(), at))
             .collect();
-        let in_old: HashMap<&RowKind, usize> = old_keys
-            .iter()
-            .enumerate()
-            .map(|(at, key)| (key, at))
-            .collect();
-        /* In the list's indices as it is being changed: everything before `j` is already new. */
-        let mut splices: Vec<(usize, usize, usize)> = Vec::new();
-        let mut changed: Vec<usize> = Vec::new();
-        let mut splice = |at: usize, removed: usize, inserted: usize| match splices.last_mut() {
-            Some(last) if last.0 + last.2 == at => {
-                last.1 += removed;
-                last.2 += inserted;
-            }
-            _ => splices.push((at, removed, inserted)),
-        };
-        let (mut i, mut j) = (0, 0);
-        while i < old.len() && j < new.len() {
-            if old_keys[i] == new_keys[j] {
-                if old[i] != new[j] {
-                    changed.push(j);
-                }
-                i += 1;
-                j += 1;
-            } else if in_new.get(&old_keys[i]).is_none_or(|&at| at < j) {
-                splice(j, 1, 0);
-                i += 1;
-            } else if in_old.get(&new_keys[j]).is_none_or(|&at| at < i) {
-                splice(j, 0, 1);
-                j += 1;
-            } else {
-                splice(j, 1, 0);
-                i += 1;
-            }
-        }
-        splice(j, old.len() - i, new.len() - j);
+        let anchor = old.get(top.item_ix).and_then(|row| {
+            in_new
+                .get(&row.key())
+                .map(|&at| (at, top.offset_in_item))
+                .or_else(|| {
+                    old[..top.item_ix]
+                        .iter()
+                        .rev()
+                        .find_map(|row| in_new.get(&row.key()))
+                        .map(|&at| (at, px(0.)))
+                })
+        });
         for (at, removed, inserted) in splices {
-            if removed + inserted > 0 {
-                self.list.splice(at..at + removed, inserted);
-            }
+            self.list.splice(at..at + removed, inserted);
         }
-        /* The changed rows' places are the new rows', which the list's are once spliced. */
         for at in changed {
             self.list.remeasure_items(at..at + 1);
+        }
+        if let Some((item_ix, offset_in_item)) = anchor {
+            self.list.scroll_to(gpui::ListOffset {
+                item_ix,
+                offset_in_item,
+            });
         }
         self.rows = Rc::new(new);
         if old.is_empty() {
@@ -392,7 +378,7 @@ impl ReaderView {
         let selected = self
             .states
             .values()
-            .map(|(state, _)| state.read(cx).selected_text())
+            .map(|(state, _)| crate::markdown::shown_to_source(&state.read(cx).selected_text()))
             .find(|text| !text.is_empty());
         if let Some(text) = selected {
             crate::system::copy_text(text, cx);
@@ -523,6 +509,17 @@ impl ReaderView {
             Some((first, last)) => (first.min(ix), last.max(ix)),
             None => (ix, ix),
         }));
+        /* A subagent's conversation is kept while a row of it, or of its panel, is near. */
+        match &row.kind {
+            RowKind::Panel { item, .. } | RowKind::Unattached { item, .. } => {
+                self.hold(Held::Subagent(item.clone()), ix)
+            }
+            RowKind::Raw { at, .. } => self.hold(Held::Raw(at.clone()), ix),
+            _ => {}
+        }
+        if let Some(at) = row.block() {
+            self.hold(Held::Subagent(at.conversation.clone()), ix);
+        }
         let theme = cx.sb_theme().clone();
         let focused = self.keyboard && self.focused.as_ref().is_some_and(|(at, _)| *at == ix);
         let content = match &row.kind {
@@ -533,7 +530,23 @@ impl ReaderView {
             | RowKind::Unattached { .. } => calls::render(self, ix, &row, focused, window, cx),
             _ => blocks::render(self, ix, &row, focused, window, cx),
         };
-        frame(&row, content, &theme)
+        let framed = frame(&row, content, &theme);
+        if !row.is_focusable() {
+            return framed;
+        }
+        /* A click on a row the keyboard can rest on puts it there, as an arrow would. */
+        div()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    if let Some(row) = this.rows.get(ix).cloned() {
+                        this.focused = Some((ix, row));
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(framed)
+            .into_any_element()
     }
 
     fn render_header(&self, theme: &SbTheme, cx: &mut Context<Self>) -> AnyElement {
@@ -551,7 +564,7 @@ impl ReaderView {
         };
         let session = library.open_session();
         let title: SharedString = session
-            .and_then(|session| session.title.clone())
+            .and_then(|session| session.title.as_deref().map(crate::hostile::label))
             .unwrap_or_else(|| "Untitled session".to_string())
             .into();
         let starred = session.is_some_and(|session| session.starred);
@@ -796,6 +809,60 @@ fn message_text(open: &OpenSession, at: &BlockRef) -> Option<String> {
     }
 }
 
+/**
+ * How to turn the rows `old` into `new`: the splices to make, in order (where, in the list as it
+ * is being changed, how many rows go and how many come), and the places in `new` of the rows
+ * kept but changed, to measure again. Rows are matched by [`Row::key`]: one in both, in order,
+ * is kept; one only in the old rows is spliced out, one only in the new spliced in. What is
+ * matched out of order is spliced out and in again.
+ */
+fn diff(old: &[Row], new: &[Row]) -> (Vec<(usize, usize, usize)>, Vec<usize>) {
+    let old_keys: Vec<RowKind> = old.iter().map(Row::key).collect();
+    let new_keys: Vec<RowKind> = new.iter().map(Row::key).collect();
+    let in_new: HashMap<&RowKind, usize> = new_keys
+        .iter()
+        .enumerate()
+        .map(|(at, key)| (key, at))
+        .collect();
+    let in_old: HashMap<&RowKind, usize> = old_keys
+        .iter()
+        .enumerate()
+        .map(|(at, key)| (key, at))
+        .collect();
+    /* In the list's indices as it is being changed: everything before `j` is already new. */
+    let mut splices: Vec<(usize, usize, usize)> = Vec::new();
+    let mut changed: Vec<usize> = Vec::new();
+    let mut splice = |at: usize, removed: usize, inserted: usize| match splices.last_mut() {
+        Some(last) if last.0 + last.2 == at => {
+            last.1 += removed;
+            last.2 += inserted;
+        }
+        _ => splices.push((at, removed, inserted)),
+    };
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() && j < new.len() {
+        if old_keys[i] == new_keys[j] {
+            if old[i] != new[j] {
+                changed.push(j);
+            }
+            i += 1;
+            j += 1;
+        } else if in_new.get(&old_keys[i]).is_none_or(|&at| at < j) {
+            splice(j, 1, 0);
+            i += 1;
+        } else if in_old.get(&new_keys[j]).is_none_or(|&at| at < i) {
+            splice(j, 0, 1);
+            j += 1;
+        } else {
+            splice(j, 1, 0);
+            i += 1;
+        }
+    }
+    splice(j, old.len() - i, new.len() - j);
+    splices.retain(|&(_, removed, inserted)| removed + inserted > 0);
+    (splices, changed)
+}
+
 /// The reading column: at most 720 wide with 32 at its sides, centred.
 fn column(theme: &SbTheme) -> gpui::Div {
     div()
@@ -990,6 +1057,16 @@ pub fn bind_keys(
         // What follows the last row the keyboard takes (a body, how the session ended) too.
         this.list.scroll_to_end();
     });
+    /* A body's own Copy, with text selected in it: the reader's instead, so that it copies
+    what the transcript holds and goes through the system's seam. Caught on the way down,
+    before the body's handler would write the clipboard itself. */
+    let element = {
+        let view = view.clone();
+        element.capture_action(move |_: &gpui_base::input::Copy, _, cx| {
+            view.update(cx, |this, cx| this.copy(cx));
+            cx.stop_propagation();
+        })
+    };
     element
         .on_action(|_: &act::SwitchCalls, _, cx| {
             let reader = cx.services().reader.clone();

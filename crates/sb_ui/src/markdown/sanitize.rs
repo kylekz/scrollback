@@ -35,26 +35,28 @@ fn prose_options() -> ParseOptions {
  * - **Raw HTML** is shown as the text it is: a block of HTML as a fenced code block, a tag in a
  *   line as its text ([`untagged`]). Either reads literally, and no link runs into it.
  * - **A hard break of trailing spaces** becomes the backslash break the view keeps.
+ * - **A link whose text is another site's address** (`[https://bank.example](https://…)`)
+ *   is followed by the site it goes to, in parentheses, so the text can't pass for it.
  *
  * If parsing fails, a span doesn't map onto the source, or the result still parses to an image
  * or HTML, the whole body is shown as a code block: uglier, still inert, and every character
  * there.
  */
 pub fn sanitize(source: &str) -> String {
-    let edited = match edit(source, &options()) {
-        Some(edited) => edited,
-        None => return literal(source),
-    };
-    if inert(&edited) {
-        edited
-    } else {
-        literal(source)
+    checked(source, edit(source, &options()))
+}
+
+/// `edited`, made of `source`, if it is inert; else `source` shown literally.
+fn checked(source: &str, edited: Option<String>) -> String {
+    match edited {
+        Some(edited) if inert(&edited) => edited,
+        _ => literal(source),
     }
 }
 
 /// The edits of [`sanitize`] made to `source` parsed with `options`; `None` when they can't be.
 fn edit(source: &str, options: &ParseOptions) -> Option<String> {
-    if !source.contains(['<', '!', '$']) && !source.contains("  \n") {
+    if !source.contains(['<', '!', '$', '[']) && !source.contains("  \n") {
         return Some(source.to_string());
     }
     let root = markdown::to_mdast(source, options).ok()?;
@@ -98,6 +100,13 @@ fn edit(source: &str, options: &ParseOptions) -> Option<String> {
                     edits.push((start, end, prose));
                 }
             }
+            Node::Link(link) => {
+                let (_, end, _) = span()?;
+                if let Some(host) = spoofed(&node.to_string(), &link.url) {
+                    edits.push((end, end, format!(" (to {host})")));
+                }
+                stack.extend(node.children().into_iter().flatten().map(|it| (it, false)));
+            }
             Node::Break(_) => {
                 let (start, end, text) = span()?;
                 if text.starts_with(' ') {
@@ -107,7 +116,8 @@ fn edit(source: &str, options: &ParseOptions) -> Option<String> {
             other => stack.extend(other.children().into_iter().flatten().map(|it| (it, false))),
         }
     }
-    edits.sort_by_key(|&(start, _, _)| start);
+    /* An insertion at a span's end goes before an edit that starts there. */
+    edits.sort_by_key(|&(start, end, _)| (start, end));
     let mut out = String::with_capacity(source.len() + 64);
     let mut cursor = 0;
     for (start, end, replacement) in edits {
@@ -124,8 +134,12 @@ fn edit(source: &str, options: &ParseOptions) -> Option<String> {
     Some(out)
 }
 
-/// The edit that puts `replacement` at `start..end`, taking in a `!` right before it and
-/// escaping it, so that the brackets that begin `replacement` can't make an image with it.
+/**
+ * The edit that puts `replacement` at `start..end`, separated by a zero-width space from a `!`
+ * right before it, so that the brackets that begin `replacement` can't make an image with it.
+ * Escaping the `!` instead can be undone by a backslash before it, which the escape then
+ * escapes; nothing undoes a character between them.
+ */
 fn after_bang(
     source: &str,
     start: usize,
@@ -133,7 +147,7 @@ fn after_bang(
     replacement: String,
 ) -> (usize, usize, String) {
     if source[..start].ends_with('!') {
-        (start - 1, end, format!("\\!{replacement}"))
+        (start, end, format!("\u{200B}{replacement}"))
     } else {
         (start, end, replacement)
     }
@@ -183,11 +197,23 @@ fn ticks(text: &str, least: usize) -> String {
  * starting a tag, and reads as nothing. The `<` itself stays, so a web address written just
  * before it ends there, as it does before a tag (an escape or an entity would let the address
  * run on into the tag's text). An address inside the tag (`<img src="https://…">`) gets a
- * zero-width space too, so it doesn't become a link whose text runs on into the tag's.
+ * zero-width space too, so it doesn't become a link whose text runs on into the tag's. Every
+ * other mark Markdown reads is escaped: what the tag held (a comment's `![x](…)`) was never
+ * Markdown, and mustn't become it once the tag is gone.
  */
 fn untagged(text: &str) -> String {
-    text.replace('<', "<\u{200B}")
-        .replace("://", ":\u{200B}//")
+    let mut out = String::with_capacity(text.len() + 16);
+    for c in text.chars() {
+        match c {
+            '<' => out.push_str("<\u{200B}"),
+            '!' | '[' | ']' | '(' | ')' | '*' | '_' | '`' | '$' | '&' | '~' | '\\' | '|' => {
+                out.push('\\');
+                out.push(c);
+            }
+            other => out.push(other),
+        }
+    }
+    out.replace("://", ":\u{200B}//")
         .replace("www.", "www\u{200B}.")
 }
 
@@ -200,6 +226,34 @@ fn fence(text: &str) -> String {
 /// A whole body shown literally, as a code block: nothing in it is parsed.
 pub fn literal(text: &str) -> String {
     fence(text)
+}
+
+/**
+ * The site a link to `url` goes to, when its text `text` is a web address of another site, and
+ * the site's name is plain enough to show as it is.
+ */
+fn spoofed(text: &str, url: &str) -> Option<String> {
+    fn host(address: &str) -> Option<String> {
+        let rest = address.trim();
+        let rest = ["https://", "http://"]
+            .iter()
+            .find_map(|scheme| {
+                rest.get(..scheme.len())?
+                    .eq_ignore_ascii_case(scheme)
+                    .then(|| &rest[scheme.len()..])
+            })
+            .unwrap_or(rest);
+        let host = rest.split(['/', '?', '#']).next()?.to_ascii_lowercase();
+        let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
+        let plain = host.contains('.')
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'));
+        plain.then_some(host)
+    }
+    let shown = host(text)?;
+    let real = host(url)?;
+    (shown != real).then_some(real)
 }
 
 /// `url` when it is a web address that can sit in a link's `<…>` as it is.
@@ -266,6 +320,11 @@ mod tests {
         "!![x](https://example.com/p.png)",
         "!!![x](https://example.com/p.png)",
         "\\![x](https://example.com/p.png)",
+        "\\!![x](https://example.com/p.png)",
+        "\\\\!![x](https://example.com/p.png)",
+        "\\!![x][r]\n\n[r]: https://example.com/p.png",
+        "!<!--![a](https://example.com/p.png)-->",
+        "a <span title=\"![x](https://example.com/p.png)\">b</span>",
         "!![x][r]\n\n[r]: https://example.com/p.png",
         "!![x]\n\n[x]: https://example.com/p.png",
         "$x`$ <img src=\"https://example.com/p.png\"> `y",
@@ -310,9 +369,52 @@ mod tests {
     #[test]
     fn a_bang_before_an_image_cannot_make_its_replacement_an_image() {
         let out = sanitize("!![x](https://example.com/p.png)");
-        assert_eq!(out, "\\![image: x](<https://example.com/p.png>)");
+        assert_eq!(out, "!\u{200B}[image: x](<https://example.com/p.png>)");
         assert_eq!(links(&out), ["https://example.com/p.png"]);
         assert_inert(&out);
+        /* Escaped, the bang is kept as written, and still kept apart. */
+        let out = sanitize("\\!![x](https://example.com/p.png)");
+        assert_eq!(out, "\\!\u{200B}[image: x](<https://example.com/p.png>)");
+        assert_inert(&out);
+    }
+
+    #[test]
+    fn a_link_whose_text_is_another_sites_address_says_where_it_goes() {
+        assert_eq!(
+            sanitize("[https://bank.example/login](https://evil.example/x)"),
+            "[https://bank.example/login](https://evil.example/x) (to evil.example)"
+        );
+        for source in [
+            "[https://example.com](https://www.example.com/docs)",
+            "[the docs](https://evil.example/x)",
+            "<https://example.com/x>",
+        ] {
+            assert_eq!(sanitize(source), source);
+        }
+    }
+
+    #[test]
+    fn what_a_tag_held_stays_text_once_the_tag_is_shown() {
+        let source = "!<!--![a](https://example.com/p.png)-->";
+        let out = edit(source, &options()).unwrap();
+        assert_inert(&out);
+        assert_eq!(links(&out), Vec::<String>::new());
+        assert_eq!(
+            sanitize(source),
+            out,
+            "made inert in place, not shown whole as code"
+        );
+    }
+
+    #[test]
+    fn an_edit_that_left_markup_is_never_used() {
+        let image = "[image: x](<https://example.com/p.png>)".to_string();
+        assert_eq!(checked("![x](y)", Some(image.clone())), image);
+        for edited in [Some("![x](https://example.com/p.png)".to_string()), None] {
+            let out = checked("![x](y)", edited);
+            assert_eq!(out, "```\n![x](y)\n```");
+            assert_inert(&out);
+        }
     }
 
     #[test]

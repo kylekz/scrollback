@@ -146,7 +146,10 @@ pub(super) fn input(name: &str, raw: &RawValue, line: &Line) -> ToolInput {
         ToolKind::ContentSearch => typed(raw).map(|input: Search| ToolInput::ContentSearch {
             pattern: input.pattern.0,
             path: text(input.path),
-            files: text(input.r#type.or(input.glob)),
+            files: match (text(input.r#type), text(input.glob)) {
+                (Some(kind), Some(glob)) => Some(format!("{kind}, {glob}")),
+                (kind, glob) => kind.or(glob),
+            },
         }),
         ToolKind::FileSearch => typed(raw).map(|input: Search| ToolInput::FileSearch {
             pattern: input.pattern.0,

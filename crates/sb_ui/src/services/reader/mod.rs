@@ -43,7 +43,9 @@ use gpui::{AppContext as _, Context, Entity, Subscription};
 use sb_core::archive::{Archive, ArchivedSession, Pinned, SegmentCache};
 use sb_core::catalogue::SessionId;
 use sb_core::provider::{ItemKind, Provider, SessionItems};
-use sb_core::transcript::{BlockId, Content, Conversation, Output, Subagent, ToolCall};
+use sb_core::transcript::{
+    BlockId, Content, Conversation, Outline, Output, Stored, Subagent, ToolCall,
+};
 
 use super::{ArchiveService, LibraryService, Providers};
 pub use picture::Picture;
@@ -54,6 +56,15 @@ pub use text::Text;
 /// up to 8 MiB.
 const CACHED_SEGMENTS: usize = 4;
 const CACHED_BYTES: usize = 32 * 1024 * 1024;
+
+/**
+ * How much of a call's input and of each part of its output is read for its body, until Show
+ * all asks for the whole: past the first lines a body shows, for lines of a few hundred bytes.
+ */
+const HEAD_BYTES: u64 = 16 * 1024;
+
+/// How many images are decoded at once: each may take [`picture::DECODE_BYTES`] while it is.
+const DECODES: usize = 2;
 
 /// How many of the first prompts and replies of the session's own conversation are prepared
 /// with the parse, so that the first turns paint with it: those of at most a piece each.
@@ -96,6 +107,12 @@ pub enum Held {
     Prose(BlockRef),
     Body(BlockRef),
     Image(ImageKey),
+    /// An unrecognised record as it was recorded.
+    Raw(BlockRef),
+    /// A subagent's conversation, by its item.
+    Subagent(Arc<str>),
+    /// The whole of a call's input (`None`) or of a part of its output, read for Show all.
+    Whole(BlockRef, Option<usize>),
 }
 
 /// A row the owner opened or closed by hand (the module docs).
@@ -199,6 +216,8 @@ pub struct OpenSession {
     subagents: HashMap<Arc<str>, Load<Arc<SubagentRead>>>,
     bodies: HashMap<BlockRef, Load<Arc<CallBody>>>,
     raws: HashMap<BlockRef, Load<Arc<Text>>>,
+    /// The whole of a call's input or output part, when its body has only its head.
+    wholes: HashMap<(BlockRef, Option<usize>), Load<Arc<Text>>>,
     images: HashMap<ImageKey, Load<Picture>>,
     placement: Option<Load<Arc<Placement>>>,
     /// The rows opened by hand in Activity, and closed by hand in Full calls.
@@ -290,6 +309,10 @@ impl OpenSession {
         self.raws.get(at)
     }
 
+    pub fn whole(&self, at: &BlockRef, part: Option<usize>) -> Option<&Load<Arc<Text>>> {
+        self.wholes.get(&(at.clone(), part))
+    }
+
     pub fn image(&self, key: &ImageKey) -> Option<&Load<Picture>> {
         self.images.get(key)
     }
@@ -304,7 +327,7 @@ impl OpenSession {
     }
 
     /// What is loading or loaded, by kind, for automation's `state`.
-    pub fn loads(&self) -> [(&'static str, usize, usize); 5] {
+    pub fn loads(&self) -> [(&'static str, usize, usize); 6] {
         fn count<K, T>(map: &HashMap<K, Load<T>>) -> (usize, usize) {
             let loaded = map
                 .values()
@@ -319,12 +342,12 @@ impl OpenSession {
             row("prose", count(&self.prose)),
             row("images", count(&self.images)),
             row("raws", count(&self.raws)),
+            row("wholes", count(&self.wholes)),
         ]
     }
 
     /// Keeps a subagent's conversation just read, with the subagents it read in place (whose
-    /// records are in its own transcript) moved out of it, and those its calls started placed
-    /// under them rather than with the ones no call is known to have started.
+    /// records are in its own transcript) moved out of it.
     fn take_in(
         &mut self,
         kind: Option<String>,
@@ -333,16 +356,6 @@ impl OpenSession {
     ) -> Arc<SubagentRead> {
         let mut found = Vec::new();
         settle(&mut conversation, &mut found);
-        let started: Vec<Arc<str>> = conversation
-            .blocks()
-            .iter()
-            .filter_map(|block| match &block.content {
-                Content::ToolCall(call) => Some(call),
-                _ => None,
-            })
-            .flat_map(|call| call.subagents.iter().map(|it| it.item().clone()))
-            .collect();
-        self.unattached.retain(|item| !started.contains(item));
         for (item, read) in found {
             self.subagents.insert(item, Load::Loaded(read));
         }
@@ -490,6 +503,9 @@ impl ReaderService {
                     }
                     other => other.is_some(),
                 },
+                Held::Raw(at) => open.raws.remove(&at).is_some(),
+                Held::Whole(at, part) => open.wholes.remove(&(at, part)).is_some(),
+                Held::Subagent(item) => open.subagents.remove(&item).is_some(),
             };
         }
         if released {
@@ -623,7 +639,7 @@ impl ReaderService {
         enum Source {
             Markdown(String),
             Plain(String),
-            Stored(sb_core::transcript::Stored),
+            Stored(Stored),
         }
         let source = match self
             .open_session()
@@ -654,7 +670,7 @@ impl ReaderService {
             {
                 let at = at.clone();
                 move |open, prose, _| {
-                    open.prose.insert(at, loaded(prose));
+                    land(&mut open.prose, at, loaded(prose));
                 }
             },
             cx,
@@ -674,17 +690,26 @@ impl ReaderService {
         self.load(
             |open| claim(&mut open.bodies, &key),
             move |_, items| {
-                let text = |text: Result<String, _>| {
-                    text.map(|text| Arc::new(Text::new(text)))
-                        .map_err(|error: sb_core::transcript::LoadError| error.to_string())
+                let head = |stored: &Stored, json: bool| {
+                    stored
+                        .load_head(items, HEAD_BYTES)
+                        .map(|(text, whole)| {
+                            Arc::new(if whole {
+                                Text::new(if json { pretty(text) } else { text })
+                            } else {
+                                let rest = stored.length.saturating_sub(text.len() as u64);
+                                Text::head(text, rest)
+                            })
+                        })
+                        .map_err(|error| error.to_string())
                 };
                 Arc::new(CallBody {
-                    input: text(input.load_text(items).map(pretty)),
+                    input: head(&input, true),
                     output: output
                         .unwrap_or_default()
                         .iter()
                         .map(|part| match part {
-                            Output::Text(stored) => Part::Text(text(stored.load_text(items))),
+                            Output::Text(stored) => Part::Text(head(stored, false)),
                             Output::Image(_) => Part::Image,
                         })
                         .collect(),
@@ -693,7 +718,111 @@ impl ReaderService {
             {
                 let at = at.clone();
                 move |open, body, _| {
-                    open.bodies.insert(at, Load::Loaded(body));
+                    land(&mut open.bodies, at, Load::Loaded(body));
+                }
+            },
+            cx,
+        );
+    }
+
+    /**
+     * Reads the whole of the input (`part` `None`) or of an output part of the call at `at`,
+     * whose body has only its head: wanted when Show all is pressed under it.
+     */
+    pub fn want_whole(&mut self, at: &BlockRef, part: Option<usize>, cx: &mut Context<Self>) {
+        let Some(call) = self.open_session().and_then(|open| open.call(at)) else {
+            return;
+        };
+        let stored = match part {
+            None => Some(call.raw_input.clone()),
+            Some(index) => {
+                call.result
+                    .as_ref()
+                    .and_then(|result| match result.output.get(index)? {
+                        Output::Text(stored) => Some(stored.clone()),
+                        Output::Image(_) => None,
+                    })
+            }
+        };
+        let Some(stored) = stored else {
+            return;
+        };
+        let key = (at.clone(), part);
+        self.load(
+            |open| claim(&mut open.wholes, &key),
+            move |_, items| {
+                stored
+                    .load_text(items)
+                    .map(|text| Arc::new(Text::new(text)))
+                    .map_err(|error| error.to_string())
+            },
+            {
+                let key = (at.clone(), part);
+                move |open, whole, _| land(&mut open.wholes, key, loaded(whole))
+            },
+            cx,
+        );
+    }
+
+    /**
+     * Copies the input of the call at `at`, or every text part of its output: from its body when
+     * that has them whole, else read whole off the UI thread first.
+     */
+    pub fn copy_call(&mut self, at: &BlockRef, output: bool, cx: &mut Context<Self>) {
+        let Some(open) = self.open_session() else {
+            return;
+        };
+        if let Some(Load::Loaded(body)) = open.body(at) {
+            let texts: Vec<&Arc<Text>> = if output {
+                body.output
+                    .iter()
+                    .filter_map(|part| match part {
+                        Part::Text(Ok(text)) => Some(text),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                body.input.as_ref().ok().into_iter().collect()
+            };
+            if texts.iter().all(|text| text.rest.is_none()) {
+                let text = texts
+                    .iter()
+                    .map(|text| text.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    crate::system::copy_text(text, cx);
+                }
+                return;
+            }
+        }
+        let Some(call) = open.call(at) else {
+            return;
+        };
+        let stored: Vec<Stored> = if output {
+            call.result
+                .iter()
+                .flat_map(|result| &result.output)
+                .filter_map(|part| match part {
+                    Output::Text(stored) => Some(stored.clone()),
+                    Output::Image(_) => None,
+                })
+                .collect()
+        } else {
+            vec![call.raw_input.clone()]
+        };
+        self.load(
+            |_| true,
+            move |_, items| {
+                stored
+                    .iter()
+                    .filter_map(|stored| stored.load_text(items).ok())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            },
+            |_, text, cx| {
+                if !text.is_empty() {
+                    crate::system::copy_text(text, cx);
                 }
             },
             cx,
@@ -720,7 +849,7 @@ impl ReaderService {
                             Load::Failed("its agent's provider reads no subagents".to_string())
                         }
                     };
-                    open.subagents.insert(item, loaded);
+                    land(&mut open.subagents, item, loaded);
                 }
             },
             cx,
@@ -728,21 +857,23 @@ impl ReaderService {
     }
 
     /**
-     * Works out which subagent started which (the module docs): reads every subagent the
-     * session has, keeping only what each says it is and the subagents its calls started.
-     * Wanted once those no call of the session's own started come into view.
+     * Works out which subagent started which (the module docs), from the provider's outlines
+     * of them: wanted once those no call of the session's own started come into view. Each is
+     * placed under the first subagent found to start it, walking from those the session's own
+     * calls started and then from the rest in turn, so that a subagent claimed by one it
+     * started, or by itself, is still reached: such a claim is passed over.
      */
     pub fn want_placement(&mut self, cx: &mut Context<Self>) {
         let Some(open) = self.open_session() else {
             return;
         };
-        let mut first: Vec<Arc<str>> = open.unattached.clone();
-        if let Some(main) = &open.main {
-            first.extend(
-                main.calls()
-                    .flat_map(|(_, call)| call.subagents.iter().map(|it| it.item().clone())),
-            );
-        }
+        let roots = open.unattached.clone();
+        let first: Vec<Arc<str>> = open
+            .main
+            .iter()
+            .flat_map(|main| main.calls())
+            .flat_map(|(_, call)| call.subagents.iter().map(|it| it.item().clone()))
+            .collect();
         self.load(
             |open| {
                 if open.placement.is_some() {
@@ -752,31 +883,40 @@ impl ReaderService {
                 true
             },
             move |provider, items| {
+                let outlines: HashMap<Arc<str>, Outline> = provider
+                    .outlines(items)
+                    .into_iter()
+                    .map(|outline| (outline.item.clone(), outline))
+                    .collect();
                 let mut placement = Placement::default();
                 let mut seen: HashSet<Arc<str>> = first.iter().cloned().collect();
                 let mut queue: VecDeque<Arc<str>> = first.into();
-                while let Some(item) = queue.pop_front() {
-                    let Subagent::Read {
-                        kind,
-                        description,
-                        conversation,
-                    } = provider.subagent(items, &item)
-                    else {
+                let mut roots = roots.into_iter();
+                while let Some(item) = queue.pop_front().or_else(|| {
+                    let root = roots.find(|root| !seen.contains(root))?;
+                    seen.insert(root.clone());
+                    Some(root)
+                }) {
+                    let Some(outline) = outlines.get(&item) else {
                         continue;
                     };
-                    placement
-                        .names
-                        .insert(item.clone(), Names { kind, description });
-                    for (_, call) in conversation.calls() {
-                        for child in &call.subagents {
-                            let child = child.item().clone();
+                    for child in &outline.started {
+                        if seen.insert(child.clone()) {
                             placement.parents.insert(child.clone(), item.clone());
-                            if seen.insert(child.clone()) {
-                                queue.push_back(child);
-                            }
+                            queue.push_back(child.clone());
                         }
                     }
                 }
+                placement.names = outlines
+                    .into_iter()
+                    .map(|(item, outline)| {
+                        let names = Names {
+                            kind: outline.kind,
+                            description: outline.description,
+                        };
+                        (item, names)
+                    })
+                    .collect();
                 Arc::new(placement)
             },
             |open, placement, _| open.placement = Some(Load::Loaded(placement)),
@@ -805,7 +945,7 @@ impl ReaderService {
             {
                 let at = at.clone();
                 move |open, raw, _| {
-                    open.raws.insert(at, loaded(raw));
+                    land(&mut open.raws, at, loaded(raw));
                 }
             },
             cx,
@@ -836,7 +976,14 @@ impl ReaderService {
         };
         let claimed = key.clone();
         self.load(
-            |open| claim(&mut open.images, &claimed),
+            |open| {
+                open.images
+                    .values()
+                    .filter(|it| matches!(it, Load::Loading))
+                    .count()
+                    < DECODES
+                    && claim(&mut open.images, &claimed)
+            },
             move |_, items| {
                 image
                     .data
@@ -847,7 +994,7 @@ impl ReaderService {
             {
                 let key = key.clone();
                 move |open, picture, _| {
-                    open.images.insert(key, loaded(picture));
+                    land(&mut open.images, key, loaded(picture));
                 }
             },
             cx,
@@ -862,6 +1009,17 @@ fn claim<K: Eq + std::hash::Hash + Clone, T>(map: &mut HashMap<K, Load<T>>, key:
     }
     map.insert(key.clone(), Load::Loading);
     true
+}
+
+/**
+ * Puts what a load read for `key` in `map`, if `key` is still loading there: a row that let go
+ * of it while it was being read (or a new read since) must not get it back, or nothing would
+ * release it again.
+ */
+fn land<K: Eq + std::hash::Hash, T>(map: &mut HashMap<K, Load<T>>, key: K, value: Load<T>) {
+    if let Some(slot @ Load::Loading) = map.get_mut(&key) {
+        *slot = value;
+    }
 }
 
 fn loaded<T>(result: Result<T, String>) -> Load<T> {
@@ -959,6 +1117,7 @@ fn parse(archive: &Archive, providers: &Providers, id: &SessionId) -> Result<Ope
         subagents: HashMap::new(),
         bodies: HashMap::new(),
         raws: HashMap::new(),
+        wholes: HashMap::new(),
         images: HashMap::new(),
         placement: None,
         opened: HashSet::new(),

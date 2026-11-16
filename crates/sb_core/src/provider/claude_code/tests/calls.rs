@@ -62,7 +62,7 @@ fn a_session_with_a_call_of_each_kind_of_tool() {
     t.result_with(&call, json!("The file was created."), false, written);
     let call = t.call(
         "Grep",
-        json!({ "pattern": "fn main", "path": "src", "type": "rust" }),
+        json!({ "pattern": "fn main", "path": "src", "type": "rust", "glob": "*.rs" }),
     );
     let found = json!({ "mode": "content", "numFiles": 1, "numMatches": 2 });
     t.result_with(&call, json!("src/main.rs:10:fn main() {"), false, found);
@@ -108,7 +108,7 @@ fn a_session_with_a_call_of_each_kind_of_tool() {
     Ok Changed { added: 2, removed: 1 } "The file was updated."
   Write: write /home/user/code/app/notes.md: "# Notes\n"
     Ok Written { new: true, lines: 1 } "The file was created."
-  Grep: content search "fn main" in Some("src") of Some("rust")
+  Grep: content search "fn main" in Some("src") of Some("rust, *.rs")
     Ok Matches(2) "src/main.rs:10:fn main() {"
   Glob: file search "**/*.rs" in None
     Ok Matches(1) "src/main.rs"

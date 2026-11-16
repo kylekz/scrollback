@@ -365,7 +365,7 @@ pub enum ToolInput {
     ContentSearch {
         pattern: String,
         path: Option<String>,
-        /// Which files are searched, when not all: a file type or a glob.
+        /// Which files are searched, when not all: a file type, a glob, or both.
         files: Option<String>,
     },
     FileSearch {
@@ -457,6 +457,21 @@ pub struct Image {
     /// Its MIME type, as `image/png`.
     pub media_type: String,
     pub data: Stored,
+}
+
+/**
+ * A subagent of a session as far as placing it needs: what it says it is, and the subagents
+ * its calls started, read without its conversation ([`Provider::outlines`]).
+ *
+ * [`Provider::outlines`]: crate::provider::Provider::outlines
+ */
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Outline {
+    /// The key of the item its conversation is.
+    pub item: Arc<str>,
+    pub kind: Option<String>,
+    pub description: Option<String>,
+    pub started: Vec<Arc<str>>,
 }
 
 /// A subagent, under the call that started it.
@@ -606,6 +621,61 @@ impl Stored {
     pub fn load_text(&self, items: &dyn SessionItems) -> Result<String, LoadError> {
         Ok(String::from_utf8_lossy(&self.load(items)?).into_owned())
     }
+
+    /**
+     * The start of the content as text, from about its first `limit` bytes as stored, and
+     * whether that is all of it: what shows the start of something that may be large without
+     * reading it whole. Base64 content is read whole.
+     */
+    pub fn load_head(
+        &self,
+        items: &dyn SessionItems,
+        limit: u64,
+    ) -> Result<(String, bool), LoadError> {
+        if self.length <= limit || self.encoding == Encoding::Base64 {
+            return Ok((self.load_text(items)?, true));
+        }
+        let mut bytes = Vec::new();
+        items
+            .open(&self.item, self.offset)
+            .and_then(|reader| reader.take(limit).read_to_end(&mut bytes))
+            .map_err(|source| LoadError::Read {
+                item: self.item.clone(),
+                source,
+            })?;
+        if (bytes.len() as u64) < limit {
+            return Err(LoadError::Short {
+                item: self.item.clone(),
+                offset: self.offset,
+            });
+        }
+        /* Not the part of a character the limit cut. */
+        let whole = match str::from_utf8(&bytes) {
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            _ => bytes.len(),
+        };
+        let head = String::from_utf8_lossy(&bytes[..whole]);
+        match self.encoding {
+            Encoding::JsonString => {
+                /* Closed where it was cut, less what may be half of an escape or of a
+                surrogate pair. */
+                let ends = head.char_indices().rev().take(13).map(|(at, _)| at);
+                std::iter::once(head.len())
+                    .chain(ends)
+                    .find_map(|end| {
+                        json_string(&format!("{}\"", &head[..end]))
+                            .filter(|text| !text.ends_with(char::REPLACEMENT_CHARACTER))
+                    })
+                    .ok_or_else(|| LoadError::Encoding {
+                        item: self.item.clone(),
+                        offset: self.offset,
+                        encoding: self.encoding,
+                    })
+            }
+            _ => Ok(head.into_owned()),
+        }
+        .map(|head| (head, false))
+    }
 }
 
 /**
@@ -667,7 +737,58 @@ pub fn json_string(literal: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::json_string;
+    use std::io::{self, Read};
+
+    use super::{Encoding, SessionItems, Stored, json_string};
+    use crate::provider::SessionItem;
+
+    /// One item, whose bytes are these.
+    struct Bytes(Vec<u8>);
+
+    impl SessionItems for Bytes {
+        fn list(&self) -> &[SessionItem] {
+            &[]
+        }
+
+        fn open(&self, _: &str, offset: u64) -> io::Result<Box<dyn Read + '_>> {
+            Ok(Box::new(&self.0[offset as usize..]))
+        }
+    }
+
+    #[test]
+    fn the_head_of_content_is_read_without_the_rest_and_never_half_a_character() {
+        let stored = |bytes: &Bytes, encoding| Stored {
+            item: "item".into(),
+            offset: 0,
+            length: bytes.0.len() as u64,
+            encoding,
+        };
+        let plain = Bytes("ab\u{e9}cd".as_bytes().to_vec());
+        assert_eq!(
+            stored(&plain, Encoding::Plain)
+                .load_head(&plain, 3)
+                .unwrap(),
+            ("ab".to_string(), false)
+        );
+        assert_eq!(
+            stored(&plain, Encoding::Plain)
+                .load_head(&plain, 64)
+                .unwrap(),
+            ("ab\u{e9}cd".to_string(), true)
+        );
+        /* A JSON string cut inside an escape, wherever. */
+        let json = Bytes(br#""a\n\u00e9\ud83c\udf89 b""#.to_vec());
+        for limit in 2..json.0.len() as u64 {
+            let (head, whole) = stored(&json, Encoding::JsonString)
+                .load_head(&json, limit)
+                .unwrap();
+            assert!(!whole);
+            assert!(
+                "a\n\u{e9}\u{1F389} b".starts_with(&head),
+                "{limit}: {head:?}"
+            );
+        }
+    }
 
     #[test]
     fn a_json_string_reads_as_its_text() {

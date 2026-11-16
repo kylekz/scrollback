@@ -25,6 +25,7 @@ fn library(cx: &mut TestAppContext) -> (Entity<LibraryService>, Entity<ReaderSer
     reader::constructs(&mut tree);
     reader::subagents_only(&mut tree);
     reader::hostile(&mut tree, 64 * 1024);
+    reader::tangled(&mut tree);
     let file = tree.path(&format!("projects/{backfill}.jsonl"));
     init(tree, cx);
     cx.update(|cx| {
@@ -526,6 +527,132 @@ fn nothing_read_for_a_session_outlives_it(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn subagents_that_claim_each_other_are_each_reached_and_drawn_once(cx: &mut TestAppContext) {
+    let (library, reader, _) = library(cx);
+    open(
+        &library,
+        "Reader fixture: subagents that claim each other",
+        cx,
+    );
+    reader.update(cx, |reader, cx| reader.set_full_calls(true, cx));
+    draw_all(&reader, cx);
+    reader.read_with(cx, |reader, _| {
+        let open = reader.open_session().unwrap();
+        let unattached = open.unattached().expect("placed");
+        /* The one that starts itself, and the first of the two that start each other; the
+        second is under the first. */
+        assert_eq!(unattached.len(), 2, "{unattached:?}");
+        let rows = rows(open, true, None);
+        let mut keys = HashSet::new();
+        for row in &rows {
+            assert!(keys.insert(row.key()), "{:?} twice", row.kind);
+        }
+        let repeats = rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    RowKind::Panel {
+                        part: PanelPart::Repeat,
+                        ..
+                    }
+                )
+            })
+            .count();
+        /* The call in the second of the two that start each other. (The parser gives a
+        subagent to one call only, and passes over one that starts itself.) */
+        assert_eq!(repeats, 1);
+    });
+}
+
+#[gpui::test]
+fn the_providers_outlines_agree_with_its_subagents_read_whole(cx: &mut TestAppContext) {
+    let (library, reader, _) = library(cx);
+    for title in [
+        "Reader fixture: every construct",
+        "Reader fixture: subagents that claim each other",
+    ] {
+        open(&library, title, cx);
+        reader.read_with(cx, |reader, cx| {
+            let open = reader.open_session().unwrap();
+            let archive = reader.archive.read(cx).archive().cloned().unwrap();
+            let items = archive.pinned_session(&open.pinned, open.cache.clone());
+            let provider = reader.providers[open.provider].as_ref();
+            let mut outlines = provider.outlines(&items);
+            outlines.sort_by(|a, b| a.item.cmp(&b.item));
+            let mut whole: Vec<Outline> = items
+                .list()
+                .iter()
+                .filter(|item| item.kind == sb_core::provider::ItemKind::Subagent)
+                .filter_map(|item| match provider.subagent(&items, &item.key) {
+                    Subagent::Read {
+                        kind,
+                        description,
+                        conversation,
+                    } => Some(Outline {
+                        item: conversation.item.clone(),
+                        kind,
+                        description,
+                        started: conversation
+                            .calls()
+                            .flat_map(|(_, call)| call.subagents.iter().map(|it| it.item().clone()))
+                            .collect(),
+                    }),
+                    Subagent::Unread { .. } => None,
+                })
+                .collect();
+            whole.sort_by(|a, b| a.item.cmp(&b.item));
+            assert!(!whole.is_empty());
+            assert_eq!(outlines, whole, "{title}");
+        });
+    }
+}
+
+#[gpui::test]
+fn what_is_let_go_of_while_it_is_read_is_not_kept_when_it_lands(cx: &mut TestAppContext) {
+    let (library, reader, _) = library(cx);
+    open(&library, "Throttle yt-dlp metadata backfill", cx);
+    let grep = call(&reader, "Grep", cx);
+    reader.update(cx, |reader, cx| {
+        reader.want_body(&grep, cx);
+        reader.release(vec![Held::Body(grep.clone())], cx);
+    });
+    cx.run_until_parked();
+    reader.read_with(cx, |reader, _| {
+        assert!(reader.open_session().unwrap().body(&grep).is_none());
+    });
+}
+
+#[gpui::test]
+fn a_body_is_read_to_its_head_and_whole_when_all_of_it_is_asked_for(cx: &mut TestAppContext) {
+    let (library, reader, _) = library(cx);
+    open(&library, "Reader fixture: hostile content", cx);
+    let bash = call(&reader, "Bash", cx);
+    reader.update(cx, |reader, cx| reader.want_body(&bash, cx));
+    cx.run_until_parked();
+    let head = reader.read_with(cx, |reader, _| {
+        let Some(Load::Loaded(body)) = reader.open_session().unwrap().body(&bash) else {
+            panic!("the body is read");
+        };
+        let Some(Part::Text(Ok(output))) = body.output.first() else {
+            panic!("its output is text");
+        };
+        output.clone()
+    });
+    assert!(head.rest.is_some_and(|rest| rest > 0), "{:?}", head.rest);
+    assert!(head.text.len() as u64 <= HEAD_BYTES);
+    reader.update(cx, |reader, cx| reader.want_whole(&bash, Some(0), cx));
+    cx.run_until_parked();
+    reader.read_with(cx, |reader, _| {
+        let Some(Load::Loaded(whole)) = reader.open_session().unwrap().whole(&bash, Some(0)) else {
+            panic!("the whole is read");
+        };
+        assert!(whole.text.starts_with(&head.text));
+        assert!(whole.text.len() > head.text.len() * 2);
+    });
+}
+
+#[gpui::test]
 fn what_the_views_let_go_of_is_dropped_and_prepared_again_when_wanted(cx: &mut TestAppContext) {
     let (library, reader, _) = library(cx);
     open(&library, "Throttle yt-dlp metadata backfill", cx);
@@ -596,7 +723,7 @@ fn the_library_steps_to_the_next_session_of_the_page_and_stars_the_open_one(
     let (library, reader, _) = library(cx);
     open(&library, "Throttle yt-dlp metadata backfill", cx);
     let (at, of) = library.read_with(cx, |library, _| library.open_place().unwrap());
-    assert_eq!(of, 4);
+    assert_eq!(of, 5);
     let step = if at + 1 < of { 1 } else { -1 };
     library.update(cx, |library, cx| library.open_step(step, cx));
     cx.run_until_parked();

@@ -5,13 +5,19 @@
 //!   U+2066–2069) reorder what follows them, so a path or a command could read reversed. They
 //!   are shown as what they are, `⟦U+202E⟧`. Right-to-left text needs none of them to read
 //!   right, and the marks (U+200E, U+200F) only nudge neutral characters, so both stay.
-//! - **A one-line label** (a row's target, a tool's name, a note's kind) is one line: line
-//!   breaks and tabs become spaces, and it is cut at a bound, since a row clips it anyway.
+//! - **A one-line label** ([`label`]: a title, a row's target, a tool's name, a model's, a
+//!   note's kind, a caption) is one line: every line break Unicode has (U+2028, U+2029, NEL,
+//!   vertical tab and form feed with the usual ones), tabs and other controls become spaces, a
+//!   stack of combining marks is cut short, and it is cut at a bound, since a row clips it
+//!   anyway. Every string from a transcript drawn outside prose goes through it.
 
 use std::borrow::Cow;
 
 /// The longest label drawn, in characters: past what any row can show.
 pub const LABEL_CHARS: usize = 300;
+/// The most combining marks kept on one character: more than any script stacks, and few
+/// enough that a stack can't spill over the rows above and below.
+pub const COMBINING_MARKS: usize = 4;
 
 fn is_bidi_control(c: char) -> bool {
     matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
@@ -33,17 +39,71 @@ pub fn bidi(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// `text` as one line of at most [`LABEL_CHARS`] characters, its controls shown.
+/// `text` with what [`bidi`] showed put back: the controls, for a copy of what was shown.
+pub fn unbidi(text: &str) -> Cow<'_, str> {
+    if !text.contains("⟦U+") {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("⟦U+") {
+        out.push_str(&rest[..at]);
+        let marker = &rest[at..];
+        let control = marker
+            .get("⟦U+".len().."⟦U+".len() + 4)
+            .filter(|_| marker["⟦U+".len() + 4..].starts_with('⟧'))
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .and_then(char::from_u32)
+            .filter(|c| is_bidi_control(*c));
+        match control {
+            Some(c) => {
+                out.push(c);
+                rest = &marker["⟦U+".len() + 4 + '⟧'.len_utf8()..];
+            }
+            None => {
+                out.push_str("⟦U+");
+                rest = &marker["⟦U+".len()..];
+            }
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// Whether `c` is a combining mark: the blocks of them, which is where stacks are built from.
+fn is_combining(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0300}'..='\u{036F}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20FF}'
+            | '\u{FE20}'..='\u{FE2F}'
+    )
+}
+
+/// `text` as one line of at most [`LABEL_CHARS`] characters, its controls shown (the module
+/// docs): transcript text drawn outside prose.
 pub fn label(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(LABEL_CHARS * 4));
+    let mut marks = 0;
     for (count, c) in text.chars().enumerate() {
         if count == LABEL_CHARS {
             out.push('…');
             break;
         }
+        if is_combining(c) {
+            marks += 1;
+            if marks <= COMBINING_MARKS {
+                out.push(c);
+            }
+            continue;
+        }
+        marks = 0;
         match c {
-            '\n' | '\r' | '\t' => out.push(' '),
             c if is_bidi_control(c) => out.push_str(&format!("⟦U+{:04X}⟧", c as u32)),
+            '\u{2028}' | '\u{2029}' => out.push(' '),
+            c if c.is_control() => out.push(' '),
             c => out.push(c),
         }
     }
@@ -62,6 +122,19 @@ mod tests {
         assert_eq!(bidi("a\u{2066}b\u{2069}"), "a⟦U+2066⟧b⟦U+2069⟧");
         let hebrew = "שלום \u{200F}עולם";
         assert!(matches!(bidi(hebrew), Cow::Borrowed(text) if text == hebrew));
+        for text in [
+            "rm -rf \u{202E}gpj.exe",
+            "a\u{2066}b\u{2069}",
+            "⟦U+0041⟧ ⟦U+20",
+            "",
+        ] {
+            assert_eq!(unbidi(&bidi(text)), text);
+        }
+        /* What a body shows, back to what the transcript holds. */
+        let source = "a <b>x</b> at https://example.com/x \u{202E}txt.exe";
+        let shown = crate::markdown::Sanitized::new(source);
+        assert_ne!(shown.as_str(), source);
+        assert_eq!(crate::markdown::shown_to_source(shown.as_str()), source);
     }
 
     #[test]
@@ -71,5 +144,11 @@ mod tests {
         assert_eq!(long.chars().count(), LABEL_CHARS + 1);
         assert!(long.ends_with('…'));
         assert_eq!(label("\u{202E}x"), "⟦U+202E⟧x");
+        assert_eq!(
+            label("a\u{2028}b\u{2029}c\u{85}d\u{b}e\u{c}f\u{0}g"),
+            "a b c d e f g"
+        );
+        let stacked = label(&format!("Z{}", "\u{0336}".repeat(200)));
+        assert_eq!(stacked.chars().count(), 1 + COMBINING_MARKS);
     }
 }

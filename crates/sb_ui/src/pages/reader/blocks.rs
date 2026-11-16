@@ -365,7 +365,10 @@ fn task_head(
         (open.id.provider.clone(), target("task", at, open))
     };
     let label = match from {
-        Some(model) => format!("Task from {}", agents::model_name(&provider, model, cx)),
+        Some(model) => hostile::label(&format!(
+            "Task from {}",
+            agents::model_name(&provider, model, cx)
+        )),
         None => "Task".to_string(),
     };
     div()
@@ -497,14 +500,14 @@ fn prose(
             _ => div().into_any_element(),
         },
         ProsePart::More { piece: index, all } => {
-            let count = match piece(*index) {
-                Some(ProsePiece::Plain { text, .. }) => text.line_count(),
-                _ => 0,
+            let text = match piece(*index) {
+                Some(ProsePiece::Plain { text, .. }) => Some(text.as_ref()),
+                _ => None,
             };
             let toggle = crate::services::reader::Toggle::ProseLines(at.clone(), *index);
             more_lines(
                 format!("prose-more-{ix}").into(),
-                count,
+                text,
                 *all,
                 toggle,
                 theme,
@@ -554,11 +557,11 @@ pub fn text_rows(text: &Text, chunk: usize, all: bool) -> String {
     }
 }
 
-/// Under lines that have more than their first: how many more, and Show all; or Show fewer
-/// once all are shown.
+/// Under lines that have more than their first: how many more (in bytes when `text` is only
+/// the head of something longer), and Show all; or Show fewer once all are shown.
 pub fn more_lines(
     id: SharedString,
-    count: usize,
+    text: Option<&Text>,
     all: bool,
     toggle: crate::services::reader::Toggle,
     theme: &SbTheme,
@@ -573,10 +576,17 @@ pub fn more_lines(
         .text_color(c.fg3)
         .text_spec(&theme.text.small)
         .when(!all, |this| {
-            this.child(format!(
-                "+{} more lines",
-                format::count(count.saturating_sub(FIRST_LINES) as u64)
-            ))
+            this.child(match text {
+                Some(Text {
+                    rest: Some(rest), ..
+                }) => format!("+{} more", format::size(*rest)),
+                _ => format!(
+                    "+{} more lines",
+                    format::count(
+                        text.map_or(0, Text::line_count).saturating_sub(FIRST_LINES) as u64
+                    )
+                ),
+            })
         })
         .child(
             div()
@@ -647,7 +657,7 @@ fn shot(image: Option<Load<Picture>>, theme: &SbTheme) -> AnyElement {
             picture.height,
             format::size(picture.bytes as u64)
         ),
-        Some(Load::Failed(why)) => why.clone(),
+        Some(Load::Failed(why)) => hostile::label(why),
         None | Some(Load::Loading) => "Loading…".to_string(),
     };
     let bad = matches!(image, Some(Load::Failed(_)));

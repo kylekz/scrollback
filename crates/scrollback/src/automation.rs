@@ -34,15 +34,16 @@
 //!   the `open` session, and `error` (why the library couldn't be read, or `null`).
 //! - `reader`: `state` (`closed`, `opening`, `failed` with `error`, or `open`), `full_calls`,
 //!   `place` (`[n, of]`: the open session among its page's), `rows` (the column's), `top` and
-//!   `top_name` (the row at its top, and what it is: `kind conversation/block`), `focused`
+//!   `top_name` (the row at its top, and what it is: `kind conversation/block`) and
+//!   `top_offset` (how far into that row it is scrolled), `focused`
 //!   (`row`, `kind` and the start of the `text` of the keyboard's row, or `null`),
 //!   `open_calls`, `markdown_states` and `held` (how many parsed bodies, and how many prepared
 //!   things of the service's, are kept), `alone` (a subagent read on its own), `loads`
-//!   (`bodies`, `subagents`, `prose`, `images`, `raws`: how many are `loading` and
+//!   (`bodies`, `subagents`, `prose`, `images`, `raws`, `wholes`: how many are `loading` and
 //!   `loaded`) and `fault` (a read that failed for a reason other than the stored bytes).
 //! - `system`: what the app would have opened and copied (`sb_ui::system`): every link
-//!   `opened`, and how many texts were `copied`. A scripted run records them instead of reaching
-//!   the browser or the clipboard.
+//!   `opened`, how many texts were `copied` and the `last_copied`. A scripted run records them
+//!   instead of reaching the browser or the clipboard.
 //!
 //! Commands. An argument a command doesn't have is an error, so a misspelt one never passes
 //! for a change. These reply with `state.appearance` after the change:
@@ -109,6 +110,7 @@ impl AutomationHost for ScrollbackAutomation {
             "system": cx.try_global::<sb_ui::system::Recorded>().map(|recorded| json!({
                 "opened": recorded.opened,
                 "copied": recorded.copied.len(),
+                "last_copied": recorded.copied.last(),
             })),
         })
     }
@@ -283,6 +285,7 @@ fn reader(shell: &Shell, cx: &App) -> Value {
         "rows": view.rows,
         "top": view.top,
         "top_name": view.top_name,
+        "top_offset": view.top_offset,
         "focused": view.focused.map(|(at, kind, text)| json!({ "row": at, "kind": kind, "text": text })),
         "open_calls": view.open_calls,
         "markdown_states": view.states,

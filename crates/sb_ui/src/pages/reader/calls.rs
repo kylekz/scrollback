@@ -418,7 +418,7 @@ fn body(
 ) -> AnyElement {
     let c = &theme.colors;
     let reader = cx.services().reader.clone();
-    let (loaded, call, image, all, name) = {
+    let (loaded, call, image, all, whole, name) = {
         let reader = reader.read(cx);
         let Some(session) = reader.open_session() else {
             return div().into_any_element();
@@ -434,10 +434,16 @@ fn body(
             _ => None,
         };
         let all = match part {
-            BodyPart::Lines { part, .. } => {
+            BodyPart::Lines { part, .. } | BodyPart::More { part, .. } => {
                 session.is_open(&Toggle::AllLines(at.clone(), *part), reader.full_calls())
             }
             _ => false,
+        };
+        let whole = match part {
+            BodyPart::Lines { part, .. }
+            | BodyPart::Whole { part }
+            | BodyPart::More { part, .. } => session.whole(at, *part).cloned(),
+            _ => None,
         };
         (
             match session.body(at) {
@@ -447,12 +453,25 @@ fn body(
             session.call(at).cloned(),
             image,
             all,
+            whole,
             target("body", at, session),
         )
     };
     view.hold(Held::Body(at.clone()), ix);
     if matches!(part, BodyPart::Loading) && loaded.is_none() {
         reader.update(cx, |reader, cx| reader.want_body(at, cx));
+    }
+    match part {
+        BodyPart::Whole { part: index } => {
+            view.hold(Held::Whole(at.clone(), *index), ix);
+            if whole.is_none() {
+                reader.update(cx, |reader, cx| reader.want_whole(at, *index, cx));
+            }
+        }
+        BodyPart::Lines { part: index, .. } if whole.is_some() => {
+            view.hold(Held::Whole(at.clone(), *index), ix);
+        }
+        _ => {}
     }
     let content = match (part, &loaded, &call) {
         (BodyPart::Loading, _, _) => div()
@@ -486,7 +505,20 @@ fn body(
             first,
             theme,
         ),
-        (BodyPart::Lines { part, chunk }, Some(body), _) => match text_of(body, *part) {
+        (BodyPart::Whole { .. }, _, _) => div()
+            .py(theme.spacing.md)
+            .px(theme.spacing.lg)
+            .child(match &whole {
+                Some(Load::Failed(why)) => {
+                    failed(&format!("The rest couldn't be read: {why}"), theme)
+                }
+                _ => skeleton(3, theme),
+            })
+            .into_any_element(),
+        (BodyPart::Lines { part, chunk }, Some(body), _) => match match (&whole, all) {
+            (Some(Load::Loaded(whole)), true) => Some(whole.as_ref()),
+            _ => text_of(body, *part),
+        } {
             Some(text) => div()
                 .px(theme.spacing.lg)
                 .when(*chunk == 0, |this| this.pt(theme.spacing.md))
@@ -498,14 +530,17 @@ fn body(
             None => div().into_any_element(),
         },
         (BodyPart::More { part, all }, Some(body), _) => {
-            let count = text_of(body, *part).map_or(0, Text::line_count);
+            let text = match (&whole, *all) {
+                (Some(Load::Loaded(whole)), true) => Some(whole.as_ref()),
+                _ => text_of(body, *part),
+            };
             div()
                 .px(px(10.))
                 .border_t_1()
                 .border_color(c.line_subtle)
                 .child(more_lines(
                     format!("more-{ix}").into(),
-                    count,
+                    text,
                     *all,
                     Toggle::AllLines(at.clone(), *part),
                     theme,
@@ -595,7 +630,7 @@ fn tool_image(
             .text_color(if bad { c.red } else { c.fg3 })
             .text_spec(&theme.text.small)
             .child(icon(SbIcon::Image, theme.sizes.icon_xs, c.fg3))
-            .child(text)
+            .child(hostile::label(&text))
     };
     let inner = match load {
         Some(Load::Loaded(picture)) => {
@@ -693,55 +728,34 @@ fn head(
             .ml_auto()
             .aria_label(format!("Copy the {what}"))
             .on_click(move |_, _, cx| {
-                let text = {
-                    let reader = cx.services().reader.read(cx);
-                    let open = reader.open_session();
-                    match &copy {
-                        Copy::Input(at) => open.and_then(|open| match open.body(at)? {
-                            Load::Loaded(body) => {
-                                body.input.as_ref().ok().map(|text| text.text.clone())
-                            }
-                            _ => None,
-                        }),
-                        Copy::Output(at) => open.and_then(|open| match open.body(at)? {
-                            Load::Loaded(body) => Some(output_text(body)),
-                            _ => None,
-                        }),
-                    }
-                };
-                if let Some(text) = text.filter(|text| !text.is_empty()) {
-                    crate::system::copy_text(text, cx);
-                }
+                let reader = cx.services().reader.clone();
+                reader.update(cx, |reader, cx| match &copy {
+                    Copy::Input(at) => reader.copy_call(at, false, cx),
+                    Copy::Output(at) => reader.copy_call(at, true, cx),
+                });
             })
             .child(icon(SbIcon::Copy, theme.sizes.icon_xs, c.fg2)),
         )
         .into_any_element()
 }
 
-/// Every text part of the output, joined: what Copy output copies.
-fn output_text(body: &CallBody) -> String {
-    body.output
-        .iter()
-        .filter_map(|part| match part {
-            Part::Text(Ok(text)) => Some(text.text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// A call body's footer (`callfoot`, 24): its status and its output's lines. A failed call
 /// reads as failed whatever its exit status.
 fn footer(call: &ToolCall, body: &CallBody, theme: &SbTheme) -> AnyElement {
     let c = &theme.colors;
-    let lines: usize = body
-        .output
-        .iter()
-        .map(|part| match part {
-            Part::Text(Ok(text)) => text.line_count(),
-            _ => 0,
+    let texts = || {
+        body.output.iter().filter_map(|part| match part {
+            Part::Text(Ok(text)) => Some(text),
+            _ => None,
         })
-        .sum();
+    };
+    /* Of an output read only in part, the lines aren't known: its size is. */
+    let size = if texts().any(|text| text.rest.is_some()) {
+        let bytes = texts().map(|text| text.text.len() as u64 + text.rest.unwrap_or(0));
+        format::size(bytes.sum())
+    } else {
+        format::plural(texts().map(|text| text.line_count()).sum(), "line")
+    };
     let (status, bad) = match &call.result {
         None => ("not answered".to_string(), false),
         Some(result) if result.status == ToolStatus::Failed => match result.brief {
@@ -763,7 +777,7 @@ fn footer(call: &ToolCall, body: &CallBody, theme: &SbTheme) -> AnyElement {
         .child(div().when(bad, |this| this.text_color(c.red)).child(status))
         .when(
             body.output.iter().any(|part| matches!(part, Part::Text(_))),
-            |this| this.child(format::plural(lines, "line")),
+            |this| this.child(size),
         )
         .into_any_element()
 }
@@ -881,6 +895,15 @@ fn panel(
             .text_color(c.fg3)
             .text_spec(&theme.text.small)
             .child("A subagent nested deeper than the reader draws.")
+            .child(alone_button(format!("alone-{ix}").into()))
+            .into_any_element(),
+        PanelPart::Repeat => div()
+            .flex()
+            .items_center()
+            .gap(theme.spacing.md)
+            .text_color(c.fg3)
+            .text_spec(&theme.text.small)
+            .child("A subagent already shown where it was first started.")
             .child(alone_button(format!("alone-{ix}").into()))
             .into_any_element(),
     }

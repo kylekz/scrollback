@@ -12,11 +12,14 @@
 //! row it is whatever its state, so the view can match the rows before and after a change and
 //! tell the list which ones were added, removed, or changed in place.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use sb_core::transcript::{BlockId, Content, Conversation, Ending, Turn};
 
-use crate::services::reader::{BlockRef, CallBody, Load, OpenSession, Part, Piece, Prose, Toggle};
+use crate::services::reader::{
+    BlockRef, CallBody, Load, OpenSession, Part, Piece, Prose, Text, Toggle,
+};
 
 /// How many lines text shown as it is shows until "Show all" (DESIGN §4.2.4).
 pub const FIRST_LINES: usize = 20;
@@ -67,6 +70,11 @@ pub enum BodyPart {
     PartFailed {
         part: Option<usize>,
     },
+    /// All of a part was asked for, of which the body has only the head: being read, or why
+    /// it couldn't be.
+    Whole {
+        part: Option<usize>,
+    },
     Image(usize),
     /// A call that returned nothing, or was never answered.
     NoOutput,
@@ -114,6 +122,9 @@ pub enum PanelPart {
     More(usize),
     /// Nested too deep to draw: only Open on its own.
     TooDeep,
+    /// Started again where it is already drawn (claimed by a second call, or by a subagent it
+    /// started): drawn once, and here only named.
+    Repeat,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -342,6 +353,7 @@ pub fn rows(
         rows: Vec::new(),
         depth: 0,
         task_from: None,
+        drawn: HashSet::new(),
     };
     if let Some((item, call)) = alone {
         out.push(RowKind::Alone(item.clone()), Space::Top);
@@ -386,6 +398,9 @@ struct Rows<'a> {
     depth: usize,
     /// The model of the call that started the subagent being laid out, whose task it gave.
     task_from: Option<Arc<str>>,
+    /// The subagents whose panels are laid out: each is laid out once, so that its rows' keys
+    /// are its own.
+    drawn: HashSet<Arc<str>>,
 }
 
 impl Rows<'_> {
@@ -523,8 +538,11 @@ impl Rows<'_> {
                     self.body(&at);
                     return;
                 }
+                let mut started = HashSet::new();
                 for subagent in &call.subagents {
-                    self.panel(subagent.item(), Some(&at), Space::None, false);
+                    if started.insert(subagent.item()) {
+                        self.panel(subagent.item(), Some(&at), Space::None, false);
+                    }
                 }
                 let io = open.is_open(&Toggle::CallIo(at.clone()), full_calls);
                 self.push(
@@ -673,24 +691,14 @@ impl Rows<'_> {
      */
     fn body_parts(&self, at: &BlockRef, body: &CallBody) -> Vec<BodyPart> {
         let mut parts = vec![BodyPart::InputHead];
-        self.lines(
-            at,
-            None,
-            body.input.as_ref().map(|text| text.line_count()),
-            &mut parts,
-        );
+        self.lines(at, None, body.input.as_ref(), &mut parts);
         parts.push(BodyPart::OutputHead);
         if body.output.is_empty() {
             parts.push(BodyPart::NoOutput);
         }
         for (index, part) in body.output.iter().enumerate() {
             match part {
-                Part::Text(text) => self.lines(
-                    at,
-                    Some(index),
-                    text.as_ref().map(|text| text.line_count()),
-                    &mut parts,
-                ),
+                Part::Text(text) => self.lines(at, Some(index), text.as_ref(), &mut parts),
                 Part::Image => parts.push(BodyPart::Image(index)),
             }
         }
@@ -698,27 +706,41 @@ impl Rows<'_> {
         parts
     }
 
-    /// The rows of one part's lines: its first lines, or all of them a chunk a row.
+    /**
+     * The rows of one part's lines: its first lines, or all of them a chunk a row. All of a
+     * part the body has only the head of are its whole, read for them.
+     */
     fn lines(
         &self,
         at: &BlockRef,
         part: Option<usize>,
-        count: Result<usize, &String>,
+        text: Result<&Arc<Text>, &String>,
         parts: &mut Vec<BodyPart>,
     ) {
-        let Ok(count) = count else {
+        let Ok(text) = text else {
             parts.push(BodyPart::PartFailed { part });
             return;
+        };
+        let all = self
+            .open
+            .is_open(&Toggle::AllLines(at.clone(), part), self.full_calls);
+        let count = match (all, text.rest) {
+            (true, Some(_)) => match self.open.whole(at, part) {
+                Some(Load::Loaded(whole)) => whole.line_count(),
+                _ => {
+                    parts.push(BodyPart::Whole { part });
+                    parts.push(BodyPart::More { part, all });
+                    return;
+                }
+            },
+            _ => text.line_count(),
         };
         if count == 0 {
             return;
         }
-        let all = self
-            .open
-            .is_open(&Toggle::AllLines(at.clone(), part), self.full_calls);
         let chunks = if all { count.div_ceil(CHUNK_LINES) } else { 1 };
         parts.extend((0..chunks).map(|chunk| BodyPart::Lines { part, chunk }));
-        if count > FIRST_LINES {
+        if count > FIRST_LINES || text.rest.is_some() {
             parts.push(BodyPart::More { part, all });
         }
     }
@@ -736,6 +758,15 @@ impl Rows<'_> {
         };
         if !alone {
             self.depth += 1;
+        }
+        if !self.drawn.insert(item.clone()) {
+            self.push(panel(PanelPart::Repeat), space);
+            if let Some(last) = self.rows.last_mut() {
+                last.opens = true;
+                last.closes += 1;
+            }
+            self.depth -= 1;
+            return;
         }
         let outer = std::mem::replace(
             &mut self.task_from,

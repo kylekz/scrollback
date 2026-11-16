@@ -237,26 +237,35 @@ pub(super) fn subagent(items: &dyn SessionItems, key: &str) -> Subagent {
     }
 }
 
-fn file_name(key: &str) -> &str {
+pub(super) fn file_name(key: &str) -> &str {
     key.rsplit_once('/').map_or(key, |(_, name)| name)
 }
 
 /// The key of the `.meta.json` beside the subagent transcript `key`.
-fn meta_key(key: &str) -> String {
+pub(super) fn meta_key(key: &str) -> String {
     format!("{}.meta.json", key.strip_suffix(".jsonl").unwrap_or(key))
 }
 
+/// The most of a sidecar read: those Claude Code writes are a few hundred bytes.
+const SIDECAR_BYTES: u64 = 64 * 1024;
+
 /// The small JSON file `key` of the session, when it is there. An error is why it couldn't be
-/// read, or that it isn't what `T` reads.
-fn sidecar<T: DeserializeOwned>(items: &dyn SessionItems, key: &str) -> Result<Option<T>, String> {
+/// read, that it is larger than [`SIDECAR_BYTES`], or that it isn't what `T` reads.
+pub(super) fn sidecar<T: DeserializeOwned>(
+    items: &dyn SessionItems,
+    key: &str,
+) -> Result<Option<T>, String> {
     if !items.list().iter().any(|item| item.key == key) {
         return Ok(None);
     }
     let mut json = Vec::new();
     items
         .open(key, 0)
-        .and_then(|mut file| file.read_to_end(&mut json))
+        .and_then(|file| file.take(SIDECAR_BYTES + 1).read_to_end(&mut json))
         .map_err(|error| error.to_string())?;
+    if json.len() as u64 > SIDECAR_BYTES {
+        return Err(format!("it is larger than {SIDECAR_BYTES} bytes"));
+    }
     serde_json::from_slice(&json)
         .map(Some)
         .map_err(|error| format!("it is not as expected ({:?})", error.classify()))

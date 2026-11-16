@@ -900,6 +900,7 @@ pub const HOSTILE_REPLIES: &[&str] = &[
     "fetch('http://evil.example/script');</script> stays text",
     "<div>\n<img src=\"https://evil.example/p.png\">\n</div>",
     "A path that reads backwards: \u{202E}gnp.exe and a hard break  \nhere",
+    "Copied as written: <b>bold</b> at https://example.com/x and \u{202E}txt.exe",
 ];
 
 /// The links of every scheme the link scenario clicks, one a reply, each long enough that its
@@ -993,6 +994,18 @@ pub fn hostile(tree: &mut ProjectsTree, big: usize) -> String {
             ),
         );
     }
+    /* An output much longer than what a body shows of it. */
+    let long = s
+        .at("08:02:59")
+        .call(OPUS_55, "Bash", json!({ "command": "seq 1 999999" }));
+    let mut lines = String::new();
+    for n in 1.. {
+        if lines.len() >= big {
+            break;
+        }
+        lines.push_str(&format!("{n}\n"));
+    }
+    s.result(&long, json!(lines), json!({}));
     let bidi = s.at("08:03:00").call(
         OPUS_55,
         "Bash",
@@ -1039,6 +1052,54 @@ pub fn subagents_only(tree: &mut ProjectsTree) -> String {
     s.at("08:00:04")
         .reply(HAIKU, "The queue holds three items.");
     std::fs::remove_file(tree.path(&session.key)).expect("the transcript was written");
+    session.session_key().to_string()
+}
+
+/**
+ * A session of fc whose subagents claim each other wrongly: two of its own calls both start
+ * the same subagent; of those no call of its own started, one starts itself, and two start each
+ * other. Returns its key.
+ */
+pub fn tangled(tree: &mut ProjectsTree) -> String {
+    let mut session = tree.session(FC, 0);
+    session.title("Reader fixture: subagents that claim each other");
+    let mut twice = session.subagent_without_meta();
+    let mut itself = session.subagent_without_meta();
+    let mut one = session.subagent_without_meta();
+    let mut other = session.subagent_without_meta();
+    let id = |records: &Records| records.agent.clone().expect("a subagent has an id");
+    let (twice_id, itself_id, one_id, other_id) = (id(&twice), id(&itself), id(&one), id(&other));
+    {
+        let mut s = Script::new(&mut session.transcript, "2026-11-06", "t");
+        s.at("08:00:00").prompt("Look twice.");
+        for at in ["08:00:01", "08:00:02"] {
+            let call = s.at(at).call(
+                OPUS_55,
+                "Agent",
+                json!({ "description": "Look", "prompt": "Look.", "subagent_type": "Explore" }),
+            );
+            s.result(&call, json!("Looked."), json!({ "agentId": twice_id }));
+        }
+        s.at("08:00:03").reply(OPUS_55, "Looked twice.");
+    }
+    for (records, prefix, starts) in [
+        (&mut twice, "u", None),
+        (&mut itself, "v", Some(&itself_id)),
+        (&mut one, "w", Some(&other_id)),
+        (&mut other, "x", Some(&one_id)),
+    ] {
+        let mut s = Script::new(records, "2026-11-06", prefix);
+        s.at("08:00:01").prompt("Look.");
+        if let Some(starts) = starts {
+            let call = s.at("08:00:02").call(
+                HAIKU,
+                "Agent",
+                json!({ "description": "Again", "prompt": "Again.", "subagent_type": "Explore" }),
+            );
+            s.result(&call, json!("Again."), json!({ "agentId": starts }));
+        }
+        s.at("08:00:03").reply(HAIKU, "Done.");
+    }
     session.session_key().to_string()
 }
 

@@ -22,7 +22,7 @@ use std::path::Path;
 use thiserror::Error;
 use toolbox_store::rusqlite;
 
-use crate::transcript::{Subagent, Transcript};
+use crate::transcript::{Outline, Subagent, Transcript};
 use crate::transport::{Halt, RangeSink, Transport, TransportError};
 
 pub use crate::transport::{Hashed, RangeFailure, Unlisted};
@@ -241,6 +241,36 @@ pub trait Provider: Send + Sync {
     /// calls started named. An agent without subagents has none to read.
     fn subagent(&self, _items: &dyn SessionItems, item: &str) -> Subagent {
         Subagent::Unread { item: item.into() }
+    }
+
+    /**
+     * Every subagent of the session whose items are `items`, outlined: what it says it is and
+     * the subagents its calls started, which is what places it among the others. By default
+     * each is read whole with [`Provider::subagent`]; a provider that can find the calls
+     * without reading a conversation outlines them more cheaply.
+     */
+    fn outlines(&self, items: &dyn SessionItems) -> Vec<Outline> {
+        items
+            .list()
+            .iter()
+            .filter(|item| item.kind == ItemKind::Subagent)
+            .filter_map(|item| match self.subagent(items, &item.key) {
+                Subagent::Read {
+                    kind,
+                    description,
+                    conversation,
+                } => Some(Outline {
+                    item: conversation.item.clone(),
+                    kind,
+                    description,
+                    started: conversation
+                        .calls()
+                        .flat_map(|(_, call)| call.subagents.iter().map(|it| it.item().clone()))
+                        .collect(),
+                }),
+                Subagent::Unread { .. } => None,
+            })
+            .collect()
     }
 
     /**

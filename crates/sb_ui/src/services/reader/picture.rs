@@ -1,17 +1,21 @@
 //! An image from a transcript, decoded to draw: on a background thread, to one still frame of
-//! bounded size, so that no image can take more than [`MAX_PIXELS`] to decode or more than
-//! [`MAX_SIDE`] a side to keep. Only raster formats are drawn: an SVG can name files and
-//! addresses to load.
+//! bounded size. No image may claim more than [`MAX_PIXELS`] in its header, no decode may
+//! allocate more than [`DECODE_BYTES`] (whatever its frames claim: a GIF's frame carries its
+//! own size, up to 65535 a side, apart from its screen's), and what is kept is at most
+//! [`MAX_SIDE`] a side. A decode's peak is its own allocations, then a still of at most
+//! [`MAX_SIDE`] a side converted from them. Only raster formats are drawn: an SVG can name
+//! files and addresses to load.
 
 use std::io::Cursor;
 use std::sync::Arc;
 
 use gpui::RenderImage;
-use image::codecs::gif::GifDecoder;
-use image::{AnimationDecoder as _, ImageFormat, ImageReader, Limits, RgbaImage};
+use image::{DynamicImage, ImageDecoder as _, ImageFormat, ImageReader, Limits};
 
 /// The most pixels an image may claim in its header and still be decoded: a 6K screenshot.
 pub const MAX_PIXELS: u64 = 6144 * 4096;
+/// The most a decode may allocate: [`MAX_PIXELS`] at four bytes a pixel.
+pub const DECODE_BYTES: u64 = MAX_PIXELS * 4;
 /// The longest side an image is kept at once decoded: past what the column draws.
 pub const MAX_SIDE: u32 = 2048;
 
@@ -44,36 +48,30 @@ pub fn decode(media_type: &str, bytes: &[u8]) -> Result<Picture, String> {
         "image/webp" => ImageFormat::WebP,
         other => return Err(format!("{other} images aren't shown")),
     };
-    let reader = || ImageReader::with_format(Cursor::new(bytes), format);
-    let (width, height) = reader()
-        .into_dimensions()
+    let mut limits = Limits::default();
+    limits.max_alloc = Some(DECODE_BYTES);
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    /* Handed to the decoder, which checks each frame's own size against them before it
+    allocates for it. */
+    reader.limits(limits);
+    let decoder = reader
+        .into_decoder()
         .map_err(|error| format!("The image can't be read: {error}"))?;
+    let (width, height) = decoder.dimensions();
     if u64::from(width) * u64::from(height) > MAX_PIXELS {
         return Err(format!(
             "The image claims {width} × {height} pixels, too many to decode"
         ));
     }
-    let undecodable = |error: image::ImageError| format!("The image can't be decoded: {error}");
-    let mut frame: RgbaImage = if format == ImageFormat::Gif {
-        let decoder = GifDecoder::new(Cursor::new(bytes)).map_err(undecodable)?;
-        decoder
-            .into_frames()
-            .next()
-            .ok_or("The image has no frame")?
-            .map_err(undecodable)?
-            .into_buffer()
-    } else {
-        let mut reader = reader();
-        let mut limits = Limits::default();
-        limits.max_alloc = Some(MAX_PIXELS * 4 * 2);
-        reader.limits(limits);
-        reader.decode().map_err(undecodable)?.to_rgba8()
-    };
-    if frame.width().max(frame.height()) > MAX_SIDE {
-        let scale = f64::from(MAX_SIDE) / f64::from(frame.width().max(frame.height()));
+    /* A GIF decodes to its first frame. */
+    let mut still = DynamicImage::from_decoder(decoder)
+        .map_err(|error| format!("The image can't be decoded: {error}"))?;
+    if still.width().max(still.height()) > MAX_SIDE {
+        let scale = f64::from(MAX_SIDE) / f64::from(still.width().max(still.height()));
         let fit = |side: u32| ((f64::from(side) * scale).round() as u32).max(1);
-        frame = image::imageops::thumbnail(&frame, fit(frame.width()), fit(frame.height()));
+        still = still.thumbnail_exact(fit(still.width()), fit(still.height()));
     }
+    let mut frame = still.into_rgba8();
     /* gpui draws BGRA. */
     for pixel in frame.pixels_mut() {
         pixel.0.swap(0, 2);
@@ -146,5 +144,23 @@ mod tests {
         let crc = crc32(&huge[12..29]);
         huge[29..33].copy_from_slice(&crc.to_be_bytes());
         assert!(decode("image/png", &huge).unwrap_err().contains("too many"));
+    }
+
+    #[test]
+    fn a_gif_frame_larger_than_its_screen_is_refused_before_it_is_allocated() {
+        /* A 1 × 1 screen, then a frame of the size given, its data cut short. Past what a
+        decode may allocate, it is refused for that, before anything is allocated for it. */
+        let gif = |side: u16| {
+            let mut gif = b"GIF89a".to_vec();
+            gif.extend_from_slice(&[1, 0, 1, 0, 0, 0, 0, 0x2C, 0, 0, 0, 0]);
+            gif.extend_from_slice(&side.to_le_bytes());
+            gif.extend_from_slice(&side.to_le_bytes());
+            gif.extend_from_slice(&[0x80, 0, 0, 0, 255, 255, 255, 2, 2, 0x4C, 0x01, 0, 0x3B]);
+            gif
+        };
+        for side in [65535, 8000] {
+            let why = decode("image/gif", &gif(side)).unwrap_err();
+            assert!(why.contains("limit"), "{side}: {why}");
+        }
     }
 }

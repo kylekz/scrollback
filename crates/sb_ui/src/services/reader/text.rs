@@ -9,53 +9,97 @@ use std::ops::Range;
  */
 pub const SEGMENT_BYTES: usize = 512;
 
-/// Text, whole, and cut into the lines drawn: its own lines, each long one in segments of at
-/// most [`SEGMENT_BYTES`], cut at a space near the end where there is one.
+/**
+ * How many lines drawn apart the text notes where one starts: a row's lines are found from the
+ * note before them. Noting every line costs 16 bytes a line, as much as the text itself for
+ * short lines; this costs a few bytes a hundred lines and a scan of at most this many.
+ */
+const NOTE_EVERY: usize = 64;
+
+/// Text and the lines drawn of it: its own lines, each long one in segments of at most
+/// [`SEGMENT_BYTES`], cut at a space near the end where there is one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Text {
     pub text: String,
-    lines: Vec<Range<usize>>,
+    /// When `text` is only the head of something longer: about how many bytes more there are
+    /// (as stored, so escapes count as written).
+    pub rest: Option<u64>,
+    /// Where every [`NOTE_EVERY`]th line drawn starts.
+    notes: Vec<usize>,
+    count: usize,
 }
 
 impl Text {
     pub fn new(text: String) -> Self {
-        let mut lines = Vec::new();
-        let mut start = 0;
-        for line in text.split_inclusive('\n') {
-            let shown = line.trim_end_matches(['\n', '\r']);
-            let mut at = 0;
-            loop {
-                let rest = &shown[at..];
-                if rest.len() <= SEGMENT_BYTES {
-                    lines.push(start + at..start + shown.len());
-                    break;
-                }
-                let mut end = boundary(rest, SEGMENT_BYTES);
-                let half = boundary(rest, SEGMENT_BYTES / 2);
-                if let Some(space) = rest[half..end].rfind(' ') {
-                    end = half + space + 1;
-                }
-                lines.push(start + at..start + at + end);
-                at += end;
+        let mut notes = Vec::new();
+        let mut count = 0;
+        let mut at = Some(0);
+        while let Some(start) = at.filter(|start| *start < text.len()) {
+            if count % NOTE_EVERY == 0 {
+                notes.push(start);
             }
-            start += line.len();
+            count += 1;
+            at = Some(segment(&text, start).1);
         }
-        Self { text, lines }
+        Self {
+            text,
+            rest: None,
+            notes,
+            count,
+        }
+    }
+
+    /// The first part of something `rest` bytes longer.
+    pub fn head(text: String, rest: u64) -> Self {
+        Self {
+            rest: Some(rest),
+            ..Self::new(text)
+        }
     }
 
     pub fn line_count(&self) -> usize {
-        self.lines.len()
+        self.count
     }
 
     /// The lines `range`, joined: what a row draws of them.
     pub fn lines(&self, range: Range<usize>) -> String {
-        let end = range.end.min(self.lines.len());
-        self.lines[range.start.min(end)..end]
-            .iter()
-            .map(|line| &self.text[line.clone()])
-            .collect::<Vec<_>>()
-            .join("\n")
+        let end = range.end.min(self.count);
+        let start = range.start.min(end);
+        let Some(&noted) = self.notes.get(start / NOTE_EVERY) else {
+            return String::new();
+        };
+        let mut lines = Vec::with_capacity(end - start);
+        let mut at = noted;
+        for line in start / NOTE_EVERY * NOTE_EVERY..end {
+            let (shown, next) = segment(&self.text, at);
+            if line >= start {
+                lines.push(&self.text[shown]);
+            }
+            at = next;
+        }
+        lines.join("\n")
     }
+}
+
+/// The line drawn that starts at `start` in `text`, and where the next one starts.
+fn segment(text: &str, start: usize) -> (Range<usize>, usize) {
+    /* Only as far as a segment can reach: a line of megabytes is not searched to its end for
+    each of its segments. */
+    let reach = &text[start..boundary(text, (start + SEGMENT_BYTES + 2).min(text.len()))];
+    let (end, next) = match reach.find('\n') {
+        Some(newline) => (start + newline, start + newline + 1),
+        None => (start + reach.len(), start + reach.len()),
+    };
+    let shown = text[start..end].trim_end_matches('\r');
+    if shown.len() <= SEGMENT_BYTES {
+        return (start..start + shown.len(), next);
+    }
+    let mut cut = boundary(shown, SEGMENT_BYTES);
+    let half = boundary(shown, SEGMENT_BYTES / 2);
+    if let Some(space) = shown[half..cut].rfind(' ') {
+        cut = half + space + 1;
+    }
+    (start..start + cut, start + cut)
 }
 
 /// The start of the character at `at` in `text`, or `at` if one starts there.
@@ -93,5 +137,30 @@ mod tests {
             let wide = format!("{}{}", "a".repeat(lead), "\u{200B}".repeat(400));
             assert_eq!(Text::new(wide.clone()).lines(0..9).replace('\n', ""), wide);
         }
+    }
+
+    #[test]
+    fn any_lines_are_found_from_the_notes_and_cost_little_to_index() {
+        let text: String = (0..1_000).map(|n| format!("line {n}\r\n\n")).collect();
+        let text = Text::new(text);
+        assert_eq!(text.line_count(), 2_000);
+        assert_eq!(text.lines(130..133), "line 65\n\nline 66");
+        assert_eq!(text.lines(1_998..2_005), "line 999\n");
+        assert_eq!(text.lines(5..5), "");
+
+        /* Ten megabytes of newlines: ten million lines, noted in a few megabytes. */
+        let newlines = Text::new("\n".repeat(10_000_000));
+        assert_eq!(newlines.line_count(), 10_000_000);
+        assert!(newlines.notes.len() * size_of::<usize>() < 2 * 1024 * 1024);
+        assert_eq!(newlines.lines(9_999_998..10_000_000), "\n");
+
+        /* One line of five megabytes: each segment looks only as far as it can reach. */
+        let start = std::time::Instant::now();
+        let long = Text::new("word ".repeat(1_000_000));
+        assert_eq!(
+            long.lines(0..long.line_count()).len(),
+            5_000_000 + long.line_count() - 1
+        );
+        assert!(start.elapsed().as_secs_f64() < 2.0, "{:?}", start.elapsed());
     }
 }

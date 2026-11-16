@@ -54,12 +54,19 @@
 
 // Full calls (E): every call open; the choice is the app's, kept for the next session. The row at the top stays at the top.
 {"cmd": "key", "keystroke": "]"}
-{"cmd": "settle", "expect": {"pointer": "/reader/top_name", "equals": "reply main/12"}}
+{"cmd": "settle", "expect": [{"pointer": "/reader/top_name", "equals": "reply main/12"}, {"pointer": "/reader/top_offset", "equals": 184}]}
 {"cmd": "key", "keystroke": "e"}
-{"cmd": "settle", "expect": [{"pointer": "/reader/full_calls", "equals": true}, {"pointer": "/reader/open_calls", "equals": 17}, {"pointer": "/reader/top_name", "equals": "reply main/12"}]}
+{"cmd": "settle", "expect": [{"pointer": "/reader/full_calls", "equals": true}, {"pointer": "/reader/open_calls", "equals": 17}, {"pointer": "/reader/top_name", "equals": "reply main/12"}, {"pointer": "/reader/top_offset", "equals": 184}]}
 {"cmd": "key", "keystroke": "home"}
 {"cmd": "settle"}
 {"cmd": "screenshot", "name": "full-calls-1440-dark"}
+// Back to Activity with the top of the column inside a body: the call it was under takes the top.
+{"cmd": "scroll", "target": "reader/column", "dy": -760}
+{"cmd": "settle", "expect": {"pointer": "/reader/top_name", "equals": "body main/3"}}
+{"cmd": "key", "keystroke": "e"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/full_calls", "equals": false}, {"pointer": "/reader/top_name", "equals": "call main/3"}, {"pointer": "/reader/top_offset", "equals": 0}]}
+{"cmd": "key", "keystroke": "e"}
+{"cmd": "settle", "expect": {"pointer": "/reader/full_calls", "equals": true}}
 {"cmd": "key", "keystroke": "end"}
 {"cmd": "settle"}
 {"cmd": "screenshot", "name": "full-calls-end-1440-dark"}
@@ -106,19 +113,23 @@
 {"cmd": "key", "keystroke": "j"}
 {"cmd": "settle", "expect": [{"pointer": "/reader/place", "equals": [4, 5]}, {"pointer": "/reader/state", "equals": "open"}]}
 {"cmd": "screenshot", "name": "hostile-top-1440-dark"}
+// Ctrl C on a reply copies what the transcript holds, not what sanitising made of it.
+{"cmd": "click", "target": "reader/reply/main/6"}
+{"cmd": "key", "keystroke": "secondary-c"}
+{"cmd": "settle", "expect": {"pointer": "/system/last_copied", "equals": "Copied as written: <b>bold</b> at https://example.com/x and \u202etxt.exe"}}
 {"cmd": "scroll", "target": "reader/column", "dy": -900}
 {"cmd": "settle"}
 {"cmd": "screenshot", "name": "hostile-deep-1440-dark"}
-// A link of each scheme: only http and https are opened.
+// A link of each scheme: only http and https are opened (after the address in the reply copied above, whose click landed on it).
 {"cmd": "key", "keystroke": "end"}
 {"cmd": "settle"}
-{"cmd": "click", "target": "reader/reply/main/10"}
 {"cmd": "click", "target": "reader/reply/main/11"}
 {"cmd": "click", "target": "reader/reply/main/12"}
 {"cmd": "click", "target": "reader/reply/main/13"}
 {"cmd": "click", "target": "reader/reply/main/14"}
 {"cmd": "click", "target": "reader/reply/main/15"}
-{"cmd": "settle", "expect": {"pointer": "/system/opened", "equals": ["http://example.com/plain", "https://example.com/secure"]}}
+{"cmd": "click", "target": "reader/reply/main/16"}
+{"cmd": "settle", "expect": {"pointer": "/system/opened", "equals": ["https://example.com/x", "http://example.com/plain", "https://example.com/secure"]}}
 {"cmd": "key", "keystroke": "e"}
 {"cmd": "settle", "expect": {"pointer": "/reader/full_calls", "equals": true}}
 {"cmd": "key", "keystroke": "end"}
