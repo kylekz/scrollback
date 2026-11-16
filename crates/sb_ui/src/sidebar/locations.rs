@@ -10,7 +10,7 @@ use gpui::{
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div,
     prelude::FluentBuilder as _, px, relative,
 };
-use sb_core::location::{Location, LocationKind};
+use sb_core::location::{Location, LocationId, LocationKind};
 
 use super::{NO_LOCATIONS, NONE_SYNCED, Sidebar, SidebarEvent, note};
 use crate::automation::AutomationTargetExt as _;
@@ -66,7 +66,7 @@ impl Sidebar {
     /// The locations' rows, or "None yet" (DESIGN §4.10).
     pub(super) fn render_locations(
         &self,
-        cursor: Option<usize>,
+        cursor: Option<&LocationId>,
         theme: &SbTheme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -93,10 +93,11 @@ impl Sidebar {
             // Many locations scroll in their own part of the sidebar.
             .max_h(relative(0.4))
             .overflow_y_scroll()
+            .track_scroll(&self.location_scroll)
             .flex()
             .flex_col()
             .gap(px(2.))
-            .children(locations.iter().enumerate().map(|(at, location)| {
+            .children(locations.iter().map(|location| {
                 let id = location.id.clone();
                 let stale = stale(
                     location.last_success,
@@ -108,7 +109,7 @@ impl Sidebar {
                     location,
                     sync.status(location),
                     sync.indexing(Some(&location.id)),
-                    (now, stale, cursor == Some(at)),
+                    (now, stale, cursor == Some(&location.id)),
                     theme,
                     cx.listener(move |_, _, _, cx| {
                         cx.emit(SidebarEvent::Locations(Some(id.clone())));
@@ -307,7 +308,7 @@ fn location_row(
             theme,
         ),
         (LocationStatus::Synced(at), None) => resting(
-            row,
+            row.aria_label(format!("{}: synced", location.name)),
             line(
                 format!("{kind} · synced {}", format::ago(at, now)),
                 c.fg3,
@@ -315,11 +316,13 @@ fn location_row(
             ),
         )
         .child(dot(Some(c.green))),
-        (LocationStatus::NeverSynced, None) => {
-            resting(row, line(format!("{kind} · not synced yet"), c.fg3, theme)).child(dot(None))
-        }
+        (LocationStatus::NeverSynced, None) => resting(
+            row.aria_label(format!("{}: not synced yet", location.name)),
+            line(format!("{kind} · not synced yet"), c.fg3, theme),
+        )
+        .child(dot(None)),
         (LocationStatus::Failed(_), None) => resting(
-            row,
+            row.aria_label(format!("{}: last sync failed", location.name)),
             alerted(
                 SbIcon::CircleAlert,
                 format!("{kind} · last sync failed"),
@@ -348,7 +351,7 @@ fn location_row(
             },
             None,
         ) => resting(
-            row,
+            row.aria_label(format!("{}: stopped", location.name)),
             line(
                 format!(
                     "{kind} · stopped · {} left",

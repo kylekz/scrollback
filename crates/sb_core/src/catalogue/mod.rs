@@ -44,12 +44,12 @@ pub(crate) use trash::{ItemFile, Removal};
 pub enum CatalogueError {
     #[error(transparent)]
     Database(#[from] toolbox_store::Error),
-    /// A range was to be recorded as the continuation of a version that is not as long as the
-    /// pass that fetched the range found it. Nothing was recorded.
     /// A host that is not one to hand ssh ([`crate::location::host_problem`]): nothing was
     /// added.
     #[error("{0}")]
     BadHost(String),
+    /// A range was to be recorded as the continuation of a version that is not as long as the
+    /// pass that fetched the range found it. Nothing was recorded.
     #[error("version {version} is no longer {length} bytes long, so nothing is appended to it")]
     VersionMoved { version: i64, length: u64 },
     /// A path that names no directory (an empty one, `/`) would claim every session.

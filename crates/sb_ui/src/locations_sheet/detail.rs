@@ -12,7 +12,7 @@ use gpui::{
 use sb_core::location::{Location, LocationKind};
 
 use super::LocationsSheet;
-use crate::add_location::{field, help_line, test_card};
+use crate::add_location::{field, fixed_field, help_line, test_card};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
@@ -425,7 +425,6 @@ fn failed_note(kind: &LocationKind) -> &'static str {
 /// What connects to the location: an SSH host as typed, which is not edited here; a distro,
 /// whether it runs, and where it mounts the Windows drives (DESIGN §4.11).
 fn connects(location: &Location, sync: &SyncService, theme: &SbTheme) -> Vec<AnyElement> {
-    let c = &theme.colors;
     match &location.kind {
         LocationKind::Local => Vec::new(),
         LocationKind::Ssh { host } => vec![
@@ -434,21 +433,7 @@ fn connects(location: &Location, sync: &SyncService, theme: &SbTheme) -> Vec<Any
                 .flex_col()
                 .gap(theme.spacing.xs)
                 .child(label("Host", theme))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .h(theme.sizes.input_height)
-                        .px(theme.sizes.list_row_padding)
-                        .rounded(theme.radii.input)
-                        .border_1()
-                        .border_color(c.line_subtle)
-                        .bg(c.s1)
-                        .text_color(c.fg2)
-                        .text_spec(&theme.text.path)
-                        .child(host.clone())
-                        .automation_target("sheet/host"),
-                )
+                .child(fixed_field(host.clone(), true, theme).automation_target("sheet/host"))
                 .into_any_element(),
             help_line(theme),
         ],

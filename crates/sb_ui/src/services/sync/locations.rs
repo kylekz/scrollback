@@ -236,21 +236,18 @@ pub fn refusal<'a>(
 }
 
 /**
- * What is wrong with `name` as the name of the location `id` (`None` for a new one) among
- * `locations`, if anything: nothing left of it once what can't be seen is taken out
- * ([`clean_name`]), or the name of another location.
+ * What is wrong with `name` as a location's name, if anything: nothing left of it once what
+ * can't be seen is taken out ([`clean_name`]), or one of the names `taken` by others,
+ * whatever its case.
  */
-pub fn name_problem<'a>(
-    name: &str,
-    id: Option<&LocationId>,
-    mut locations: impl Iterator<Item = &'a Location>,
-) -> Option<String> {
+pub fn name_problem<'a>(name: &str, taken: impl IntoIterator<Item = &'a str>) -> Option<String> {
     let Some(name) = clean_name(name) else {
         return Some("A location needs a name.".to_string());
     };
-    locations
-        .find(|it| Some(&it.id) != id && it.name.eq_ignore_ascii_case(&name))
-        .map(|it| format!("{} is another location's name.", it.name))
+    taken
+        .into_iter()
+        .find(|it| it.eq_ignore_ascii_case(&name))
+        .map(|it| format!("{it} is another location's name."))
 }
 
 impl SyncService {
@@ -301,7 +298,29 @@ impl SyncService {
 
     /// Whether the place `kind` is being added.
     pub fn is_adding(&self, kind: &LocationKind) -> bool {
-        self.adding.iter().any(|it| it.same_place(kind))
+        self.adding.iter().any(|(it, _)| it.same_place(kind))
+    }
+
+    /// The names the locations have, but the location `except`, and those of adds under way.
+    pub fn names_taken(&self, except: Option<&LocationId>) -> impl Iterator<Item = &str> {
+        self.locations
+            .iter()
+            .flatten()
+            .filter(move |location| Some(&location.id) != except)
+            .map(|location| location.name.as_str())
+            .chain(self.adding.iter().map(|(_, name)| name.as_str()))
+    }
+
+    /**
+     * The removed location that is the place `kind`, if one is, and whether the name it had
+     * is another's now: then it comes back under a new one.
+     */
+    pub fn restoring(&self, kind: &LocationKind) -> Option<(&Location, bool)> {
+        let location = refusal(kind, self.removed.iter())?;
+        Some((
+            location,
+            name_problem(&location.name, self.names_taken(None)).is_some(),
+        ))
     }
 
     /// Reads what the archive holds from each location again.
@@ -322,8 +341,9 @@ impl SyncService {
     /**
      * Adds the place `kind` as a location named `name`, and with `sync_now` starts its first
      * sync. A place that is a location already, or is being added, is not added again, nor
-     * is a name another location has; one the owner removed comes back under the name it had
-     * (module docs). The locations are then as the catalogue orders them.
+     * is a name another location or an add under way has. One the owner removed comes back
+     * under the name it had (module docs), or under `name` when another has taken that
+     * since. The locations are then as the catalogue orders them.
      */
     pub fn add(
         &mut self,
@@ -338,16 +358,18 @@ impl SyncService {
         if self.is_adding(&kind) || refusal(&kind, self.locations.iter().flatten()).is_some() {
             return;
         }
-        let restored = refusal(&kind, self.removed.iter()).is_some();
-        if !restored
-            && let Some(problem) = name_problem(&name, None, self.locations.iter().flatten())
-        {
-            self.refused = Some(problem);
-            cx.notify();
-            return;
-        }
-        let name = clean_name(&name).unwrap_or(name);
-        self.adding.push(kind.clone());
+        let name = match self.restoring(&kind) {
+            Some((location, false)) => location.name.clone(),
+            _ => {
+                if let Some(problem) = name_problem(&name, self.names_taken(None)) {
+                    self.refused = Some(problem);
+                    cx.notify();
+                    return;
+                }
+                clean_name(&name).unwrap_or(name)
+            }
+        };
+        self.adding.push((kind.clone(), name.clone()));
         self.run(
             cx,
             {
@@ -358,7 +380,7 @@ impl SyncService {
                     let added = match place {
                         Some(location) if location.removed.is_none() => Err(location.name),
                         Some(location) => {
-                            catalogue.restore_location(&location.id, &location.name)?;
+                            catalogue.restore_location(&location.id, &name)?;
                             Ok(location.id)
                         }
                         None => Ok(catalogue.add_location(kind, &name)?.id),
@@ -371,7 +393,7 @@ impl SyncService {
                 }
             },
             move |this, added, cx| {
-                this.adding.retain(|it| !it.same_place(&kind));
+                this.adding.retain(|(it, _)| !it.same_place(&kind));
                 match added {
                     Ok((Ok(id), locations, details)) => {
                         this.take_locations(locations, Some(&id));
@@ -437,7 +459,7 @@ impl SyncService {
         name: &str,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        if let Some(problem) = name_problem(name, Some(id), self.locations.iter().flatten()) {
+        if let Some(problem) = name_problem(name, self.names_taken(Some(id))) {
             return Err(problem);
         }
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
@@ -509,6 +531,7 @@ impl SyncService {
                             this.removed.push(location);
                         }
                         this.errors.remove(&id);
+                        this.stopped.remove(&id);
                         this.read_details(cx);
                     }
                     Err(error) => {

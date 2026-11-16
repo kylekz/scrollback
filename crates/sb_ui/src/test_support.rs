@@ -5,6 +5,7 @@
 //! sync, its index and the library's load through to the end.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
     AppContext as _, Bounds, Entity, Global, Pixels, Size, TestAppContext, VisualTestContext, px,
@@ -14,7 +15,7 @@ use gpui_appearance::{MaterialSupport, Mode};
 use gpui_component::Root;
 use sb_core::CancelToken;
 use sb_core::location::LocationKind;
-use sb_core::transport::Transport;
+use sb_core::transport::{Probe, Transport};
 use sb_test_support::{Outline, ProjectsTree};
 use tempfile::TempDir;
 
@@ -142,6 +143,40 @@ pub fn init_reaching(
         cx.set_global(Scratch { archive, machine });
     });
     cx.run_until_parked();
+}
+
+/// What a shell that answered with every tool says to the connection test.
+pub fn answered() -> Probe {
+    Probe {
+        home: "/home/user".to_string(),
+        clock_ns: 0,
+        clock_ahead_ns: 0,
+        missing: Vec::new(),
+        whole_seconds: false,
+        shell: "/bin/sh".to_string(),
+        login_shell: None,
+        drive_mount: None,
+        took: Duration::from_millis(1),
+    }
+}
+
+/**
+ * [`init`] where every other place is [`machine`]'s tree again and every connection test
+ * passes ([`answered`]); WSL has no distros. Nothing real is reached.
+ */
+pub fn init_answering(cx: &mut TestAppContext) {
+    init_reaching(
+        tempfile::tempdir().expect("a scratch folder"),
+        machine(),
+        Reach {
+            connect: Arc::new(|_, _| Box::new(machine().transport())),
+            tester: Arc::new(|_, _| Ok(answered())),
+            distros: Arc::new(|_| Ok(None)),
+            launcher: Arc::new(LocationKind::launcher),
+            development_home: None,
+        },
+        cx,
+    );
 }
 
 /// Has the agent on this machine write another session, for the next sync to find.

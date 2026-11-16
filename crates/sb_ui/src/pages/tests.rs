@@ -480,3 +480,26 @@ fn picking_a_row_closes_a_narrow_windows_sidebar(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("f6");
     assert_eq!(placement(cx), SidebarPlacement::Collapsed);
 }
+
+#[gpui::test]
+fn the_arrows_row_goes_with_a_location_that_is_removed(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    let sync = cx.update(|_, cx| cx.services().sync.clone());
+    let distro = sb_core::location::LocationKind::Wsl {
+        distro: "Ubuntu-24.04".to_string(),
+    };
+    sync.update(cx, |sync, cx| {
+        sync.add(distro, "Ubuntu-24.04".to_string(), false, cx)
+    });
+    cx.run_until_parked();
+    // Past Unsorted, the last page's row, to this machine's row.
+    cx.simulate_keystrokes("f6 down down down");
+    let here = sync.read_with(cx, |sync, _| sync.locations().unwrap()[0].id.clone());
+    sync.update(cx, |sync, cx| sync.remove(&here, cx));
+    cx.run_until_parked();
+    // Its row is gone, and the arrows' with it: Enter doesn't open the next location.
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| shell.read(cx).locations_sheet().is_none()));
+    assert!(main_focused(&shell, cx));
+}

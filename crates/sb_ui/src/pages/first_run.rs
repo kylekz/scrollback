@@ -277,7 +277,12 @@ impl FirstRun {
     /// Opens the add dialog's SSH step: a host chosen there joins the list, checked.
     fn add_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let back = window.focused(cx);
-        let taken = self.hosts.iter().map(|host| host.kind.clone()).collect();
+        // Every row's place and name, checked or not: a row can be checked again later.
+        let taken = self
+            .offered(cx)
+            .into_iter()
+            .map(|offered| (offered.kind, offered.name))
+            .collect();
         let dialog =
             cx.new(|cx| AddLocation::new(Purpose::Choose, Kind::Ssh, None, taken, window, cx));
         let heard = cx.subscribe_in(&dialog, window, |this, _, event, window, cx| {
@@ -317,8 +322,10 @@ impl FirstRun {
         };
         let kind = offered.kind.clone();
         tab_stop(
+            /* Named for its place: the found rows and the hosts are counted apart, and two
+            rows of one name would share their focus. */
             div()
-                .id(SharedString::from(format!("first-run-row-{at}")))
+                .id(SharedString::from(target.clone()))
                 .role(Role::CheckBox)
                 .flex()
                 .items_center()
@@ -474,15 +481,18 @@ impl Render for FirstRun {
             development_notice(home, &theme).automation_target("first-run/development")
         });
         let dialog = self.dialog.as_ref().map(|(dialog, ..)| {
-            let this = cx.entity().downgrade();
+            let (this, holding) = (cx.entity().downgrade(), dialog.clone());
             overlay::modal(
                 dialog.clone(),
                 Layer::Dialog,
                 window,
                 &theme,
+                // As over the sheet: a press beside it leaves a dialog that holds input.
                 move |window, cx| {
-                    this.update(cx, |this, cx| this.close_dialog(window, cx))
-                        .ok();
+                    if !holding.read(cx).holds_input(cx) {
+                        this.update(cx, |this, cx| this.close_dialog(window, cx))
+                            .ok();
+                    }
                 },
             )
         });
@@ -622,9 +632,69 @@ impl Render for FirstRun {
 
 #[cfg(test)]
 mod tests {
+    use gpui::{KeyUpEvent, Keystroke, TestAppContext, VisualTestContext, px, size};
+    use gpui_component::Root;
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::test_support::{init, machine};
+
+    /// Presses and releases `key`: a row with the keyboard is clicked on the release.
+    fn press(cx: &mut VisualTestContext, key: &'static str) {
+        cx.simulate_keystrokes(key);
+        cx.simulate_event(KeyUpEvent {
+            keystroke: Keystroke::parse(key).unwrap(),
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn each_row_has_its_own_focus_and_space_checks_only_it(cx: &mut TestAppContext) {
+        init(machine(), cx);
+        let mut first_run = None;
+        let window = cx.open_window(size(px(1440.), px(900.)), |window, cx| {
+            let view = cx.new(FirstRun::new);
+            first_run = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let first_run = first_run.expect("the window built the first run");
+        let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+        // This machine is the first found row and the host the first host row.
+        let host = LocationKind::Ssh {
+            host: "user@macbook".to_string(),
+        };
+        first_run.update(cx, |first_run, cx| {
+            first_run.hosts.push(Host {
+                kind: host.clone(),
+                name: "user@macbook".to_string(),
+                said: "3 sessions".to_string(),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let checked = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                first_run
+                    .read(cx)
+                    .checked(cx)
+                    .into_iter()
+                    .map(|(kind, _)| kind)
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(checked(cx), [LocationKind::Local, host.clone()]);
+
+        // The second stop is the host's row: Space there leaves this machine checked.
+        cx.update(|window, cx| {
+            window.focus_next(cx);
+            window.focus_next(cx);
+        });
+        press(cx, "space");
+        assert_eq!(checked(cx), [LocationKind::Local]);
+        cx.update(|window, cx| window.focus_prev(cx));
+        press(cx, "space");
+        assert_eq!(checked(cx), Vec::<LocationKind>::new());
+    }
 
     #[test]
     fn the_copy_names_an_agent_only_from_its_provider() {

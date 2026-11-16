@@ -5,15 +5,19 @@
 //! - **WSL distro:** the distros WSL lists, never starting one (PLAN §6.3); those that are
 //!   locations already can't be chosen. A running distro is tested as it is chosen; a
 //!   stopped one is added without a test, as it is, and its first sync starts it.
-//! - **SSH host:** the host exactly as the owner gives it to `ssh` (PLAN §6.4), checked only
-//!   for what `ssh` can't take. It is tested on Test, on `Enter`, and 600 ms after typing
-//!   stops; a new value cancels the test under way. A host that fails can still be added
-//!   when nothing needs the owner's hand first ([`TestFailure::may_add_anyway`]); one whose
-//!   key isn't accepted can't, and nothing here offers to accept it.
+//! - **SSH host:** the host as the owner gives it to `ssh` (PLAN §6.4): a `~/.ssh/config`
+//!   alias, a host, or `user@host`, held to the strict characters of
+//!   [`sb_core::location::host_problem`], whose sentence the field shows. It is tested on
+//!   Test, on `Enter`, and 600 ms after typing stops; a new value cancels the test under
+//!   way. A host that fails can still be added when nothing needs the owner's hand first
+//!   ([`TestFailure::may_add_anyway`]); one whose key isn't accepted can't, and nothing here
+//!   offers to accept it.
 //! - **This machine:** what its providers find, and add.
 //!
-//! The name is the place's until the owner types one. A place that is a location already is
-//! refused. **Add and sync now** adds and starts the first sync; **Add** only adds. In the
+//! The name is the place's until the owner types one, and no other location, add under way or
+//! place the first run chose may have it. A place that is a location already is refused. One
+//! the owner removed comes back under the name it had, shown and not typed, unless another
+//! has that name now: then it needs a new one. **Add and sync now** adds and starts the first sync; **Add** only adds. In the
 //! first run the dialog adds nothing itself: what was chosen joins the first run's list.
 //!
 //! Keyboard: `Esc` closes it, cancelling its test; `Enter` tests the host while the host field
@@ -101,7 +105,7 @@ pub struct AddLocation {
     /// The owner typed a name: the place's own is no longer put in.
     named: bool,
     /// Places the first run has chosen already, which are not chosen twice.
-    taken: Vec<LocationKind>,
+    taken: Vec<(LocationKind, String)>,
     focus_handle: FocusHandle,
     _typing: Option<Task<()>>,
     _subscriptions: [Subscription; 3],
@@ -121,7 +125,7 @@ impl AddLocation {
         purpose: Purpose,
         kind: Kind,
         distro: Option<String>,
-        taken: Vec<LocationKind>,
+        taken: Vec<(LocationKind, String)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -250,7 +254,7 @@ impl AddLocation {
             .or_else(|| {
                 self.taken
                     .iter()
-                    .any(|it| it.same_place(place))
+                    .any(|(it, _)| it.same_place(place))
                     .then(|| "in the list already".to_string())
             })
     }
@@ -269,12 +273,15 @@ impl AddLocation {
             )
     }
 
-    /// Why the name typed can't be taken, if it can't (another location has it).
+    /**
+     * Why the name typed can't be taken, if it can't: another location has it, an add under
+     * way, or another place the first run has chosen.
+     */
     fn name_problem(&self, cx: &App) -> Option<String> {
         let place = self.place(cx)?;
         let sync = self.sync.read(cx);
-        // A removed location comes back under the name it had.
-        if refusal(&place, sync.removed().iter()).is_some() {
+        // A removed location comes back under the name it had, if that is still its own.
+        if let Some((_, false)) = sync.restoring(&place) {
             return None;
         }
         let typed = self.name.read(cx).value().to_string();
@@ -283,7 +290,12 @@ impl AddLocation {
         } else {
             typed
         };
-        name_problem(&typed, None, sync.locations().unwrap_or_default().iter())
+        let chosen = self
+            .taken
+            .iter()
+            .filter(|(kind, _)| !kind.same_place(&place))
+            .map(|(_, name)| name.as_str());
+        name_problem(&typed, sync.names_taken(None).chain(chosen))
     }
 
     fn test_host(&mut self, cx: &mut Context<Self>) {
@@ -787,19 +799,23 @@ impl AddLocation {
         let c = &theme.colors;
         let problem = self.name_problem(cx);
         let sync = self.sync.read(cx);
-        let restored = self
+        let restoring = self
             .place(cx)
-            .and_then(|place| refusal(&place, sync.removed().iter()).cloned());
+            .and_then(|place| sync.restoring(&place))
+            .map(|(location, renamed)| (location.clone(), renamed));
         let mut step = vec![
             div()
                 .flex()
                 .flex_col()
                 .gap(theme.spacing.xs)
                 .child(label("Name", theme))
-                .child(
-                    field(&self.name, false, problem.is_some(), window, theme, cx)
+                // A location that comes back under its own name has nothing to type.
+                .child(match &restoring {
+                    Some((location, false)) => fixed_field(location.name.clone(), false, theme)
+                        .automation_target("add/name-kept"),
+                    _ => field(&self.name, false, problem.is_some(), window, theme, cx)
                         .automation_target("add/name"),
-                )
+                })
                 .children(problem.map(|problem| {
                     div()
                         .text_color(c.red)
@@ -809,21 +825,30 @@ impl AddLocation {
                 }))
                 .into_any_element(),
         ];
-        if let Some(location) = restored {
-            /* A location removed before comes back as it was: its name, and what was archived
-            from it, so its next sync copies only what is new. */
-            let held = sync.details().sessions(&location.id);
+        if let Some((location, renamed)) = restoring {
+            /* A location removed before comes back as it was: its name, unless another has
+            taken it since, and what was archived from it, so its next sync copies only what
+            is new. */
+            let held = format::plural(sync.details().sessions(&location.id), "session");
+            let name = &location.name;
             step.push(
                 div()
                     .text_color(c.fg3)
                     .text_spec(&theme.text.secondary)
-                    .child(format!(
-                        "This was the location {}, removed earlier. It comes back under that \
-                         name with the {} the archive still holds from it; its next sync copies \
-                         only what is new.",
-                        location.name,
-                        format::plural(held, "session")
-                    ))
+                    .child(if renamed {
+                        format!(
+                            "This was the location {name}, removed earlier. Another location is \
+                             called that now, so it comes back under the name above, with the \
+                             {held} the archive still holds from it; its next sync copies only \
+                             what is new."
+                        )
+                    } else {
+                        format!(
+                            "This was the location {name}, removed earlier. It comes back under \
+                             that name with the {held} the archive still holds from it; its next \
+                             sync copies only what is new."
+                        )
+                    })
                     .into_any_element(),
             );
         } else if let Some(TestState::Passed { found, .. }) = self.test(cx).map(|test| &test.state)
@@ -864,6 +889,7 @@ impl AddLocation {
             .child(div().flex_1())
             .child(
                 button("add-cancel", ButtonKind::Plain, false, true, theme)
+                    .debug_selector(|| "add-cancel".into())
                     .on_click(cx.listener(|this, _, window, cx| this.close(&Close, window, cx)))
                     .child("Cancel")
                     .automation_target("add/cancel"),
@@ -1041,6 +1067,29 @@ pub(crate) fn help_line(theme: &SbTheme) -> AnyElement {
 
 /// A text field (`.inp`: 30 high, radius 7, `s1` with a `line` border; `accent` with the
 /// keyboard, `red` when what it holds is wrong), in the code font with `mono`.
+/// A field's box around a value that can't be changed here, `mono` in the code font.
+pub(crate) fn fixed_field(value: String, mono: bool, theme: &SbTheme) -> Div {
+    let c = &theme.colors;
+    div()
+        .flex()
+        .items_center()
+        .h(theme.sizes.input_height)
+        .px(theme.sizes.list_row_padding)
+        .rounded(theme.radii.input)
+        .border_1()
+        .border_color(c.line_subtle)
+        .bg(c.s1)
+        .text_color(c.fg2)
+        .map(|this| {
+            if mono {
+                this.text_spec(&theme.text.path)
+            } else {
+                this.text_spec(&theme.text.body)
+            }
+        })
+        .child(value)
+}
+
 pub(crate) fn field(
     input: &Entity<InputState>,
     mono: bool,
@@ -1462,16 +1511,12 @@ pub(crate) fn test_card(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use gpui::{TestAppContext, VisualTestContext, px, size};
     use gpui_component::Root;
     use pretty_assertions::assert_eq;
-    use sb_core::transport::Probe;
 
     use super::*;
-    use crate::services::Reach;
-    use crate::test_support::{init_reaching, machine};
+    use crate::test_support::init_answering;
 
     fn host(name: &str) -> LocationKind {
         LocationKind::Ssh {
@@ -1481,30 +1526,7 @@ mod tests {
 
     #[gpui::test]
     fn add_waits_for_a_test_of_the_host_shown_and_a_name_of_its_own(cx: &mut TestAppContext) {
-        init_reaching(
-            tempfile::tempdir().expect("a scratch folder"),
-            machine(),
-            Reach {
-                connect: Arc::new(|_, _| Box::new(machine().transport())),
-                tester: Arc::new(|_, _| {
-                    Ok(Probe {
-                        home: "/home/user".to_string(),
-                        clock_ns: 0,
-                        clock_ahead_ns: 0,
-                        missing: Vec::new(),
-                        whole_seconds: false,
-                        shell: "/bin/sh".to_string(),
-                        login_shell: None,
-                        drive_mount: None,
-                        took: Duration::from_millis(1),
-                    })
-                }),
-                distros: Arc::new(|_| Ok(None)),
-                launcher: Arc::new(LocationKind::launcher),
-                development_home: None,
-            },
-            cx,
-        );
+        init_answering(cx);
         let mut dialog = None;
         let window = cx.open_window(size(px(1440.), px(900.)), |window, cx| {
             let view = cx

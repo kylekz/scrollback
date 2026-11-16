@@ -5,6 +5,7 @@
 //! reached and neither `wsl.exe` nor `ssh` runs.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{Entity, TestAppContext};
 use pretty_assertions::assert_eq;
@@ -14,6 +15,7 @@ use sb_core::transport::wsl::Distro;
 use sb_core::transport::{Launcher, Probe, TransportError};
 use sb_test_support::{Outline, ProjectsTree};
 
+use super::location_tests::Asleep;
 use super::sync::{TestFailure, TestState};
 use super::*;
 use crate::test_support::{SESSIONS, init_reaching, machine};
@@ -537,15 +539,14 @@ fn the_development_override_is_what_a_test_runs_and_shows(cx: &mut TestAppContex
 
 #[gpui::test]
 fn a_test_replaced_by_another_never_shows_its_answer_under_the_new_place(cx: &mut TestAppContext) {
+    /* The first host's test fails, whatever its cancel says: a cancelled pass is dropped
+    before it is answered, a failure only by the guard where the answer lands. */
     let sync = init(
-        |launcher| {
-            let Launcher::Ssh { host } = launcher else {
-                panic!("only hosts here");
-            };
-            Ok(Probe {
-                home: format!("/{host}"),
-                ..answered()
-            })
+        |launcher| match launcher {
+            Launcher::Ssh { host } if host == "first" => {
+                Err(TransportError::Unreachable("asleep".to_string()))
+            }
+            _ => Ok(answered()),
         },
         cx,
     );
@@ -566,9 +567,11 @@ fn a_test_replaced_by_another_never_shows_its_answer_under_the_new_place(cx: &mu
         sync.read_with(cx, |sync, _| {
             let test = sync.test().unwrap();
             assert_eq!(test.kind, second);
-            if let TestState::Passed { probe, .. } = &test.state {
-                assert_eq!(probe.as_ref().map(|it| it.home.as_str()), Some("/second"));
-            }
+            assert!(
+                !matches!(test.state, TestState::Failed(_)),
+                "{:?}",
+                test.state
+            );
         });
     }
     cx.run_until_parked();
@@ -649,9 +652,11 @@ fn a_rename_that_lands_after_a_removal_renames_the_removed_location(cx: &mut Tes
     });
 }
 
-#[gpui::test]
-fn a_stopped_pass_says_what_it_left_until_one_completes(cx: &mut TestAppContext) {
-    // More files than one batch holds, so that stopping after the first leaves some.
+/**
+ * The services with a distro of more sessions than one batch holds, so that a pass stopped
+ * after its first batch leaves some; it is asleep while `asleep` is set.
+ */
+fn init_many(asleep: Arc<AtomicBool>, cx: &mut TestAppContext) -> Entity<SyncService> {
     let mut big = ProjectsTree::new();
     for at in 0..300 {
         big.outlined(&Outline {
@@ -667,7 +672,13 @@ fn a_stopped_pass_says_what_it_left_until_one_completes(cx: &mut TestAppContext)
         tempfile::tempdir().unwrap(),
         machine(),
         Reach {
-            connect: Arc::new(move |_, _| Box::new(big.transport())),
+            connect: Arc::new(move |_, _| {
+                if asleep.load(Ordering::SeqCst) {
+                    Box::new(Asleep)
+                } else {
+                    Box::new(big.transport())
+                }
+            }),
             tester: Arc::new(|_, _| Ok(answered())),
             distros: Arc::new(|_| Ok(None)),
             launcher: Arc::new(LocationKind::launcher),
@@ -675,16 +686,27 @@ fn a_stopped_pass_says_what_it_left_until_one_completes(cx: &mut TestAppContext)
         },
         cx,
     );
-    let sync = cx.update(|cx| cx.services().sync.clone());
+    cx.update(|cx| cx.services().sync.clone())
+}
+
+/// Adds the distro, its first sync stopped after one batch, and returns it.
+fn add_stopped(sync: &Entity<SyncService>, cx: &mut TestAppContext) -> Location {
     sync.update(cx, |sync, _| sync.hold_after(1, super::sync::Held::Stop));
-    add(&sync, ubuntu(), "Ubuntu-24.04", true, cx);
-    let distro = locations(&sync, cx)[0].clone();
+    add(sync, ubuntu(), "Ubuntu-24.04", true, cx);
+    let distro = locations(sync, cx)[0].clone();
     let LocationStatus::Stopped { items_left, .. } =
         sync.read_with(cx, |sync, _| sync.status(&distro))
     else {
         panic!("the stopped pass says so");
     };
     assert!(items_left > 0);
+    distro
+}
+
+#[gpui::test]
+fn a_stopped_pass_says_what_it_left_until_one_completes(cx: &mut TestAppContext) {
+    let sync = init_many(Arc::default(), cx);
+    let distro = add_stopped(&sync, cx);
     sync.update(cx, |sync, cx| sync.sync(&distro.id, cx));
     cx.run_until_parked();
     let distro = locations(&sync, cx)[0].clone();
@@ -692,4 +714,78 @@ fn a_stopped_pass_says_what_it_left_until_one_completes(cx: &mut TestAppContext)
         sync.read_with(cx, |sync, _| sync.status(&distro)),
         LocationStatus::Synced(_)
     ));
+}
+
+#[gpui::test]
+fn a_pass_after_a_stop_that_cant_reach_the_place_says_so(cx: &mut TestAppContext) {
+    let asleep = Arc::new(AtomicBool::new(false));
+    let sync = init_many(asleep.clone(), cx);
+    let distro = add_stopped(&sync, cx);
+    asleep.store(true, Ordering::SeqCst);
+    sync.update(cx, |sync, cx| sync.sync(&distro.id, cx));
+    cx.run_until_parked();
+    let distro = locations(&sync, cx)[0].clone();
+    assert!(matches!(
+        sync.read_with(cx, |sync, _| sync.status(&distro)),
+        LocationStatus::Unreachable { .. }
+    ));
+}
+
+#[gpui::test]
+fn a_stopped_location_removed_and_added_again_is_not_stopped(cx: &mut TestAppContext) {
+    let asleep = Arc::new(AtomicBool::new(false));
+    let sync = init_many(asleep.clone(), cx);
+    let distro = add_stopped(&sync, cx);
+    sync.update(cx, |sync, cx| sync.remove(&distro.id, cx));
+    cx.run_until_parked();
+    // Back without a sync: what the stopped pass stored is its last word, and no stop is.
+    add(&sync, ubuntu(), "Ubuntu-24.04", false, cx);
+    let distro = locations(&sync, cx)[0].clone();
+    assert!(!matches!(
+        sync.read_with(cx, |sync, _| sync.status(&distro)),
+        LocationStatus::Stopped { .. }
+    ));
+}
+
+fn host(name: &str) -> LocationKind {
+    LocationKind::Ssh {
+        host: name.to_string(),
+    }
+}
+
+#[gpui::test]
+fn a_location_added_again_whose_name_is_taken_needs_a_new_one(cx: &mut TestAppContext) {
+    let sync = init(|_| Ok(answered()), cx);
+    add(&sync, host("user@a"), "Work Mac", false, cx);
+    let a = locations(&sync, cx)[0].id.clone();
+    sync.update(cx, |sync, cx| sync.remove(&a, cx));
+    cx.run_until_parked();
+    add(&sync, host("user@b"), "Work Mac", false, cx);
+    sync.read_with(cx, |sync, _| {
+        let renamed = sync.restoring(&host("user@a")).map(|(_, renamed)| renamed);
+        assert_eq!(renamed, Some(true));
+    });
+
+    // Its old name is another's now: that is refused, and it comes back under a new one.
+    add(&sync, host("user@a"), "work mac", false, cx);
+    sync.read_with(cx, |sync, _| {
+        assert_eq!(sync.refused(), Some("Work Mac is another location's name."));
+    });
+    add(&sync, host("user@a"), "Old Mac", false, cx);
+    let names: Vec<String> = locations(&sync, cx).into_iter().map(|it| it.name).collect();
+    assert_eq!(names, ["Old Mac", "Work Mac"]);
+}
+
+#[gpui::test]
+fn two_adds_under_way_cant_share_a_name(cx: &mut TestAppContext) {
+    let sync = init(|_| Ok(answered()), cx);
+    sync.update(cx, |sync, cx| {
+        sync.add(host("user@a"), "Work Mac".to_string(), false, cx);
+        sync.add(host("user@b"), "WORK MAC".to_string(), false, cx);
+    });
+    cx.run_until_parked();
+    sync.read_with(cx, |sync, _| {
+        assert_eq!(sync.refused(), Some("Work Mac is another location's name."));
+    });
+    assert_eq!(locations(&sync, cx).len(), 1);
 }

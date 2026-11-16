@@ -333,7 +333,7 @@ pub struct SyncService {
     /// What the pass the owner stopped left to copy, files and bytes, until a pass completes.
     stopped: HashMap<LocationId, (usize, u64)>,
     /// The places being added as locations.
-    adding: Vec<LocationKind>,
+    adding: Vec<(LocationKind, String)>,
     /// The locations to remove once their pass has stopped.
     removing: HashSet<LocationId>,
     /// Why the last of the owner's changes to the locations could not be made.
@@ -652,20 +652,19 @@ impl SyncService {
                         Ok(None) => {}
                         Err(error) => log::error!("a location could not be read: {error}"),
                     }
-                    let (mut changed, mut whole, mut stopped) = (false, true, false);
+                    /* A stop is said until the next pass ends some other way: then that
+                    pass's word stands, a failure or not reaching it among them. */
+                    this.stopped.remove(&id);
+                    let (mut changed, mut whole) = (false, true);
                     match synced {
                         Ok(passes) => {
                             this.errors.remove(&id);
-                            if passes.iter().all(|pass| pass.outcome.is_ok()) {
-                                this.stopped.remove(&id);
-                            }
                             for pass in passes {
                                 match pass.outcome {
                                     Ok(report) => {
                                         changed |=
                                             report.unchanged < report.scanned || report.gone > 0;
                                     }
-                                    Err(SyncError::Cancelled) => stopped = true,
                                     // A normal state (the module docs), on the location's row.
                                     Err(SyncError::Unreachable(reason)) => {
                                         log::info!("{id} could not be reached: {reason}");
@@ -678,26 +677,24 @@ impl SyncService {
                                 changed |= this.indexed(pass.index);
                             }
                         }
+                        /* A stop before the plan was made left nothing that can be counted:
+                        the location is as it was before the pass. */
                         Err(SyncError::Cancelled) => {
                             this.errors.remove(&id);
-                            stopped = true;
+                            let left = *stopped_at.lock().unwrap_or_else(PoisonError::into_inner);
+                            let items_left = left.items.saturating_sub(left.items_done);
+                            if left.planned && items_left > 0 {
+                                this.stopped.insert(
+                                    id.clone(),
+                                    (items_left, left.bytes.saturating_sub(left.bytes_done)),
+                                );
+                            }
                             whole = false;
                         }
                         Err(error) => {
                             log::error!("a sync stopped: {error}");
                             this.errors.insert(id.clone(), error.to_string());
                             whole = false;
-                        }
-                    }
-                    // A stopped pass says what it left, until a pass completes.
-                    if stopped {
-                        let left = *stopped_at.lock().unwrap_or_else(PoisonError::into_inner);
-                        let items_left = left.items.saturating_sub(left.items_done);
-                        if left.planned && items_left > 0 {
-                            this.stopped.insert(
-                                id.clone(),
-                                (items_left, left.bytes.saturating_sub(left.bytes_done)),
-                            );
                         }
                     }
                     if !whole {

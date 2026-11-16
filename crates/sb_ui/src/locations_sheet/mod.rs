@@ -15,6 +15,8 @@
 //! running pass before it removes the location; what was archived from it stays.
 
 mod detail;
+#[cfg(test)]
+mod sheet_tests;
 
 use std::time::Duration;
 

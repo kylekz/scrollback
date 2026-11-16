@@ -117,6 +117,19 @@
 {"cmd": "query", "prefix": "sheet/stale/", "expect_result": {"pointer": "", "len": 0}}
 {"cmd": "screenshot", "name": "sheet-removed-dark"}
 
+// Adding the removed host again shows the name it comes back under, not a field to type in. Asleep now, it can be added anyway.
+{"cmd": "stand_in", "places": {"user@macbook": "unreachable"}}
+{"cmd": "click", "target": "sheet/add"}
+{"cmd": "click", "target": "add/kind/ssh"}
+{"cmd": "type", "text": "user@macbook"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "add/name-kept", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "add/name", "expect_error": "no target"}
+{"cmd": "screenshot", "name": "add-restore-dark"}
+{"cmd": "click", "target": "add/cancel"}
+{"cmd": "settle", "expect": {"pointer": "/sheet/dialog", "equals": null}}
+
 // Esc closes the sheet and the keyboard is back on the page.
 {"cmd": "key", "keystroke": "escape"}
 {"cmd": "settle", "expect": [{"pointer": "/sheet", "equals": null}, {"pointer": "/page", "equals": "sessions"}]}

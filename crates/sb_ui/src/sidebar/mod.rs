@@ -30,8 +30,9 @@ use std::time::Duration;
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle,
     Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Render, Role,
-    ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
-    UniformListScrollHandle, Window, div, prelude::FluentBuilder as _, px, uniform_list,
+    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, UniformListScrollHandle, Window, div, prelude::FluentBuilder as _, px,
+    uniform_list,
 };
 use gpui_component::input::{Input, InputState};
 use sb_core::catalogue::{FOLDER_NAME_CHARS, Shelf};
@@ -126,10 +127,12 @@ pub struct Sidebar {
     /// The tree's rows, as of the library's folders and `open`.
     tree: Vec<TreeRow>,
     renaming: Option<Renaming>,
-    /// The location row the arrows moved to, below the last page's row; `Enter` there opens
-    /// the locations sheet with its location selected (DESIGN §4.1, §5).
-    location_cursor: Option<usize>,
+    /// The location whose row the arrows moved to, below the last page's row; `Enter` there
+    /// opens the locations sheet with it selected (DESIGN §4.1, §5). It goes with its location.
+    location_cursor: Option<LocationId>,
     scroll: UniformListScrollHandle,
+    /// The location rows' own scroll, which the arrows' row is kept in view of.
+    location_scroll: ScrollHandle,
     _observers: [Subscription; 3],
     _clock: Task<()>,
 }
@@ -152,7 +155,20 @@ impl Sidebar {
                     this.rebuild(cx);
                     cx.notify();
                 }),
-                cx.observe(&sync, |_, _, cx| cx.notify()),
+                cx.observe(&sync, |this: &mut Self, sync, cx| {
+                    // A location removed takes the arrows' row with it.
+                    if let Some(id) = &this.location_cursor
+                        && !sync
+                            .read(cx)
+                            .locations()
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|location| location.id == *id)
+                    {
+                        this.location_cursor = None;
+                    }
+                    cx.notify();
+                }),
                 cx.subscribe_in(&library, window, |this, _, event, window, cx| match event {
                     LibraryEvent::FolderCreated(folder) => this.rename(*folder, window, cx),
                 }),
@@ -173,6 +189,7 @@ impl Sidebar {
             renaming: None,
             location_cursor: None,
             scroll: UniformListScrollHandle::new(),
+            location_scroll: ScrollHandle::new(),
         }
     }
 
@@ -225,19 +242,35 @@ impl Sidebar {
         }
         let shelves = self.shelves(cx);
         let shown = self.library.read(cx).shelf();
-        let locations = self.sync.read(cx).locations().map_or(0, <[_]>::len);
+        let locations: Vec<LocationId> = self
+            .sync
+            .read(cx)
+            .locations()
+            .unwrap_or_default()
+            .iter()
+            .map(|location| location.id.clone())
+            .collect();
         /* The location rows follow the last page's row: the arrows go on into them. */
-        if let Some(at) = self.location_cursor {
-            self.location_cursor = match at.checked_add_signed(by) {
-                Some(next) if next < locations => Some(next),
+        let at = self
+            .location_cursor
+            .as_ref()
+            .and_then(|id| locations.iter().position(|it| it == id));
+        let next = match at {
+            Some(at) => Some(match at.checked_add_signed(by) {
+                Some(next) if next < locations.len() => Some(next),
                 Some(_) => Some(at),
                 None => None,
-            };
-            cx.notify();
-            return;
-        }
-        if by > 0 && shelves.last() == Some(&shown) && locations > 0 {
-            self.location_cursor = Some(0);
+            }),
+            None if by > 0 && shelves.last() == Some(&shown) && !locations.is_empty() => {
+                Some(Some(0))
+            }
+            None => None,
+        };
+        if let Some(next) = next {
+            self.location_cursor = next.map(|at| locations[at].clone());
+            if let Some(at) = next {
+                self.location_scroll.scroll_to_item(at);
+            }
             cx.notify();
             return;
         }
@@ -333,12 +366,8 @@ impl Sidebar {
     /// `Enter` on the rows hands the keyboard to the page; on one of the sidebar's buttons it
     /// is left to press the button.
     fn open(&mut self, _: &Open, window: &mut Window, cx: &mut Context<Self>) {
-        let cursor = self.location_cursor.and_then(|at| {
-            let locations = self.sync.read(cx).locations()?;
-            locations.get(at).map(|it| it.id.clone())
-        });
         if self.focus_handle.is_focused(window)
-            && let Some(id) = cursor
+            && let Some(id) = self.location_cursor.clone()
         {
             cx.emit(SidebarEvent::Locations(Some(id)));
         } else if self.focus_handle.is_focused(window) {
@@ -781,7 +810,10 @@ impl Render for Sidebar {
             !unavailable,
             self.keyboard(window) && self.location_cursor.is_none(),
         );
-        let cursor = self.location_cursor.filter(|_| self.keyboard(window));
+        let cursor = self
+            .location_cursor
+            .clone()
+            .filter(|_| self.keyboard(window));
         let disabled_button = |glyph: AnyElement, label: String, target: &'static str| {
             div()
                 .id(target)
@@ -927,7 +959,7 @@ impl Render for Sidebar {
                         }
                     }),
             )
-            .child(self.render_locations(cursor, &theme, cx))
+            .child(self.render_locations(cursor.as_ref(), &theme, cx))
     }
 }
 
