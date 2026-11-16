@@ -130,9 +130,15 @@ fn a_launcher_that_fails_says_why_in_its_own_words() {
         Err(TransportError::Failed(said)) => said,
         other => panic!("{other:?}"),
     };
-    assert_eq!(
-        failed(launched("echo 'no such distro' >&2; exit 3")),
-        "no such distro"
+    /* Its verdict first, and last how far the script was written to it: whole into the pipe,
+    or not at all when it ended first. */
+    let said = failed(launched("echo 'no such distro' >&2; exit 3"));
+    let said: Vec<&str> = said.lines().collect();
+    assert_eq!(said[0], "no such distro");
+    assert!(
+        said[1].starts_with("the script was written whole (")
+            || said[1].starts_with("the script could not be written: "),
+        "{said:?}"
     );
     assert!(failed(launched("exit 3")).contains("ended before it answered"));
     assert!(failed(launched("echo 'not a shell at all'")).contains("ended before it answered"));
@@ -175,7 +181,9 @@ fn an_answer_cut_off_fails_the_call_and_never_passes_for_a_whole_one() {
         ));
         let mut sink = Collect::default();
         match dropped.read_ranges(&requests, &mut sink) {
-            Err(TransportError::Failed(said)) => assert_eq!(said, "Connection lost", "{cut}"),
+            Err(TransportError::Failed(said)) => {
+                assert_eq!(said.lines().next(), Some("Connection lost"), "{cut}");
+            }
             other => panic!("cut at {cut}: {other:?}"),
         }
         /* No range ended well that had not arrived whole. */
