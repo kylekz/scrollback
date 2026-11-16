@@ -16,7 +16,7 @@
 //! **Completions** for `model:` and `branch:` are read when the palette opens, with how many
 //! sessions are not searchable yet (the palette's "Still indexing" banner).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -193,8 +193,8 @@ impl SearchService {
     /**
      * Reads what the palette shows before anything is typed, as it is now: the completions,
      * how many sessions are not searchable yet, and the recent sessions, which a rename or a
-     * refiling shows and which leave the list once in Trash or deleted. The palette is
-     * opening; a read asked for since supersedes this one.
+     * refiling shows and which leave the list once in Trash or deleted; those opened while it
+     * reads stay. The palette is opening; a read asked for since supersedes this one.
      */
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(archive) = self.archive(cx) else {
@@ -210,8 +210,9 @@ impl SearchService {
             .collect();
         let job = cx.background_spawn(async move {
             let catalogue = archive.catalogue();
-            let sessions: Result<Vec<Option<Session>>, _> =
-                recent.iter().map(|id| catalogue.session(id)).collect();
+            let sessions: Result<HashMap<SessionId, Option<Session>>, _> = (recent.into_iter())
+                .map(|id| catalogue.session(&id).map(|read| (id, read)))
+                .collect();
             (
                 catalogue.models_and_branches(),
                 archive.unsearchable(),
@@ -232,14 +233,19 @@ impl SearchService {
                 if let Ok(unsearchable) = unsearchable {
                     this.unsearchable = unsearchable;
                 }
+                /* Merged into the list as it is now, which a session opened meanwhile has joined:
+                each read is as it is now, or leaves the list when it is gone or in Trash. */
                 match sessions {
-                    Ok(sessions) => {
-                        this.recent_sessions = sessions
-                            .into_iter()
-                            .flatten()
-                            .filter(|session| session.trashed.is_none())
-                            .collect();
-                    }
+                    Ok(read) => this
+                        .recent_sessions
+                        .retain_mut(|kept| match read.get(&kept.id) {
+                            None => true,
+                            Some(Some(now)) if now.trashed.is_none() => {
+                                *kept = now.clone();
+                                true
+                            }
+                            Some(_) => false,
+                        }),
                     Err(error) => log::warn!("the recent sessions couldn't be read: {error}"),
                 }
                 cx.notify();

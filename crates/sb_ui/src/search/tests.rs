@@ -551,6 +551,15 @@ fn the_recent_sessions_leave_once_in_trash_or_deleted_for_good(cx: &mut TestAppC
     library(cx).update(cx, |library, cx| library.answer_delete_for_good(true, cx));
     cx.run_until_parked();
     assert_eq!(recent(cx), Vec::<String>::new());
+
+    // A session opened while the list is read again stays in it.
+    service(cx).update(cx, SearchService::refresh);
+    let third = library(cx).read_with(cx, |library, _| {
+        library.sessions().unwrap().sessions[0].id.clone()
+    });
+    library(cx).update(cx, |library, cx| library.open_session_at(&third, 0, cx));
+    cx.run_until_parked();
+    assert_eq!(recent(cx), [SESSIONS[2].title]);
 }
 
 /// Has this machine's agent write a session titled `title`, and syncs it.
