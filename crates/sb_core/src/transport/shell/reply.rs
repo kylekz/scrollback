@@ -11,8 +11,17 @@
 //! reads: a launcher that is slow to take it (`ssh` still connecting, `wsl.exe` starting a
 //! distro), or that has a lot to say on stderr first, holds nothing up, and a cancel is seen
 //! at once. Dropping the reply kills the launcher and everything it started, which also
-//! releases a write that was still waiting.
+//! releases a write that was still waiting. A launcher that ends before the answer began
+//! says, in its error, whether the script was written to it whole.
+//!
+//! **A script that reaches the shell cut short is run once more.** The shell parses the whole
+//! script before it runs any of it ([`super::script`]), so a script that arrived cut short
+//! ran nothing, and the shell ends in one of two ways: with exit status 0 and not a word,
+//! when nothing arrived at all, or with its own complaint of a script that stops in the
+//! middle. A launcher that ends either way before the answer began has its call started over
+//! once, and a warning is logged. Any other end is the call's failure, as it always was.
 
+use std::fmt;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
@@ -45,6 +54,31 @@ const GREETING_MAX: usize = 1024 * 1024;
 /// The answer's last line.
 pub(super) const END: &str = "Z";
 
+/// The script goes to the launcher in pieces this long, so that a write that fails can say
+/// how far it got.
+const PIECE: usize = 8 * 1024;
+
+/// How long a launcher that has ended may keep its writer waiting before how the write went
+/// is given up on: once the launcher is gone, a write fails at once.
+const WRITTEN_WAIT: Duration = Duration::from_secs(1);
+
+/// How much of what the launcher wrote to stderr goes in the warning of a call run again.
+const LOGGED: usize = 1024;
+
+/**
+ * How a shell words a script that ends in the middle (lowercased): bash and dash say "syntax
+ * error" or bash "unexpected EOF while looking for matching"; ksh "syntax error at line N:
+ * `{' unmatched"; zsh "parse error near", "unmatched '" or "closing brace expected"; busybox
+ * ash "syntax error: unexpected end of file". A script that arrived whole always parses.
+ */
+const UNFINISHED: [&str; 5] = [
+    "syntax error",
+    "unexpected eof",
+    "parse error",
+    "unmatched",
+    "closing brace expected",
+];
+
 pub(super) struct Reply<'a> {
     /// Dropped before `process`, whose own thread may be waiting to send here.
     events: Receiver<Event>,
@@ -76,7 +110,8 @@ impl<'a> Reply<'a> {
     /**
      * Starts the launcher, has `script` written to its stdin, and reads up to where the
      * records begin: past the line `marker`, and the script's word on the tools it needs.
-     * Returns the tools that are missing with the reply.
+     * Returns the tools that are missing with the reply. A launcher that ends as one does
+     * when the script reached its shell cut short is started once more (the module docs).
      */
     pub(super) fn start(
         launcher: &'a Launcher,
@@ -85,6 +120,51 @@ impl<'a> Reply<'a> {
         cancel: &'a CancelToken,
         idle: Duration,
     ) -> Result<(Self, Vec<String>), TransportError> {
+        let script: Arc<[u8]> = script.into();
+        /* Running a call again is sound only because nothing of it has reached the caller:
+        the reply is handed over once its marker is read, and no sink is reachable from here
+        before then. So nothing is delivered twice. */
+        let first = match Self::attempt(launcher, &script, marker, cancel, idle)? {
+            Ok(started) => return Ok(started),
+            Err(unanswered) => unanswered,
+        };
+        let failure = first.failure(launcher);
+        if !first.cut_short(&failure) {
+            return Err(failure);
+        }
+        if cancel.is_cancelled() {
+            return Err(TransportError::Cancelled);
+        }
+        log::warn!(
+            "{} ended before it answered, as when the script reaches its shell cut short \
+             ({}; {}), and is run once more; it said on stderr: {:?}",
+            launcher.command_line(),
+            first
+                .exit
+                .map_or("no exit status".to_string(), |exit| exit.to_string()),
+            first.written,
+            String::from_utf8_lossy(&first.stderr[first.stderr.len().saturating_sub(LOGGED)..]),
+        );
+        match Self::attempt(launcher, &script, marker, cancel, idle)? {
+            Ok(started) => Ok(started),
+            Err(second) => Err(match second.failure(launcher) {
+                TransportError::Failed(said) => TransportError::Failed(format!(
+                    "{said}\nit was run twice; the first time: {failure}"
+                )),
+                other => other,
+            }),
+        }
+    }
+
+    /// One run of the launcher with `script`: the reply, or how the launcher ended when it
+    /// did so before the answer began.
+    fn attempt(
+        launcher: &'a Launcher,
+        script: &Arc<[u8]>,
+        marker: &str,
+        cancel: &'a CancelToken,
+        idle: Duration,
+    ) -> Result<Result<(Self, Vec<String>), Unanswered>, TransportError> {
         /* Before anything is started: `wsl.exe` would start a distro that is stopped. */
         if cancel.is_cancelled() {
             return Err(TransportError::Cancelled);
@@ -114,12 +194,27 @@ impl<'a> Reply<'a> {
             exit: None,
         };
         /* The script is all the shell is to read. A launcher that ends without reading it
-        says why through its exit. */
+        says why through its exit, and the writer says how far it got. */
+        let (wrote, written) = sync_channel(1);
+        let script = Arc::clone(script);
         std::thread::Builder::new()
             .name("sb-shell-in".into())
             .spawn(move || {
-                let _ = process.write(&script);
+                let mut went = 0;
+                let result = script.chunks(PIECE).try_for_each(|piece| {
+                    process.write(piece)?;
+                    went += piece.len();
+                    Ok::<(), ProcessError>(())
+                });
                 process.close_stdin();
+                let _ = wrote.send(match result {
+                    Ok(()) => Written::Whole(went),
+                    Err(error) => Written::Failed {
+                        went,
+                        of: script.len(),
+                        error,
+                    },
+                });
             })
             .map_err(|error| TransportError::Failed(error.to_string()))?;
 
@@ -138,8 +233,14 @@ impl<'a> Reply<'a> {
                 )));
             }
             if !reply.more()? {
-                reply.before = reply.buffer[..reply.buffer.len().min(KEPT)].to_vec();
-                return Err(reply.broken());
+                return Ok(Err(Unanswered {
+                    exit: reply.exit.flatten(),
+                    stderr: std::mem::take(&mut reply.stderr),
+                    stdout: reply.buffer[..reply.buffer.len().min(KEPT)].to_vec(),
+                    written: written
+                        .recv_timeout(WRITTEN_WAIT)
+                        .unwrap_or(Written::Unknown),
+                }));
             }
         }
         let mut missing = Vec::new();
@@ -151,7 +252,7 @@ impl<'a> Reply<'a> {
                 None => return Err(unexpected("K", &line)),
             }
         }
-        Ok((reply, missing))
+        Ok(Ok((reply, missing)))
     }
 
     /// Waits for more output and adds it to the buffer; `false` once the process has ended.
@@ -320,4 +421,127 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// The answer has `line` where a record that starts with `letter` belongs.
 pub(super) fn unexpected(letter: &str, line: &str) -> TransportError {
     TransportError::Protocol(format!("{line:?} where a {letter} record belongs"))
+}
+
+/// A launcher that ended before the answer began: what it left behind.
+struct Unanswered {
+    exit: Option<ExitStatus>,
+    /// The end of what it wrote to stderr, and the start of what it wrote to stdout.
+    stderr: Vec<u8>,
+    stdout: Vec<u8>,
+    written: Written,
+}
+
+impl Unanswered {
+    /// Why the call failed, by the launcher's account, with how the write of the script went.
+    fn failure(&self, launcher: &Launcher) -> TransportError {
+        match launcher.failure(self.exit, &self.stderr, &self.stdout) {
+            TransportError::Failed(said) => {
+                TransportError::Failed(format!("{said}\n{}", self.written))
+            }
+            other => other,
+        }
+    }
+
+    /// Whether the launcher ended as it does when the script reached its shell cut short,
+    /// having run none of it (the module docs). `failure` is what the launcher's end means.
+    fn cut_short(&self, failure: &TransportError) -> bool {
+        match self.exit {
+            Some(exit) if exit.success() => self.stdout.is_empty() && self.stderr.is_empty(),
+            Some(_) => {
+                let said = String::from_utf8_lossy(&self.stderr).to_lowercase();
+                matches!(failure, TransportError::Failed(_))
+                    && UNFINISHED.iter().any(|words| said.contains(words))
+            }
+            None => false,
+        }
+    }
+}
+
+/// How writing the script to the launcher's stdin went.
+enum Written {
+    Whole(usize),
+    /// After `went` of its `of` bytes.
+    Failed {
+        went: usize,
+        of: usize,
+        error: ProcessError,
+    },
+    /// The writer had not finished when the launcher ended.
+    Unknown,
+}
+
+impl fmt::Display for Written {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Whole(length) => write!(f, "the script was written whole ({length} bytes)"),
+            Self::Failed { went, of, error } => write!(
+                f,
+                "the script could not be written: {error} (after {went} of {of} bytes)"
+            ),
+            Self::Unknown => write!(f, "the script was still being written"),
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    use super::*;
+
+    /// A launcher that ended with exit status `code`, having written `stderr` and `stdout`.
+    fn ended(code: i32, stderr: &str, stdout: &str) -> Unanswered {
+        Unanswered {
+            exit: Some(ExitStatus::from_raw(code << 8)),
+            stderr: stderr.as_bytes().to_vec(),
+            stdout: stdout.as_bytes().to_vec(),
+            written: Written::Whole(10),
+        }
+    }
+
+    #[test]
+    fn only_the_two_ends_of_a_script_cut_short_are_run_again() {
+        let wsl = Launcher::Wsl {
+            distro: "Ubuntu-24.04".to_string(),
+        };
+        let ssh = Launcher::Ssh {
+            host: "user@macbook".to_string(),
+        };
+        let again = |launcher: &Launcher, unanswered: Unanswered| {
+            unanswered.cut_short(&unanswered.failure(launcher))
+        };
+        /* Nothing arrived; or the shell found the script unfinished, after a greeting. */
+        assert!(again(&wsl, ended(0, "", "")));
+        let dash = "sh: 12: Syntax error: end of file unexpected (expecting \"}\")\n";
+        assert!(again(&wsl, ended(2, dash, "")));
+        assert!(again(&ssh, ended(1, "zsh: unmatched '\n", "Welcome!\n")));
+        /* Anything else, however it looks. */
+        for (launcher, unanswered) in [
+            (&wsl, ended(0, "", "Welcome!\n")),
+            (&wsl, ended(0, "\n", "")),
+            (&wsl, ended(1, "", "")),
+            (
+                &ssh,
+                ended(127, "bash: line 1: sh: command not found\n", ""),
+            ),
+            (
+                &ssh,
+                ended(
+                    255,
+                    "bash: syntax error\nConnection closed by 192.0.2.7\n",
+                    "",
+                ),
+            ),
+            (&ssh, ended(255, "Host key verification failed.\n", "")),
+        ] {
+            let said = String::from_utf8_lossy(&unanswered.stderr).into_owned();
+            assert!(!again(launcher, unanswered), "{said:?}");
+        }
+        let unknown = Unanswered {
+            exit: None,
+            ..ended(0, "", "")
+        };
+        assert!(!again(&wsl, unknown));
+    }
 }
