@@ -11,10 +11,14 @@ use sb_core::catalogue::{Deletion, Filed, Session, SessionId, Shelf};
 use sb_core::filing::FolderId;
 
 use super::Showing;
+use crate::hostile;
+use crate::services::Answer;
 use crate::services::library::Refusal;
+use crate::services::library::title_of;
 use crate::services::{ActiveServices as _, LibraryService};
 use crate::shell::Shell;
 use crate::test_support::{SESSIONS, bounds, open_shell, write_with};
+use sb_test_support::Outline;
 
 fn library(cx: &mut VisualTestContext) -> Entity<LibraryService> {
     cx.update(|_, cx| cx.services().library.clone())
@@ -539,4 +543,77 @@ fn delete_folder_goes_round_its_buttons_with_tab_too(cx: &mut TestAppContext) {
     }
     press(cx, "enter");
     assert!(!kept(cx), "Delete folder");
+}
+
+/**
+ * A title made to read backwards (U+202E) is drawn inert wherever it shows outside the
+ * reader: the palette's row, Trash's row, the confirmation to delete it for good and the toast
+ * that moved it to Trash all draw it through `hostile::label`, the control as its code point.
+ */
+#[gpui::test]
+fn a_title_that_reverses_text_is_drawn_inert_in_the_palette_trash_the_dialog_and_a_toast(
+    cx: &mut TestAppContext,
+) {
+    const TITLE: &str = "Invoice \u{202E}fdp.exe";
+    let (shell, cx) = open_shell(cx);
+    write_with(
+        |tree| {
+            tree.outlined(&Outline {
+                project: "/home/user/code/\u{202E}ppa",
+                title: TITLE,
+                prompt: "Open the invoice \u{202E}gnp.exe now.",
+                model: "model-\u{202E}a",
+                day: (2026, 11, 13),
+                calls: 1,
+            });
+        },
+        cx,
+    );
+    let sync = cx.update(|_, cx| cx.services().sync.clone());
+    sync.update(cx, |sync, cx| sync.sync_all(cx));
+    cx.run_until_parked();
+    let inert = |text: &str| !text.contains('\u{202E}') && text.contains("⟦U+202E⟧");
+    let archived = session(TITLE, cx).expect("the session is archived");
+    assert!(inert(&title_of(&archived)), "{}", title_of(&archived));
+
+    // The palette finds it; its row draws `title_of`.
+    cx.simulate_keystrokes("secondary-k");
+    cx.run_until_parked();
+    cx.simulate_input("invoice");
+    cx.run_until_parked();
+    let found = cx.update(|_, cx| {
+        let search = cx.services().search.read(cx);
+        match search.answer().map(|answered| &answered.answer) {
+            Some(Answer::Found(results)) => results.sessions.first().map(|it| it.session.clone()),
+            _ => None,
+        }
+    });
+    assert_eq!(found.map(|it| it.id), Some(archived.id.clone()));
+    assert!(bounds(cx, "palette").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Trash draws its row with `title_of`.
+    trash(TITLE, cx);
+    assert!(bounds(cx, "trash-row-0").is_some(), "Trash draws its row");
+    assert_eq!(
+        cx.update(|_, cx| shell.read(cx).showing(cx)),
+        Showing::Trash
+    );
+
+    // The confirmation to delete it for good asks about it by `title_of`.
+    let in_trash = session(TITLE, cx).expect("the session is in Trash");
+    library(cx).update(cx, |library, cx| library.ask_delete_for_good(in_trash, cx));
+    cx.run_until_parked();
+    assert!(bounds(cx, "for-good").is_some());
+    let asked = library(cx).read_with(cx, |it, _| it.for_good().map(|it| title_of(&it.session)));
+    assert!(asked.is_some_and(|it| inert(&it)));
+
+    // The toast that says it is deleted names it, and draws its text as a label.
+    library(cx).update(cx, |library, cx| library.answer_delete_for_good(true, cx));
+    cx.run_until_parked();
+    let (said, _) = toast(cx).expect("a toast says it is deleted");
+    assert!(said.contains("Invoice"), "{said}");
+    assert!(inert(&hostile::label(&said)), "{said}");
+    assert!(bounds(cx, "toast").is_some());
 }

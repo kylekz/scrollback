@@ -1640,7 +1640,7 @@ fn paths_line(
                         .overflow_hidden()
                         .text_ellipsis_middle()
                         .text_spec(&theme.text.path)
-                        .child(path.typed.clone()),
+                        .child(crate::hostile::label(&path.typed)),
                 )
                 .child(
                     div()

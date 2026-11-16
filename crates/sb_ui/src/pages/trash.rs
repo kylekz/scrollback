@@ -33,6 +33,7 @@ use super::header::{Under, header};
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{ButtonKind, button, focus_ring, icon, location_tag};
 use crate::format;
+use crate::hostile;
 use crate::icons::SbIcon;
 use crate::services::library::title_of;
 use crate::services::{ActiveServices as _, LibraryService, SyncService};
@@ -268,7 +269,7 @@ impl TrashView {
         let was_in = match session.filed {
             Filed::ByRule(folder) | Filed::ByHand(folder) => library
                 .folder(folder)
-                .map_or_else(|| "Unsorted".to_string(), |it| it.name.clone()),
+                .map_or_else(|| "Unsorted".to_string(), |it| hostile::label(&it.name)),
             Filed::Unsorted => "Unsorted".to_string(),
         };
         let size = library
@@ -324,7 +325,11 @@ impl TrashView {
                             .text_ellipsis()
                             .text_color(c.fg3)
                             .text_spec(&theme.text.secondary)
-                            .child(session.first_prompt.clone().unwrap_or_default()),
+                            .child(
+                                (session.first_prompt.as_deref())
+                                    .map(hostile::label)
+                                    .unwrap_or_default(),
+                            ),
                     ),
             )
             .child(

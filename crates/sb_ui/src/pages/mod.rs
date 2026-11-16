@@ -349,7 +349,7 @@ impl MainArea {
         if let Some(why) = library.write_failure() {
             banners.push(
                 bad_banner(theme)
-                    .child(text(why.to_string()))
+                    .child(text(crate::hostile::label(why)))
                     .child(
                         button("write-failed-dismiss", ButtonKind::Plain, true, true, theme)
                             .on_click(cx.listener(|_, _, _, cx| {
@@ -551,7 +551,7 @@ impl MainArea {
                                 .overflow_hidden()
                                 .text_ellipsis()
                                 .whitespace_nowrap()
-                                .child(toast.text.clone())
+                                .child(crate::hostile::label(&toast.text))
                                 .automation_target("toast/text"),
                         )
                         .when(toast.can_undo(), |this| {

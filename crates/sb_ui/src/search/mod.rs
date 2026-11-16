@@ -66,6 +66,7 @@ use crate::components::{
     location_tag, overline,
 };
 use crate::format;
+use crate::hostile;
 use crate::icons::SbIcon;
 use crate::keymap;
 use crate::menu::{self, Entry, Item};
@@ -653,7 +654,7 @@ impl Palette {
     fn menu_values(&self, offer: Offer, cx: &App) -> Vec<(String, Chip)> {
         let chip = |filter, what: &str, label: &str| {
             (
-                label.to_string(),
+                hostile::label(label),
                 Chip {
                     filter,
                     label: format!("{what}: {label}"),
@@ -751,7 +752,9 @@ fn counted(results: &Results) -> String {
 
 /**
  * A match's text with each hit marked (`hl`: `yellow-soft` under a 1px `yellow` underline),
- * in the code face for a command or a path. Line breaks read as spaces.
+ * in the code face for a command or a path. It is a transcript's text, drawn as a label
+ * ([`hostile::label`]: line breaks read as spaces, controls shown), each part of it on its own
+ * so that the hits stay where they are.
  */
 fn marked(found: &Match, theme: &SbTheme) -> StyledText {
     let c = &theme.colors;
@@ -761,7 +764,21 @@ fn marked(found: &Match, theme: &SbTheme) -> StyledText {
     } else {
         theme.fonts.ui.clone()
     };
-    let text = found.snippet.text.replace(['\n', '\r', '\t'], " ");
+    let snippet = &found.snippet.text;
+    let mut text = String::with_capacity(snippet.len());
+    let mut hits = Vec::new();
+    let mut at = 0;
+    for hit in &found.snippet.hits {
+        if hit.start < at || hit.end > snippet.len() {
+            continue;
+        }
+        text.push_str(&hostile::label(&snippet[at..hit.start]));
+        let start = text.len();
+        text.push_str(&hostile::label(&snippet[hit.clone()]));
+        hits.push(start..text.len());
+        at = hit.end;
+    }
+    text.push_str(&hostile::label(&snippet[at..]));
     let run = |len: usize, hit: bool| TextRun {
         len,
         font: font(family.clone()),
@@ -776,10 +793,7 @@ fn marked(found: &Match, theme: &SbTheme) -> StyledText {
     };
     let mut runs = Vec::new();
     let mut at = 0;
-    for hit in &found.snippet.hits {
-        if hit.start < at || hit.end > text.len() {
-            continue;
-        }
+    for hit in hits {
         if hit.start > at {
             runs.push(run(hit.start - at, false));
         }
@@ -829,7 +843,7 @@ impl Palette {
                     .child(format!(
                         "“{}:{}” names nothing",
                         token.key.as_str(),
-                        token.value
+                        hostile::label(&token.value)
                     ))
                     .into_any_element(),
             ),
@@ -870,13 +884,14 @@ impl Palette {
                     .items_center()
                     .gap(theme.spacing.sm)
                     .children(self.chips.iter().enumerate().map(|(at, chip)| {
+                        let label = hostile::label(&chip.label);
                         chip_base(("palette-chip", at), true, theme)
-                            .aria_label(format!("{}, remove", chip.label))
+                            .aria_label(format!("{label}, remove"))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.clicked(window, cx, |this, cx| this.remove_chip(at, cx));
                             }))
                             .children(self.chip_glyph(chip, theme, cx))
-                            .child(chip.label.clone())
+                            .child(label)
                             .child(icon(SbIcon::X, theme.sizes.icon_xs, c.accent_text))
                             .automation_target_with(move || format!("palette/chip/{at}").into())
                             .into_any_element()
@@ -906,7 +921,7 @@ impl Palette {
                         } else {
                             this.child(kbd(keymap::label("tab"), theme)).children(
                                 view.completions.iter().enumerate().map(|(at, completion)| {
-                                    let label = completion.label();
+                                    let label = hostile::label(&completion.label());
                                     let completion = completion.clone();
                                     chip_base(("palette-completion", at), false, theme)
                                         .when(at == 0, |this| this.border_color(c.accent))
@@ -975,7 +990,7 @@ impl Palette {
                 SbIcon::Folder,
                 library
                     .folder(folder)
-                    .map_or_else(String::new, |it| it.name.clone()),
+                    .map_or_else(String::new, |it| hostile::label(&it.name)),
             ),
             Filed::Unsorted => (SbIcon::Inbox, "Unsorted".to_string()),
         };
@@ -1195,7 +1210,7 @@ impl Palette {
                         .h(SESSION_ROW_HEIGHT)
                         .px(px(10.))
                         .child(icon(SbIcon::Search, theme.sizes.icon_sm, c.fg3))
-                        .child(text)
+                        .child(hostile::label(&text))
                         .automation_target_with(move || format!("palette/row/{row}").into()),
                     );
                     row += 1;

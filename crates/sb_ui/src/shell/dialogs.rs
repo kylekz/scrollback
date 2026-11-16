@@ -337,6 +337,7 @@ impl Shell {
                 }
             }
         });
+        /* Its project's path and its model are a transcript's: drawn as a label. */
         let summary = [
             session.project_path.clone().map(|path| format::path(&path)),
             agents::model(&session.id.provider, &session.models, cx),
@@ -348,6 +349,7 @@ impl Shell {
         ]
         .into_iter()
         .flatten()
+        .map(|part| crate::hostile::label(&part))
         .collect::<Vec<_>>()
         .join(" · ");
         let ready = deletion.is_some();

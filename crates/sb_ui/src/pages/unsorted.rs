@@ -693,7 +693,7 @@ impl UnsortedView {
                                 .overflow_hidden()
                                 .text_ellipsis_middle()
                                 .text_spec(&theme.text.path)
-                                .child(shown.clone()),
+                                .child(crate::hostile::label(shown)),
                         );
                     match dragged.clone() {
                         Some(dragged) => {

@@ -208,7 +208,8 @@ pub fn tag_width(label: &str, theme: &SbTheme, window: &Window) -> Pixels {
 }
 
 /// The tag that names a location, in its kind's colours (DESIGN §1: `.tag.win` for this
-/// machine, `.tag.wsl` for a distro, `.tag.mac` for a host over SSH).
+/// machine, `.tag.wsl` for a distro, `.tag.mac` for a host over SSH). The name is drawn as a
+/// label ([`crate::hostile::label`]): it may be a distro's or a host's own.
 pub fn location_tag(
     name: impl Into<SharedString>,
     kind: &LocationKind,
@@ -220,7 +221,7 @@ pub fn location_tag(
         LocationKind::Wsl { .. } => Tone::Blue,
         LocationKind::Ssh { .. } => Tone::Neutral,
     };
-    tag(name, tone, small, theme)
+    tag(crate::hostile::label(&name.into()), tone, small, theme)
 }
 
 /// A chip (`.chip`: 22 high, a pill, 12px), in `tone`'s colours.

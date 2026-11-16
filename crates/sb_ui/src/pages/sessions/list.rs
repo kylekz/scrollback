@@ -477,7 +477,11 @@ impl SessionsView {
                         .text_ellipsis()
                         .text_color(c.fg2)
                         .text_spec(&theme.text.path_small)
-                        .child(session.branch.clone().unwrap_or_default()),
+                        .child(
+                            (session.branch.as_deref())
+                                .map(crate::hostile::label)
+                                .unwrap_or_default(),
+                        ),
                 )
             })
             .child(

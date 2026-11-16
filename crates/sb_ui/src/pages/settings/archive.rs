@@ -24,6 +24,7 @@ use crate::components::{
     with_numbers,
 };
 use crate::format;
+use crate::hostile;
 use crate::icons::SbIcon;
 use crate::overlay::{self, Layer};
 use crate::services::ActiveServices as _;
@@ -780,9 +781,10 @@ impl SettingsPage {
         /* One item at a time is fetched again by hand, and none while Fetch all again runs. */
         let can_fetch = !opening && sync.fetch_all_progress().is_none();
         let wrong = what_is_wrong(problem.damage.kind);
-        /* A session's title comes from its transcript, which may be what is damaged. */
+        /* A session's title comes from its transcript, which may be what is damaged: what names
+        the session is drawn as a label. */
         let session = problem.session.as_ref().map(|session| {
-            format!(
+            let named = format!(
                 " · in {} ({}{})",
                 match (&session.title, &session.project_path) {
                     (Some(title), _) => format!("“{title}”"),
@@ -795,7 +797,8 @@ impl SettingsPage {
                     .as_ref()
                     .map(|location| format!(", {}", location.name))
                     .unwrap_or_default()
-            )
+            );
+            hostile::label(&named)
         });
         let target = move |what: &str| -> SharedString {
             format!("settings/verify/problem/{at}/{what}").into()
@@ -1013,11 +1016,12 @@ fn archived_when(at: i64, now: i64) -> String {
 }
 
 /// What names a session deleted for good: where it ran, since its tombstone keeps nothing of
-/// what was said in it (PLAN §4.3), not even its title.
+/// what was said in it (PLAN §4.3), not even its title. The path is a transcript's, drawn as
+/// a label ([`hostile::label`]).
 fn named(tombstone: &Tombstone) -> String {
     tombstone.project_path.as_deref().map_or_else(
         || "A session with no project path".to_string(),
-        format::path,
+        |path| hostile::label(&format::path(path)),
     )
 }
 
@@ -1129,7 +1133,7 @@ fn deleted_row(
                             Standing::Deleted => c.fg3,
                             Standing::Allowed(_) | Standing::ArchivedAgain { .. } => c.accent_text,
                         })
-                        .child(line),
+                        .child(hostile::label(&line)),
                 )
                 .children(row.refused.clone().map(|why| {
                     div()

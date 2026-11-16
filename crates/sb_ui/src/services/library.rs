@@ -486,6 +486,8 @@ impl Change {
 /// (DESIGN §4.14), shown once its change is written.
 #[derive(Clone, Debug)]
 pub struct Toast {
+    /// What it says. It may name a session's title, a project's path, a folder: it is drawn
+    /// as a label ([`crate::hostile::label`]).
     pub text: String,
     undo: Option<Change>,
 }

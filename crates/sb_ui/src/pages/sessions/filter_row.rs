@@ -19,6 +19,7 @@ use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{ButtonKind, below, bounds_of, button, chip_base, icon};
 use crate::format;
+use crate::hostile;
 use crate::icons::SbIcon;
 use crate::menu::{self, Entry, Item};
 use crate::services::{ActiveServices as _, DateRange, PageView, view::RECENT_DAYS};
@@ -126,14 +127,14 @@ impl SessionsView {
             self.chip(
                 "branch",
                 "Branch",
-                view.branch.clone(),
+                view.branch.as_deref().map(hostile::label),
                 facets
                     .branches
                     .iter()
                     .map(|branch| {
                         let set = branch.clone();
                         (
-                            branch.clone(),
+                            hostile::label(branch),
                             Box::new(move |view: &mut PageView| view.branch = Some(set.clone()))
                                 as Setter,
                         )
