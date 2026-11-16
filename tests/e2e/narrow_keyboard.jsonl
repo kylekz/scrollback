@@ -45,10 +45,12 @@
 {"cmd": "click", "target": "titlebar/sidebar"}
 {"cmd": "click", "target": "sidebar/all-sessions"}
 {"cmd": "settle", "expect": [{"pointer": "/library/shelf", "equals": "all"}, {"pointer": "/shell/sidebar", "equals": "collapsed"}]}
+// The sidebar's button, Sync all, Settings, then the page.
 {"cmd": "key", "keystroke": "tab"}
 {"cmd": "key", "keystroke": "tab"}
 {"cmd": "key", "keystroke": "tab"}
-{"cmd": "screenshot", "name": "after-three-tabs-dark"}
+{"cmd": "key", "keystroke": "tab"}
+{"cmd": "screenshot", "name": "after-four-tabs-dark"}
 {"cmd": "key", "keystroke": "right", "expect": {"pointer": "/library/selected", "equals": "Fix the flaky upload test"}}
 {"cmd": "key", "keystroke": "right", "expect": {"pointer": "/library/selected", "equals": "Add retries to the fetcher"}}
 {"cmd": "key", "keystroke": "enter", "expect": [{"pointer": "/page", "equals": "session"}, {"pointer": "/library/open", "equals": "Add retries to the fetcher"}]}
