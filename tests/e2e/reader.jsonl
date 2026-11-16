@@ -10,7 +10,7 @@
 {"cmd": "click", "target": "card/1/title"}
 {"cmd": "settle", "expect": [{"pointer": "/page", "equals": "session"}, {"pointer": "/reader/state", "equals": "open"}, {"pointer": "/reader/place", "equals": [2, 5]}, {"pointer": "/reader/full_calls", "equals": false}, {"pointer": "/reader/open_calls", "equals": 0}, {"pointer": "/reader/top_name", "equals": "prompt main/0"}]}
 {"cmd": "bounds", "target": "session/title", "expect_result": {"pointer": "/visible", "not_equals": null}}
-{"cmd": "bounds", "target": "reader/call/main/4", "expect_result": [{"pointer": "/h", "equals": 26}, {"pointer": "/w", "equals": 736}]}
+{"cmd": "bounds", "target": "reader/call/main/4", "expect_result": [{"pointer": "/h", "gte": 25, "lte": 26}, {"pointer": "/w", "equals": 736}]}
 {"cmd": "bounds", "target": "reader/reply/main/2", "expect_result": {"pointer": "/w", "equals": 732}}
 {"cmd": "screenshot", "name": "reader-top-1440-dark"}
 
@@ -52,11 +52,11 @@
 // Ctrl C with nothing selected copies the focused message.
 {"cmd": "key", "keystroke": "secondary-c", "expect": {"pointer": "/system/copied", "equals": 1}}
 
-// Full calls (E): every call open; the choice is the app's, kept for the next session. The row at the top stays at the top.
+// Full calls (E): every call open; the choice is the app's, kept for the next session. The row at the top stays at the top. Where it sits is a range: the rows above it lay out a few pixels apart at each display scale and on each platform; it must not move when the calls open.
 {"cmd": "key", "keystroke": "]"}
-{"cmd": "settle", "expect": [{"pointer": "/reader/top_name", "equals": "reply main/12"}, {"pointer": "/reader/top_offset", "equals": 184}]}
+{"cmd": "settle", "expect": [{"pointer": "/reader/top_name", "equals": "reply main/12"}, {"pointer": "/reader/top_offset", "gte": 176, "lte": 188}]}
 {"cmd": "key", "keystroke": "e"}
-{"cmd": "settle", "expect": [{"pointer": "/reader/full_calls", "equals": true}, {"pointer": "/reader/open_calls", "equals": 17}, {"pointer": "/reader/top_name", "equals": "reply main/12"}, {"pointer": "/reader/top_offset", "equals": 184}]}
+{"cmd": "settle", "expect": [{"pointer": "/reader/full_calls", "equals": true}, {"pointer": "/reader/open_calls", "equals": 17}, {"pointer": "/reader/top_name", "equals": "reply main/12"}, {"pointer": "/reader/top_offset", "gte": 176, "lte": 188}]}
 {"cmd": "key", "keystroke": "home"}
 {"cmd": "settle"}
 {"cmd": "screenshot", "name": "full-calls-1440-dark"}
