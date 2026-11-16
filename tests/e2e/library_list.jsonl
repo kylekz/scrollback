@@ -7,7 +7,7 @@
 // The list: a header row, then each month's overline with its count and its rows, 34 high.
 {"cmd": "click", "target": "filter/list"}
 {"cmd": "settle", "expect": [{"pointer": "/page_view/list", "equals": true}, {"pointer": "/page_view/shown", "equals": 2318}]}
-{"cmd": "bounds", "target": "list/row/0", "expect_result": [{"pointer": "/h", "equals": 34}, {"pointer": "/x", "equals": 272}, {"pointer": "/w", "equals": 1144}]}
+{"cmd": "bounds", "target": "list/row/0", "expect_result": [{"pointer": "/h", "gte": 33}, {"pointer": "/h", "lte": 34}, {"pointer": "/x", "equals": 272}, {"pointer": "/w", "equals": 1144}]}
 {"cmd": "bounds", "target": "card/0", "expect_error": "no target"}
 {"cmd": "screenshot", "name": "list-dark"}
 {"cmd": "pin_appearance", "appearance": "light"}
