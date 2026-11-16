@@ -19,11 +19,14 @@
 //! ([`crate::services::reader`]) and draws the code plain until it lands.
 //!
 //! A grammar whose C code aborts the process on some input (an `assert`, which nothing can
-//! catch) can't be bounded at all, so it is not built in, and its code is plain: Bash (nested
-//! heredocs), Kotlin (nested string templates) and YAML (a few hundred levels of indentation),
-//! whose scanners overflow the state tree-sitter keeps for them. The ignored test
+//! catch) can't be bounded at all, so it is not built in: Bash (nested heredocs), Kotlin
+//! (nested string templates) and YAML (a few hundred levels of indentation), whose scanners
+//! overflow the state tree-sitter keeps for them. Kotlin's and YAML's code is plain; a shell's
+//! is highlighted by a lexer of our own, linear and total ([`shell`]). The ignored test
 //! `grammars_never_abort` runs every grammar over code built to find such a thing, each in a
 //! process of its own.
+
+mod shell;
 
 use std::collections::HashMap;
 use std::ops::{ControlFlow, Range};
@@ -194,6 +197,9 @@ fn highlight_within(
 ) -> Option<Vec<(Range<usize>, TokenKind)>> {
     if code.len() > MAX_HIGHLIGHT_BYTES {
         return None;
+    }
+    if let Some(dialect) = shell::dialect(language) {
+        return Some(shell::highlight(code, dialect));
     }
     let Some(host) = grammar(language) else {
         return Some(Vec::new());
@@ -546,15 +552,103 @@ mod tests {
     }
 
     #[test]
-    fn the_grammars_that_abort_are_not_built_in_and_their_code_is_plain() {
+    fn the_grammars_that_abort_are_not_built_in_and_a_shells_code_is_lexed_by_hand() {
         for (name, code) in [
             ("yaml", "a:\n  - b\n  - c\n"),
             ("yml", "a: b\n"),
-            ("bash", "echo \"$HOME\" # c\n"),
-            ("sh", "cat <<EOF\nx\nEOF\n"),
             ("kotlin", "val a = \"${b}\"\n"),
         ] {
             assert_eq!(highlight(name, code), Some(Vec::new()), "{name}");
+        }
+        for name in ["bash", "sh", "shell", "zsh"] {
+            assert_eq!(
+                kinds(name, "echo \"$HOME\" # c\n"),
+                vec![
+                    ("echo", TokenKind::Function),
+                    ("\"", TokenKind::String),
+                    ("$HOME", TokenKind::Property),
+                    ("\"", TokenKind::String),
+                    ("# c", TokenKind::Comment),
+                ],
+                "{name}"
+            );
+        }
+        assert_eq!(
+            kinds("console", "$ ls -la\ntotal 0\n"),
+            vec![("ls", TokenKind::Function)]
+        );
+    }
+
+    /// Whether `tokens` are kinds of `code` that can be drawn: in order, apart, inside it, each
+    /// starting and ending between characters, none plain.
+    fn drawable(code: &str, tokens: &[(Range<usize>, TokenKind)]) -> bool {
+        tokens.iter().all(|(range, kind)| {
+            !range.is_empty()
+                && *kind != TokenKind::Plain
+                && code.is_char_boundary(range.start)
+                && code.is_char_boundary(range.end)
+        }) && tokens
+            .windows(2)
+            .all(|pair| pair[0].0.end <= pair[1].0.start)
+    }
+
+    /**
+     * The shell's lexer over the code built to break grammars, at every size, as a script and as
+     * a session: it finishes, quickly, with tokens that can be drawn.
+     */
+    #[test]
+    fn the_shell_lexer_takes_any_hostile_code_in_linear_time() {
+        let bound = if cfg!(debug_assertions) {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_millis(10)
+        };
+        let mut worst = (Duration::ZERO, String::new());
+        for size in [512, 4 * 1024, MAX_HIGHLIGHT_BYTES] {
+            for (name, code) in hostile(size) {
+                for language in ["bash", "console"] {
+                    let start = Instant::now();
+                    let tokens = highlight(language, &code).expect("a shell's code is lexed");
+                    let took = start.elapsed();
+                    assert!(drawable(&code, &tokens), "{language} on {name} at {size}");
+                    assert!(took < bound, "{language} on {name} at {size} took {took:?}");
+                    if took > worst.0 {
+                        worst = (took, format!("{language} on {name} at {size}"));
+                    }
+                }
+            }
+        }
+        eprintln!("worst: {} at {:?}", worst.1, worst.0);
+    }
+
+    /// The shell's lexer over random code: any bytes, and runs of what a shell reads.
+    #[test]
+    fn the_shell_lexer_takes_any_bytes() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        const SHELL: &[u8] = b"$(){}[]'\"`\\<>|&;#=-+ \t\n\r!?*@0123ab_EOF<<-";
+        for case in 0..4_000 {
+            let len = (next() % 2_048) as usize;
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| {
+                    let random = next();
+                    if case % 2 == 0 {
+                        random as u8
+                    } else {
+                        SHELL[(random % SHELL.len() as u64) as usize]
+                    }
+                })
+                .collect();
+            let code = String::from_utf8_lossy(&bytes);
+            for language in ["sh", "console"] {
+                let tokens = highlight(language, &code).expect("a shell's code is lexed");
+                assert!(drawable(&code, &tokens), "{language} on {code:?}");
+            }
         }
     }
 
