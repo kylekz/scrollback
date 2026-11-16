@@ -6161,6 +6161,7 @@ dependencies = [
  "gpui-pre-platform",
  "gpui_appearance",
  "gpui_automation",
+ "libc",
  "libmimalloc-sys",
  "log",
  "mimalloc",
@@ -6169,7 +6170,9 @@ dependencies = [
  "sb_ui",
  "serde",
  "serde_json",
+ "tempfile",
  "velopack",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

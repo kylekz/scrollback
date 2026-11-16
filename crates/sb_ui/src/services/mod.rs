@@ -114,6 +114,8 @@ pub struct ServicesConfig {
     pub reach: Reach,
     /// What looks for scrollback's own updates: an installed copy's, or why there is none.
     pub updater: Updater,
+    /// The installer's folder, in an installed copy: no archive may be chosen inside it.
+    pub install_root: Option<std::path::PathBuf>,
 }
 
 /// The app's services.
@@ -135,10 +137,12 @@ pub struct Services {
 impl Global for Services {}
 
 impl Services {
-    /// Nothing is opening, syncing, indexing, loading, being read or being saved:
-    /// automation's `settled`.
+    /// Nothing is opening, syncing, indexing, loading, being read, being saved or checking for
+    /// updates: automation's `settled`.
     pub fn is_settled(&self, cx: &App) -> bool {
-        self.is_quiet(cx) && self.settings.read(cx).is_settled()
+        self.is_quiet(cx)
+            && self.settings.read(cx).is_settled()
+            && !self.updates.read(cx).is_checking()
     }
 
     /// Nothing runs on the archive: it opened or failed to, and nothing syncs, indexes,
@@ -160,7 +164,14 @@ pub fn init(config: ServicesConfig, cx: &mut App) {
         config.settings.data_dir.join(settings::ARCHIVE_FOLDER),
         config.settings.unreadable.clone(),
     );
-    let settings = cx.new(|cx| SettingsService::new(config.settings, config.mode_override, cx));
+    let settings = cx.new(|cx| {
+        SettingsService::new(
+            config.settings,
+            config.mode_override,
+            config.install_root,
+            cx,
+        )
+    });
     /* An archive is made without asking only in its default place (PLAN D3): a folder the
     owner chose that holds none now is one that can't be reached (PLAN §4.4). Settings that
     can't be read say neither, so nothing is opened. */

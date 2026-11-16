@@ -42,7 +42,7 @@ pub mod system;
 #[cfg(test)]
 mod test_support;
 pub mod theme;
-pub mod updates;
+pub mod update_line;
 pub mod version;
 
 pub use assets::Assets;

@@ -15,6 +15,10 @@
 //! show comes from the services: the app's settings ([`crate::services::SettingsService`]), the
 //! archive's upkeep ([`crate::services::UpkeepService`]) and sync's own settings. Nothing here
 //! opens anything outside scrollback but through [`crate::system`].
+//!
+//! **The version** sits at the column's foot, under the sections, with the line on
+//! scrollback's own updates under it and Restart to update once one is ready
+//! ([`crate::update_line`]).
 
 mod appearance;
 mod archive;
@@ -112,13 +116,17 @@ pub struct SettingsPage {
     cancel_focus: FocusHandle,
     /// While the confirmation is open: where the keyboard was before it.
     confirm_back: Option<Option<FocusHandle>>,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 3],
 }
 
 impl SettingsPage {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let services = cx.services();
-        let (stale_sync, settings) = (services.sync.clone(), services.settings.clone());
+        let (stale_sync, settings, updates) = (
+            services.sync.clone(),
+            services.settings.clone(),
+            services.updates.clone(),
+        );
         let days = stale_sync.read(cx).stale_after_days();
         let stale_after = cx.new(|cx| {
             InputState::new(window, cx)
@@ -145,6 +153,9 @@ impl SettingsPage {
                         this.take_stale_after(window, cx);
                     }
                 }),
+                /* The update line under the version. The service is the app's, kept when the
+                app moves onto another archive. */
+                cx.observe(&updates, |_, _, cx| cx.notify()),
             ],
             scroll: ScrollHandle::new(),
             picked: None,
@@ -587,6 +598,17 @@ impl Render for SettingsPage {
                                                 })
                                         },
                                     ))
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .w_full()
+                                            .max_w(column)
+                                            .pt(theme.spacing.lg)
+                                            .border_t_1()
+                                            .border_color(theme.colors.line_subtle)
+                                            .debug_selector(|| "settings-version".into())
+                                            .child(crate::update_line::render(cx)),
+                                    )
                                     .automation_target("settings/column"),
                             ),
                     ),

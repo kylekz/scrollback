@@ -349,14 +349,25 @@ pub struct SettingsService {
     /// Whether Settings is shown in the main area.
     shown: bool,
     switch: Option<Switch>,
+    /// The installer's folder, in an installed copy: its uninstaller removes it, so no
+    /// archive may be there ([`Self::refusal`]).
+    install_root: Option<PathBuf>,
     _quit: Subscription,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsService {}
 
 impl SettingsService {
-    /// The settings `loaded`, with `mode_override` for light or dark this run, if any.
-    pub fn new(loaded: Loaded, mode_override: Option<Mode>, cx: &mut Context<Self>) -> Self {
+    /**
+     * The settings `loaded`, with `mode_override` for light or dark this run, if any, in an
+     * install whose installer owns `install_root`, if it is one.
+     */
+    pub fn new(
+        loaded: Loaded,
+        mode_override: Option<Mode>,
+        install_root: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             path: loaded.data_dir.join(SETTINGS_FILE),
             data_dir: loaded.data_dir,
@@ -370,6 +381,7 @@ impl SettingsService {
             save_failure: None,
             shown: false,
             switch: None,
+            install_root,
             _quit: cx.on_app_quit(|this: &mut Self, _| {
                 this.flush();
                 async {}
@@ -497,14 +509,32 @@ impl SettingsService {
         }
     }
 
+    /// An installer's folder in tests, in place of a real install's.
+    #[cfg(test)]
+    pub fn set_install_root(&mut self, root: PathBuf) {
+        self.install_root = Some(root);
+    }
+
     /**
-     * Why `folder` can't be the archive's at all, before it is looked into: the archive open
-     * now, or a folder inside it. With no archive open, any folder may be tried.
+     * Why `folder` can't be the archive's at all, before it is looked into: a folder inside
+     * the installer's, which its uninstaller removes (Locate and Use a different folder… alike,
+     * with an archive open or not), the archive open now, or a folder inside it.
      */
     pub fn refusal(&self, folder: &Path, cx: &gpui::App) -> Option<&'static str> {
+        let chosen = resolved(folder);
+        if self
+            .install_root
+            .as_deref()
+            .is_some_and(|root| chosen.starts_with(resolved(root)))
+        {
+            return Some(
+                "That folder is inside scrollback's install folder, which uninstalling removes. \
+                 Choose one outside it.",
+            );
+        }
         let archive = cx.services().archive.read(cx);
         archive.archive()?;
-        let (current, chosen) = (resolved(archive.dir()), resolved(folder));
+        let current = resolved(archive.dir());
         if chosen == current {
             Some("That is the archive open now.")
         } else if chosen.starts_with(&current) {

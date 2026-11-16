@@ -578,6 +578,9 @@ pub enum Leave {
     /// Closing the window.
     Close,
     Quit,
+    /// Restart to update (`crate::services::updates`): the installer takes the update and the
+    /// app quits.
+    Restart,
 }
 
 /**
@@ -1412,7 +1415,8 @@ impl LibraryService {
         self.hold.as_ref().map(|(folder, _)| *folder)
     }
 
-    /// Asks before closing the window or quitting, while the paths editor has changes to save.
+    /// Asks before closing the window, quitting or restarting to update, while the paths editor
+    /// has changes to save.
     pub fn ask_before(&mut self, leave: Leave, cx: &mut Context<Self>) {
         self.asked = Some(leave);
         cx.notify();
@@ -1435,7 +1439,9 @@ impl LibraryService {
                 Leave::Show(shelf) => self.show(shelf, cx),
                 Leave::Open(session, at) => self.open_at(*session, at, cx),
                 Leave::Edit(folder) => self.edit_paths(folder, cx),
-                leave @ (Leave::Close | Leave::Quit) => cx.emit(LibraryEvent::Leave(leave)),
+                leave @ (Leave::Close | Leave::Quit | Leave::Restart) => {
+                    cx.emit(LibraryEvent::Leave(leave));
+                }
             }
         }
         cx.notify();

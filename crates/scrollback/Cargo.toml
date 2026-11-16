@@ -55,11 +55,24 @@ gpui_platform = { workspace = true, features = ["font-kit", "runtime_shaders"] }
 mimalloc = { version = "0.1", default-features = false }
 # mimalloc's own calls: `mi_collect`, which hands back what it holds free (`main.rs`).
 libmimalloc-sys = { version = "0.1", features = ["extended"] }
+# The other scrollback processes running from the app bundle, which applying an update ends
+# (`processes.rs`).
+libc.workspace = true
 
 # Velopack, where scrollback is packaged: the installer's hooks and an installed copy's updates
 # (`installer.rs`, `updates.rs`).
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 velopack.workspace = true
+
+# The other scrollback processes running from an install, which applying an update ends
+# (`processes.rs`), and the message box a windows-subsystem build reports with (`fatal.rs`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # scrollback.exe's icon and version resource on Windows (`build.rs`); a no-op elsewhere.
 [build-dependencies]
@@ -67,3 +80,4 @@ embed-resource.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
+tempfile.workspace = true

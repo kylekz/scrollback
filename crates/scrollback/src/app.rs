@@ -19,8 +19,8 @@ use crate::cli::Cli;
 /// Starts the app and blocks until it quits.
 ///
 /// Errors before the app starts are returned, for `main` to report. A failure during startup
-/// inside the app (the window can't open, the fonts don't load) is logged where it happens and
-/// ends the process there with status 1: `Application::run` can't hand an error back, and on
+/// inside the app (the window can't open, the fonts don't load) is reported where it happens
+/// (`crate::fatal`) and ends the process there with status 1: `Application::run` can't hand an error back, and on
 /// macOS a quit ends the process with status 0 without ever returning here.
 pub fn run(cli: Cli) -> Result<()> {
     #[cfg(feature = "automation")]
@@ -32,6 +32,16 @@ pub fn run(cli: Cli) -> Result<()> {
     if cli.dev_location_home.is_some() {
         crate::data_dir::for_development(&place)?;
     }
+    #[cfg(any(windows, target_os = "macos"))]
+    let install_root = crate::installer::root();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let install_root = None;
+    crate::data_dir::outside_install(&place.dir, install_root.as_deref())?;
+    /* A panic's report goes beside the app's other files; under automation the runner keeps
+    stderr, where the default hook writes it. */
+    if !automation {
+        crate::crash::install(&place.dir);
+    }
     log::info!(
         "data directory: {} ({})",
         place.dir.display(),
@@ -42,8 +52,8 @@ pub fn run(cli: Cli) -> Result<()> {
         .with_assets(sb_ui::Assets)
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(move |cx| {
-            if let Err(error) = start(cli, place.dir, updater, cx) {
-                log::error!("scrollback couldn't start: {error:#}");
+            if let Err(error) = start(cli, place.dir, updater, install_root, cx) {
+                crate::fatal::report(&error);
                 std::process::exit(1);
             }
         });
@@ -53,11 +63,17 @@ pub fn run(cli: Cli) -> Result<()> {
 /**
  * Opens the main window as `cli` asks. `data_dir` is where this run keeps its files: the
  * app's settings, and the archive unless they name another folder, made there on the first
- * run (PLAN D3). `updater` looks for scrollback's own updates, in an installed copy
- * (`crate::updates`).
+ * run (PLAN D3). `updater` looks for scrollback's own updates, and `install_root` is the
+ * installer's folder, in an installed copy (`crate::updates`, `crate::installer`).
  */
 #[cfg_attr(not(feature = "automation"), expect(unused_variables))]
-fn start(cli: Cli, data_dir: PathBuf, updater: Updater, cx: &mut App) -> Result<()> {
+fn start(
+    cli: Cli,
+    data_dir: PathBuf,
+    updater: Updater,
+    install_root: Option<PathBuf>,
+    cx: &mut App,
+) -> Result<()> {
     sb_ui::init(cx)?;
     #[cfg(target_os = "macos")]
     cx.set_global(sb_ui::system::GiveBack(crate::give_back));
@@ -109,6 +125,7 @@ fn start(cli: Cli, data_dir: PathBuf, updater: Updater, cx: &mut App) -> Result<
             providers: sb_core::provider::builtin(),
             reach,
             updater,
+            install_root,
         },
         cx,
     );

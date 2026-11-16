@@ -114,9 +114,13 @@
 //!   `output/<n>`, `diff` or `fetched`; `null` while Find is closed), whether the `facts` show,
 //!   whose `history` is open (a file's key), the version read for a look (`viewing`, its
 //!   number) and whether an image shows full size (`full_image`).
-//! - `update`: scrollback's own updates, `off` under automation with the reason
-//!   (`development`, or `automation` for a packaged build): a scripted run never looks for
-//!   one (`crate::updates`).
+//! - `update`: scrollback's own updates. `off`, with the reason, under automation
+//!   (`development`, or `automation` for a packaged build): a scripted run never looks for one
+//!   (`crate::updates`) until `update_ready` stands one in; then `null`. With the stand-in:
+//!   the version `ready`, whether it is `checking`, the last check (`checked`: `up_to_date`,
+//!   `ready` with its `version` or `failed` with its `error`), how many others Restart to
+//!   update asks about (`confirm`), whether it is `restarting`, whether the stand-in took the
+//!   update (`restarted`) and why a restart failed (`failure`).
 //!
 //! Commands. An argument a command doesn't have is an error, so a misspelt one never passes
 //! for a change. These reply with `state.appearance` after the change:
@@ -129,6 +133,12 @@
 //! And this with `state.system`:
 //! - `answer_picker {folder}` answers the next folder picker with `folder`, or cancels it
 //!   with `null`.
+//!
+//! And this with `state.update`:
+//! - `update_ready {version, fail?, others?}` stands a scripted feed in for Velopack (never
+//!   the network) and checks it at once: `version` is downloaded and ready; Restart to update
+//!   then records the restart in `restarted`, or fails with `fail`, and asks first about
+//!   `others` processes running from the install (none unless given).
 //!
 //! And these with `state.sync`, for a scenario that needs a pass in a known state whatever
 //! the machine's speed:
@@ -168,8 +178,8 @@ use sb_ui::services::settings::Switch;
 use sb_ui::services::sync::{Refetch, TestFailure, TestState};
 use sb_ui::services::upkeep::{Fix, Standing};
 use sb_ui::services::{
-    ActiveServices as _, Answer as Searched, ArchiveState, Dragged, DropTarget, Failure, Held,
-    LocationStatus, Page, Reach, ReadAt, ReaderState, Verdict,
+    ActiveServices as _, Answer as Searched, ArchiveState, CheckResult, Dragged, DropTarget,
+    Failure, Held, LocationStatus, Page, Reach, ReadAt, ReaderState, Verdict,
 };
 use sb_ui::system::{self, SystemRequest};
 use serde::Deserialize;
@@ -229,9 +239,7 @@ impl AutomationHost for ScrollbackAutomation {
                     "dialog": sheet.dialog(),
                 })
             }),
-            "update": {
-                "off": cx.services().updates.read(cx).off().map(|off| off.key()),
-            },
+            "update": update(cx),
         })
     }
 
@@ -248,6 +256,7 @@ impl AutomationHost for ScrollbackAutomation {
             "release_sync",
             "stand_in",
             "answer_picker",
+            "update_ready",
         ]
     }
 
@@ -285,6 +294,29 @@ impl AutomationHost for ScrollbackAutomation {
                     Ok(json!(system::requests(cx).len()))
                 })
                 .map_err(|error| serde_json::Error::io(std::io::Error::other(error.to_string()))),
+            "update_ready" => serde_json::from_value(args).map(
+                |UpdateReady {
+                     version,
+                     fail,
+                     others,
+                 }| {
+                    let updater = crate::updates::real(
+                        Arc::new(ScriptedFeed {
+                            version,
+                            fail,
+                            downloaded: Mutex::new(false),
+                        }),
+                        Box::new(move || others),
+                        |_| {},
+                    );
+                    let updates = cx.services().updates.clone();
+                    updates.update(cx, |updates, cx| {
+                        updates.set_updater(updater, cx);
+                        updates.check_now(cx);
+                    });
+                    update(cx)
+                },
+            ),
             "hold_sync" => serde_json::from_value(args).map(|HoldSync { after }| {
                 service.update(cx, |sync, _| sync.hold_after(after, Held::Pause));
                 sync(cx)
@@ -317,6 +349,62 @@ impl AutomationHost for ScrollbackAutomation {
             _ => return None,
         };
         Some(result.with_context(|| format!("{cmd}'s arguments")))
+    }
+}
+
+/// `state.update`.
+fn update(cx: &App) -> Value {
+    let updates = cx.services().updates.read(cx);
+    json!({
+        "off": updates.off().map(|off| off.key()),
+        "ready": updates.ready(),
+        "checking": updates.is_checking(),
+        "checked": updates.last_check().map(|check| match &check.result {
+            CheckResult::UpToDate => json!({"result": "up_to_date"}),
+            CheckResult::Ready(version) => json!({"result": "ready", "version": version}),
+            CheckResult::Failed(error) => json!({"result": "failed", "error": error}),
+        }),
+        "confirm": updates.confirm(),
+        "restarting": updates.is_restarting(),
+        "restarted": updates.is_restarted(),
+        "failure": updates.failure(),
+    })
+}
+
+/**
+ * `update_ready`'s feed: `version` is the newest, downloaded when asked; applying it records
+ * nothing of its own (the service keeps `restarted`) or fails with `fail`. Nothing of it
+ * reaches the network or the disk.
+ */
+struct ScriptedFeed {
+    version: String,
+    fail: Option<String>,
+    downloaded: Mutex<bool>,
+}
+
+impl crate::updates::Releases for ScriptedFeed {
+    fn pending(&self) -> Option<String> {
+        (*self
+            .downloaded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner))
+        .then(|| self.version.clone())
+    }
+
+    fn newer(&self) -> Result<Option<String>, String> {
+        Ok(Some(self.version.clone()))
+    }
+
+    fn download(&self) -> Result<(), String> {
+        *self
+            .downloaded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = true;
+        Ok(())
+    }
+
+    fn apply(&self) -> Result<(), String> {
+        self.fail.clone().map_or(Ok(()), Err)
     }
 }
 
@@ -770,6 +858,16 @@ struct AnswerPicker {
     /// `null` cancels the picker. Required, as `pin_appearance`'s argument is.
     #[serde(deserialize_with = "Option::deserialize")]
     folder: Option<PathBuf>,
+}
+
+/// `update_ready {"version": …, "fail"?: …, "others"?: n}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateReady {
+    version: String,
+    fail: Option<String>,
+    #[serde(default)]
+    others: usize,
 }
 
 /// `hold_sync {"after": items}`.

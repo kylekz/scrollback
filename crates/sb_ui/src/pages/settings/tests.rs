@@ -472,3 +472,55 @@ fn a_dialog_over_settings_keeps_the_keyboard(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_ne!(showing(cx), Showing::Settings);
 }
+
+/**
+ * The version at the column's foot, and Restart to update under it once an update is ready:
+ * clicked, the installer takes the update.
+ */
+#[gpui::test]
+fn restart_to_update_shows_under_the_version_once_an_update_is_ready(cx: &mut TestAppContext) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::services::updates::{FIRST_CHECK_AFTER, Real, Updater};
+
+    let (shell, cx) = open_settings(cx);
+    let page = page(&shell, cx);
+    let scroll_down = |cx: &mut VisualTestContext| {
+        page.update(cx, |page, cx| {
+            page.scroll.scroll_to_bottom();
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    scroll_down(cx);
+    assert!(bounds(cx, "settings-version").is_some());
+    assert!(
+        bounds(cx, "settings/restart-to-update").is_none(),
+        "a development build has none"
+    );
+
+    let restarts = Arc::new(AtomicUsize::new(0));
+    let counted = restarts.clone();
+    let updates = cx.update(|_, cx| cx.services().updates.clone());
+    updates.update(cx, |updates, cx| {
+        updates.set_updater(
+            Updater::Real(Real {
+                check: Arc::new(|| Box::pin(async { Ok(Some("0.2.0".to_string())) })),
+                restart: Box::new(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+                others: Box::new(|| 0),
+                then: |_| {},
+            }),
+            cx,
+        )
+    });
+    cx.executor().advance_clock(FIRST_CHECK_AFTER);
+    cx.run_until_parked();
+    scroll_down(cx);
+    click(cx, "settings/restart-to-update");
+    assert_eq!(restarts.load(Ordering::SeqCst), 1);
+    updates.read_with(cx, |updates, _| assert!(updates.is_restarted()));
+}

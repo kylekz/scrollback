@@ -233,6 +233,11 @@ impl Shell {
                     match leave {
                         Leave::Close => window.remove_window(),
                         Leave::Quit => cx.quit(),
+                        Leave::Restart => cx
+                            .services()
+                            .updates
+                            .clone()
+                            .update(cx, |updates, cx| updates.hand_over(cx)),
                         Leave::Show(_) | Leave::Open(..) | Leave::Edit(_) => {}
                     }
                 }

@@ -86,6 +86,24 @@ fn choose(
 }
 
 /**
+ * Refuses a data folder inside the installer's (`install_root`, in an installed copy), which
+ * its uninstaller removes with whatever is in it: the settings file and the archive with them.
+ */
+pub fn outside_install(dir: &Path, install_root: Option<&Path>) -> Result<()> {
+    let Some(root) = install_root else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        !sb_core::archive::resolved(dir).starts_with(sb_core::archive::resolved(root)),
+        "the data folder {} is inside scrollback's install folder {}, which uninstalling \
+         removes: pass --data-dir or SCROLLBACK_DATA_DIR naming a folder outside it",
+        dir.display(),
+        root.display()
+    );
+    Ok(())
+}
+
+/**
  * Whether `place` may be the data dir of a run with the development override
  * (`--dev-location-home`), which archives generated data under real distros and hosts: only
  * a data dir named for it, and never scrollback's own data folder, so that nothing of the
@@ -208,6 +226,19 @@ mod tests {
         assert!(refused(r"C:\Users\user\AppData\Local\.\scrollback\"));
         assert!(!refused(r"D:\Projects\scratch"));
         assert!(!refused(r"C:\Users\user\AppData\Local\scrollback-dev"));
+    }
+
+    #[test]
+    fn a_data_folder_inside_the_install_is_refused() {
+        let install = tempfile::tempdir().unwrap();
+        let root = install.path().join("scrollback-app");
+        std::fs::create_dir_all(root.join("current")).unwrap();
+        for inside in [root.clone(), root.join("current"), root.join("data")] {
+            assert!(outside_install(&inside, Some(&root)).is_err(), "{inside:?}");
+        }
+        let beside = install.path().join("scrollback");
+        assert!(outside_install(&beside, Some(&root)).is_ok());
+        assert!(outside_install(&root, None).is_ok(), "not installed");
     }
 
     #[test]

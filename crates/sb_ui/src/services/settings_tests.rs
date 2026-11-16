@@ -476,6 +476,41 @@ fn a_folder_that_holds_something_else_is_refused_and_the_app_stays(cx: &mut Test
     assert_eq!(load(current.parent().unwrap()).settings.archive, None);
 }
 
+/// No archive goes inside the installer's folder, which uninstalling removes: not one there
+/// already, nor an empty folder to make one in.
+#[gpui::test]
+fn a_folder_inside_the_install_is_refused(cx: &mut TestAppContext) {
+    init_library(cx);
+    let current = archive_dir(cx);
+    let install = tempfile::tempdir().unwrap();
+    let inside = install.path().join("current").join("archive");
+    std::fs::create_dir_all(&inside).unwrap();
+    Archive::create(&install.path().join("packages")).unwrap();
+    settings(cx).update(cx, |settings, _| {
+        settings.set_install_root(install.path().to_path_buf())
+    });
+    for folder in [
+        install.path().to_path_buf(),
+        inside.clone(),
+        install.path().join("packages"),
+    ] {
+        let why = refused(&folder, cx);
+        assert!(
+            why.as_deref()
+                .is_some_and(|why| why.contains("scrollback's install folder")),
+            "{folder:?}: {why:?}"
+        );
+        cx.update(|cx| assert_eq!(cx.services().archive.read(cx).dir(), current));
+    }
+    assert_eq!(
+        std::fs::read_dir(&inside).unwrap().count(),
+        0,
+        "nothing made"
+    );
+    let elsewhere = tempfile::tempdir().unwrap();
+    assert_eq!(refused(elsewhere.path(), cx), None);
+}
+
 /// Why using `folder` was refused, if it was.
 fn refused(folder: &Path, cx: &mut TestAppContext) -> Option<String> {
     let settings = settings(cx);

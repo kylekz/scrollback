@@ -93,6 +93,8 @@ dirs = "6"
 # Windows only: the scrollback binary's icon and version resource (`crates/scrollback/build.rs`).
 embed-resource = "3.0"
 env_logger = "0.11"
+# macOS only: the other processes running from an install (`crates/scrollback/src/processes.rs`).
+libc = "0.2"
 # The size of an image in a transcript, read from its header before gpui decodes it
 # (`sb_ui::services::reader`); gpui's own pin, the formats a transcript holds.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
