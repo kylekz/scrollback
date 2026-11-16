@@ -109,10 +109,43 @@ pub fn what_is_in(dir: &Path) -> Result<Holds> {
     Ok(Holds::Nothing)
 }
 
+/**
+ * `path` as the file system knows it: absolute, with what exists of it resolved (links, `..`,
+ * the case a folder is spelt in), and the rest as given. Two spellings of one folder resolve
+ * alike.
+ */
+pub fn resolved(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    absolute
+        .ancestors()
+        .find_map(|there| {
+            let found = plain(fs::canonicalize(there).ok()?);
+            Some(match absolute.strip_prefix(there) {
+                Ok(rest) if !rest.as_os_str().is_empty() => found.join(rest),
+                _ => found,
+            })
+        })
+        .unwrap_or(absolute)
+}
+
+/// `path` without the `\\?\` that resolving a path with a drive letter gives it on Windows.
+fn plain(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(rest) = path
+        .to_str()
+        .and_then(|text| text.strip_prefix(r"\\?\"))
+        .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
+    {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
 /// The archive `dir`, absolute, is inside, if it is inside one: the nearest folder above it
-/// that holds an `archive.json`.
+/// that holds an `archive.json`, a link into an archive seen through.
 pub(super) fn archive_around(dir: &Path) -> Option<PathBuf> {
-    dir.ancestors()
+    resolved(dir)
+        .ancestors()
         .skip(1)
         .find(|folder| folder.join(layout::MANIFEST).is_file())
         .map(Path::to_path_buf)

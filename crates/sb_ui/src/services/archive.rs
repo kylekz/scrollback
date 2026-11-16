@@ -110,6 +110,15 @@ impl ArchiveService {
         }
     }
 
+    /// Gives up the archive, open no more here: the app has moved onto another
+    /// (`super::reopen`), which drops it off the UI thread.
+    pub(super) fn give_up(&mut self) -> Option<Arc<Archive>> {
+        match std::mem::replace(&mut self.state, ArchiveState::Opening) {
+            ArchiveState::Open(archive) => Some(archive),
+            _ => None,
+        }
+    }
+
     /// Tries again to open an archive that failed to. Not when the settings couldn't be read:
     /// only the owner's choice of an archive settles that.
     pub fn retry(&mut self, cx: &mut Context<Self>) {

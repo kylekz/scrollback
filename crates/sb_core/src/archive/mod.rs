@@ -48,7 +48,7 @@ pub use items::ArchivedSession;
 pub(crate) use layout::item_folder;
 pub use segment::{Problem, SEGMENT_BYTES, VersionReader};
 pub(crate) use segment::{RangeWriter, Sealed};
-pub use stats::{ArchiveStats, Holds, id_in, open_or_make, what_is_in};
+pub use stats::{ArchiveStats, Holds, id_in, open_or_make, resolved, what_is_in};
 pub(crate) use verify::LAST_VERIFY_VERSION;
 pub use verify::{
     Damage, DamageKind, DamageRecord, KEPT_DAMAGES, LastVerify, Unread, VerifyProgress,
@@ -210,6 +210,20 @@ impl Archive {
     /// nor what is left of one.
     pub fn create(dir: &Path) -> Result<Self> {
         let dir = &absolute(dir)?;
+        let manifest_path = dir.join(layout::MANIFEST);
+        /* The refusals that look at the folder alone come first: what is left of an archive
+        is refused without walking its files. */
+        let refusal = |dir: &Path| {
+            if manifest_path.exists() {
+                return Some(ArchiveError::AlreadyAnArchive(dir.to_path_buf()));
+            }
+            fs::read_dir(dir.join(layout::FILES))
+                .is_ok_and(|mut entries| entries.next().is_some())
+                .then(|| ArchiveError::HoldsAnArchivesFiles(dir.to_path_buf()))
+        };
+        if let Some(refused) = refusal(dir) {
+            return Err(refused);
+        }
         if let Some(other) = stats::archive_around(dir).or_else(|| stats::archive_within(dir)) {
             return Err(ArchiveError::Nested {
                 dir: dir.to_path_buf(),
@@ -218,14 +232,9 @@ impl Archive {
         }
         fs::create_dir_all(dir).map_err(io_error("create", dir))?;
         let lock = lock(dir)?;
-        let manifest_path = dir.join(layout::MANIFEST);
-        if manifest_path.exists() {
-            return Err(ArchiveError::AlreadyAnArchive(dir.to_path_buf()));
-        }
-        let holds_files =
-            fs::read_dir(dir.join(layout::FILES)).is_ok_and(|mut entries| entries.next().is_some());
-        if holds_files {
-            return Err(ArchiveError::HoldsAnArchivesFiles(dir.to_path_buf()));
+        /* Again under the lock: another scrollback may have made one meanwhile. */
+        if let Some(refused) = refusal(dir) {
+            return Err(refused);
         }
         let (catalogue, tmp) = Self::prepare(dir)?;
         /* A catalogue that is here already is what a create that was cut short left, with

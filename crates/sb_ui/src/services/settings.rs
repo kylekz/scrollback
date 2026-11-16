@@ -25,11 +25,11 @@
 
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use gpui::{AppContext as _, Context, EventEmitter, Subscription, Task};
-use sb_core::archive::{self, Archive};
+use sb_core::archive::{self, Archive, resolved};
 use serde_json::{Map, Value, json};
 
 use super::ActiveServices as _;
@@ -300,6 +300,17 @@ fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Writes `text`, the settings as of `generation`, unless the file holds a later generation
+/// already.
+fn write_newer(on_disk: &Mutex<u64>, path: &Path, generation: u64, text: &str) -> io::Result<()> {
+    let mut newest = on_disk.lock().unwrap_or_else(PoisonError::into_inner);
+    if *newest < generation {
+        write_atomically(path, text)?;
+        *newest = generation;
+    }
+    Ok(())
+}
+
 /// A different folder being opened as the archive (the module docs).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Switch {
@@ -328,6 +339,9 @@ pub struct SettingsService {
     generation: u64,
     /// The newest generation written.
     written: u64,
+    /// The generation of the file on disk, which a write takes while it writes: one that
+    /// started first never replaces one that started later (the quit's, say).
+    on_disk: Arc<Mutex<u64>>,
     saving: Option<Task<()>>,
     /// Why the last write failed, until one succeeds. What is unwritten is tried again with
     /// the next change, and at quit.
@@ -351,6 +365,7 @@ impl SettingsService {
             mode_override,
             generation: 0,
             written: 0,
+            on_disk: Arc::default(),
             saving: None,
             save_failure: None,
             shown: false,
@@ -400,6 +415,9 @@ impl SettingsService {
     pub fn show(&mut self, shown: bool, cx: &mut Context<Self>) {
         if self.shown != shown {
             self.shown = shown;
+            if !shown {
+                self.save(cx);
+            }
             cx.notify();
         }
     }
@@ -468,12 +486,14 @@ impl SettingsService {
     }
 
     /// Keeps how big the archive open now is, once Settings has measured it.
-    pub fn remember_size(&mut self, id: &str, bytes: u64, cx: &mut Context<Self>) {
+    /// It is written when Settings closes, with the next change, or at quit, not with every
+    /// measure.
+    pub fn remember_size(&mut self, id: &str, bytes: u64) {
         if let Some(last) = self.settings.last.as_mut().filter(|last| last.id == id)
             && last.bytes != Some(bytes)
         {
             last.bytes = Some(bytes);
-            self.changed(cx);
+            self.generation += 1;
         }
     }
 
@@ -514,21 +534,22 @@ impl SettingsService {
             return;
         }
         self.switch = Some(Switch::Opening(folder.clone()));
+        super::pause(true, cx);
         cx.notify();
-        let opening = cx.background_spawn({
-            let folder = folder.clone();
-            async move { archive::open_or_make(&folder) }
-        });
+        let opening =
+            cx.background_spawn({
+                let folder = folder.clone();
+                async move {
+                    archive::open_or_make(&folder).map_err(|error| why_refused(&folder, &error))
+                }
+            });
         cx.spawn(async move |this, cx| {
             let opened = opening.await;
             this.update(cx, |this, cx| match opened {
                 Ok(archive) => this.reopen(archive, cx),
-                Err(error) => {
-                    log::warn!("{} wasn't opened as the archive: {error}", folder.display());
-                    this.switch = Some(Switch::Refused {
-                        why: why_refused(&folder, &error),
-                        folder,
-                    });
+                Err(why) => {
+                    super::pause(false, cx);
+                    this.switch = Some(Switch::Refused { why, folder });
                     cx.notify();
                 }
             })
@@ -579,7 +600,9 @@ impl SettingsService {
         }
         let (path, generation, text) =
             (self.path.clone(), self.generation, self.settings.to_json());
-        let write = cx.background_spawn(async move { write_atomically(&path, &text) });
+        let on_disk = self.on_disk.clone();
+        let write =
+            cx.background_spawn(async move { write_newer(&on_disk, &path, generation, &text) });
         self.saving = Some(cx.spawn(async move |this, cx| {
             let written = write.await;
             this.update(cx, |this, cx| {
@@ -604,7 +627,8 @@ impl SettingsService {
     /// Writes what is unwritten, now: the app is quitting.
     fn flush(&mut self) {
         if self.written != self.generation && self.unreadable.is_none() {
-            match write_atomically(&self.path, &self.settings.to_json()) {
+            let text = self.settings.to_json();
+            match write_newer(&self.on_disk, &self.path, self.generation, &text) {
                 Ok(()) => self.written = self.generation,
                 Err(error) => log::error!("the settings couldn't be saved at quit: {error}"),
             }
@@ -612,31 +636,10 @@ impl SettingsService {
     }
 }
 
-/**
- * `path` as the file system resolves it as far as it exists (links, `..`, and on Windows the
- * case of each name), the rest as it is written: so one folder compares equal however it was
- * reached, before it is made.
- */
-fn resolved(path: &Path) -> PathBuf {
-    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut rest = Vec::new();
-    let mut at = absolute.as_path();
-    loop {
-        if let Ok(found) = at.canonicalize() {
-            return rest.iter().rev().fold(found, |path, name| path.join(name));
-        }
-        match (at.parent(), at.file_name()) {
-            (Some(parent), Some(name)) => {
-                rest.push(name.to_owned());
-                at = parent;
-            }
-            _ => return absolute,
-        }
-    }
-}
-
-/// Why `folder` wasn't taken as the archive, for the owner.
+/// Why `folder` wasn't taken as the archive, for the owner; the error itself is logged. It
+/// looks at the folder, so it is called off the UI thread.
 pub fn why_refused(folder: &Path, error: &archive::ArchiveError) -> String {
+    log::warn!("{} wasn't taken as the archive: {error}", folder.display());
     match error {
         archive::ArchiveError::NotAnArchive(_) => format!(
             "{} holds other files, so no archive is made there. Choose an archive's folder or \
@@ -655,13 +658,17 @@ pub fn why_refused(folder: &Path, error: &archive::ArchiveError) -> String {
         archive::ArchiveError::Io { .. } if folder.is_file() => {
             "That's a file, not a folder.".to_string()
         }
-        archive::ArchiveError::Io { source, .. }
+        archive::ArchiveError::Io { action, source, .. }
             if matches!(
                 source.kind(),
                 io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
             ) =>
         {
-            "scrollback can't write to that folder.".to_string()
+            if matches!(*action, "read" | "list" | "resolve") {
+                "scrollback can't read that folder.".to_string()
+            } else {
+                "scrollback can't write to that folder.".to_string()
+            }
         }
         archive::ArchiveError::Io { action, path, .. } => {
             format!("scrollback couldn't {action} {}.", path.display())
@@ -738,6 +745,19 @@ mod tests {
         ] {
             assert!(AppSettings::parse(text).is_err(), "{text}");
         }
+    }
+
+    /// A write of an older snapshot that ends after a newer one (a background save after the
+    /// quit's) leaves the newer on disk.
+    #[test]
+    fn an_older_snapshot_never_replaces_a_newer_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, on_disk) = (dir.path().join(SETTINGS_FILE), Mutex::new(0));
+        write_newer(&on_disk, &path, 2, "newer").unwrap();
+        write_newer(&on_disk, &path, 1, "older").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "newer");
+        write_newer(&on_disk, &path, 3, "newest").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "newest");
     }
 
     #[test]

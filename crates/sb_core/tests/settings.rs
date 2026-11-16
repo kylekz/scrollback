@@ -10,8 +10,8 @@ use std::fs;
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::archive::{
-    Archive, ArchiveError, DamageKind, DamageRecord, Holds, Problem, VerifyProgress, id_in,
-    open_or_make, what_is_in,
+    Archive, ArchiveError, DamageKind, DamageRecord, Holds, KEPT_DAMAGES, Problem, VerifyProgress,
+    id_in, open_or_make, resolved, what_is_in,
 };
 use sb_core::catalogue::{CatalogueError, Reason};
 use sb_core::sync::{SyncError, refetch};
@@ -121,7 +121,7 @@ fn a_verify_that_runs_to_its_end_is_kept_with_what_it_found() {
 
 #[test]
 fn a_last_verify_kept_by_another_version_reads_as_none_and_a_stop_at_the_end_keeps_nothing() {
-    let (bench, _) = synced::<FileAgent>();
+    let (bench, key) = synced::<FileAgent>();
     let catalogue = bench.archive().catalogue();
     bench.archive().verify(&CancelToken::new()).unwrap();
     let kept = catalogue.setting("verify.last").unwrap().unwrap();
@@ -131,7 +131,9 @@ fn a_last_verify_kept_by_another_version_reads_as_none_and_a_stop_at_the_end_kee
         .unwrap();
     assert_eq!(catalogue.last_verify().unwrap(), None);
 
-    /* Stopped as it read its last version: nothing kept. */
+    /* Stopped as it read its last version: nothing kept, neither the record nor a mark on the
+    version it found damaged. */
+    damage(&bench, &key);
     let cancel = CancelToken::new();
     let stopped = bench.archive().verify_reporting(&cancel, &mut |progress| {
         if progress.segments_done == progress.segments && progress.segments > 0 {
@@ -140,6 +142,49 @@ fn a_last_verify_kept_by_another_version_reads_as_none_and_a_stop_at_the_end_kee
     });
     assert!(matches!(stopped, Err(ArchiveError::Cancelled)));
     assert_eq!(catalogue.last_verify().unwrap(), None);
+    assert!(bench.versions(&key).iter().all(|version| !version.damaged));
+}
+
+/// Every stored segment under `dir`'s `files/`, with a byte in its middle changed.
+fn damage_every_segment(dir: &std::path::Path) {
+    let mut folders = vec![dir.join("files")];
+    while let Some(folder) = folders.pop() {
+        for entry in fs::read_dir(folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                folders.push(path);
+            } else {
+                let mut bytes = fs::read(&path).unwrap();
+                let middle = bytes.len() / 2;
+                bytes[middle] ^= 0xff;
+                fs::write(&path, bytes).unwrap();
+            }
+        }
+    }
+}
+
+/// What is kept of a verify that found more than [`KEPT_DAMAGES`] problems: the first of them,
+/// and how many there were.
+#[test]
+fn a_verify_keeps_its_first_problems_and_counts_them_all() {
+    let mut agent = FileAgent::default();
+    for _ in 0..KEPT_DAMAGES + 5 {
+        agent.add_session(2);
+    }
+    let bench = Bench::new(agent);
+    bench.sync();
+    damage_every_segment(bench.dir());
+    let report = bench.archive().verify(&CancelToken::new()).unwrap();
+    assert_eq!(report.damaged.len(), KEPT_DAMAGES + 5);
+    let last = bench.archive().catalogue().last_verify().unwrap().unwrap();
+    assert_eq!(last.damaged_total, KEPT_DAMAGES + 5);
+    let kept: Vec<DamageRecord> = report
+        .damaged
+        .iter()
+        .take(KEPT_DAMAGES)
+        .map(DamageRecord::from)
+        .collect();
+    assert_eq!(last.damaged, kept);
 }
 
 #[test]
@@ -346,7 +391,7 @@ fn a_folder_opens_its_archive_gets_a_new_one_when_empty_and_refuses_anything_els
     for inside in [missing.join("tmp"), missing.join("files").join("new")] {
         assert_eq!(
             what_is_in(&inside).unwrap(),
-            Holds::InsideAnArchive(missing.clone())
+            Holds::InsideAnArchive(resolved(&missing))
         );
         assert!(matches!(
             open_or_make(&inside),
@@ -365,6 +410,23 @@ fn a_folder_opens_its_archive_gets_a_new_one_when_empty_and_refuses_anything_els
         Err(ArchiveError::Nested { .. })
     ));
     assert!(!around.join("archive.json").exists());
+    /* A link into an archive is seen through. */
+    #[cfg(unix)]
+    {
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(missing.join("files"), &link).unwrap();
+        assert!(matches!(
+            Archive::create(&link.join("new")),
+            Err(ArchiveError::Nested { .. })
+        ));
+    }
+    /* What is left of an archive is refused before anything below it is looked through. */
+    let remains = root.path().join("remains");
+    fs::create_dir_all(remains.join("files").join("location")).unwrap();
+    assert!(matches!(
+        Archive::create(&remains),
+        Err(ArchiveError::HoldsAnArchivesFiles(_))
+    ));
 
     /* Anything else is refused, and nothing is made in it. */
     let documents = root.path().join("documents");

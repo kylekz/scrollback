@@ -527,8 +527,8 @@ impl Render for SettingsPage {
                 .mt(theme.spacing.lg)
                 .max_w(column)
                 .child(div().flex_1().min_w_0().child(format!(
-                    "Your last change to Settings wasn't saved, and is lost when scrollback \
-                         quits unless a later change saves it: {}.",
+                    "Your last change to Settings wasn't saved: {}. scrollback tries again \
+                     with your next change, and when it quits.",
                     why.trim_end_matches('.')
                 )))
                 .automation_target("settings/unsaved")

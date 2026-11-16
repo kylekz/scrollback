@@ -15,7 +15,7 @@ use gpui::{
 };
 use gpui_component::FocusTrapElement as _;
 use sb_core::archive::{self, DamageKind, Holds};
-use sb_core::catalogue::Tombstone;
+use sb_core::catalogue::{Held, Tombstone};
 
 use super::{Chosen, SettingsPage, section_head};
 use crate::automation::AutomationTargetExt as _;
@@ -29,7 +29,7 @@ use crate::overlay::{self, Layer};
 use crate::services::ActiveServices as _;
 use crate::services::settings::Switch;
 use crate::services::sync::Refetch;
-use crate::services::upkeep::{Deleted, Fix, PROBLEMS_PAGE, Standing};
+use crate::services::upkeep::{Deleted, Fix, HeldBack, PROBLEMS_PAGE, Problem, Standing};
 use crate::system;
 use crate::theme::{SbTheme, StyledText as _};
 
@@ -677,7 +677,7 @@ impl SettingsPage {
      */
     fn fetch_all(
         &self,
-        problems: &[crate::services::upkeep::Problem],
+        problems: &[Problem],
         theme: &SbTheme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
@@ -768,14 +768,17 @@ impl SettingsPage {
     fn problem_row(
         &self,
         at: usize,
-        problem: &crate::services::upkeep::Problem,
+        problem: &Problem,
         theme: &SbTheme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &theme.colors;
         let services = cx.services();
         let opening = services.settings.read(cx).is_switching();
-        let refetch = services.sync.read(cx).refetch_of(&problem.damage).cloned();
+        let sync = services.sync.read(cx);
+        let refetch = sync.refetch_of(&problem.damage).cloned();
+        /* One item at a time is fetched again by hand, and none while Fetch all again runs. */
+        let can_fetch = !opening && sync.fetch_all_progress().is_none();
         let wrong = what_is_wrong(problem.damage.kind);
         /* A session's title comes from its transcript, which may be what is damaged. */
         let session = problem.session.as_ref().map(|session| {
@@ -832,10 +835,10 @@ impl SettingsPage {
                             SharedString::from(format!("settings-fetch-{at}")),
                             ButtonKind::Plain,
                             true,
-                            !opening,
+                            can_fetch,
                             theme,
                         )
-                        .when(!opening, |this| {
+                        .when(can_fetch, |this| {
                             this.on_click(cx.listener(move |_, _, _, cx| {
                                 let sync = cx.services().sync.clone();
                                 sync.update(cx, |sync, cx| sync.refetch(&damage, cx));
@@ -850,11 +853,21 @@ impl SettingsPage {
                 .text_spec(&theme.text.secondary)
                 .text_color(c.green)
                 .child(match held {
-                    /* PLAN §4.2: a shorter version is held back; the owner chooses which to read
-                    (the versions popover). */
-                    Some(reading) => {
+                    /* PLAN §4.2: a version that would lose what the copy read has is held
+                    back; the owner chooses which to read (the versions popover). */
+                    Some(HeldBack {
+                        why: Held::Shorter,
+                        reading,
+                    }) => {
                         format!("Fetched again as v{version} · held back, shorter than v{reading}")
                     }
+                    Some(HeldBack {
+                        why: Held::ParsesWorse,
+                        reading,
+                    }) => format!(
+                        "Fetched again as v{version} · held back, it parses worse than \
+                         v{reading}"
+                    ),
                     None => format!("Fetched again as v{version}"),
                 })
                 .automation_target(target("fetched")),
@@ -989,6 +1002,16 @@ impl SettingsPage {
     }
 }
 
+/// ` at 09:02` today, ` on 12 Nov at 09:02` another day.
+fn archived_when(at: i64, now: i64) -> String {
+    let day = format::day(at, now);
+    if day == format::day(now, now) {
+        format!(" at {}", format::clock(at))
+    } else {
+        format!(" on {day} at {}", format::clock(at))
+    }
+}
+
 /// What names a session deleted for good: where it ran, since its tombstone keeps nothing of
 /// what was said in it (PLAN §4.3), not even its title.
 fn named(tombstone: &Tombstone) -> String {
@@ -1047,8 +1070,7 @@ fn deleted_row(
             format!(
                 "Archived again by the sync of {}{}",
                 location.map_or("its location", |it| it.name.as_str()),
-                at.map(|at| format!(" at {}", format::clock(at)))
-                    .unwrap_or_default()
+                at.map(|at| archived_when(at, now)).unwrap_or_default()
             ),
             None,
         ),

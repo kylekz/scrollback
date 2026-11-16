@@ -54,7 +54,9 @@ impl Shell {
     ) -> AnyElement {
         let c = &theme.colors;
         let showing = Showing::now(cx);
-        let first_run = showing == Showing::FirstRun;
+        /* Settings over a first run keeps its title bar. */
+        let first_run = showing == Showing::FirstRun
+            || showing == Showing::Settings && cx.services().sync.read(cx).is_first_run();
         let has_library = showing.is_library();
         /* A first run shows only the gear, and that only in a folder the owner chose, to choose
         another. */

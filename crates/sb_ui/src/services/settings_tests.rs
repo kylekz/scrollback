@@ -634,6 +634,73 @@ fn two_fetchable(cx: &mut TestAppContext) -> Vec<sb_core::archive::DamageRecord>
     })
 }
 
+/// The last verify's problems are read a page at a time: the first, then more as asked, and
+/// how many are left.
+#[gpui::test]
+fn problems_are_shown_a_page_at_a_time(cx: &mut TestAppContext) {
+    let mut machine = sb_test_support::ProjectsTree::new();
+    let total = upkeep::PROBLEMS_PAGE + 5;
+    for at in 0..total {
+        machine.outlined(&Outline {
+            project: "/home/user/code/app",
+            title: &format!("Session {at}"),
+            prompt: "One of many.",
+            model: "model-a",
+            day: (2026, 11, 1 + (at % 28) as u32),
+            calls: 0,
+        });
+    }
+    crate::test_support::init(machine, cx);
+    cx.update(|cx| {
+        let sync = cx.services().sync.clone();
+        sync.update(cx, |sync, cx| sync.add_local(cx));
+    });
+    settle(cx);
+    let mut folders = vec![archive_dir(cx).join("files")];
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                folders.push(path);
+            } else {
+                let mut bytes = std::fs::read(&path).unwrap();
+                let middle = bytes.len() / 2;
+                bytes[middle] ^= 0xff;
+                std::fs::write(&path, bytes).unwrap();
+            }
+        }
+    }
+    let upkeep = cx.update(|cx| cx.services().upkeep.clone());
+    upkeep.update(cx, |upkeep, cx| upkeep.verify(cx));
+    settle(cx);
+    let shown = |cx: &mut TestAppContext| {
+        upkeep.read_with(cx, |upkeep, _| {
+            (upkeep.problems().len(), upkeep.more_problems())
+        })
+    };
+    assert_eq!(shown(cx), (upkeep::PROBLEMS_PAGE, 5));
+    upkeep.update(cx, |upkeep, cx| upkeep.show_more_problems(cx));
+    settle(cx);
+    assert_eq!(shown(cx), (total, 0));
+}
+
+/// A location being removed fetches nothing again.
+#[gpui::test]
+fn a_refetch_asked_for_while_its_location_is_removed_fails(cx: &mut TestAppContext) {
+    let damages = two_fetchable(cx);
+    let sync = cx.update(|cx| cx.services().sync.clone());
+    sync.update(cx, |sync, cx| {
+        sync.remove(&damages[0].location, cx);
+        sync.refetch(&damages[0], cx);
+        assert!(matches!(
+            sync.refetch_of(&damages[0]),
+            Some(Refetch::Failed(why)) if why.contains("was removed")
+        ));
+        assert!(!sync.is_refetching(&damages[0].location));
+    });
+    settle(cx);
+}
+
 #[gpui::test]
 fn fetch_all_again_fetches_each_in_turn(cx: &mut TestAppContext) {
     let damages = two_fetchable(cx);

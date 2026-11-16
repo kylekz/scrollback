@@ -93,11 +93,21 @@ impl UnavailablePage {
         open
     }
 
+    /// Forgets what was refused before: the owner is choosing again, and only what comes of
+    /// that is said.
+    fn choosing_again(&mut self, cx: &mut Context<Self>) {
+        self.refused = None;
+        let settings = cx.services().settings.clone();
+        settings.update(cx, |settings, cx| settings.dismiss_switch(cx));
+    }
+
     /**
      * Locate the archive…: a folder whose `archive.json` names the archive last open opens at
-     * once; one that holds another asks first; one that holds none is refused.
+     * once; one that holds another asks first, as one does when there is no id to compare
+     * with (settings written before ids were kept); one that holds none is refused.
      */
     fn locate(&mut self, cx: &mut Context<Self>) {
+        self.choosing_again(cx);
         let picked = system::pick_folder("Locate the archive", cx);
         cx.spawn(async move |this, cx| {
             let Ok(Some(folder)) = picked.await else {
@@ -106,7 +116,7 @@ impl UnavailablePage {
             let id = cx
                 .background_spawn({
                     let folder = folder.clone();
-                    async move { archive::id_in(&folder) }
+                    async move { archive::id_in(&folder).map_err(|error| why_refused(&folder, &error)) }
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -117,19 +127,16 @@ impl UnavailablePage {
                     .last
                     .as_ref()
                     .map(|last| last.id.clone());
-                this.refused = None;
-                match id {
-                    Ok(Some(id)) if Some(&id) == last.as_ref() => {
+                match (id, last) {
+                    (Ok(Some(id)), Some(last)) if id == last => {
                         settings.update(cx, |settings, cx| settings.use_folder(folder, cx));
                     }
-                    Ok(Some(_)) => this.asking = Some(Asking::Different(folder)),
-                    Ok(None) => {
+                    (Ok(Some(_)), Some(_)) => this.asking = Some(Asking::Different(folder)),
+                    (Ok(Some(_)), None) => this.asking = Some(Asking::Open(folder)),
+                    (Ok(None), _) => {
                         this.refused = Some(format!("{} holds no archive.", folder.display()));
                     }
-                    Err(error) => {
-                        log::warn!("{} wasn't looked into: {error}", folder.display());
-                        this.refused = Some(why_refused(&folder, &error));
-                    }
+                    (Err(why), _) => this.refused = Some(why),
                 }
                 cx.notify();
             })
@@ -140,6 +147,7 @@ impl UnavailablePage {
 
     /// Use a different folder…: what it holds, then the question (the module docs).
     fn choose(&mut self, cx: &mut Context<Self>) {
+        self.choosing_again(cx);
         let picked = system::pick_folder("Use this folder", cx);
         cx.spawn(async move |this, cx| {
             let Ok(Some(folder)) = picked.await else {
@@ -152,7 +160,6 @@ impl UnavailablePage {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.refused = None;
                 match looked {
                     Ok(Holds::Archive) => this.asking = Some(Asking::Open(folder)),
                     Ok(Holds::Nothing) => this.asking = Some(Asking::Make(folder)),
@@ -566,13 +573,126 @@ impl Render for UnavailablePage {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use gpui::{Entity, TestAppContext};
     use pretty_assertions::assert_eq;
+    use sb_core::archive::Archive;
 
     use super::*;
+    use crate::system::SystemShell;
+    use crate::test_support::{init_in, machine};
 
     #[test]
     fn an_archive_id_is_written_as_the_board_does() {
         assert_eq!(short_id("a3f061c2d4e5f6a7"), "a3f0 61c2");
         assert_eq!(short_id("a3f"), "a3f");
+    }
+
+    /// The app over settings that name an archive in a folder that isn't there, remembering
+    /// the archive `last` by its id when given, and the page that says so.
+    fn gone(last: Option<&str>, cx: &mut TestAppContext) -> Entity<UnavailablePage> {
+        let data = tempfile::tempdir().unwrap();
+        let mut settings = serde_json::json!({
+            "v": 1,
+            "archive": data.path().join("unplugged").join("Archive"),
+        });
+        if let Some(id) = last {
+            settings["last_archive"] =
+                serde_json::json!({ "id": id, "opened": 1_794_758_400_000_i64, "sessions": 3 });
+        }
+        std::fs::write(data.path().join("settings.json"), settings.to_string()).unwrap();
+        init_in(data, machine(), cx);
+        cx.update(|cx| system::install(SystemShell::scripted(), cx));
+        let failure = cx.update(|cx| match cx.services().archive.read(cx).state() {
+            ArchiveState::Failed(failure) => Some(failure.clone()),
+            _ => None,
+        });
+        assert_eq!(failure, Some(Failure::Missing { there: false }));
+        cx.new(UnavailablePage::new)
+    }
+
+    /// Locates `folder` and lets what comes of it settle.
+    fn locate(page: &Entity<UnavailablePage>, folder: &Path, cx: &mut TestAppContext) {
+        cx.update(|cx| system::queue_answer(Some(folder.to_path_buf()), cx).unwrap());
+        page.update(cx, |page, cx| page.locate(cx));
+        for _ in 0..10 {
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+        }
+    }
+
+    /// An archive in a folder of its own, closed again, and its id.
+    fn archive_elsewhere(root: &Path, name: &str) -> (std::path::PathBuf, String) {
+        let dir = root.join(name);
+        let id = Archive::create(&dir).unwrap().id().to_string();
+        (dir, id)
+    }
+
+    fn open_dir(cx: &mut TestAppContext) -> Option<std::path::PathBuf> {
+        cx.update(|cx| {
+            let archive = cx.services().archive.read(cx);
+            archive.archive().map(|_| archive.dir().to_path_buf())
+        })
+    }
+
+    #[gpui::test]
+    fn the_archive_located_by_its_id_opens_at_once(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, id) = archive_elsewhere(root.path(), "moved");
+        let page = gone(Some(&id), cx);
+        locate(&page, &dir, cx);
+        assert!(page.read_with(cx, |page, _| page.asking.is_none()));
+        assert_eq!(open_dir(cx), Some(std::path::absolute(&dir).unwrap()));
+    }
+
+    #[gpui::test]
+    fn another_archive_located_asks_first(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let (other, _) = archive_elsewhere(root.path(), "other");
+        let page = gone(Some("a3f061c27b1e4c2a9d4f0e5b8c1d2f30"), cx);
+        locate(&page, &other, cx);
+        assert_eq!(
+            page.read_with(cx, |page, _| page.asking.clone()),
+            Some(Asking::Different(other))
+        );
+        assert_eq!(open_dir(cx), None);
+    }
+
+    #[gpui::test]
+    fn a_folder_located_that_holds_no_archive_is_refused(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let page = gone(Some("a3f061c27b1e4c2a9d4f0e5b8c1d2f30"), cx);
+        locate(&page, root.path(), cx);
+        page.read_with(cx, |page, _| {
+            assert_eq!(page.asking, None);
+            assert!(
+                page.refused
+                    .as_deref()
+                    .is_some_and(|why| why.ends_with("holds no archive."))
+            );
+        });
+        assert_eq!(open_dir(cx), None);
+    }
+
+    /// Settings written before archives' ids were kept: there is nothing to compare, so the
+    /// archive found is offered as itself, not as a different one.
+    #[gpui::test]
+    fn with_no_id_remembered_the_archive_located_is_offered(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, _) = archive_elsewhere(root.path(), "moved");
+        let page = gone(None, cx);
+        locate(&page, &dir, cx);
+        assert_eq!(
+            page.read_with(cx, |page, _| page.asking.clone()),
+            Some(Asking::Open(dir.clone()))
+        );
+        page.update(cx, |page, cx| page.answer(cx));
+        for _ in 0..10 {
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+        }
+        assert_eq!(open_dir(cx), Some(std::path::absolute(&dir).unwrap()));
     }
 }

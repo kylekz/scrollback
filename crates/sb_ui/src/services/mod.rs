@@ -194,11 +194,10 @@ const QUIET_TICK: Duration = Duration::from_millis(20);
 /**
  * Moves the app onto `archive`, open already (Settings › Use a different folder…, PLAN §4.4):
  * every pass, index, refetch and verify on the archive open now is stopped and nothing new
- * starts on it; once nothing runs on it, and its background removal of deleted files is over
- * (off the UI thread, so that closing it never waits there), the services are made anew over
- * `archive` and installed, which the views follow. The archive left closes as the last of the
- * services over it goes, and nothing writes to it after. The task ends once the new services
- * are in place.
+ * starts on it; once nothing runs on it, the services are made anew over `archive` and
+ * installed, which the views follow. The archive left is closed off the UI thread, after its
+ * background removal of deleted files (the wait closing it is), and nothing writes to it after.
+ * The task ends once it is closed.
  */
 pub fn reopen(archive: Arc<Archive>, cx: &mut App) -> Task<()> {
     let services = cx.services();
@@ -208,25 +207,40 @@ pub fn reopen(archive: Arc<Archive>, cx: &mut App) -> Task<()> {
         services.reach.clone(),
     );
     let (sync, upkeep) = (services.sync.clone(), services.upkeep.clone());
-    let left = services.archive.read(cx).archive().cloned();
+    let left = services.archive.clone();
     sync.update(cx, |sync, cx| sync.close(cx));
     upkeep.update(cx, |upkeep, cx| upkeep.close(cx));
     cx.spawn(async move |cx| {
         while !cx.update(|cx| cx.services().is_quiet(cx)) {
             cx.background_executor().timer(QUIET_TICK).await;
         }
-        if let Some(left) = left {
-            cx.background_spawn(async move { left.wait_for_removals() })
-                .await;
-        }
-        cx.update(|cx| {
+        /* The service left gives up its archive as the new ones take over, so that nothing
+        on the UI thread holds it: its last handle, and the wait for its removals that
+        dropping it is, go to a background job. That ends before the switch does, so the
+        folder is free to be opened again. */
+        let given_up = cx.update(|cx| {
+            let given_up = left.update(cx, |left, _| left.give_up());
             let archive = cx.new(|cx| ArchiveService::opened(archive, cx));
             let services = build(settings, archive.clone(), providers, reach, cx);
             cx.set_global(services);
             /* The new services start as they do on an archive that has just opened. */
             archive.update(cx, |_, cx| cx.notify());
+            given_up
         });
+        if let Some(given_up) = given_up {
+            cx.background_spawn(async move { drop(given_up) }).await;
+        }
     })
+}
+
+/// Holds the work on the archive open now while the app opens another to move onto: no pass,
+/// round or refresh starts until the other opens, and the switch closes these services, or
+/// it is refused, and they go on.
+pub fn pause(paused: bool, cx: &mut App) {
+    let services = cx.services();
+    let (sync, upkeep) = (services.sync.clone(), services.upkeep.clone());
+    sync.update(cx, |sync, _| sync.pause(paused));
+    upkeep.update(cx, |upkeep, _| upkeep.pause(paused));
 }
 
 /// Access to the installed [`Services`].

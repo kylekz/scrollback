@@ -232,7 +232,15 @@ pub const SHORTCUT_ROWS: &[ShortcutRow] = &[
         "Move and choose in a menu",
         &["menu::Previous", "menu::Next", "menu::Choose"],
     ),
+    row(
+        "Open a menu's submenu, back out of it, or close the menu",
+        &["menu::Open", "menu::Back", "menu::Close"],
+    ),
     row("Save the paths editor's changes", &["sessions::SavePaths"]),
+    row(
+        "Leave the paths editor without saving",
+        &["sessions::CancelPaths"],
+    ),
     row("Rename the folder shown", &["sidebar::Rename"]),
     row(
         "Narrow windows: show the sidebar; otherwise move between the sidebar and the page",

@@ -30,13 +30,21 @@ impl Catalogue {
     pub fn last_verify(&self) -> Result<Option<LastVerify>> {
         self.db.read(|c| {
             Ok(KV.get_parsed(c, LAST_VERIFY, |json| {
-                let mut kept: Value = serde_json::from_str(json).ok()?;
-                let version = kept.as_object_mut()?.remove("v")?.as_u64()?;
-                if version != u64::from(LAST_VERIFY_VERSION) {
-                    log::warn!("the last verify was kept as version {version}: not read");
-                    return None;
-                }
-                serde_json::from_value(kept).ok()
+                let read = serde_json::from_str::<Value>(json)
+                    .map_err(|error| error.to_string())
+                    .and_then(|mut kept| {
+                        let version = kept
+                            .as_object_mut()
+                            .and_then(|kept| kept.remove("v"))
+                            .and_then(|version| version.as_u64())
+                            .ok_or_else(|| "it has no version".to_string())?;
+                        if version != u64::from(LAST_VERIFY_VERSION) {
+                            return Err(format!("it was kept as version {version}"));
+                        }
+                        serde_json::from_value(kept).map_err(|error| error.to_string())
+                    });
+                read.map_err(|why| log::warn!("the last verify isn't read: {why}"))
+                    .ok()
             })?)
         })
     }

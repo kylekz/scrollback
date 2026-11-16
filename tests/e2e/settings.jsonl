@@ -101,7 +101,7 @@
 // Shortcuts: one row per action the keymap binds.
 {"cmd": "click", "target": "settings/nav/shortcuts"}
 {"cmd": "settle", "expect": {"pointer": "/settings/section", "equals": "shortcuts"}}
-{"cmd": "query", "prefix": "settings/shortcuts/", "expect_result": {"pointer": "", "len": 19}}
+{"cmd": "query", "prefix": "settings/shortcuts/", "expect_result": {"pointer": "", "len": 21}}
 {"cmd": "screenshot", "name": "shortcuts-dark"}
 {"cmd": "pin_appearance", "appearance": "light"}
 {"cmd": "settle"}

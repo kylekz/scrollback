@@ -81,6 +81,9 @@ pub const SYNC_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// How often the rounds look whether one is due (the module docs).
 pub const ROUND_TICK: Duration = Duration::from_secs(60);
 
+/// How long a pass that found its location held by something else waits to run again.
+const BUSY_RETRY: Duration = Duration::from_secs(2);
+
 /// How often a running pass's progress is read.
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
 
@@ -368,8 +371,11 @@ pub struct SyncService {
     next_round: Option<i64>,
     /// The start has run on this archive.
     started: bool,
-    /// The app is moving onto another archive: nothing more starts on this one.
+    /// The app has moved onto another archive: nothing more starts on this one.
     closed: bool,
+    /// The app is opening another archive to move onto: no pass starts meanwhile, so that
+    /// the archive it may leave isn't worked ([`super::pause`]).
+    paused: bool,
     /// After how many days without a good sync a location is stale (the module docs).
     stale_after: u32,
     /// The items being fetched again, or last fetched again, and how that went.
@@ -442,6 +448,7 @@ impl SyncService {
             next_round: None,
             started: false,
             closed: false,
+            paused: false,
             stale_after: STALE_AFTER_DAYS,
             refetches: HashMap::new(),
             refetching: HashMap::new(),
@@ -691,7 +698,8 @@ impl SyncService {
         let Some(location) = self.locations.iter().flatten().find(|it| it.id == *id) else {
             return;
         };
-        if self.passes.contains_key(id) || self.removing.contains(id) || self.closed {
+        if self.passes.contains_key(id) || self.removing.contains(id) || self.closed || self.paused
+        {
             return;
         }
         if self.indexes.contains_key(&Some(id.clone())) || self.refetching.contains_key(id) {
@@ -772,13 +780,15 @@ impl SyncService {
                                 changed |= this.indexed(pass.index);
                             }
                         }
+                        /* Something else held the location a moment (a delete for good, an
+                        undo): the pass didn't run, and the location is as it was. It waits,
+                        and runs once that is likely over. */
+                        Err(SyncError::Busy(_)) => {
+                            this.waiting.insert(id.clone());
+                            this.sync_after(id.clone(), BUSY_RETRY, cx);
+                        }
                         /* A stop before the plan was made left nothing that can be counted:
                         the location is as it was before the pass. */
-                        /* Something else held the location a moment (a delete for good): the
-                        pass didn't run, and the location is as it was. */
-                        Err(SyncError::Busy(_)) => {
-                            whole = false;
-                        }
                         Err(SyncError::Cancelled) => {
                             this.errors.remove(&id);
                             let left = *stopped_at.lock().unwrap_or_else(PoisonError::into_inner);
@@ -827,6 +837,20 @@ impl SyncService {
             },
         );
         cx.notify();
+    }
+
+    /// Syncs `id` after `delay`, if it is still waiting then: a stop takes it out of waiting.
+    fn sync_after(&mut self, id: LocationId, delay: Duration, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |this, cx| {
+                if this.waiting.remove(&id) {
+                    this.sync(&id, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Brings the session index up to date outside a pass: of `location`, or of every
@@ -970,6 +994,11 @@ impl SyncService {
         self.stop_all();
         self.stop_index.cancel();
         self.cancel_test();
+    }
+
+    /// Starts no pass while `paused` (the field's docs).
+    pub(super) fn pause(&mut self, paused: bool) {
+        self.paused = paused;
     }
 
     /// Stops everything, and starts nothing more: the app is moving onto another archive

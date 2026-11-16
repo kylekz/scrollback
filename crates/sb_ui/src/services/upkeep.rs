@@ -31,7 +31,7 @@ use sb_core::archive::{
     Archive, ArchiveError, ArchiveStats, DamageRecord, LastVerify, VerifyProgress,
 };
 use sb_core::catalogue::{
-    AllowedAgain, CatalogueError, Filed, Folder, Reason, Session, SessionId, Tombstone,
+    AllowedAgain, CatalogueError, Filed, Folder, Held, Reason, Session, SessionId, Tombstone,
 };
 use sb_core::location::Location;
 
@@ -50,15 +50,26 @@ pub const PROBLEMS_PAGE: usize = 20;
 pub enum Fix {
     /// Its newest version is the damaged one and its location still has it: fetch it again.
     FetchAgain,
-    /// It was fetched again since, as `version`. `held` is the version still read in its place
-    /// when the new one is held back as shorter (PLAN §4.2): the owner chooses which to read.
-    Fetched { version: u32, held: Option<u32> },
+    /// It was fetched again since, as `version`, which may be held back (PLAN §4.2): the owner
+    /// chooses which to read.
+    Fetched {
+        version: u32,
+        held: Option<HeldBack>,
+    },
     /// Its location no longer has the damaged bytes: they are gone there, the source changed
     /// since, or the location was removed. The version stays marked, readable as far as it
     /// decodes.
     Damaged,
     /// The item is no longer in the archive: its session was deleted for good.
     Deleted,
+}
+
+/// Why a version fetched again isn't the one read, and which is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeldBack {
+    pub why: Held,
+    /// The version read in its place.
+    pub reading: u32,
 }
 
 /// One problem the last verify found, with what the archive holds of it now.
@@ -80,8 +91,7 @@ pub enum Standing {
     Deleted,
     /// The owner allowed it to be archived again: what to put back on Undo.
     Allowed(AllowedAgain),
-    /// A sync has archived it again, the one that started at `at` (Unix milliseconds) if it is
-    /// known.
+    /// A sync has archived it again, at `at` (Unix milliseconds) once that is read.
     ArchivedAgain { at: Option<i64> },
 }
 
@@ -132,14 +142,6 @@ fn problem(
     let newest = versions.last().map_or(damage.version, |it| it.number);
     let reachable =
         item.gone_since.is_none() && location.as_ref().is_some_and(|it| it.removed.is_none());
-    let fix = match refetched {
-        Some(version) => Fix::Fetched {
-            version: version.number,
-            held: version.held_back.map(|_| damage.version),
-        },
-        None if newest == damage.version && reachable => Fix::FetchAgain,
-        None => Fix::Damaged,
-    };
     let session = match &item.session {
         Some(key) => catalogue.session(&SessionId {
             location: damage.location.clone(),
@@ -147,6 +149,31 @@ fn problem(
             key: key.clone(),
         })?,
         None => None,
+    };
+    /* The copy read: the one the session reads, for its own transcript, else the newest not
+    held back. */
+    let reading = session
+        .as_ref()
+        .filter(|session| session.main_item == Some(item.id))
+        .and_then(|session| session.reading_version)
+        .or_else(|| {
+            versions
+                .iter()
+                .rev()
+                .find(|it| it.held_back.is_none())
+                .map(|it| it.number)
+        })
+        .unwrap_or(damage.version);
+    let fix = match refetched {
+        Some(version) => Fix::Fetched {
+            version: version.number,
+            held: version
+                .held_back
+                .filter(|_| reading != version.number)
+                .map(|why| HeldBack { why, reading }),
+        },
+        None if newest == damage.version && reachable => Fix::FetchAgain,
+        None => Fix::Damaged,
     };
     let folder = session.as_ref().and_then(|session| match session.filed {
         Filed::Unsorted => None,
@@ -187,12 +214,17 @@ fn load(archive: &Archive, shown: usize, allowed: Vec<SessionId>) -> Result<Load
                 refused: None,
             });
         }
+        /* When it was archived again: when its transcript's newest version was stored. */
         let mut again = Vec::new();
         for id in allowed {
-            if catalogue.session(&id)?.is_some() {
-                let at = catalogue
-                    .location(&id.location)?
-                    .and_then(|location| location.last_attempt);
+            if let Some(session) = catalogue.session(&id)? {
+                let at = match session.main_item {
+                    Some(item) => catalogue
+                        .versions(item)?
+                        .last()
+                        .map(|version| version.started_at),
+                    None => None,
+                };
                 again.push((id, at));
             }
         }
@@ -232,8 +264,11 @@ pub struct UpkeepService {
     stale: bool,
     /// Writes in flight.
     jobs: usize,
-    /// The app is moving onto another archive: nothing more starts on this one.
+    /// The app has moved onto another archive: nothing more starts on this one.
     closed: bool,
+    /// The app is opening another archive to move onto: the archive isn't read meanwhile
+    /// ([`super::pause`]).
+    paused: bool,
     _observers: [Subscription; 1],
 }
 
@@ -263,6 +298,7 @@ impl UpkeepService {
             stale: false,
             jobs: 0,
             closed: false,
+            paused: false,
         }
     }
 
@@ -329,7 +365,7 @@ impl UpkeepService {
 
     /// Reads what Settings › Archive shows again, now or once the read running is over.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.closed {
+        if self.closed || self.paused {
             return;
         }
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
@@ -345,7 +381,7 @@ impl UpkeepService {
         let allowed = self
             .deleted
             .iter()
-            .filter(|deleted| matches!(deleted.standing, Standing::Allowed(_)))
+            .filter(|deleted| !matches!(deleted.standing, Standing::Deleted))
             .map(|deleted| deleted.tombstone.session.clone())
             .collect();
         let job = cx.background_spawn(async move { load(&archive, shown, allowed) });
@@ -356,8 +392,8 @@ impl UpkeepService {
                 match loaded {
                     Ok(loaded) => {
                         let on_disk = loaded.stats.on_disk;
-                        this.settings.update(cx, |settings, cx| {
-                            settings.remember_size(&id, on_disk, cx);
+                        this.settings.update(cx, |settings, _| {
+                            settings.remember_size(&id, on_disk);
                         });
                         this.stats = Some(loaded.stats);
                         this.last = loaded.last;
@@ -484,6 +520,11 @@ impl UpkeepService {
         }
     }
 
+    /// Reads nothing of the archive while `paused` (the field's docs).
+    pub(super) fn pause(&mut self, paused: bool) {
+        self.paused = paused;
+    }
+
     /// Stops the verify running, and starts nothing more (the module docs).
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.stop();
@@ -562,9 +603,8 @@ impl UpkeepService {
                             row.refused = None;
                         }
                         Err(ArchiveError::Catalogue(CatalogueError::ArchivedAgain(_))) => {
-                            row.standing = Standing::ArchivedAgain {
-                                at: row.location.as_ref().and_then(|it| it.last_attempt),
-                            };
+                            /* When, the next read of the archive says. */
+                            row.standing = Standing::ArchivedAgain { at: None };
                             row.refused = Some(
                                 "To remove it again, move it to Trash and delete it for good."
                                     .to_string(),

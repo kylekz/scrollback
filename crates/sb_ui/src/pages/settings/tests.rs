@@ -172,6 +172,9 @@ fn a_different_folder_is_confirmed_before_the_app_moves_onto_it(cx: &mut TestApp
     assert!(bounds(cx, "titlebar-sync-all").is_none());
     click(cx, "titlebar-settings");
     assert_eq!(showing(cx), Showing::Settings);
+    /* Settings over it keeps the first run's title bar. */
+    assert!(bounds(cx, "titlebar-sync-all").is_none());
+    assert!(bounds(cx, "titlebar-search").is_none());
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     assert_eq!(showing(cx), Showing::FirstRun);

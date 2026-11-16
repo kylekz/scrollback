@@ -312,6 +312,11 @@ impl Archive {
             done.segments_done = report.segments;
             progress(done);
         }
+        /* A stop asked for as it ended is a stop: nothing it found is kept. Once the marks are
+        written, the record that explains them is too. */
+        if cancel.is_cancelled() {
+            return Err(ArchiveError::Cancelled);
+        }
         let marks: Vec<(&Stored, bool)> = damaged
             .iter()
             .map(|(read, _)| (read, true))
@@ -323,10 +328,6 @@ impl Archive {
             .zip(there)
             .filter_map(|((_, damage), there)| there.then_some(damage))
             .collect();
-        /* A stop asked for as it ended is a stop: what it found is not kept. */
-        if cancel.is_cancelled() {
-            return Err(ArchiveError::Cancelled);
-        }
         self.catalogue.record_verify(&LastVerify {
             at: catalogue::now_ms(),
             took_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
