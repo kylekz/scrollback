@@ -5,45 +5,95 @@
 //! an image (`![](url)`, a raw `<img>`) and renders raw HTML, so a body reaches it only as
 //! [`Sanitized`], which has neither (PLAN D11). The sanitiser is dv's (D15).
 //!
-//! [`view`] is the one way a view renders a body, so every body gets the same style, the same
-//! link and copy handling ([`crate::system`]: links open only for `http` and `https`) and the
-//! same highlighter: fenced code is highlighted by [`crate::syntax`] into token kinds, coloured
-//! from the theme here.
+//! [`view`] is the one way a view renders a body, so every body gets the same style and the same
+//! link and copy handling ([`crate::system`]: links open only for `http` and `https`). Fenced
+//! code is drawn by the reader's own code view, highlighted off the UI thread
+//! ([`crate::syntax`]); what `TextView` draws as code is plain.
+//!
+//! **The view parses on the UI thread.** `TextView` parses a body of up to 4 KiB as it is handed
+//! it, on the UI thread, and a larger one on gpui's background executor; the parser is far
+//! slower than linear on some text. So a body reaches it only once that same parse has been
+//! timed off the UI thread ([`Sanitized::measured`]): one that took long is shown as plain text
+//! instead.
 //!
 //! A body's parsed document lives in a [`TextViewState`] its owner keeps ([`state`]). One takes
 //! about half a megabyte, so the reader keeps them only for the rows near what is on screen
-//! (D11). A body over a few kilobytes is parsed on a background thread.
+//! (D11).
 
 mod sanitize;
 
-use std::cell::RefCell;
-use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    App, AppContext as _, Entity, FontFeatures, FontWeight, HighlightStyle, Hsla,
-    InteractiveElement as _, IntoElement, Overflow, ParentElement as _, Pixels, SharedString,
+    App, AppContext as _, Entity, FontFeatures, FontWeight, Hsla, InteractiveElement as _,
+    IntoElement, Overflow, ParentElement as _, Pixels, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, div, px, rems,
 };
 use gpui_base::text::{CodeBlock, TextView, TextViewState, TextViewStyle};
 
-use crate::syntax;
-use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _, SyntaxColors, TextSpec};
+use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _, TextSpec};
 
 #[cfg(test)]
 pub(crate) use sanitize::inert;
 pub use sanitize::{options, sanitize};
 
-/// A body that has been through [`sanitize`]: nothing in it fetches anything or renders
-/// markup. The only way to make one is to sanitise text.
+/**
+ * The most a body's sanitising and the view's parse of it may take together, for each
+ * [`VIEW_PARSE_UNIT`] of the body begun; past it, the body is plain text.
+ *
+ * Measured on an Apple M-series release build, a unit of ordinary prose takes 1.6 ms (two
+ * thirds of it the sanitiser's two parses, a third the view's), and dense but ordinary
+ * Markdown (a heading or a link every few words, a long loose list, a table) 3 to 7 ms; the
+ * inputs the parser is slow on take from 17 ms to over 80 ms. So this keeps ordinary prose
+ * clear five times over, for a slower machine or a busy one, and the slow inputs out. What a
+ * body that passes costs the UI thread is the view's share: about a third, under 3 ms here.
+ */
+pub const VIEW_PARSE_LIMIT: Duration = Duration::from_millis(8);
+/// gpui-base's `MAX_SYNC_FULL_REPLACE_BYTES`: the most of a body `TextView` parses on the UI
+/// thread.
+pub const VIEW_PARSE_UNIT: usize = 4 * 1024;
+
+/// [`VIEW_PARSE_LIMIT`] for a body of `bytes`.
+pub fn view_parse_limit(bytes: usize) -> Duration {
+    let units = bytes.div_ceil(VIEW_PARSE_UNIT).max(1);
+    VIEW_PARSE_LIMIT * u32::try_from(units).unwrap_or(u32::MAX)
+}
+
+/**
+ * A body that has been through [`sanitize`], and whose parse by the view was timed: nothing in
+ * it fetches anything or renders markup, and the view parses it quickly. The only way to make
+ * one is [`Sanitized::measured`].
+ */
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sanitized(SharedString);
 
 impl Sanitized {
-    /// `text` sanitised, its bidirectional controls shown as what they are
-    /// ([`crate::hostile::bidi`]).
-    pub fn new(text: &str) -> Self {
-        Self(sanitize(&crate::hostile::bidi(text)).into())
+    /**
+     * `text` sanitised, its bidirectional controls shown as what they are
+     * ([`crate::hostile::bidi`]), and parsed as `TextView` parses it, timed together: `None` when
+     * that took past [`VIEW_PARSE_LIMIT`]. Run it off the UI thread, on a thread with a stack
+     * as deep as the body nests.
+     *
+     * A time not far past the limit is taken again, and the shorter kept: the thread may have
+     * been made to wait.
+     */
+    pub fn measured(text: &str) -> Option<Self> {
+        let limit = view_parse_limit(text.len());
+        let attempt = || {
+            let start = Instant::now();
+            let sanitized = sanitize(&crate::hostile::bidi(text));
+            let parsed =
+                gpui_base::text::editor_host::parse_markdown(&sanitized, Default::default());
+            drop(parsed.ok()?);
+            Some((sanitized, start.elapsed()))
+        };
+        let (sanitized, took) = attempt()?;
+        let took = match took {
+            took if took > limit && took < limit * 4 => took.min(attempt()?.1),
+            took => took,
+        };
+        (took <= limit).then(|| Self(sanitized.into()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -83,7 +133,6 @@ pub fn view(state: &Entity<TextViewState>, size: Size, cx: &App) -> TextView {
     TextView::new(state)
         .style(style(theme))
         .text_spec(text)
-        .shared_code_block_highlighter(highlighter(theme.colors.syntax))
         .code_block_actions(move |block, _window, _cx| code_block_header(block, header.clone()))
         .on_link_click(|url, _event, _window, cx| crate::system::open_url(url, cx))
         // Defence in depth: a sanitised body has no image, and none is ever fetched.
@@ -235,45 +284,6 @@ fn code_block_header(block: &CodeBlock, header: CodeHeader) -> impl IntoElement 
                 .on_click(move |_, _, cx| crate::system::copy_text(code.to_string(), cx))
                 .child("Copy"),
         )
-}
-
-/// What `TextView` asks for a code block's colours: byte ranges of its code and their styles.
-type Highlighter = Arc<dyn Fn(&CodeBlock) -> Vec<(Range<usize>, HighlightStyle)> + Send + Sync>;
-
-/// The highlighter for `colors`, the same `Arc` for as long as the colours are: a code block
-/// keeps its highlights only while its highlighter is the same one.
-fn highlighter(colors: SyntaxColors) -> Highlighter {
-    thread_local! {
-        static CURRENT: RefCell<Option<(SyntaxColors, Highlighter)>> =
-            const { RefCell::new(None) };
-    }
-    CURRENT.with(|current| {
-        let mut current = current.borrow_mut();
-        match &*current {
-            Some((shared_colors, shared)) if *shared_colors == colors => shared.clone(),
-            _ => {
-                let shared: Highlighter = Arc::new(move |block: &CodeBlock| {
-                    let Some(language) = block.lang() else {
-                        return Vec::new();
-                    };
-                    syntax::highlight(&language, &block.code())
-                        .into_iter()
-                        .filter_map(|(range, kind)| {
-                            Some((
-                                range,
-                                HighlightStyle {
-                                    color: Some(kind.color(&colors)?),
-                                    ..Default::default()
-                                },
-                            ))
-                        })
-                        .collect()
-                });
-                *current = Some((colors, shared.clone()));
-                shared
-            }
-        }
-    })
 }
 
 #[cfg(test)]

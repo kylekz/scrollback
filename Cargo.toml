@@ -17,11 +17,12 @@ gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11" }
 # gpui-component's base: the rich text view (`TextView`, its style, range highlights and the
 # window-wide text selection) that `sb_ui::markdown` renders prompts and replies with (PLAN D11).
 gpui-base = "=0.9.0"
-# The tree-sitter grammars `sb_ui::syntax` highlights fenced code with (PLAN §9): every one of
-# gpui-component's `tree-sitter-languages`, as dv enables them.
+# The tree-sitter grammars `sb_ui::syntax` highlights fenced code with (PLAN §9): gpui-component's
+# `tree-sitter-languages`, as dv enables them, less those whose C code aborts the process on some
+# input, which nothing can catch (`sb_ui::syntax`'s `grammars_never_abort`): Bash (nested
+# heredocs), Kotlin (nested string templates) and YAML (deep indentation).
 gpui-component = { version = "=0.9.0", features = [
     "tree-sitter-astro",
-    "tree-sitter-bash",
     "tree-sitter-c",
     "tree-sitter-cmake",
     "tree-sitter-cpp",
@@ -37,7 +38,6 @@ gpui-component = { version = "=0.9.0", features = [
     "tree-sitter-java",
     "tree-sitter-javascript",
     "tree-sitter-jsdoc",
-    "tree-sitter-kotlin",
     "tree-sitter-lua",
     "tree-sitter-make",
     "tree-sitter-markdown",
@@ -53,9 +53,11 @@ gpui-component = { version = "=0.9.0", features = [
     "tree-sitter-toml",
     "tree-sitter-tsx",
     "tree-sitter-typescript",
-    "tree-sitter-yaml",
     "tree-sitter-zig",
 ] }
+# What `sb_ui::syntax` runs those grammars with, to give up on a parse or a query past its
+# deadline. gpui-component's own pin; already in the tree.
+tree-sitter = "=0.26.13"
 
 # ---- internal crates (docs/PLAN.md §3)
 sb_core = { path = "crates/sb_core" }

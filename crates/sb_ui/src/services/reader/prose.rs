@@ -10,32 +10,40 @@
 //!
 //! - **No parse is larger than [`REGION_BYTES`].** A body is scanned line by line ([`scan`]) and
 //!   cut at blank lines into regions of at most that, each parsed on its own; a paragraph
-//!   larger than that alone is plain text. Reference definitions found anywhere in the body
-//!   are carried into the regions that refer to them.
+//!   larger than that alone is plain text.
 //! - **Fenced code is never parsed.** What the scan takes for a fenced block is a piece of its
 //!   own ([`Piece::Code`]), drawn by the reader's code view. Where the scan is wrong, the result
 //!   looks wrong, and costs nothing.
-//! - **A body's parses stop after [`PARSE_BUDGET`].** The time is checked between regions; once
-//!   spent, the rest is plain text. So is a body whose session closed meanwhile.
+//! - **A body's parses stop after [`PARSE_BUDGET`].** The time is checked before each region
+//!   and each piece; once spent, the rest is plain text. So is a body whose session closed, or
+//!   whose row was let go, meanwhile.
+//! - **The view is handed only what it parses quickly.** Each piece of Markdown is sanitised
+//!   and parsed as the view will parse it, timed ([`Sanitized::measured`]): one that took long is
+//!   plain text.
+//! - **Definitions are carried as the parser read them, never as they were written.** A
+//!   reference link's definition may be in another region, or another piece: each definition
+//!   in a region's tree is written out anew on a line of its own ([`definition`]), and goes to
+//!   the pieces, and the regions, that refer to it, up to [`DEFINITION_BYTES`]; a region that
+//!   refers to one made in another is parsed again with it.
 //! - The parser recurses once per level of nesting, so it runs on a thread with a stack of
 //!   [`PARSE_STACK`], and its tree is taken apart without recursing.
 //!
 //! The scan also picks plain text early for a paragraph nested past [`MAX_NESTING`] or with
-//! more delimiters than [`DELIMITER_COST`] allows: those only spare the parser work that would
-//! end in plain text anyway, and nothing depends on them.
+//! more delimiters than [`DELIMITER_COST`] allows: those spare the parser work that would end
+//! in plain text anyway (nested past [`MAX_NESTING`], a list that would take the parser
+//! hundreds of milliseconds); what they miss is still bounded by the rest.
 //!
 //! A parsed region is cut between its top-level blocks into pieces, each sanitised on its own:
 //! blocks are grouped up to [`PIECE_BYTES`], a single block may be up to [`BLOCK_BYTES`]
-//! ([`CODE_BYTES`] for code), and a reference link's definitions go with each piece that uses
-//! them, up to [`DEFINITION_BYTES`]. What is past these is shown as its plain text instead, a
-//! bounded number of lines a row: a code block past [`CODE_LINES`] or [`CODE_BYTES`], any other
-//! block past [`BLOCK_BYTES`], with a line past [`LINE_BYTES`] or nested past [`MAX_NESTING`],
-//! and a group whose definitions are past [`DEFINITION_BYTES`].
+//! ([`CODE_BYTES`] for code). What is past these is shown as its plain text instead, a bounded
+//! number of lines a row: a code block past [`CODE_LINES`] or [`CODE_BYTES`], any other block
+//! past [`BLOCK_BYTES`], with a line past [`LINE_BYTES`] or nested past [`MAX_NESTING`], and a
+//! group whose definitions are past [`DEFINITION_BYTES`].
 //!
 //! The bounds come from D11's measurement of the view: about a millisecond a kilobyte to lay
 //! out, so a piece costs a few milliseconds, once, as it scrolls in.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -132,8 +140,9 @@ impl Prose {
     }
 
     /**
-     * `text` prepared while `wanted` says it still is: asked between parses, so that a body of
-     * a session closed meanwhile goes no further (the rest of it is plain text, and dropped).
+     * `text` prepared while `wanted` says it still is: asked before each region and each piece,
+     * so that a body of a session closed, or of a row let go, meanwhile goes no further (the
+     * rest of it is plain text, and dropped).
      */
     pub fn markdown_while(text: &str, wanted: &(dyn Fn() -> bool + Sync)) -> Self {
         if let Some(note) = crate::hostile::nothing_shown(text) {
@@ -161,7 +170,37 @@ impl Prose {
 /// The pieces of `text` (the module docs); `None` if a region doesn't parse.
 fn prepare(text: &str, wanted: &(dyn Fn() -> bool + Sync)) -> Option<Vec<Piece>> {
     let started = Instant::now();
-    let definitions = definitions(text);
+    let going = || started.elapsed() < PARSE_BUDGET && wanted();
+    /* Each region parsed on its own, and the definitions the body makes: the first of a label
+    is the one Markdown follows. */
+    let mut definitions: HashMap<String, String> = HashMap::new();
+    let mut spans = Vec::new();
+    for span in regions(scan(text)) {
+        spans.push(match span {
+            Span::Code { language, body } => Prepared::Piece(code(language, body)),
+            Span::Prose(range) if going() => {
+                let region = markdown_pieces(&text[range.clone()], "", &going)?;
+                for (label, definition) in &region.definitions {
+                    definitions
+                        .entry(label.clone())
+                        .or_insert_with(|| definition.clone());
+                }
+                Prepared::Region(range, region)
+            }
+            Span::Prose(range) | Span::Plain(range) => Prepared::Plain(range),
+        });
+    }
+    /* Then each region that refers to a definition made in another, again with it. */
+    for prepared in &mut spans {
+        let Prepared::Region(range, region) = prepared else {
+            continue;
+        };
+        let source = &text[range.clone()];
+        let carried = carried(source, &region.definitions, &definitions);
+        if !carried.is_empty() && going() {
+            *region = markdown_pieces(source, &carried, &going)?;
+        }
+    }
     let mut pieces = Vec::new();
     let mut plain: Option<Range<usize>> = None;
     let flush_plain = |plain: &mut Option<Range<usize>>, pieces: &mut Vec<Piece>| {
@@ -172,29 +211,40 @@ fn prepare(text: &str, wanted: &(dyn Fn() -> bool + Sync)) -> Option<Vec<Piece>>
             }
         }
     };
-    for span in regions(scan(text)) {
-        let range = match span {
-            Span::Code { language, body, .. } => {
-                flush_plain(&mut plain, &mut pieces);
-                pieces.push(code(language, body));
-                continue;
+    for prepared in spans {
+        match prepared {
+            Prepared::Plain(range) => {
+                plain = Some(match plain {
+                    Some(open) => open.start..range.end,
+                    None => range,
+                });
             }
-            Span::Prose(range) if started.elapsed() < PARSE_BUDGET && wanted() => {
+            Prepared::Piece(piece) => {
                 flush_plain(&mut plain, &mut pieces);
-                let source = &text[range];
-                let carried = carried(source, &definitions);
-                pieces.extend(markdown_pieces(source, &carried)?);
-                continue;
+                pieces.push(piece);
             }
-            Span::Prose(range) | Span::Plain(range) => range,
-        };
-        plain = Some(match plain {
-            Some(open) => open.start..range.end,
-            None => range,
-        });
+            Prepared::Region(_, region) => {
+                flush_plain(&mut plain, &mut pieces);
+                pieces.extend(region.pieces);
+            }
+        }
     }
     flush_plain(&mut plain, &mut pieces);
     Some(pieces)
+}
+
+/// A run of a body, prepared: fenced code, a region parsed, or plain text.
+enum Prepared {
+    Piece(Piece),
+    Region(Range<usize>, Region),
+    Plain(Range<usize>),
+}
+
+/// A region parsed: its pieces, and the definitions it makes, by label, written out to be
+/// carried ([`definition`]).
+struct Region {
+    pieces: Vec<Piece>,
+    definitions: HashMap<String, String>,
 }
 
 /// A piece of fenced code; plain text when it is longer than a code block may be.
@@ -210,22 +260,29 @@ fn code(language: Option<String>, body: String) -> Piece {
 
 /**
  * `text`, a region, parsed with the definitions `carried` from elsewhere in the body after it,
- * and cut into pieces; `None` if it doesn't parse.
+ * and cut into pieces while `going` says the body's parses may go on: past that, each group of
+ * blocks left is plain text. `None` if it doesn't parse.
+ *
+ * A region whose parse alone took longer than its pieces' sanitising and parsing may
+ * ([`crate::markdown::view_parse_limit`]) is plain text without them: a piece is most often the
+ * whole of its region, and would take as long three times over.
  */
-fn markdown_pieces(text: &str, carried: &str) -> Option<Vec<Piece>> {
+fn markdown_pieces(text: &str, carried: &str, going: &dyn Fn() -> bool) -> Option<Region> {
     let source = format!("{text}\n\n{carried}");
+    let started = Instant::now();
     let root = markdown::to_mdast(&source, &options()).ok()?;
-    /* Every definition, wherever it is (in a quote, in a list item): the first of a name is
-    the one Markdown follows. */
-    let mut definitions: HashMap<&str, &str> = HashMap::new();
+    let slow = started.elapsed() > crate::markdown::view_parse_limit(source.len());
+    /* Every definition, wherever it is (in a quote, in a list item), where it starts and
+    written out once: the first of a label is the one Markdown follows. */
+    let mut definitions: HashMap<&str, (usize, String)> = HashMap::new();
     let mut stack = vec![&root];
     while let Some(node) = stack.pop() {
-        if let Node::Definition(definition) = node
-            && let Some(source) = span(node, &source)
+        if let Node::Definition(found) = node
+            && let Some(at) = node.position()
         {
             definitions
-                .entry(definition.identifier.as_str())
-                .or_insert(source);
+                .entry(found.identifier.as_str())
+                .or_insert_with(|| (at.start.offset, definition(found)));
         }
         /* Children in order: the first definition is found first. */
         stack.extend(node.children().into_iter().flatten().rev());
@@ -246,22 +303,30 @@ fn markdown_pieces(text: &str, carried: &str) -> Option<Vec<Piece>> {
             return;
         };
         let source = &text[group.start..group.end];
+        if slow || !going() {
+            pieces.push(oversized(source));
+            return;
+        }
+        /* Those the group refers to and doesn't hold. */
         let carried: Vec<&str> = group
             .references
             .iter()
-            .filter_map(|identifier| definitions.get(identifier).copied())
-            .filter(|definition| !source.contains(definition))
+            .filter_map(|identifier| definitions.get(identifier))
+            .filter(|(at, _)| !(group.start..group.end).contains(at))
+            .map(|(_, definition)| definition.as_str())
             .collect();
         if carried.iter().map(|it| it.len() + 2).sum::<usize>() > DEFINITION_BYTES {
             pieces.push(oversized(source));
             return;
         }
-        let mut source = source.to_string();
+        let mut markdown = source.to_string();
         for definition in carried {
-            source.push_str("\n\n");
-            source.push_str(definition);
+            markdown.push_str("\n\n");
+            markdown.push_str(definition);
         }
-        pieces.push(Piece::Markdown(Sanitized::new(&source)));
+        pieces.push(
+            Sanitized::measured(&markdown).map_or_else(|| oversized(source), Piece::Markdown),
+        );
     };
     let mut group: Option<Group> = None;
     for node in &blocks {
@@ -295,8 +360,16 @@ fn markdown_pieces(text: &str, carried: &str) -> Option<Vec<Piece>> {
         }
     }
     flush(&mut group, &mut pieces);
+    let definitions = definitions
+        .into_iter()
+        .filter(|(_, (at, _))| *at < text.len())
+        .map(|(label, (_, definition))| (label.to_string(), definition))
+        .collect();
     dismantle(root);
-    Some(pieces)
+    Some(Region {
+        pieces,
+        definitions,
+    })
 }
 
 /// Top-level blocks being gathered into a piece: where they start and end in the body, and the
@@ -305,11 +378,6 @@ struct Group<'a> {
     start: usize,
     end: usize,
     references: BTreeSet<&'a str>,
-}
-
-fn span<'a>(node: &Node, text: &'a str) -> Option<&'a str> {
-    let at = node.position()?;
-    text.get(at.start.offset..at.end.offset)
 }
 
 /// Drops a parsed tree a node at a time: dropping it whole recurses once per level.
@@ -322,56 +390,71 @@ fn dismantle(root: Node) {
     }
 }
 
-/// A label as Markdown matches it: case folded, its whitespace collapsed.
-fn label(raw: &str) -> String {
-    raw.split_whitespace()
+/**
+ * A label as the parser matches it, and names it in its tree: its whitespace collapsed, its
+ * case folded (`markdown`'s `normalize_identifier`, then lower case).
+ */
+fn identifier(label: &str) -> String {
+    label
+        .split([' ', '\t', '\n', '\r'])
+        .filter(|word| !word.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
+        .to_lowercase()
+        .to_uppercase()
         .to_lowercase()
 }
 
 /**
- * The reference definitions of `text`, found without parsing, by label: each line that, past
- * its quote and list markers, reads `[label]: destination`, outside what the scan takes for
- * fenced code. The first of a label is the one Markdown follows. A definition the scan misses
- * only leaves a reference in another region as text.
+ * `found` written out to be carried into another piece or region: on a line of its own, its
+ * label as the parser names it, its destination in angle brackets and its title in quotes, each
+ * escaped, so that it reads back as the same definition wherever it is put, at the cost of a
+ * definition's parse. What it was written as in the body (a destination on the next line, in a
+ * quote) is never carried: that could read back as something else, and cost far more.
  */
-fn definitions(text: &str) -> HashMap<String, &str> {
-    let mut found = HashMap::new();
-    let mut fence: Option<Fence> = None;
-    for line in text.lines() {
-        let prefix = Prefix::of(line);
-        if let Some(open) = &fence {
-            if open.closes(&prefix) || !open.carries(&prefix) {
-                fence = None;
+fn definition(found: &markdown::mdast::Definition) -> String {
+    let mut out = format!("[{}]: <", found.identifier);
+    for c in found.url.chars() {
+        match c {
+            '\\' | '<' | '>' | '&' => {
+                out.push('\\');
+                out.push(c);
             }
-            continue;
-        }
-        if let Some(open) = Fence::opens(&prefix) {
-            fence = Some(open);
-            continue;
-        }
-        let rest = prefix.rest.trim_end();
-        if let Some(inner) = rest.strip_prefix('[')
-            && let Some((name, after)) = inner.split_once("]:")
-            && !name.is_empty()
-            && name.len() <= 999
-            && !name.contains(['[', ']'])
-            && !after.trim().is_empty()
-        {
-            found.entry(label(name)).or_insert(rest);
+            /* A line break can't be in a destination: as the parser would have it in a URL. */
+            c if c.is_control() => {
+                for byte in c.encode_utf8(&mut [0; 4]).bytes() {
+                    out.push_str(&format!("%{byte:02X}"));
+                }
+            }
+            c => out.push(c),
         }
     }
-    found
+    out.push('>');
+    if let Some(title) = &found.title {
+        out.push_str(" \"");
+        for c in title.chars() {
+            match c {
+                '\\' | '"' | '&' => {
+                    out.push('\\');
+                    out.push(c);
+                }
+                c if c.is_control() => out.push(' '),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+    out
 }
 
 /**
- * The definitions of `definitions` the region `text` may refer to, and doesn't hold: those
- * whose label is in brackets in it. At most [`DEFINITION_BYTES`] of them.
+ * The labels `text` holds in brackets, as the parser matches them ([`identifier`]), each once in
+ * the order they first appear: the definitions it may refer to. In one pass: a bracket opened
+ * inside another starts again from the inner one.
  */
-fn carried(text: &str, definitions: &HashMap<String, &str>) -> String {
-    let mut out = String::new();
-    let mut seen = BTreeSet::new();
+fn labels(text: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut found = Vec::new();
     let mut rest = text;
     while let Some(open) = rest.find('[') {
         rest = &rest[open + 1..];
@@ -379,20 +462,44 @@ fn carried(text: &str, definitions: &HashMap<String, &str>) -> String {
             break;
         };
         let name = &rest[..close];
-        if name.is_empty() || name.len() > 999 || name.contains('[') {
+        if let Some(inner) = name.rfind('[') {
+            rest = &rest[inner..];
             continue;
         }
-        let key = label(name);
-        if let Some(definition) = definitions.get(&key)
-            && !text.contains(definition)
-            && seen.insert(key)
-        {
-            if out.len() + definition.len() + 2 > DEFINITION_BYTES {
-                break;
+        rest = &rest[close + 1..];
+        if !name.is_empty() && name.len() <= 999 {
+            let label = identifier(name);
+            if seen.insert(label.clone()) {
+                found.push(label);
             }
-            out.push_str(definition);
-            out.push_str("\n\n");
         }
+    }
+    found
+}
+
+/**
+ * The definitions of `definitions` the region `text` may refer to and doesn't make itself
+ * (`own`): those whose label is in brackets in it, one after another. At most
+ * [`DEFINITION_BYTES`] of them.
+ */
+fn carried(
+    text: &str,
+    own: &HashMap<String, String>,
+    definitions: &HashMap<String, String>,
+) -> String {
+    let mut out = String::new();
+    for label in labels(text) {
+        let Some(definition) = definitions
+            .get(&label)
+            .filter(|_| !own.contains_key(&label))
+        else {
+            continue;
+        };
+        if out.len() + definition.len() + 2 > DEFINITION_BYTES {
+            break;
+        }
+        out.push_str(definition);
+        out.push_str("\n\n");
     }
     out
 }
@@ -433,8 +540,8 @@ fn regions(spans: Vec<Span>) -> Vec<Span> {
 /**
  * `text` as runs of paragraphs, by a scan line by line that never parses. A paragraph is the
  * lines up to a blank one, to parse unless it is longer than [`REGION_BYTES`], a line of it
- * nests past [`MAX_NESTING`] (its quote and list markers, and its indentation before them at
- * two columns a level), or its delimiters cost past [`DELIMITER_COST`].
+ * nests past [`MAX_NESTING`] as the parsed tree would ([`Prefix::depth`]), or its delimiters
+ * cost past [`DELIMITER_COST`].
  *
  * A fence opens only as CommonMark opens one, and as narrowly: three or more backticks or
  * tildes at most three columns in from the line's last container marker, a backtick fence's
@@ -481,7 +588,7 @@ fn scan(text: &str) -> Vec<Span> {
             spans.push(Span::Code { language, body });
             start = line_start;
         }
-        paragraph.deep |= prefix.indent / 2 + prefix.quotes + prefix.lists > MAX_NESTING;
+        paragraph.deep |= prefix.depth() > MAX_NESTING;
         if let Some(open) = Fence::opens(&prefix) {
             finish(start..line_start, &paragraph, &mut spans);
             paragraph = Paragraph::default();
@@ -575,6 +682,20 @@ impl<'a> Prefix<'a> {
             blank: rest.trim().is_empty(),
             rest,
         }
+    }
+
+    /**
+     * How deep the line's content nests, at least, as the parsed tree counts it: two levels a
+     * list (the list and its item), one a quote. A list item indented under another is taken
+     * as nested in it, at two columns a level; indentation without a marker (code, a lazy
+     * line) nests nothing of its own.
+     */
+    fn depth(&self) -> usize {
+        let lists = match self.lists {
+            0 => 0,
+            lists => lists + self.indent / 2,
+        };
+        2 * lists + self.quotes
     }
 }
 
@@ -798,12 +919,18 @@ mod tests {
             })
             .collect();
         assert!(markdown.len() > 1);
-        for piece in markdown.iter().filter(|piece| piece.contains("[docs].")) {
-            assert!(
-                piece.contains("[docs]: https://example.com/docs"),
-                "{piece}"
-            );
-        }
+        /* Written out anew where it is carried; as it is where it was written. */
+        let [first, .., last] = markdown.as_slice() else {
+            panic!("{markdown:?}");
+        };
+        assert!(
+            first.ends_with("\n\n[docs]: <https://example.com/docs>"),
+            "{first}"
+        );
+        assert!(
+            last.ends_with("\n\n[docs]: https://example.com/docs"),
+            "{last}"
+        );
     }
 
     /// `prepare` run on a thread with the stack a worker thread has on macOS.
@@ -887,6 +1014,27 @@ mod tests {
                 "entities after an autolink",
                 format!("www.a.b{}&am", repeated("&amp;", size - 10)),
             ),
+            (
+                "unknown entities after an autolink",
+                format!("www.a.b{}&a", repeated("&a;", size - 9)),
+            ),
+            /* An autolink's trailing punctuation, looked at again for each mark. */
+            (
+                "autolink, then ]",
+                format!("www.a.b{}a", "]".repeat(size - 8)),
+            ),
+            (
+                "autolink, then .",
+                format!("www.a.b{}a", ".".repeat(size - 8)),
+            ),
+            (
+                "autolink, then !",
+                format!("www.a.b{}a", "!".repeat(size - 8)),
+            ),
+            (
+                "autolink, then )",
+                format!("www.a.b{}a", ")".repeat(size - 8)),
+            ),
             ("setext lines", repeated("a\n=\n", size)),
             ("hard breaks", repeated("a  \n", size)),
             ("emphasis runs", repeated("*a ", size)),
@@ -952,7 +1100,7 @@ mod tests {
             let start = std::time::Instant::now();
             let pieces = std::thread::Builder::new()
                 .stack_size(PARSE_STACK)
-                .spawn(move || markdown_pieces(&body, "").map(|it| it.len()))
+                .spawn(move || markdown_pieces(&body, "", &|| true).map(|it| it.pieces.len()))
                 .unwrap()
                 .join()
                 .unwrap();
@@ -978,12 +1126,235 @@ mod tests {
     #[test]
     fn a_whole_body_of_any_family_is_prepared_in_bounded_time() {
         let bound = if cfg!(debug_assertions) { 4.0 } else { 0.5 };
-        for (name, body) in families(MARKDOWN_BYTES) {
+        let bodies = families(MARKDOWN_BYTES)
+            .into_iter()
+            .chain(scanned(MARKDOWN_BYTES))
+            .chain(carrying());
+        let mut worst = (0.0, "");
+        for (name, body) in bodies {
             let (prose, took) = on_a_worker_stack(body);
-            eprintln!("{name:<36} {:>8.1} ms", took.as_secs_f64() * 1000.);
+            let took = took.as_secs_f64();
+            eprintln!("{name:<44} {:>8.1} ms", took * 1000.);
             assert!(!prose.pieces.is_empty(), "{name}");
-            assert!(took.as_secs_f64() < bound, "{name} took {took:?}");
+            assert!(took < bound, "{name} took {:.0} ms", took * 1000.);
+            if took > worst.0 {
+                worst = (took, name);
+            }
         }
+        eprintln!("worst: {} at {:.1} ms", worst.1, worst.0 * 1000.);
+    }
+
+    /**
+     * What only the scan keeps from the parser, each to `size` bytes: lazy lines in a list or a
+     * quote nested to half the body, and a line of quote and list markers. A region of any
+     * takes the parser past the region's bound (400 ms and more at [`REGION_BYTES`]).
+     */
+    fn scanned(size: usize) -> Vec<(&'static str, String)> {
+        let half = size / 2;
+        vec![
+            (
+                "lazy lines in a deep list",
+                repeated("- ", half) + "a\n" + &repeated("b\n", half - 3),
+            ),
+            (
+                "lazy lines in a deep quote",
+                repeated(">", half) + "a\n" + &repeated("b\n", half - 3),
+            ),
+            (
+                "quote, list and ordered list markers",
+                repeated("> 1. - ", size),
+            ),
+        ]
+    }
+
+    /**
+     * A block the scan lets through and the view can't be handed, nested too deep: it cuts a
+     * region's blocks into pieces.
+     */
+    fn splitter() -> String {
+        let splitter = format!("{}a", "- ".repeat(MAX_NESTING / 2));
+        assert!(matches!(scan(&splitter).as_slice(), [Span::Prose(_)]));
+        let pieces = markdown_pieces(&splitter, "", &|| true).unwrap().pieces;
+        assert!(matches!(
+            pieces.as_slice(),
+            [Piece::Plain {
+                oversized: true,
+                ..
+            }]
+        ));
+        splitter
+    }
+
+    /**
+     * Bodies built to make what is carried between regions and pieces cost: a line that reads
+     * like a definition and isn't, and a definition written in a quote, its destination on the
+     * next line (an autolink with trailing brackets were it a paragraph), referred to by 64
+     * pieces of the region it is in, of another region, and of 64 other regions.
+     */
+    fn carrying() -> Vec<(&'static str, String)> {
+        let trail = |size: usize| format!("www.a.b{}a", "]".repeat(size - 8));
+        let splitter = splitter();
+        let quoted = format!("> [a]:\n> {}", trail(5_400));
+        let small = format!("[a]\n\n{splitter}\n\n").repeat(64);
+        let large = format!("[a] {}\n\n{splitter}\n\n", "x".repeat(40)).repeat(64);
+        vec![
+            (
+                "a line like a definition, and a reference",
+                format!(
+                    "[a] {}\n\n[a]: x {}",
+                    trail(REGION_BYTES - 4),
+                    trail(DEFINITION_BYTES - 10)
+                ),
+            ),
+            (
+                "a quoted definition, in its region's 64 pieces",
+                format!("{quoted}\n\n{small}"),
+            ),
+            (
+                "a quoted definition, carried to 64 pieces",
+                format!("{large}{quoted}"),
+            ),
+            (
+                "and to 64 regions of 64",
+                format!("{}{quoted}", large.repeat(64)),
+            ),
+        ]
+    }
+
+    #[test]
+    fn what_is_carried_is_what_the_parser_read() {
+        let trail = format!("www.a.b{}a", "]".repeat(2_000));
+        let splitter = splitter();
+        let body = format!(
+            "[a]\n\n{splitter}\n\n[a]\n\n{}\n\n> [a]:\n> {trail}\n\n[b]: x {trail}\n\n[b]",
+            "x".repeat(REGION_BYTES)
+        );
+        let prose = Prose::markdown(&body);
+        let markdown: Vec<&str> = prose
+            .pieces
+            .iter()
+            .filter_map(|piece| match piece {
+                Piece::Markdown(markdown) => Some(markdown.as_str()),
+                Piece::Plain { .. } | Piece::Code { .. } => None,
+            })
+            .collect();
+        /* Each piece referring to the quoted definition carries it on a line of its own. */
+        let carried = format!("[a]\n\n[a]: <{trail}>");
+        assert_eq!(
+            markdown.iter().filter(|it| **it == carried).count(),
+            2,
+            "{markdown:?}"
+        );
+        /* A line like a definition that isn't one is carried nowhere. */
+        assert!(
+            markdown.iter().all(|it| !it.contains("[b]: x")),
+            "{markdown:?}"
+        );
+    }
+
+    #[test]
+    fn a_definition_carried_reads_back_as_the_same_definition() {
+        for definition in [
+            "[A  b]: <https://example.com/a b> \"t\"",
+            "[a]: https://example.com/&amp;\\<\\>\\\\ 'a \"quoted\" title'",
+            "[a]: https://example.com/&#10;x (a title\nover lines)",
+            "> [a]:\n> https://example.com/x\n> \"t\"",
+        ] {
+            let read = |text: &str| -> Option<markdown::mdast::Definition> {
+                let root = markdown::to_mdast(text, &options()).ok()?;
+                let mut stack = vec![root];
+                while let Some(node) = stack.pop() {
+                    if let Node::Definition(found) = node {
+                        return Some(found);
+                    }
+                    stack.extend(node.children().into_iter().flatten().cloned());
+                }
+                None
+            };
+            let found = read(definition).unwrap_or_else(|| panic!("{definition:?}"));
+            let carried = super::definition(&found);
+            assert!(!carried.contains('\n'), "{carried:?}");
+            let again = read(&carried).unwrap_or_else(|| panic!("{carried:?}"));
+            assert_eq!(again.identifier, found.identifier, "{carried:?}");
+            assert_eq!(again.title, found.title.map(|it| it.replace('\n', " ")));
+            assert_eq!(
+                again.url,
+                found.url.replace('\n', "%0A"),
+                "{definition:?} as {carried:?}"
+            );
+        }
+    }
+
+    /**
+     * Every piece of every family, at a region's size, and of every body built to carry: either
+     * plain, or Markdown whose parse by the view itself takes under [`VIEW_PARSE_LIMIT`] for
+     * each unit. Says how many fell back to plain text.
+     */
+    #[test]
+    fn every_piece_the_view_is_handed_is_one_it_parses_quickly() {
+        let bodies = families(REGION_BYTES)
+            .into_iter()
+            .chain(scanned(REGION_BYTES))
+            .chain(carrying());
+        let (mut markdown, mut plain) = (0, 0);
+        for (name, body) in bodies {
+            let (prose, _) = on_a_worker_stack(body);
+            for piece in prose.pieces {
+                let Piece::Markdown(sanitized) = piece else {
+                    plain += 1;
+                    continue;
+                };
+                markdown += 1;
+                let took = std::thread::Builder::new()
+                    .stack_size(PARSE_STACK)
+                    .spawn(move || {
+                        let start = Instant::now();
+                        let parsed = gpui_base::text::editor_host::parse_markdown(
+                            sanitized.as_str(),
+                            Default::default(),
+                        );
+                        assert!(parsed.is_ok());
+                        (start.elapsed(), sanitized.as_str().len())
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap();
+                let (took, bytes) = took;
+                assert!(
+                    took < crate::markdown::view_parse_limit(bytes),
+                    "{name}: a piece of {bytes} bytes took the view {took:?}"
+                );
+            }
+        }
+        eprintln!("{markdown} pieces of Markdown, {plain} plain");
+    }
+
+    #[test]
+    fn a_body_no_longer_wanted_goes_no_further_than_its_next_piece() {
+        /* One region, cut into pieces by blocks nested too deep to lay out. */
+        let body = repeated(&format!("Paragraph.\n\n{}\n\n", splitter()), 2_048);
+        assert_eq!(regions(scan(&body)).len(), 1);
+        /* Wanted for the region and its first piece. */
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let prose = Prose::markdown_while(&body, &|| {
+            asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2
+        });
+        let paragraphs: Vec<&Piece> = prose
+            .pieces
+            .iter()
+            .filter(|piece| match piece {
+                Piece::Markdown(markdown) => markdown.as_str().starts_with("Paragraph"),
+                Piece::Plain { text, .. } => text.text.starts_with("Paragraph"),
+                Piece::Code { .. } => false,
+            })
+            .collect();
+        assert!(paragraphs.len() > 10);
+        assert!(matches!(paragraphs[0], Piece::Markdown(_)));
+        assert!(
+            paragraphs[1..]
+                .iter()
+                .all(|piece| matches!(piece, Piece::Plain { .. }))
+        );
     }
 
     #[test]

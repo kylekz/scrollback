@@ -522,7 +522,9 @@ impl ReaderView {
         }
         let highlights: Highlights = match language {
             Some(language) if code.len() <= crate::syntax::MAX_HIGHLIGHT_BYTES => {
-                crate::syntax::highlight(language, code).into()
+                crate::syntax::highlight(language, code)
+                    .unwrap_or_default()
+                    .into()
             }
             _ => Rc::default(),
         };
