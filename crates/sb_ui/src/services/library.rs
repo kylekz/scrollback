@@ -44,6 +44,7 @@ use super::read_at::ReadAt;
 use super::view::{self, PageView, UnsortedView};
 use super::{ArchiveService, SyncEvent, SyncService};
 use crate::format;
+use crate::hostile::label;
 
 /// The sessions of a page that ended in one calendar month, as a range of the page's sessions.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,7 +264,7 @@ pub(super) fn load(archive: &Archive, shelf: Shelf) -> Result<Loaded, CatalogueE
         were cleaned may hold anything: each is drawn as it is read here. */
         folders: (catalogue.folders()?.into_iter())
             .map(|folder| Folder {
-                name: crate::hostile::label(&folder.name),
+                name: label(&folder.name),
                 ..folder
             })
             .collect(),
@@ -466,14 +467,17 @@ impl Change {
         })
     }
 
-    /// What it is, for the owner and the log: "The name “work”" and the like.
+    /// What it is, for the owner and the log: "The name “work”" and the like, what it names
+    /// drawn as a label ([`label`]: a name or a path may be a transcript's).
     fn what(&self) -> String {
         match self {
             Self::Star { starred: true, .. } => "The star".to_string(),
             Self::Star { starred: false, .. } => "Removing the star".to_string(),
-            Self::NewFolder { name, .. } => format!("The new folder “{name}”"),
-            Self::Rename { name, .. } => format!("The name “{name}”"),
-            Self::FolderFrom { name, typed, .. } => format!("The folder “{name}” for {typed}"),
+            Self::NewFolder { name, .. } => format!("The new folder “{}”", label(name)),
+            Self::Rename { name, .. } => format!("The name “{}”", label(name)),
+            Self::FolderFrom { name, typed, .. } => {
+                format!("The folder “{}” for {}", label(name), label(typed))
+            }
             Self::FileByHand { .. } | Self::FileAutomatically { .. } => "Filing".to_string(),
             Self::Refile { .. } | Self::Restore { .. } => "Undoing".to_string(),
             Self::Trash { .. } => "Moving to Trash".to_string(),
@@ -482,7 +486,7 @@ impl Change {
                 format!("Deleting “{}” for good", title_of(session))
             }
             Self::ChangePaths { .. } => "The change of paths".to_string(),
-            Self::MovePath { path, .. } => format!("Moving {}", path.0),
+            Self::MovePath { path, .. } => format!("Moving {}", label(&path.0)),
             Self::MoveFolder { .. } => "Moving the folder".to_string(),
             Self::DeleteFolder { .. } => "Deleting the folder".to_string(),
         }
@@ -493,8 +497,8 @@ impl Change {
 /// (DESIGN §4.14), shown once its change is written.
 #[derive(Clone, Debug)]
 pub struct Toast {
-    /// What it says. It may name a session's title, a project's path, a folder: it is drawn
-    /// as a label ([`crate::hostile::label`]).
+    /// What it says. What it names (a session's title, a project's path, a folder) is a label
+    /// already ([`label`]).
     pub text: String,
     undo: Option<Change>,
 }
@@ -554,7 +558,7 @@ pub fn title_of(session: &Session) -> String {
     session
         .title
         .as_deref()
-        .map_or_else(|| UNTITLED.to_string(), crate::hostile::label)
+        .map_or_else(|| UNTITLED.to_string(), label)
 }
 
 /// What a new folder is called until it is named; the catalogue makes it "New folder 2" and on
@@ -1711,7 +1715,7 @@ impl LibraryService {
         cx: &mut Context<Self>,
     ) {
         let toast = Toast {
-            text: format!("Moved {} to {}", path.0, self.folder_path(to)),
+            text: format!("Moved {} to {}", label(&path.0), self.folder_path(to)),
             undo: Some(Change::MovePath {
                 from: to,
                 path: path.clone(),
@@ -2008,7 +2012,7 @@ impl LibraryService {
         let written = match (&change, written) {
             (_, Ok(written)) => written,
             (Change::FolderFrom { group, .. }, Err(error)) => {
-                self.refused = Some((group.clone(), error.to_string()));
+                self.refused = Some((group.clone(), label(&error.to_string())));
                 return;
             }
             /* Nothing was deleted (PLAN §4.5). The confirmation shows again, with why and the
@@ -2244,7 +2248,7 @@ impl LibraryService {
 
     /// Why a change was refused, said as the owner knows things: no folder ids.
     fn why(&self, error: &ArchiveError) -> String {
-        match error {
+        let why = match error {
             ArchiveError::Catalogue(CatalogueError::NoFolder(_)) => {
                 "the folder was deleted".to_string()
             }
@@ -2259,7 +2263,9 @@ impl LibraryService {
                 self.folder_path(*folder)
             ),
             error => error.to_string().trim_end_matches('.').to_string(),
-        }
+        };
+        /* It may name a path, or say what a file it couldn't read held. */
+        label(&why)
     }
 
     /// Whether an Undo can still be done: the folders it names are still there.

@@ -784,7 +784,7 @@ impl SettingsPage {
         /* A session's title comes from its transcript, which may be what is damaged: what names
         the session is drawn as a label. */
         let session = problem.session.as_ref().map(|session| {
-            let named = format!(
+            hostile::label(&format!(
                 " · in {} ({}{})",
                 match (&session.title, &session.project_path) {
                     (Some(title), _) => format!("“{title}”"),
@@ -797,8 +797,7 @@ impl SettingsPage {
                     .as_ref()
                     .map(|location| format!(", {}", location.name))
                     .unwrap_or_default()
-            );
-            hostile::label(&named)
+            ))
         });
         let target = move |what: &str| -> SharedString {
             format!("settings/verify/problem/{at}/{what}").into()

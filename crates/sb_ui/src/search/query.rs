@@ -16,6 +16,7 @@ use sb_core::provider::ProviderId;
 use sb_core::search::{Calendar, Filter, Filters, Key, Names, Query, Token, parse, word};
 
 use crate::components::end_cut;
+use crate::hostile;
 
 /// The pages `in:` names before folders, as typed and as their chips say them.
 const PAGES: [(&str, Shelf, &str); 4] = [
@@ -47,6 +48,7 @@ const CHIP_CHARS: usize = 40;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Chip {
     pub filter: Filter,
+    /// What it says, what it names a label ([`hostile::label`]): it is drawn as it is.
     pub label: String,
 }
 
@@ -86,10 +88,11 @@ impl<'a> Known<'a> {
     fn chip(&self, filter: Filter, typed: &str) -> Chip {
         match &filter {
             Filter::Shelf(Shelf::Folder(id)) => {
+                /* A folder's name is a label as the library reads it; what was typed isn't. */
                 let name = (self.folders.iter())
                     .find(|folder| folder.id == *id)
-                    .map_or(typed, |folder| folder.name.as_str());
-                Chip::new(filter.clone(), "Folder", name)
+                    .map_or_else(|| hostile::label(typed), |folder| folder.name.clone());
+                Chip::new(filter.clone(), "Folder", &name)
             }
             Filter::Shelf(shelf) => {
                 let (_, _, name) = PAGES
@@ -103,7 +106,7 @@ impl<'a> Known<'a> {
                 let name = (self.locations.iter())
                     .find(|location| location.id == *id)
                     .map_or(typed, |location| location.name.as_str());
-                Chip::new(filter.clone(), "Location", name)
+                Chip::new(filter.clone(), "Location", &hostile::label(name))
             }
             Filter::Agent(id) => {
                 let name = (self.agents.iter())
@@ -112,7 +115,7 @@ impl<'a> Known<'a> {
                 Chip::new(filter.clone(), "Agent", name)
             }
             Filter::Model(model) => Chip::new(filter.clone(), "Model", &(self.model_name)(model)),
-            Filter::Branch(branch) => Chip::new(filter.clone(), "Branch", branch),
+            Filter::Branch(branch) => Chip::new(filter.clone(), "Branch", &hostile::label(branch)),
             Filter::After(_) => Chip::new(filter, "After", typed),
             Filter::Before(_) => Chip::new(filter, "Before", typed),
         }

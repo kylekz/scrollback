@@ -85,7 +85,8 @@ pub enum Progress {
     Indexing { sessions: usize, bytes: u64 },
     /// So many of those sessions are indexed, and so many of those bytes read.
     Indexed { sessions: usize, bytes: u64 },
-    /// So many sessions' text is made searchable, at the end of an index: search finds more.
+    /// So many sessions' text is made searchable so far by the index's second step, counted
+    /// from its start: said after each batch of text it writes, so search finds more.
     Searchable { sessions: usize },
 }
 

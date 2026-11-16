@@ -17,19 +17,21 @@
 //! **Find in session** isn't built yet (PLAN §13, phase 4b): the request's `find` is kept with
 //! the request taken ([`ReaderView::read_at`]), for Find to be filled with when it comes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{App, Context, Entity, ListOffset, Task, px};
+use gpui::{App, Context, Entity, EntityId, ListOffset, Task, px};
 use gpui_base::text::{RangeHighlight, TextViewState};
 use sb_core::search::first_match;
 use sb_core::transcript::{At, searchable};
 
 use super::rows::{MAX_DEPTH, Row};
 use super::{Piece, ReaderView};
-use crate::services::reader::{BlockRef, Load, OpenSession, ReaderService, Toggle};
+use crate::services::reader::{
+    BlockRef, Load, OpenSession, Piece as ProsePiece, ReaderService, Toggle,
+};
 use crate::services::{ActiveServices as _, ReadAt};
 use crate::theme::ActiveTheme as _;
 
@@ -45,8 +47,13 @@ const FLASH_TICK: Duration = Duration::from_millis(50);
 pub(super) struct Flash {
     pub(super) at: BlockRef,
     pub(super) text: String,
-    /// The piece of prose it is lit in, once it is.
-    lit: Option<Piece>,
+    /// The piece of prose it is lit in, once it is, and the Markdown state it was lit on: one
+    /// made again (let go of and drawn again) is lit again.
+    lit: Option<(Piece, EntityId)>,
+    /// The pieces of its block's prose drawn without it, and whether the activity row drawn for
+    /// the block lacks it: once all that could hold it don't, it won't light.
+    missed: HashSet<Piece>,
+    missed_row: bool,
     /// Whether it has been drawn: it shows for [`FLASH`] from then.
     drawn: bool,
     _ticks: Task<()>,
@@ -201,7 +208,7 @@ impl ReaderView {
                     } else {
                         waited += FLASH_TICK;
                     }
-                    if shown >= FLASH || waited >= FLASH_WAIT {
+                    if shown >= FLASH || waited >= FLASH_WAIT || this.wont_light(cx) {
                         this.end_flash(cx);
                         return false;
                     }
@@ -218,9 +225,38 @@ impl ReaderView {
             at,
             text,
             lit: None,
+            missed: HashSet::new(),
+            missed_row: false,
             drawn: false,
             _ticks: ticks,
         });
+    }
+
+    /**
+     * Whether the flash, not drawn yet, is clear not to light: the activity row drawn for its
+     * block lacks it, or every piece of its block's prose the Markdown view draws was drawn
+     * without it (a hit in fenced code or plain lines isn't lit).
+     */
+    fn wont_light(&self, cx: &App) -> bool {
+        let Some(flash) = self.flash.as_ref().filter(|flash| !flash.drawn) else {
+            return false;
+        };
+        if flash.missed_row {
+            return true;
+        }
+        let reader = cx.services().reader.read(cx);
+        let Some(Load::Loaded(prose)) = reader.open_session().and_then(|it| it.prose(&flash.at))
+        else {
+            return false;
+        };
+        (prose.pieces.iter().enumerate())
+            .filter(|(_, piece)| matches!(piece, ProsePiece::Markdown(_)))
+            .all(|(index, _)| {
+                flash.missed.contains(&Piece {
+                    at: flash.at.clone(),
+                    piece: index,
+                })
+            })
     }
 
     /// Stops the flash, and takes its highlight off the prose it lit.
@@ -228,14 +264,16 @@ impl ReaderView {
         let Some(flash) = self.flash.take() else {
             return;
         };
-        if let Some((state, _)) = flash.lit.and_then(|piece| self.states.get(&piece)) {
+        if let Some((state, _)) = flash.lit.and_then(|(piece, _)| self.states.get(&piece)) {
             state.update(cx, |state, cx| state.clear_range_highlights(cx));
         }
         cx.notify();
     }
 
-    /// Lights the flash in the piece of prose `piece`, drawn with `state`, if it is in that
-    /// piece and isn't lit elsewhere.
+    /**
+     * Lights the flash in the piece of prose `piece`, drawn with `state`, if it is in that
+     * piece's text as drawn and isn't lit in another piece; again on a state made anew.
+     */
     pub(super) fn light_prose(
         &mut self,
         piece: &Piece,
@@ -246,10 +284,15 @@ impl ReaderView {
             return;
         };
         match &flash.lit {
-            Some(lit) => flash.drawn |= lit == piece,
-            None => {
+            Some((lit, on)) if lit == piece && *on == state.entity_id() => flash.drawn = true,
+            Some((lit, _)) if lit != piece => {}
+            _ => {
                 let rendered = state.read(cx).rendered_text();
-                let Some(range) = first_match(rendered.as_str(), &flash.text) else {
+                if rendered.is_empty() {
+                    return;
+                }
+                let Some(range) = shown_match(rendered.as_str(), &flash.text) else {
+                    flash.missed.insert(piece.clone());
                     return;
                 };
                 let accent = cx.sb_theme().colors.accent;
@@ -257,7 +300,7 @@ impl ReaderView {
                     state.set_range_highlights([RangeHighlight::new(range, accent)], cx)
                 });
                 if lit.is_ok() {
-                    flash.lit = Some(piece.clone());
+                    flash.lit = Some((piece.clone(), state.entity_id()));
                     flash.drawn = true;
                 }
             }
@@ -268,10 +311,30 @@ impl ReaderView {
     /// row's command or path), if it is there.
     pub(super) fn flash_in(&mut self, at: &BlockRef, text: &str) -> Option<Range<usize>> {
         let flash = self.flash.as_mut().filter(|flash| flash.at == *at)?;
-        let range = first_match(text, &flash.text)?;
+        let Some(range) = shown_match(text, &flash.text) else {
+            flash.missed_row = true;
+            return None;
+        };
         flash.drawn = true;
         Some(range)
     }
+}
+
+/**
+ * Where `term` first is in `shown`, text as a view draws it, as search matches it: the
+ * zero-width spaces the sanitiser puts in tags and addresses are passed over, so a hit across
+ * one is found, and the range covers them.
+ */
+fn shown_match(shown: &str, term: &str) -> Option<Range<usize>> {
+    /* Each byte of the text without them, with where it is in `shown`. */
+    let mut bare = String::with_capacity(shown.len());
+    let mut places = Vec::with_capacity(shown.len());
+    for (at, c) in shown.char_indices().filter(|(_, c)| *c != '\u{200B}') {
+        bare.push(c);
+        places.extend(at..at + c.len_utf8());
+    }
+    let found = first_match(&bare, term)?;
+    Some(places[found.start]..places[found.end - 1] + 1)
 }
 
 /// Whether the block `at` holds `text` where search looks, as search matches it.
@@ -403,4 +466,20 @@ fn chain(parents: &HashMap<Arc<str>, Arc<str>>, target: &Arc<str>) -> Option<Vec
     }
     chain.reverse();
     Some(chain)
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::shown_match;
+
+    #[test]
+    fn a_hit_across_a_zero_width_space_is_found_and_covers_it() {
+        let shown = "see https:\u{200B}//example.com now";
+        let found = shown_match(shown, "https://example").expect("found");
+        assert_eq!(&shown[found], "https:\u{200B}//example");
+        assert_eq!(shown_match("Café crème", "cafe CREME"), Some(0..12));
+        assert_eq!(shown_match("nothing", "quokka"), None);
+    }
 }
