@@ -421,7 +421,7 @@ fn prose(
 ) -> AnyElement {
     let c = &theme.colors;
     let reader = cx.services().reader.clone();
-    let (prepared, thinking, length, name) = {
+    let (prepared, thinking, of_reply, length, name) = {
         let reader = reader.read(cx);
         let Some(open) = reader.open_session() else {
             return div().into_any_element();
@@ -433,6 +433,7 @@ fn prose(
                 _ => None,
             },
             matches!(block, Some(Content::Thinking { .. })),
+            matches!(block, Some(Content::Reply { .. })),
             match block {
                 Some(Content::Prompt { text, .. } | Content::Reply { text }) => text.len(),
                 _ => 0,
@@ -550,8 +551,15 @@ fn prose(
             )
         }
     };
+    /* The Copy button's own column, at the right of every row of a reply: the reply's text and
+    a code block's own Copy stop short of it, so that its pieces are all as wide. */
+    let copy_column = theme.sizes.small_button + theme.spacing.xs;
     if !reply {
-        return content;
+        return if of_reply {
+            div().pr(copy_column).child(content).into_any_element()
+        } else {
+            content
+        };
     }
     let group: SharedString = format!("message-{ix}").into();
     ringed(
@@ -563,9 +571,8 @@ fn prose(
         focused,
         theme,
     )
-    /* The Copy button's own column, at the right: the reply's text and a code block's own
-    Copy stop short of it. After `ringed`, whose padding it widens. */
-    .pr(theme.spacing.sm + theme.sizes.small_button + theme.spacing.xs)
+    /* After `ringed`, whose padding it widens. */
+    .pr(theme.spacing.sm + copy_column)
     .child(content)
     .child(
         div()
