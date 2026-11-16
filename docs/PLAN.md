@@ -188,8 +188,8 @@ Tables, in outline (the schema is `toolbox_store` migrations, append-only):
 
 | Table | Holds |
 |---|---|
-| `location` | id, kind, name, connection details (distro, or SSH host), its drive mount when it has its own, last sync attempt and success, last error, unreachable since and why |
-| `location_provider` | per provider found at a location: the retention last read |
+| `location` | id, kind, name, connection details (distro, or SSH host), its drive mount when it has its own, last sync attempt and success, last error, unreachable since and why, removed-at (a removed location syncs no more and keeps what was archived from it; adding it again clears it) |
+| `location_provider` | per provider found at a location: the retention last read, and the root where it keeps its data there, from the last pass |
 | `item` | location, provider, key, item id, kind (transcript, subagent, tool result, sidecar), the session it belongs to, last seen length and stamp, gone-since |
 | `version` | item, number, reason, started, length, hash, held-back, held for parsing, accepted by the owner, damaged, the provider's export version when the item is an export |
 | `segment` | version, offset, length, hash, stored-at |
@@ -287,9 +287,9 @@ No operation writes, and none runs an agent's own tools. That is enough for an a
 
 ### 6.4 SSH
 
-- **A location is a host string** exactly as the owner would give it to `ssh`: an alias from `~/.ssh/config` or `user@host`.
+- **A location is a host string** as the owner would give it to `ssh`: an alias from `~/.ssh/config` or `user@host`. It is checked strictly (`sb_core::location::host_problem`) when a location is added and again before every launch, so nothing typed can reach `ssh` as an option. At most 320 characters, split at the last `@`. A user part takes `[A-Za-z0-9._+-]`. A host part may not start with `-` (nor may the whole string), and takes `[A-Za-z0-9._:-]`, or an IPv6 address in brackets (hex digits, `:` and `.`, and an optional `%zone` of `[A-Za-z0-9._-]`). Anything else is refused with a sentence naming the character: whitespace, quotes, shell metacharacters, control and invisible characters, bidi overrides, look-alike dashes. `user@domain@host` is refused too; such a login goes in a `~/.ssh/config` alias with `User`. Two host strings are the same place when their user parts are equal and their host parts equal ignoring case.
 - **Launch:** `ssh -T -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ClearAllForwardings=yes -o ControlMaster=no -o LogLevel=INFO -- <host> sh -s`. No password or passphrase prompt can appear; a host that needs one fails with `ssh`'s message, which the location shows. The keep-alives stop a host that goes to sleep mid-pass from hanging the sync.
-- **How a failure is read:** `ssh` exiting with its own error is unreachable when it couldn't resolve, reach or stay connected to the host, or gave up without a word (not an error, §5), refused when sign-in was refused, and a host-key failure when the key changed, which is shown plainly and never bypassed. Any other failure carries the tool's last line as its reason.
+- **How a failure is read:** `ssh` exiting with its own error is unreachable when it couldn't resolve, reach or stay connected to the host, or gave up without a word (not an error, §5), refused when sign-in was refused, and a host-key failure when the key changed or isn't known yet (told apart, each with its own advice), which is shown plainly and never bypassed. Any other failure carries the tool's last line as its reason.
 - **Adding** runs the connection test: connect, find the tools, then ask each provider what it finds there (which agents are present, and how many sessions). A host that fails the test can still be added, so a machine that is asleep can be set up now and synced when it wakes.
 - Windows ships an OpenSSH client; if `ssh` isn't on `PATH`, adding an SSH location says so.
 
