@@ -81,10 +81,12 @@ fn shape(raw: &str, keep: bool) -> (String, Vec<(Range<usize>, Mark)>) {
         column: 0,
     };
     let mut at = 0;
+    /* Where a string's terminator may next start: none does before it (`escape`). */
+    let mut unended = 0;
     while at < bytes.len() {
         match bytes[at] {
             0x1b => {
-                let (end, sgr) = escape(bytes, at);
+                let (end, sgr) = escape(bytes, at, &mut unended);
                 if let Some(params) = sgr {
                     colour = sgr_colour(params, colour);
                 }
@@ -123,8 +125,13 @@ fn shape(raw: &str, keep: bool) -> (String, Vec<(Range<usize>, Mark)>) {
  * The escape at `at` (an ESC): where what follows it starts, and for a Select Graphic
  * Rendition (`ESC [ … m`) its parameters. An escape not ended within [`ESCAPE_BYTES`] is its
  * ESC and its introducer only.
+ *
+ * `unended` is how far the bytes are known to hold no string terminator (BEL or ESC \): a
+ * string that doesn't end is followed by the next, which would look through the same bytes
+ * again, so a run of them looks at each byte once. (A control sequence's look stops at the
+ * next one's `[`, a final byte, so those never overlap.)
  */
-fn escape(bytes: &[u8], at: usize) -> (usize, Option<&[u8]>) {
+fn escape<'a>(bytes: &'a [u8], at: usize, unended: &mut usize) -> (usize, Option<&'a [u8]>) {
     let reach = (at + ESCAPE_BYTES).min(bytes.len());
     match bytes.get(at + 1) {
         /* A control sequence: parameters and intermediates, then a final byte. */
@@ -145,13 +152,17 @@ fn escape(bytes: &[u8], at: usize) -> (usize, Option<&[u8]>) {
         /* An operating system command, and the strings like it: up to BEL or ST. */
         Some(b']' | b'P' | b'_' | b'^' | b'X') => {
             let body = at + 2;
-            let found = bytes[body.min(reach)..reach]
+            let from = body.max(*unended).min(reach);
+            let found = bytes[from..reach]
                 .iter()
                 .enumerate()
                 .find(|(offset, byte)| {
-                    **byte == 0x07 || **byte == 0x1b && bytes.get(body + offset + 1) == Some(&b'\\')
+                    **byte == 0x07 || **byte == 0x1b && bytes.get(from + offset + 1) == Some(&b'\\')
                 })
-                .map(|(offset, byte)| body + offset + if *byte == 0x07 { 1 } else { 2 });
+                .map(|(offset, byte)| from + offset + if *byte == 0x07 { 1 } else { 2 });
+            if found.is_none() {
+                *unended = (*unended).max(reach);
+            }
             (found.unwrap_or(body.min(bytes.len())), None)
         }
         /* Any other: ESC and the one byte after it, when that is ASCII. */
@@ -307,6 +318,24 @@ mod tests {
         );
         assert_eq!(coloured("\u{1b}"), (String::new(), vec![]));
         assert_eq!(coloured("x\u{1b}é"), ("xé".to_string(), vec![]));
+        /* Strings that don't end, then one that does past the first's reach: the later ones,
+        which reach it, end there, whichever end it is. */
+        for end in ["\u{7}", "\u{1b}\\"] {
+            /* The end at the first one's reach exactly, then well past it. */
+            for count in [ESCAPE_BYTES / 2, 200] {
+                let run = "\u{1b}]".repeat(count);
+                assert_eq!(
+                    strip_text(&format!("{run}{end}tail")),
+                    "tail",
+                    "{end:?} {count}"
+                );
+            }
+        }
+        let far = format!("\u{1b}]{}\u{7}tail", "x".repeat(ESCAPE_BYTES));
+        assert_eq!(
+            strip_text(&far),
+            format!("{}tail", "x".repeat(ESCAPE_BYTES))
+        );
         /* A giant escape: parameters past the reach are text, read once. */
         let giant = format!("\u{1b}[{}mtail", "1;".repeat(4_000_000));
         let started = Instant::now();
