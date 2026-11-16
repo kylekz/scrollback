@@ -109,6 +109,41 @@ pub mod sessions {
             Open,
             /// Star or unstar the selected session (`S`).
             Star,
+            /// Move the selected sessions to Trash (`Delete`).
+            Trash,
+            /// Open Move to folder for the selected sessions (`M`).
+            Move,
+            /// Select every session the page shows (`Ctrl A`).
+            SelectAll,
+            /// Open the selected session's menu (`Shift F10`).
+            Menu,
+            /// In the paths editor: save the changes (`Ctrl Enter`).
+            SavePaths,
+            /// In the paths editor: drop the changes and close it (`Esc`).
+            CancelPaths,
+        ]
+    );
+}
+
+/// A menu's actions, while it has the keyboard (DESIGN §5).
+pub mod menu {
+    use gpui::actions;
+
+    actions!(
+        menu,
+        [
+            /// The item above (`↑`).
+            Previous,
+            /// The item below (`↓`).
+            Next,
+            /// Do what the item says, or open its submenu (`Enter`, `Space`).
+            Choose,
+            /// Open the item's submenu (`→`).
+            Open,
+            /// Close the submenu, back to the menu it is in (`←`).
+            Back,
+            /// Close the menu (`Esc`).
+            Close,
         ]
     );
 }

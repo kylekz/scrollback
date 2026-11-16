@@ -173,6 +173,16 @@ impl FromSql for NormalPath {
     }
 }
 
+/// A path as the owner typed it, without the white space around it, and without the pair of
+/// double quotes a path copied from a file manager comes in.
+pub fn as_typed(typed: &str) -> &str {
+    let typed = typed.trim();
+    typed
+        .strip_prefix('"')
+        .and_then(|typed| typed.strip_suffix('"'))
+        .map_or(typed, str::trim)
+}
+
 /// A folder's identity in the catalogue (PLAN §2.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FolderId(pub i64);
@@ -184,6 +194,15 @@ pub struct AttachedPath {
     pub path: NormalPath,
     /// The one location whose sessions it files; `None` files every location's.
     pub location: Option<LocationId>,
+}
+
+/// A session the rules may move (PLAN §8): indexed with a project path, and not filed by hand.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fileable {
+    pub project: NormalPath,
+    pub location: LocationId,
+    /// The folder the rules have it in; `None` in Unsorted.
+    pub folder: Option<FolderId>,
 }
 
 /**
@@ -340,6 +359,15 @@ mod tests {
             plain(r"\\wsl.localhost\Ubuntu-24.04\home\user\app"),
             plain(r"\\wsl.localhost\Ubuntu-24.04\home\user\App")
         );
+    }
+
+    #[test]
+    fn a_typed_path_loses_the_space_and_the_quotes_around_it() {
+        assert_eq!(as_typed("  /home/user/code/app \n"), "/home/user/code/app");
+        assert_eq!(as_typed(r#""D:\Projects\fc""#), r"D:\Projects\fc");
+        assert_eq!(as_typed(r#" " D:\Projects\fc " "#), r"D:\Projects\fc");
+        // One quote alone is part of the path.
+        assert_eq!(as_typed(r#""/home/user"#), r#""/home/user"#);
     }
 
     #[test]

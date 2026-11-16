@@ -1,0 +1,95 @@
+{"scenario": {"window_size": "1440x900", "fixture": "boards", "description": "A folder's paths editor in place on its page (DESIGN §4.4, §4.7; E-Folder-Paths, E-Edge-Empty-Folder), on the boards' library: fc's paths with the equivalence note; a path typed that player has, refused and naming it; one completed from what a location has seen, added as a change with what it would file; a path taken off with Undo; leaving with changes asking first; Save, its toast and Undo; Esc dropping changes; and a new, empty folder whose short editor attaches a suggestion from Unsorted at once. Captured dark and light, and at 960x600"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/library/sessions", "equals": 2318}]}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+{"cmd": "click", "target": "sidebar/folder/fc"}
+{"cmd": "settle", "expect": {"pointer": "/library/shelf", "equals": {"folder": "fc"}}}
+
+// Edit paths turns the paths line into the editor, the keyboard in its add row.
+{"cmd": "click", "target": "page/edit-paths"}
+{"cmd": "settle", "expect": {"pointer": "/page_view/editor", "equals": {"short": false, "added": [], "removed": []}}}
+{"cmd": "query", "prefix": "paths/row/", "expect_result": {"pointer": "", "len": 6}}
+{"cmd": "screenshot", "name": "editor-dark"}
+
+// A path player has for Ubuntu-24.04, typed for the same: refused, and the refusal names fc › player. The scope's menu gives the keyboard back to the field.
+{"cmd": "click", "target": "paths/scope"}
+{"cmd": "settle", "expect": {"pointer": "/menu/items", "contains": "location/Ubuntu-24.04"}}
+{"cmd": "click", "target": "menu/location/Ubuntu-24.04"}
+{"cmd": "type", "text": "/home/user/code/fc/crates/fc_player"}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "paths/holder", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "key", "keystroke": "enter", "expect": {"pointer": "/page_view/editor/added", "equals": []}}
+{"cmd": "screenshot", "name": "refused-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "refused-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// Completion: the paths a location has seen that hold what is typed; picking one fills the field and its location.
+{"cmd": "key", "keystroke": "secondary-a"}
+{"cmd": "key", "keystroke": "backspace"}
+{"cmd": "type", "text": "advent"}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "paths/completion/0", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "completion-dark"}
+{"cmd": "click", "target": "paths/completion/0"}
+{"cmd": "click", "target": "paths/add"}
+{"cmd": "settle", "expect": {"pointer": "/page_view/editor/added", "len": 1}}
+// And the Mac's path taken off: struck through, with what it hands back, and Undo.
+{"cmd": "click", "target": "paths/row/2/remove"}
+{"cmd": "settle", "expect": {"pointer": "/page_view/editor/removed", "equals": ["/Users/user/code/fc"]}}
+{"cmd": "bounds", "target": "paths/summary", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "pending-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "pending-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "click", "target": "paths/row/2/undo"}
+{"cmd": "settle", "expect": {"pointer": "/page_view/editor/removed", "equals": []}}
+
+// Leaving the page with a change asks; Cancel stays.
+{"cmd": "click", "target": "sidebar/folder/dv"}
+{"cmd": "settle", "expect": [{"pointer": "/library/asked", "equals": true}, {"pointer": "/library/shelf", "equals": {"folder": "fc"}}]}
+{"cmd": "screenshot", "name": "ask-dark"}
+{"cmd": "click", "target": "ask/cancel"}
+{"cmd": "settle", "expect": [{"pointer": "/library/asked", "equals": false}, {"pointer": "/page_view/editor/added", "len": 1}]}
+
+// Save paths: one change, the sessions at that path filed into fc, and a toast that undoes it.
+{"cmd": "click", "target": "paths/save"}
+{"cmd": "settle", "expect": [{"pointer": "/page_view/editor", "equals": null}, {"pointer": "/library/toast/text", "equals": "Paths of fc saved"}, {"pointer": "/library/counts/unsorted", "lte": 36}]}
+{"cmd": "click", "target": "toast/undo"}
+{"cmd": "settle", "expect": {"pointer": "/library/counts/unsorted", "equals": 37}}
+
+// Esc drops the changes and closes the editor.
+{"cmd": "click", "target": "page/edit-paths"}
+{"cmd": "click", "target": "paths/row/0/remove"}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": {"pointer": "/page_view/editor", "equals": null}}
+{"cmd": "click", "target": "sidebar/folder/dv"}
+{"cmd": "settle", "expect": [{"pointer": "/library/asked", "equals": false}, {"pointer": "/library/shelf", "equals": {"folder": "dv"}}]}
+
+// A new folder, blog, is empty: its page opens the short editor with Unsorted's blog path suggested; Attach files it at once.
+{"cmd": "key", "keystroke": "secondary-shift-n"}
+{"cmd": "type", "text": "blog\n"}
+{"cmd": "settle"}
+{"cmd": "click", "target": "sidebar/folder/blog"}
+{"cmd": "settle", "expect": [{"pointer": "/library/shelf", "equals": {"folder": "blog"}}, {"pointer": "/page_view/editor/short", "equals": true}]}
+{"cmd": "bounds", "target": "paths/suggested/0", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "empty-folder-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 2}
+{"cmd": "screenshot", "name": "empty-folder-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "resize", "w": 960, "h": 600}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "empty-folder-narrow-dark"}
+{"cmd": "click", "target": "paths/suggested/0"}
+// The attach is written and the page read again before the editor is asked about: the short editor closes once the folder isn't empty, and doesn't open again while the page is read.
+{"cmd": "settle", "expect": [{"pointer": "/library/toast/text", "equals": "Attached to blog · 6 sessions filed"}, {"pointer": "/library/sessions", "equals": 6}]}
+{"cmd": "settle", "expect": {"pointer": "/page_view/editor", "equals": null}}
+
+// The full editor at 960x600.
+{"cmd": "click", "target": "page/edit-paths"}
+{"cmd": "settle", "expect": {"pointer": "/page_view/editor/short", "equals": false}}
+{"cmd": "screenshot", "name": "editor-narrow-dark"}

@@ -7,13 +7,22 @@
 use gpui::{App, Menu, MenuItem, SystemMenuType};
 
 use crate::actions::app;
+use crate::services::{ActiveServices as _, Leave};
 
 /// Installs the menu bar and the app actions behind it, on macOS.
 pub fn init(cx: &mut App) {
     if !cfg!(target_os = "macos") {
         return;
     }
-    cx.on_action(|_: &app::Quit, cx| cx.quit());
+    // Quitting asks first while the paths editor has changes to save (`crate::shell`).
+    cx.on_action(|_: &app::Quit, cx| {
+        let library = cx.services().library.clone();
+        if library.read(cx).held().is_some() {
+            library.update(cx, |library, cx| library.ask_before(Leave::Quit, cx));
+        } else {
+            cx.quit();
+        }
+    });
     cx.on_action(|_: &app::Hide, cx| cx.hide());
     cx.on_action(|_: &app::HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &app::ShowAll, cx| cx.unhide_other_apps());

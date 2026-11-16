@@ -24,19 +24,23 @@
 //! what may not have been: the job writing the change in hand may still finish it.
 
 use std::cmp::Reverse;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
-use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription};
+use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 use sb_core::archive::Archive;
 use sb_core::catalogue::{
-    CatalogueError, Filed, Folder, LibraryCounts, PathGroup, Session, SessionId, Shelf,
+    Before, CatalogueError, Filed, Folder, FolderPath, LibraryCounts, PathGroup, Session,
+    SessionId, Shelf, Undone,
 };
 use sb_core::filing::{self, AttachedPath, FolderId, NormalPath};
 use sb_core::location::LocationId;
 
+use super::drag::DragState;
+use super::view::{self, PageView, UnsortedView};
 use super::{ArchiveService, SyncEvent, SyncService};
 use crate::format;
 
@@ -65,6 +69,8 @@ pub struct Stats {
 pub struct PathChip {
     /// The path as the owner typed it.
     pub typed: String,
+    /// The path as filing compares it.
+    pub path: NormalPath,
     /// The one location it is attached for; `None` for any.
     pub location: Option<LocationId>,
     /// How many of the page's sessions it filed here.
@@ -118,7 +124,7 @@ impl SessionsPage {
 
     /// Where the session `id` is: at `hint`, where it was when the page was last drawn, or
     /// wherever a load has moved it since.
-    fn find(&self, id: &SessionId, hint: usize) -> Option<usize> {
+    pub fn find(&self, id: &SessionId, hint: usize) -> Option<usize> {
         match self.sessions.get(hint) {
             Some(session) if session.id == *id => Some(hint),
             _ => self.sessions.iter().position(|session| session.id == *id),
@@ -184,6 +190,7 @@ pub(super) struct Loaded {
     shelf: Shelf,
     counts: LibraryCounts,
     folders: Vec<Folder>,
+    attached: Vec<FolderPath>,
     agents: usize,
     pub(super) page: Page,
 }
@@ -229,6 +236,7 @@ pub(super) fn load(archive: &Archive, shelf: Shelf) -> Result<Loaded, CatalogueE
                         .zip(filed)
                         .map(|(path, sessions)| PathChip {
                             typed: path.typed,
+                            path: path.attached.path,
                             location: path.attached.location,
                             sessions,
                         })
@@ -243,6 +251,7 @@ pub(super) fn load(archive: &Archive, shelf: Shelf) -> Result<Loaded, CatalogueE
         shelf,
         counts: catalogue.library_counts()?,
         folders: catalogue.folders()?,
+        attached: catalogue.attached_paths()?,
         agents: agents.len(),
         page,
     })
@@ -252,17 +261,32 @@ pub enum LibraryEvent {
     /// A folder the owner just made is among the folders now: the sidebar renames it in
     /// place (DESIGN §4.6).
     FolderCreated(FolderId),
+    /// The owner asked to rename a folder from a menu: the sidebar renames it in place.
+    Rename(FolderId),
+    /// The owner asked to edit a folder's paths, whose page shows now (DESIGN §4.7).
+    EditPaths(FolderId),
+    /// The owner closed the window, or quit, and the paths editor's changes were saved or
+    /// dropped: it closes, or the app quits, now.
+    Leave(Leave),
 }
 
+/// A project path on a folder as the owner typed it, and the one location it is for: how the
+/// changes name a path, so that one is written as the catalogue reads it then.
+pub type TypedPath = (String, Option<LocationId>);
+
 /// One of the owner's changes, waiting its turn to be written.
-enum Change {
+#[derive(Clone, Debug)]
+pub enum Change {
     Star {
-        id: SessionId,
+        ids: Vec<SessionId>,
         starred: bool,
     },
+    /// A folder, and the sessions filed in it by hand once it is made (Move to folder's New
+    /// folder…, DESIGN §4.5).
     NewFolder {
         name: String,
         parent: Option<FolderId>,
+        sessions: Vec<SessionId>,
     },
     Rename {
         folder: FolderId,
@@ -276,25 +300,131 @@ enum Change {
         typed: String,
         location: Option<LocationId>,
     },
+    FileByHand {
+        ids: Vec<SessionId>,
+        folder: FolderId,
+    },
+    FileAutomatically {
+        ids: Vec<SessionId>,
+    },
+    /// Puts sessions back as they were filed: an Undo.
+    Refile {
+        before: Vec<Before>,
+    },
+    Trash {
+        ids: Vec<SessionId>,
+    },
+    /// Takes sessions out of Trash: an Undo.
+    Restore {
+        ids: Vec<SessionId>,
+    },
+    /// A folder's paths taken off and put on in one change: the editor's Save, attaching a
+    /// group's path, and their Undo.
+    ChangePaths {
+        folder: FolderId,
+        detach: Vec<TypedPath>,
+        attach: Vec<TypedPath>,
+    },
+    MovePath {
+        from: FolderId,
+        path: TypedPath,
+        to: FolderId,
+    },
+    MoveFolder {
+        folder: FolderId,
+        parent: Option<FolderId>,
+        position: usize,
+    },
+    DeleteFolder {
+        folder: FolderId,
+    },
+}
+
+/**
+ * What writing a change did, as the catalogue said in the change's own transaction: what the
+ * toast says and its Undo put back are made from it.
+ */
+enum Written {
+    Done,
+    /// A folder was made.
+    Made(FolderId),
+    /// A folder was deleted, and these of its subfolders renamed, from what to what, as they
+    /// moved up beside folders of their name.
+    Deleted(Vec<(String, String)>),
+    /// Sessions were filed by hand in the folder; how they were before.
+    Filed(FolderId, Vec<Before>),
+    /// Sessions were handed back to the rules; how they were before, and where they are now.
+    Handed(Vec<(Before, Option<FolderId>)>),
+    /// These sessions were moved to Trash; any others were there already.
+    Trashed(Vec<SessionId>),
+    /// An Undo, and what it could not put back.
+    Undone(Undone),
 }
 
 impl Change {
-    /// Writes it, off the UI thread. A folder made is returned.
-    fn write(&self, archive: &Archive) -> Result<Option<FolderId>, CatalogueError> {
+    /// Writes it, off the UI thread, each in one transaction.
+    fn write(&self, archive: &Archive) -> Result<Written, CatalogueError> {
         let catalogue = archive.catalogue();
-        match self {
-            Self::Star { id, starred } => catalogue.set_starred(id, *starred).map(|()| None),
-            Self::NewFolder { name, parent } => catalogue.create_folder(name, *parent).map(Some),
-            Self::Rename { folder, name } => catalogue.rename_folder(*folder, name).map(|()| None),
+        Ok(match self {
+            Self::Star { ids, starred } => {
+                catalogue.set_starred_all(ids, *starred)?;
+                Written::Done
+            }
+            Self::NewFolder {
+                name,
+                parent,
+                sessions,
+            } => Written::Made(catalogue.create_folder_with(name, *parent, sessions)?),
+            Self::Rename { folder, name } => {
+                catalogue.rename_folder(*folder, name)?;
+                Written::Done
+            }
             Self::FolderFrom {
                 name,
                 typed,
                 location,
                 ..
-            } => catalogue
-                .create_folder_with_path(name, None, typed, location.as_ref())
-                .map(Some),
-        }
+            } => Written::Made(catalogue.create_folder_with_path(
+                name,
+                None,
+                typed,
+                location.as_ref(),
+            )?),
+            Self::FileByHand { ids, folder } => {
+                Written::Filed(*folder, catalogue.file_by_hand_all(ids, *folder)?)
+            }
+            Self::FileAutomatically { ids } => {
+                Written::Handed(catalogue.file_automatically_all(ids)?)
+            }
+            Self::Refile { before } => Written::Undone(catalogue.refile_as(before)?),
+            Self::Trash { ids } => Written::Trashed(catalogue.trash_all(ids)?),
+            Self::Restore { ids } => Written::Undone(catalogue.restore_all(ids)?),
+            Self::ChangePaths {
+                folder,
+                detach,
+                attach,
+            } => {
+                catalogue.change_paths(*folder, detach, attach)?;
+                Written::Done
+            }
+            Self::MovePath {
+                from,
+                path: (typed, location),
+                to,
+            } => {
+                catalogue.move_path(*from, (typed, location.as_ref()), *to)?;
+                Written::Done
+            }
+            Self::MoveFolder {
+                folder,
+                parent,
+                position,
+            } => {
+                catalogue.move_folder(*folder, *parent, *position)?;
+                Written::Done
+            }
+            Self::DeleteFolder { folder } => Written::Deleted(catalogue.delete_folder(*folder)?),
+        })
     }
 
     /// What it is, for the owner and the log: "The name “work”" and the like.
@@ -305,7 +435,81 @@ impl Change {
             Self::NewFolder { name, .. } => format!("The new folder “{name}”"),
             Self::Rename { name, .. } => format!("The name “{name}”"),
             Self::FolderFrom { name, typed, .. } => format!("The folder “{name}” for {typed}"),
+            Self::FileByHand { .. } | Self::FileAutomatically { .. } => "Filing".to_string(),
+            Self::Refile { .. } | Self::Restore { .. } => "Undoing".to_string(),
+            Self::Trash { .. } => "Moving to Trash".to_string(),
+            Self::ChangePaths { .. } => "The change of paths".to_string(),
+            Self::MovePath { path, .. } => format!("Moving {}", path.0),
+            Self::MoveFolder { .. } => "Moving the folder".to_string(),
+            Self::DeleteFolder { .. } => "Deleting the folder".to_string(),
         }
+    }
+}
+
+/// A note at the bottom of the main area that something was done, with a way to undo it
+/// (DESIGN §4.14), shown once its change is written.
+#[derive(Clone, Debug)]
+pub struct Toast {
+    pub text: String,
+    undo: Option<Change>,
+}
+
+impl Toast {
+    pub fn can_undo(&self) -> bool {
+        self.undo.is_some()
+    }
+}
+
+/// What a new folder is called until it is named; the catalogue makes it "New folder 2" and on
+/// where a folder there has that name.
+pub const NEW_FOLDER: &str = "New folder";
+
+/// How long a toast shows (DESIGN §4.14).
+const TOAST_TIME: Duration = Duration::from_secs(5);
+
+/// Where the owner was going when the paths editor had changes to save (DESIGN §4.7).
+#[derive(Clone, Debug)]
+pub enum Leave {
+    Show(Shelf),
+    Open(Box<Session>),
+    /// Another folder's paths editor: its page, with the editor open.
+    Edit(FolderId),
+    /// Closing the window.
+    Close,
+    Quit,
+}
+
+/**
+ * What an Undo that couldn't put everything back as it was says: "Undone, but 1 session was
+ * deleted for good", "…; 2 sessions filed by their paths, as their folder is gone".
+ */
+fn undone_text(undone: Undone) -> String {
+    let gone = (undone.gone > 0).then(|| match undone.gone {
+        1 => "1 session was deleted for good".to_string(),
+        n => format!("{} were deleted for good", format::plural(n, "session")),
+    });
+    let refiled = (undone.refiled > 0).then(|| match undone.refiled {
+        1 => "1 session was filed by its path, as its folder is gone".to_string(),
+        n => format!(
+            "{} were filed by their paths, as their folder is gone",
+            format::plural(n, "session")
+        ),
+    });
+    format!(
+        "Undone, but {}",
+        gone.into_iter()
+            .chain(refiled)
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+/// "Moved to Trash", "3 sessions moved to Trash": said of one, or of `n`.
+fn of_sessions(n: usize, one: &str, several: &str) -> String {
+    if n == 1 {
+        one.to_string()
+    } else {
+        format!("{} {several}", format::plural(n, "session"))
     }
 }
 
@@ -336,10 +540,15 @@ pub struct LibraryService {
     shelf: Shelf,
     counts: LibraryCounts,
     folders: Vec<Folder>,
+    /// Every folder's attached paths.
+    attached: Vec<FolderPath>,
     /// How many agents the archive holds sessions of (DESIGN §4.2.10).
     agents: usize,
     /// The page last loaded, and the shelf it is of.
     page: Option<(Shelf, Page)>,
+    /// Where each of its sessions is: its group of Unsorted (0 on another page), and its place
+    /// among the page's or the group's sessions.
+    places: HashMap<SessionId, (usize, usize)>,
     /// All sessions as it was last loaded, while another page shows, and what its load saw.
     all: Option<(Page, Seen)>,
     /// What a load starting now would see.
@@ -348,6 +557,8 @@ pub struct LibraryService {
     page_seen: Seen,
     /// The selected session, and where it is among a sessions page's.
     selected: Option<(SessionId, Option<usize>)>,
+    /// Where a `Shift`-click's run starts ([`Self::anchor`]).
+    anchor: Option<SessionId>,
     /// The session whose reader is open.
     open: Option<Session>,
     loading: bool,
@@ -355,8 +566,30 @@ pub struct LibraryService {
     stale: bool,
     /// Why the last load failed.
     failure: Option<String>,
-    /// The owner's changes still to write, the next first.
-    queue: VecDeque<Change>,
+    /// The sessions selected with `Ctrl` or `Shift` or `Ctrl A`, the selected one among them;
+    /// empty while only the selected one is.
+    chosen: HashSet<SessionId>,
+    /// How each page was set to show, while the app runs.
+    views: HashMap<Shelf, PageView>,
+    unsorted_view: UnsortedView,
+    /// What is being dragged, and where.
+    drag: Option<DragState>,
+    /// The toast showing, and the one to show once the change being written is.
+    toast: Option<Toast>,
+    toast_in_hand: (u64, Option<Toast>),
+    /// The changes queued before the last Undo, by their number ([`Seen::changes`]), show no
+    /// toast when they are written.
+    quiet_before: u64,
+    toast_timer: Option<Task<()>>,
+    /// The folder whose paths editor has changes to save, and the change saving them is:
+    /// leaving its page asks first.
+    hold: Option<(FolderId, Change)>,
+    asked: Option<Leave>,
+    /// The folder the owner asked to delete, until they confirm or cancel.
+    deleting: Option<FolderId>,
+    /// The owner's changes still to write, the next first, each with the toast to show once
+    /// it is.
+    queue: VecDeque<(Change, Option<Toast>, u64)>,
     /// What the change being written is, while one is.
     writing: Option<String>,
     /// The change handed to a job to write, until the job takes it. Whoever writes holds the
@@ -408,16 +641,30 @@ impl LibraryService {
             shelf: Shelf::All,
             counts: LibraryCounts::default(),
             folders: Vec::new(),
+            attached: Vec::new(),
             agents: 0,
             page: None,
+            places: HashMap::new(),
             all: None,
             seen: Seen::default(),
             page_seen: Seen::default(),
             selected: None,
+            anchor: None,
             open: None,
             loading: false,
             stale: false,
             failure: None,
+            chosen: HashSet::new(),
+            views: HashMap::new(),
+            unsorted_view: UnsortedView::default(),
+            drag: None,
+            toast: None,
+            toast_in_hand: (0, None),
+            quiet_before: 0,
+            toast_timer: None,
+            hold: None,
+            asked: None,
+            deleting: None,
             queue: VecDeque::new(),
             writing: None,
             in_hand: Arc::default(),
@@ -444,6 +691,11 @@ impl LibraryService {
 
     pub fn folder(&self, id: FolderId) -> Option<&Folder> {
         self.folders.iter().find(|folder| folder.id == id)
+    }
+
+    /// Every folder's attached paths.
+    pub fn attached(&self) -> &[FolderPath] {
+        &self.attached
     }
 
     pub fn agents(&self) -> usize {
@@ -537,6 +789,11 @@ impl LibraryService {
         if self.shelf == shelf && self.open.is_none() {
             return;
         }
+        if self.holds(shelf) {
+            self.asked = Some(Leave::Show(shelf));
+            cx.notify();
+            return;
+        }
         self.open = None;
         if self.shelf != shelf {
             if let Some((Shelf::All, page)) = self.page.take_if(|(of, _)| *of == Shelf::All) {
@@ -544,6 +801,8 @@ impl LibraryService {
             }
             self.shelf = shelf;
             self.selected = None;
+            self.chosen.clear();
+            self.anchor = None;
             self.refused = None;
             match self.all.take_if(|_| shelf == Shelf::All) {
                 // Nothing changed since it was loaded: it is shown as it was.
@@ -563,6 +822,8 @@ impl LibraryService {
     pub fn select_index(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(session) = self.sessions().and_then(|page| page.sessions.get(index)) {
             self.selected = Some((session.id.clone(), Some(index)));
+            self.chosen.clear();
+            self.anchor = None;
             cx.notify();
         }
     }
@@ -572,6 +833,8 @@ impl LibraryService {
     pub fn select_session(&mut self, id: &SessionId, hint: usize, cx: &mut Context<Self>) {
         if let Some(at) = self.sessions().and_then(|page| page.find(id, hint)) {
             self.selected = Some((id.clone(), Some(at)));
+            self.chosen.clear();
+            self.anchor = None;
             cx.notify();
         }
     }
@@ -579,12 +842,154 @@ impl LibraryService {
     /// Selects a session of Unsorted.
     pub fn select(&mut self, id: SessionId, cx: &mut Context<Self>) {
         self.selected = Some((id, None));
+        self.chosen.clear();
+        self.anchor = None;
         cx.notify();
+    }
+
+    /**
+     * Selects the sessions `chosen` together (`Ctrl` and `Shift`-click, `Ctrl A`), with
+     * `selected`, last drawn at its hint of the page's sessions, as the one the keys act on.
+     * One alone is the selected one. `anchored`: `selected` is where the next `Shift`-click's
+     * run starts, as it is after a plain or `Ctrl` click but not after a `Shift`-click.
+     */
+    pub fn choose(
+        &mut self,
+        chosen: HashSet<SessionId>,
+        (selected, hint): (SessionId, Option<usize>),
+        anchored: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let at = match (self.page(), hint) {
+            (Some(Page::Sessions(page)), Some(hint)) => page.find(&selected, hint),
+            _ => None,
+        };
+        self.chosen = if chosen.len() > 1 {
+            chosen
+        } else {
+            HashSet::new()
+        };
+        if anchored {
+            self.anchor = Some(selected.clone());
+        }
+        self.selected = Some((selected, at));
+        self.prune();
+        cx.notify();
+    }
+
+    /// Where a `Shift`-click's run starts: the session of the last plain or `Ctrl` click.
+    pub fn anchor(&self) -> Option<&SessionId> {
+        self.anchor.as_ref().or(self.selected())
+    }
+
+    /// The sessions selected together, or the selected one alone, of those the page shows.
+    pub fn selection(&self) -> Vec<SessionId> {
+        let visible = self.visible();
+        if self.chosen.is_empty() {
+            (self.selected().cloned().into_iter())
+                .filter(|id| visible.contains(id))
+                .collect()
+        } else {
+            (self.chosen.iter())
+                .filter(|id| visible.contains(*id))
+                .cloned()
+                .collect()
+        }
+    }
+
+    /// Whether the session `id` is selected, alone or with others.
+    pub fn is_selected(&self, id: &SessionId) -> bool {
+        if self.chosen.is_empty() {
+            self.selected() == Some(id)
+        } else {
+            self.chosen.contains(id)
+        }
+    }
+
+    /**
+     * Takes `id` out of the selection (a `Ctrl`-click on a session in it). The keys then act on
+     * where a run starts, while it is still selected, or on the first shown of those left; with
+     * none left, nothing is selected.
+     */
+    pub fn unchoose(&mut self, id: &SessionId, cx: &mut Context<Self>) {
+        let mut chosen: HashSet<SessionId> = self.selection().into_iter().collect();
+        chosen.remove(id);
+        let shown = self.shown();
+        let next = (self.anchor.as_ref())
+            .filter(|anchor| chosen.contains(*anchor))
+            .and_then(|anchor| shown.iter().find(|(it, _)| it == anchor))
+            .or_else(|| shown.iter().find(|(it, _)| chosen.contains(it)))
+            .cloned();
+        if self.anchor.as_ref() == Some(id) {
+            self.anchor = next.as_ref().map(|(it, _)| it.clone());
+        }
+        self.chosen = if chosen.len() > 1 {
+            chosen
+        } else {
+            HashSet::new()
+        };
+        self.selected = next;
+        cx.notify();
+    }
+
+    /// The sessions an action on `id` is for: the selection when `id` is in it, else `id`.
+    pub fn acted_on(&self, id: &SessionId) -> Vec<SessionId> {
+        if self.chosen.contains(id) {
+            self.selection()
+        } else {
+            vec![id.clone()]
+        }
+    }
+
+    /**
+     * The sessions the page shows, as its filters leave them: what the selection is kept to,
+     * so that the keys never act on a session out of sight (DESIGN §4.4).
+     */
+    fn visible(&self) -> HashSet<SessionId> {
+        self.shown().into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// The sessions the page shows, in the order it shows them, each with where it is among a
+    /// sessions page's.
+    fn shown(&self) -> Vec<(SessionId, Option<usize>)> {
+        match self.page() {
+            Some(Page::Sessions(page)) => view::shown(&page.sessions, &self.view(), format::now())
+                .into_iter()
+                .filter_map(|at| Some((page.sessions.get(at)?.id.clone(), Some(at))))
+                .collect(),
+            Some(Page::Unsorted(groups)) => view::shown_groups(groups, &self.unsorted_view)
+                .into_iter()
+                .flat_map(|(at, places)| {
+                    places
+                        .into_iter()
+                        .filter_map(move |place| groups.get(at)?.sessions.get(place))
+                })
+                .map(|session| (session.id.clone(), None))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Keeps the selection to what the page shows: after a load, and when its filters change.
+    fn prune(&mut self) {
+        let visible = self.visible();
+        self.chosen.retain(|id| visible.contains(id));
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|(id, _)| !visible.contains(id))
+        {
+            self.selected = None;
+        }
     }
 
     /// Opens a session's reader.
     pub fn open(&mut self, session: Session, cx: &mut Context<Self>) {
-        self.open = Some(session);
+        if self.hold.is_some() {
+            self.asked = Some(Leave::Open(Box::new(session)));
+        } else {
+            self.open = Some(session);
+        }
         cx.notify();
     }
 
@@ -593,51 +998,73 @@ impl LibraryService {
         let Some(page) = self.sessions() else {
             return;
         };
-        if let Some(at) = page.find(id, hint) {
-            self.open = Some(page.sessions[at].clone());
+        if let Some((at, session)) = page
+            .find(id, hint)
+            .and_then(|at| Some((at, page.sessions.get(at)?.clone())))
+        {
             self.selected = Some((id.clone(), Some(at)));
+            self.chosen.clear();
+            self.anchor = None;
+            self.open(session, cx);
+        }
+    }
+
+    /// Where the session `id` is among the shown page's sessions, on a page of sessions.
+    pub fn index_of(&self, id: &SessionId) -> Option<usize> {
+        self.sessions()?;
+        self.session(id)?;
+        self.places.get(id).map(|(_, at)| *at)
+    }
+
+    /// The session `id` of the shown page, wherever it is on it.
+    pub fn session(&self, id: &SessionId) -> Option<&Session> {
+        let (group, at) = self.places.get(id)?;
+        match self.page()? {
+            Page::Sessions(page) => page.sessions.get(*at),
+            Page::Unsorted(groups) => groups.get(*group)?.sessions.get(*at),
+        }
+        .filter(|session| session.id == *id)
+    }
+
+    /// How a page shows: as the owner last set it, or as every page starts.
+    pub fn view(&self) -> PageView {
+        self.views.get(&self.shelf).cloned().unwrap_or_default()
+    }
+
+    pub fn set_view(&mut self, view: PageView, cx: &mut Context<Self>) {
+        if self.view() != view {
+            self.views.insert(self.shelf, view);
+            self.prune();
             cx.notify();
         }
     }
 
-    /// The sessions of the shown page in its order: a page of sessions', or Unsorted's group
-    /// after group.
-    fn listed(&self) -> Vec<&Session> {
-        match self.page() {
-            Some(Page::Sessions(page)) => page.sessions.iter().collect(),
-            Some(Page::Unsorted(groups)) => {
-                groups.iter().flat_map(|group| &group.sessions).collect()
-            }
-            None => Vec::new(),
-        }
-    }
-
-    /// Where the open session is among the sessions of the page it was opened from, from 0,
-    /// and how many that page lists (DESIGN §4.2.1: "4 of 488").
+    /// Where the open session is among the sessions the page it was opened from shows, from 0,
+    /// and how many that page shows (DESIGN §4.2.1: "4 of 488"), as filtered and sorted.
     pub fn open_place(&self) -> Option<(usize, usize)> {
         let id = &self.open.as_ref()?.id;
-        let listed = self.listed();
-        let at = listed.iter().position(|session| session.id == *id)?;
-        Some((at, listed.len()))
+        let shown = self.shown();
+        let at = shown.iter().position(|(shown, _)| shown == id)?;
+        Some((at, shown.len()))
     }
 
-    /// Opens the session `by` places after the open one (before, for a negative `by`) on the
-    /// page it was opened from, and selects it there. Nothing happens past either end.
+    /// Opens the session `by` places after the open one (before, for a negative `by`) among
+    /// those the page it was opened from shows, and selects it there. Nothing happens past
+    /// either end.
     pub fn open_step(&mut self, by: isize, cx: &mut Context<Self>) {
         let Some((at, _)) = self.open_place() else {
             return;
         };
-        let Some(session) = at
+        let Some((session, place)) = at
             .checked_add_signed(by)
-            .and_then(|next| self.listed().get(next).map(|session| (*session).clone()))
+            .and_then(|next| self.shown().get(next).cloned())
+            .and_then(|(id, place)| Some((self.session(&id)?.clone(), place)))
         else {
             return;
         };
-        let index =
-            matches!(self.page(), Some(Page::Sessions(_))).then_some(at.wrapping_add_signed(by));
-        self.selected = Some((session.id.clone(), index));
-        self.open = Some(session);
-        cx.notify();
+        self.selected = Some((session.id.clone(), place));
+        self.chosen.clear();
+        self.open(session, cx);
     }
 
     /// Stars the open session, or takes its star away.
@@ -657,8 +1084,387 @@ impl LibraryService {
         } else {
             self.counts.starred = self.counts.starred.saturating_sub(1);
         }
-        self.write(Change::Star { id, starred }, cx);
+        self.write(
+            Change::Star {
+                ids: vec![id],
+                starred,
+            },
+            None,
+            cx,
+        );
         cx.notify();
+    }
+
+    pub fn unsorted_view(&self) -> &UnsortedView {
+        &self.unsorted_view
+    }
+
+    pub fn set_unsorted_view(&mut self, view: UnsortedView, cx: &mut Context<Self>) {
+        if self.unsorted_view != view {
+            self.unsorted_view = view;
+            self.prune();
+            cx.notify();
+        }
+    }
+
+    /// What is being dragged, while something is.
+    pub fn drag(&self) -> Option<&DragState> {
+        self.drag.as_ref()
+    }
+
+    pub fn set_drag(&mut self, drag: Option<DragState>, cx: &mut Context<Self>) {
+        if self.drag != drag {
+            self.drag = drag;
+            cx.notify();
+        }
+    }
+
+    /**
+     * Whether a folder in `parent`, or at the top, other than `except` has the name `name`,
+     * whatever its case: two folders in one place don't (the catalogue refuses it).
+     */
+    pub fn name_taken(
+        &self,
+        name: &str,
+        parent: Option<FolderId>,
+        except: Option<FolderId>,
+    ) -> bool {
+        let name = name.trim().to_lowercase();
+        (self.folders.iter()).any(|folder| {
+            folder.parent == parent
+                && Some(folder.id) != except
+                && folder.name.to_lowercase() == name
+        })
+    }
+
+    /// A folder's name with the folders it is in: "fc › player".
+    pub fn folder_path(&self, folder: FolderId) -> String {
+        let mut names: Vec<&str> = std::iter::successors(self.folder(folder), |it| {
+            it.parent.and_then(|parent| self.folder(parent))
+        })
+        .map(|it| it.name.as_str())
+        .collect();
+        names.reverse();
+        names.join(" › ")
+    }
+
+    /// The toast showing.
+    pub fn toast(&self) -> Option<&Toast> {
+        self.toast.as_ref()
+    }
+
+    /// Undoes what the toast showing says was done.
+    pub fn undo(&mut self, cx: &mut Context<Self>) {
+        if let Some(undo) = self.toast.take().and_then(|toast| toast.undo)
+            && self.undoable(&undo)
+        {
+            self.write(undo, None, cx);
+            /* A change queued before it may still be being written: its toast would undo into
+            a state that never was. */
+            self.quiet_before = self.seen.changes;
+        }
+        cx.notify();
+    }
+
+    pub fn dismiss_toast(&mut self, cx: &mut Context<Self>) {
+        if self.toast.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn show_toast(&mut self, toast: Toast, cx: &mut Context<Self>) {
+        self.toast = Some(toast);
+        self.pause_toast(false, cx);
+        cx.notify();
+    }
+
+    /// Stops the toast's time running out while the pointer rests on it, and starts it again
+    /// once the pointer leaves.
+    pub fn pause_toast(&mut self, paused: bool, cx: &mut Context<Self>) {
+        self.toast_timer = (!paused).then(|| {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(TOAST_TIME).await;
+                this.update(cx, |this, cx| this.dismiss_toast(cx)).ok();
+            })
+        });
+    }
+
+    /// Whether leaving for `shelf` waits on the owner: the paths editor has changes to save.
+    fn holds(&self, shelf: Shelf) -> bool {
+        self.held()
+            .is_some_and(|folder| Shelf::Folder(folder) != shelf)
+    }
+
+    /**
+     * Marks the folder whose paths editor has changes to save, with what they would take off
+     * and put on, or none. A quit that asks nothing saves them (the module docs).
+     */
+    pub fn hold(&mut self, held: Option<(FolderId, Vec<TypedPath>, Vec<TypedPath>)>) {
+        self.hold = held.map(|(folder, detach, attach)| {
+            (
+                folder,
+                Change::ChangePaths {
+                    folder,
+                    detach,
+                    attach,
+                },
+            )
+        });
+    }
+
+    /// The folder whose paths editor has changes to save.
+    pub fn held(&self) -> Option<FolderId> {
+        self.hold.as_ref().map(|(folder, _)| *folder)
+    }
+
+    /// Asks before closing the window or quitting, while the paths editor has changes to save.
+    pub fn ask_before(&mut self, leave: Leave, cx: &mut Context<Self>) {
+        self.asked = Some(leave);
+        cx.notify();
+    }
+
+    /// Where the owner was going when leaving waited on them.
+    pub fn asked(&self) -> Option<&Leave> {
+        self.asked.as_ref()
+    }
+
+    /// Goes where the owner was going, or stays (`go` false). The paths editor has saved or
+    /// dropped its changes by now, or keeps them.
+    pub fn answer(&mut self, go: bool, cx: &mut Context<Self>) {
+        let Some(asked) = self.asked.take() else {
+            return;
+        };
+        if go {
+            self.hold = None;
+            match asked {
+                Leave::Show(shelf) => self.show(shelf, cx),
+                Leave::Open(session) => self.open(*session, cx),
+                Leave::Edit(folder) => self.edit_paths(folder, cx),
+                leave @ (Leave::Close | Leave::Quit) => cx.emit(LibraryEvent::Leave(leave)),
+            }
+        }
+        cx.notify();
+    }
+
+    /// The folder the owner asked to delete, until they answer.
+    pub fn deleting(&self) -> Option<FolderId> {
+        self.deleting
+    }
+
+    pub fn ask_delete(&mut self, folder: FolderId, cx: &mut Context<Self>) {
+        self.deleting = Some(folder);
+        cx.notify();
+    }
+
+    /// Deletes the folder asked about, or leaves it.
+    pub fn answer_delete(&mut self, delete: bool, cx: &mut Context<Self>) {
+        let Some(folder) = self.deleting.take() else {
+            return;
+        };
+        if delete {
+            if self.shelf == Shelf::Folder(folder) {
+                self.hold = None;
+                self.show(Shelf::All, cx);
+            }
+            self.write(Change::DeleteFolder { folder }, None, cx);
+        }
+        cx.notify();
+    }
+
+    /// Asks the sidebar to rename `folder` in its row.
+    pub fn ask_rename(&mut self, folder: FolderId, cx: &mut Context<Self>) {
+        cx.emit(LibraryEvent::Rename(folder));
+    }
+
+    /// Shows `folder`'s page with its paths editor open (DESIGN §4.7); while another
+    /// folder's editor has changes to save, asks first.
+    pub fn edit_paths(&mut self, folder: FolderId, cx: &mut Context<Self>) {
+        if self.holds(Shelf::Folder(folder)) {
+            self.asked = Some(Leave::Edit(folder));
+            cx.notify();
+            return;
+        }
+        self.show(Shelf::Folder(folder), cx);
+        cx.emit(LibraryEvent::EditPaths(folder));
+    }
+
+    /// Files `ids` in `folder` by hand (DESIGN §4.4), with a toast that undoes it.
+    pub fn file_by_hand(&mut self, ids: Vec<SessionId>, folder: FolderId, cx: &mut Context<Self>) {
+        self.write(Change::FileByHand { ids, folder }, None, cx);
+    }
+
+    /// Hands `ids` back to the rules (decision 2); the toast says where they went once they
+    /// are there.
+    pub fn file_automatically(&mut self, ids: Vec<SessionId>, cx: &mut Context<Self>) {
+        self.write(Change::FileAutomatically { ids }, None, cx);
+    }
+
+    /**
+     * Moves `ids` to Trash (PLAN §4.5), with a toast that restores them. They leave the
+     * selection at once; when the selected one goes, the one shown after it, or else before
+     * it, is selected, so that the keys go on from where it was. On Trash's page nothing
+     * happens.
+     */
+    pub fn trash(&mut self, ids: Vec<SessionId>, cx: &mut Context<Self>) {
+        // Trash's own page holds sessions there already: nothing moves, nor does the selection.
+        if self.shelf == Shelf::Trash {
+            return;
+        }
+        let trashed: HashSet<&SessionId> = ids.iter().collect();
+        self.chosen.retain(|id| !trashed.contains(id));
+        if let Some(selected) = self.selected().filter(|id| trashed.contains(id)) {
+            let shown = self.shown();
+            let at = shown.iter().position(|(id, _)| id == selected).unwrap_or(0);
+            let (before, after) = shown.split_at(at);
+            self.selected = (after.iter())
+                .chain(before.iter().rev())
+                .find(|(id, _)| !trashed.contains(id))
+                .cloned();
+        }
+        // One left of several selected together is the selected one alone.
+        if self.chosen.len() == 1 {
+            let left = self.chosen.drain().next();
+            self.selected = (self.shown().into_iter()).find(|(id, _)| Some(id) == left.as_ref());
+        }
+        self.write(Change::Trash { ids }, None, cx);
+        cx.notify();
+    }
+
+    /// Stars `ids`, or takes their stars away, at once on the page.
+    pub fn star(&mut self, ids: Vec<SessionId>, starred: bool, cx: &mut Context<Self>) {
+        if let Some((_, Page::Sessions(page))) = &mut self.page {
+            let starring: HashSet<&SessionId> = ids.iter().collect();
+            for session in &mut page.sessions {
+                if session.starred != starred && starring.contains(&session.id) {
+                    session.starred = starred;
+                    if starred {
+                        self.counts.starred += 1;
+                    } else {
+                        self.counts.starred = self.counts.starred.saturating_sub(1);
+                    }
+                }
+            }
+        }
+        self.write(Change::Star { ids, starred }, None, cx);
+        cx.notify();
+    }
+
+    /// Stars the session `id`, or takes its star away.
+    pub fn toggle_star(&mut self, id: &SessionId, cx: &mut Context<Self>) {
+        if let Some(starred) = self.session(id).map(|session| !session.starred) {
+            self.star(vec![id.clone()], starred, cx);
+        }
+    }
+
+    /**
+     * Attaches a path to `folder` for `location`, or for any, from Unsorted (DESIGN §4.6),
+     * with a toast that says how many sessions it files and undoes it.
+     */
+    pub fn attach(
+        &mut self,
+        folder: FolderId,
+        path: TypedPath,
+        sessions: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self.folder_path(folder);
+        let toast = Toast {
+            text: format!(
+                "Attached to {name} · {} filed",
+                format::plural(sessions, "session")
+            ),
+            undo: Some(Change::ChangePaths {
+                folder,
+                detach: vec![path.clone()],
+                attach: Vec::new(),
+            }),
+        };
+        let change = Change::ChangePaths {
+            folder,
+            detach: Vec::new(),
+            attach: vec![path],
+        };
+        self.write(change, Some(toast), cx);
+    }
+
+    /// Moves a path from one folder to another (DESIGN §4.4, a chip dropped on a folder).
+    pub fn move_path(
+        &mut self,
+        from: FolderId,
+        path: TypedPath,
+        to: FolderId,
+        cx: &mut Context<Self>,
+    ) {
+        let toast = Toast {
+            text: format!("Moved {} to {}", path.0, self.folder_path(to)),
+            undo: Some(Change::MovePath {
+                from: to,
+                path: path.clone(),
+                to: from,
+            }),
+        };
+        self.write(Change::MovePath { from, path, to }, Some(toast), cx);
+    }
+
+    /// Saves the paths editor's changes to `folder` in one change, with a toast saying what
+    /// they did and that undoes them.
+    pub fn change_paths(
+        &mut self,
+        folder: FolderId,
+        detach: Vec<TypedPath>,
+        attach: Vec<TypedPath>,
+        said: String,
+        cx: &mut Context<Self>,
+    ) {
+        let toast = Toast {
+            text: said,
+            undo: Some(Change::ChangePaths {
+                folder,
+                detach: attach.clone(),
+                attach: detach.clone(),
+            }),
+        };
+        self.write(
+            Change::ChangePaths {
+                folder,
+                detach,
+                attach,
+            },
+            Some(toast),
+            cx,
+        );
+    }
+
+    /// Nests `folder` in `parent`, or moves it to the top, as the one at `position` there.
+    pub fn move_folder(
+        &mut self,
+        folder: FolderId,
+        parent: Option<FolderId>,
+        position: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.write(
+            Change::MoveFolder {
+                folder,
+                parent,
+                position,
+            },
+            None,
+            cx,
+        );
+    }
+
+    /// Makes a top-level folder and files `ids` in it by hand; the sidebar names it in place.
+    pub fn new_folder_with(&mut self, ids: Vec<SessionId>, cx: &mut Context<Self>) {
+        self.write(
+            Change::NewFolder {
+                name: NEW_FOLDER.to_string(),
+                parent: None,
+                sessions: ids,
+            },
+            None,
+            cx,
+        );
     }
 
     /// Goes back from the reader to the page it was opened from.
@@ -668,33 +1474,6 @@ impl LibraryService {
         }
     }
 
-    /// Stars the session `id` of the shown page's sessions, last drawn at `hint`, or takes its
-    /// star away.
-    pub fn toggle_star(&mut self, id: &SessionId, hint: usize, cx: &mut Context<Self>) {
-        let Some((_, Page::Sessions(page))) = &mut self.page else {
-            return;
-        };
-        let Some(at) = page.find(id, hint) else {
-            return;
-        };
-        let session = &mut page.sessions[at];
-        let starred = !session.starred;
-        session.starred = starred;
-        if starred {
-            self.counts.starred += 1;
-        } else {
-            self.counts.starred = self.counts.starred.saturating_sub(1);
-        }
-        self.write(
-            Change::Star {
-                id: id.clone(),
-                starred,
-            },
-            cx,
-        );
-        cx.notify();
-    }
-
     /// Makes a folder in `parent`, or at the top. The sidebar hears when it is there.
     pub fn create_folder(
         &mut self,
@@ -702,11 +1481,19 @@ impl LibraryService {
         parent: Option<FolderId>,
         cx: &mut Context<Self>,
     ) {
-        self.write(Change::NewFolder { name, parent }, cx);
+        self.write(
+            Change::NewFolder {
+                name,
+                parent,
+                sessions: Vec::new(),
+            },
+            None,
+            cx,
+        );
     }
 
     pub fn rename_folder(&mut self, folder: FolderId, name: String, cx: &mut Context<Self>) {
-        self.write(Change::Rename { folder, name }, cx);
+        self.write(Change::Rename { folder, name }, None, cx);
     }
 
     /**
@@ -747,6 +1534,7 @@ impl LibraryService {
                 typed,
                 location,
             },
+            None,
             cx,
         );
         cx.notify();
@@ -793,6 +1581,7 @@ impl LibraryService {
         self.failure = None;
         self.counts = loaded.counts;
         self.folders = loaded.folders;
+        self.attached = loaded.attached;
         self.agents = loaded.agents;
         if let Some((id, at)) = &mut self.selected
             && let Page::Sessions(page) = &loaded.page
@@ -801,6 +1590,13 @@ impl LibraryService {
             *at = page.find(id, at.unwrap_or(0));
         }
         self.set_page(loaded.shelf, loaded.page, seen, cx);
+        self.prune();
+        if (self.toast.as_ref())
+            .and_then(|toast| toast.undo.as_ref())
+            .is_some_and(|undo| !self.undoable(undo))
+        {
+            self.toast = None;
+        }
         // The folders being made are made, or refused, by now.
         self.creating.clear();
         if let Some(folder) = self.created
@@ -813,6 +1609,17 @@ impl LibraryService {
 
     fn set_page(&mut self, shelf: Shelf, page: Page, seen: Seen, cx: &mut Context<Self>) {
         self.page_seen = seen;
+        self.places = match &page {
+            Page::Sessions(page) => (page.sessions.iter().enumerate())
+                .map(|(at, session)| (session.id.clone(), (0, at)))
+                .collect(),
+            Page::Unsorted(groups) => (groups.iter().enumerate())
+                .flat_map(|(group, it)| {
+                    (it.sessions.iter().enumerate())
+                        .map(move |(at, session)| (session.id.clone(), (group, at)))
+                })
+                .collect(),
+        };
         let before = self.page.replace((shelf, page));
         self.discard(before, cx);
     }
@@ -825,9 +1632,9 @@ impl LibraryService {
     }
 
     /// Queues one of the owner's changes, to be written after those made before it.
-    fn write(&mut self, change: Change, cx: &mut Context<Self>) {
+    fn write(&mut self, change: Change, toast: Option<Toast>, cx: &mut Context<Self>) {
         self.seen.changes += 1;
-        self.queue.push_back(change);
+        self.queue.push_back((change, toast, self.seen.changes));
         self.write_next(cx);
     }
 
@@ -840,11 +1647,12 @@ impl LibraryService {
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return;
         };
-        let Some(change) = self.queue.pop_front() else {
+        let Some((change, toast, number)) = self.queue.pop_front() else {
             self.reload(cx);
             return;
         };
         self.writing = Some(change.what());
+        self.toast_in_hand = (number, toast);
         // Free: the last job let go of it before its end reached here.
         *self.in_hand.lock().unwrap_or_else(PoisonError::into_inner) = Some(change);
         let in_hand = self.in_hand.clone();
@@ -861,7 +1669,7 @@ impl LibraryService {
             };
             this.update(cx, |this, cx| {
                 this.writing = None;
-                this.written(change, written);
+                this.written(change, written, cx);
                 this.write_next(cx);
                 cx.notify();
             })
@@ -872,20 +1680,136 @@ impl LibraryService {
 
     /// Takes in how a change's write went. A refusal is said to the owner: under the group of
     /// Unsorted a folder was to be made from, or in [`Self::write_failure`].
-    fn written(&mut self, change: Change, written: Result<Option<FolderId>, CatalogueError>) {
-        match (change, written) {
-            (_, Ok(folder)) => self.created = folder.or(self.created),
+    fn written(
+        &mut self,
+        change: Change,
+        written: Result<Written, CatalogueError>,
+        cx: &mut Context<Self>,
+    ) {
+        let (number, toast) = std::mem::take(&mut self.toast_in_hand);
+        let written = match (&change, written) {
+            (_, Ok(written)) => written,
             (Change::FolderFrom { group, .. }, Err(error)) => {
-                self.refused = Some((group, error.to_string()));
+                self.refused = Some((group.clone(), error.to_string()));
+                return;
             }
             (change, Err(error)) => {
                 log::warn!("{} was refused: {error}", change.what());
                 self.write_failure = Some(format!(
                     "{} couldn't be saved: {}.",
                     change.what(),
-                    error.to_string().trim_end_matches('.')
+                    self.why(&error)
                 ));
+                return;
             }
+        };
+        let toast = match written {
+            Written::Done => toast,
+            Written::Made(folder) => {
+                self.created = Some(folder);
+                toast
+            }
+            Written::Deleted(renamed) => renamed.first().map(|(from, to)| Toast {
+                text: match renamed.len() {
+                    1 => format!("Folder deleted; its subfolder {from} is {to} now"),
+                    n => format!(
+                        "Folder deleted; {n} of its subfolders were renamed beside folders \
+                         of their names"
+                    ),
+                },
+                undo: None,
+            }),
+            Written::Filed(folder, before) => {
+                let place = self.folder_path(folder);
+                Some(Toast {
+                    text: of_sessions(
+                        before.len(),
+                        &format!("Filed in {place} by hand"),
+                        &format!("filed in {place} by hand"),
+                    ),
+                    undo: Some(Change::Refile { before }),
+                })
+            }
+            Written::Handed(handed) => Some(Toast {
+                text: self.handed(&handed),
+                undo: Some(Change::Refile {
+                    before: handed.into_iter().map(|(before, _)| before).collect(),
+                }),
+            }),
+            Written::Trashed(moved) if moved.is_empty() => None,
+            Written::Trashed(moved) => Some(Toast {
+                text: of_sessions(moved.len(), "Moved to Trash", "moved to Trash"),
+                undo: Some(Change::Restore { ids: moved }),
+            }),
+            Written::Undone(undone) if undone.is_whole() => toast,
+            Written::Undone(undone) => Some(Toast {
+                text: undone_text(undone),
+                undo: None,
+            }),
+        };
+        // Toasts of changes queued before an Undo say nothing: the Undo has the last word.
+        if let Some(toast) = toast.filter(|_| number >= self.quiet_before) {
+            self.show_toast(toast, cx);
+        }
+    }
+
+    /// Where a filing toast says sessions went: "Filed in fc by its path", or how many went to
+    /// a folder and how many stayed in Unsorted.
+    fn handed(&self, handed: &[(Before, Option<FolderId>)]) -> String {
+        let places: HashSet<Option<FolderId>> = handed.iter().map(|(_, now)| *now).collect();
+        let unsorted = handed.iter().filter(|(_, now)| now.is_none()).count();
+        match places.into_iter().collect::<Vec<_>>()[..] {
+            [Some(folder)] => of_sessions(
+                handed.len(),
+                &format!("Filed in {} by its path", self.folder_path(folder)),
+                &format!("filed in {} by their paths", self.folder_path(folder)),
+            ),
+            [None] => of_sessions(
+                handed.len(),
+                "In Unsorted: no folder's path claims it",
+                "in Unsorted: no folder's path claims them",
+            ),
+            _ if unsorted == 0 => format!(
+                "{} filed by their paths",
+                format::plural(handed.len(), "session")
+            ),
+            _ => format!(
+                "{} filed by {}; {} in Unsorted",
+                format::plural(handed.len() - unsorted, "session"),
+                if handed.len() - unsorted == 1 {
+                    "its path"
+                } else {
+                    "their paths"
+                },
+                unsorted
+            ),
+        }
+    }
+
+    /// Why the catalogue refused a change, said as the owner knows things: no folder ids.
+    fn why(&self, error: &CatalogueError) -> String {
+        match error {
+            CatalogueError::NoFolder(_) => "the folder was deleted".to_string(),
+            CatalogueError::NoSession(_) => "a session was deleted for good".to_string(),
+            CatalogueError::NotAttached(typed) => {
+                format!("{typed} isn't attached to that folder any more")
+            }
+            CatalogueError::PathAttached { folder, typed, .. } => format!(
+                "{typed} is already attached to {}",
+                self.folder_path(*folder)
+            ),
+            error => error.to_string().trim_end_matches('.').to_string(),
+        }
+    }
+
+    /// Whether an Undo can still be done: the folders it names are still there.
+    fn undoable(&self, undo: &Change) -> bool {
+        match undo {
+            Change::ChangePaths { folder, .. } => self.folder(*folder).is_some(),
+            Change::MovePath { from, to, .. } => {
+                self.folder(*from).is_some() && self.folder(*to).is_some()
+            }
+            _ => true,
         }
     }
 
@@ -893,7 +1817,16 @@ impl LibraryService {
     /// long as gpui waits (the module docs).
     fn write_what_is_queued(&mut self, cx: &mut Context<Self>) -> impl Future<Output = ()> + use<> {
         let archive = self.archive.read(cx).archive().cloned();
-        let changes: Vec<Change> = self.queue.drain(..).collect();
+        /* Changes the paths editor holds are deliberate edits: a quit that asked nothing, from
+        the Dock or at logout, saves them rather than dropping them. */
+        if let Some((folder, change)) = self.hold.take() {
+            log::warn!(
+                "the app quit with the paths editor's changes to {} unsaved: saving them",
+                self.folder_path(folder)
+            );
+            self.queue.push_back((change, None, 0));
+        }
+        let changes: Vec<Change> = self.queue.drain(..).map(|(change, ..)| change).collect();
         let written = Arc::new(AtomicUsize::new(0));
         let unwritten = Unwritten {
             changes: self
