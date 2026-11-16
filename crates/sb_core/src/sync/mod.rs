@@ -8,6 +8,7 @@
 
 mod index;
 mod plan;
+mod refetch;
 mod store;
 
 use std::collections::HashSet;
@@ -23,6 +24,7 @@ use crate::search::SearchError;
 use crate::transport::{Transport, TransportError, wsl};
 
 pub use index::{IndexReport, index, index_session};
+pub use refetch::refetch;
 
 #[derive(Debug, Error)]
 pub enum SyncError {
@@ -35,6 +37,15 @@ pub enum SyncError {
     Unreachable(String),
     #[error("location {0} is already being synced")]
     Busy(LocationId),
+    /// An item was to be fetched again whose newest version is not damaged.
+    #[error("{0} is not damaged in the archive, so it is not fetched again")]
+    NotDamaged(String),
+    /// An item was to be fetched again that its location no longer has.
+    #[error("{0} is no longer at its location")]
+    NotAtLocation(String),
+    /// An item fetched again could not be stored: why, in the words of the pass's report.
+    #[error("it could not be fetched again: {0}")]
+    NotFetched(String),
     #[error(transparent)]
     Provider(#[from] ProviderError),
     /// The provider's fetch did not keep to the order ranges are streamed in.

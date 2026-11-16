@@ -12,6 +12,7 @@ use sb_core::transport::wsl;
 use sb_ui::ActiveTheme as _;
 use sb_ui::appearance::MaterialSupport;
 use sb_ui::services::{Reach, ServicesConfig};
+use sb_ui::system::SystemShell;
 
 use crate::cli::Cli;
 
@@ -48,11 +49,9 @@ pub fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// The archive's folder in the data dir (PLAN §4.4, DESIGN §4.10).
-const ARCHIVE: &str = "archive";
-
 /// Opens the main window as `cli` asks. `data_dir` is where this run keeps its files: the
-/// archive is opened in it, and made there on the first run (PLAN D3).
+/// app's settings, and the archive unless they name another folder, made there on the first
+/// run (PLAN D3).
 #[cfg_attr(not(feature = "automation"), expect(unused_variables))]
 fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
     sb_ui::init(cx)?;
@@ -61,8 +60,27 @@ fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
     if let Some(year) = cli.automation_calendar {
         sb_ui::format::pin_calendar(year);
     }
-    // Light or dark and the material, before the first frame.
-    sb_ui::appearance::init(MaterialSupport::probe(), cli.theme.unwrap_or_default(), cx);
+    // A scripted run shows nothing in Explorer or Finder and opens no picker.
+    #[cfg(feature = "automation")]
+    let scripted = cli.automation_enabled();
+    #[cfg(not(feature = "automation"))]
+    let scripted = false;
+    sb_ui::system::install(
+        if scripted {
+            SystemShell::scripted()
+        } else {
+            SystemShell::Real
+        },
+        cx,
+    );
+    let settings = sb_ui::services::settings::load(&data_dir);
+    // Light or dark and the material, before the first frame; `--theme` is for this run.
+    sb_ui::appearance::init(
+        MaterialSupport::probe(),
+        cli.theme.unwrap_or(settings.settings.mode),
+        settings.settings.material,
+        cx,
+    );
     let reach = Reach {
         connect: Arc::new(LocationKind::transport),
         tester: Arc::new(sb_ui::services::probe),
@@ -80,7 +98,8 @@ fn start(cli: Cli, data_dir: PathBuf, cx: &mut App) -> Result<()> {
     };
     sb_ui::services::init(
         ServicesConfig {
-            archive_dir: data_dir.join(ARCHIVE),
+            settings,
+            mode_override: cli.theme,
             providers: sb_core::provider::builtin(),
             reach,
         },

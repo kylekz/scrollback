@@ -20,9 +20,24 @@
 //!   (what was applied to the window) and `window_native` (macOS: what AppKit reports, `forced`
 //!   light or dark or `null`, `opaque` and `vibrancy_view`; `null` elsewhere).
 //! - `page`: what the main area shows: `starting`, `archive-failed`, `locations-failed`,
-//!   `first-run`, `sessions` (All sessions, Starred or a folder), `unsorted` or `session` (an
-//!   opened session).
-//! - `archive`: `dir`, and `state` (`opening`, `open` or `failed`, then with `error`).
+//!   `first-run`, `settings`, `sessions` (All sessions, Starred or a folder), `unsorted` or
+//!   `session` (an opened session).
+//! - `settings` (DESIGN §4.13): `section` (the one picked in Settings' list: `archive`, `sync`,
+//!   `appearance` or `shortcuts`), `archive` (its folder), `default` (whether that is the data
+//!   dir's), `switch` (`null`, `{"opening": folder}` or `{"refused": why}`), `sync_every`
+//!   (`5m`, `15m`, `30m`, `60m` or `asked`), `next_round` (whether a round is due),
+//!   `stale_after` (days), `stats` (`sessions`, `items`, `versions`, or `null` before they are
+//!   measured), `verify` (`running` with its `progress`, the `last` one's `segments` and
+//!   `problems`, each with its `file` and `fix`: `fetch_again`, `fetched`, `damaged` or
+//!   `deleted`, and `refetch`: `null`, `running`, `done`, `skipped: …` or the failure's words;
+//!   and `fetch_all`, Fetch all again's `done` and `total` while it runs, or `null`), `deleted`
+//!   (each session deleted for good's `location`, whether it is `allowed` again, and its
+//!   `standing`: `deleted`, `allowed` or `archived_again`), and `saved` (why the settings
+//!   aren't being saved, or `null`).
+//! - `system`: what the app asked of the operating system, never done in a scripted run: each
+//!   request's `kind` (`reveal`, `pick_folder`) and its `path`.
+//! - `archive`: `dir`, and `state` (`opening`, `open` or `failed`, then with `error` and
+//!   `failure`: `missing`, `empty`, `locked`, `settings` or `other`).
 //! - `sync`: `syncing`, `indexing` (an index runs outside a pass), `held` (a pass waits at
 //!   `hold_sync`'s hold), and `locations`, each with its `name`, `kind` (`local`, `wsl` or
 //!   `ssh`) and `state` (`syncing` with `progress`: the `items` to fetch and `items_done`, the
@@ -75,7 +90,12 @@
 //! - `pin_appearance {appearance}` pins `light` or `dark` whatever the mode and the OS say, so
 //!   a scenario looks the same on every machine; `null` lifts the pin.
 //! - `set_appearance {mode?, material?}` changes what scrollback asks for, as Settings ›
-//!   Appearance will (DESIGN §4.13).
+//!   Appearance does (DESIGN §4.13), and keeps it in the app's settings; `--theme` still wins
+//!   for the run.
+//!
+//! And this with `state.system`:
+//! - `answer_picker {folder}` answers the next folder picker with `folder`, or cancels it
+//!   with `null`.
 //!
 //! And these with `state.sync`, for a scenario that needs a pass in a known state whatever
 //! the machine's speed:
@@ -109,11 +129,14 @@ use sb_core::transport::{
 };
 use sb_ui::Shell;
 use sb_ui::pages::sessions::LineMeasure;
-use sb_ui::services::sync::{TestFailure, TestState, stale};
+use sb_ui::services::settings::Switch;
+use sb_ui::services::sync::{Refetch, TestFailure, TestState};
+use sb_ui::services::upkeep::{Fix, Standing};
 use sb_ui::services::{
-    ActiveServices as _, ArchiveState, Dragged, DropTarget, Held, LocationStatus, Page, Reach,
-    Verdict,
+    ActiveServices as _, ArchiveState, Dragged, DropTarget, Failure, Held, LocationStatus, Page,
+    Reach, Verdict,
 };
+use sb_ui::system::{self, SystemRequest};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -145,6 +168,14 @@ impl AutomationHost for ScrollbackAutomation {
             "archive": archive(cx),
             "sync": sync(cx),
             "library": library(cx),
+            "settings": settings(shell, cx),
+            "system": system::requests(cx).iter().map(|request| json!({
+                "kind": request.kind(),
+                "path": match request {
+                    SystemRequest::Reveal(path) => Some(path.display().to_string()),
+                    SystemRequest::PickFolder { .. } => None,
+                },
+            })).collect::<Vec<_>>(),
             "cards": cards(shell.main().read(cx).sessions().read(cx).line_measure()),
             "page_view": page_view(shell, cx),
             "menu": sb_ui::menu::items(cx).map(|(items, submenu)| json!({
@@ -174,6 +205,7 @@ impl AutomationHost for ScrollbackAutomation {
             "hold_sync",
             "release_sync",
             "stand_in",
+            "answer_picker",
         ]
     }
 
@@ -192,13 +224,25 @@ impl AutomationHost for ScrollbackAutomation {
             }),
             "set_appearance" => {
                 serde_json::from_value(args).map(|SetAppearance { mode, material }| {
-                    let mut preferences = gpui_appearance::state(cx).preferences();
-                    preferences.mode = mode.unwrap_or(preferences.mode);
-                    preferences.material = material.unwrap_or(preferences.material);
-                    gpui_appearance::set_preferences(preferences, cx);
+                    let settings = cx.services().settings.clone();
+                    settings.update(cx, |settings, cx| {
+                        if let Some(mode) = mode {
+                            settings.set_mode(mode, cx);
+                        }
+                        if let Some(material) = material {
+                            settings.set_material(material, cx);
+                        }
+                    });
                     self::appearance(cx)
                 })
             }
+            "answer_picker" => serde_json::from_value(args)
+                .map_err(anyhow::Error::from)
+                .and_then(|AnswerPicker { folder }| {
+                    system::queue_answer(folder, cx)?;
+                    Ok(json!(system::requests(cx).len()))
+                })
+                .map_err(|error| serde_json::Error::io(std::io::Error::other(error.to_string()))),
             "hold_sync" => serde_json::from_value(args).map(|HoldSync { after }| {
                 service.update(cx, |sync, _| sync.hold_after(after, Held::Pause));
                 sync(cx)
@@ -240,9 +284,20 @@ fn archive(cx: &App) -> Value {
     let (state, error) = match archive.state() {
         ArchiveState::Opening => ("opening", None),
         ArchiveState::Open(_) => ("open", None),
-        ArchiveState::Failed(failure) => ("failed", Some(&failure.why)),
+        ArchiveState::Failed(failure) => ("failed", Some(failure)),
     };
-    json!({ "dir": archive.dir().display().to_string(), "state": state, "error": error })
+    json!({
+        "dir": archive.dir().display().to_string(),
+        "state": state,
+        "error": error.map(Failure::why),
+        "failure": error.map(|failure| match failure {
+            Failure::Missing { there: false } => "missing",
+            Failure::Missing { there: true } => "empty",
+            Failure::Locked(_) => "locked",
+            Failure::Settings(_) => "settings",
+            Failure::Other(_) => "other",
+        }),
+    })
 }
 
 /// `state.sync`.
@@ -277,8 +332,7 @@ fn sync(cx: &App) -> Value {
                     "sessions": progress.sessions,
                     "sessions_done": progress.sessions_done,
                 })),
-                "stale": stale(location.last_success, sync.details().found(&location.id), now)
-                    .is_some(),
+                "stale": sync.stale(location, now).is_some(),
                 "removing": sync.is_removing(&location.id),
             })
         })
@@ -402,6 +456,77 @@ fn library(cx: &App) -> Value {
     })
 }
 
+/// `state.settings`.
+fn settings(shell: &Shell, cx: &App) -> Value {
+    let services = cx.services();
+    let settings = services.settings.read(cx);
+    let (sync, upkeep) = (services.sync.read(cx), services.upkeep.read(cx));
+    let archive = services.archive.read(cx).dir().to_path_buf();
+    let problems: Vec<Value> = upkeep
+        .problems()
+        .iter()
+        .map(|problem| {
+            json!({
+                "file": problem.damage.file,
+                "fix": match problem.fix {
+                    Fix::FetchAgain => "fetch_again",
+                    Fix::Fetched { .. } => "fetched",
+                    Fix::Damaged => "damaged",
+                    Fix::Deleted => "deleted",
+                },
+                "refetch": sync.refetch_of(&problem.damage).map(|refetch| match refetch {
+                    Refetch::Running => "running".to_string(),
+                    Refetch::Done(_) => "done".to_string(),
+                    Refetch::Skipped(why) => format!("skipped: {why}"),
+                    Refetch::Failed(why) => why.clone(),
+                }),
+            })
+        })
+        .collect();
+    json!({
+        "section": shell.settings_section(cx).key(),
+        "archive": archive.display().to_string(),
+        "default": settings.is_default(&archive),
+        "switch": settings.switch().map(|switch| match switch {
+            Switch::Opening(folder) => json!({ "opening": folder.display().to_string() }),
+            Switch::Refused { why, .. } => json!({ "refused": why }),
+        }),
+        "sync_every": sync.every().key(),
+        "next_round": sync.next_round().is_some(),
+        "stale_after": sync.stale_after_days(),
+        "stats": upkeep.stats().map(|stats| json!({
+            "sessions": stats.totals.sessions,
+            "items": stats.totals.items,
+            "versions": stats.totals.versions,
+        })),
+        "verify": {
+            "running": upkeep.verifying().is_some(),
+            "progress": upkeep.verifying().map(|verifying| json!({
+                "segments": verifying.progress.segments,
+                "segments_done": verifying.progress.segments_done,
+            })),
+            "last": upkeep.last().map(|last| json!({
+                "segments": last.segments,
+                "problems": problems,
+            })),
+            "fetch_all": sync.fetch_all_progress().map(|(done, total)| json!({
+                "done": done,
+                "total": total,
+            })),
+        },
+        "deleted": upkeep.deleted().iter().map(|deleted| json!({
+            "location": deleted.location.as_ref().map(|location| &location.name),
+            "allowed": matches!(deleted.standing, Standing::Allowed(_)),
+            "standing": match deleted.standing {
+                Standing::Deleted => "deleted",
+                Standing::Allowed(_) => "allowed",
+                Standing::ArchivedAgain { .. } => "archived_again",
+            },
+        })).collect::<Vec<_>>(),
+        "saved": settings.save_failure(),
+    })
+}
+
 /// `state.page_view`: how the page of sessions shows, and its paths editor.
 fn page_view(shell: &Shell, cx: &App) -> Value {
     let page = shell.main().read(cx).sessions().read(cx);
@@ -486,6 +611,15 @@ struct PinAppearance {
 struct SetAppearance {
     mode: Option<Mode>,
     material: Option<Material>,
+}
+
+/// `answer_picker {"folder": path | null}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnswerPicker {
+    /// `null` cancels the picker. Required, as `pin_appearance`'s argument is.
+    #[serde(deserialize_with = "Option::deserialize")]
+    folder: Option<PathBuf>,
 }
 
 /// `hold_sync {"after": items}`.

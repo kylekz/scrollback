@@ -12,6 +12,7 @@
 
 mod batch;
 mod folder;
+mod kv;
 mod library;
 mod schema;
 mod session;
@@ -40,7 +41,7 @@ pub use folder::{Folder, FolderPath, ProjectPath};
 pub use library::{LibraryCounts, PathGroup, Shelf};
 pub(crate) use session::{Derived, Indexed, Reading, fingerprint};
 pub use session::{Filed, Session, SessionId, Usage};
-pub use trash::{Deletion, Tombstone};
+pub use trash::{AllowedAgain, Deletion, Tombstone};
 pub(crate) use trash::{ItemFile, Removal};
 
 #[derive(Debug, Error)]
@@ -97,6 +98,10 @@ pub enum CatalogueError {
     /// item was added to it, or a version, since. Nothing was deleted.
     #[error("the session {} of {} at location {} changed since it was shown", .0.key, .0.provider, .0.location)]
     DeletionChanged(SessionId),
+    /// A tombstone the owner removed is not put back once a sync has archived its session
+    /// again: the session is live in the archive.
+    #[error("the session {} of {} at location {} is archived again", .0.key, .0.provider, .0.location)]
+    ArchivedAgain(SessionId),
 }
 
 /// The most characters a folder's name has.
@@ -311,6 +316,16 @@ pub struct Waiting {
     pub since: i64,
     /// Why the last pass could not.
     pub reason: String,
+}
+
+/// How much the catalogue records ([`Catalogue::totals`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Totals {
+    pub sessions: usize,
+    pub items: usize,
+    pub versions: usize,
+    /// What every version holds, uncompressed.
+    pub bytes: u64,
 }
 
 /// A provider whose agent was found at a location (DESIGN §4.11), as its last pass there read
@@ -724,6 +739,27 @@ impl Catalogue {
                 }
             }
             Ok(holdings)
+        })
+    }
+
+    /// How much the catalogue records (DESIGN §4.13): its sessions, items and versions, and
+    /// what the versions hold uncompressed.
+    pub fn totals(&self) -> Result<Totals> {
+        self.db.read(|c| {
+            Ok(c.query_row(
+                "SELECT (SELECT COUNT(*) FROM session), (SELECT COUNT(*) FROM item),
+                        COUNT(*), COALESCE(SUM(length), 0)
+                 FROM version",
+                [],
+                |row| {
+                    Ok(Totals {
+                        sessions: row.get(0)?,
+                        items: row.get(1)?,
+                        versions: row.get(2)?,
+                        bytes: row.get(3)?,
+                    })
+                },
+            )?)
         })
     }
 
@@ -1220,7 +1256,7 @@ fn stored_from(row: &Row<'_>) -> rusqlite::Result<Stored> {
 }
 
 /// The archive's backups of its catalogue.
-fn backups(dir: &Path) -> Backups {
+pub(crate) fn backups(dir: &Path) -> Backups {
     Backups::new(dir.join("backups"), "scrollback")
 }
 

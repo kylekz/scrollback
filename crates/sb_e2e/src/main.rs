@@ -27,6 +27,15 @@
 //! - `"archive-remains"`: what is left of an archive in the data dir, its files without its
 //!   `archive.json`: the app must say it can't open it, and make no new one in its place
 //!   (docs/PLAN.md §4.4).
+//! - `"settings"`: an archive in the data dir with a distro read from the home, two of whose
+//!   transcripts are damaged (one still in the home, one gone from it), and a host whose two
+//!   sessions were deleted for good ([`fixture::settings`]): Settings › Archive
+//!   (docs/DESIGN.md §4.13).
+//! - `"archive-gone"`: settings that name an archive in a folder that isn't there, as on a
+//!   drive unplugged, and remember what it held ([`fixture::archive_gone`]): the
+//!   archive-unavailable page (docs/DESIGN.md §4.14).
+//! - `"settings-unreadable"`: a settings file that isn't JSON, naming an archive
+//!   ([`fixture::settings_unreadable`]): nothing is opened or made until the owner chooses.
 
 mod boards;
 mod fixture;
@@ -53,6 +62,9 @@ enum Library {
     BoardsHeldBack,
     Locations,
     ArchiveRemains,
+    Settings,
+    ArchiveGone,
+    SettingsUnreadable,
 }
 
 /// scrollback's header keys: `{"scenario": {"fixture": "boards"}}`.
@@ -145,9 +157,22 @@ impl RunnerApp for Scrollback {
                 &cx.data_dir.join("archive"),
                 &cx.out_dir.join("locations"),
             )?,
+            Library::Settings => fixture::settings(
+                &mut tree,
+                &cx.data_dir.join("archive"),
+                &cx.out_dir.join("locations"),
+            )?,
             Library::ArchiveRemains => {
                 std::fs::remove_dir_all(&home)?;
                 std::fs::create_dir_all(cx.data_dir.join("archive/files/location"))?;
+            }
+            Library::ArchiveGone => {
+                std::fs::remove_dir_all(&home)?;
+                fixture::archive_gone(cx.data_dir, &cx.out_dir.join("drive"))?;
+            }
+            Library::SettingsUnreadable => {
+                std::fs::remove_dir_all(&home)?;
+                fixture::settings_unreadable(cx.data_dir, &cx.out_dir.join("drive"))?;
             }
         }
         Ok(Box::new(Home { env, home }))

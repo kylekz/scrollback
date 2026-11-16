@@ -11,7 +11,7 @@ use gpui::{
     AppContext as _, Bounds, Entity, Global, Pixels, Size, TestAppContext, VisualTestContext, px,
     size,
 };
-use gpui_appearance::{MaterialSupport, Mode};
+use gpui_appearance::MaterialSupport;
 use gpui_component::Root;
 use sb_core::CancelToken;
 use sb_core::location::LocationKind;
@@ -111,7 +111,8 @@ pub fn init_with(
 }
 
 /// [`init_with`], with the connection test and WSL's distros the test's stand-ins too:
-/// `elsewhere` reaches every place but this machine.
+/// `elsewhere` reaches every place but this machine. The scratch folder `archive` is the data
+/// dir: the archive is its `archive` folder, and the app's settings are beside it.
 pub fn init_reaching(
     archive: TempDir,
     machine: ProjectsTree,
@@ -120,12 +121,19 @@ pub fn init_reaching(
 ) {
     cx.update(|cx| {
         crate::init(cx).expect("sb_ui initialises");
-        crate::appearance::init(MaterialSupport::ALL, Mode::System, cx);
+        let settings = services::settings::load(archive.path());
+        crate::appearance::init(
+            MaterialSupport::ALL,
+            settings.settings.mode,
+            settings.settings.material,
+            cx,
+        );
         let here = machine.transport();
         let connect = elsewhere.connect;
         services::init(
             ServicesConfig {
-                archive_dir: archive.path().join("archive"),
+                settings,
+                mode_override: None,
                 providers: sb_core::provider::builtin(),
                 reach: Reach {
                     connect: Arc::new(move |kind, cancel| match kind {
@@ -182,6 +190,35 @@ pub fn init_answering(cx: &mut TestAppContext) {
 /// Has the agent on this machine write another session, for the next sync to find.
 pub fn write_session(outline: &Outline, cx: &mut TestAppContext) {
     cx.update(|cx| cx.global_mut::<Scratch>().machine.outlined(outline));
+}
+
+/// The file of this machine's agent that the item `key` is.
+pub fn machine_path(key: &str, cx: &mut TestAppContext) -> std::path::PathBuf {
+    cx.update(|cx| cx.global::<Scratch>().machine.path(key))
+}
+
+/// The key of the transcript of [`SESSIONS`]' session `at`, once it is archived.
+pub fn machine_file(at: usize, cx: &mut TestAppContext) -> String {
+    cx.update(|cx| {
+        let archive = cx.services().archive.read(cx).archive().cloned();
+        let catalogue = archive.as_ref().expect("the archive is open").catalogue();
+        let session = catalogue
+            .sessions(sb_core::catalogue::Shelf::All)
+            .unwrap()
+            .into_iter()
+            .find(|session| session.title.as_deref() == Some(SESSIONS[at].title))
+            .expect("the session is archived");
+        catalogue
+            .items(&session.id.location, &session.id.provider)
+            .unwrap()
+            .into_iter()
+            .find(|item| {
+                item.session.as_deref() == Some(session.id.key.as_str())
+                    && item.kind == sb_core::provider::ItemKind::Transcript
+            })
+            .expect("the session has a transcript")
+            .key
+    })
 }
 
 /// The folder the services' archive is in.

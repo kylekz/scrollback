@@ -151,7 +151,7 @@ fn a_material_change_reaches_the_window(cx: &mut TestAppContext) {
     shell.read_with(cx, |shell, _| {
         assert_eq!(
             shell.applied_material(),
-            crate::appearance::default_material()
+            crate::appearance::default_material(gpui_appearance::MaterialSupport::ALL)
         )
     });
     for material in [
@@ -203,7 +203,8 @@ fn the_window_opens_at_its_size_with_the_material(cx: &mut TestAppContext) {
     let options = cx.update(|_, cx| window_options(size(px(1440.), px(900.)), cx));
     assert_eq!(
         options.window_background,
-        crate::appearance::default_material().window_background(Backing::Solid)
+        crate::appearance::default_material(gpui_appearance::MaterialSupport::ALL)
+            .window_background(Backing::Solid)
     );
     // DESIGN §2.
     assert_eq!(options.window_min_size, Some(size(px(960.), px(600.))));

@@ -36,6 +36,16 @@
 //! keeps the keyboard while it is open, and gives it back to where it was when it closes. So
 //! do the library's dialogs ([`dialogs`]).
 //!
+//! **Settings** (DESIGN §4.13) open in the main area from the title bar's gear or `Ctrl ,`,
+//! while a library page shows; `Esc`, `Alt ←` and Back go back to the page they were opened
+//! from. While a library dialog, or Settings' own confirmation, is open, `Esc` answers it and
+//! the shell's other keys do nothing.
+//!
+//! **Another archive.** When the app moves onto another archive (Settings › Use a different
+//! folder…, `crate::services::reopen`), the shell makes its sidebar and main area anew over
+//! the new services, and closes the locations sheet and any dialog: the window is the same,
+//! its contents are the other archive's.
+//!
 //! **While a drag is held** (`crate::drag`) no key but `Esc` does anything, so that nothing
 //! changes under it: `Esc` gives the drag up. Resting on the sidebar's button in a narrow
 //! window shows the sidebar over the main area until the drag ends, so that its folders can
@@ -64,7 +74,7 @@ use gpui_appearance::Backing;
 use gpui_component::Root;
 
 use crate::actions::library::{Back, NewFolder, SyncAll};
-use crate::actions::shell::{Dismiss, FocusOther, OpenLocations, ToggleSidebar};
+use crate::actions::shell::{Dismiss, FocusOther, OpenLocations, OpenSettings, ToggleSidebar};
 use crate::actions::sidebar::Rename;
 use crate::automation::AutomationTargetExt as _;
 use crate::keymap;
@@ -72,7 +82,7 @@ use crate::locations_sheet::{LocationsSheet, LocationsSheetEvent};
 use crate::overlay::{self, Layer};
 use crate::pages::{MainArea, Showing};
 use crate::services::library::LibraryEvent;
-use crate::services::{ActiveServices as _, DropTarget, Leave};
+use crate::services::{ActiveServices as _, DropTarget, Leave, Services};
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::theme::{ActiveTheme as _, Material, SbTheme, StyledText as _};
 
@@ -119,7 +129,9 @@ pub struct Shell {
     /// Showing the sidebar for a drag resting on its button, and whether it shows for one.
     springing: Option<Task<()>>,
     sprung: bool,
-    _observers: [Subscription; 8],
+    /// What the shell hears from the services and the sidebar, made anew with them.
+    attached: [Subscription; 6],
+    _observers: [Subscription; 4],
 }
 
 /**
@@ -130,15 +142,7 @@ const SPRING: Duration = Duration::from_millis(500);
 
 impl Shell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let main = cx.new(MainArea::new);
-        main.focus_handle(cx).focus(window, cx);
-        let sidebar = cx.new(|cx| Sidebar::new(window, cx));
-        let services = cx.services();
-        let (archive, sync, library) = (
-            services.archive.clone(),
-            services.sync.clone(),
-            services.library.clone(),
-        );
+        let (main, sidebar, attached) = Self::attach(window, cx);
         // Closing the window asks first while the paths editor has changes to save.
         window.on_window_should_close(cx, |_, cx| {
             let library = cx.services().library.clone();
@@ -157,24 +161,9 @@ impl Shell {
             dialog_focus: cx.focus_handle(),
             springing: None,
             sprung: false,
+            attached,
             _observers: [
                 cx.observe_global_in::<SbTheme>(window, |_, _, cx| cx.notify()),
-                // The title bar follows the archive, the locations and the passes.
-                cx.observe(&archive, |_, _, cx| cx.notify()),
-                cx.observe(&sync, |_, _, cx| cx.notify()),
-                cx.observe(&library, |this, _, cx| {
-                    this.follow_drag(cx);
-                    cx.notify();
-                }),
-                cx.subscribe_in(&library, window, |_, _, event, window, cx| {
-                    if let LibraryEvent::Leave(leave) = event {
-                        match leave {
-                            Leave::Close => window.remove_window(),
-                            Leave::Quit => cx.quit(),
-                            Leave::Show(_) | Leave::Open(_) | Leave::Edit(_) => {}
-                        }
-                    }
-                }),
                 // No key but `Esc` acts while a drag is held (module docs).
                 cx.intercept_keystrokes(|event, _, cx| {
                     if event.keystroke.key != "escape"
@@ -183,32 +172,6 @@ impl Shell {
                         cx.stop_propagation();
                     }
                 }),
-                cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
-                    match event {
-                        /* Picking a row closes a narrow window's overlay (DESIGN §2), and
-                        the keyboard goes to the page with it. */
-                        SidebarEvent::Picked => {
-                            if std::mem::take(&mut this.sidebar_open) {
-                                this.main.focus_handle(cx).focus(window, cx);
-                            }
-                        }
-                        SidebarEvent::Open => {
-                            this.sidebar_open = false;
-                            this.main.focus_handle(cx).focus(window, cx);
-                        }
-                        // The row that is renamed has the keyboard, so it must show.
-                        SidebarEvent::Renaming => {
-                            this.sidebar_open = this
-                                .sidebar_placement(window.viewport_size().width, cx)
-                                != SidebarPlacement::Docked;
-                        }
-                        SidebarEvent::Locations(selected) => {
-                            this.sidebar_open = false;
-                            this.open_locations(selected.clone(), window, cx);
-                        }
-                    }
-                    cx.notify();
-                }),
                 // What had the keyboard is gone from the window (module docs).
                 cx.on_focus_lost(window, |this, window, cx| {
                     window
@@ -216,10 +179,84 @@ impl Shell {
                         .unwrap_or_else(|| this.main.focus_handle(cx))
                         .focus(window, cx);
                 }),
+                // Another archive's services (module docs).
+                cx.observe_global_in::<Services>(window, |this, window, cx| {
+                    this.locations = None;
+                    this.dialog = None;
+                    this.sidebar_open = false;
+                    this.springing = None;
+                    this.sprung = false;
+                    (this.main, this.sidebar, this.attached) = Self::attach(window, cx);
+                    cx.notify();
+                }),
             ],
             sidebar,
             main,
         }
+    }
+
+    /// The main area and the sidebar over the services there are now, the keyboard on the
+    /// main area, and what the shell hears from them.
+    fn attach(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<MainArea>, Entity<Sidebar>, [Subscription; 6]) {
+        let main = cx.new(|cx| MainArea::new(window, cx));
+        main.focus_handle(cx).focus(window, cx);
+        let sidebar = cx.new(|cx| Sidebar::new(window, cx));
+        let services = cx.services();
+        let (archive, sync, library, settings) = (
+            services.archive.clone(),
+            services.sync.clone(),
+            services.library.clone(),
+            services.settings.clone(),
+        );
+        let attached = [
+            // The title bar follows the archive, the locations, the passes and Settings.
+            cx.observe(&archive, |_, _, cx| cx.notify()),
+            cx.observe(&sync, |_, _, cx| cx.notify()),
+            cx.observe(&settings, |_, _, cx| cx.notify()),
+            cx.observe(&library, |this, _, cx| {
+                this.follow_drag(cx);
+                cx.notify();
+            }),
+            cx.subscribe_in(&library, window, |_, _, event, window, cx| {
+                if let LibraryEvent::Leave(leave) = event {
+                    match leave {
+                        Leave::Close => window.remove_window(),
+                        Leave::Quit => cx.quit(),
+                        Leave::Show(_) | Leave::Open(_) | Leave::Edit(_) => {}
+                    }
+                }
+            }),
+            cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| {
+                match event {
+                    /* Picking a row closes a narrow window's overlay (DESIGN §2), and the
+                    keyboard goes to the page with it. */
+                    SidebarEvent::Picked => {
+                        if std::mem::take(&mut this.sidebar_open) {
+                            this.main.focus_handle(cx).focus(window, cx);
+                        }
+                    }
+                    SidebarEvent::Open => {
+                        this.sidebar_open = false;
+                        this.main.focus_handle(cx).focus(window, cx);
+                    }
+                    // The row that is renamed has the keyboard, so it must show.
+                    SidebarEvent::Renaming => {
+                        this.sidebar_open = this
+                            .sidebar_placement(window.viewport_size().width, cx)
+                            != SidebarPlacement::Docked;
+                    }
+                    SidebarEvent::Locations(selected) => {
+                        this.sidebar_open = false;
+                        this.open_locations(selected.clone(), window, cx);
+                    }
+                }
+                cx.notify();
+            }),
+        ];
+        (main, sidebar, attached)
     }
 
     #[cfg(test)]
@@ -230,6 +267,20 @@ impl Shell {
     /// The main area.
     pub fn main(&self) -> &Entity<MainArea> {
         &self.main
+    }
+
+    /// The section picked in Settings' list (DESIGN §4.13), whether or not they show.
+    pub fn settings_section(&self, cx: &App) -> crate::pages::settings::Section {
+        self.main.read(cx).settings_page().read(cx).current()
+    }
+
+    /// Whether a dialog is open over the window: the library's, Settings' confirmation, or
+    /// the question of the archive-unavailable page.
+    fn asking(&self, cx: &App) -> bool {
+        let main = self.main.read(cx);
+        self.dialog.is_some()
+            || main.settings_page().read(cx).is_confirming()
+            || main.unavailable_page().read(cx).is_asking()
     }
 
     /// The material applied to the window.
@@ -303,7 +354,25 @@ impl Shell {
             self.sidebar_open = false;
             self.main.focus_handle(cx).focus(window, cx);
             cx.notify();
+        } else if Showing::now(cx) == Showing::Settings {
+            self.main.update(cx, MainArea::leave_settings);
+        } else {
+            let unavailable = self.main.read(cx).unavailable_page().clone();
+            unavailable.update(cx, |page, cx| page.dismiss(cx));
         }
+    }
+
+    /// Shows Settings in the main area, while a library page shows, or a first run in a folder
+    /// the owner chose (module docs).
+    pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !Showing::now(cx).has_settings(cx) {
+            return;
+        }
+        self.sidebar_open = false;
+        self.main
+            .update(cx, |main, cx| main.open_settings(window, cx));
+        self.main.focus_handle(cx).focus(window, cx);
+        cx.notify();
     }
 
     /**
@@ -390,6 +459,10 @@ impl Shell {
     }
 
     fn back(&mut self, _: &Back, _: &mut Window, cx: &mut Context<Self>) {
+        if Showing::now(cx) == Showing::Settings {
+            let settings = cx.services().settings.clone();
+            return settings.update(cx, |settings, cx| settings.show(false, cx));
+        }
         let library = cx.services().library.clone();
         library.update(cx, |library, cx| library.close(cx));
     }
@@ -472,6 +545,12 @@ impl Render for Shell {
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.keep_name_left_behind(window, cx));
         self.follow_dialogs(window, cx);
+        /* Settings show over a library page or a first run only: one that leaves (the archive
+        is lost) takes them with it, so they don't come back when a library does. */
+        let settings = cx.services().settings.clone();
+        if settings.read(cx).is_shown() && !Showing::now(cx).is_library() {
+            settings.update(cx, |settings, cx| settings.show(false, cx));
+        }
         // A sidebar that isn't shown can't keep the keyboard.
         if placement == SidebarPlacement::Collapsed
             && self.sidebar.focus_handle(cx).contains_focused(window, cx)
@@ -484,7 +563,7 @@ impl Render for Shell {
             .on_action(cx.listener(Self::dismiss))
             /* The shell's other keys are for the window under a dialog: while one is open they
             do nothing, so that nothing changes behind it nor takes the keyboard from it. */
-            .when(self.dialog.is_none(), |this| {
+            .when(!self.asking(cx), |this| {
                 this.on_action(cx.listener(Self::toggle_sidebar))
                     .on_action(cx.listener(Self::focus_other))
                     .on_action(cx.listener(Self::new_folder))
@@ -493,6 +572,9 @@ impl Render for Shell {
                     .on_action(cx.listener(Self::back))
                     .on_action(cx.listener(|this, _: &OpenLocations, window, cx| {
                         this.open_locations(None, window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                        this.open_settings(window, cx);
                     }))
             })
             // A drag is measured from its press, and ends wherever it is let go (`crate::drag`).

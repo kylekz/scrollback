@@ -28,9 +28,14 @@ use sb_core::transport::{Launcher, Probe, TransportError};
 use super::{Survey, SyncService, surveyed};
 use crate::format;
 
-/// After how many days without a good sync a location is stale (DESIGN §4.11, whose board
-/// says "warning after 7 days"; Settings will make it the owner's, DESIGN §4.13).
-pub const STALE_AFTER_DAYS: i64 = 7;
+/// After how many days without a good sync a location is stale until the owner says otherwise
+/// in Settings (DESIGN §4.11, whose board says "warning after 7 days"; §4.13), and the most and
+/// fewest days they can say.
+pub const STALE_AFTER_DAYS: u32 = 7;
+pub const STALE_AFTER_RANGE: std::ops::RangeInclusive<u32> = 1..=90;
+
+/// The archive's setting (`kv`) that holds the owner's threshold.
+pub(super) const STALE_AFTER_KEY: &str = "sync.stale_after_days";
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -216,11 +221,16 @@ pub struct Expiring {
 }
 
 /// Whether a location whose last good sync was at `last_success` and whose agents are `found`
-/// has gone more than [`STALE_AFTER_DAYS`] without one, seen from `now`. One never synced is
-/// not stale: it says so itself.
-pub fn stale(last_success: Option<i64>, found: &[ProviderAt], now: i64) -> Option<Stale> {
+/// has gone more than `after_days` without one, seen from `now`. One never synced is not
+/// stale: it says so itself.
+pub fn stale(
+    last_success: Option<i64>,
+    found: &[ProviderAt],
+    after_days: u32,
+    now: i64,
+) -> Option<Stale> {
     let last = last_success?;
-    let since = last + STALE_AFTER_DAYS * DAY_MS;
+    let since = last + i64::from(after_days) * DAY_MS;
     if now < since {
         return None;
     }
@@ -316,9 +326,59 @@ impl SyncService {
         self.development_home.as_deref()
     }
 
-    /// When every location is synced next, in Unix milliseconds.
+    /// When every location is synced next, in Unix milliseconds; `None` when they are synced
+    /// only when the owner asks.
     pub fn next_round(&self) -> Option<i64> {
         self.next_round
+    }
+
+    /// How stale `location` is, by the archive's threshold ([`stale`]).
+    pub fn stale(&self, location: &Location, now: i64) -> Option<Stale> {
+        stale(
+            location.last_success,
+            self.details.found(&location.id),
+            self.stale_after,
+            now,
+        )
+    }
+
+    /// After how many days without a good sync a location is stale (DESIGN §4.13).
+    pub fn stale_after_days(&self) -> u32 {
+        self.stale_after
+    }
+
+    /**
+     * Makes a location stale after `days` without a good sync, within [`STALE_AFTER_RANGE`],
+     * for this archive: it is kept in its catalogue. Shown at once; a write the catalogue
+     * refuses is said like any change to the locations.
+     */
+    pub fn set_stale_after_days(&mut self, days: u32, cx: &mut Context<Self>) {
+        let days = days.clamp(*STALE_AFTER_RANGE.start(), *STALE_AFTER_RANGE.end());
+        let Some(archive) = self.archive.read(cx).archive().cloned() else {
+            return;
+        };
+        if days == self.stale_after || self.closed {
+            return;
+        }
+        self.stale_after = days;
+        cx.notify();
+        self.run(
+            cx,
+            move || {
+                archive
+                    .catalogue()
+                    .set_setting(STALE_AFTER_KEY, &days.to_string())
+            },
+            |this, written, _| {
+                if let Err(error) = written {
+                    log::error!("the stale threshold could not be kept: {error}");
+                    this.refused = Some(format!(
+                        "The number of days couldn't be saved: {}.",
+                        error.to_string().trim_end_matches('.')
+                    ));
+                }
+            },
+        );
     }
 
     /// Whether `location` is being removed: its pass is stopping, or the removal is written.
@@ -534,12 +594,13 @@ impl SyncService {
         Ok(())
     }
 
-    /// Removes a location (module docs): its pass, if one runs, is stopped first.
+    /// Removes a location (module docs): its pass or its refetch, if one runs, is stopped
+    /// first.
     pub fn remove(&mut self, id: &LocationId, cx: &mut Context<Self>) {
         if self.archive.read(cx).archive().is_none() || !self.removing.insert(id.clone()) {
             return;
         }
-        if self.passes.contains_key(id) {
+        if self.passes.contains_key(id) || self.refetching.contains_key(id) {
             self.stop(id);
         } else {
             self.waiting.remove(id);
@@ -725,12 +786,13 @@ mod tests {
             },
         ];
         let synced = Some(last);
-        assert_eq!(stale(synced, &found, last + 6 * DAY_MS), None);
-        assert_eq!(stale(None, &found, last + 60 * DAY_MS), None);
+        let week = STALE_AFTER_DAYS;
+        assert_eq!(stale(synced, &found, week, last + 6 * DAY_MS), None);
+        assert_eq!(stale(None, &found, week, last + 60 * DAY_MS), None);
         /* DESIGN §4.11: 12 days without a sync, and the agent that keeps transcripts the
         shortest time starts deleting 30 days after the last sync. */
         assert_eq!(
-            stale(synced, &found, last + 12 * DAY_MS + 1000),
+            stale(synced, &found, week, last + 12 * DAY_MS + 1000),
             Some(Stale {
                 days: 12,
                 since: last + 7 * DAY_MS,
@@ -741,8 +803,13 @@ mod tests {
                 }),
             })
         );
-        let unknown = stale(synced, &[], last + 8 * DAY_MS).unwrap();
+        let unknown = stale(synced, &[], week, last + 8 * DAY_MS).unwrap();
         assert_eq!(unknown.expiring, None);
+        /* The owner's threshold moves when it is stale from, not when the agent deletes. */
+        assert_eq!(stale(synced, &found, 14, last + 12 * DAY_MS), None);
+        let fortnight = stale(synced, &found, 14, last + 15 * DAY_MS).unwrap();
+        assert_eq!(fortnight.since, last + 14 * DAY_MS);
+        assert_eq!(fortnight.expiring.unwrap().at, last + 30 * DAY_MS);
     }
 
     #[test]
