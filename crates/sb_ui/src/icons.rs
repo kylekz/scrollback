@@ -95,6 +95,7 @@ sb_icons! {
     MessageSquare => "message-square",
     Monitor => "monitor",
     PanelLeft => "panel-left",
+    PanelRight => "panel-right",
     Pause => "pause",
     Pen => "pen",
     Plug => "plug",

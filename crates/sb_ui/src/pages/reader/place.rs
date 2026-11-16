@@ -14,8 +14,8 @@
 //! since it was indexed), at the first block of the column that does, as Find's first match of
 //! it would be. It flashes in a message's prose and in an activity row's command or path.
 //!
-//! **Find in session** isn't built yet (PLAN §13, phase 4b): the request's `find` is kept with
-//! the request taken ([`ReaderView::read_at`]), for Find to be filled with when it comes.
+//! **Find in session** is filled with the request's `find` once there ([`super::find`]), the
+//! match where it flashes being current, without going to the first.
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -140,10 +140,30 @@ impl ReaderView {
             Step::Arrive(at) => {
                 self.placing = None;
                 self.arrive(&at, read_at.flash.as_deref(), cx);
+                self.fill_from(&read_at);
             }
             Step::Wait => {}
-            Step::Start => self.placing = None,
+            Step::Start => {
+                self.placing = None;
+                self.fill_from(&read_at);
+            }
         }
+    }
+
+    /**
+     * Fills Find with the request's `find`, the match where it flashes current, when the
+     * request was the palette's (Find's own way down to a match asks with none). The field is
+     * filled as the view is next drawn, which has the window it needs.
+     */
+    fn fill_from(&mut self, read_at: &ReadAt) {
+        if read_at.find.trim().is_empty() {
+            return;
+        }
+        let flash = self
+            .flash
+            .as_ref()
+            .map(|flash| (flash.at.clone(), flash.text.clone()));
+        self.filling = Some((read_at.find.clone(), flash));
     }
 
     /**
@@ -234,6 +254,10 @@ impl ReaderView {
         };
         if let Some((state, _)) = flash.lit.and_then(|piece| self.states.get(&piece)) {
             state.update(cx, |state, cx| state.clear_range_highlights(cx));
+        }
+        /* Find's matches are lit there again. */
+        if let Some(find) = self.find.as_mut() {
+            find.lit.retain(|piece, _| piece.at != flash.at);
         }
         cx.notify();
     }

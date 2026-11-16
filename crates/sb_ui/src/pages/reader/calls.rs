@@ -17,12 +17,14 @@ use gpui::{
 };
 use gpui_component::tooltip::Tooltip;
 use sb_core::transcript::{
-    Brief, Content, Conversation, TodoState, ToolCall, ToolInput, ToolKind, ToolStatus,
+    Brief, Content, Conversation, ToolCall, ToolInput, ToolKind, ToolStatus,
 };
 
 use super::ReaderView;
-use super::blocks::{failed, more_lines, on_toggle, skeleton, target, text_rows};
-use super::rows::{BodyPart, CHUNK_LINES, PanelPart, Row, RowKind};
+use super::blocks::{failed, more_lines, on_toggle, skeleton, target};
+use super::facts::HistoryOf;
+use super::kinds;
+use super::rows::{BodyPart, CHUNK_LINES, FIRST_LINES, FIRST_RESULTS, PanelPart, Row, RowKind};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{Tone, focus_ring, icon, icon_button, low_chip, tag, text_width};
@@ -30,7 +32,8 @@ use crate::format;
 use crate::hostile;
 use crate::icons::SbIcon;
 use crate::services::ActiveServices as _;
-use crate::services::reader::text::expand_tabs;
+use crate::services::reader::find::Spot;
+use crate::services::reader::shape;
 use crate::services::reader::{BlockRef, CallBody, Held, ImageKey, Load, Part, Slot, Text, Toggle};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
@@ -84,84 +87,6 @@ pub fn kind_icon(kind: ToolKind) -> SbIcon {
         ToolKind::WebSearch | ToolKind::WebFetch => SbIcon::Globe,
         ToolKind::Mcp => SbIcon::Plug,
         ToolKind::Other => SbIcon::Puzzle,
-    }
-}
-
-/// `path` under the session's project folder `root`, as the boards write it; else whole.
-fn relative<'a>(path: &'a str, root: Option<&str>) -> &'a str {
-    root.and_then(|root| path.strip_prefix(root))
-        .and_then(|rest| rest.strip_prefix(['/', '\\']))
-        .filter(|rest| !rest.is_empty())
-        .unwrap_or(path)
-}
-
-/// What the call was about, from its typed input: the command, the path, the pattern. Paths
-/// under the session's project folder `root` are written from there.
-fn call_target(call: &ToolCall, root: Option<&str>) -> String {
-    let path = |path: &str| relative(path, root).to_string();
-    match &call.input {
-        ToolInput::Shell { command, .. } => command.lines().next().unwrap_or("").to_string(),
-        ToolInput::Read {
-            path: file,
-            first_line,
-            lines,
-        } => match (first_line, lines) {
-            (Some(first), Some(lines)) => {
-                format!(
-                    "{}  {first}–{}",
-                    path(file),
-                    first + lines.saturating_sub(1)
-                )
-            }
-            (Some(first), None) => format!("{}  {first}–", path(file)),
-            _ => path(file),
-        },
-        ToolInput::Edit { path: file, .. } | ToolInput::Write { path: file, .. } => path(file),
-        ToolInput::ContentSearch {
-            pattern,
-            path: within,
-            files,
-            ..
-        } => {
-            let searched = match within {
-                Some(within) => format!("\"{pattern}\" in {}", path(within)),
-                None => format!("\"{pattern}\""),
-            };
-            match files {
-                Some(files) => format!("{searched} · {files}"),
-                None => searched,
-            }
-        }
-        ToolInput::FileSearch {
-            pattern,
-            path: within,
-        } => match within {
-            Some(within) => format!("{pattern} in {}", path(within)),
-            None => pattern.clone(),
-        },
-        ToolInput::Todos(todos) => {
-            let done = todos
-                .iter()
-                .filter(|todo| todo.state == TodoState::Done)
-                .count();
-            let doing = todos
-                .iter()
-                .find(|todo| todo.state == TodoState::InProgress)
-                .map(|todo| format!("{} · ", todo.text))
-                .unwrap_or_default();
-            format!("{doing}{done} of {} done", todos.len())
-        }
-        ToolInput::Subagent {
-            kind, description, ..
-        } => [kind.as_deref(), description.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" · "),
-        ToolInput::WebSearch { query } => query.clone(),
-        ToolInput::WebFetch { url, .. } => url.clone(),
-        ToolInput::Mcp { server, tool } => format!("{server} · {tool}"),
-        ToolInput::Other => String::new(),
     }
 }
 
@@ -288,7 +213,7 @@ fn activity(
         .and_then(|session| session.project_path.clone());
     let label = hostile::label(&agents::tool_label(&provider, &call.name, cx));
     /* A search match opened at flashes in the command or path (`super::place`). */
-    let aim = hostile::label(&call_target(&call, root.as_deref()));
+    let aim = hostile::label(&shape::target(&call, root.as_deref()));
     let aim = match view.flash_in(at, &aim) {
         Some(flash) => gpui::StyledText::new(aim)
             .with_highlights([(
@@ -454,8 +379,15 @@ fn body(
             BodyPart::Lines { part, .. } | BodyPart::More { part, .. } => {
                 session.is_open(&Toggle::AllLines(at.clone(), *part), reader.full_calls())
             }
+            BodyPart::Diff { .. } | BodyPart::Pair { .. } => {
+                session.is_open(&Toggle::AllLines(at.clone(), None), reader.full_calls())
+            }
             _ => false,
         };
+        let took = session.block(at).and_then(|block| {
+            let answered = session.call(at)?.result.as_ref()?.at?;
+            Some(answered - block.at?)
+        });
         let whole = match part {
             BodyPart::Lines { part, .. }
             | BodyPart::Whole { part }
@@ -469,11 +401,12 @@ fn body(
             },
             session.call(at).cloned(),
             image,
-            all,
+            (all, took),
             whole,
             target("body", at, session),
         )
     };
+    let (all, took) = all;
     view.hold(Held::Body(at.clone()), ix);
     if matches!(part, BodyPart::Loading) && loaded.is_none() {
         reader.update(cx, |reader, cx| reader.want_body(at, cx));
@@ -538,17 +471,31 @@ fn body(
         } {
             /* Space above the first row and below the last only: the rows of one part read as
             one block, with no seam where one ends and the next begins. */
-            Some(text) => div()
-                .px(theme.spacing.lg)
-                .when(*chunk == 0, |this| this.pt(theme.spacing.md))
-                .when(
-                    !all || (chunk + 1) * CHUNK_LINES >= text.line_count(),
-                    |this| this.pb(theme.spacing.xs),
-                )
-                .text_color(c.fg2)
-                .text_spec(&theme.text.code)
-                .child(expand_tabs(&hostile::bidi(&text_rows(text, *chunk, all))).into_owned())
-                .into_any_element(),
+            Some(text) => {
+                /* Find's matches, where the search read the text as drawn: all of it, or
+                an output's head, which is the start of all of it. */
+                let finds = if text.rest.is_none() || part.is_some() {
+                    view.finds(&Spot::Part(at.clone(), *part))
+                } else {
+                    Vec::new()
+                };
+                div()
+                    .px(theme.spacing.lg)
+                    .when(*chunk == 0, |this| this.pt(theme.spacing.md))
+                    .when(
+                        !all || (chunk + 1) * CHUNK_LINES >= text.line_count(),
+                        |this| this.pb(theme.spacing.xs),
+                    )
+                    .text_color(c.fg2)
+                    .text_spec(&theme.text.code)
+                    .child(kinds::styled(
+                        text,
+                        kinds::chunk(*chunk, all, FIRST_LINES, text.line_count()),
+                        &finds,
+                        theme,
+                    ))
+                    .into_any_element()
+            }
             None => div().into_any_element(),
         },
         (BodyPart::More { part, all }, Some(body), _) => {
@@ -611,7 +558,64 @@ fn body(
                 "No result: the session stopped before the call was answered."
             })
             .into_any_element(),
-        (BodyPart::Footer, Some(body), Some(call)) => footer(call, body, theme),
+        (BodyPart::Footer, Some(body), Some(call)) => footer(ix, at, call, body, took, theme, cx),
+        (BodyPart::Head, Some(_), Some(call)) => kinds::head(ix, at, call, first, theme),
+        (BodyPart::Diff { chunk }, Some(body), Some(call)) => match &body.diff {
+            Some(Ok(diff)) => kinds::diff_rows(
+                diff,
+                *chunk,
+                all,
+                call.kind == ToolKind::Write,
+                &view.finds(&Spot::Diff(at.clone())),
+                theme,
+            ),
+            _ => div().into_any_element(),
+        },
+        (BodyPart::DiffMore { all }, Some(body), Some(call)) => match &body.diff {
+            Some(Ok(diff)) => {
+                kinds::diff_more(ix, at, diff, *all, call.kind == ToolKind::Write, theme, cx)
+            }
+            _ => div().into_any_element(),
+        },
+        (BodyPart::Todo(index), _, Some(call)) => match &call.input {
+            ToolInput::Todos(todos) => todos.get(*index).map_or_else(
+                || div().into_any_element(),
+                |todo| {
+                    kinds::todo(
+                        &todo.text,
+                        todo.state,
+                        *index == 0,
+                        *index + 1 == todos.len(),
+                        theme,
+                    )
+                },
+            ),
+            _ => div().into_any_element(),
+        },
+        (BodyPart::Result(index), Some(body), _) => body.results.get(*index).map_or_else(
+            || div().into_any_element(),
+            |found| kinds::result(&found.title, &found.url, theme),
+        ),
+        (BodyPart::ResultsMore { all }, Some(body), _) => kinds::results_more(
+            ix,
+            at,
+            body.results.len().saturating_sub(FIRST_RESULTS),
+            *all,
+            theme,
+            cx,
+        ),
+        (BodyPart::Fetched(index), Some(body), _) => {
+            kinds::fetched(view, ix, at, body, *index, theme, cx)
+        }
+        (BodyPart::Pair { chunk }, Some(body), _) => {
+            let output = body
+                .output
+                .iter()
+                .position(|part| matches!(part, Part::Text(Ok(_))));
+            let input = view.finds(&Spot::Part(at.clone(), None));
+            let output = view.finds(&Spot::Part(at.clone(), output));
+            kinds::pair(body, *chunk, all, [&input, &output], theme)
+        }
         _ => div().into_any_element(),
     };
     let piece = div()
@@ -761,10 +765,80 @@ fn head(
         .into_any_element()
 }
 
-/// A call body's footer (`callfoot`, 24): its status and its output's lines. A failed call
-/// reads as failed whatever its exit status.
-fn footer(call: &ToolCall, body: &CallBody, theme: &SbTheme) -> AnyElement {
+/**
+ * A call body's footer (`callfoot`, 24): its status, how long it took for a command, its
+ * output's lines, and a command's Copy output; and for each file its output was saved to that
+ * has more than one version, which is read and its History (DESIGN §4.3). A failed call reads
+ * as failed whatever its exit status.
+ */
+fn footer(
+    ix: usize,
+    at: &BlockRef,
+    call: &ToolCall,
+    body: &CallBody,
+    took: Option<i64>,
+    theme: &SbTheme,
+    cx: &mut Context<ReaderView>,
+) -> AnyElement {
     let c = &theme.colors;
+    let shell = shape::renderer(call) == shape::Renderer::Shell;
+    let viewing = cx
+        .services()
+        .reader
+        .read(cx)
+        .open_session()
+        .and_then(|open| open.viewing().cloned());
+    let versions = body.versions.iter().map(|versioned| {
+        let shown = viewing
+            .as_ref()
+            .filter(|(key, _)| *key == versioned.key)
+            .map_or(versioned.history.reading, |(_, version)| *version);
+        let of = HistoryOf {
+            key: versioned.key.clone(),
+            history: versioned.history.clone(),
+            main: false,
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(theme.spacing.sm)
+            .child(format!(
+                "v{} of {}",
+                super::facts::number(&versioned.history, shown).unwrap_or(0),
+                versioned.history.versions.len()
+            ))
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "call-history-{ix}-{}",
+                        versioned.key
+                    )))
+                    .text_color(c.accent_text)
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.history = Some(of.clone());
+                        cx.notify();
+                    }))
+                    .child("History")
+                    .automation_target_with({
+                        let at = at.clone();
+                        move || format!("reader/call-history/{}", at.block.0).into()
+                    }),
+            )
+    });
+    let versions: Vec<_> = versions.collect();
+    let copy = shell.then(|| {
+        let at = at.clone();
+        div()
+            .id(("copy-output", ix))
+            .text_color(c.accent_text)
+            .cursor_pointer()
+            .on_click(move |_, _, cx| {
+                let reader = cx.services().reader.clone();
+                reader.update(cx, |reader, cx| reader.copy_call(&at, true, cx));
+            })
+            .child("Copy output")
+    });
     let texts = || {
         body.output.iter().filter_map(|part| match part {
             Part::Text(Ok(text)) => Some(text),
@@ -797,10 +871,14 @@ fn footer(call: &ToolCall, body: &CallBody, theme: &SbTheme) -> AnyElement {
         .text_color(c.fg3)
         .text_spec(&theme.text.small)
         .child(div().when(bad, |this| this.text_color(c.red)).child(status))
+        .children(took.filter(|_| shell).map(format::duration))
         .when(
             body.output.iter().any(|part| matches!(part, Part::Text(_))),
             |this| this.child(size),
         )
+        .children(versions)
+        .child(div().flex_1())
+        .children(copy)
         .into_any_element()
 }
 

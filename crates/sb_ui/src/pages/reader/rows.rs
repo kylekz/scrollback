@@ -15,8 +15,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use sb_core::transcript::{BlockId, Content, Conversation, Ending, Turn};
+use sb_core::transcript::{
+    BlockId, Content, Conversation, Ending, ToolInput, ToolKind, ToolStatus, Turn,
+};
 
+use crate::services::reader::shape::{Renderer, renderer};
 use crate::services::reader::{
     BlockRef, CallBody, Load, OpenSession, Part, Piece, Prose, Text, Toggle,
 };
@@ -25,6 +28,11 @@ use crate::services::reader::{
 pub const FIRST_LINES: usize = 20;
 /// How many lines one row holds once all are shown.
 pub const CHUNK_LINES: usize = 100;
+/// How many lines of an edit's diff, and of a write's, show until Show all (DESIGN §4.2.4).
+pub const FIRST_DIFF_LINES: usize = 20;
+pub const FIRST_WRITTEN_LINES: usize = 6;
+/// How many of a web search's results show until Show all.
+pub const FIRST_RESULTS: usize = 5;
 /// How many of a subagent's calls its panel shows until "Show n more calls" (DESIGN §4.2.7).
 pub const FIRST_CALLS: usize = 5;
 /// The deepest a subagent's panel is drawn inside another's; one deeper shows only Open on its
@@ -79,6 +87,31 @@ pub enum BodyPart {
     /// A call that returned nothing, or was never answered.
     NoOutput,
     Footer,
+    /// The kind's own header (DESIGN §4.2.4): a command, a file and its lines, a search, a
+    /// web fetch's prompt, an MCP tool's whole name.
+    Head,
+    /// The `chunk`th row of an edit's diff lines: its first [`FIRST_DIFF_LINES`] (a write's
+    /// [`FIRST_WRITTEN_LINES`]) until all are shown, then [`CHUNK_LINES`] a row.
+    Diff {
+        chunk: usize,
+    },
+    /// Under a diff with more lines: how many more and Show all, or Show fewer.
+    DiffMore {
+        all: bool,
+    },
+    /// One of a list of todos.
+    Todo(usize),
+    /// One of a web search's results, and under them how many more and Show all.
+    Result(usize),
+    ResultsMore {
+        all: bool,
+    },
+    /// A piece of a web fetch's result, as Markdown.
+    Fetched(usize),
+    /// The `chunk`th row of an MCP call's input and output, side by side.
+    Pair {
+        chunk: usize,
+    },
 }
 
 /// What a row of a block's prose is.
@@ -242,7 +275,9 @@ impl Row {
                 (*first, *last) = (false, false);
                 match part {
                     BodyPart::Failed(_) => *part = BodyPart::Loading,
-                    BodyPart::More { all, .. } => *all = false,
+                    BodyPart::More { all, .. }
+                    | BodyPart::DiffMore { all }
+                    | BodyPart::ResultsMore { all } => *all = false,
                     _ => {}
                 }
             }
@@ -729,25 +764,140 @@ impl Rows<'_> {
     }
 
     /**
-     * The generic call body (DESIGN §4.2.4): the input as sent and each part of the output.
-     * A kind's own renderer takes its place here, by the call's kind, and in the view's
-     * drawing of the parts it adds.
+     * A call's body, by its kind (DESIGN §4.2.4): a command's header, its output and its
+     * footer; a read's header and the file's lines; an edit's diff; a search's header and what
+     * it found; a list of todos; a web search's results; a web fetch's prompt and its result
+     * as Markdown; an MCP call's input and output side by side. A kind whose input isn't in
+     * its shape, and a tool no provider knows, show the input as sent and each part of the
+     * output. What failed shows what the tool said; a footer says which versions of the files
+     * it saved to are read, when they have more than one.
      */
     fn body_parts(&self, at: &BlockRef, body: &CallBody) -> Vec<BodyPart> {
-        let mut parts = vec![BodyPart::InputHead];
-        self.lines(at, None, body.input.as_ref(), &mut parts);
-        parts.push(BodyPart::OutputHead);
+        let Some(call) = self.open.call(at) else {
+            return vec![BodyPart::NoOutput];
+        };
+        let failed = call
+            .result
+            .as_ref()
+            .is_some_and(|result| result.status == ToolStatus::Failed);
+        let mut parts = Vec::new();
+        match (renderer(call), &call.input) {
+            (Renderer::Shell, _) => {
+                parts.push(BodyPart::Head);
+                self.outputs(at, body, &mut parts);
+                parts.push(BodyPart::Footer);
+            }
+            (Renderer::Read | Renderer::Search, _) => {
+                parts.push(BodyPart::Head);
+                self.outputs(at, body, &mut parts);
+            }
+            (Renderer::Files, _) => self.outputs(at, body, &mut parts),
+            (Renderer::Diff, _) => {
+                match &body.diff {
+                    Some(Ok(diff)) => self.diff(at, call.kind, diff.lines.len(), &mut parts),
+                    _ => parts.push(BodyPart::PartFailed { part: None }),
+                }
+                if failed {
+                    self.outputs(at, body, &mut parts);
+                }
+            }
+            (Renderer::Todos, ToolInput::Todos(todos)) => {
+                parts.extend((0..todos.len()).map(BodyPart::Todo));
+                if failed {
+                    self.outputs(at, body, &mut parts);
+                }
+            }
+            (Renderer::WebSearch, _) if !body.results.is_empty() => {
+                let all = self
+                    .open
+                    .is_open(&Toggle::AllLines(at.clone(), None), self.full_calls);
+                let count = body.results.len();
+                let shown = if all { count } else { count.min(FIRST_RESULTS) };
+                parts.extend((0..shown).map(BodyPart::Result));
+                if count > FIRST_RESULTS {
+                    parts.push(BodyPart::ResultsMore { all });
+                }
+            }
+            (Renderer::WebFetch, _) if body.fetched.is_some() => {
+                parts.push(BodyPart::Head);
+                let pieces = body.fetched.as_ref().map_or(0, |prose| prose.pieces.len());
+                parts.extend((0..pieces).map(BodyPart::Fetched));
+            }
+            (Renderer::Mcp, _) => {
+                parts.push(BodyPart::Head);
+                let lines = |text: Option<&Result<Arc<Text>, String>>| {
+                    text.and_then(|text| text.as_ref().ok())
+                        .map_or(0, |text| text.line_count())
+                };
+                let first = body.output.iter().find_map(|part| match part {
+                    Part::Text(text) => Some(text),
+                    Part::Image => None,
+                });
+                let count = lines(Some(&body.input)).max(lines(first));
+                let all = self
+                    .open
+                    .is_open(&Toggle::AllLines(at.clone(), None), self.full_calls);
+                let chunks = if all {
+                    count.div_ceil(CHUNK_LINES)
+                } else {
+                    count.min(1)
+                };
+                parts.extend((0..chunks).map(|chunk| BodyPart::Pair { chunk }));
+                if count > FIRST_LINES {
+                    parts.push(BodyPart::More { part: None, all });
+                }
+                parts.extend(
+                    (body.output.iter().enumerate())
+                        .filter(|(_, part)| matches!(part, Part::Image))
+                        .map(|(index, _)| BodyPart::Image(index)),
+                );
+            }
+            _ => {
+                parts.push(BodyPart::InputHead);
+                self.lines(at, None, body.input.as_ref(), &mut parts);
+                parts.push(BodyPart::OutputHead);
+                self.outputs(at, body, &mut parts);
+                parts.push(BodyPart::Footer);
+            }
+        }
+        if !body.versions.is_empty() && !parts.contains(&BodyPart::Footer) {
+            parts.push(BodyPart::Footer);
+        }
+        parts
+    }
+
+    /// The rows of each part of a call's output: its lines, or its image; or that it has none.
+    fn outputs(&self, at: &BlockRef, body: &CallBody, parts: &mut Vec<BodyPart>) {
         if body.output.is_empty() {
             parts.push(BodyPart::NoOutput);
         }
         for (index, part) in body.output.iter().enumerate() {
             match part {
-                Part::Text(text) => self.lines(at, Some(index), text.as_ref(), &mut parts),
+                Part::Text(text) => self.lines(at, Some(index), text.as_ref(), parts),
                 Part::Image => parts.push(BodyPart::Image(index)),
             }
         }
-        parts.push(BodyPart::Footer);
-        parts
+    }
+
+    /// The rows of an edit's diff of `count` lines: its first, or all a chunk a row.
+    fn diff(&self, at: &BlockRef, kind: ToolKind, count: usize, parts: &mut Vec<BodyPart>) {
+        let first = if kind == ToolKind::Write {
+            FIRST_WRITTEN_LINES
+        } else {
+            FIRST_DIFF_LINES
+        };
+        let all = self
+            .open
+            .is_open(&Toggle::AllLines(at.clone(), None), self.full_calls);
+        let chunks = if all {
+            count.div_ceil(CHUNK_LINES)
+        } else {
+            count.min(1)
+        };
+        parts.extend((0..chunks).map(|chunk| BodyPart::Diff { chunk }));
+        if count > first {
+            parts.push(BodyPart::DiffMore { all });
+        }
     }
 
     /**

@@ -121,6 +121,7 @@ pub const READER_STAR: Shortcut = shortcut!("s", READER, reader::Star);
 pub const NEXT_SESSION: Shortcut = shortcut!("j", READER, reader::NextSession);
 pub const PREVIOUS_SESSION: Shortcut = shortcut!("k", READER, reader::PreviousSession);
 pub const SWITCH_CALLS: Shortcut = shortcut!("e", READER, reader::SwitchCalls);
+pub const FIND: Shortcut = shortcut!("secondary-f", READER, reader::Find);
 /// `]`, `[` and `Ctrl C` in the reader. Named, because the palette's commands say them.
 pub const NEXT_TURN: Shortcut = shortcut!("]", READER, reader::NextTurn);
 pub const PREVIOUS_TURN: Shortcut = shortcut!("[", READER, reader::PreviousTurn);
@@ -194,6 +195,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     NEXT_SESSION,
     PREVIOUS_SESSION,
     SWITCH_CALLS,
+    FIND,
     NEXT_TURN,
     PREVIOUS_TURN,
     shortcut!("up", READER, reader::Up),
@@ -249,6 +251,7 @@ pub const SHORTCUT_ROWS: &[ShortcutRow] = &[
         "Next or previous turn",
         &["reader::NextTurn", "reader::PreviousTurn"],
     ),
+    row("Find in the session", &["reader::Find"]),
     row("Switch Activity or Full calls", &["reader::SwitchCalls"]),
     row(
         "Star or unstar the selected or open session",

@@ -223,6 +223,13 @@ impl MainArea {
         &self.unavailable
     }
 
+    /// `Esc` in the reader: closes what it shows over the column, or Find. Whether it closed
+    /// anything.
+    pub fn dismiss_reader(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.reader
+            .update(cx, |reader, cx| reader.dismiss(window, cx))
+    }
+
     /// What the reader shows, for automation.
     pub fn reader(&self, cx: &App) -> reader::ReaderSnapshot {
         self.reader.read(cx).snapshot(cx)

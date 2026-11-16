@@ -51,6 +51,7 @@
 //! toggle opens a row; in Full calls, where every call, thought and subagent's call list is
 //! open, it closes one until the switch is flipped again (DESIGN §4.2.3).
 
+pub mod find;
 pub mod highlights;
 pub mod picture;
 pub mod prose;
@@ -68,16 +69,18 @@ use std::time::Instant;
 
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription};
 use sb_core::archive::{Archive, ArchivedSession, Pinned, SegmentCache};
-use sb_core::catalogue::SessionId;
+use sb_core::catalogue::{History, SessionId};
 use sb_core::provider::{ItemKind, Provider, SessionItems};
 use sb_core::transcript::{
-    BlockId, Content, Conversation, Outline, Output, Stored, Subagent, ToolCall,
+    BlockId, Content, Conversation, Outline, Output, Stored, Subagent, ToolCall, ToolKind,
 };
 
 use super::{ArchiveService, LibraryService, Providers};
 use crate::syntax::TokenKind;
 pub use picture::Picture;
 pub use prose::{Piece, Prose};
+pub use shape::WebResult;
+use shape::diff::Diff;
 use shape::json::pretty;
 pub use text::Text;
 
@@ -329,11 +332,27 @@ pub enum Part {
     Image,
 }
 
-/// A call's body: its input as it was sent, and its output.
+/// A call's body: its input as it was sent, and its output, as its kind shapes them
+/// ([`shape`]), and what its kind's renderer draws besides (DESIGN §4.2.4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallBody {
     pub input: Result<Arc<Text>, String>,
     pub output: Vec<Part>,
+    /// An edit's or a write's diff, from its input.
+    pub diff: Option<Result<Arc<Diff>, String>>,
+    /// A web search's results, from its output.
+    pub results: Vec<WebResult>,
+    /// A web fetch's result, as Markdown.
+    pub fetched: Option<Arc<Prose>>,
+    /// The files its output was saved to that have more than one version (DESIGN §4.3).
+    pub versions: Vec<Versioned>,
+}
+
+/// A file of the session's with more than one version, and its history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Versioned {
+    pub key: Arc<str>,
+    pub history: History,
 }
 
 /// What a subagent says it is, from its own record of itself.
@@ -368,7 +387,7 @@ pub struct OpenSession {
     pinned: Pinned,
     cache: Arc<SegmentCache>,
     /// The session's own conversation; `None` when its items hold no main transcript.
-    main: Option<Conversation>,
+    main: Option<Arc<Conversation>>,
     /// The subagents no call of the session's own conversation started, by item. Until
     /// [`Placement`] is worked out, those started by another subagent are among them.
     unattached: Vec<Arc<str>>,
@@ -377,6 +396,13 @@ pub struct OpenSession {
     /// again may read more.
     fault: Option<String>,
     gone: Option<Gone>,
+    /// The versions of the session's own transcript, and which is read (DESIGN §4.3).
+    history: Option<History>,
+    /// Those of the item read for a look, when it is another.
+    viewed_history: Option<History>,
+    /// The version of one of the session's items read in place of its reading copy, for a
+    /// look ([`ReaderService::view_version`]): the item's key, and the version's id.
+    viewing: Option<(Arc<str>, i64)>,
     prose: HashMap<BlockRef, Load<Arc<Prose>>>,
     subagents: HashMap<Arc<str>, Load<Arc<SubagentRead>>>,
     /**
@@ -398,7 +424,7 @@ pub struct OpenSession {
 
 impl OpenSession {
     pub fn main(&self) -> Option<&Conversation> {
-        self.main.as_ref()
+        self.main.as_deref()
     }
 
     /// The subagents no call is known to have started; `None` until that is known, while
@@ -452,10 +478,30 @@ impl OpenSession {
         self.gone.as_ref()
     }
 
+    /// The versions of the session's own transcript, when it has one.
+    pub fn history(&self) -> Option<&History> {
+        self.history.as_ref()
+    }
+
+    /// The version read for a look in place of an item's reading copy, if one is.
+    pub fn viewing(&self) -> Option<&(Arc<str>, i64)> {
+        self.viewing.as_ref()
+    }
+
+    /// The versions of the item read for a look, when it isn't the session's own transcript.
+    pub fn viewed_history(&self) -> Option<&History> {
+        self.viewed_history.as_ref()
+    }
+
+    /// The key of the session's own transcript.
+    pub fn main_key(&self) -> Option<&Arc<str>> {
+        self.main.as_ref().map(|main| &main.item)
+    }
+
     /// The conversation parsed from the item `item`, once it is read.
     pub fn conversation(&self, item: &str) -> Option<&Conversation> {
         match &self.main {
-            Some(main) if *main.item == *item => Some(main),
+            Some(main) if *main.item == *item => Some(main.as_ref()),
             _ => match self.subagents.get(item)? {
                 Load::Loaded(read) => Some(&read.conversation),
                 _ => None,
@@ -478,6 +524,14 @@ impl OpenSession {
 
     pub fn subagent(&self, item: &str) -> Option<&Load<Arc<SubagentRead>>> {
         self.subagents.get(item)
+    }
+
+    /// The subagents read so far, by item.
+    pub fn subagents_read(&self) -> impl Iterator<Item = (&Arc<str>, &Arc<SubagentRead>)> {
+        self.subagents.iter().filter_map(|(item, load)| match load {
+            Load::Loaded(read) => Some((item, read)),
+            _ => None,
+        })
     }
 
     pub fn prose(&self, at: &BlockRef) -> Option<&Load<Arc<Prose>>> {
@@ -591,6 +645,9 @@ pub struct ReaderService {
     state: ReaderState,
     /// Whether every call is shown open (DESIGN §4.2.1), for the app.
     full_calls: bool,
+    /// The version of an item of the open session read for a look (DESIGN §4.3): its key and
+    /// the version's id. It goes when another session opens.
+    viewing: Option<(Arc<str>, i64)>,
     /// Counts the opens, so that what an earlier one asked for is dropped when it lands.
     generation: u64,
     /// The loads of this generation not landed yet.
@@ -647,6 +704,7 @@ impl ReaderService {
             providers,
             state: ReaderState::Closed,
             full_calls: false,
+            viewing: None,
             generation: 0,
             loading: 0,
             alive: Arc::new(AtomicBool::new(true)),
@@ -777,6 +835,61 @@ impl ReaderService {
         }
     }
 
+    /**
+     * Reads the open session with its item `key` at its version `version` for a look, in
+     * place of its reading copy (DESIGN §4.3 "Read vN"), choosing nothing; `None` goes back to
+     * the reading copy. The session is parsed again.
+     */
+    pub fn view_version(&mut self, viewing: Option<(Arc<str>, i64)>, cx: &mut Context<Self>) {
+        self.viewing = viewing;
+        self.reopen(cx);
+    }
+
+    /**
+     * Makes the open session's item `item` read at its version `version` (DESIGN §4.3 "Make
+     * vN the reading copy"), off the UI thread: the catalogue's choice, then the session
+     * indexed again so that its row (its card's `held back`) follows. The session is then read
+     * at its reading copy, and the library read again.
+     */
+    pub fn make_reading_copy(&mut self, item: i64, version: i64, cx: &mut Context<Self>) {
+        let (Some(open), Some(archive)) = (self.open_session(), self.archive.read(cx).archive())
+        else {
+            return;
+        };
+        let (id, archive, providers, provider) = (
+            open.id.clone(),
+            archive.clone(),
+            self.providers.clone(),
+            open.provider,
+        );
+        let job = cx.background_spawn(async move {
+            guarded(|| {
+                archive
+                    .catalogue()
+                    .set_reading_version(&id, item, Some(version))
+                    .map_err(|error| error.to_string())?;
+                sb_core::sync::index_session(&archive, providers[provider].as_ref(), &id)
+                    .map(drop)
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|it| it)
+        });
+        cx.spawn(async move |this, cx| {
+            let made = job.await;
+            this.update(cx, |this, cx| {
+                if let Err(why) = made {
+                    log::warn!("a version could not be made the reading copy: {why}");
+                }
+                this.viewing = None;
+                this.reopen(cx);
+                let library = this.library.clone();
+                library.update(cx, |library, cx| library.reload(cx));
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Parses the session `id` again: after a failure, or to read past a read that failed.
     pub fn reopen(&mut self, cx: &mut Context<Self>) {
         if let Some(id) = self.state.id().cloned() {
@@ -815,6 +928,9 @@ impl ReaderService {
     }
 
     fn open(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if self.state.id() != Some(&id) {
+            self.viewing = None;
+        }
         self.close(cx);
         /* Without the archive there is nothing to read: the reader stays closed rather than
         show the session it had. */
@@ -827,13 +943,14 @@ impl ReaderService {
         /* Only the newest session asked for is parsed: one passed over (J held down) is
         closed, its flag cleared, before its turn on the background comes. */
         let alive = self.alive.clone();
+        let viewing = self.viewing.clone();
         let job = cx.background_spawn({
             let id = id.clone();
             async move {
                 if !alive.load(Ordering::Relaxed) {
                     return Err("passed over".to_string());
                 }
-                guarded(|| parse(&archive, &providers, &id, &alive)).and_then(|it| it)
+                guarded(|| parse(&archive, &providers, &id, viewing, &alive)).and_then(|it| it)
             }
         });
         cx.spawn(async move |this, cx| {
@@ -1089,38 +1206,89 @@ impl ReaderService {
         self.pump(cx);
     }
 
-    /// Loads the body of the call at `at`, unless it is loading or loaded.
+    /**
+     * Loads the body of the call at `at`, unless it is loading or loaded: its input and each
+     * part of its output as its kind shapes them ([`shape`]), an edit's diff, a web search's
+     * results, a web fetch's result as Markdown, and the versions of the files its output was
+     * saved to.
+     */
     pub fn want_body(&mut self, at: &BlockRef, cx: &mut Context<Self>) {
-        let Some(call) = self.open_session().and_then(|open| open.call(at)) else {
+        let (Some(open), Some(archive)) = (self.open_session(), self.archive.read(cx).archive())
+        else {
             return;
         };
-        let (input, output) = (
-            call.raw_input.clone(),
-            call.result.as_ref().map(|r| r.output.clone()),
-        );
+        let Some(call) = open.call(at).cloned() else {
+            return;
+        };
+        let (archive, id, conversation) =
+            (archive.clone(), open.id.clone(), at.conversation.clone());
         let key = at.clone();
         self.load(
             |open| claim(&mut open.bodies, &key),
             move |_, items| {
-                let head = |stored: &Stored, json: bool| {
+                let head = |stored: &Stored, shape: &dyn Fn(String) -> Text| {
                     stored
                         .load_head(items, HEAD_BYTES)
-                        .map(|(text, rest)| {
-                            Arc::new(match rest {
-                                0 => Text::new(if json { pretty(text) } else { text }),
-                                rest => Text::head(text, rest),
-                            })
-                        })
+                        .map(|(text, rest)| Arc::new(shape(text).cut(rest)))
                         .map_err(|error| error.to_string())
                 };
+                let output: Vec<Output> = call
+                    .result
+                    .iter()
+                    .flat_map(|result| result.output.clone())
+                    .collect();
+                let texts = || {
+                    output.iter().filter_map(|part| match part {
+                        Output::Text(stored) => Some(stored),
+                        Output::Image(_) => None,
+                    })
+                };
+                let first_text = || {
+                    texts()
+                        .next()
+                        .and_then(|stored| stored.load_head(items, shape::RESULT_BYTES).ok())
+                        .map(|(text, _)| text)
+                };
+                let saved: Vec<Arc<str>> = output
+                    .iter()
+                    .map(|part| match part {
+                        Output::Text(stored) => &stored.item,
+                        Output::Image(image) => &image.data.item,
+                    })
+                    .filter(|item| **item != conversation)
+                    .fold(Vec::new(), |mut saved, item| {
+                        if !saved.contains(item) {
+                            saved.push(item.clone());
+                        }
+                        saved
+                    });
                 Arc::new(CallBody {
-                    input: head(&input, true),
+                    input: head(&call.raw_input, &|text| shape::input(&call, text)),
                     output: output
-                        .unwrap_or_default()
                         .iter()
                         .map(|part| match part {
-                            Output::Text(stored) => Part::Text(head(stored, false)),
+                            Output::Text(stored) => {
+                                Part::Text(head(stored, &|text| shape::output(&call, text)))
+                            }
                             Output::Image(_) => Part::Image,
+                        })
+                        .collect(),
+                    diff: shape::edit(&call, items).map(|diff| diff.map(Arc::new)),
+                    results: match call.kind {
+                        ToolKind::WebSearch => {
+                            first_text().map_or_else(Vec::new, |text| shape::results(&text))
+                        }
+                        _ => Vec::new(),
+                    },
+                    fetched: (call.kind == ToolKind::WebFetch)
+                        .then(first_text)
+                        .flatten()
+                        .map(|text| Arc::new(Prose::markdown(&text))),
+                    versions: saved
+                        .into_iter()
+                        .filter_map(|key| {
+                            let history = archive.catalogue().history(&id, &key).ok()??;
+                            (history.versions.len() > 1).then_some(Versioned { key, history })
                         })
                         .collect(),
                 })
@@ -1159,15 +1327,19 @@ impl ReaderService {
         let Some(stored) = stored else {
             return;
         };
+        let call = call.clone();
         let key = (at.clone(), part);
         self.load(
             |open| claim(&mut open.wholes, &key),
+            /* Shaped as the head is. */
             move |_, items| {
                 stored
                     .load_text(items)
-                    /* The input as its head shows it when it is whole: pretty-printed. */
                     .map(|text| {
-                        Arc::new(Text::new(if part.is_none() { pretty(text) } else { text }))
+                        Arc::new(match part {
+                            None => shape::input(&call, text),
+                            Some(_) => shape::output(&call, text),
+                        })
                     })
                     .map_err(|error| error.to_string())
             },
@@ -1235,6 +1407,7 @@ impl ReaderService {
         } else {
             vec![call.raw_input.clone()]
         };
+        let call = call.clone();
         self.load(
             |_| true,
             move |_, items| {
@@ -1242,7 +1415,12 @@ impl ReaderService {
                     .iter()
                     .map(|stored| {
                         let text = stored.load_text(items).map_err(|error| error.to_string())?;
-                        Ok(if output { text } else { pretty(text) })
+                        /* As the body shows it. */
+                        Ok(if output {
+                            shape::output(&call, text).text
+                        } else {
+                            pretty(text)
+                        })
                     })
                     .collect::<Vec<_>>()
             },
@@ -1354,6 +1532,51 @@ impl ReaderService {
             },
             cx,
         );
+    }
+
+    /**
+     * Searches the open session for `query` off the UI thread, while `going` says the search
+     * is wanted (Find in session, [`find`]); `root` is the session's project folder, which the
+     * rows write targets from. `None` when no session is open, or when the search is let go.
+     */
+    pub fn find(
+        &self,
+        query: String,
+        root: Option<String>,
+        going: Arc<AtomicBool>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Task<Option<find::Findings>>> {
+        let open = self.open_session()?;
+        let archive = self.archive.read(cx).archive()?.clone();
+        let source = find::Source {
+            main: open.main.clone(),
+            subagents: open
+                .subagents
+                .iter()
+                .filter_map(|(item, load)| match load {
+                    Load::Loaded(read) => Some((item.clone(), read.clone())),
+                    _ => None,
+                })
+                .collect(),
+            unattached: open.unattached.clone(),
+            root,
+        };
+        let (pinned, cache, provider) = (open.pinned.clone(), open.cache.clone(), open.provider);
+        let providers = self.providers.clone();
+        Some(cx.background_spawn(async move {
+            guarded(|| {
+                let items = archive.pinned_session(&pinned, cache);
+                find::search(
+                    &query,
+                    &source,
+                    providers[provider].as_ref(),
+                    &items,
+                    &|| going.load(Ordering::Relaxed),
+                )
+            })
+            .ok()
+            .flatten()
+        }))
     }
 
     /// Loads an unrecognised record as it was recorded.
@@ -1582,6 +1805,7 @@ fn parse(
     archive: &Archive,
     providers: &Providers,
     id: &SessionId,
+    viewing: Option<(Arc<str>, i64)>,
     alive: &AtomicBool,
 ) -> Result<OpenSession, String> {
     let provider = providers
@@ -1589,10 +1813,12 @@ fn parse(
         .position(|provider| provider.id().as_str() == id.provider)
         .ok_or_else(|| format!("this build has no provider for {}", id.provider))?;
     let cache = Arc::new(SegmentCache::new(CACHED_SEGMENTS, CACHED_BYTES));
-    let items = archive
-        .session(id)
-        .map_err(|error| error.to_string())?
-        .with_cache(cache.clone());
+    let items = match &viewing {
+        Some((key, version)) => archive.session_at(id, key, *version),
+        None => archive.session(id),
+    }
+    .map_err(|error| error.to_string())?
+    .with_cache(cache.clone());
     let transcript = providers[provider].parse(&items);
     let catalogue = archive.catalogue();
     let gone = items
@@ -1613,12 +1839,27 @@ fn parse(
                 since,
             })
         });
+    let main_key = items
+        .list()
+        .iter()
+        .find(|item| item.kind == ItemKind::Transcript)
+        .map(|main| main.key.clone());
+    let history = main_key
+        .as_ref()
+        .and_then(|key| catalogue.history(id, key).ok().flatten());
+    let viewed_history = viewing
+        .as_ref()
+        .filter(|(key, _)| main_key.as_deref() != Some(&**key))
+        .and_then(|(key, _)| catalogue.history(id, key).ok().flatten());
     let mut open = OpenSession {
         id: id.clone(),
         provider,
+        history,
+        viewed_history,
+        viewing,
         pinned: items.pinned().clone(),
         cache,
-        main: transcript.conversation,
+        main: None,
         unattached: transcript
             .unattached
             .iter()
@@ -1638,8 +1879,11 @@ fn parse(
         closed: HashSet::new(),
     };
     let mut found = Vec::new();
-    if let Some(main) = &mut open.main {
-        settle(main, &mut found);
+    open.main = transcript.conversation.map(|mut main| {
+        settle(&mut main, &mut found);
+        Arc::new(main)
+    });
+    if let Some(main) = &open.main {
         let item = main.item.clone();
         let started = Instant::now();
         /* The budget is asked before each piece of each body: one it runs out in is dropped,

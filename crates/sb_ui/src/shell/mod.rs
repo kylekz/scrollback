@@ -374,6 +374,9 @@ impl Shell {
             cx.notify();
         } else if Showing::now(cx) == Showing::Settings {
             self.main.update(cx, MainArea::leave_settings);
+        } else if Showing::now(cx) == Showing::Session {
+            self.main
+                .update(cx, |main, cx| main.dismiss_reader(window, cx));
         } else {
             let unavailable = self.main.read(cx).unavailable_page().clone();
             unavailable.update(cx, |page, cx| page.dismiss(cx));

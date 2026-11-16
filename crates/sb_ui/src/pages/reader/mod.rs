@@ -33,6 +33,9 @@
 
 pub(crate) mod blocks;
 mod calls;
+mod facts;
+mod find;
+mod kinds;
 mod place;
 #[cfg(test)]
 mod place_tests;
@@ -47,10 +50,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
-    ListAlignment, ListState, ParentElement as _, Pixels, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, list,
-    prelude::FluentBuilder as _, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _,
+    IntoElement, ListAlignment, ListState, ParentElement as _, Pixels, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription,
+    UniformListScrollHandle, Window, div, list, prelude::FluentBuilder as _, px,
 };
 use gpui_base::text::TextViewState;
 use gpui_component::scroll::Scrollbar;
@@ -65,7 +68,8 @@ use crate::icons::SbIcon;
 use crate::keymap;
 use crate::markdown::Sanitized;
 use crate::services::reader::{
-    BlockRef, Changed, Code, Held, Highlights, OpenSession, Rank, ReaderService, ReaderState,
+    BlockRef, Changed, Code, Held, Highlights, ImageKey, OpenSession, Rank, ReaderService,
+    ReaderState,
 };
 use crate::services::{ActiveServices as _, LibraryService, ReadAt};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
@@ -115,6 +119,17 @@ pub struct ReaderSnapshot {
     /// What flashes: the row name of its block ([`blocks::row_name`]'s, without the row's
     /// kind), its text, and whether it has been drawn.
     pub flash: Option<(String, String, bool)>,
+    /// Find's query, its count ("3 of 14"), and where its current match is: the row name of
+    /// its block and which of its texts.
+    pub find: Option<(String, Option<String>, Option<String>)>,
+    /// Whether the facts show: as the margin, or over the column in a narrow window.
+    pub facts: bool,
+    /// Whose History is open.
+    pub history: Option<String>,
+    /// The version read for a look, by its number, when one is.
+    pub viewing: Option<u32>,
+    /// The image shown full size, when one is.
+    pub full_image: bool,
 }
 
 pub struct ReaderView {
@@ -154,6 +169,21 @@ pub struct ReaderView {
     placing: Option<ReadAt>,
     read_at: Option<ReadAt>,
     flash: Option<place::Flash>,
+    /// Find in session, once there was a window to make its field in ([`find`]); and what to
+    /// fill it with when the view is next drawn.
+    find: Option<find::Find>,
+    filling: Option<(String, Option<(BlockRef, String)>)>,
+    /// The History popover open ([`facts`]).
+    history: Option<facts::HistoryOf>,
+    /// The facts' turns, and the turn they last showed current.
+    turns_scroll: UniformListScrollHandle,
+    facts_turn: Option<usize>,
+    /// Whether the facts show over the column, in a window too narrow for the margin.
+    facts_open: bool,
+    /// The image a tool returned shown full size, over the column.
+    full_image: Option<ImageKey>,
+    /// Whether the margin showed last frame: the window was wide enough.
+    wide: bool,
     _observers: [Subscription; 3],
 }
 
@@ -181,6 +211,14 @@ impl ReaderView {
             placing: None,
             read_at: None,
             flash: None,
+            find: None,
+            filling: None,
+            history: None,
+            turns_scroll: UniformListScrollHandle::new(),
+            facts_turn: None,
+            facts_open: false,
+            full_image: None,
+            wide: true,
             _observers: [
                 cx.observe(&reader, |this, _, cx| this.refresh(cx)),
                 cx.subscribe(&reader, |this, _, changed, cx| this.changed(changed, cx)),
@@ -249,6 +287,32 @@ impl ReaderView {
                 });
                 (name, text.to_string(), drawn)
             }),
+            find: self
+                .find
+                .as_ref()
+                .filter(|find| find.is_active())
+                .map(|find| {
+                    let current = find
+                        .current
+                        .and_then(|at| find.findings.as_ref()?.matches.get(at))
+                        .and_then(|found| {
+                            let at = found.spot.block();
+                            let name = format!(
+                                "{}/{}",
+                                blocks::conversation_name(&at.conversation, open?),
+                                at.block.0
+                            );
+                            Some(format!("{name} {}", find::spot_kind(&found.spot)))
+                        });
+                    (find.query.clone(), find.count(), current)
+                }),
+            facts: self.wide || self.facts_open,
+            history: self.history.as_ref().map(|of| of.key.to_string()),
+            viewing: open.and_then(|open| {
+                let (_, version) = open.viewing()?;
+                Some(facts::number(open.history()?, *version).unwrap_or(0))
+            }),
+            full_image: self.full_image.is_some(),
         }
     }
 
@@ -279,6 +343,13 @@ impl ReaderView {
             self.placing = None;
             self.read_at = None;
             self.flash = None;
+            self.history = None;
+            self.facts_open = false;
+            self.full_image = None;
+            self.facts_turn = None;
+            if let Some(find) = self.find.take() {
+                find.stop();
+            }
             self.states.clear();
             self.held.clear();
             self.rows = rows;
@@ -290,6 +361,7 @@ impl ReaderView {
         }
         self.take_read_at(cx);
         self.place(cx);
+        self.reveal_pending(cx);
         cx.notify();
     }
 
@@ -339,6 +411,7 @@ impl ReaderView {
             + 1;
         let rows = rows::relaid(open, reader.full_calls(), &self.rows[start..end]);
         self.replace(start..end, rows);
+        self.reveal_pending(cx);
         cx.notify();
     }
 
@@ -625,6 +698,9 @@ impl ReaderView {
             }
         };
         self.light_prose(&piece, &state, cx);
+        if self.flash.as_ref().is_none_or(|flash| flash.at != piece.at) {
+            self.light_found(&piece, &state, cx);
+        }
         Some(state)
     }
 
@@ -763,7 +839,12 @@ impl ReaderView {
             .into_any_element()
     }
 
-    fn render_header(&self, theme: &SbTheme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_header(
+        &self,
+        window: &Window,
+        theme: &SbTheme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let c = &theme.colors;
         let services = cx.services();
         let library = services.library.read(cx);
@@ -911,6 +992,7 @@ impl ReaderView {
                     })),
             )
             .child(div().flex_1())
+            .child(self.render_find(window, theme, cx))
             .child(
                 div()
                     .flex_none()
@@ -925,13 +1007,226 @@ impl ReaderView {
                     .child(segment("full", "Full calls", full_calls, true))
                     .automation_target("reader/calls"),
             )
+            .when(!self.wide, |this| {
+                this.child(
+                    icon_button("facts-toggle", theme.sizes.control_height, theme)
+                        .aria_label("Facts")
+                        .when(self.facts_open, |this| this.bg(c.s3))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.facts_open = !this.facts_open;
+                            cx.notify();
+                        }))
+                        .child(icon(SbIcon::PanelRight, theme.sizes.icon, c.fg2))
+                        .automation_target("reader/facts-toggle"),
+                )
+            })
             .into_any_element()
     }
 
-    /// What stands over the column: a source gone at its location, a read that failed.
+    /**
+     * The header's Find field (DESIGN §4.2.9): 240 wide, 300 and ringed while it has the
+     * keyboard; the count, and the previous, next and close buttons while it has a query.
+     */
+    fn render_find(&self, window: &Window, theme: &SbTheme, cx: &mut Context<Self>) -> AnyElement {
+        let c = &theme.colors;
+        let Some(find) = &self.find else {
+            return div().into_any_element();
+        };
+        let focused = find.input.focus_handle(cx).is_focused(window);
+        let active = find.is_active();
+        let count = find.count();
+        let none = find
+            .findings
+            .as_ref()
+            .is_some_and(|findings| findings.matches.is_empty());
+        let step = |id: &'static str, glyph, label: &'static str, by: isize| {
+            icon_button(id, theme.sizes.control_height, theme)
+                .aria_label(label)
+                .on_click(cx.listener(move |this, _, _, cx| this.step_match(by, cx)))
+                .child(icon(glyph, theme.sizes.icon, c.fg2))
+                .automation_target_with(move || format!("reader/find/{id}").into())
+        };
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(theme.spacing.xs)
+            .child(
+                div()
+                    .id("find-field")
+                    .flex_none()
+                    .w(if focused || active {
+                        px(300.)
+                    } else {
+                        px(240.)
+                    })
+                    .h(theme.sizes.control_height)
+                    .flex()
+                    .items_center()
+                    .gap(theme.spacing.md)
+                    .px(theme.sizes.list_row_padding)
+                    .rounded(theme.radii.input)
+                    .border_1()
+                    .border_color(if focused || active { c.accent } else { c.line })
+                    .when(focused || active, |this| {
+                        this.shadow(crate::components::focus_ring(false, theme))
+                    })
+                    .bg(c.s1)
+                    .text_spec(&theme.text.secondary)
+                    .capture_action(cx.listener(
+                        |this, _: &gpui_component::input::Escape, window, cx| {
+                            this.close_find(window, cx);
+                            cx.stop_propagation();
+                        },
+                    ))
+                    .child(icon(SbIcon::Search, theme.sizes.icon_sm, c.fg3))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            gpui_component::input::Input::new(&find.input)
+                                .appearance(false)
+                                .px_0(),
+                        ),
+                    )
+                    .children(count.filter(|_| active).map(|count| {
+                        div()
+                            .flex_none()
+                            .text_color(if none { c.fg3 } else { c.fg2 })
+                            .text_spec(&theme.text.count)
+                            .child(count)
+                            .automation_target("reader/find/count")
+                    }))
+                    .when(!focused && !active, |this| {
+                        this.child(crate::components::kbd(keymap::FIND.label(), theme))
+                    })
+                    .automation_target("reader/find/field"),
+            )
+            .when(active, |this| {
+                this.child(step(
+                    "previous-match",
+                    SbIcon::ChevronUp,
+                    "Previous match",
+                    -1,
+                ))
+                .child(step("next-match", SbIcon::ChevronDown, "Next match", 1))
+                .child(
+                    icon_button("close-find", theme.sizes.control_height, theme)
+                        .aria_label("Close find")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.close_find(window, cx);
+                        }))
+                        .child(icon(SbIcon::X, theme.sizes.icon, c.fg2))
+                        .automation_target("reader/find/close"),
+                )
+            })
+            .into_any_element()
+    }
+
+    /**
+     * What stands over the column: an older version read for a look (DESIGN §4.3), a source
+     * gone at its location, a version that failed verification, a read that failed (§4.14).
+     */
     fn render_banners(&self, open: &OpenSession, theme: &SbTheme) -> Vec<AnyElement> {
         let c = &theme.colors;
         let mut banners = Vec::new();
+        if let Some((key, version)) = open.viewing() {
+            let main = open.main_key() == Some(key);
+            let history = if main {
+                open.history()
+            } else {
+                open.viewed_history()
+            };
+            let of = history.map_or(0, |history| history.versions.len());
+            let shown = history.and_then(|history| {
+                history
+                    .versions
+                    .iter()
+                    .find(|(it, _)| it.id == *version)
+                    .map(|(it, _)| it.clone())
+            });
+            let reading = history.and_then(|history| facts::number(history, history.reading));
+            let n = shown.as_ref().map_or(0, |it| it.number);
+            let synced = shown.as_ref().map_or_else(String::new, |it| {
+                format!(
+                    ", synced {} at {}",
+                    format::day(it.started_at, format::now()),
+                    format::clock(it.started_at)
+                )
+            });
+            let what = if main {
+                String::new()
+            } else {
+                format!(" of {}", crate::hostile::label(blocks::file_stem(key)))
+            };
+            let item = history.map(|history| history.item);
+            let id = *version;
+            banners.push(
+                crate::components::warn_banner(theme)
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child(format!("Reading v{n} of {of}{what}{synced}.")),
+                            )
+                            .child(div().text_color(c.fg2).child(match reading {
+                                Some(reading) => format!(
+                                    "This is an older version. The reading copy is v{reading}."
+                                ),
+                                None => "This is an older version.".to_string(),
+                            })),
+                    )
+                    .child(
+                        button("reader-back-to-copy", ButtonKind::Plain, true, true, theme)
+                            .on_click(|_, _, cx| {
+                                let reader = cx.services().reader.clone();
+                                reader.update(cx, |reader, cx| reader.view_version(None, cx));
+                            })
+                            .child("Back to the reading copy")
+                            .automation_target("reader/older/back"),
+                    )
+                    .children(item.map(|item| {
+                        button("reader-make-copy", ButtonKind::Plain, true, true, theme)
+                            .on_click(move |_, _, cx| {
+                                let reader = cx.services().reader.clone();
+                                reader.update(cx, |reader, cx| {
+                                    reader.make_reading_copy(item, id, cx)
+                                });
+                            })
+                            .child(format!("Make v{n} the reading copy"))
+                            .automation_target("reader/older/make")
+                    }))
+                    .automation_target("reader/older")
+                    .into_any_element(),
+            );
+        }
+        let damaged = open.history().is_some_and(|history| {
+            history
+                .versions
+                .iter()
+                .any(|(version, _)| version.id == history.reading && version.damaged)
+        });
+        if damaged && open.viewing().is_none() {
+            banners.push(
+                bad_banner(theme)
+                    .text_spec(&theme.text.row)
+                    .child(div().flex_1().min_w_0().child(
+                        "Part of this session failed verification. What follows the damage may                          be wrong.",
+                    ))
+                    .child(
+                        button("reader-damage-details", ButtonKind::Plain, true, true, theme)
+                            .on_click(|_, _, cx| {
+                                let settings = cx.services().settings.clone();
+                                settings.update(cx, |settings, cx| settings.show(true, cx));
+                            })
+                            .child("Details"),
+                    )
+                    .automation_target("reader/damaged")
+                    .into_any_element(),
+            );
+        }
         if let Some(gone) = open.gone() {
             banners.push(
                 div()
@@ -948,7 +1243,7 @@ impl ReaderView {
                     .child(icon(SbIcon::FileX, theme.sizes.icon_sm, c.fg3))
                     .child(div().flex_1().min_w_0().child(format!(
                         "Gone at {} since {}. This archive holds the only copy.",
-                        gone.location,
+                        crate::hostile::label(&gone.location),
                         format::day(gone.since, format::now())
                     )))
                     .automation_target("reader/gone")
@@ -977,6 +1272,62 @@ impl ReaderView {
             );
         }
         banners
+    }
+
+    /**
+     * `Esc` (DESIGN §5): closes the image shown full size, else History, else the facts over
+     * the column, else Find. Whether it closed anything.
+     */
+    pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.full_image.take().is_some() || self.history.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        if std::mem::take(&mut self.facts_open) {
+            cx.notify();
+            return true;
+        }
+        self.close_find(window, cx)
+    }
+
+    /// An image a tool returned, full size over the column, while one is shown: a click or
+    /// `Esc` closes it.
+    fn render_full_image(&self, theme: &SbTheme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let key = self.full_image.as_ref()?;
+        let reader = cx.services().reader.read(cx);
+        let Some(crate::services::reader::Load::Loaded(picture)) =
+            reader.open_session()?.image(key).cloned()
+        else {
+            return None;
+        };
+        Some(
+            div()
+                .id("full-image")
+                .occlude()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p(theme.spacing.xl)
+                .bg(theme.colors.scrim)
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.full_image = None;
+                    cx.notify();
+                }))
+                .child(
+                    gpui::img(gpui::ImageSource::Render(picture.image))
+                        .max_w_full()
+                        .max_h_full()
+                        .w(px(picture.width as f32))
+                        .h(px(picture.height as f32))
+                        .object_fit(gpui::ObjectFit::Contain)
+                        .into_any_element(),
+                )
+                .automation_target("reader/full-image")
+                .into_any_element(),
+        )
     }
 
     /// The column while the session is parsed: skeleton rows, no spinner (DESIGN §4.14).
@@ -1164,7 +1515,7 @@ fn frame(row: &Row, content: AnyElement, theme: &SbTheme) -> AnyElement {
 }
 
 impl Render for ReaderView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.sb_theme().clone();
         if self.wheeled.take() {
             self.list.set_follow_mode(gpui::FollowMode::Normal);
@@ -1180,7 +1531,29 @@ impl Render for ReaderView {
             theme.sizes.activity_name_width,
             theme.sizes.activity_name_max,
         );
-        let header = self.render_header(&theme, cx);
+        self.ensure_find(window, cx);
+        if let Some((query, flash)) = self.filling.take() {
+            self.fill(&query, flash, window, cx);
+        }
+        /* Below 1280 the margin gives way to the header's Facts toggle (DESIGN §2). */
+        self.wide = window.viewport_size().width >= theme.sizes.facts_collapse_width;
+        if self.wide {
+            self.facts_open = false;
+        }
+        let header = self.render_header(window, &theme, cx);
+        let open = matches!(cx.services().reader.read(cx).state(), ReaderState::Open(_));
+        let facts = (open && (self.wide || self.facts_open)).then(|| self.render_facts(cx));
+        let (margin, over) = if self.wide {
+            (facts, None)
+        } else {
+            (None, facts)
+        };
+        let history = self
+            .history
+            .clone()
+            .filter(|_| open)
+            .map(|of| self.render_history(&of, cx));
+        let full_image = self.render_full_image(&theme, cx);
         let reader = cx.services().reader.read(cx);
         let body = match reader.state() {
             ReaderState::Closed => div().into_any_element(),
@@ -1235,8 +1608,11 @@ impl Render for ReaderView {
                     .into_any_element()
             }
         };
+        let wide = self.wide;
+        let below_header = theme.sizes.reader_header_height;
         div()
             .id("reader")
+            .relative()
             .size_full()
             // A click in the column leaves the keyboard on the reader, for its keys.
             .on_mouse_down(
@@ -1246,12 +1622,64 @@ impl Render for ReaderView {
             .flex()
             .flex_col()
             .child(header)
-            .child(div().flex_1().min_h_0().child(body))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(div().flex_1().min_w_0().h_full().child(body))
+                    .children(margin),
+            )
+            /* Over the column: what a click outside closes, under the overlay it closes. */
+            .when(
+                self.history.is_some() || (!wide && self.facts_open),
+                |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .top(below_header)
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    if this.history.take().is_none() {
+                                        this.facts_open = false;
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                },
+            )
+            .children(over.map(|facts| {
+                div()
+                    .id("facts-overlay")
+                    .occlude()
+                    .absolute()
+                    .top(below_header)
+                    .right_0()
+                    .bottom_0()
+                    .shadow(theme.shadows.pop.clone())
+                    .child(facts)
+            }))
+            .children(history.map(|history| {
+                div()
+                    .absolute()
+                    .top(below_header + px(120.))
+                    .right(px(24.))
+                    .child(history)
+            }))
+            .children(full_image)
             .automation_target("session")
     }
 }
 
-/// `view`'s action on `element`: `run` with the view.
+/**
+ * `view`'s action on `element`: `run` with the view. While Find's field has the keyboard, the
+ * reader's keys are the field's: the action goes on, and the key is typed.
+ */
 fn on<A: gpui::Action>(
     element: gpui::Stateful<gpui::Div>,
     view: &Entity<ReaderView>,
@@ -1259,6 +1687,10 @@ fn on<A: gpui::Action>(
 ) -> gpui::Stateful<gpui::Div> {
     let view = view.clone();
     element.on_action(move |_: &A, window, cx| {
+        if view.read(cx).finding(window, cx) {
+            cx.propagate();
+            return;
+        }
         view.update(cx, |this, cx| {
             this.keyboard = true;
             /* Every key but End lets go of the end (below). */
@@ -1328,8 +1760,13 @@ pub fn bind_keys(
         let library = cx.services().library.clone();
         library.update(cx, |library, cx| library.open_step(1, cx));
     });
-    on::<act::PreviousSession>(element, view, |_, _, cx| {
+    let element = on::<act::PreviousSession>(element, view, |_, _, cx| {
         let library = cx.services().library.clone();
         library.update(cx, |library, cx| library.open_step(-1, cx));
+    });
+    let view = view.clone();
+    /* Ctrl F works in the field too: its text is selected again. */
+    element.on_action(move |_: &act::Find, window, cx| {
+        view.update(cx, |this, cx| this.focus_find(window, cx));
     })
 }

@@ -109,7 +109,11 @@
 //!   `loaded`), `fault` (a read that failed for a reason other than the stored bytes), the
 //!   last request to open the session at a search match it took (`read_at`, as the library's),
 //!   and what `flash`es: its `block` (`conversation/block`), its `text` and whether it was
-//!   `drawn`.
+//!   `drawn`; `find` (Find in session's `query`, its `count` as the field shows it, and its
+//!   `current` match: `conversation/block` and which text, `prose`, `target`, `input`,
+//!   `output/<n>`, `diff` or `fetched`; `null` while Find is closed), whether the `facts` show,
+//!   whose `history` is open (a file's key), the version read for a look (`viewing`, its
+//!   number) and whether an image shows full size (`full_image`).
 //!
 //! Commands. An argument a command doesn't have is an error, so a misspelt one never passes
 //! for a change. These reply with `state.appearance` after the change:
@@ -676,6 +680,15 @@ fn reader(shell: &Shell, cx: &App) -> Value {
             "text": text,
             "drawn": drawn,
         })),
+        "find": view.find.map(|(query, count, current)| json!({
+            "query": query,
+            "count": count,
+            "current": current,
+        })),
+        "facts": view.facts,
+        "history": view.history,
+        "viewing": view.viewing,
+        "full_image": view.full_image,
         "loads": open.map(|open| {
             open.loads()
                 .into_iter()

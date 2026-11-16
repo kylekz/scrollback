@@ -89,6 +89,14 @@ impl Text {
         }
     }
 
+    /// The same text, as the first part of something `rest` bytes longer when `rest` isn't 0.
+    pub fn cut(self, rest: u64) -> Self {
+        Self {
+            rest: (rest > 0).then_some(rest),
+            ..self
+        }
+    }
+
     /// `text` with `marks`, which are ranges of it, in order, apart.
     pub fn marked(text: String, marks: Vec<(Range<usize>, Mark)>) -> Self {
         Self {

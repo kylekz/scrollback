@@ -169,6 +169,8 @@ pub mod reader {
             PreviousTurn,
             /// Switch between Activity and Full calls (`E`).
             SwitchCalls,
+            /// Find in the session (`Ctrl F`).
+            Find,
             /// Star or unstar the session (`S`).
             Star,
             /// Move to the row above (`↑`).

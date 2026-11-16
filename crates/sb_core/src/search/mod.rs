@@ -34,7 +34,7 @@ use crate::transcript::{At, InSubagent, SpanKind};
 
 pub use run::{MOST_TERMS, TERM_CHARS};
 pub(crate) use store::{Log, SEARCH_DATABASE, SearchIndex, Text};
-pub use text::first_match;
+pub use text::{find_all, first_match};
 
 #[derive(Debug, Error)]
 pub enum SearchError {

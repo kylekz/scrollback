@@ -15,7 +15,8 @@ pub mod json;
 use std::ops::Range;
 
 use regex::RegexBuilder;
-use sb_core::transcript::{ToolCall, ToolInput, ToolKind};
+use sb_core::provider::SessionItems;
+use sb_core::transcript::{Brief, Stored, TodoState, ToolCall, ToolInput, ToolKind};
 
 use super::text::{Mark, Text};
 use crate::syntax::TokenKind;
@@ -26,6 +27,179 @@ pub const MARKS: usize = 64 * 1024;
 const PATTERN_BYTES: usize = 1024 * 1024;
 /// The most results a web search's body lists.
 pub const RESULTS: usize = 50;
+
+/// Which renderer draws a call's body (DESIGN §4.2.4), by its kind and whether its input is
+/// in the kind's shape. A web search with no results found in its text, and a web fetch that
+/// returned no text, draw as [`Renderer::Generic`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Renderer {
+    /// A command: its header, its output with its colours, its footer.
+    Shell,
+    /// A file read: its header, its numbered lines.
+    Read,
+    /// A content search: its header, what it found.
+    Search,
+    /// A file search: the paths it found.
+    Files,
+    /// An edit or a write: its diff.
+    Diff,
+    Todos,
+    WebSearch,
+    WebFetch,
+    /// An MCP call: its input and output side by side.
+    Mcp,
+    /// The input as sent and each part of the output: a tool no provider knows, a subagent's
+    /// call, and any whose input isn't in its kind's shape.
+    Generic,
+}
+
+pub fn renderer(call: &ToolCall) -> Renderer {
+    match (call.kind, &call.input) {
+        (ToolKind::Shell, ToolInput::Shell { .. }) => Renderer::Shell,
+        (ToolKind::Read, ToolInput::Read { .. }) => Renderer::Read,
+        (ToolKind::ContentSearch, ToolInput::ContentSearch { .. }) => Renderer::Search,
+        (ToolKind::FileSearch, ToolInput::FileSearch { .. }) => Renderer::Files,
+        (ToolKind::Edit, ToolInput::Edit { .. }) | (ToolKind::Write, ToolInput::Write { .. }) => {
+            Renderer::Diff
+        }
+        (ToolKind::Todos, ToolInput::Todos(_)) => Renderer::Todos,
+        (ToolKind::WebSearch, _) => Renderer::WebSearch,
+        (ToolKind::WebFetch, _) => Renderer::WebFetch,
+        (ToolKind::Mcp, _) => Renderer::Mcp,
+        _ => Renderer::Generic,
+    }
+}
+
+/// `path` under the session's project folder `root`, as the boards write it; else whole.
+fn relative<'a>(path: &'a str, root: Option<&str>) -> &'a str {
+    root.and_then(|root| path.strip_prefix(root))
+        .and_then(|rest| rest.strip_prefix(['/', '\\']))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(path)
+}
+
+/// What the call was about, from its typed input, as its activity row shows it: the command,
+/// the path, the pattern. Paths under the session's project folder `root` are written from
+/// there.
+pub fn target(call: &ToolCall, root: Option<&str>) -> String {
+    let path = |path: &str| relative(path, root).to_string();
+    match &call.input {
+        ToolInput::Shell { command, .. } => command.lines().next().unwrap_or("").to_string(),
+        ToolInput::Read {
+            path: file,
+            first_line,
+            lines,
+        } => match (first_line, lines) {
+            (Some(first), Some(lines)) => {
+                format!(
+                    "{}  {first}–{}",
+                    path(file),
+                    first + lines.saturating_sub(1)
+                )
+            }
+            (Some(first), None) => format!("{}  {first}–", path(file)),
+            _ => path(file),
+        },
+        ToolInput::Edit { path: file, .. } | ToolInput::Write { path: file, .. } => path(file),
+        ToolInput::ContentSearch {
+            pattern,
+            path: within,
+            files,
+            ..
+        } => {
+            let searched = match within {
+                Some(within) => format!("\"{pattern}\" in {}", path(within)),
+                None => format!("\"{pattern}\""),
+            };
+            match files {
+                Some(files) => format!("{searched} · {files}"),
+                None => searched,
+            }
+        }
+        ToolInput::FileSearch {
+            pattern,
+            path: within,
+        } => match within {
+            Some(within) => format!("{pattern} in {}", path(within)),
+            None => pattern.clone(),
+        },
+        ToolInput::Todos(todos) => {
+            let done = todos
+                .iter()
+                .filter(|todo| todo.state == TodoState::Done)
+                .count();
+            let doing = todos
+                .iter()
+                .find(|todo| todo.state == TodoState::InProgress)
+                .map(|todo| format!("{} · ", todo.text))
+                .unwrap_or_default();
+            format!("{doing}{done} of {} done", todos.len())
+        }
+        ToolInput::Subagent {
+            kind, description, ..
+        } => [kind.as_deref(), description.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · "),
+        ToolInput::WebSearch { query } => query.clone(),
+        ToolInput::WebFetch { url, .. } => url.clone(),
+        ToolInput::Mcp { server, tool } => format!("{server} · {tool}"),
+        ToolInput::Other => String::new(),
+    }
+}
+
+/// The most of a web search's or a web fetch's output read to show it as its kind does.
+pub const RESULT_BYTES: u64 = 256 * 1024;
+/// The most of an edit's text, before and after, read for its diff.
+pub const DIFF_BYTES: u64 = 256 * 1024;
+
+/**
+ * An edit's or a write's diff, from its input: what it replaced and with what, numbered from
+ * where the agent said it starts, coloured by the file's extension; `None` for any other call.
+ */
+pub fn edit(call: &ToolCall, items: &dyn SessionItems) -> Option<Result<diff::Diff, String>> {
+    let (old, new, path) = match &call.input {
+        ToolInput::Edit { path, old, new, .. } => (Some(old), new, path),
+        ToolInput::Write { path, content } => (None, content, path),
+        _ => return None,
+    };
+    let start = match call
+        .result
+        .as_ref()
+        .and_then(|result| result.brief.as_ref())
+    {
+        Some(Brief::Changed {
+            start: Some((old, new)),
+            ..
+        }) => (
+            u32::try_from(*old).unwrap_or(1),
+            u32::try_from(*new).unwrap_or(1),
+        ),
+        _ => (1, 1),
+    };
+    let load = |stored: &Stored| {
+        stored
+            .load_head(items, DIFF_BYTES)
+            .map(|(text, _)| text)
+            .map_err(|error| error.to_string())
+    };
+    let made = (|| {
+        let old = old.map(load).transpose()?.unwrap_or_default();
+        let new = load(new)?;
+        let mut made = diff::diff(&old, &new, start);
+        let language = extension(path);
+        let shift = old.len() + 1;
+        made.marks = highlighted(&old, language, &|| true);
+        made.marks.extend(
+            highlighted(&new, language, &|| true)
+                .into_iter()
+                .map(|(range, mark)| (range.start + shift..range.end + shift, mark)),
+        );
+        Ok(made)
+    })();
+    Some(made)
+}
 
 /// What a call's body shows its input as: printed again as JSON, MCP's coloured, a tool's that
 /// no provider knows on one line (DESIGN §4.2.4).

@@ -165,6 +165,10 @@ pub const COMMANDS: &[Command] = &[
         run: Run::Key(keymap::PREVIOUS_TURN),
     },
     Command {
+        name: "Find in the session",
+        run: Run::Key(keymap::FIND),
+    },
+    Command {
         name: "Switch between Activity and Full calls",
         run: Run::Key(keymap::SWITCH_CALLS),
     },

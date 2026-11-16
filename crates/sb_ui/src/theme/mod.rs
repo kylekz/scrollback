@@ -421,6 +421,8 @@ pub struct Sizes {
     pub window_min_height: Pixels,
     /// Below this window width the sidebar collapses (DESIGN §2, "Narrow windows").
     pub sidebar_collapse_width: Pixels,
+    /// Below this window width the reader's facts margin gives way to a toggle (DESIGN §2).
+    pub facts_collapse_width: Pixels,
     /// The reader (DESIGN §4.2): its column at most 720 wide with 32 at its sides, 28 above its
     /// first block and 16 between blocks.
     pub reading_width: Pixels,
@@ -532,6 +534,7 @@ impl Default for Sizes {
             window_min_width: px(960.),
             window_min_height: px(600.),
             sidebar_collapse_width: px(1040.),
+            facts_collapse_width: px(1280.),
             reading_width: px(720.),
             reading_side: px(32.),
             reading_top: px(28.),
