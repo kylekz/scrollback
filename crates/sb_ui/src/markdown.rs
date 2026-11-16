@@ -39,15 +39,17 @@ pub(crate) use sanitize::inert;
 pub use sanitize::{options, sanitize};
 
 /**
- * The most a body's sanitising and the view's parse of it may take together, for each
- * [`VIEW_PARSE_UNIT`] of the body begun; past it, the body is plain text.
+ * The most the view's parse of a body may take, for each [`VIEW_PARSE_UNIT`] of the body
+ * begun; past it, the body is plain text. Only the view's parse is timed against it: that is
+ * what the UI thread pays, while the sanitiser runs in the background with the rest of a
+ * body's preparation, bounded by its size and its budget ([`crate::services::reader::prose`]).
  *
- * Measured on an Apple M-series release build, a unit of ordinary prose takes 1.6 ms (two
- * thirds of it the sanitiser's two parses, a third the view's), and dense but ordinary
- * Markdown (a heading or a link every few words, a long loose list, a table) 3 to 7 ms; the
- * inputs the parser is slow on take from 17 ms to over 80 ms. So this keeps ordinary prose
- * clear five times over, for a slower machine or a busy one, and the slow inputs out. What a
- * body that passes costs the UI thread is the view's share: about a third, under 3 ms here.
+ * Measured on an Apple M-series release build, the view parses a unit of ordinary prose in
+ * under a quarter of a millisecond, dense but ordinary Markdown (a heading or a link every few
+ * words, a long loose list) in about half a millisecond, and a table of a dozen columns in
+ * 2 ms; runs of emphasis or of one-line blocks take 3 to 5 ms, and the inputs the parser is
+ * slow on from 16 ms to 50 ms. So this keeps ordinary Markdown clear many times over, and the
+ * densest twice over, for a slower machine or a busy one, and the slow inputs out.
  */
 pub const VIEW_PARSE_LIMIT: Duration = Duration::from_millis(8);
 /// gpui-base's `MAX_SYNC_FULL_REPLACE_BYTES`: the most of a body `TextView` parses on the UI
@@ -71,26 +73,25 @@ pub struct Sanitized(SharedString);
 impl Sanitized {
     /**
      * `text` sanitised, its bidirectional controls shown as what they are
-     * ([`crate::hostile::bidi`]), and parsed as `TextView` parses it, timed together: `None` when
-     * that took past [`VIEW_PARSE_LIMIT`]. Run it off the UI thread, on a thread with a stack
-     * as deep as the body nests.
+     * ([`crate::hostile::bidi`]), then parsed as `TextView` parses it, the parse timed: `None`
+     * when it took past [`VIEW_PARSE_LIMIT`]. Run it off the UI thread, on a thread with a
+     * stack as deep as the body nests.
      *
      * A time not far past the limit is taken again, and the shorter kept: the thread may have
      * been made to wait.
      */
     pub fn measured(text: &str) -> Option<Self> {
-        let limit = view_parse_limit(text.len());
-        let attempt = || {
+        let sanitized = sanitize(&crate::hostile::bidi(text));
+        let limit = view_parse_limit(sanitized.len());
+        let parse = || {
             let start = Instant::now();
-            let sanitized = sanitize(&crate::hostile::bidi(text));
             let parsed =
                 gpui_base::text::editor_host::parse_markdown(&sanitized, Default::default());
             drop(parsed.ok()?);
-            Some((sanitized, start.elapsed()))
+            Some(start.elapsed())
         };
-        let (sanitized, took) = attempt()?;
-        let took = match took {
-            took if took > limit && took < limit * 4 => took.min(attempt()?.1),
+        let took = match parse()? {
+            took if took > limit && took < limit * 4 => took.min(parse()?),
             took => took,
         };
         (took <= limit).then(|| Self(sanitized.into()))

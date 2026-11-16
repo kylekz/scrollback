@@ -263,9 +263,9 @@ fn code(language: Option<String>, body: String) -> Piece {
  * and cut into pieces while `going` says the body's parses may go on: past that, each group of
  * blocks left is plain text. `None` if it doesn't parse.
  *
- * A region whose parse alone took longer than its pieces' sanitising and parsing may
+ * A region whose parse took longer than the view's parse of its pieces may
  * ([`crate::markdown::view_parse_limit`]) is plain text without them: a piece is most often the
- * whole of its region, and would take as long three times over.
+ * whole of its region, parsed by the same parser, and would take as long again three times.
  */
 fn markdown_pieces(text: &str, carried: &str, going: &dyn Fn() -> bool) -> Option<Region> {
     let source = format!("{text}\n\n{carried}");
@@ -544,11 +544,15 @@ fn regions(spans: Vec<Span>) -> Vec<Span> {
  * cost past [`DELIMITER_COST`].
  *
  * A fence opens only as CommonMark opens one, and as narrowly: three or more backticks or
- * tildes at most three columns in from the line's last container marker, a backtick fence's
- * info string holding no backtick. It closes at a closing fence, or at the first line that no
- * longer carries the containers it opened in (fewer quote markers, or a list item's content
- * left). What it holds is a [`Span::Code`], never parsed: where the scan takes for a fence what
- * isn't one, that is only drawn wrong.
+ * tildes at most three columns in from the line's last container marker, or, on a line of a
+ * list item's content, from the column that content starts at; a backtick fence's info string
+ * holding no backtick. The list items a line may be in are those of the lines before whose
+ * content starts at or before the line's own. It closes at a closing fence, or at the first
+ * line that no longer carries the containers it opened in (fewer quote markers, or a list
+ * item's content left). What it holds is a [`Span::Code`], never parsed: where the scan takes
+ * for a fence what isn't one, that is only drawn wrong. And where it misses one, `TextView`
+ * draws it, highlighted off the UI thread all the same
+ * ([`crate::services::reader::highlights`]).
  */
 fn scan(text: &str) -> Vec<Span> {
     let mut spans = Vec::new();
@@ -566,6 +570,8 @@ fn scan(text: &str) -> Vec<Span> {
         });
     };
     let mut fence: Option<(Fence, Option<String>, String)> = None;
+    /* The columns the content of the list items the line may be in starts at, innermost last. */
+    let mut items: Vec<usize> = Vec::new();
     let mut paragraph = Paragraph::default();
     let (mut start, mut at) = (0, 0);
     for line in text.split_inclusive('\n') {
@@ -589,7 +595,20 @@ fn scan(text: &str) -> Vec<Span> {
             start = line_start;
         }
         paragraph.deep |= prefix.depth() > MAX_NESTING;
-        if let Some(open) = Fence::opens(&prefix) {
+        if !prefix.blank {
+            let start = if prefix.lists > 0 {
+                prefix.indent
+            } else {
+                prefix.column
+            };
+            while items.last().is_some_and(|&item| item > start) {
+                items.pop();
+            }
+            if prefix.lists > 0 {
+                items.push(prefix.content);
+            }
+        }
+        if let Some(open) = Fence::opens(&prefix, items.last().copied()) {
             finish(start..line_start, &paragraph, &mut spans);
             paragraph = Paragraph::default();
             let info = &prefix.rest[open.length * open.mark.len_utf8()..];
@@ -636,6 +655,8 @@ struct Prefix<'a> {
     content: usize,
     /// The columns of whitespace between the last marker and the content.
     inset: usize,
+    /// The column the content starts at.
+    column: usize,
     rest: &'a str,
     blank: bool,
 }
@@ -679,6 +700,7 @@ impl<'a> Prefix<'a> {
             indent,
             content,
             inset,
+            column,
             blank: rest.trim().is_empty(),
             rest,
         }
@@ -709,14 +731,18 @@ struct Fence {
 }
 
 impl Fence {
-    /// The fence the line `prefix` opens, by CommonMark's rules, if it opens one.
-    fn opens(prefix: &Prefix) -> Option<Self> {
+    /**
+     * The fence the line `prefix` opens, by CommonMark's rules, if it opens one: in the list
+     * item whose content starts at the column `item`, when the line has no marker of its own.
+     */
+    fn opens(prefix: &Prefix, item: Option<usize>) -> Option<Self> {
         let markers = prefix.quotes + prefix.lists;
-        /* After a marker, one column of the whitespace belongs to it. */
-        let indent = if markers == 0 {
-            prefix.indent
-        } else {
-            prefix.inset.saturating_sub(1)
+        /* After a marker, one column of the whitespace belongs to it; on a line of a list
+        item's content, the columns up to where that starts do. */
+        let (indent, content) = match item.filter(|&item| item <= prefix.column) {
+            Some(item) if prefix.lists == 0 => (prefix.column - item, Some(prefix.column)),
+            _ if markers == 0 => (prefix.indent, None),
+            _ => (prefix.inset.saturating_sub(1), None),
         };
         if indent > 3 {
             return None;
@@ -728,10 +754,10 @@ impl Fence {
                 mark,
                 length,
                 quotes: prefix.quotes,
-                content: if prefix.lists > 0 {
-                    prefix.content
-                } else {
-                    indent
+                content: match content {
+                    Some(column) => column,
+                    None if prefix.lists > 0 => prefix.content,
+                    None => indent,
                 },
             })
         })
@@ -1297,6 +1323,8 @@ mod tests {
             .chain(scanned(REGION_BYTES))
             .chain(carrying());
         let (mut markdown, mut plain) = (0, 0);
+        /* The share of its limit the slowest piece of each family took the view. */
+        let mut worst: HashMap<&str, f64> = HashMap::new();
         for (name, body) in bodies {
             let (prose, _) = on_a_worker_stack(body);
             for piece in prose.pieces {
@@ -1305,26 +1333,39 @@ mod tests {
                     continue;
                 };
                 markdown += 1;
+                /* The least of three, as the gate takes its time again: the tests run side by
+                side, and one may be made to wait. */
                 let took = std::thread::Builder::new()
                     .stack_size(PARSE_STACK)
                     .spawn(move || {
-                        let start = Instant::now();
-                        let parsed = gpui_base::text::editor_host::parse_markdown(
-                            sanitized.as_str(),
-                            Default::default(),
-                        );
-                        assert!(parsed.is_ok());
-                        (start.elapsed(), sanitized.as_str().len())
+                        let took = (0..3).map(|_| {
+                            let start = Instant::now();
+                            let parsed = gpui_base::text::editor_host::parse_markdown(
+                                sanitized.as_str(),
+                                Default::default(),
+                            );
+                            assert!(parsed.is_ok());
+                            start.elapsed()
+                        });
+                        (took.min().unwrap_or_default(), sanitized.as_str().len())
                     })
                     .unwrap()
                     .join()
                     .unwrap();
                 let (took, bytes) = took;
+                let limit = crate::markdown::view_parse_limit(bytes);
                 assert!(
-                    took < crate::markdown::view_parse_limit(bytes),
+                    took < limit,
                     "{name}: a piece of {bytes} bytes took the view {took:?}"
                 );
+                let share = worst.entry(name).or_default();
+                *share = share.max(took.as_secs_f64() / limit.as_secs_f64());
             }
+        }
+        let mut worst: Vec<(&str, f64)> = worst.into_iter().collect();
+        worst.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (name, share) in worst {
+            eprintln!("{name:<44} {:>5.1}% of the limit", share * 100.);
         }
         eprintln!("{markdown} pieces of Markdown, {plain} plain");
     }
@@ -1390,6 +1431,51 @@ mod tests {
             kinds(&prose),
             ["markdown", "code", "markdown", "code", "markdown"]
         );
+    }
+
+    /**
+     * A fence indented on a line of a list item's content, up to three columns past where that
+     * content starts, as CommonMark has it: a piece of code, in a list, a nested list, a list
+     * in a quote. Indented four past it, or after the list has ended, it is not.
+     */
+    #[test]
+    fn a_fence_in_a_list_items_content_is_a_piece_of_its_own() {
+        let codes = |body: &str| -> Vec<(Option<String>, String)> {
+            Prose::markdown(body)
+                .pieces
+                .into_iter()
+                .filter_map(|piece| match piece {
+                    Piece::Code { language, text } => Some((language, text.text.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let swift = |body: &str| vec![(Some("swift".to_string()), body.to_string())];
+        assert_eq!(
+            codes("- a\n\n    ```swift\n    /* x\n\n    y\n    ```\n"),
+            swift("/* x\n\ny\n")
+        );
+        assert_eq!(
+            codes("1. a\n\n   ```swift\n   z\n   ```\nAfter."),
+            swift("z\n")
+        );
+        assert_eq!(
+            codes("- a\n  - b\n\n      ```swift\n      z\n      ```\n"),
+            swift("z\n")
+        );
+        assert_eq!(
+            codes("- a\n  - b\n\n        ```swift\n        z\n        ```\n").len(),
+            0
+        );
+        assert_eq!(
+            codes("> - a\n>\n>     ```swift\n>     z\n>     ```\n"),
+            swift("z\n")
+        );
+        assert_eq!(
+            codes("- a\n\n      ```swift\n      z\n      ```\n").len(),
+            0
+        );
+        assert_eq!(codes("- a\n\nb\n\n    ```swift\n    z\n    ```\n").len(), 0);
     }
 
     #[test]
