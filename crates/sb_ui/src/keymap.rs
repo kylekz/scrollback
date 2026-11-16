@@ -10,7 +10,7 @@
 
 use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, SharedString};
 
-use crate::actions::{app, first_run, library, locations, sessions, shell, sidebar};
+use crate::actions::{app, first_run, library, locations, menu, sessions, shell, sidebar};
 
 /// Key context of the shell's root element: everything in the main window.
 pub const SHELL: &str = "Shell";
@@ -31,6 +31,17 @@ pub const LOCATIONS_LIST: &str = "LocationsList";
 /// Key context of a dialog over the sheet or the first run: adding a location (DESIGN
 /// §4.12), confirming a removal.
 pub const LOCATION_DIALOG: &str = "LocationDialog";
+/// Key context of an open menu.
+pub const MENU: &str = "Menu";
+/// Key context of a folder's paths editor (DESIGN §4.7).
+pub const PATHS_EDITOR: &str = "PathsEditor";
+/**
+ * Key context of a dialog over a library page: Delete folder… and the question about the
+ * paths editor's changes. It sits outside the page's context, so the page's keys don't reach
+ * the page behind it; `Esc` is the shell's `Dismiss`, and `Enter` presses only the button
+ * `Tab` put the keyboard on.
+ */
+pub const LIBRARY_DIALOG: &str = "LibraryDialog";
 
 /// One row of the keymap.
 #[derive(Clone, Copy)]
@@ -93,6 +104,12 @@ pub const BACK: Shortcut = shortcut!("alt-left", SHELL, library::Back);
 pub const STAR: Shortcut = shortcut!("s", SESSIONS, sessions::Star);
 /// `Ctrl L`. Named, because the Locations overline's label says it.
 pub const LOCATIONS: Shortcut = shortcut!("secondary-l", SHELL, shell::OpenLocations);
+/// `Delete`, `M`, `Enter` and `Shift F10` on a page of sessions. Named, because the session
+/// menu and the hover bar say them.
+pub const TRASH: Shortcut = shortcut!("delete", SESSIONS, sessions::Trash);
+pub const MOVE: Shortcut = shortcut!("m", SESSIONS, sessions::Move);
+pub const OPEN: Shortcut = shortcut!("enter", SESSIONS, sessions::Open);
+pub const MENU_KEY: Shortcut = shortcut!("shift-f10", SESSIONS, sessions::Menu);
 
 /// Every binding scrollback defines.
 pub const SHORTCUTS: &[Shortcut] = &[
@@ -114,11 +131,28 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut!("right", SESSIONS, sessions::Right),
     shortcut!("up", SESSIONS, sessions::Up),
     shortcut!("down", SESSIONS, sessions::Down),
-    shortcut!("enter", SESSIONS, sessions::Open),
+    OPEN,
     STAR,
+    TRASH,
+    MOVE,
+    MENU_KEY,
+    shortcut!("secondary-a", SESSIONS, sessions::SelectAll),
     shortcut!("up", UNSORTED, sessions::Up),
     shortcut!("down", UNSORTED, sessions::Down),
     shortcut!("enter", UNSORTED, sessions::Open),
+    shortcut!("s", UNSORTED, sessions::Star),
+    shortcut!("delete", UNSORTED, sessions::Trash),
+    shortcut!("m", UNSORTED, sessions::Move),
+    shortcut!("shift-f10", UNSORTED, sessions::Menu),
+    shortcut!("up", MENU, menu::Previous),
+    shortcut!("down", MENU, menu::Next),
+    shortcut!("enter", MENU, menu::Choose),
+    shortcut!("space", MENU, menu::Choose),
+    shortcut!("right", MENU, menu::Open),
+    shortcut!("left", MENU, menu::Back),
+    shortcut!("escape", MENU, menu::Close),
+    shortcut!("secondary-enter", PATHS_EDITOR, sessions::SavePaths),
+    shortcut!("escape", PATHS_EDITOR, sessions::CancelPaths),
     shortcut!("enter", FIRST_RUN, first_run::Add),
     LOCATIONS,
     shortcut!("escape", LOCATIONS_SHEET, locations::Close),
@@ -134,13 +168,19 @@ pub const SEARCH_KEYS: &str = "secondary-k";
 /// `Ctrl ,`, Settings' key (module docs).
 pub const SETTINGS_KEYS: &str = "secondary-,";
 
-/// The keys every Mac app has (DESIGN §5, "macOS"), bound on macOS only, anywhere in the window:
-/// the app menu shows them (`crate::app_menu`).
+/**
+ * The keys every Mac app has (DESIGN §5, "macOS"), bound on macOS only: anywhere in the window
+ * those the app menu shows (`crate::app_menu`), and `⌘⌫`, which moves to Trash as `Delete`
+ * does. Plain `Backspace` moves nothing to Trash on any platform: it is too easily pressed
+ * meaning to edit text.
+ */
 pub const MACOS_SHORTCUTS: &[Shortcut] = &[
     shortcut!("cmd-q", SHELL, app::Quit),
     shortcut!("cmd-h", SHELL, app::Hide),
     shortcut!("alt-cmd-h", SHELL, app::HideOthers),
     shortcut!("cmd-m", SHELL, app::Minimize),
+    shortcut!("cmd-backspace", SESSIONS, sessions::Trash),
+    shortcut!("cmd-backspace", UNSORTED, sessions::Trash),
 ];
 
 /// Binds [`SHORTCUTS`], and on macOS [`MACOS_SHORTCUTS`]. Call after `gpui_component::init`, so

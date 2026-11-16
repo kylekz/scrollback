@@ -14,6 +14,10 @@
 pub mod first_run;
 mod first_sync;
 mod header;
+#[cfg(test)]
+mod interaction_tests;
+pub(crate) mod menus;
+pub mod paths_editor;
 pub mod sessions;
 mod states;
 #[cfg(test)]
@@ -29,7 +33,7 @@ use gpui::{
 use sb_core::catalogue::Shelf;
 
 use crate::actions::first_run::Add;
-use crate::actions::sessions::{Down, Left, Open, Right, Star, Up};
+use crate::actions::sessions::{Down, Left, Menu, Move, Open, Right, SelectAll, Star, Trash, Up};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{ButtonKind, bad_banner, button};
@@ -155,6 +159,11 @@ impl MainArea {
         }
     }
 
+    /// The page of All sessions, Starred or a folder.
+    pub fn sessions(&self) -> &Entity<SessionsView> {
+        &self.sessions
+    }
+
     /// Moves a page's selection: `by` along the reading order, or `lines` up or down.
     fn step(&mut self, by: isize, lines: isize, cx: &mut Context<Self>) {
         match Showing::now(cx) {
@@ -164,6 +173,49 @@ impl MainArea {
             Showing::Unsorted => self
                 .unsorted
                 .update(cx, |unsorted, cx| unsorted.step(lines, cx)),
+            _ => {}
+        }
+    }
+
+    /**
+     * Whether a text field of the page has the keyboard: a single-letter key or `Delete` is
+     * then the field's (DESIGN §5), and goes on to it.
+     */
+    fn typing(&self, window: &Window, cx: &mut Context<Self>) -> bool {
+        let typing = match Showing::now(cx) {
+            Showing::Sessions => self.sessions.read(cx).is_typing(window, cx),
+            Showing::Unsorted => self.unsorted.read(cx).is_typing(window, cx),
+            _ => false,
+        };
+        if typing {
+            cx.propagate();
+        }
+        typing
+    }
+
+    /// Does `sessions` on a page of sessions, or `unsorted` on Unsorted.
+    fn each_page(
+        &mut self,
+        cx: &mut Context<Self>,
+        sessions: impl FnOnce(&mut SessionsView, &mut Context<SessionsView>),
+        unsorted: impl FnOnce(&mut UnsortedView, &mut Context<UnsortedView>),
+    ) {
+        match Showing::now(cx) {
+            Showing::Sessions => self.sessions.update(cx, sessions),
+            Showing::Unsorted => self.unsorted.update(cx, unsorted),
+            _ => {}
+        }
+    }
+
+    /// Opens the selected session's menu, or with `moving` its Move to folder.
+    fn menu(&mut self, moving: bool, window: &mut Window, cx: &mut Context<Self>) {
+        match Showing::now(cx) {
+            Showing::Sessions => self.sessions.update(cx, |sessions, cx| {
+                sessions.menu_selected(moving, window, cx)
+            }),
+            Showing::Unsorted => self.unsorted.update(cx, |unsorted, cx| {
+                unsorted.menu_selected(moving, window, cx)
+            }),
             _ => {}
         }
     }
@@ -340,11 +392,37 @@ impl Render for MainArea {
             .on_action(cx.listener(|this, _: &Up, _, cx| this.step(0, -1, cx)))
             .on_action(cx.listener(|this, _: &Down, _, cx| this.step(0, 1, cx)))
             .on_action(cx.listener(Self::open))
-            .on_action(cx.listener(|this, _: &Star, _, cx| {
-                this.sessions
-                    .update(cx, |sessions, cx| sessions.star_selected(cx));
+            .on_action(cx.listener(|this, _: &Star, window, cx| {
+                if !this.typing(window, cx) {
+                    this.each_page(cx, SessionsView::star_selected, UnsortedView::star_selected);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Trash, window, cx| {
+                if !this.typing(window, cx) {
+                    this.each_page(
+                        cx,
+                        SessionsView::trash_selected,
+                        UnsortedView::trash_selected,
+                    );
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Move, window, cx| {
+                if !this.typing(window, cx) {
+                    this.menu(true, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Menu, window, cx| {
+                if !this.typing(window, cx) {
+                    this.menu(false, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectAll, window, cx| {
+                if !this.typing(window, cx) {
+                    this.each_page(cx, SessionsView::select_all, |_, _| {});
+                }
             }))
             .on_action(cx.listener(Self::add))
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -361,5 +439,96 @@ impl Render for MainArea {
                 )
             })
             .child(div().flex_1().min_h_0().children(page))
+            .children(
+                showing
+                    .is_library()
+                    .then(|| self.toast(&theme, cx))
+                    .flatten(),
+            )
+    }
+}
+
+/// How far above the main area's foot a toast sits (DESIGN §4.14).
+const TOAST_BOTTOM: gpui::Pixels = gpui::px(24.);
+
+impl MainArea {
+    /**
+     * The toast (DESIGN §4.14): at the bottom centre of the main area, `s2`, radius 8,
+     * `shadow-pop`, what was done and Undo where it can be undone.
+     */
+    fn toast(&self, theme: &SbTheme, cx: &Context<Self>) -> Option<AnyElement> {
+        let c = &theme.colors;
+        let toast = cx.services().library.read(cx).toast()?;
+        Some(
+            div()
+                .absolute()
+                .bottom(TOAST_BOTTOM)
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id("toast")
+                        .debug_selector(|| "toast".into())
+                        // Its time stops running out while the pointer rests on it.
+                        .on_hover(|hovered, _, cx| {
+                            let library = cx.services().library.clone();
+                            library.update(cx, |library, cx| library.pause_toast(*hovered, cx));
+                        })
+                        .flex()
+                        .items_center()
+                        .gap(theme.spacing.lg)
+                        .py(theme.spacing.md)
+                        .pl(theme.spacing.lg)
+                        .pr(theme.spacing.md)
+                        .rounded(theme.radii.row)
+                        .border_1()
+                        .border_color(c.line)
+                        .bg(c.s2)
+                        .shadow(theme.shadows.pop.clone())
+                        .child(
+                            div()
+                                .child(toast.text.clone())
+                                .automation_target("toast/text"),
+                        )
+                        .when(toast.can_undo(), |this| {
+                            this.child(
+                                div()
+                                    .id("toast-undo")
+                                    .role(Role::Button)
+                                    .text_color(c.accent_text)
+                                    .font_weight(theme.text.control.weight)
+                                    .cursor_pointer()
+                                    .on_click(|_, _, cx| {
+                                        let library = cx.services().library.clone();
+                                        library.update(cx, LibraryService::undo);
+                                    })
+                                    .child("Undo")
+                                    .automation_target("toast/undo"),
+                            )
+                        })
+                        .child(
+                            crate::components::icon_button(
+                                "toast-dismiss",
+                                theme.sizes.control_small_height,
+                                theme,
+                            )
+                            .aria_label("Dismiss")
+                            .on_click(|_, _, cx| {
+                                let library = cx.services().library.clone();
+                                library.update(cx, LibraryService::dismiss_toast);
+                            })
+                            .child(crate::components::icon(
+                                crate::icons::SbIcon::X,
+                                theme.sizes.icon_sm,
+                                c.fg2,
+                            ))
+                            .automation_target("toast/dismiss"),
+                        )
+                        .automation_target("toast"),
+                )
+                .into_any_element(),
+        )
     }
 }
