@@ -82,7 +82,7 @@ fn bodies(cx: &mut VisualTestContext) -> Vec<(String, Vec<BodyPart>)> {
 
 #[gpui::test]
 fn each_kind_of_tool_draws_its_own_body(cx: &mut TestAppContext) {
-    let (shell, cx) = open_shell(cx);
+    let (_, cx) = open_shell(cx);
     synced(
         |tree| {
             reader::playlist(tree);
