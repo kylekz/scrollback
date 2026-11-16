@@ -1,0 +1,203 @@
+# Every gate of script/check on GitHub's own runners, Windows and macOS, plus the workflows' and
+# the dependencies' own checks (as dv's ci.yml). It runs on pushes to main and on pull requests,
+# never on a push to any other branch (this repository pushes many working branches), and when
+# a release tag's commit has no passing run on main (release.yml calls it). On Windows,
+# script/check runs as two jobs side by side, `--fast` (steps 1-5) and `--e2e-only` (step 6),
+# which together are its every step. macOS runs `--fast`: its runner's screen is 1024x768, too
+# small for the scenarios' 1440x900 windows, and can't be resized; the scenarios run on a Mac by
+# hand (script/check).
+#
+# Security: the token is read-only in every job, no job has a secret, checkouts keep no
+# credentials, every action is pinned to a commit, and nothing runs on pull_request_target. The
+# caches are main's alone (a push to main saves one per Cargo.lock, whether or not its checks
+# pass, so a failing test doesn't cost the next run a cold build) and a release's run restores
+# none.
+
+name: CI
+
+# A change to the documentation or the design boards alone (docs/, design/, the Markdown at the
+# root) runs nothing: no gate reads them. A release's call (workflow_call) has no path filter.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!design/**"
+      - "!*.md"
+  pull_request:
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!design/**"
+      - "!*.md"
+  workflow_call:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  workflows:
+    name: Workflows (actionlint, zizmor)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # actionlint has no action of its own: its release archive, checked against the sha256 its
+      # release publishes (actionlint_1.7.12_checksums.txt), so nothing unpinned runs here.
+      - name: Download actionlint 1.7.12
+        env:
+          URL: https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/actionlint.tar.gz" "$URL"
+          echo "$SHA256  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+      - name: actionlint
+        run: '"$RUNNER_TEMP/actionlint" -color'
+      - name: zizmor
+        uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
+        with:
+          persona: pedantic
+          advanced-security: false
+          version: 1.31.1
+
+  dependencies:
+    name: Dependencies (cargo-deny)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # deny.toml checks every feature ([graph] all-features) on every target.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --locked
+
+  windows:
+    name: Windows (script/check ${{ matrix.check }})
+    runs-on: windows-2025
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [--fast, --e2e-only]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain (rust-toolchain.toml)
+        shell: bash
+        run: rustup toolchain install && rustc --version
+      - name: Restore main's cache
+        id: cache
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: windows-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: windows-
+      # The runner's desktop is 1024x768, too small for the scenarios' 1440x900 windows.
+      - name: A 1920x1080 desktop for the e2e scenarios
+        if: ${{ matrix.check == '--e2e-only' }}
+        shell: pwsh
+        run: |
+          Set-DisplayResolution -Width 1920 -Height 1080 -Force
+          Get-CimInstance Win32_VideoController |
+            Select-Object CurrentHorizontalResolution, CurrentVerticalResolution
+      # The runner's own temp dir, whose name is long: the default one is spelled with an 8.3
+      # short name (C:\Users\RUNNER~1\…), which the file system reports long, so tests that
+      # compare a fixture's path with what came back would see two spellings of one folder.
+      - name: script/check ${{ matrix.check }}
+        shell: bash
+        env:
+          CHECK: ${{ matrix.check }}
+        run: |
+          export TMP="$RUNNER_TEMP" TEMP="$RUNNER_TEMP"
+          bash script/check "$CHECK"
+      - name: The e2e scenarios' screenshots and logs
+        if: ${{ failure() && matrix.check == '--e2e-only' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-windows
+          path: target/e2e
+          retention-days: 7
+          if-no-files-found: ignore
+      # The --fast half's target dir, whose dependencies the --e2e-only half's build reuses.
+      - name: Save the cache (main, once per Cargo.lock)
+        if: ${{ !cancelled() && matrix.check == '--fast' && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        run: rm -rf target/debug/incremental target/e2e target/tmp
+      - if: ${{ !cancelled() && matrix.check == '--fast' && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: windows-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+  macos:
+    name: macOS (script/check --fast)
+    runs-on: macos-15
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - name: Restore main's cache
+        id: cache
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: macos-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: macos-
+      # Without the e2e scenarios: the runner's screen is 1024x768, too small for their
+      # 1440x900 windows.
+      - name: script/check --fast
+        run: bash script/check --fast
+      - name: Save the cache (main, once per Cargo.lock)
+        if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        run: rm -rf target/debug/incremental target/e2e target/tmp
+      - if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: macos-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
