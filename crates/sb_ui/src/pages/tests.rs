@@ -145,11 +145,17 @@ fn f6_moves_the_keyboard_to_the_sidebar_where_the_arrows_show_pages(cx: &mut Tes
     cx.run_until_parked();
     assert_eq!(shelf(cx), Shelf::Unsorted);
     assert_eq!(showing(cx), Showing::Unsorted);
-    /* Trash has no page yet, and there are no folders: Unsorted is the last page's row, and
-    the arrows go on to the location rows; up comes back. */
+    /* There are no folders: Trash is the last page's row, and the arrows go on to the
+    location rows; up comes back. */
     cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(shelf(cx), Shelf::Trash);
+    assert_eq!(showing(cx), Showing::Trash);
+    cx.simulate_keystrokes("down");
+    assert_eq!(shelf(cx), Shelf::Trash);
+    cx.simulate_keystrokes("up up");
+    cx.run_until_parked();
     assert_eq!(shelf(cx), Shelf::Unsorted);
-    cx.simulate_keystrokes("up");
 
     // Enter hands the keyboard to the page: its sessions, top to bottom.
     cx.simulate_keystrokes("enter");
@@ -192,7 +198,7 @@ fn a_new_folder_is_named_in_its_row(cx: &mut TestAppContext) {
     assert_eq!(folder_names(cx), ["work"]);
 
     // The sidebar has the keyboard again: down to the folder, F2 renames it, Esc leaves it.
-    cx.simulate_keystrokes("down down down");
+    cx.simulate_keystrokes("down down down down");
     cx.run_until_parked();
     let work = library(cx).read_with(cx, |library, _| library.folders()[0].id);
     assert_eq!(shelf(cx), Shelf::Folder(work));
@@ -363,9 +369,9 @@ fn tab_walks_the_buttons_and_never_strands_the_keyboard(cx: &mut TestAppContext)
             break;
         }
     }
-    /* The page's filter field, the title bar's Sync all, the sidebar's rows and its two
-    buttons, the main area. */
-    assert_eq!(stops, 6);
+    /* The page's filter field, the title bar's search field and Sync all, the sidebar's rows
+    and its two buttons, the main area. */
+    assert_eq!(stops, 7);
     // Shift Tab goes the other way: to the sidebar's buttons, where the page's keys still work.
     cx.simulate_keystrokes("shift-tab");
     assert!(!main_focused(&shell, cx));

@@ -6,6 +6,7 @@
 //! - [`SyncService`] (`Sync`): the locations, the passes that sync them and their progress.
 //! - [`LibraryService`] (`Library`): the page shown, what is selected on it, and what the
 //!   sidebar and the pages read from the catalogue.
+//! - [`SearchService`]: the palette's searches, and its recent sessions and searches.
 //!
 //! Nothing here blocks the UI thread: the archive is opened, synced and read in
 //! `background_spawn` jobs (in tests, gpui's deterministic scheduler), and a service's state
@@ -18,8 +19,10 @@ pub mod library;
 mod location_tests;
 #[cfg(test)]
 mod owner_tests;
+pub mod read_at;
 #[cfg(test)]
 mod scale;
+pub mod search;
 pub mod sync;
 #[cfg(test)]
 mod tests;
@@ -38,9 +41,11 @@ use sb_core::transport::{Launcher, Probe, ShellTransport, Transport, TransportEr
 pub use archive::{ArchiveService, ArchiveState};
 pub use drag::{DragState, Dragged, DropTarget, Verdict};
 pub use library::{
-    Leave, LibraryService, Month, Page, PathChip, SessionsPage, Stats, Toast, TypedPath,
+    ForGood, Leave, LibraryService, Month, Page, PathChip, SessionsPage, Stats, Toast, TypedPath,
     can_attach, group_key, group_path,
 };
+pub use read_at::ReadAt;
+pub use search::{Answer, SearchService};
 #[cfg(any(test, feature = "automation"))]
 pub use sync::Held;
 pub use sync::{LocationStatus, PassProgress, Reach, SyncEvent, SyncService};
@@ -90,6 +95,7 @@ pub struct Services {
     pub archive: Entity<ArchiveService>,
     pub sync: Entity<SyncService>,
     pub library: Entity<LibraryService>,
+    pub search: Entity<SearchService>,
     pub providers: Providers,
 }
 
@@ -101,6 +107,7 @@ impl Services {
         !matches!(self.archive.read(cx).state(), ArchiveState::Opening)
             && self.sync.read(cx).is_settled()
             && self.library.read(cx).is_settled()
+            && self.search.read(cx).is_settled()
     }
 }
 
@@ -110,10 +117,12 @@ pub fn init(config: ServicesConfig, cx: &mut App) {
     let archive = cx.new(|cx| ArchiveService::new(config.archive_dir, cx));
     let sync = cx.new(|cx| SyncService::new(archive.clone(), providers.clone(), config.reach, cx));
     let library = cx.new(|cx| LibraryService::new(archive.clone(), sync.clone(), cx));
+    let search = cx.new(|cx| SearchService::new(archive.clone(), library.clone(), cx));
     cx.set_global(Services {
         archive,
         sync,
         library,
+        search,
         providers,
     });
 }

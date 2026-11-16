@@ -153,13 +153,32 @@ pub fn size(bytes: u64) -> String {
     format!("{} {unit}", amount(bytes))
 }
 
-/// The unit that suits `total` bytes, and how an amount reads in it.
-fn scaled(total: u64) -> (&'static str, impl Fn(u64) -> String) {
-    const UNITS: [(&str, u64); 3] = [("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)];
-    let (unit, size) = UNITS
+/// `bytes` in the unit that suits it, with a tenth below ten of it: `9.8 MB`, `18 KB`,
+/// `412 MB` (DESIGN §4.8's sizes).
+pub fn fine_size(bytes: u64) -> String {
+    let (unit, size) = unit_of(bytes);
+    let value = bytes as f64 / size as f64;
+    if value < 10. && unit != "KB" {
+        format!("{value:.1} {unit}")
+    } else {
+        format!("{value:.0} {unit}")
+    }
+}
+
+/// The units sizes are written in, the largest first.
+const UNITS: [(&str, u64); 3] = [("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)];
+
+/// The unit that suits `total` bytes, and its size.
+fn unit_of(total: u64) -> (&'static str, u64) {
+    UNITS
         .into_iter()
         .find(|(_, size)| total >= *size)
-        .unwrap_or(("KB", 1 << 10));
+        .unwrap_or(("KB", 1 << 10))
+}
+
+/// The unit that suits `total` bytes, and how an amount reads in it.
+fn scaled(total: u64) -> (&'static str, impl Fn(u64) -> String) {
+    let (unit, size) = unit_of(total);
     let amount = move |bytes: u64| {
         let value = bytes as f64 / size as f64;
         if unit == "GB" {

@@ -52,6 +52,16 @@ pub fn model(id: &str, models: &[String], cx: &App) -> Option<String> {
     Some(provider(id, cx).map_or_else(|| model.clone(), |provider| provider.model_name(model)))
 }
 
+/// A model of whichever agent's it is, as that agent's provider writes it: for a model seen
+/// apart from its sessions (the palette's Model menu). Written as it is when no provider
+/// writes it otherwise.
+pub fn any_model(model: &str, cx: &App) -> String {
+    (cx.services().providers.iter())
+        .map(|provider| provider.model_name(model))
+        .find(|named| named != model)
+        .unwrap_or_else(|| model.to_string())
+}
+
 /// The agent's mark at `size` in its own colour, or the generic `bot` glyph in `fg3` for an
 /// agent that brings none (DESIGN §1.5).
 pub fn mark(id: &str, size: Pixels, cx: &App) -> AnyElement {

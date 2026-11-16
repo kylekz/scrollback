@@ -51,6 +51,7 @@ sb_icons! {
     ArrowLeft => "arrow-left",
     Bot => "bot",
     Box => "box",
+    Calendar => "calendar",
     Check => "check",
     ChevronDown => "chevron-down",
     ChevronRight => "chevron-right",
@@ -60,11 +61,13 @@ sb_icons! {
     Copy => "copy",
     Ellipsis => "ellipsis",
     Eye => "eye",
+    FileText => "file-text",
     Filter => "filter",
     Folder => "folder",
     // Move to folder.
     FolderInput => "folder-input",
     FolderPlus => "folder-plus",
+    GitBranch => "git-branch",
     GripVertical => "grip-vertical",
     Hand => "hand",
     History => "history",
@@ -75,6 +78,8 @@ sb_icons! {
     LayoutGrid => "layout-grid",
     Link => "link",
     List => "list",
+    // A search result (DESIGN §4.9).
+    MessageSquare => "message-square",
     Monitor => "monitor",
     PanelLeft => "panel-left",
     Pause => "pause",
@@ -83,13 +88,18 @@ sb_icons! {
     // A tool call of no kind in particular (DESIGN §1.5 "puzzle", as the boards draw it).
     Puzzle => "puzzle",
     RefreshCw => "refresh-cw",
+    // Restore from Trash.
+    RotateCcw => "rotate-ccw",
     Search => "search",
     Settings => "settings",
     Star => "star",
     // The star of a starred session: filled (DESIGN §4.2.1).
     StarFilled => "star-filled",
+    Terminal => "terminal",
     Trash => "trash-2",
     TriangleAlert => "triangle-alert",
+    // What the owner typed: a prompt among search results (`E-Search`).
+    User => "user",
     X => "x",
 }
 

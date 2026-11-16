@@ -41,6 +41,8 @@ pub mod shell {
             Dismiss,
             /// Open the locations sheet (`Ctrl L`, DESIGN §4.11).
             OpenLocations,
+            /// Open the search palette, or close it (`Ctrl K`, DESIGN §4.9).
+            Search,
         ]
     );
 }
