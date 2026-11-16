@@ -5,7 +5,9 @@
 #   script/release-feed previous <channel> <dir>
 #       the latest published release's full package for <channel>, from this repository's
 #       GitHub Releases into <dir>, which `vpk pack` makes the delta from and checks the new
-#       version against. Needs vpk and gh, GH_TOKEN, GITHUB_REPOSITORY
+#       version against. Reads with GH_TOKEN, so a private repository works as a public one
+#       does; with no earlier release, or none with this channel's feed, it downloads nothing
+#       and vpk packs no delta. Needs vpk and gh, GH_TOKEN, GITHUB_REPOSITORY
 #   script/release-feed files <channel> <out> <upload>
 #       this release's files from script/package's <out> into <upload>: the packages and the
 #       installer vpk lists in assets.<channel>.json, the feed releases.<channel>.json and

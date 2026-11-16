@@ -18,7 +18,8 @@
 //! next start carries on where the passes left off.
 //!
 //! Every other run has [`Updater::Off`] with the reason: a development build, a packaged build
-//! that isn't installed, a run whose data folder `--data-dir` names, or an automation run.
+//! that names no feed or isn't installed, a run whose data folder `--data-dir` names, or an
+//! automation run.
 //! Nothing is checked and nothing reaches the network there.
 
 use std::future::Future;
@@ -85,6 +86,8 @@ pub type Others = Box<dyn Fn() -> usize>;
 pub enum Off {
     /// Built by cargo, not by `script/package`: no release and no feed.
     Development,
+    /// A packaged build that names no feed to update from (`script/package --no-feed`).
+    NoFeed,
     /// A packaged build that the installer didn't put where it is.
     NotInstalled,
     /// `--data-dir` or `SCROLLBACK_DATA_DIR` names the data folder: a scratch run.
@@ -98,6 +101,7 @@ impl Off {
     pub fn key(self) -> &'static str {
         match self {
             Self::Development => "development",
+            Self::NoFeed => "no_feed",
             Self::NotInstalled => "not_installed",
             Self::DataDir => "data_dir",
             Self::Automation => "automation",

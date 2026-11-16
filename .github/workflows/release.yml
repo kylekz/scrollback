@@ -7,6 +7,15 @@
 #
 # macOS: Apple silicon alone (`osx-arm64`, the macos-15 runner's); an Intel Mac isn't built.
 #
+# The feed baked into the builds, which an installed copy checks for updates: this repository's
+# GitHub Releases (`https://github.com/<owner>/<repo>`, read anonymously, so only while the
+# repository is public), unless the repository variable UPDATE_FEED names another feed Velopack
+# reads (an http(s) URL).
+#
+# A private repository: every step reads the repository with the workflow's token, so the
+# release is built and published all the same (its files and SHA256SUMS); only the build
+# provenance is left out, which GitHub attests for a public repository alone.
+#
 # Signing: Windows' installer and executable carry no certificate's signature (SmartScreen asks
 # once). The macOS app is sealed with an ad-hoc signature, unless the repository variable
 # MACOS_SIGNING is `true`: then the `macos-signed` job, in the `release` environment (so it
@@ -34,7 +43,8 @@
 #   is read-only
 # - the one job that can write (publish) checks out no code and runs nothing from the repository:
 #   it takes the built files, writes their SHA256SUMS, attests their build provenance (Sigstore,
-#   `gh attestation verify`) and creates the release; releases are immutable once published
+#   `gh attestation verify`; a public repository's alone) and creates the release; releases are
+#   immutable once published
 # - the only job that reads a secret (macos-signed) runs the tagged commit's own scripts and
 #   vpk (pinned by version; NuGet's tool install takes no hash), never cargo, after the owner
 #   approved it, with a token that can only read
@@ -71,10 +81,15 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # With the workflow's token, through gh, as checkout's own fetch: a private repository
+      # can't be read anonymously.
       - name: The tag as it is on GitHub (checkout can leave a lightweight copy)
         env:
           TAG: ${{ github.ref_name }}
-        run: git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          git -c credential.helper= -c 'credential.helper=!gh auth git-credential'
+          fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
       - name: script/release-check
         id: check
         env:
@@ -175,10 +190,12 @@ jobs:
         run: bash script/release-feed previous win target/package/out
       - name: script/package
         shell: bash
+        env:
+          UPDATE_FEED: ${{ vars.UPDATE_FEED }}
         run: |
           set -euo pipefail
-          bash script/package --version "$VERSION" --feed "https://github.com/$GITHUB_REPOSITORY" \
-            --out target/package/out
+          bash script/package --version "$VERSION" \
+            --feed "${UPDATE_FEED:-https://github.com/$GITHUB_REPOSITORY}" --out target/package/out
       - name: This release's files (vpk's assets.win.json, the feed and RELEASES)
         shell: bash
         run: bash script/release-feed files win target/package/out target/package/upload
@@ -206,9 +223,12 @@ jobs:
       - name: Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
       - name: script/package --build-only
+        env:
+          UPDATE_FEED: ${{ vars.UPDATE_FEED }}
         run: |
           set -euo pipefail
-          bash script/package --version "$VERSION" --feed "https://github.com/$GITHUB_REPOSITORY" \
+          bash script/package --version "$VERSION" \
+            --feed "${UPDATE_FEED:-https://github.com/$GITHUB_REPOSITORY}" \
             --build-only target/package/app
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -380,7 +400,9 @@ jobs:
           sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
           mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
           cat SHA256SUMS
+      # GitHub attests a public repository's builds alone (or any on Enterprise).
       - name: Build provenance
+        if: ${{ github.event.repository.private == false }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*

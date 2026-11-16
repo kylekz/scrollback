@@ -9,11 +9,13 @@
 //!
 //! **The feed** is read through Velopack's `AutoSource`: a release from the release workflow
 //! names the repository on GitHub, which Velopack reads as its published releases (never drafts
-//! or prereleases); a local trial names a folder of `vpk pack` output.
+//! or prereleases), unless the repository variable `UPDATE_FEED` names another; a local trial
+//! names a folder of `vpk pack` output.
 //!
 //! **Off** ([`updater`]), and so never reaching the network, in a development build, under
-//! automation, when `--data-dir` or `SCROLLBACK_DATA_DIR` names the data folder, and in a
-//! packaged build the installer didn't put where it runs: `UpdateManager::new` fails without an
+//! automation, when `--data-dir` or `SCROLLBACK_DATA_DIR` names the data folder, in a packaged
+//! build that names no feed (`script/package --no-feed`), and in a packaged build the installer
+//! didn't put where it runs: `UpdateManager::new` fails without an
 //! `Update.exe` above it (an app bundle around it, on macOS). Velopack writes only in the
 //! install's packages folder (`%LOCALAPPDATA%\<pack id>\packages`; on macOS
 //! `~/Library/Caches/velopack/<pack id>`), and keeps no log file: its `file-logging` feature is
@@ -79,32 +81,52 @@ pub fn real(releases: Arc<dyn Releases>, others: Others, then: fn(&mut App)) -> 
     })
 }
 
+/**
+ * The feed `script/package` baked into this build: `None` in a development build, and in a
+ * packaged one built with `--no-feed`.
+ */
+const BUILT_FEED: Option<&str> = option_env!("SCROLLBACK_UPDATE_FEED");
+
 /// Whether this run looks for updates, and with what (module docs).
 pub fn updater(automation: bool, data_dir: Source) -> Updater {
-    match off(sb_ui::version::is_packaged(), automation, data_dir) {
-        Some(off) => Updater::Off(off),
-        None => installed(),
+    match off(
+        sb_ui::version::is_packaged(),
+        BUILT_FEED,
+        automation,
+        data_dir,
+    ) {
+        Err(off) => Updater::Off(off),
+        Ok(feed) => installed(feed),
     }
 }
 
 /**
- * Why a run that is `packaged` or not, driven by `automation` or not, with its data folder
- * chosen as `data_dir` says, looks for no updates; `None` when it may, if it is installed.
+ * The feed a run checks when it is installed, or why it looks for no updates: the run is
+ * `packaged` or not, with the `built` feed, driven by `automation` or not, and with its data
+ * folder chosen as `data_dir` says.
  */
-fn off(packaged: bool, automation: bool, data_dir: Source) -> Option<Off> {
+fn off(
+    packaged: bool,
+    built: Option<&str>,
+    automation: bool,
+    data_dir: Source,
+) -> Result<&str, Off> {
     if !packaged {
-        Some(Off::Development)
-    } else if automation {
-        Some(Off::Automation)
-    } else if data_dir != Source::Platform {
-        Some(Off::DataDir)
-    } else {
-        None
+        return Err(Off::Development);
     }
+    if automation {
+        return Err(Off::Automation);
+    }
+    if data_dir != Source::Platform {
+        return Err(Off::DataDir);
+    }
+    built
+        .filter(|feed| !feed.trim().is_empty())
+        .ok_or(Off::NoFeed)
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn installed() -> Updater {
+fn installed(_feed: &str) -> Updater {
     Updater::Off(Off::NotInstalled)
 }
 
@@ -122,9 +144,6 @@ mod velopack_releases {
     use velopack::{UpdateCheck, UpdateInfo, UpdateManager};
 
     use super::Releases;
-
-    /// The feed `script/package` baked into this build; `None` in a development build.
-    const BUILT_FEED: Option<&str> = option_env!("SCROLLBACK_UPDATE_FEED");
 
     /// [`Releases`] through Velopack's `UpdateManager`.
     struct Velopack {
@@ -179,12 +198,8 @@ mod velopack_releases {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The updater of an installed copy, or why this one has none (module docs).
-    pub fn installed() -> Updater {
-        let Some(feed) = BUILT_FEED.filter(|feed| !feed.trim().is_empty()) else {
-            log::info!("updates: off (this build names no feed)");
-            return Updater::Off(Off::NotInstalled);
-        };
+    /// The updater over `feed` of an installed copy, or why this one has none (module docs).
+    pub fn installed(feed: &str) -> Updater {
         let Some(binaries) = crate::installer::binaries_dir() else {
             log::info!("updates: off (not an installed copy)");
             return Updater::Off(Off::NotInstalled);
@@ -291,18 +306,36 @@ mod tests {
 
     #[test]
     fn only_an_installed_release_in_the_platforms_data_folder_looks_for_updates() {
+        const FEED: Option<&str> = Some("https://github.com/user/scrollback");
         for source in [Source::Platform, Source::Explicit, Source::Automation] {
             for automation in [false, true] {
-                assert_eq!(off(false, automation, source), Some(Off::Development));
+                assert_eq!(off(false, FEED, automation, source), Err(Off::Development));
+                assert_eq!(off(false, None, automation, source), Err(Off::Development));
             }
-            assert_eq!(off(true, true, source), Some(Off::Automation));
+            assert_eq!(off(true, FEED, true, source), Err(Off::Automation));
         }
-        assert_eq!(off(true, false, Source::Explicit), Some(Off::DataDir));
-        assert_eq!(off(true, false, Source::Platform), None);
+        assert_eq!(off(true, FEED, false, Source::Explicit), Err(Off::DataDir));
+        assert_eq!(
+            off(true, FEED, false, Source::Platform),
+            Ok("https://github.com/user/scrollback")
+        );
         /* A test is a development build. */
         assert!(matches!(
             updater(false, Source::Platform),
             Updater::Off(Off::Development)
         ));
+    }
+
+    #[test]
+    fn a_release_built_without_a_feed_looks_for_no_updates() {
+        for built in [None, Some(""), Some("  ")] {
+            assert_eq!(off(true, built, false, Source::Platform), Err(Off::NoFeed));
+        }
+        /* The run's own reasons still come first. */
+        assert_eq!(
+            off(true, None, true, Source::Platform),
+            Err(Off::Automation)
+        );
+        assert_eq!(off(true, None, false, Source::Explicit), Err(Off::DataDir));
     }
 }

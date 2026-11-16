@@ -3,7 +3,7 @@
 //! ([`crate::services::updates`]) last found, with **Restart to update** once a newer release
 //! is downloaded, and its question while other scrollback processes would end. A development
 //! build shows the version alone, which says it is one; any other run that looks for no
-//! updates says why.
+//! updates says why (a build with no feed, that updates aren't set up for it).
 
 use gpui::{
     AnyElement, App, InteractiveElement as _, IntoElement, ParentElement as _,
@@ -65,6 +65,7 @@ pub fn update_line(updates: &UpdatesService, now: i64) -> Option<UpdateLine> {
     if let Some(off) = updates.off() {
         return match off {
             Off::Development => None,
+            Off::NoFeed => Some(UpdateLine::plain("Updates aren't set up for this build.")),
             Off::NotInstalled => Some(UpdateLine::plain(
                 "Updates are off: this copy wasn't installed by scrollback's installer.",
             )),
@@ -238,6 +239,21 @@ mod tests {
         );
         assert!(off(Off::NotInstalled, cx).is_some());
         assert!(off(Off::Automation, cx).is_some());
+    }
+
+    /// A build with no feed never checked anything, so it never says it couldn't.
+    #[gpui::test]
+    fn a_build_without_a_feed_says_updates_arent_set_up(cx: &mut TestAppContext) {
+        let updates = service(Updater::Off(Off::NoFeed), cx);
+        cx.executor().advance_clock(FIRST_CHECK_AFTER);
+        cx.run_until_parked();
+        assert_eq!(
+            line(&updates, cx),
+            Some(UpdateLine {
+                text: "Updates aren't set up for this build.".into(),
+                actions: vec![],
+            })
+        );
     }
 
     #[gpui::test]

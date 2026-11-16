@@ -13,7 +13,10 @@
 #
 # The release workflow (.github/workflows/release.yml) adds:
 #   --feed <url or folder>            the feed baked into the build instead of the local one
-#                                     (the workflow's: https://github.com/<owner>/<repo>)
+#                                     (the workflow's: https://github.com/<owner>/<repo>, or
+#                                     the repository variable UPDATE_FEED)
+#   --no-feed                         no feed baked in: an installed copy never looks for
+#                                     updates, and Settings says they aren't set up
 #   --out <dir>                       the release into <dir> instead of the trial folder; never
 #                                     the local feed, which only --publish writes
 #   --build-only <dir>                steps 1 and 2 alone, the binary copied into <dir>: no vpk
@@ -28,8 +31,8 @@
 # 2. the app, `cargo build -p scrollback --no-default-features --profile dist` (no automation),
 #    with SCROLLBACK_CHANNEL=release, SCROLLBACK_VERSION=<version> and
 #    SCROLLBACK_UPDATE_FEED=<the feed> baked in (the local feed target/package/releases, a
-#    trial's too, unless --feed names another): target/dist, never target/release; its
-#    `--version` must say that version
+#    trial's too, unless --feed names another; none with --no-feed): target/dist, never
+#    target/release; its `--version` must say that version
 # 3. the binary staged alone in target/package/stage
 # 4. `vpk pack` into the output folder, with the pack id in crates/scrollback/resources/pack-id:
 #    Windows (channel `win`): <pack id>-win-Setup.exe (a per-user install, no wizard, no admin,
@@ -62,8 +65,8 @@ bundle_id=io.github.kylekz.scrollback
 
 usage() {
     cat <<'EOF'
-usage: script/package [--publish] [--version <semver>] [--feed <url or folder>] [--out <dir>]
-                      [--build-only <dir> | --prebuilt <dir>]
+usage: script/package [--publish] [--version <semver>] [--feed <url or folder> | --no-feed]
+                      [--out <dir>] [--build-only <dir> | --prebuilt <dir>]
 
   builds a release of scrollback (the installer and an update feed) into target/package/try:
   from Git Bash on Windows the Windows release, on a Mac the macOS one
@@ -71,6 +74,7 @@ usage: script/package [--publish] [--version <semver>] [--feed <url or folder>] 
                       copy updates from (the owner's alone)
   --version <semver>  the release's version [default: the workspace's, -local.<UTC time>]
   --feed <url|dir>    the feed baked into the build [default: target/package/releases]
+  --no-feed           no feed baked into the build: an installed copy looks for no updates
   --out <dir>         the release into <dir> instead of target/package/try (never the feed)
   --build-only <dir>  only build the app, into <dir>
   --prebuilt <dir>    only pack the app --build-only built into <dir> (needs --version)
@@ -83,6 +87,7 @@ out_arg=""
 build_only=""
 prebuilt=""
 publish=0
+no_feed=0
 while [[ $# -gt 0 ]]; do
     arg="$1"
     shift
@@ -102,6 +107,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --publish) publish=1 ;;
+        --no-feed) no_feed=1 ;;
         -h | --help)
             usage
             exit 0
@@ -124,15 +130,19 @@ fi
 if [[ -n "$feed_arg" && "$publish" -eq 1 ]]; then
     refuse "--publish writes the local feed, so the build names that one; --feed goes with --out"
 fi
+if [[ "$no_feed" -eq 1 && (-n "$feed_arg" || "$publish" -eq 1) ]]; then
+    refuse "--no-feed builds without a feed, so it takes neither --feed nor --publish" \
+        "(whose build names the local feed)"
+fi
 if [[ -n "$build_only" && -n "$prebuilt" ]]; then
     refuse "--build-only and --prebuilt are the two halves of one run; pick one"
 fi
 if [[ -n "$build_only" && ("$publish" -eq 1 || -n "$out_arg") ]]; then
     refuse "--build-only packs nothing, so it takes neither --publish nor --out"
 fi
-if [[ -n "$prebuilt" && (-n "$feed_arg" || -z "$explicit") ]]; then
-    refuse "--prebuilt packs the binary --build-only made: give its --version, and no --feed" \
-        "(the feed is the one it was built with)"
+if [[ -n "$prebuilt" && (-n "$feed_arg" || "$no_feed" -eq 1 || -z "$explicit") ]]; then
+    refuse "--prebuilt packs the binary --build-only made: give its --version, and neither" \
+        "--feed nor --no-feed (the feed is the one it was built with)"
 fi
 
 on_windows=0
@@ -249,8 +259,13 @@ else
     step 2 "cargo build -p scrollback --no-default-features --profile dist  (target/dist)"
     export SCROLLBACK_CHANNEL=release
     export SCROLLBACK_VERSION="$version"
-    export SCROLLBACK_UPDATE_FEED="$baked_feed"
-    echo "the feed: $SCROLLBACK_UPDATE_FEED"
+    if [[ "$no_feed" -eq 1 ]]; then
+        unset SCROLLBACK_UPDATE_FEED
+        echo "the feed: none (an installed copy looks for no updates)"
+    else
+        export SCROLLBACK_UPDATE_FEED="$baked_feed"
+        echo "the feed: $SCROLLBACK_UPDATE_FEED"
+    fi
     cargo build --locked -p scrollback --no-default-features --profile dist
     built="$root/target/dist/$exe"
     check_version "$built"
