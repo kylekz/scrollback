@@ -34,6 +34,8 @@
 pub(crate) mod blocks;
 mod calls;
 mod facts;
+#[cfg(test)]
+mod features_tests;
 mod find;
 mod kinds;
 mod place;
@@ -1010,6 +1012,7 @@ impl ReaderView {
             .when(!self.wide, |this| {
                 this.child(
                     icon_button("facts-toggle", theme.sizes.control_height, theme)
+                        .debug_selector(|| "facts-toggle".into())
                         .aria_label("Facts")
                         .when(self.facts_open, |this| this.bg(c.s3))
                         .on_click(cx.listener(|this, _, _, cx| {

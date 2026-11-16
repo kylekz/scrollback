@@ -356,6 +356,31 @@ mod tests {
     }
 
     #[test]
+    fn marks_fall_where_their_text_is_drawn() {
+        let text = Text::marked(
+            "a\tbc\n\u{202E}def\nghi".to_string(),
+            vec![
+                (2..4, Mark::Number),
+                (5..11, Mark::Found),
+                (12..13, Mark::File),
+            ],
+        );
+        let (drawn, marks) = text.draw(0..3, &text.marks);
+        assert_eq!(drawn, "a   bc\n⟦U+202E⟧def\nghi");
+        let shown: Vec<&str> = marks
+            .iter()
+            .map(|(range, _)| &drawn[range.clone()])
+            .collect();
+        assert_eq!(shown, ["bc", "⟦U+202E⟧def", "g"]);
+        /* A row's lines only: a mark cut to them, those outside left out. */
+        let (drawn, marks) = text.draw(1..2, &text.marks);
+        assert_eq!(drawn, "⟦U+202E⟧def");
+        assert_eq!(marks.len(), 1);
+        assert_eq!(text.line_at(9), 1);
+        assert_eq!(text.line_at(12), 2);
+    }
+
+    #[test]
     fn any_lines_are_found_from_the_notes_and_cost_little_to_index() {
         let text: String = (0..1_000).map(|n| format!("line {n}\r\n\n")).collect();
         let text = Text::new(text);

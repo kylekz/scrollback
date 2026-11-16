@@ -70,9 +70,12 @@ impl Find {
     pub(super) fn new(window: &mut Window, cx: &mut Context<ReaderView>) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Find"));
         let heard = cx.subscribe(&input, |this, input, event, cx| match event {
+            /* A change that leaves the text as it was (Enter) is no new search. */
             InputEvent::Change => {
                 let query = input.read(cx).value().to_string();
-                this.search(query, None, cx);
+                if this.find.as_ref().is_none_or(|find| find.query != query) {
+                    this.search(query, None, cx);
+                }
             }
             InputEvent::PressEnter { shift, .. } => {
                 this.step_match(if *shift { -1 } else { 1 }, cx)
