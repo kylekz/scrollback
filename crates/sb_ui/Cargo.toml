@@ -18,6 +18,7 @@ automation = ["gpui_automation/enabled"]
 
 [dependencies]
 anyhow.workspace = true
+async-channel.workspace = true
 # Dates are shown in the machine's time zone (`format`).
 chrono.workspace = true
 gpui.workspace = true

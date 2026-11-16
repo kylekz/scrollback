@@ -8,7 +8,9 @@
 //! [`view`] is the one way a view renders a body, so every body gets the same style and the same
 //! link and copy handling ([`crate::system`]: links open only for `http` and `https`). Fenced
 //! code is drawn by the reader's own code view, highlighted off the UI thread
-//! ([`crate::syntax`]); what `TextView` draws as code is plain.
+//! ([`crate::syntax`]). What `TextView` draws as fenced code (a fence the reader's scan
+//! missed) is highlighted off the UI thread too, by the reader's highlighter, which takes
+//! gpui-component's place for the whole app ([`crate::services::reader::highlights`]).
 //!
 //! **The view parses on the UI thread.** `TextView` parses a body of up to 4 KiB as it is handed
 //! it, on the UI thread, and a larger one on gpui's background executor; the parser is far
@@ -134,6 +136,7 @@ pub fn view(state: &Entity<TextViewState>, size: Size, cx: &App) -> TextView {
     TextView::new(state)
         .style(style(theme))
         .text_spec(text)
+        .shared_code_block_highlighter(crate::services::reader::highlights::current(cx))
         .code_block_actions(move |block, _window, _cx| code_block_header(block, header.clone()))
         .on_link_click(|url, _event, _window, cx| crate::system::open_url(url, cx))
         // Defence in depth: a sanitised body has no image, and none is ever fetched.
@@ -292,7 +295,83 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::services::reader::Code;
     use crate::theme::{Appearance, Material};
+
+    /// A view of one body, as the reader's (`markdown::view`) or as any other `TextView`.
+    struct Body {
+        state: Entity<TextViewState>,
+        ours: bool,
+    }
+
+    impl gpui::Render for Body {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            if self.ours {
+                view(&self.state, Size::Reading, cx).into_any_element()
+            } else {
+                /* In the text colour a window's root sets, as gpui-component's does. */
+                div()
+                    .text_color(gpui_component::ActiveTheme::theme(&**cx).foreground)
+                    .child(TextView::new(&self.state))
+                    .into_any_element()
+            }
+        }
+    }
+
+    /**
+     * A fence the reader's scan missed, drawn by `TextView` (a fence in a list item that a
+     * tree-sitter parse takes a minute on), by the reader's view or any other, before and after
+     * gpui-component puts its own highlighter back with a theme: never highlighted on the UI
+     * thread, only asked for of the reader service.
+     */
+    #[gpui::test]
+    fn a_fence_textview_draws_is_highlighted_by_ours_off_the_ui_thread(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| crate::init(cx).unwrap());
+        let asked = cx.update(|cx| crate::services::reader::highlights::asked(cx));
+        let fence = |n: usize| {
+            format!(
+                "- a\n\n    ```swift\n    {}\n\n    {}\n    ```\n",
+                "/*".repeat(1_500 + n),
+                "/*".repeat(1_500)
+            )
+        };
+        for (n, ours) in [(0, true), (1, false), (2, true), (3, false)] {
+            if n == 2 {
+                cx.update(|cx| {
+                    gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx)
+                });
+            }
+            let body = fence(n);
+            let start = Instant::now();
+            let (_, window) = cx.add_window_view(|_, cx| Body {
+                state: cx.new(|cx| TextViewState::markdown(&body, cx)),
+                ours,
+            });
+            window.run_until_parked();
+            window.update(|window, _| window.refresh());
+            window.run_until_parked();
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "{n}: {:?}",
+                start.elapsed()
+            );
+            /* The windows before ask again for theirs once the highlighter is renewed. */
+            let codes: Vec<Code> = std::iter::from_fn(|| asked.try_recv().ok()).collect();
+            let opener = format!("{}\n", "/*".repeat(1_500 + n));
+            assert!(
+                codes
+                    .iter()
+                    .any(|code| &*code.language == "swift" && code.text.starts_with(&opener)),
+                "{n}: the code was asked for"
+            );
+        }
+    }
 
     #[test]
     fn the_style_is_drawn_from_the_tokens() {

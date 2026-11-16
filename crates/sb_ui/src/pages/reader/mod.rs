@@ -6,9 +6,12 @@
 //! and keeps the height of each row it has measured. Every row is bounded: a collapsed activity
 //! row is a fixed height, prose comes a piece a row, text a bounded number of lines a row. When
 //! the service changes, the rows are laid out again and matched with the ones before by what
-//! they are ([`ReaderView::set_rows`]): rows that came are spliced in, rows that went are
+//! they are ([`ReaderView::replace`]): rows that came are spliced in, rows that went are
 //! spliced out, rows changed in place are measured again, and the row at the top of the
-//! column stays where it is.
+//! column stays where it is. Only what changes the rows' structure (a row opened or closed,
+//! Full calls, a subagent read) lays out the whole session again; a block's prose prepared or a
+//! call's body read lays out only its own rows ([`rows::relaid`]), and highlights or an image
+//! that land only paint the rows again.
 //!
 //! **What is kept near the screen.** Markdown states ([`crate::markdown`]) are kept for the
 //! rows within [`KEEP_STATES`] of those drawn, and the service's prepared prose, bodies and
@@ -34,6 +37,7 @@ mod tests;
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -56,7 +60,7 @@ use crate::icons::SbIcon;
 use crate::keymap;
 use crate::markdown::Sanitized;
 use crate::services::reader::{
-    BlockRef, Code, Held, Highlights, OpenSession, Rank, ReaderService, ReaderState,
+    BlockRef, Changed, Code, Held, Highlights, OpenSession, Rank, ReaderService, ReaderState,
 };
 use crate::services::{ActiveServices as _, LibraryService};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
@@ -107,7 +111,7 @@ pub struct ReaderView {
     /// The main area's: where the keyboard rests.
     focus_handle: FocusHandle,
     list: ListState,
-    rows: Rc<Vec<Row>>,
+    rows: Vec<Row>,
     /// The session the rows are of.
     session: Option<SessionId>,
     /// The subagent read on its own, and the row of the call it was opened from.
@@ -135,7 +139,7 @@ pub struct ReaderView {
     /// the bounds of DESIGN §4.2.3; and the widest drawn this frame so far.
     label_width: Pixels,
     label_width_next: Cell<Pixels>,
-    _observers: [Subscription; 1],
+    _observers: [Subscription; 2],
 }
 
 impl ReaderView {
@@ -145,7 +149,7 @@ impl ReaderView {
         let mut this = Self {
             focus_handle,
             list: ListState::new(0, ListAlignment::Top, px(OVERDRAW)),
-            rows: Rc::default(),
+            rows: Vec::new(),
             session: None,
             alone: None,
             focused: None,
@@ -159,7 +163,10 @@ impl ReaderView {
             drawn: Rc::default(),
             label_width: label,
             label_width_next: Cell::new(label),
-            _observers: [cx.observe(&reader, |this, _, cx| this.refresh(cx))],
+            _observers: [
+                cx.observe(&reader, |this, _, cx| this.refresh(cx)),
+                cx.subscribe(&reader, |this, _, changed, cx| this.changed(changed, cx)),
+            ],
         };
         this.list.set_scroll_handler({
             let wheeled = this.wheeled.clone();
@@ -240,51 +247,104 @@ impl ReaderView {
             self.keyboard = false;
             self.states.clear();
             self.held.clear();
-            self.rows = Rc::new(rows);
+            self.rows = rows;
             self.list.set_follow_mode(gpui::FollowMode::Normal);
             self.list.reset(self.rows.len());
             self.focus_first();
         } else {
-            self.set_rows(rows);
+            self.replace(0..self.rows.len(), rows);
         }
         cx.notify();
     }
 
     /**
-     * Puts `new` in the place of the rows (the module docs), by [`diff`]. The row at the top of
-     * the column stays there, as far into it as it was; when it is gone (a body or a panel
-     * closed under it), the row before it that is left takes its place, from its top: the call
-     * whose body it was.
+     * Lays out again the rows of what `changed` in the service, or paints them again (the
+     * module docs): its rows are looked for from where they were last drawn, outwards.
      */
-    fn set_rows(&mut self, new: Vec<Row>) {
-        let old = self.rows.clone();
+    fn changed(&mut self, changed: &Changed, cx: &mut Context<Self>) {
+        let (of, held) = match changed {
+            Changed::Paint => return cx.notify(),
+            Changed::Highlight(code) => {
+                if self.held.contains_key(&Held::Highlight(code.clone())) {
+                    cx.notify();
+                }
+                return;
+            }
+            Changed::Prose(at) => (at, Held::Prose(at.clone())),
+            Changed::Body(at) => (at, Held::Body(at.clone())),
+            Changed::Raw(at) => (at, Held::Raw(at.clone())),
+        };
+        let laid = |row: &Row| match (&row.kind, changed) {
+            (RowKind::Prose { at, .. }, Changed::Prose(_))
+            | (RowKind::Body { at, .. }, Changed::Body(_))
+            | (RowKind::Raw { at, .. }, Changed::Raw(_)) => at == of,
+            _ => false,
+        };
+        let reader = cx.services().reader.read(cx);
+        let Some(open) = reader
+            .open_session()
+            .filter(|open| Some(&open.id) == self.session.as_ref())
+        else {
+            return;
+        };
+        let from = self.held.get(&held).copied().unwrap_or(self.top);
+        let Some(found) = outwards(self.rows.len(), from).find(|&at| laid(&self.rows[at])) else {
+            return;
+        };
+        let start = (0..found)
+            .rev()
+            .take_while(|&at| laid(&self.rows[at]))
+            .last()
+            .unwrap_or(found);
+        let end = (found..self.rows.len())
+            .take_while(|&at| laid(&self.rows[at]))
+            .last()
+            .unwrap_or(found)
+            + 1;
+        let rows = rows::relaid(open, reader.full_calls(), &self.rows[start..end]);
+        self.replace(start..end, rows);
+        cx.notify();
+    }
+
+    /**
+     * Puts `new` in the place of the rows `range` (the module docs), by [`diff`]. The row at
+     * the top of the column stays there, as far into it as it was; when it is gone (a body or
+     * a panel closed under it), the row before it that is left takes its place, from its top:
+     * the call whose body it was.
+     */
+    fn replace(&mut self, range: Range<usize>, new: Vec<Row>) {
         let top = self.list.logical_scroll_top();
-        let (splices, changed) = diff(&old, &new);
-        let in_new: HashMap<RowKind, usize> = new
-            .iter()
-            .enumerate()
-            .map(|(at, row)| (row.key(), at))
-            .collect();
+        let old = &self.rows[range.clone()];
+        let (splices, changed) = diff(old, &new);
         /* At the end, the list keeps itself there. */
-        let anchor = old
-            .get(top.item_ix)
-            .filter(|_| !self.list.is_following_tail())
-            .and_then(|row| {
+        let anchor = (range.contains(&top.item_ix) && !self.list.is_following_tail())
+            .then(|| {
+                let in_new: HashMap<RowKind, usize> = new
+                    .iter()
+                    .enumerate()
+                    .map(|(at, row)| (row.key(), at))
+                    .collect();
+                let at = top.item_ix - range.start;
                 in_new
-                    .get(&row.key())
-                    .map(|&at| (at, top.offset_in_item))
+                    .get(&old[at].key())
+                    .map(|&found| (range.start + found, top.offset_in_item))
                     .or_else(|| {
-                        old[..top.item_ix]
+                        old[..at]
                             .iter()
                             .rev()
                             .find_map(|row| in_new.get(&row.key()))
-                            .map(|&at| (at, px(0.)))
+                            .map(|&found| (range.start + found, px(0.)))
                     })
-            });
+                    /* The rows before `range` are all kept. */
+                    .or_else(|| range.start.checked_sub(1).map(|before| (before, px(0.))))
+            })
+            .flatten();
         for (at, removed, inserted) in splices {
+            let at = range.start + at;
             self.list.splice(at..at + removed, inserted);
         }
         for at in changed {
+            let at = range.start + at;
             self.list.remeasure_items(at..at + 1);
         }
         if let Some((item_ix, offset_in_item)) = anchor {
@@ -293,25 +353,38 @@ impl ReaderView {
                 offset_in_item,
             });
         }
-        self.rows = Rc::new(new);
-        if old.is_empty() {
+        let (removed, inserted) = (range.len(), new.len());
+        let first = self.rows.is_empty();
+        self.rows.splice(range.clone(), new);
+        if first {
             self.focus_first();
         } else {
-            self.keep_focus();
+            self.keep_focus(range.start, removed, inserted);
         }
     }
 
-    /// Puts the keyboard back on the row it was on, wherever that row is now; on the row
-    /// before when it is gone.
-    fn keep_focus(&mut self) {
+    /**
+     * Puts the keyboard back on the row it was on, wherever that row is now, once the `removed`
+     * rows from `start` were replaced by `inserted` rows; on the row before when it is gone.
+     */
+    fn keep_focus(&mut self, start: usize, removed: usize, inserted: usize) {
         let Some((was, row)) = self.focused.take() else {
             return;
         };
+        if was < start {
+            self.focused = Some((was, row));
+            return;
+        }
+        if was >= start + removed {
+            let at = was - removed + inserted;
+            self.focused = Some((at, self.rows[at].clone()));
+            return;
+        }
         let key = blocks::focus_key(&row.kind);
-        let found = self
-            .rows
+        let found = self.rows[start..start + inserted]
             .iter()
-            .position(|it| key.is_some() && blocks::focus_key(&it.kind) == key);
+            .position(|it| key.is_some() && blocks::focus_key(&it.kind) == key)
+            .map(|at| start + at);
         self.focused = match found {
             Some(at) => Some((at, self.rows[at].clone())),
             None => self.rows[..was.min(self.rows.len())]
@@ -481,7 +554,7 @@ impl ReaderView {
             ),
             None => Vec::new(),
         };
-        self.rows = Rc::new(rows);
+        self.rows = rows;
         self.list.reset(self.rows.len());
         let call = back_to.filter(|_| self.alone.is_none()).and_then(|call| {
             self.rows
@@ -918,6 +991,15 @@ fn message_text(open: &OpenSession, at: &BlockRef) -> Option<String> {
     }
 }
 
+/// The places of `len` rows from `from` outwards: `from`, the one after it, the one before, …
+fn outwards(len: usize, from: usize) -> impl Iterator<Item = usize> {
+    let from = from.min(len);
+    (0..len)
+        .flat_map(move |step| [from.checked_add(step), from.checked_sub(step + 1)])
+        .flatten()
+        .filter(move |&at| at < len)
+}
+
 /**
  * How to turn the rows `old` into `new`: the splices to make, in order (where, in the list as it
  * is being changed, how many rows go and how many come), and the places in `new` of the rows
@@ -1030,8 +1112,11 @@ fn frame(row: &Row, content: AnyElement, theme: &SbTheme) -> AnyElement {
     } else {
         space
     };
+    /* Painted within its own bounds: a stack of combining marks in its text, as tall as it
+    may be, can't paint over the rows around it. Focus rings are drawn inside what they ring. */
     div()
         .w_full()
+        .overflow_hidden()
         .child(column(theme).pt(space).child(inner))
         .into_any_element()
 }

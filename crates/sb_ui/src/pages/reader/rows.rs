@@ -392,6 +392,42 @@ pub fn rows(
     out.finish()
 }
 
+/**
+ * The rows `old`, all of one block's prose, of one call's body or one record as recorded, laid
+ * out again from `open` as it is now, where they are: as deep, the first with the space the
+ * first had, the last closing the panels the last closed. What [`rows`] would lay out there,
+ * without laying out the rest; so a body that loads costs its own rows, not the session's.
+ */
+pub fn relaid(open: &OpenSession, full_calls: bool, old: &[Row]) -> Vec<Row> {
+    let (Some(first), Some(last)) = (old.first(), old.last()) else {
+        return Vec::new();
+    };
+    let mut out = Rows {
+        open,
+        full_calls,
+        rows: Vec::new(),
+        depth: first.depth,
+        task_from: None,
+        drawn: HashSet::new(),
+    };
+    match &first.kind {
+        RowKind::Prose {
+            at, boxed, reply, ..
+        } => out.prose(at, *boxed, *reply),
+        RowKind::Body { at, .. } => out.body(at),
+        RowKind::Raw { at, .. } => out.raw(at.clone()),
+        _ => return old.to_vec(),
+    }
+    let mut rows = out.finish();
+    if let Some(start) = rows.first_mut() {
+        (start.space, start.opens) = (first.space, first.opens);
+    }
+    if let Some(end) = rows.last_mut() {
+        end.closes = last.closes;
+    }
+    rows
+}
+
 struct Rows<'a> {
     open: &'a OpenSession,
     full_calls: bool,
@@ -583,11 +619,16 @@ impl Rows<'_> {
                     space,
                 );
                 if opened {
-                    let ready = matches!(open.raw(&at), Some(Load::Loaded(_) | Load::Failed(_)));
-                    self.push(RowKind::Raw { at, ready }, Space::Tight);
+                    self.raw(at);
                 }
             }
         }
+    }
+
+    /// A record as it was recorded, under its row.
+    fn raw(&mut self, at: BlockRef) {
+        let ready = matches!(self.open.raw(&at), Some(Load::Loaded(_) | Load::Failed(_)));
+        self.push(RowKind::Raw { at, ready }, Space::Tight);
     }
 
     /// The rows of a block's prose, as far as it is prepared. In a task's box, the last closes

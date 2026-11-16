@@ -231,7 +231,12 @@ pub fn open_window(
     (shell.expect("the window built a shell"), cx)
 }
 
-/// The bounds an element with `.debug_selector(|| name.into())` drew at, after a fresh frame.
+/**
+ * The bounds an element with `.debug_selector(|| name.into())` drew at, after a fresh frame.
+ * gpui records selectors only in a build with debug assertions, so in a release build this is
+ * always `None`, and the tests that use it fail there: they are run unoptimised, as
+ * `script/check` runs them.
+ */
 pub fn bounds(cx: &mut VisualTestContext, name: &'static str) -> Option<Bounds<Pixels>> {
     cx.update(|window, _| window.refresh());
     cx.run_until_parked();

@@ -81,6 +81,9 @@ toolbox_store = { git = "https://github.com/kylekz/toolbox-rs", tag = "v0.5.2" }
 
 # ---- shared third-party
 anyhow = "1.0"
+# What `TextView`'s highlighter, which runs without a context, asks the reader service for
+# (`sb_ui::services::reader::highlights`). gpui's own; already in the tree.
+async-channel = "2.5"
 # Images inside a transcript are base64 (`sb_core::transcript::Stored`).
 base64 = "0.22"
 # The catalogue's daily backup is named by the local calendar day (`toolbox_store`'s own pin).

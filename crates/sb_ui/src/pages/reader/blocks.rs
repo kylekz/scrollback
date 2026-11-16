@@ -602,23 +602,7 @@ fn code_view(
     theme: &SbTheme,
 ) -> AnyElement {
     let c = &theme.colors;
-    let runs: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> = highlights
-        .iter()
-        .filter(|(range, _)| {
-            code.is_char_boundary(range.start)
-                && code.is_char_boundary(range.end)
-                && range.end <= code.len()
-        })
-        .filter_map(|(range, kind)| {
-            Some((
-                range.clone(),
-                gpui::HighlightStyle {
-                    color: Some(kind.color(&theme.colors.syntax)?),
-                    ..Default::default()
-                },
-            ))
-        })
-        .collect();
+    let runs = crate::syntax::styles(&code, highlights, &c.syntax);
     let copied = code.clone();
     div()
         .flex()

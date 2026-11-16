@@ -13,7 +13,7 @@ use sb_test_support::ProjectsTree;
 use sb_test_support::reader;
 
 use super::*;
-use crate::pages::reader::rows::{BodyPart, Ended, PanelPart, ProsePart, RowKind, rows};
+use crate::pages::reader::rows::{BodyPart, Ended, PanelPart, ProsePart, RowKind, relaid, rows};
 use crate::services::{ActiveServices as _, LibraryService};
 use crate::test_support::init;
 
@@ -836,6 +836,141 @@ fn code_is_highlighted_off_the_ui_thread_once_and_kept_by_its_text(cx: &mut Test
     library.update(cx, |library, cx| library.close(cx));
     cx.run_until_parked();
     reader.update(cx, |reader, _| assert!(reader.highlighted(&code).is_some()));
+}
+
+/// The language of code whose highlighting job panics: the tests' stand-in for content that a
+/// bug in the reader panics on.
+pub(super) const PANICS: &str = "\u{0}panics";
+
+#[gpui::test]
+fn a_job_that_panics_is_drawn_plain_and_the_reader_goes_on(cx: &mut TestAppContext) {
+    let (library, reader, _) = library(cx);
+    open(&library, "Throttle yt-dlp metadata backfill", cx);
+    let code = |language: &str, text: &str| Code {
+        language: language.into(),
+        text: text.into(),
+    };
+    let panicking = [code(PANICS, "a"), code(PANICS, "b")];
+    let after = code("rust", "fn after() {}");
+    let grep = call(&reader, "Grep", cx);
+    reader.update(cx, |reader, cx| {
+        /* Both places taken by jobs that panic, one waiting behind them. */
+        for code in &panicking {
+            reader.want_highlight(code.clone(), rank(0), cx);
+        }
+        reader.want_highlight(after.clone(), rank(1), cx);
+        assert_eq!(reader.busy, JOBS);
+    });
+    cx.run_until_parked();
+    reader.update(cx, |reader, cx| {
+        for code in &panicking {
+            assert_eq!(reader.highlighted(code), Some(Highlights::default()));
+        }
+        assert!(!reader.highlighted(&after).expect("made").is_empty());
+        assert_eq!(reader.busy, 0);
+        reader.toggle(Toggle::Call(grep.clone()), cx);
+        reader.want_body(&grep, cx);
+    });
+    cx.run_until_parked();
+    reader.read_with(cx, |reader, _| {
+        let open = reader.open_session().unwrap();
+        assert!(matches!(open.body(&grep), Some(Load::Loaded(_))));
+        assert!(reader.is_settled());
+    });
+}
+
+#[test]
+fn a_panic_in_guarded_work_is_why_it_failed() {
+    assert_eq!(guarded(|| 1), Ok(1));
+    let failed: Result<(), String> = guarded(|| panic!("at the disco"));
+    assert_eq!(failed, Err("scrollback failed on it".to_string()));
+    let sliced = guarded(|| "é".to_string()[..1].len());
+    assert!(sliced.is_err());
+}
+
+/// The kind and block of the rows [`relaid`] lays out again, one run of each.
+fn relaid_run(row: &RowKind) -> Option<(u8, &BlockRef)> {
+    match row {
+        RowKind::Prose { at, .. } => Some((0, at)),
+        RowKind::Body { at, .. } => Some((1, at)),
+        RowKind::Raw { at, .. } => Some((2, at)),
+        _ => None,
+    }
+}
+
+/**
+ * What lands, laid out again on its own ([`relaid`]): every run of a block's prose, a call's
+ * body or a record in the rows from before, each laid out again in its place, is what the
+ * whole session lays out now.
+ */
+#[gpui::test]
+fn what_lands_is_laid_out_in_its_place_as_the_whole_session_lays_it_out(cx: &mut TestAppContext) {
+    let (library, reader, _) = library(cx);
+    for title in [
+        "Throttle yt-dlp metadata backfill",
+        "Reader fixture: every construct",
+    ] {
+        open(&library, title, cx);
+        reader.update(cx, |reader, cx| {
+            reader.set_full_calls(true, cx);
+            let open = reader.open_session().unwrap();
+            let records: Vec<BlockRef> = rows(open, true, None)
+                .into_iter()
+                .filter_map(|row| match row.kind {
+                    RowKind::Unrecognised { at, .. } => Some(at),
+                    _ => None,
+                })
+                .collect();
+            for at in records {
+                reader.toggle(Toggle::Raw(at), cx);
+            }
+        });
+        let before = reader.read_with(cx, |reader, _| {
+            rows(reader.open_session().unwrap(), true, None)
+        });
+        /* Only what is laid out again lands: prose, bodies and records. */
+        reader.update(cx, |reader, cx| {
+            for row in &before {
+                match &row.kind {
+                    RowKind::Prose {
+                        at,
+                        part: ProsePart::Pending,
+                        ..
+                    } => reader.want_prose(at, Rank::default(), cx),
+                    RowKind::Body {
+                        at,
+                        part: BodyPart::Loading,
+                        ..
+                    } => reader.want_body(at, cx),
+                    RowKind::Raw { at, ready: false } => reader.want_raw(at, cx),
+                    _ => {}
+                }
+            }
+        });
+        cx.run_until_parked();
+        reader.read_with(cx, |reader, _| {
+            let open = reader.open_session().unwrap();
+            let mut laid = Vec::new();
+            let mut at = 0;
+            while at < before.len() {
+                let run = relaid_run(&before[at].kind);
+                let end = at
+                    + before[at..]
+                        .iter()
+                        .take_while(|row| run.is_some() && relaid_run(&row.kind) == run)
+                        .count()
+                        .max(1);
+                match run {
+                    Some(_) => laid.extend(relaid(open, true, &before[at..end])),
+                    None => laid.push(before[at].clone()),
+                }
+                at = end;
+            }
+            let now = rows(open, true, None);
+            assert_ne!(before, now, "{title}: something landed");
+            assert_eq!(laid, now, "{title}");
+        });
+    }
 }
 
 #[gpui::test]

@@ -50,13 +50,15 @@ use gpui::App;
 
 /// Everything views need before the first window opens: gpui-component, scrollback's key
 /// bindings (after gpui-component's, so scrollback's win within a context), macOS's menu bar,
-/// the bundled fonts and a first theme. The app must have been built with [`Assets`] as its
-/// asset source.
+/// the bundled fonts, a first theme, and the highlighter of `TextView`'s fenced code in place of
+/// gpui-component's ([`services::reader::highlights`]). The app must have been built with
+/// [`Assets`] as its asset source.
 pub fn init(cx: &mut App) -> anyhow::Result<()> {
     gpui_component::init(cx);
     keymap::init(cx)?;
     app_menu::init(cx);
     assets::load_fonts(cx)?;
     theme::apply(cx);
+    services::reader::highlights::init(cx);
     Ok(())
 }
