@@ -41,7 +41,7 @@ use crate::archive::{Archive, ArchivedSession};
 use crate::catalogue::{Derived, Held, Indexed, Reading, SessionId, fingerprint};
 use crate::location::LocationId;
 use crate::provider::{ItemKind, Provider};
-use crate::search::{SEARCH_DATABASE, Text};
+use crate::search::Text;
 use crate::transcript::{self, Content, Conversation, Ending, SessionIndex, Subagent, Transcript};
 
 /// What an index did.
@@ -170,7 +170,7 @@ fn run(
             bytes,
         });
     }
-    searchable(archive, location, providers, cancel, &mut report)?;
+    searchable(archive, location, providers, cancel, progress, &mut report)?;
     /* A log a read held when a delete for good was to empty it is emptied now. */
     catalogue.retry_empty_log();
     if let Some(search) = archive.search_index_if_open() {
@@ -188,21 +188,25 @@ const TEXTS: usize = 256;
  * The second step of an index (the module docs): makes the text of each session of
  * `providers` at `location` (or at every location) searchable, where it is not of the
  * session's row as it is now, the session that did something last first, some sessions at a
- * time; and takes out the text of each whose row went. With nothing to do it reads only the
- * catalogue's index of what is to do, and does not open the search index.
+ * time; and takes out the text of each whose row went. The search index is opened first: one
+ * made anew (gone, unreadable, or of another layout, as an older release left it) marks every
+ * session not searchable, so the first index after a start makes it all again rather than the
+ * first search finding it empty. It stays open, so later indexes only read the catalogue's
+ * index of what is to do when there is nothing.
  */
 fn searchable(
     archive: &Archive,
     location: Option<&LocationId>,
     providers: &[&dyn Provider],
     cancel: &CancelToken,
+    progress: &mut dyn FnMut(&Progress),
     report: &mut IndexReport,
 ) -> Result<(), SyncError> {
     let catalogue = archive.catalogue();
-    /* A search index that is gone is made again, and holds no session's text. */
-    if !archive.dir().join(SEARCH_DATABASE).exists() {
-        let _ = archive.search_index();
-    }
+    /* Search that is not available is left to the next index; the library is not. */
+    let Ok(search) = archive.search_index() else {
+        return Ok(());
+    };
     let gone = catalogue.text_gone()?;
     let mut rows = Vec::new();
     for provider in providers {
@@ -216,10 +220,6 @@ fn searchable(
     if gone.is_empty() && rows.is_empty() {
         return Ok(());
     }
-    /* Search that is not available is left to the next index; the library is not. */
-    let Ok(search) = archive.search_index() else {
-        return Ok(());
-    };
     if !gone.is_empty() {
         search.forget(&gone)?;
         catalogue.text_forgotten(&gone)?;
@@ -242,9 +242,17 @@ fn searchable(
         batch.extend(text(archive, provider, id, made)?);
         if batch.len() >= TEXTS || batch.iter().map(Text::bytes).sum::<usize>() >= TEXT_BYTES {
             report.searchable += record(archive, &std::mem::take(&mut batch))?;
+            progress(&Progress::Searchable {
+                sessions: report.searchable,
+            });
         }
     }
-    report.searchable += record(archive, &batch)?;
+    if !batch.is_empty() {
+        report.searchable += record(archive, &batch)?;
+        progress(&Progress::Searchable {
+            sessions: report.searchable,
+        });
+    }
     Ok(())
 }
 

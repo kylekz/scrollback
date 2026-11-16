@@ -17,7 +17,6 @@ use crate::automation::AutomationTargetExt as _;
 use crate::components::{focus_ring, icon, kind_icon, kind_name, progress_bar, with_numbers};
 use crate::format;
 use crate::icons::SbIcon;
-use crate::services::sync::stale;
 use crate::services::{LocationStatus, PassProgress};
 use crate::theme::{SbTheme, StyledText as _};
 
@@ -99,12 +98,7 @@ impl Sidebar {
             .gap(px(2.))
             .children(locations.iter().map(|location| {
                 let id = location.id.clone();
-                let stale = stale(
-                    location.last_success,
-                    sync.details().found(&location.id),
-                    now,
-                )
-                .is_some();
+                let stale = sync.stale(location, now).is_some();
                 location_row(
                     location,
                     sync.status(location),

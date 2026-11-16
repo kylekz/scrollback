@@ -35,6 +35,68 @@ pub(super) fn holds(text: &str, term: &str) -> bool {
     folded(text).contains(term)
 }
 
+/**
+ * Where in `text` the first match of `term` is, as search matches (any case, Latin accents
+ * folded): the bytes of `text` it covers. `None` for an empty term, or one `text` doesn't hold.
+ */
+pub fn first_match(text: &str, term: &str) -> Option<Range<usize>> {
+    let term: Vec<char> = folded(term).chars().collect();
+    if term.is_empty() {
+        return None;
+    }
+    /* Each folded character of `text`, with where the character it was starts and ends. */
+    let chars: Vec<(char, Range<usize>)> = text
+        .char_indices()
+        .filter_map(|(at, char)| fold(char).map(|folded| (folded, at..at + char.len_utf8())))
+        .collect();
+    let found = chars.windows(term.len()).position(|window| {
+        window
+            .iter()
+            .map(|(char, _)| *char)
+            .eq(term.iter().copied())
+    })?;
+    Some(chars[found].1.start..chars[found + term.len() - 1].1.end)
+}
+
+/**
+ * Where in `text` each match of `term` is, as [`first_match`] matches, apart and in order: at
+ * most `most` of them. Linear in `text`, whatever `term` is: a term found everywhere stops at
+ * `most`.
+ */
+pub fn find_all(text: &str, term: &str, most: usize) -> Vec<Range<usize>> {
+    let term = folded(term);
+    if term.is_empty() || most == 0 {
+        return Vec::new();
+    }
+    if text.is_ascii() && term.is_ascii() {
+        return text
+            .to_ascii_lowercase()
+            .match_indices(term.as_str())
+            .take(most)
+            .map(|(at, found)| at..at + found.len())
+            .collect();
+    }
+    /* The folded text, and for each of its characters where it starts in it and where the
+    character it was starts and ends in `text`. */
+    let mut folded_text = String::with_capacity(text.len());
+    let mut places: Vec<(usize, Range<usize>)> = Vec::with_capacity(text.len());
+    for (at, char) in text.char_indices() {
+        if let Some(folded) = fold(char) {
+            places.push((folded_text.len(), at..at + char.len_utf8()));
+            folded_text.push(folded);
+        }
+    }
+    let place = |at: usize| places.partition_point(|(start, _)| *start < at);
+    folded_text
+        .match_indices(term.as_str())
+        .take(most)
+        .map(|(at, found)| {
+            let (first, last) = (place(at), place(at + found.len()) - 1);
+            places[first].1.start..places[last].1.end
+        })
+        .collect()
+}
+
 /// The part of `text` about the first match of the rarest of `terms` ([`folded`] already) in
 /// it, the whole of that match always, with every match in that part marked.
 pub(super) fn snippet(text: &str, terms: &[String]) -> Snippet {
@@ -119,6 +181,36 @@ mod tests {
     use toolbox_store::rusqlite::{Connection, params};
 
     use super::*;
+
+    #[test]
+    fn a_first_match_is_found_in_any_case_and_with_accents_folded() {
+        assert_eq!(first_match("Retry the Upload", "upload"), Some(10..16));
+        assert_eq!(first_match("un café crème", "CAFE CREME"), Some(3..15));
+        assert_eq!(first_match("nothing here", "upload"), None);
+        assert_eq!(first_match("anything", ""), None);
+    }
+
+    #[test]
+    fn every_match_is_found_as_the_first_is_and_no_more_than_asked() {
+        assert_eq!(
+            find_all("Upload, upload and UPLOAD", "upload", 10),
+            [0..6, 8..14, 19..25]
+        );
+        assert_eq!(find_all("un café crème, CAFE", "cafe", 10), [3..8, 17..21]);
+        assert_eq!(find_all("Ångström", "angstrom", 10).first(), Some(&(0..10)));
+        assert_eq!(find_all("aaaa", "aa", 10), [0..2, 2..4]);
+        assert_eq!(find_all("anything", "", 10), []);
+        /* A term that matches every character, in a long text: the first `most`, at once. */
+        let started = std::time::Instant::now();
+        let long = "é".repeat(5_000_000);
+        assert_eq!(find_all(&long, "e", 10_000).len(), 10_000);
+        assert_eq!(find_all(&"a".repeat(10_000_000), "a", 10_000).len(), 10_000);
+        assert!(
+            started.elapsed().as_secs_f64() < 5.0,
+            "{:?}",
+            started.elapsed()
+        );
+    }
 
     /**
      * The fold is the index's own, for every code point: what the bundled SQLite's `trigram`

@@ -1,0 +1,82 @@
+{"scenario": {"window_size": "1440x900", "fixture": "reader", "description": "The tool renderers (DESIGN §4.2.4) on E-Reader-Calls-1 and -2's playlist session: a command, a read, an edit's and a write's diff, a search, todos, a web search and fetch, MCP side by side, a tool no provider knows, an image full size; the facts margin beside the column and the Facts toggle below 1280 (§4.2.8, §2); dark and light at 1440x900 and 960x600"}}
+{"cmd": "wait_ready", "timeout_ms": 60000}
+{"cmd": "settle", "timeout_ms": 60000, "expect": {"pointer": "/library/counts/all", "equals": 8}}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+{"cmd": "click", "target": "sidebar/folder/fc"}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 5}}
+{"cmd": "click", "target": "card/2/title"}
+{"cmd": "settle", "expect": [{"pointer": "/library/open", "equals": "Downloads: paste a whole playlist"}, {"pointer": "/reader/state", "equals": "open"}, {"pointer": "/reader/facts", "equals": true}]}
+
+// The facts margin: the session, its turns, its calls by kind. 268 wide at the main area's right.
+{"cmd": "bounds", "target": "reader/facts", "expect_result": [{"pointer": "/w", "gte": 267, "lte": 269}]}
+{"cmd": "bounds", "target": "reader/facts/turn/1", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "facts-1440-dark"}
+
+// A command: `$ command` with Copy, its output, and a footer with its exit status and Copy output.
+{"cmd": "click", "target": "reader/call/main/1"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/open_calls", "equals": 1}, {"pointer": "/reader/loads/bodies/loaded", "equals": 1}]}
+{"cmd": "bounds", "target": "reader/head/1", "expect_result": [{"pointer": "/h", "gte": 25, "lte": 27}]}
+{"cmd": "screenshot", "name": "tool-bash-1440-dark"}
+
+// A read: its file and lines, numbered and highlighted; an edit's diff: the hunk, the gutter, the words marked.
+{"cmd": "click", "target": "reader/call/main/2"}
+{"cmd": "click", "target": "reader/call/main/3"}
+{"cmd": "settle", "expect": {"pointer": "/reader/loads/bodies/loaded", "equals": 3}}
+{"cmd": "scroll", "target": "reader/column", "dy": -400}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "reader/body/main/3", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "tool-read-edit-1440-dark"}
+
+// Full calls: every renderer at once, scrolled through.
+{"cmd": "key", "keystroke": "e"}
+{"cmd": "settle", "expect": {"pointer": "/reader/full_calls", "equals": true}}
+{"cmd": "scroll", "target": "reader/column", "dy": -500}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "tool-write-grep-todos-1440-dark"}
+{"cmd": "scroll", "target": "reader/column", "dy": -700}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "tool-web-mcp-1440-dark"}
+{"cmd": "scroll", "target": "reader/column", "dy": -700}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "tool-unknown-image-1440-dark"}
+
+// An image a tool returned opens full size; a click closes it.
+{"cmd": "key", "keystroke": "end"}
+{"cmd": "settle"}
+{"cmd": "click", "target": "reader/full-size/18"}
+{"cmd": "settle", "expect": {"pointer": "/reader/full_image", "equals": true}}
+{"cmd": "screenshot", "name": "tool-image-full-1440-dark"}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": {"pointer": "/reader/full_image", "equals": false}}
+
+// Light.
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "key", "keystroke": "home"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "facts-1440-light"}
+{"cmd": "scroll", "target": "reader/column", "dy": -500}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "tool-write-grep-todos-1440-light"}
+{"cmd": "scroll", "target": "reader/column", "dy": -700}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "tool-web-mcp-1440-light"}
+
+// 960x600: the margin gives way to the Facts toggle, which shows it over the column; Esc closes it. MCP's input and output stack.
+{"cmd": "resize", "w": 960, "h": 600, "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
+{"cmd": "settle", "expect": {"pointer": "/reader/facts", "equals": false}}
+{"cmd": "screenshot", "name": "tool-web-mcp-960-light"}
+{"cmd": "click", "target": "reader/facts-toggle"}
+{"cmd": "settle", "expect": {"pointer": "/reader/facts", "equals": true}}
+{"cmd": "screenshot", "name": "facts-overlay-960-light"}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": {"pointer": "/reader/facts", "equals": false}}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "tool-web-mcp-960-dark"}
+{"cmd": "click", "target": "reader/facts-toggle"}
+{"cmd": "settle", "expect": {"pointer": "/reader/facts", "equals": true}}
+{"cmd": "screenshot", "name": "facts-overlay-960-dark"}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "resize", "w": 1440, "h": 900}
+{"cmd": "settle", "expect": {"pointer": "/reader/facts", "equals": true}}

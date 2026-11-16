@@ -1,13 +1,15 @@
 //! Small building blocks shared by the views, drawn from the theme's tokens
 //! (`design/project/sb.css` names each in parentheses).
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, BoxShadow, Div, ElementId, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Role, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, StyledText, TextRun, Transformation, Window, div,
-    font, percentage, point, prelude::FluentBuilder as _, px, relative, svg,
+    Animation, AnimationExt as _, AnyElement, Bounds, BoxShadow, Div, ElementId, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Role, SharedString,
+    Stateful, StatefulInteractiveElement as _, Styled as _, StyledText, TextRun, Transformation,
+    Window, canvas, div, font, percentage, point, prelude::FluentBuilder as _, px, relative, svg,
 };
 use sb_core::location::LocationKind;
 
@@ -135,6 +137,10 @@ pub enum Tone {
     Blue,
     /// `yellow-soft` with `yellow`: a warning.
     Warn,
+    /// `green-soft` with `green`: what went well (`.chip.ok`).
+    Good,
+    /// `red-soft` with `red`: what failed (`.chip.bad`).
+    Bad,
 }
 
 impl Tone {
@@ -145,8 +151,27 @@ impl Tone {
             Self::Accent => (c.accent_soft, c.accent_text),
             Self::Blue => (c.blue_soft, c.blue),
             Self::Warn => (c.yellow_soft, c.yellow),
+            Self::Good => (c.green_soft, c.green),
+            Self::Bad => (c.red_soft, c.red),
         }
     }
+}
+
+/// A chip in `tone` (`.chip`), as low as a tag: a status beside an activity row's target.
+pub fn low_chip(label: impl Into<SharedString>, tone: Tone, theme: &SbTheme) -> Div {
+    let (fill, text) = tone.colors(theme);
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .h(theme.sizes.tag_height)
+        .px(theme.spacing.md)
+        .rounded(theme.radii.pill)
+        .bg(fill)
+        .text_color(text)
+        .text_spec(&theme.text.small)
+        .whitespace_nowrap()
+        .child(label.into())
 }
 
 /// A tag (`.tag`: 18 high, radius 4, 11px at 500), or the 16px one of a card's last line. It
@@ -183,7 +208,8 @@ pub fn tag_width(label: &str, theme: &SbTheme, window: &Window) -> Pixels {
 }
 
 /// The tag that names a location, in its kind's colours (DESIGN §1: `.tag.win` for this
-/// machine, `.tag.wsl` for a distro, `.tag.mac` for a host over SSH).
+/// machine, `.tag.wsl` for a distro, `.tag.mac` for a host over SSH). The name is drawn as a
+/// label ([`crate::hostile::label`]): it may be a distro's or a host's own.
 pub fn location_tag(
     name: impl Into<SharedString>,
     kind: &LocationKind,
@@ -195,7 +221,24 @@ pub fn location_tag(
         LocationKind::Wsl { .. } => Tone::Blue,
         LocationKind::Ssh { .. } => Tone::Neutral,
     };
-    tag(name, tone, small, theme)
+    tag(crate::hostile::label(&name.into()), tone, small, theme)
+}
+
+/// A chip (`.chip`: 22 high, a pill, 12px), in `tone`'s colours.
+pub fn chip(label: impl Into<SharedString>, tone: Tone, theme: &SbTheme) -> Div {
+    let (fill, text) = tone.colors(theme);
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .h(px(22.))
+        .px(theme.spacing.md)
+        .rounded(theme.radii.pill)
+        .bg(fill)
+        .text_color(text)
+        .text_spec(&theme.text.secondary)
+        .whitespace_nowrap()
+        .child(label.into())
 }
 
 /// A chip that warns (`.chip.warn`), as low as a card's last line.
@@ -350,6 +393,9 @@ pub enum ButtonKind {
     Danger,
     /// `.btn.ghost`: no fill and no border, `fg2` text; `s3` under the pointer.
     Ghost,
+    /// `.btn.danger-fill`: `danger-fill` with white text, the app's only filled red
+    /// (DESIGN §4.8).
+    DangerFill,
 }
 
 /// A button (`.btn`: 28 high, radius 6, 500), or the small one (`.btn.sm`: 24 high, 12px).
@@ -368,6 +414,12 @@ pub fn button(
         ButtonKind::Plain => (c.s2, c.s3, c.fg, c.line),
         ButtonKind::Danger => (c.s2, c.s3, c.red, c.line),
         ButtonKind::Ghost => (none, c.s3, c.fg2, none),
+        ButtonKind::DangerFill => (
+            c.danger_fill,
+            c.danger_fill.opacity(0.9),
+            gpui::white(),
+            none,
+        ),
         /* A primary button that can't be pressed loses its accent too, so that it reads as
         off and not as a paler on. */
         ButtonKind::Primary if !enabled => (c.s3, c.s3, c.fg3, none),
@@ -654,6 +706,55 @@ pub fn kind_tile(kind: &LocationKind, theme: &SbTheme) -> impl IntoElement {
         .rounded(theme.radii.input)
         .bg(fill)
         .child(icon(kind_icon(kind), theme.sizes.icon, color))
+}
+
+/// A chip's height (`.chip`).
+pub const CHIP_HEIGHT: Pixels = px(22.);
+
+/// Keeps where its parent, a chip, was last drawn: its menu opens below it.
+pub fn bounds_of(at: Rc<Cell<Bounds<Pixels>>>) -> impl IntoElement {
+    canvas(move |bounds, _, _| at.set(bounds), |_, _, _, _| {})
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+}
+
+/// Where a chip's menu opens: under it, from its left edge.
+pub fn below(chip: &Cell<Bounds<Pixels>>) -> Point<Pixels> {
+    chip.get().bottom_left() + point(px(0.), px(4.))
+}
+
+/// A chip (`.chip`: 22 high, `s2` with a `line-subtle` border, radius 999, 12px `fg2`), or a
+/// set one (`.chip.acc`).
+pub fn chip_base(id: impl Into<ElementId>, set: bool, theme: &SbTheme) -> Stateful<Div> {
+    let c = &theme.colors;
+    let hover = if set { c.accent_soft } else { c.s3 };
+    div()
+        .id(id)
+        .role(Role::Button)
+        .relative()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .h(CHIP_HEIGHT)
+        .px(theme.spacing.md)
+        .rounded(theme.radii.pill)
+        .border_1()
+        .whitespace_nowrap()
+        .text_spec(&theme.text.secondary)
+        .cursor_pointer()
+        .map(|this| {
+            if set {
+                this.bg(c.accent_soft)
+                    .border_color(gpui::transparent_black())
+                    .text_color(c.accent_text)
+            } else {
+                this.bg(c.s2).border_color(c.line_subtle).text_color(c.fg2)
+            }
+        })
+        .hover(move |style| style.bg(hover))
 }
 
 #[cfg(test)]

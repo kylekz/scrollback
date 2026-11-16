@@ -364,6 +364,154 @@ impl Session {
     }
 }
 
+/// What [`with_subagents`] wrote: the keys of the session's items, for a test to find them by.
+pub struct WithSubagents {
+    /// The session's own transcript.
+    pub key: String,
+    /// The subagent the session's first call started, the subagent that one started, and the
+    /// subagent no call is known to have started.
+    pub subagent: String,
+    pub nested: String,
+    pub lone: String,
+}
+
+/**
+ * A session in `project` called `title`, whose subagents hold words to find. Its first turn asks
+ * a subagent, which answers "A widget holds a frobnicator." and asks another, which answers
+ * "Deep inside sits a gizmotron."; then come `turns` turns that say nothing of note, and a last
+ * one that asks "Where is the zanzibar setting?" and is answered "It sits in the quokka file.".
+ * One subagent no call is known to have started answers "The quuxifier hums.".
+ */
+pub fn with_subagents(
+    tree: &mut ProjectsTree,
+    project: &str,
+    title: &str,
+    turns: usize,
+) -> WithSubagents {
+    let mut session = tree.session(project, 0);
+    let ask = |description: &str| json!({ "subagent_type": "expert", "description": description, "prompt": "Explain." });
+    session.transcript.prompt("Ask the widget expert.");
+    let call = session.transcript.call("Agent", ask("Ask"));
+    let (subagent, mut first) = session.subagent_transcript(
+        "",
+        Some(json!({ "agentType": "expert", "description": "Ask", "toolUseId": call.id })),
+    );
+    first.prompt("Explain widgets.");
+    first.reply("A widget holds a frobnicator.");
+    let inner = first.call("Agent", ask("Look deeper"));
+    let (nested, mut second) = session.subagent_transcript(
+        "",
+        Some(json!({ "agentType": "expert", "description": "Look deeper", "toolUseId": inner.id })),
+    );
+    second.prompt("Look deeper.");
+    second.reply("Deep inside sits a gizmotron.");
+    let started = |records: &Records| json!({ "agentId": records.agent, "status": "completed" });
+    first.result_with(&inner, json!("Looked."), false, started(&second));
+    first.reply("Widgets explained.");
+    session
+        .transcript
+        .result_with(&call, json!("Explained."), false, started(&first));
+    session.transcript.reply("The expert explained widgets.");
+    for turn in 1..=turns {
+        session
+            .transcript
+            .prompt(&format!("Carry on with step {turn}."));
+        session.transcript.reply(&format!("Step {turn} is done."));
+    }
+    session.transcript.prompt("Where is the zanzibar setting?");
+    session.transcript.reply("It sits in the quokka file.");
+    let (lone, mut alone) = session.subagent_transcript("", None);
+    alone.prompt("Nobody asked.");
+    alone.reply("The quuxifier hums.");
+    session.title(title);
+    WithSubagents {
+        key: session.key,
+        subagent,
+        nested,
+        lone,
+    }
+}
+
+/// What [`nested_subagents`] wrote: the keys of the session's items.
+pub struct NestedSubagents {
+    /// The session's own transcript.
+    pub key: String,
+    /// The subagents from the one the session's call started down to the innermost, each
+    /// started by the one before.
+    pub chain: Vec<String>,
+    /// The subagents the outermost started besides the next of the chain.
+    pub siblings: Vec<String>,
+}
+
+/**
+ * A session in `project` called `title` whose call starts a chain of `depth` subagents, each
+ * started by the one before; the outermost also starts `siblings` subagents of its own, before
+ * the next of the chain. The innermost answers "The needle is a quillwort.", each sibling
+ * "Leaf n.".
+ */
+pub fn nested_subagents(
+    tree: &mut ProjectsTree,
+    project: &str,
+    title: &str,
+    depth: usize,
+    siblings: usize,
+) -> NestedSubagents {
+    let mut session = tree.session(project, 0);
+    let ask = |description: &str| json!({ "subagent_type": "expert", "description": description, "prompt": "Go." });
+    let meta = |call: &Call| {
+        Some(json!({ "agentType": "expert", "description": "Go", "toolUseId": call.id }))
+    };
+    let started = |records: &Records| json!({ "agentId": records.agent, "status": "completed" });
+    session.transcript.prompt("Go down the chain.");
+    let mut call = session.transcript.call("Agent", ask("Level 1"));
+    let mut chain: Vec<(String, Records, Call)> = Vec::new();
+    let mut leaves = Vec::new();
+    for level in 1..=depth {
+        let (key, mut records) = session.subagent_transcript("", meta(&call));
+        records.prompt(&format!("Level {level}."));
+        if level == 1 {
+            for leaf in 0..siblings {
+                let asked = records.call("Agent", ask(&format!("Leaf {leaf}")));
+                let (key, mut sibling) = session.subagent_transcript("", meta(&asked));
+                sibling.prompt("Look.");
+                sibling.reply(&format!("Leaf {leaf}."));
+                records.result_with(&asked, json!("Looked."), false, started(&sibling));
+                leaves.push(key);
+            }
+        }
+        if level == depth {
+            records.reply("The needle is a quillwort.");
+        } else {
+            let next = records.call("Agent", ask(&format!("Level {}", level + 1)));
+            chain.push((key, records, call));
+            call = next;
+            continue;
+        }
+        chain.push((key, records, call.clone()));
+    }
+    /* Each call's result names the subagent it started, from the innermost out. */
+    for at in (1..chain.len()).rev() {
+        let inner = started(&chain[at].1);
+        let starting = chain[at].2.clone();
+        chain[at - 1]
+            .1
+            .result_with(&starting, json!("Done."), false, inner);
+    }
+    if let Some((_, outermost, first)) = chain.first() {
+        let outer = started(outermost);
+        session
+            .transcript
+            .result_with(first, json!("Done."), false, outer);
+    }
+    session.transcript.reply("The chain is done.");
+    session.title(title);
+    NestedSubagents {
+        key: session.key,
+        chain: chain.into_iter().map(|(key, ..)| key).collect(),
+        siblings: leaves,
+    }
+}
+
 /// A tool call written to a transcript.
 #[derive(Clone, Debug)]
 pub struct Call {
@@ -401,6 +549,8 @@ pub struct Records {
     parent: Option<String>,
     /// The filler's call that its next record answers.
     unanswered: Option<Call>,
+    /// The time the records written from now on carry, when one is set ([`Records::set_time`]).
+    clock: Option<String>,
 }
 
 impl Records {
@@ -422,7 +572,14 @@ impl Records {
             filled: 0,
             parent: None,
             unanswered: None,
+            clock: None,
         }
+    }
+
+    /// Makes the records written from now on carry the time `timestamp` (`2026-11-09T09:12:00Z`),
+    /// in place of one a second after the record before.
+    pub fn set_time(&mut self, timestamp: &str) {
+        self.clock = Some(timestamp.to_string());
     }
 
     /// Makes the next record follow the record `uuid` and not the last one written: the
@@ -477,8 +634,11 @@ impl Records {
         uuid
     }
 
-    /// When the next record is written: a second after the one before it.
+    /// When the next record is written: the time set, else a second after the one before it.
     fn time(&self) -> String {
+        if let Some(clock) = &self.clock {
+            return clock.clone();
+        }
         format!(
             "2026-01-01T{:02}:{:02}:{:02}.000Z",
             self.written / 3600 % 24,

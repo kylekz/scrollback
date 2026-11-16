@@ -170,6 +170,24 @@ pub(super) struct Block<'a> {
     pub source: Option<&'a RawValue>,
 }
 
+impl Block<'_> {
+    /// The call the block makes, its id and its tool's name: a `tool_use` with an id, a name
+    /// and an input. What the parse keeps as a call, and the outline counts.
+    pub fn call(&self) -> Option<(&str, &str)> {
+        match (self.kind.as_str(), &self.id, &self.name, self.input) {
+            ("tool_use", Some(id), Some(name), Some(_)) => Some((id, name)),
+            _ => None,
+        }
+    }
+
+    /// The call a `tool_result` block answers.
+    pub fn answers(&self) -> Option<&str> {
+        (self.kind == "tool_result")
+            .then_some(self.tool_use_id.as_deref())
+            .flatten()
+    }
+}
+
 /// An image block's `source`.
 #[derive(Deserialize)]
 pub(super) struct Source<'a> {
@@ -249,6 +267,7 @@ pub(super) struct ReadResult {
 #[serde(rename_all = "camelCase")]
 pub(super) struct ReadFile {
     pub num_lines: u64,
+    pub total_lines: Option<u64>,
 }
 
 /// The `toolUseResult` of an `Edit`: the hunks of the change.
@@ -279,9 +298,13 @@ pub(super) struct SearchResult {
     pub num_files: Option<u64>,
 }
 
-/// A hunk of a `structuredPatch`: its lines, each starting with ` `, `+` or `-`.
+/// A hunk of a `structuredPatch`: where it starts before and after, and its lines, each
+/// starting with ` `, `+` or `-`.
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct Hunk<'a> {
+    pub old_start: Option<u64>,
+    pub new_start: Option<u64>,
     #[serde(borrow)]
     pub lines: Vec<&'a RawValue>,
 }

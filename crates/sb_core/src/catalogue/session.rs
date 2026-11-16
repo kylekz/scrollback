@@ -119,6 +119,21 @@ pub(crate) struct Reading {
     pub newest_accepted: bool,
 }
 
+/**
+ * The versions of one of a session's items and the one of them that is read (PLAN §4.2): what
+ * the reader's History shows ([`Catalogue::history`]).
+ */
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct History {
+    pub item: i64,
+    /// Oldest first, each with how many syncs extended it: its segments after the first.
+    pub versions: Vec<(Version, usize)>,
+    /// The id of the version that is read: the owner's choice, else the rule's.
+    pub reading: i64,
+    /// Whether the owner chose it, in the rule's place.
+    pub chosen: bool,
+}
+
 /// A session whose row is missing, or is not of what the archive holds of the session now.
 pub(crate) struct Stale {
     pub id: SessionId,
@@ -779,6 +794,42 @@ impl Catalogue {
                 )?;
             }
             Ok(())
+        })
+    }
+
+    /// The history of the session `id`'s item `key`; `None` when it is not one of its items.
+    pub fn history(&self, id: &SessionId, key: &str) -> Result<Option<History>> {
+        let Some(reading) = self
+            .session_items(id)?
+            .into_iter()
+            .find(|reading| reading.key == key)
+        else {
+            return Ok(None);
+        };
+        self.db.read(|c| {
+            let versions = c
+                .prepare(&format!(
+                    "SELECT {VERSION}, (SELECT count(*) FROM segment WHERE version_id = v.id)
+                     FROM version v WHERE v.item_id = ?1 ORDER BY v.number"
+                ))?
+                .query_map([reading.item], |row| {
+                    let segments: usize = row.get(10)?;
+                    Ok((version_from(row, 0)?, segments.saturating_sub(1)))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            let chosen = c
+                .query_row(
+                    "SELECT version_id FROM reading_choice WHERE item_id = ?1",
+                    [reading.item],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            Ok(Some(History {
+                item: reading.item,
+                versions,
+                reading: reading.version,
+                chosen: chosen == Some(reading.version),
+            }))
         })
     }
 

@@ -99,13 +99,14 @@ fn a_press_outside_the_overlay_closes_it_whatever_the_button(cx: &mut TestAppCon
     let button = bounds(cx, "titlebar-sidebar")
         .expect("the sidebar's button")
         .center();
-    // On the main area and on the title bar (here its search field), with any button.
+    // On the main area and on the title bar (between the mark and the search field), with any
+    // button.
     for (x, y, mouse_button) in [
         (600., 300., MouseButton::Left),
         (600., 300., MouseButton::Right),
         (600., 300., MouseButton::Middle),
-        (500., 20., MouseButton::Left),
-        (500., 20., MouseButton::Right),
+        (220., 20., MouseButton::Left),
+        (220., 20., MouseButton::Right),
     ] {
         cx.simulate_keystrokes("secondary-b");
         assert_eq!(placement(&shell, cx), SidebarPlacement::Overlay);
@@ -151,7 +152,7 @@ fn a_material_change_reaches_the_window(cx: &mut TestAppContext) {
     shell.read_with(cx, |shell, _| {
         assert_eq!(
             shell.applied_material(),
-            crate::appearance::default_material()
+            crate::appearance::default_material(gpui_appearance::MaterialSupport::ALL)
         )
     });
     for material in [
@@ -203,7 +204,8 @@ fn the_window_opens_at_its_size_with_the_material(cx: &mut TestAppContext) {
     let options = cx.update(|_, cx| window_options(size(px(1440.), px(900.)), cx));
     assert_eq!(
         options.window_background,
-        crate::appearance::default_material().window_background(Backing::Solid)
+        crate::appearance::default_material(gpui_appearance::MaterialSupport::ALL)
+            .window_background(Backing::Solid)
     );
     // DESIGN §2.
     assert_eq!(options.window_min_size, Some(size(px(960.), px(600.))));

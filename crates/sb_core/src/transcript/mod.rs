@@ -22,8 +22,9 @@
 
 mod build;
 mod index;
+mod placement;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read as _};
 use std::ops::Index;
 use std::sync::Arc;
@@ -36,7 +37,10 @@ use thiserror::Error;
 use crate::provider::{Provider, ProviderId, SessionItems};
 
 pub use build::Builder;
-pub use index::{At, INDEX_VERSION, SessionIndex, Span, SpanKind, Totals, index};
+pub use index::{
+    At, INDEX_VERSION, InSubagent, SessionIndex, Span, SpanKind, Totals, index, searchable,
+};
+pub use placement::{Placed, place};
 
 /// A session as its provider parsed it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,61 +58,113 @@ pub struct Transcript {
 impl Transcript {
     /**
      * Reads every subagent's conversation that isn't read yet, and those of the subagents
-     * they started in turn. Under each call its subagents end in the order they started, and
-     * a subagent found under a call leaves [`Transcript::unattached`].
+     * they started in turn, and places each under the call that started it by the rule the
+     * reader places them by too ([`place`]). Under each call its subagents end in the order
+     * they started, and a subagent placed under a call leaves [`Transcript::unattached`]. A
+     * subagent the provider's parse read with the session (one whose records are in the
+     * session's own transcript) is where the parse put it.
      */
     pub fn read_subagents(&mut self, provider: &dyn Provider, items: &dyn SessionItems) {
-        let mut placed = HashSet::new();
-        if let Some(conversation) = &mut self.conversation {
-            read_under(conversation, provider, items, &mut placed, &mut Vec::new());
+        /* What the subagents the parse read already claim, then each other one read once. */
+        let mut claims: HashMap<Arc<str>, Vec<Arc<str>>> = HashMap::new();
+        if let Some(conversation) = &self.conversation {
+            claims_within(conversation, &mut claims);
         }
-        for index in 0..self.unattached.len() {
-            let item = self.unattached[index].item().clone();
-            if placed.contains(&item) {
-                continue;
+        for subagent in &self.unattached {
+            if let Subagent::Read { conversation, .. } = subagent {
+                claims.insert(
+                    subagent.item().clone(),
+                    conversation.claims().cloned().collect(),
+                );
+                claims_within(conversation, &mut claims);
             }
-            if matches!(self.unattached[index], Subagent::Unread { .. }) {
-                self.unattached[index] = provider.subagent(items, &item);
+        }
+        let first: Vec<Arc<str>> = (self.conversation.iter())
+            .flat_map(|conversation| conversation.claims().cloned())
+            .collect();
+        let roots: Vec<Arc<str>> = (self.unattached.iter())
+            .map(|subagent| subagent.item().clone())
+            .collect();
+        let mut read: HashMap<Arc<str>, Subagent> = HashMap::new();
+        let placed = place(&first, &roots, |item| {
+            if let Some(claims) = claims.get(item) {
+                return claims.clone();
             }
-            if let Subagent::Read { conversation, .. } = &mut self.unattached[index] {
-                read_under(conversation, provider, items, &mut placed, &mut vec![item]);
-            }
+            let subagent = provider.subagent(items, item);
+            let claimed = (subagent.conversation())
+                .map(|conversation| conversation.claims().cloned().collect())
+                .unwrap_or_default();
+            read.insert(item.clone(), subagent);
+            claimed
+        });
+        let mut taken = HashSet::new();
+        if let Some(conversation) = &mut self.conversation {
+            attach(conversation, None, &placed.parents, &mut read, &mut taken);
         }
         self.unattached
-            .retain(|subagent| !placed.contains(subagent.item()));
+            .retain(|subagent| placed.unattached.contains(subagent.item()));
+        for subagent in &mut self.unattached {
+            let item = subagent.item().clone();
+            if let Some(found) = read.remove(&item) {
+                *subagent = found;
+            }
+            if let Subagent::Read { conversation, .. } = subagent {
+                attach(
+                    conversation,
+                    Some(&item),
+                    &placed.parents,
+                    &mut read,
+                    &mut taken,
+                );
+            }
+        }
+    }
+}
+
+/// What the subagents read within `conversation` claim, by their items.
+fn claims_within(conversation: &Conversation, claims: &mut HashMap<Arc<str>, Vec<Arc<str>>>) {
+    let mut within = vec![conversation];
+    while let Some(conversation) = within.pop() {
+        for subagent in conversation.calls_all().flat_map(|call| &call.subagents) {
+            if let Subagent::Read { conversation, .. } = subagent {
+                claims.insert(
+                    subagent.item().clone(),
+                    conversation.claims().cloned().collect(),
+                );
+                within.push(conversation);
+            }
+        }
     }
 }
 
 /**
- * Reads the subagents the calls of `conversation` started, and theirs. `placed` gains every
- * item that is read under a call; an item already there stays unread under a second call that
- * claims it, as does one of `above`, the subagents this conversation is itself under. A
- * subagent its provider's parse read with the session (one whose records are in the
- * session's own transcript) is where the parse put it.
+ * Puts under the calls of `conversation`, the item `item` (`None` for the session's own), the
+ * subagents placed under it, as `read` holds them, and theirs; the first call that claims one
+ * takes it. One a call claims that is placed elsewhere stays unread there.
  */
-fn read_under(
+fn attach(
     conversation: &mut Conversation,
-    provider: &dyn Provider,
-    items: &dyn SessionItems,
-    placed: &mut HashSet<Arc<str>>,
-    above: &mut Vec<Arc<str>>,
+    item: Option<&Arc<str>>,
+    parents: &HashMap<Arc<str>, Arc<str>>,
+    read: &mut HashMap<Arc<str>, Subagent>,
+    taken: &mut HashSet<Arc<str>>,
 ) {
     for block in &mut conversation.blocks {
         let Content::ToolCall(call) = &mut block.content else {
             continue;
         };
         for subagent in &mut call.subagents {
-            let item = subagent.item().clone();
+            let claimed = subagent.item().clone();
             if matches!(subagent, Subagent::Unread { .. }) {
-                if above.contains(&item) || !placed.insert(item.clone()) {
+                if parents.get(&claimed) != item || !taken.insert(claimed.clone()) {
                     continue;
                 }
-                *subagent = provider.subagent(items, &item);
+                if let Some(found) = read.remove(&claimed) {
+                    *subagent = found;
+                }
             }
             if let Subagent::Read { conversation, .. } = subagent {
-                above.push(item);
-                read_under(conversation, provider, items, placed, above);
-                above.pop();
+                attach(conversation, Some(&claimed), parents, read, taken);
             }
         }
         call.subagents.sort_by_key(|subagent| {
@@ -202,6 +258,23 @@ impl Conversation {
         Some(times.fold((first, first), |(start, end), at| {
             (start.min(at), end.max(at))
         }))
+    }
+
+    /// Every tool call, on any branch, in the order recorded.
+    fn calls_all(&self) -> impl Iterator<Item = &ToolCall> {
+        self.blocks.iter().filter_map(|block| match &block.content {
+            Content::ToolCall(call) => Some(&**call),
+            _ => None,
+        })
+    }
+
+    /**
+     * The subagents its calls, on any branch, say they started, in the order recorded: what
+     * it claims when subagents are placed ([`place`]).
+     */
+    pub fn claims(&self) -> impl Iterator<Item = &Arc<str>> {
+        self.calls_all()
+            .flat_map(|call| call.subagents.iter().map(Subagent::item))
     }
 
     /// The tool calls on the shown branch, in order, each with its block.
@@ -365,6 +438,11 @@ pub enum ToolInput {
     ContentSearch {
         pattern: String,
         path: Option<String>,
+        /// Which files are searched, when not all: a file type, a glob, or both.
+        files: Option<String>,
+        /// What it was asked to return (the matching lines, the files, a count), in its
+        /// agent's own word.
+        mode: Option<String>,
     },
     FileSearch {
         pattern: String,
@@ -413,6 +491,12 @@ pub struct ToolResult {
     pub output: Vec<Output>,
     /// What can be said of the result without loading its output, where the agent recorded it.
     pub brief: Option<Brief>,
+    /**
+     * A file read whose text output gives each line's number in the file, as its provider
+     * writes them: leading spaces, the number, then this character (`cat -n` writes a tab).
+     * The reader shows the numbers apart from the file's lines.
+     */
+    pub numbered: Option<char>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -428,10 +512,15 @@ pub enum ToolStatus {
 pub enum Brief {
     /// The status a command that failed exited with.
     Exit(i32),
-    /// How many lines were read.
-    Lines(u64),
-    /// How many lines an edit added and removed.
-    Changed { added: u64, removed: u64 },
+    /// How many lines were read, and how many the file has, where the agent said.
+    Lines { lines: u64, total: Option<u64> },
+    /// How many lines an edit added and removed, and the lines of the file, before and after
+    /// it, where its first changed line is, where the agent said.
+    Changed {
+        added: u64,
+        removed: u64,
+        start: Option<(u64, u64)>,
+    },
     /// A file was written: whether it is new, and its lines.
     Written { new: bool, lines: u64 },
     /// How many matches a search found.
@@ -455,6 +544,21 @@ pub struct Image {
     /// Its MIME type, as `image/png`.
     pub media_type: String,
     pub data: Stored,
+}
+
+/**
+ * A subagent of a session as far as placing it needs: what it says it is, and the subagents
+ * its calls started, read without its conversation ([`Provider::outlines`]).
+ *
+ * [`Provider::outlines`]: crate::provider::Provider::outlines
+ */
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Outline {
+    /// The key of the item its conversation is.
+    pub item: Arc<str>,
+    pub kind: Option<String>,
+    pub description: Option<String>,
+    pub started: Vec<Arc<str>>,
 }
 
 /// A subagent, under the call that started it.
@@ -604,6 +708,107 @@ impl Stored {
     pub fn load_text(&self, items: &dyn SessionItems) -> Result<String, LoadError> {
         Ok(String::from_utf8_lossy(&self.load(items)?).into_owned())
     }
+
+    /**
+     * The start of the content as text, from about its first `limit` bytes as stored, and how
+     * many bytes as stored are after it (none when it is all of it): what shows the start of
+     * something that may be large without reading it whole. Base64 content is read whole.
+     */
+    pub fn load_head(
+        &self,
+        items: &dyn SessionItems,
+        limit: u64,
+    ) -> Result<(String, u64), LoadError> {
+        if self.length <= limit || self.encoding == Encoding::Base64 {
+            return Ok((self.load_text(items)?, 0));
+        }
+        let mut bytes = Vec::new();
+        items
+            .open(&self.item, self.offset)
+            .and_then(|reader| reader.take(limit).read_to_end(&mut bytes))
+            .map_err(|source| LoadError::Read {
+                item: self.item.clone(),
+                source,
+            })?;
+        if (bytes.len() as u64) < limit {
+            return Err(LoadError::Short {
+                item: self.item.clone(),
+                offset: self.offset,
+            });
+        }
+        /* Not the part of a character the limit cut. */
+        let whole = match str::from_utf8(&bytes) {
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            _ => bytes.len(),
+        };
+        let head = String::from_utf8_lossy(&bytes[..whole]);
+        /* Closed where it was cut, less what may be half of an escape or of a surrogate pair:
+        found in the text as written, not in what it decodes to. */
+        let used = match self.encoding {
+            Encoding::JsonString => whole_escapes(&head),
+            _ => head.len(),
+        };
+        let text = match self.encoding {
+            Encoding::JsonString => {
+                json_string(&format!("{}\"", &head[..used])).ok_or_else(|| LoadError::Encoding {
+                    item: self.item.clone(),
+                    offset: self.offset,
+                    encoding: self.encoding,
+                })?
+            }
+            _ => head.into_owned(),
+        };
+        Ok((text, self.length.saturating_sub(used as u64)))
+    }
+}
+
+/**
+ * How much of `literal`, the start of a JSON string cut anywhere (its opening quote included),
+ * ends at the end of a whole character: not inside an escape, nor between the two escapes of a
+ * surrogate pair.
+ */
+fn whole_escapes(literal: &str) -> usize {
+    let bytes = literal.as_bytes();
+    let unit = |at: usize| {
+        literal
+            .get(at + 2..at + 6)
+            .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+    };
+    let (mut at, mut whole) = (1, 1);
+    while at < bytes.len() {
+        if bytes[at] != b'\\' {
+            at += literal[at..].chars().next().map_or(1, char::len_utf8);
+            whole = at;
+            continue;
+        }
+        match bytes.get(at + 1) {
+            None => break,
+            Some(b'u') => {}
+            Some(_) => {
+                at += 2;
+                whole = at;
+                continue;
+            }
+        }
+        if at + 6 > bytes.len() {
+            break;
+        }
+        at += 6;
+        if unit(at - 6).is_some_and(|it| (0xD800..0xDC00).contains(&it)) {
+            /* A high surrogate: whole with its low one, or with what follows it when that is
+            no escape; the cut may be inside the low one's escape. */
+            let rest = &literal[at..];
+            if rest.len() < 6 && b"\\u".starts_with(&rest.as_bytes()[..rest.len().min(2)]) {
+                break;
+            }
+            if rest.starts_with("\\u") && unit(at).is_some_and(|it| (0xDC00..0xE000).contains(&it))
+            {
+                at += 6;
+            }
+        }
+        whole = at;
+    }
+    whole
 }
 
 /**
@@ -665,7 +870,74 @@ pub fn json_string(literal: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::json_string;
+    use std::io::{self, Read};
+
+    use super::{Encoding, SessionItems, Stored, json_string};
+    use crate::provider::SessionItem;
+
+    /// One item, whose bytes are these.
+    struct Bytes(Vec<u8>);
+
+    impl SessionItems for Bytes {
+        fn list(&self) -> &[SessionItem] {
+            &[]
+        }
+
+        fn open(&self, _: &str, offset: u64) -> io::Result<Box<dyn Read + '_>> {
+            Ok(Box::new(&self.0[offset as usize..]))
+        }
+    }
+
+    #[test]
+    fn the_head_of_content_is_read_without_the_rest_and_never_half_a_character() {
+        let stored = |bytes: &Bytes, encoding| Stored {
+            item: "item".into(),
+            offset: 0,
+            length: bytes.0.len() as u64,
+            encoding,
+        };
+        let plain = Bytes("ab\u{e9}cd".as_bytes().to_vec());
+        assert_eq!(
+            stored(&plain, Encoding::Plain)
+                .load_head(&plain, 3)
+                .unwrap(),
+            ("ab".to_string(), 4)
+        );
+        assert_eq!(
+            stored(&plain, Encoding::Plain)
+                .load_head(&plain, 64)
+                .unwrap(),
+            ("ab\u{e9}cd".to_string(), 0)
+        );
+        /* A JSON string cut inside an escape, wherever. */
+        let json = Bytes(br#""a\n\u00e9\ud83c\udf89 b""#.to_vec());
+        for limit in 2..json.0.len() as u64 {
+            let (head, rest) = stored(&json, Encoding::JsonString)
+                .load_head(&json, limit)
+                .unwrap();
+            assert!(rest > 0 && rest >= json.0.len() as u64 - limit);
+            assert!(
+                "a\n\u{e9}\u{1F389} b".starts_with(&head),
+                "{limit}: {head:?}"
+            );
+        }
+        /* Replacement characters the text holds, written or escaped, are text like any other;
+        a high surrogate cut from its low one, before anything or before a wide character, is
+        not kept. */
+        for text in [
+            format!("\"{}xyz\"", "\u{FFFD}".repeat(40)),
+            format!("\"{}xyz\"", "\\ufffd".repeat(10)),
+            "\"ab\\ud83c中文中文中文\"".to_string(),
+        ] {
+            let json = Bytes(text.into_bytes());
+            for limit in 2..json.0.len() as u64 {
+                let (head, _) = stored(&json, Encoding::JsonString)
+                    .load_head(&json, limit)
+                    .unwrap();
+                assert!(head.len() as u64 <= limit, "{limit}: {head:?}");
+            }
+        }
+    }
 
     #[test]
     fn a_json_string_reads_as_its_text() {

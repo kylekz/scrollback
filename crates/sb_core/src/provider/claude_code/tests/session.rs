@@ -186,7 +186,7 @@ turn 2
             .spans
             .iter()
             .find(|span| span.text == text)
-            .map(|span| (span.at, span.subagent))
+            .map(|span| (span.at, span.subagent.is_some()))
     };
     assert_eq!(
         at("Ninety lines."),
@@ -372,7 +372,7 @@ fn search_text_is_prompts_replies_and_what_calls_were_aimed_at() {
     let span = |at, kind, text: &str| Span {
         at,
         kind,
-        subagent: false,
+        subagent: None,
         text: text.to_string(),
     };
     assert_eq!(

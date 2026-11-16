@@ -28,6 +28,16 @@ pub struct Undone {
     pub refiled: usize,
 }
 
+/// What taking sessions out of Trash did ([`Catalogue::restore_all`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Restored {
+    /// Sessions deleted for good since, which nothing put back.
+    pub gone: usize,
+    /// Each session taken out of Trash: how it was filed while there, and the folder it is in
+    /// now, read in the same transaction.
+    pub moved: Vec<(SessionId, Filed, Option<FolderId>)>,
+}
+
 impl Undone {
     /// Whether everything was put back as it was.
     pub fn is_whole(&self) -> bool {
@@ -139,25 +149,31 @@ impl Catalogue {
     }
 
     /**
-     * Takes `ids` out of Trash, as [`Catalogue::restore`] does each: the Undo of moving them
-     * there. A session deleted for good since is left out and counted; one taken out already
-     * is where the Undo puts it.
+     * Takes `ids` out of Trash, as [`Catalogue::restore`] does each, in one change: Trash's
+     * Restore, and the Undo of moving them there. A session deleted for good since is left out
+     * and counted; one taken out already stays where it is. Says where each went.
      */
-    pub fn restore_all(&self, ids: &[SessionId]) -> Result<Undone> {
+    pub fn restore_all(&self, ids: &[SessionId]) -> Result<Restored> {
         self.db.write(|tx| {
-            let mut undone = Undone::default();
+            let mut restored = Restored::default();
             for id in ids {
                 match archived(tx, id) {
-                    Err(CatalogueError::NoSession(_)) => undone.gone += 1,
+                    Err(CatalogueError::NoSession(_)) => restored.gone += 1,
                     other => {
                         other?;
                         if trashed_at(tx, id)?.is_some() {
+                            let was = filed(tx, id)?;
                             restore(tx, id)?;
+                            let now = match filed(tx, id)? {
+                                Filed::ByRule(folder) | Filed::ByHand(folder) => Some(folder),
+                                Filed::Unsorted => None,
+                            };
+                            restored.moved.push((id.clone(), was, now));
                         }
                     }
                 }
             }
-            Ok(undone)
+            Ok(restored)
         })
     }
 
@@ -174,7 +190,7 @@ impl Catalogue {
     ) -> Result<FolderId> {
         let name = named(name)?;
         self.db.write(|tx| {
-            let folder = create(tx, &free_name(tx, name, parent, None)?, parent)?;
+            let folder = create(tx, &free_name(tx, &name, parent, None)?, parent)?;
             for id in sessions {
                 archived(tx, id)?;
                 set_state(tx, id, &[("folder_id", &folder.0), ("by_hand", &true)])?;

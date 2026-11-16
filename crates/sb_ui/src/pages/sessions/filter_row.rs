@@ -9,7 +9,7 @@ use std::rc::Rc;
 use gpui::Focusable as _;
 use gpui::{
     AnyElement, App, Bounds, Context, InteractiveElement as _, IntoElement, ParentElement as _,
-    Pixels, Point, SharedString, StatefulInteractiveElement as _, Styled as _, canvas, div, point,
+    Pixels, SharedString, StatefulInteractiveElement as _, Styled as _, div,
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::input::Input;
@@ -17,17 +17,17 @@ use gpui_component::input::Input;
 use super::SessionsView;
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{ButtonKind, button, icon};
+use crate::components::{ButtonKind, below, bounds_of, button, chip_base, icon};
 use crate::format;
+use crate::hostile;
 use crate::icons::SbIcon;
 use crate::menu::{self, Entry, Item};
 use crate::services::{ActiveServices as _, DateRange, PageView, view::RECENT_DAYS};
 use crate::theme::{SbTheme, StyledText as _};
 
-/// The filter field's width and height, and a chip's height (`.field`, `.chip`).
+/// The filter field's width and height (`.field`).
 const FIELD_WIDTH: Pixels = px(220.);
 const FIELD_HEIGHT: Pixels = px(26.);
-const CHIP_HEIGHT: Pixels = px(22.);
 /// The width of a chip's menu.
 const CHIP_MENU_WIDTH: Pixels = px(220.);
 
@@ -127,14 +127,14 @@ impl SessionsView {
             self.chip(
                 "branch",
                 "Branch",
-                view.branch.clone(),
+                view.branch.as_deref().map(hostile::label),
                 facets
                     .branches
                     .iter()
                     .map(|branch| {
                         let set = branch.clone();
                         (
-                            branch.clone(),
+                            hostile::label(branch),
                             Box::new(move |view: &mut PageView| view.branch = Some(set.clone()))
                                 as Setter,
                         )
@@ -404,56 +404,6 @@ impl SessionsView {
 
 /// What a filter menu's item sets.
 type Setter = Box<dyn Fn(&mut PageView)>;
-
-/// Keeps where its parent, a chip, was last drawn: its menu opens below it.
-fn bounds_of(at: Rc<Cell<Bounds<Pixels>>>) -> impl IntoElement {
-    canvas(move |bounds, _, _| at.set(bounds), |_, _, _, _| {})
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full()
-}
-
-/// Where a chip's menu opens: under it, from its left edge.
-fn below(chip: &Cell<Bounds<Pixels>>) -> Point<Pixels> {
-    chip.get().bottom_left() + point(px(0.), px(4.))
-}
-
-/// A chip (`.chip`: 22 high, `s2` with a `line-subtle` border, radius 999, 12px `fg2`), or a
-/// set one (`.chip.acc`).
-fn chip_base(
-    id: impl Into<gpui::ElementId>,
-    set: bool,
-    theme: &SbTheme,
-) -> gpui::Stateful<gpui::Div> {
-    let c = &theme.colors;
-    let hover = if set { c.accent_soft } else { c.s3 };
-    div()
-        .id(id)
-        .role(gpui::Role::Button)
-        .relative()
-        .flex_none()
-        .flex()
-        .items_center()
-        .gap(px(5.))
-        .h(CHIP_HEIGHT)
-        .px(theme.spacing.md)
-        .rounded(theme.radii.pill)
-        .border_1()
-        .whitespace_nowrap()
-        .text_spec(&theme.text.secondary)
-        .cursor_pointer()
-        .map(|this| {
-            if set {
-                this.bg(c.accent_soft)
-                    .border_color(gpui::transparent_black())
-                    .text_color(c.accent_text)
-            } else {
-                this.bg(c.s2).border_color(c.line_subtle).text_color(c.fg2)
-            }
-        })
-        .hover(move |style| style.bg(hover))
-}
 
 /// A segment of the cards / list switch (`.seg button`), `on` while it is the view shown.
 fn segment(

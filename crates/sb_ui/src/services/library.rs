@@ -30,19 +30,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
-use sb_core::archive::Archive;
+use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
+use sb_core::archive::{Archive, ArchiveError, Deleted};
 use sb_core::catalogue::{
-    Before, CatalogueError, Filed, Folder, FolderPath, LibraryCounts, PathGroup, Session,
-    SessionId, Shelf, Undone,
+    Before, CatalogueError, Deletion, Filed, Folder, FolderPath, LibraryCounts, PathGroup,
+    Restored, Session, SessionId, Shelf, Undone,
 };
 use sb_core::filing::{self, AttachedPath, FolderId, NormalPath};
 use sb_core::location::LocationId;
 
 use super::drag::DragState;
+use super::read_at::ReadAt;
 use super::view::{self, PageView, UnsortedView};
 use super::{ArchiveService, SyncEvent, SyncService};
 use crate::format;
+use crate::hostile::label;
 
 /// The sessions of a page that ended in one calendar month, as a range of the page's sessions.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,6 +87,9 @@ pub struct SessionsPage {
     pub stats: Stats,
     /// The shown folder's attached paths; none on the other pages.
     pub paths: Vec<PathChip>,
+    /// On Trash's page, what each session holds in the archive (DESIGN §4.8's Size); empty
+    /// on the others.
+    pub sizes: HashMap<SessionId, u64>,
 }
 
 impl SessionsPage {
@@ -119,6 +124,7 @@ impl SessionsPage {
             months,
             stats,
             paths,
+            sizes: HashMap::new(),
         }
     }
 
@@ -244,13 +250,24 @@ pub(super) fn load(archive: &Archive, shelf: Shelf) -> Result<Loaded, CatalogueE
                 }
                 _ => Vec::new(),
             };
-            Page::Sessions(SessionsPage::new(sessions, paths))
+            let mut page = SessionsPage::new(sessions, paths);
+            if shelf == Shelf::Trash {
+                page.sizes = catalogue.trash_sizes()?;
+            }
+            Page::Sessions(page)
         }
     };
     Ok(Loaded {
         shelf,
         counts: catalogue.library_counts()?,
-        folders: catalogue.folders()?,
+        /* A folder may be named after a transcript's project path, and one named before names
+        were cleaned may hold anything: each is drawn as it is read here. */
+        folders: (catalogue.folders()?.into_iter())
+            .map(|folder| Folder {
+                name: label(&folder.name),
+                ..folder
+            })
+            .collect(),
         attached: catalogue.attached_paths()?,
         agents: agents.len(),
         page,
@@ -268,6 +285,9 @@ pub enum LibraryEvent {
     /// The owner closed the window, or quit, and the paths editor's changes were saved or
     /// dropped: it closes, or the app quits, now.
     Leave(Leave),
+    /// A session was deleted for good: whatever keeps it (the palette's recent sessions)
+    /// forgets it.
+    DeletedForGood(SessionId),
 }
 
 /// A project path on a folder as the owner typed it, and the one location it is for: how the
@@ -318,6 +338,15 @@ pub enum Change {
     Restore {
         ids: Vec<SessionId>,
     },
+    /// Takes sessions out of Trash from its page (DESIGN §4.8), saying where each went.
+    RestoreFromTrash {
+        ids: Vec<SessionId>,
+    },
+    /// Deletes a session in Trash for good: exactly what its confirmation showed.
+    DeleteForGood {
+        deletion: Deletion,
+        session: Box<Session>,
+    },
     /// A folder's paths taken off and put on in one change: the editor's Save, attaching a
     /// group's path, and their Undo.
     ChangePaths {
@@ -359,11 +388,15 @@ enum Written {
     Trashed(Vec<SessionId>),
     /// An Undo, and what it could not put back.
     Undone(Undone),
+    /// Sessions were taken out of Trash: where each went.
+    Restored(Restored),
+    /// A session was deleted for good.
+    DeletedForGood(Deleted),
 }
 
 impl Change {
     /// Writes it, off the UI thread, each in one transaction.
-    fn write(&self, archive: &Archive) -> Result<Written, CatalogueError> {
+    fn write(&self, archive: &Archive) -> Result<Written, ArchiveError> {
         let catalogue = archive.catalogue();
         Ok(match self {
             Self::Star { ids, starred } => {
@@ -398,7 +431,14 @@ impl Change {
             }
             Self::Refile { before } => Written::Undone(catalogue.refile_as(before)?),
             Self::Trash { ids } => Written::Trashed(catalogue.trash_all(ids)?),
-            Self::Restore { ids } => Written::Undone(catalogue.restore_all(ids)?),
+            Self::Restore { ids } => Written::Undone(Undone {
+                gone: catalogue.restore_all(ids)?.gone,
+                refiled: 0,
+            }),
+            Self::RestoreFromTrash { ids } => Written::Restored(catalogue.restore_all(ids)?),
+            Self::DeleteForGood { deletion, .. } => {
+                Written::DeletedForGood(archive.delete_for_good(deletion)?)
+            }
             Self::ChangePaths {
                 folder,
                 detach,
@@ -427,19 +467,26 @@ impl Change {
         })
     }
 
-    /// What it is, for the owner and the log: "The name “work”" and the like.
+    /// What it is, for the owner and the log: "The name “work”" and the like, what it names
+    /// drawn as a label ([`label`]: a name or a path may be a transcript's).
     fn what(&self) -> String {
         match self {
             Self::Star { starred: true, .. } => "The star".to_string(),
             Self::Star { starred: false, .. } => "Removing the star".to_string(),
-            Self::NewFolder { name, .. } => format!("The new folder “{name}”"),
-            Self::Rename { name, .. } => format!("The name “{name}”"),
-            Self::FolderFrom { name, typed, .. } => format!("The folder “{name}” for {typed}"),
+            Self::NewFolder { name, .. } => format!("The new folder “{}”", label(name)),
+            Self::Rename { name, .. } => format!("The name “{}”", label(name)),
+            Self::FolderFrom { name, typed, .. } => {
+                format!("The folder “{}” for {}", label(name), label(typed))
+            }
             Self::FileByHand { .. } | Self::FileAutomatically { .. } => "Filing".to_string(),
             Self::Refile { .. } | Self::Restore { .. } => "Undoing".to_string(),
             Self::Trash { .. } => "Moving to Trash".to_string(),
+            Self::RestoreFromTrash { .. } => "Restoring".to_string(),
+            Self::DeleteForGood { session, .. } => {
+                format!("Deleting “{}” for good", title_of(session))
+            }
             Self::ChangePaths { .. } => "The change of paths".to_string(),
-            Self::MovePath { path, .. } => format!("Moving {}", path.0),
+            Self::MovePath { path, .. } => format!("Moving {}", label(&path.0)),
             Self::MoveFolder { .. } => "Moving the folder".to_string(),
             Self::DeleteFolder { .. } => "Deleting the folder".to_string(),
         }
@@ -450,6 +497,8 @@ impl Change {
 /// (DESIGN §4.14), shown once its change is written.
 #[derive(Clone, Debug)]
 pub struct Toast {
+    /// What it says. What it names (a session's title, a project's path, a folder) is a label
+    /// already ([`label`]).
     pub text: String,
     undo: Option<Change>,
 }
@@ -458,6 +507,58 @@ impl Toast {
     pub fn can_undo(&self) -> bool {
         self.undo.is_some()
     }
+}
+
+/// A session the owner asked to delete for good (DESIGN §4.8), and what that would remove.
+#[derive(Clone, Debug)]
+pub struct ForGood {
+    pub session: Session,
+    /// What deleting it removes, once it is read.
+    pub deletion: Option<Deletion>,
+    /// Why the last confirmation was refused: the session changed since it was shown, and
+    /// these are its numbers now, or its location is being synced (PLAN §4.5).
+    pub refused: Option<Refusal>,
+}
+
+/// Why a confirmation to delete for good was refused, and nothing deleted (PLAN §4.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The session changed since it was shown: the confirmation shows its numbers now.
+    Changed,
+    /// Its location was being synced; the confirmation forgets this once no sync runs.
+    Syncing,
+}
+
+impl Refusal {
+    pub fn said(self) -> &'static str {
+        match self {
+            Self::Changed => "It changed since this was shown. These are its numbers now.",
+            Self::Syncing => "Its location is being synced. Try again once the sync is done.",
+        }
+    }
+}
+
+/// The most characters of a title a toast says: a longer one is cut in its middle.
+const TOAST_TITLE: usize = 60;
+/// The most a toast that says why something was refused says of a title: its reason, which
+/// follows, is what matters.
+const REFUSAL_TITLE: usize = 32;
+
+/// A session's title as a toast says it.
+fn toast_title(session: &Session) -> String {
+    crate::components::middle_cut(&title_of(session), TOAST_TITLE)
+}
+
+/// What a session without a title is called.
+pub const UNTITLED: &str = "Untitled session";
+
+/// A session's title as it is drawn, one line with its controls shown
+/// ([`crate::hostile::label`]: a title is a transcript's text), or [`UNTITLED`].
+pub fn title_of(session: &Session) -> String {
+    session
+        .title
+        .as_deref()
+        .map_or_else(|| UNTITLED.to_string(), label)
 }
 
 /// What a new folder is called until it is named; the catalogue makes it "New folder 2" and on
@@ -471,7 +572,7 @@ const TOAST_TIME: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug)]
 pub enum Leave {
     Show(Shelf),
-    Open(Box<Session>),
+    Open(Box<Session>, Option<ReadAt>),
     /// Another folder's paths editor: its page, with the editor open.
     Edit(FolderId),
     /// Closing the window.
@@ -537,6 +638,8 @@ impl Drop for Unwritten {
 
 pub struct LibraryService {
     archive: Entity<ArchiveService>,
+    /// Whether a location is busy, for a confirmation refused while it was.
+    sync: Entity<SyncService>,
     shelf: Shelf,
     counts: LibraryCounts,
     folders: Vec<Folder>,
@@ -559,8 +662,11 @@ pub struct LibraryService {
     selected: Option<(SessionId, Option<usize>)>,
     /// Where a `Shift`-click's run starts ([`Self::anchor`]).
     anchor: Option<SessionId>,
-    /// The session whose reader is open.
+    /// The session whose reader is open, and where it opened when it opened at a match.
     open: Option<Session>,
+    read_at: Option<ReadAt>,
+    /// How many requests to open at a match there were.
+    read_requests: u64,
     loading: bool,
     /// A load was asked for while one ran or while changes were written.
     stale: bool,
@@ -577,6 +683,9 @@ pub struct LibraryService {
     /// The toast showing, and the one to show once the change being written is.
     toast: Option<Toast>,
     toast_in_hand: (u64, Option<Toast>),
+    /// The numbers of the changes that are Undos: their toast says "Undone", with no Undo of
+    /// its own.
+    undos: HashSet<u64>,
     /// The changes queued before the last Undo, by their number ([`Seen::changes`]), show no
     /// toast when they are written.
     quiet_before: u64,
@@ -587,6 +696,8 @@ pub struct LibraryService {
     asked: Option<Leave>,
     /// The folder the owner asked to delete, until they confirm or cancel.
     deleting: Option<FolderId>,
+    /// The session the owner asked to delete for good, until they confirm or cancel.
+    for_good: Option<ForGood>,
     /// The owner's changes still to write, the next first, each with the toast to show once
     /// it is.
     queue: VecDeque<(Change, Option<Toast>, u64)>,
@@ -605,7 +716,7 @@ pub struct LibraryService {
     creating: HashSet<String>,
     /// The group whose folder the catalogue refused to make, and why.
     refused: Option<(String, String)>,
-    _observers: [Subscription; 3],
+    _observers: [Subscription; 4],
 }
 
 /// What a load saw when it started: how many of the owner's changes had been made, and how
@@ -635,9 +746,25 @@ impl LibraryService {
                     this.seen.news += 1;
                     this.reload(cx);
                 }),
+                // A confirmation refused while its location synced forgets it once it doesn't.
+                cx.observe(&sync, |this, _, cx| {
+                    let waited = (this.for_good.as_ref())
+                        .filter(|asked| asked.refused == Some(Refusal::Syncing))
+                        .map(|asked| asked.session.id.location.clone());
+                    if let Some(location) = waited
+                        && !this.is_busy(&location, cx)
+                        && let Some(asked) = this.for_good.as_mut()
+                    {
+                        asked.refused = None;
+                        asked.deletion = None;
+                        this.read_deletion(cx);
+                        cx.notify();
+                    }
+                }),
                 cx.on_app_quit(Self::write_what_is_queued),
             ],
             archive,
+            sync,
             shelf: Shelf::All,
             counts: LibraryCounts::default(),
             folders: Vec::new(),
@@ -651,6 +778,8 @@ impl LibraryService {
             selected: None,
             anchor: None,
             open: None,
+            read_at: None,
+            read_requests: 0,
             loading: false,
             stale: false,
             failure: None,
@@ -660,11 +789,13 @@ impl LibraryService {
             drag: None,
             toast: None,
             toast_in_hand: (0, None),
+            undos: HashSet::new(),
             quiet_before: 0,
             toast_timer: None,
             hold: None,
             asked: None,
             deleting: None,
+            for_good: None,
             queue: VecDeque::new(),
             writing: None,
             in_hand: Arc::default(),
@@ -684,7 +815,8 @@ impl LibraryService {
         &self.counts
     }
 
-    /// Every folder, those with the same parent together and in their order.
+    /// Every folder, those with the same parent together and in their order, each name a label
+    /// ([`crate::hostile::label`]) wherever it is drawn.
     pub fn folders(&self) -> &[Folder] {
         &self.folders
     }
@@ -743,9 +875,13 @@ impl LibraryService {
     /// The sidebar's selected row (DESIGN §4.1): the page shown, or the folder of the session
     /// being read.
     pub fn highlighted(&self) -> Shelf {
-        match self.open.as_ref().map(|session| session.filed) {
-            Some(Filed::ByRule(folder) | Filed::ByHand(folder)) => Shelf::Folder(folder),
-            Some(Filed::Unsorted) | None => self.shelf,
+        match self.open.as_ref() {
+            Some(session) if session.trashed.is_some() => Shelf::Trash,
+            Some(Session {
+                filed: Filed::ByRule(folder) | Filed::ByHand(folder),
+                ..
+            }) => Shelf::Folder(*folder),
+            Some(_) | None => self.shelf,
         }
     }
 
@@ -779,6 +915,18 @@ impl LibraryService {
         }
     }
 
+    /**
+     * Whether `location` is busy: a pass or a fetch again runs there, or a change to one of its
+     * sessions deleted for good is being written. A delete for good there is refused then.
+     */
+    fn is_busy(&self, location: &LocationId, cx: &App) -> bool {
+        self.sync.read(cx).is_busy(location)
+            || super::ActiveServices::services(cx)
+                .upkeep
+                .read(cx)
+                .is_writing_at(location)
+    }
+
     /// Nothing is being read or written.
     pub fn is_settled(&self) -> bool {
         !self.loading && self.writing.is_none() && self.queue.is_empty()
@@ -795,6 +943,7 @@ impl LibraryService {
             return;
         }
         self.open = None;
+        self.read_at = None;
         if self.shelf != shelf {
             if let Some((Shelf::All, page)) = self.page.take_if(|(of, _)| *of == Shelf::All) {
                 self.all = Some((page, self.page_seen));
@@ -983,14 +1132,59 @@ impl LibraryService {
         }
     }
 
-    /// Opens a session's reader.
+    /// Opens a session's reader, at its start.
     pub fn open(&mut self, session: Session, cx: &mut Context<Self>) {
+        self.open_at(session, None, cx);
+    }
+
+    /**
+     * Opens a session's reader at `at`, a search match, or at its start. Each request is
+     * numbered anew ([`ReadAt::request`]), so that opening the same match again moves the
+     * reader again.
+     */
+    pub fn open_at(&mut self, session: Session, at: Option<ReadAt>, cx: &mut Context<Self>) {
         if self.hold.is_some() {
-            self.asked = Some(Leave::Open(Box::new(session)));
+            self.asked = Some(Leave::Open(Box::new(session), at));
         } else {
             self.open = Some(session);
+            self.read_at = at.map(|at| {
+                self.read_requests += 1;
+                ReadAt {
+                    request: self.read_requests,
+                    ..at
+                }
+            });
         }
         cx.notify();
+    }
+
+    /// The request to open the open session at a match, until the reader takes it (the docs
+    /// of [`ReadAt`]): what automation and the tests look at.
+    pub fn read_at(&self) -> Option<&ReadAt> {
+        self.read_at.as_ref()
+    }
+
+    /// Takes the request to open the open session at a match: once, by the reader.
+    pub fn take_read_at(&mut self) -> Option<ReadAt> {
+        self.read_at.take()
+    }
+
+    /**
+     * Shows the page of the folder `session` is in, or Unsorted, or Trash where it is in
+     * Trash, with the session selected there once the page is read (the palette's
+     * `Ctrl Enter`, DESIGN §4.9).
+     */
+    pub fn show_where(&mut self, session: &Session, cx: &mut Context<Self>) {
+        let shelf = match session.filed {
+            _ if session.trashed.is_some() => Shelf::Trash,
+            Filed::ByRule(folder) | Filed::ByHand(folder) => Shelf::Folder(folder),
+            Filed::Unsorted => Shelf::Unsorted,
+        };
+        self.show(shelf, cx);
+        if self.shelf == shelf && self.open.is_none() {
+            let at = self.sessions().and_then(|page| page.find(&session.id, 0));
+            self.selected = Some((session.id.clone(), at));
+        }
     }
 
     /// Selects and opens the session `id` of the shown page's sessions, last drawn at `hint`.
@@ -1037,6 +1231,62 @@ impl LibraryService {
             self.prune();
             cx.notify();
         }
+    }
+
+    /// Where the open session is among the sessions the page it was opened from shows, from 0,
+    /// and how many that page shows (DESIGN §4.2.1: "4 of 488"), as filtered and sorted.
+    pub fn open_place(&self) -> Option<(usize, usize)> {
+        let id = &self.open.as_ref()?.id;
+        let shown = self.shown();
+        let at = shown.iter().position(|(shown, _)| shown == id)?;
+        Some((at, shown.len()))
+    }
+
+    /// Opens the session `by` places after the open one (before, for a negative `by`) among
+    /// those the page it was opened from shows, and selects it there. Nothing happens past
+    /// either end.
+    pub fn open_step(&mut self, by: isize, cx: &mut Context<Self>) {
+        let Some((at, _)) = self.open_place() else {
+            return;
+        };
+        let Some((session, place)) = at
+            .checked_add_signed(by)
+            .and_then(|next| self.shown().get(next).cloned())
+            .and_then(|(id, place)| Some((self.session(&id)?.clone(), place)))
+        else {
+            return;
+        };
+        self.selected = Some((session.id.clone(), place));
+        self.chosen.clear();
+        self.open(session, cx);
+    }
+
+    /// Stars the open session, or takes its star away.
+    pub fn toggle_open_star(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = &mut self.open else {
+            return;
+        };
+        open.starred = !open.starred;
+        let (id, starred) = (open.id.clone(), open.starred);
+        if let Some((_, Page::Sessions(page))) = &mut self.page
+            && let Some(listed) = page.sessions.iter_mut().find(|session| session.id == id)
+        {
+            listed.starred = starred;
+        }
+        if starred {
+            self.counts.starred += 1;
+        } else {
+            self.counts.starred = self.counts.starred.saturating_sub(1);
+        }
+        self.write(
+            Change::Star {
+                ids: vec![id],
+                starred,
+            },
+            None,
+            cx,
+        );
+        cx.notify();
     }
 
     pub fn unsorted_view(&self) -> &UnsortedView {
@@ -1103,6 +1353,7 @@ impl LibraryService {
             && self.undoable(&undo)
         {
             self.write(undo, None, cx);
+            self.undos.insert(self.seen.changes);
             /* A change queued before it may still be being written: its toast would undo into
             a state that never was. */
             self.quiet_before = self.seen.changes;
@@ -1182,7 +1433,7 @@ impl LibraryService {
             self.hold = None;
             match asked {
                 Leave::Show(shelf) => self.show(shelf, cx),
-                Leave::Open(session) => self.open(*session, cx),
+                Leave::Open(session, at) => self.open_at(*session, at, cx),
                 Leave::Edit(folder) => self.edit_paths(folder, cx),
                 leave @ (Leave::Close | Leave::Quit) => cx.emit(LibraryEvent::Leave(leave)),
             }
@@ -1274,6 +1525,130 @@ impl LibraryService {
         cx.notify();
     }
 
+    /**
+     * Takes `ids` out of Trash, each back where it was filed; one whose folder was deleted
+     * meanwhile goes where the rules file it (decision 10). They leave the selection at once,
+     * and the toast says where they went and undoes it.
+     */
+    pub fn restore(&mut self, ids: Vec<SessionId>, cx: &mut Context<Self>) {
+        let restored: HashSet<&SessionId> = ids.iter().collect();
+        self.chosen.retain(|id| !restored.contains(id));
+        if self.selected().is_some_and(|id| restored.contains(id)) {
+            self.selected = None;
+        }
+        self.write(Change::RestoreFromTrash { ids }, None, cx);
+        cx.notify();
+    }
+
+    /// The session the owner asked to delete for good, until they answer.
+    pub fn for_good(&self) -> Option<&ForGood> {
+        self.for_good.as_ref()
+    }
+
+    /**
+     * Asks before deleting `session`, in Trash, for good (DESIGN §4.8): what it would remove
+     * is read off the UI thread, and the confirmation shows it once it is.
+     */
+    pub fn ask_delete_for_good(&mut self, session: Session, cx: &mut Context<Self>) {
+        self.for_good = Some(ForGood {
+            session,
+            deletion: None,
+            refused: None,
+        });
+        self.read_deletion(cx);
+        cx.notify();
+    }
+
+    /// Reads what deleting the session asked about for good would remove.
+    fn read_deletion(&mut self, cx: &mut Context<Self>) {
+        let (Some(archive), Some(asked)) = (
+            self.archive.read(cx).archive().cloned(),
+            self.for_good.as_ref(),
+        ) else {
+            return;
+        };
+        let id = asked.session.id.clone();
+        let job = cx.background_spawn({
+            let id = id.clone();
+            async move { archive.catalogue().deletion(&id) }
+        });
+        cx.spawn(async move |this, cx| {
+            let read = job.await;
+            this.update(cx, |this, cx| {
+                let Some(asked) = this.for_good.as_mut().filter(|it| it.session.id == id) else {
+                    return;
+                };
+                match read {
+                    Ok(deletion) => asked.deletion = Some(deletion),
+                    Err(error) => {
+                        log::warn!(
+                            "what deleting a session would remove couldn't be read: {error}"
+                        );
+                        let session = asked.session.clone();
+                        this.for_good = None;
+                        let said = this.not_deleted(&session, &error.into());
+                        this.show_toast(
+                            Toast {
+                                text: said,
+                                undo: None,
+                            },
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /**
+     * Takes in a delete for good of `session` refused with `error`, as its write would: what
+     * a test can't make the archive do at the moment it wants, such as a location syncing.
+     */
+    #[cfg(test)]
+    pub(crate) fn refused_for_good(
+        &mut self,
+        deletion: Deletion,
+        session: Session,
+        error: ArchiveError,
+        cx: &mut Context<Self>,
+    ) {
+        let change = Change::DeleteForGood {
+            deletion,
+            session: Box::new(session),
+        };
+        self.written(change, Err(error), cx);
+    }
+
+    /**
+     * Deletes the session asked about for good (`delete`), or leaves it in Trash. Deleting
+     * waits for what it removes to be read: until then the confirmation stays as it is.
+     */
+    pub fn answer_delete_for_good(&mut self, delete: bool, cx: &mut Context<Self>) {
+        if delete
+            && self
+                .for_good
+                .as_ref()
+                .is_some_and(|it| it.deletion.is_none())
+        {
+            return;
+        }
+        let Some(asked) = self.for_good.take() else {
+            return;
+        };
+        if let (true, Some(deletion)) = (delete, asked.deletion) {
+            self.chosen.remove(&deletion.session);
+            if self.selected() == Some(&deletion.session) {
+                self.selected = None;
+            }
+            let session = Box::new(asked.session);
+            self.write(Change::DeleteForGood { deletion, session }, None, cx);
+        }
+        cx.notify();
+    }
+
     /// Stars `ids`, or takes their stars away, at once on the page.
     pub fn star(&mut self, ids: Vec<SessionId>, starred: bool, cx: &mut Context<Self>) {
         if let Some((_, Page::Sessions(page))) = &mut self.page {
@@ -1340,7 +1715,7 @@ impl LibraryService {
         cx: &mut Context<Self>,
     ) {
         let toast = Toast {
-            text: format!("Moved {} to {}", path.0, self.folder_path(to)),
+            text: format!("Moved {} to {}", label(&path.0), self.folder_path(to)),
             undo: Some(Change::MovePath {
                 from: to,
                 path: path.clone(),
@@ -1413,6 +1788,7 @@ impl LibraryService {
 
     /// Goes back from the reader to the page it was opened from.
     pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.read_at = None;
         if self.open.take().is_some() {
             cx.notify();
         }
@@ -1627,14 +2003,56 @@ impl LibraryService {
     fn written(
         &mut self,
         change: Change,
-        written: Result<Written, CatalogueError>,
+        written: Result<Written, ArchiveError>,
         cx: &mut Context<Self>,
     ) {
         let (number, toast) = std::mem::take(&mut self.toast_in_hand);
+        /* Taken whether or not it was written: a refused Undo leaves no number behind. */
+        let undo = self.undos.remove(&number);
         let written = match (&change, written) {
             (_, Ok(written)) => written,
             (Change::FolderFrom { group, .. }, Err(error)) => {
-                self.refused = Some((group.clone(), error.to_string()));
+                self.refused = Some((group.clone(), label(&error.to_string())));
+                return;
+            }
+            /* Nothing was deleted (PLAN §4.5). The confirmation shows again, with why and the
+            numbers as they are now; or, while another session's is open, a toast says it. */
+            (
+                Change::DeleteForGood { session, .. },
+                Err(
+                    error @ (ArchiveError::Syncing(_)
+                    | ArchiveError::Catalogue(CatalogueError::DeletionChanged(_))),
+                ),
+            ) if self
+                .for_good
+                .as_ref()
+                .is_none_or(|open| open.session.id == session.id) =>
+            {
+                /* Refused as its location was busy, the confirmation says so only while it still
+                is; otherwise it shows its numbers read again, Cancel taking the keyboard back,
+                as for a session that changed. */
+                let busy = self.is_busy(&session.id.location, cx);
+                self.for_good = Some(ForGood {
+                    session: (**session).clone(),
+                    deletion: None,
+                    refused: Some(match error {
+                        ArchiveError::Syncing(_) if busy => Refusal::Syncing,
+                        _ => Refusal::Changed,
+                    }),
+                });
+                self.read_deletion(cx);
+                return;
+            }
+            (Change::DeleteForGood { session, .. }, Err(error)) => {
+                log::warn!("{} was refused: {error}", change.what());
+                let said = self.not_deleted(session, &error);
+                self.show_toast(
+                    Toast {
+                        text: said,
+                        undo: None,
+                    },
+                    cx,
+                );
                 return;
             }
             (change, Err(error)) => {
@@ -1690,6 +2108,37 @@ impl LibraryService {
                 text: undone_text(undone),
                 undo: None,
             }),
+            Written::Restored(restored) => Some(Toast {
+                text: self.restored(&restored),
+                undo: (!restored.moved.is_empty()).then(|| Change::Trash {
+                    ids: restored.moved.into_iter().map(|(id, ..)| id).collect(),
+                }),
+            }),
+            Written::DeletedForGood(deleted) => Some(Toast {
+                text: match (&change, deleted.pending) {
+                    (Change::DeleteForGood { session, .. }, 0) => {
+                        format!("Deleted “{}” for good", toast_title(session))
+                    }
+                    (Change::DeleteForGood { session, .. }, _) => format!(
+                        "Deleted “{}” for good. Its files are being removed in the background",
+                        toast_title(session)
+                    ),
+                    _ => "Deleted for good".to_string(),
+                },
+                undo: None,
+            }),
+        };
+        if let Change::DeleteForGood { deletion, .. } = &change {
+            cx.emit(LibraryEvent::DeletedForGood(deletion.session.clone()));
+        }
+        // An Undo says it is done, or what it couldn't put back; it has no Undo of its own.
+        let toast = match toast {
+            _ if !undo => toast,
+            Some(Toast { undo: None, text }) => Some(Toast { text, undo: None }),
+            _ => Some(Toast {
+                text: "Undone".to_string(),
+                undo: None,
+            }),
         };
         // Toasts of changes queued before an Undo say nothing: the Undo has the last word.
         if let Some(toast) = toast.filter(|_| number >= self.quiet_before) {
@@ -1730,20 +2179,93 @@ impl LibraryService {
         }
     }
 
-    /// Why the catalogue refused a change, said as the owner knows things: no folder ids.
-    fn why(&self, error: &CatalogueError) -> String {
+    /**
+     * Where a restore put sessions (decision 10): "Restored to fc", "Restored; its folder is
+     * gone, so its path filed it in work", "3 sessions restored", with those deleted for good
+     * meanwhile counted.
+     */
+    fn restored(&self, restored: &Restored) -> String {
+        let place = |folder: Option<FolderId>| match folder {
+            Some(folder) => self.folder_path(folder),
+            None => "Unsorted".to_string(),
+        };
+        let gone = restored.gone;
+        let said = match &restored.moved[..] {
+            [] => String::new(),
+            [(_, Filed::ByRule(was) | Filed::ByHand(was), now)] if self.folder(*was).is_none() => {
+                match now {
+                    Some(now) => format!(
+                        "Restored: its folder is gone, so its path filed it in {}",
+                        place(Some(*now))
+                    ),
+                    None => {
+                        "Restored to Unsorted: its folder is gone, and no folder's path claims it"
+                            .to_string()
+                    }
+                }
+            }
+            [(_, _, now)] => format!("Restored to {}", place(*now)),
+            several => format!("{} restored", format::plural(several.len(), "session")),
+        };
+        match (said.is_empty(), gone) {
+            (_, 0) => said,
+            (true, 1) => "The session was deleted for good meanwhile".to_string(),
+            (true, n) => format!("{n} sessions were deleted for good meanwhile"),
+            (false, n) => format!(
+                "{said}; {} deleted for good meanwhile",
+                format::plural(n, "session")
+            ),
+        }
+    }
+
+    /**
+     * Why deleting `session` for good was refused, as the owner knows it. Its title is cut to
+     * [`REFUSAL_TITLE`] characters, so that why still shows in a narrow window's toast.
+     */
+    fn not_deleted(&self, session: &Session, error: &ArchiveError) -> String {
+        let title = crate::components::middle_cut(&title_of(session), REFUSAL_TITLE);
         match error {
-            CatalogueError::NoFolder(_) => "the folder was deleted".to_string(),
-            CatalogueError::NoSession(_) => "a session was deleted for good".to_string(),
-            CatalogueError::NotAttached(typed) => {
+            ArchiveError::Catalogue(CatalogueError::NotInTrash(_)) => {
+                format!("“{title}” was restored, so it wasn't deleted")
+            }
+            ArchiveError::Catalogue(CatalogueError::NoSession(_)) => {
+                format!("“{title}” is deleted already")
+            }
+            ArchiveError::Syncing(_) => format!(
+                "“{title}” wasn't deleted: its location is being synced. Try again once the \
+                 sync is done"
+            ),
+            ArchiveError::Catalogue(CatalogueError::DeletionChanged(_)) => format!(
+                "“{title}” wasn't deleted: it changed since it was shown. Ask again to see what \
+                 it holds now"
+            ),
+            error => format!(
+                "“{title}” couldn't be deleted for good: {}",
+                self.why(error)
+            ),
+        }
+    }
+
+    /// Why a change was refused, said as the owner knows things: no folder ids.
+    fn why(&self, error: &ArchiveError) -> String {
+        let why = match error {
+            ArchiveError::Catalogue(CatalogueError::NoFolder(_)) => {
+                "the folder was deleted".to_string()
+            }
+            ArchiveError::Catalogue(CatalogueError::NoSession(_)) => {
+                "a session was deleted for good".to_string()
+            }
+            ArchiveError::Catalogue(CatalogueError::NotAttached(typed)) => {
                 format!("{typed} isn't attached to that folder any more")
             }
-            CatalogueError::PathAttached { folder, typed, .. } => format!(
+            ArchiveError::Catalogue(CatalogueError::PathAttached { folder, typed, .. }) => format!(
                 "{typed} is already attached to {}",
                 self.folder_path(*folder)
             ),
             error => error.to_string().trim_end_matches('.').to_string(),
-        }
+        };
+        /* It may name a path, or say what a file it couldn't read held. */
+        label(&why)
     }
 
     /// Whether an Undo can still be done: the folders it names are still there.

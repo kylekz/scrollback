@@ -64,6 +64,7 @@ use crate::icons::SbIcon;
 use crate::keymap;
 use crate::menu;
 use crate::services::library::LibraryEvent;
+use crate::services::library::title_of;
 use crate::services::{
     ActiveServices as _, Dragged, DropTarget, Facets, LibraryService, Month, PageView, PathChip,
     SessionsPage, Stats, SyncService, view,
@@ -1104,11 +1105,7 @@ impl SessionsView {
         let lifted = drag::lifts_session(library, &session.id);
         // The hover bar shows on the selected card and on the one under the pointer.
         let barred = selected || self.hovered.as_ref() == Some(&session.id);
-        let title: SharedString = session
-            .title
-            .clone()
-            .unwrap_or_else(|| "Untitled session".to_string())
-            .into();
+        let title: SharedString = title_of(session).into();
         // With one agent in the archive a card names the model alone (DESIGN §4.2.10).
         let model = agents::model(&session.id.provider, &session.models, cx);
         let agent = (library.agents() > 1 || model.is_none())
@@ -1393,7 +1390,9 @@ impl SessionsView {
                     .text_ellipsis()
                     .text_color(c.fg2)
                     .text_spec(&theme.text.secondary)
-                    .child(session.first_prompt.clone().unwrap_or_default()),
+                    .child(crate::hostile::label(
+                        session.first_prompt.as_deref().unwrap_or_default(),
+                    )),
             )
             .child(
                 div()
@@ -1510,9 +1509,6 @@ const HOVER_BUTTONS: f32 = 4.;
 
 /// How a card or a row that is dragged stays in place (`.scard.lifted`).
 const LIFTED_OPACITY: f32 = 0.45;
-
-/// What a session is called when its agent stored no title and it has no prompt.
-const UNTITLED: &str = "Untitled session";
 
 /// A button of a card's hover bar (26 square), with its label for assistive technology.
 fn hover_button(id: impl Into<ElementId>, label: String, theme: &SbTheme) -> gpui::Stateful<Div> {
@@ -1644,7 +1640,7 @@ fn paths_line(
                         .overflow_hidden()
                         .text_ellipsis_middle()
                         .text_spec(&theme.text.path)
-                        .child(path.typed.clone()),
+                        .child(crate::hostile::label(&path.typed)),
                 )
                 .child(
                     div()

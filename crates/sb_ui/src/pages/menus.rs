@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 
-use gpui::{App, ClipboardItem, Pixels, px};
+use gpui::{App, Pixels, px};
 use sb_core::catalogue::{Filed, Session, SessionId, Shelf};
 use sb_core::filing::FolderId;
 
@@ -66,7 +66,7 @@ pub fn session_menu(session: &Session, ids: Vec<SessionId>, cx: &App) -> Vec<Ent
         Entry::Item(match path {
             Some(path) => Item::new("copy-path", "Copy project path")
                 .glyph(SbIcon::Copy)
-                .on(move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(path.clone()))),
+                .on(move |_, cx| crate::system::copy_text(path.clone(), cx)),
             None => Item::new("copy-path", "Copy project path")
                 .glyph(SbIcon::Copy)
                 .off("This session recorded no project path"),

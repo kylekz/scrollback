@@ -18,7 +18,8 @@ pub mod tokens;
 mod tests;
 
 use gpui::{
-    App, BoxShadow, FontWeight, Global, Hsla, Pixels, Rgba, SharedString, Styled, point, px,
+    App, BoxShadow, FontFeatures, FontWeight, Global, Hsla, Pixels, Rgba, SharedString, Styled,
+    point, px,
 };
 use gpui_component::{Theme, ThemeMode, ThemeTokens};
 
@@ -75,6 +76,7 @@ pub struct SbColors {
     pub blue: Hsla,
     pub green_soft: Hsla,
     pub red_soft: Hsla,
+    pub danger_fill: Hsla,
     pub yellow_soft: Hsla,
     pub blue_soft: Hsla,
     pub scrim: Hsla,
@@ -129,6 +131,7 @@ impl SbColors {
             blue: c(t.blue),
             green_soft: c(t.green_soft),
             red_soft: c(t.red_soft),
+            danger_fill: c(t.danger_fill),
             yellow_soft: c(t.yellow_soft),
             blue_soft: c(t.blue_soft),
             scrim: c(t.scrim),
@@ -187,6 +190,9 @@ pub struct TextSpec {
     pub size: Pixels,
     pub line_height: Pixels,
     pub weight: FontWeight,
+    /// Whether the face may join characters into ligatures: not the code face, whose text is
+    /// source and output to be read as it was written (`->` is two characters, not an arrow).
+    pub ligatures: bool,
 }
 
 impl TextSpec {
@@ -196,6 +202,7 @@ impl TextSpec {
             size: px(size),
             line_height: px(line_height),
             weight,
+            ligatures: family.as_ref() != fonts::JETBRAINS_MONO,
         }
     }
 }
@@ -245,8 +252,33 @@ pub struct TypeScale {
     pub empty_title: TextSpec,
     /// 14/21 the paragraph under a state's title (`E-First-Run`).
     pub lead: TextSpec,
+    /// 15/24 transcript prose: prompts and replies (DESIGN §1.3 "Reading").
+    pub reading: TextSpec,
+    /// 13/20 prose inside a nested panel or a tool's result.
+    pub reading_nested: TextSpec,
+    /// Markdown headings: 20/28 for the first level, which DESIGN leaves out, then DESIGN's
+    /// 17/24 `h2` and 14/20 `h3`, all at 600.
+    pub heading1: TextSpec,
+    pub heading2: TextSpec,
+    pub heading3: TextSpec,
+    /// 12.5 JetBrains Mono inline code, on its line's height.
+    pub inline_code: TextSpec,
+    /// 12/20 JetBrains Mono a fenced code block.
+    pub code_block: TextSpec,
+    /// 12/19 JetBrains Mono a call body's text (`callbody pre`).
+    pub code: TextSpec,
+    /// 12/16 at 600 who wrote a message, over it ("You", the model).
+    pub author: TextSpec,
+    /// 12/16 JetBrains Mono an activity row's target, and at 500 its tool's name.
+    pub activity: TextSpec,
+    pub activity_name: TextSpec,
+    /// 12.5/20 a collapsed thought, and 13/20 an open one, both drawn italic.
+    pub thought: TextSpec,
+    pub thought_open: TextSpec,
     /// 15/20 a sheet's or a dialog's title.
     pub sheet_title: TextSpec,
+    /// 17/24 a section's title in Settings.
+    pub section_title: TextSpec,
     /// 11/16 JetBrains Mono: a tool's own words in a box of their own (DESIGN §4.11).
     pub said: TextSpec,
 }
@@ -276,7 +308,21 @@ impl TypeScale {
             state_title: TextSpec::new(&fonts.ui, 22., 28., semibold),
             empty_title: TextSpec::new(&fonts.ui, 15., 20., semibold),
             lead: TextSpec::new(&fonts.ui, 14., 21., regular),
+            reading: TextSpec::new(&fonts.ui, 15., 24., regular),
+            reading_nested: TextSpec::new(&fonts.ui, 13., 20., regular),
+            heading1: TextSpec::new(&fonts.ui, 20., 28., semibold),
+            heading2: TextSpec::new(&fonts.ui, 17., 24., semibold),
+            heading3: TextSpec::new(&fonts.ui, 14., 20., semibold),
+            inline_code: TextSpec::new(&fonts.mono, 12.5, 18., regular),
+            code_block: TextSpec::new(&fonts.mono, 12., 20., regular),
+            code: TextSpec::new(&fonts.mono, 12., 19., regular),
+            author: TextSpec::new(&fonts.ui, 12., 16., semibold),
+            activity: TextSpec::new(&fonts.mono, 12., 16., regular),
+            activity_name: TextSpec::new(&fonts.mono, 12., 16., medium),
+            thought: TextSpec::new(&fonts.ui, 12.5, 20., regular),
+            thought_open: TextSpec::new(&fonts.ui, 13., 20., regular),
             sheet_title: TextSpec::new(&fonts.ui, 15., 20., semibold),
+            section_title: TextSpec::new(&fonts.ui, 17., 24., semibold),
             said: TextSpec::new(&fonts.mono, 11., 16., regular),
         }
     }
@@ -285,10 +331,16 @@ impl TypeScale {
 /// Applies a [`TextSpec`] to any styled element.
 pub trait StyledText: Styled + Sized {
     fn text_spec(self, spec: &TextSpec) -> Self {
-        self.font_family(spec.family.clone())
+        let styled = self
+            .font_family(spec.family.clone())
             .text_size(spec.size)
             .line_height(spec.line_height)
-            .font_weight(spec.weight)
+            .font_weight(spec.weight);
+        if spec.ligatures {
+            styled
+        } else {
+            styled.font_features(FontFeatures::disable_ligatures())
+        }
     }
 }
 
@@ -369,6 +421,37 @@ pub struct Sizes {
     pub window_min_height: Pixels,
     /// Below this window width the sidebar collapses (DESIGN §2, "Narrow windows").
     pub sidebar_collapse_width: Pixels,
+    /// Below this window width the reader's facts margin gives way to a toggle (DESIGN §2).
+    pub facts_collapse_width: Pixels,
+    /// The reader (DESIGN §4.2): its column at most 720 wide with 32 at its sides, 28 above its
+    /// first block and 16 between blocks.
+    pub reading_width: Pixels,
+    pub reading_side: Pixels,
+    pub reading_top: Pixels,
+    pub block_gap: Pixels,
+    /// A small square button beside a message or in a call's header (Copy).
+    pub small_button: Pixels,
+    /// The header's star button.
+    pub star_button: Pixels,
+    /// An activity row: 26, 24 inside a subagent's panel; its tool's name 44 wide; and how far
+    /// in a call's body hangs, past the row's icon.
+    pub activity_row: Pixels,
+    pub activity_row_nested: Pixels,
+    pub activity_name_width: Pixels,
+    /// The widest an activity row's label column grows to fit the labels on screen.
+    pub activity_name_max: Pixels,
+    pub call_indent: Pixels,
+    /// A call body's header and footer.
+    pub call_header: Pixels,
+    pub call_footer: Pixels,
+    /// A collapsed thought's row.
+    pub thought_row: Pixels,
+    /// A prompt's image as a thumbnail (`shot`), and its caption.
+    pub shot_width: Pixels,
+    pub shot_height: Pixels,
+    pub shot_caption: Pixels,
+    /// The highest an image a tool returned is drawn (DESIGN §4.2.4).
+    pub tool_image_max_height: Pixels,
     /// The locations sheet, and its list (DESIGN §1.4).
     pub sheet_width: Pixels,
     pub sheet_height: Pixels,
@@ -397,6 +480,11 @@ pub struct Sizes {
     pub list_row_padding: Pixels,
     /// The label column of a connection test's result (`E-Add-Location`).
     pub result_label_width: Pixels,
+    /// Settings: its header, its list of sections, and its column at its widest
+    /// (DESIGN §4.13).
+    pub settings_header_height: Pixels,
+    pub settings_nav_width: Pixels,
+    pub settings_column_width: Pixels,
 }
 
 impl Default for Sizes {
@@ -446,6 +534,25 @@ impl Default for Sizes {
             window_min_width: px(960.),
             window_min_height: px(600.),
             sidebar_collapse_width: px(1040.),
+            facts_collapse_width: px(1280.),
+            reading_width: px(720.),
+            reading_side: px(32.),
+            reading_top: px(28.),
+            block_gap: px(16.),
+            small_button: px(22.),
+            star_button: px(24.),
+            activity_row: px(26.),
+            activity_row_nested: px(24.),
+            activity_name_width: px(44.),
+            activity_name_max: px(96.),
+            call_indent: px(30.),
+            call_header: px(26.),
+            call_footer: px(24.),
+            thought_row: px(22.),
+            shot_width: px(200.),
+            shot_height: px(116.),
+            shot_caption: px(24.),
+            tool_image_max_height: px(320.),
             sheet_width: px(1200.),
             sheet_height: px(790.),
             sheet_list_width: px(540.),
@@ -462,6 +569,9 @@ impl Default for Sizes {
             pane_padding: px(20.),
             list_row_padding: px(10.),
             result_label_width: px(110.),
+            settings_header_height: px(44.),
+            settings_nav_width: px(200.),
+            settings_column_width: px(780.),
         }
     }
 }

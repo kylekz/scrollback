@@ -1,0 +1,138 @@
+{"scenario": {"window_size": "1440x900", "fixture": "settings", "description": "Settings (DESIGN §4.13, E-Settings-Archive, E-Settings) over an archive with a distro, two damaged transcripts (one still at the distro, one gone from it) and two sessions deleted for good: opened with Ctrl , and from the gear, Back and Esc; the archive's folder, its size and Show in the file manager through the seam; Verify with one row per problem, Fetch again and the damaged chip; Allow archiving again and Undo; Sync every and Stale after; Theme; Shortcuts from the keymap; each section captured dark and light"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/sync/syncing", "equals": false}, {"pointer": "/settings/sync_every", "equals": "15m"}, {"pointer": "/settings/stale_after", "equals": 7}]}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+
+// Ctrl , opens Settings over the page; the gear is on while they show. Back goes to All sessions, and so does Esc.
+{"cmd": "key", "keystroke": "secondary-,"}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "settings"}, {"pointer": "/settings/section", "equals": "archive"}, {"pointer": "/settings/default", "equals": true}, {"pointer": "/settings/archive", "contains": "archive"}, {"pointer": "/settings/verify/last", "equals": null}]}
+{"cmd": "bounds", "target": "settings/back", "expect_result": [{"pointer": "/x", "equals": 260}, {"pointer": "/w", "equals": 28}, {"pointer": "/h", "equals": 28}]}
+{"cmd": "bounds", "target": "settings/nav/archive", "expect_result": [{"pointer": "/x", "equals": 258}, {"pointer": "/w", "gte": 179}, {"pointer": "/w", "lte": 180}, {"pointer": "/h", "equals": 32}]}
+{"cmd": "bounds", "target": "settings/section/archive", "expect_result": [{"pointer": "/x", "gte": 480}, {"pointer": "/x", "lte": 481}, {"pointer": "/w", "equals": 716}]}
+{"cmd": "click", "target": "settings/back"}
+{"cmd": "settle", "expect": {"pointer": "/page", "equals": "sessions"}}
+{"cmd": "click", "target": "titlebar/settings"}
+{"cmd": "settle", "expect": {"pointer": "/page", "equals": "settings"}}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": {"pointer": "/page", "equals": "sessions"}}
+{"cmd": "key", "keystroke": "secondary-,"}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "settings"}, {"pointer": "/settings/stats/sessions", "gte": 1}, {"pointer": "/settings/deleted", "len": 2}, {"pointer": "/settings/deleted/0/location", "equals": "user@macbook"}]}
+{"cmd": "bounds", "target": "settings/archive/default", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "archive-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "archive-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// Show in Explorer or Finder asks the system, which a scripted run never does: the request is recorded with the archive's folder.
+{"cmd": "click", "target": "settings/archive/reveal"}
+{"cmd": "settle", "expect": [{"pointer": "/system/0/kind", "equals": "reveal"}, {"pointer": "/system/0/path", "contains": "archive"}]}
+
+// Verify finds both damaged transcripts: the one the distro still has can be fetched again; the one it no longer has is damaged.
+{"cmd": "click", "target": "settings/verify/run"}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/settings/verify/running", "equals": false}, {"pointer": "/settings/verify/last/problems", "len": 2}, {"pointer": "/settings/verify/last/problems", "contains": {"fix": "fetch_again"}}, {"pointer": "/settings/verify/last/problems", "contains": {"fix": "damaged"}}]}
+{"cmd": "bounds", "target": "settings/verify/result", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "verified-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "verified-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// Fetch again: the distro still has the first, so it is stored as a new version and the row says so; the damaged version stays.
+{"cmd": "click", "target": "settings/verify/problem/0/fetch"}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/settings/verify/last/problems/0/refetch", "equals": "done"}, {"pointer": "/settings/verify/last/problems/0/fix", "equals": "fetched"}, {"pointer": "/settings/verify/last/problems/1/fix", "equals": "damaged"}]}
+{"cmd": "bounds", "target": "settings/verify/problem/0/fetched", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "settings/verify/problem/1/damaged", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "fetched-dark"}
+
+// Allow archiving again, then Undo: the row says what will happen, and Undo puts it back as it was.
+{"cmd": "click", "target": "settings/deleted/0/allow"}
+{"cmd": "settle", "expect": [{"pointer": "/settings/deleted/0/allowed", "equals": true}, {"pointer": "/settings/deleted", "len": 2}]}
+{"cmd": "screenshot", "name": "allowed-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "allowed-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "click", "target": "settings/deleted/0/undo"}
+{"cmd": "settle", "expect": {"pointer": "/settings/deleted/0/allowed", "equals": false}}
+
+// The list picks the section a click scrolls to. Sync every is a menu; Esc closes it before Settings.
+{"cmd": "click", "target": "settings/nav/sync"}
+{"cmd": "settle", "expect": {"pointer": "/settings/section", "equals": "sync"}}
+{"cmd": "screenshot", "name": "sync-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "sync-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "click", "target": "settings/sync/every"}
+{"cmd": "settle"}
+{"cmd": "query", "prefix": "settings/sync/every/", "expect_result": {"pointer": "", "len": 5}}
+{"cmd": "screenshot", "name": "sync-every-menu-dark"}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": {"pointer": "/page", "equals": "settings"}}
+{"cmd": "query", "prefix": "settings/sync/every/", "expect_result": {"pointer": "", "len": 0}}
+{"cmd": "click", "target": "settings/sync/every"}
+{"cmd": "click", "target": "settings/sync/every/60m"}
+{"cmd": "settle", "expect": [{"pointer": "/settings/sync_every", "equals": "60m"}, {"pointer": "/settings/next_round", "equals": true}]}
+{"cmd": "click", "target": "settings/sync/every"}
+{"cmd": "click", "target": "settings/sync/every/asked"}
+{"cmd": "settle", "expect": [{"pointer": "/settings/sync_every", "equals": "asked"}, {"pointer": "/settings/next_round", "equals": false}]}
+
+// Stale after takes whole days, 1 to 90, and is the archive's.
+{"cmd": "click", "target": "settings/sync/stale-after"}
+{"cmd": "key", "keystroke": "secondary-a"}
+{"cmd": "type", "text": "14\n"}
+{"cmd": "settle", "expect": {"pointer": "/settings/stale_after", "equals": 14}}
+
+// Appearance: Theme, and the materials this platform offers.
+{"cmd": "click", "target": "settings/nav/appearance"}
+{"cmd": "settle", "expect": {"pointer": "/settings/section", "equals": "appearance"}}
+{"cmd": "click", "target": "settings/appearance/theme/light"}
+{"cmd": "settle", "expect": {"pointer": "/appearance/mode", "equals": "light"}}
+{"cmd": "screenshot", "name": "appearance-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "appearance-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "click", "target": "settings/appearance/theme/system"}
+{"cmd": "settle", "expect": {"pointer": "/appearance/mode", "equals": "system"}}
+
+// Shortcuts: one row per action the keymap binds.
+{"cmd": "click", "target": "settings/nav/shortcuts"}
+{"cmd": "settle", "expect": {"pointer": "/settings/section", "equals": "shortcuts"}}
+{"cmd": "query", "prefix": "settings/shortcuts/", "expect_result": {"pointer": "", "len": 28}}
+{"cmd": "screenshot", "name": "shortcuts-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "shortcuts-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// What was chosen is kept with the app, and read at the next start.
+{"restart": {}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/settings/sync_every", "equals": "asked"}, {"pointer": "/settings/stale_after", "equals": 14}, {"pointer": "/settings/saved", "equals": null}]}
+{"cmd": "set_appearance", "material": "opaque"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// Use a different folder…: a folder holding something else is refused at once; an empty one asks first, then the window reopens on a new archive there, and so does the next start.
+{"cmd": "key", "keystroke": "secondary-,"}
+{"cmd": "answer_picker", "folder": "${workspace}"}
+{"cmd": "click", "target": "settings/archive/use-folder"}
+{"cmd": "settle", "expect": [{"pointer": "/settings/switch/refused", "contains": "holds other files"}, {"pointer": "/page", "equals": "settings"}]}
+{"cmd": "screenshot", "name": "refused-dark"}
+{"cmd": "answer_picker", "folder": "${out_dir}/other-archive"}
+{"cmd": "click", "target": "settings/archive/use-folder"}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "settings/confirm", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "confirm-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "confirm-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "click", "target": "settings/confirm/ok"}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "first-run"}, {"pointer": "/settings/archive", "contains": "other-archive"}, {"pointer": "/settings/default", "equals": false}, {"pointer": "/settings/switch", "equals": null}, {"pointer": "/sync/locations", "len": 0}]}
+{"cmd": "screenshot", "name": "reopened-dark"}
+{"restart": {}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "first-run"}, {"pointer": "/settings/archive", "contains": "other-archive"}]}

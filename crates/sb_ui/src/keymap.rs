@@ -1,16 +1,20 @@
 //! The keymap (DESIGN §5). One table, [`SHORTCUTS`], holds the gpui bindings, and a view draws
-//! a bound action's keycap from its row ([`Shortcut::label`]), so the two can't drift.
+//! a bound action's keycap from its row ([`Shortcut::label`]), so the two can't drift. Settings
+//! › Shortcuts lists what [`SHORTCUT_ROWS`] says each action does, with the keys these rows
+//! bind it to.
 //!
-//! Two keycaps are ahead of the table: the title bar shows DESIGN §5's keys for the palette and
-//! for Settings, whose actions arrive with them in phases 6 and 7 (PLAN §13). Their keys are
-//! [`SEARCH_KEYS`] and [`SETTINGS_KEYS`] until then; each becomes a row with its action.
+//! The palette's Commands group ([`crate::commands`]) is made from these rows, so a command
+//! always shows the key that does it.
 //!
 //! `secondary` is gpui's platform modifier: `Ctrl` on Windows, `Cmd` on macOS (DESIGN §5:
 //! "macOS uses Cmd for every Ctrl").
 
 use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, SharedString};
 
-use crate::actions::{app, first_run, library, locations, menu, sessions, shell, sidebar};
+use crate::actions::{app, first_run, library, locations, menu, reader, sessions, shell, sidebar};
+
+/// Key context of the main area while it shows Settings (DESIGN §4.13).
+pub const SETTINGS: &str = "Settings";
 
 /// Key context of the shell's root element: everything in the main window.
 pub const SHELL: &str = "Shell";
@@ -22,8 +26,18 @@ pub const FOLDER_RENAME: &str = "FolderRename";
 pub const SESSIONS: &str = "Sessions";
 /// Key context of the main area while it shows Unsorted.
 pub const UNSORTED: &str = "Unsorted";
+/// Key context of the main area while it shows Trash (DESIGN §4.8). `Delete` is bound to
+/// nothing in it: no key deletes anything on that page.
+pub const TRASH_PAGE: &str = "Trash";
+/// Key context of the search palette (DESIGN §4.9). Its own keys are its query field's, which
+/// it takes over: `↑` and `↓` move over the results, `Enter` and `Ctrl Enter` open, `Tab` adds
+/// the highlighted completion, `Backspace` on an empty query takes the last chip away and
+/// `Esc` closes it (`crate::search`).
+pub const PALETTE: &str = "Palette";
 /// Key context of the main area while it shows the first run.
 pub const FIRST_RUN: &str = "FirstRun";
+/// Key context of the main area while it shows a session.
+pub const READER: &str = "Reader";
 /// Key context of the locations sheet (DESIGN §4.11), and of its list while it has the
 /// keyboard.
 pub const LOCATIONS_SHEET: &str = "LocationsSheet";
@@ -102,8 +116,26 @@ pub const SYNC_ALL: Shortcut = shortcut!("f5", SHELL, library::SyncAll);
 pub const BACK: Shortcut = shortcut!("alt-left", SHELL, library::Back);
 /// `S`. Named, because a card's star button says it.
 pub const STAR: Shortcut = shortcut!("s", SESSIONS, sessions::Star);
+/// The reader's keys its header's buttons say (DESIGN §4.2.1).
+pub const READER_STAR: Shortcut = shortcut!("s", READER, reader::Star);
+pub const NEXT_SESSION: Shortcut = shortcut!("j", READER, reader::NextSession);
+pub const PREVIOUS_SESSION: Shortcut = shortcut!("k", READER, reader::PreviousSession);
+pub const SWITCH_CALLS: Shortcut = shortcut!("e", READER, reader::SwitchCalls);
+pub const FIND: Shortcut = shortcut!("secondary-f", READER, reader::Find);
+/// `]`, `[` and `Ctrl C` in the reader. Named, because the palette's commands say them.
+pub const NEXT_TURN: Shortcut = shortcut!("]", READER, reader::NextTurn);
+pub const PREVIOUS_TURN: Shortcut = shortcut!("[", READER, reader::PreviousTurn);
+pub const COPY: Shortcut = shortcut!("secondary-c", READER, reader::Copy);
 /// `Ctrl L`. Named, because the Locations overline's label says it.
 pub const LOCATIONS: Shortcut = shortcut!("secondary-l", SHELL, shell::OpenLocations);
+/// `Ctrl ,`. Named, because the title bar's Settings button says it.
+pub const OPEN_SETTINGS: Shortcut = shortcut!("secondary-,", SHELL, shell::OpenSettings);
+/// `Ctrl K`. Named, because the title bar's search field says it.
+pub const SEARCH: Shortcut = shortcut!("secondary-k", SHELL, shell::Search);
+/// `F2`, `F6` and `Ctrl A`. Named, because the palette's commands say them.
+pub const RENAME: Shortcut = shortcut!("f2", SHELL, sidebar::Rename);
+pub const FOCUS_OTHER: Shortcut = shortcut!("f6", SHELL, shell::FocusOther);
+pub const SELECT_ALL: Shortcut = shortcut!("secondary-a", SESSIONS, sessions::SelectAll);
 /// `Delete`, `M`, `Enter` and `Shift F10` on a page of sessions. Named, because the session
 /// menu and the hover bar say them.
 pub const TRASH: Shortcut = shortcut!("delete", SESSIONS, sessions::Trash);
@@ -114,10 +146,10 @@ pub const MENU_KEY: Shortcut = shortcut!("shift-f10", SESSIONS, sessions::Menu);
 /// Every binding scrollback defines.
 pub const SHORTCUTS: &[Shortcut] = &[
     TOGGLE_SIDEBAR,
-    shortcut!("f6", SHELL, shell::FocusOther),
+    FOCUS_OTHER,
     shortcut!("escape", SHELL, shell::Dismiss),
     NEW_FOLDER,
-    shortcut!("f2", SHELL, sidebar::Rename),
+    RENAME,
     SYNC_ALL,
     BACK,
     shortcut!("up", SIDEBAR, sidebar::Previous),
@@ -136,7 +168,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     TRASH,
     MOVE,
     MENU_KEY,
-    shortcut!("secondary-a", SESSIONS, sessions::SelectAll),
+    SELECT_ALL,
     shortcut!("up", UNSORTED, sessions::Up),
     shortcut!("down", UNSORTED, sessions::Down),
     shortcut!("enter", UNSORTED, sessions::Open),
@@ -144,6 +176,11 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut!("delete", UNSORTED, sessions::Trash),
     shortcut!("m", UNSORTED, sessions::Move),
     shortcut!("shift-f10", UNSORTED, sessions::Menu),
+    shortcut!("up", TRASH_PAGE, sessions::Up),
+    shortcut!("down", TRASH_PAGE, sessions::Down),
+    shortcut!("enter", TRASH_PAGE, sessions::Open),
+    shortcut!("secondary-a", TRASH_PAGE, sessions::SelectAll),
+    SEARCH,
     shortcut!("up", MENU, menu::Previous),
     shortcut!("down", MENU, menu::Next),
     shortcut!("enter", MENU, menu::Choose),
@@ -154,7 +191,25 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut!("secondary-enter", PATHS_EDITOR, sessions::SavePaths),
     shortcut!("escape", PATHS_EDITOR, sessions::CancelPaths),
     shortcut!("enter", FIRST_RUN, first_run::Add),
+    READER_STAR,
+    NEXT_SESSION,
+    PREVIOUS_SESSION,
+    SWITCH_CALLS,
+    FIND,
+    NEXT_TURN,
+    PREVIOUS_TURN,
+    shortcut!("up", READER, reader::Up),
+    shortcut!("down", READER, reader::Down),
+    shortcut!("enter", READER, reader::Toggle),
+    shortcut!("right", READER, reader::Expand),
+    shortcut!("left", READER, reader::Collapse),
+    COPY,
+    shortcut!("pageup", READER, reader::PageUp),
+    shortcut!("pagedown", READER, reader::PageDown),
+    shortcut!("home", READER, reader::Top),
+    shortcut!("end", READER, reader::Bottom),
     LOCATIONS,
+    OPEN_SETTINGS,
     shortcut!("escape", LOCATIONS_SHEET, locations::Close),
     shortcut!("up", LOCATIONS_LIST, locations::Previous),
     shortcut!("down", LOCATIONS_LIST, locations::Next),
@@ -163,10 +218,149 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut!("enter", LOCATION_DIALOG, locations::Confirm),
 ];
 
-/// `Ctrl K`, the palette's key (module docs).
-pub const SEARCH_KEYS: &str = "secondary-k";
-/// `Ctrl ,`, Settings' key (module docs).
-pub const SETTINGS_KEYS: &str = "secondary-,";
+/// A row of Settings › Shortcuts (DESIGN §5, §4.13): what it does, and the actions whose keys
+/// it shows, by their names (`sidebar::Rename`). The keys are whatever [`SHORTCUTS`] binds
+/// those actions to.
+#[derive(Clone, Copy, Debug)]
+pub struct ShortcutRow {
+    pub does: &'static str,
+    pub actions: &'static [&'static str],
+}
+
+const fn row(does: &'static str, actions: &'static [&'static str]) -> ShortcutRow {
+    ShortcutRow { does, actions }
+}
+
+/// Settings › Shortcuts, in DESIGN §5's order: every key that works wherever the keyboard is
+/// in the window, then the keys of lists and pages. A key DESIGN §5 lists whose action isn't
+/// built yet has no row until it is.
+pub const SHORTCUT_ROWS: &[ShortcutRow] = &[
+    row(
+        "Search the archive, or close the palette",
+        &["shell::Search"],
+    ),
+    row(
+        "Back to the page the session was opened from, or leave Settings",
+        &["library::Back"],
+    ),
+    row(
+        "Next or previous session in that page",
+        &["reader::NextSession", "reader::PreviousSession"],
+    ),
+    row(
+        "Next or previous turn",
+        &["reader::NextTurn", "reader::PreviousTurn"],
+    ),
+    row("Find in the session", &["reader::Find"]),
+    row("Switch Activity or Full calls", &["reader::SwitchCalls"]),
+    row(
+        "Star or unstar the selected or open session",
+        &["sessions::Star", "reader::Star"],
+    ),
+    row(
+        "Move the focused or selected sessions to Trash",
+        &["sessions::Trash"],
+    ),
+    row("New folder", &["library::NewFolder"]),
+    row("Sync all", &["library::SyncAll"]),
+    row("Locations", &["shell::OpenLocations"]),
+    row("Settings", &["shell::OpenSettings"]),
+    row(
+        "Move and open in the sidebar and the locations list",
+        &[
+            "sidebar::Previous",
+            "sidebar::Next",
+            "sidebar::Open",
+            "locations::Previous",
+            "locations::Next",
+            "locations::Open",
+        ],
+    ),
+    row(
+        "Move between sessions",
+        &[
+            "sessions::Left",
+            "sessions::Right",
+            "sessions::Up",
+            "sessions::Down",
+        ],
+    ),
+    row("Open the selected session", &["sessions::Open"]),
+    row("Select every session shown", &["sessions::SelectAll"]),
+    row("Move the focused session to a folder", &["sessions::Move"]),
+    row("The focused session's menu", &["sessions::Menu"]),
+    row(
+        "Move and choose in a menu",
+        &["menu::Previous", "menu::Next", "menu::Choose"],
+    ),
+    row(
+        "Open a menu's submenu, back out of it, or close the menu",
+        &["menu::Open", "menu::Back", "menu::Close"],
+    ),
+    row(
+        "Move between the rows of a session, and open or close the one the keyboard is on",
+        &[
+            "reader::Up",
+            "reader::Down",
+            "reader::Toggle",
+            "reader::Expand",
+            "reader::Collapse",
+        ],
+    ),
+    row(
+        "Scroll a session a screen, or go to its first or last row",
+        &[
+            "reader::PageUp",
+            "reader::PageDown",
+            "reader::Top",
+            "reader::Bottom",
+        ],
+    ),
+    row(
+        "Copy the message the keyboard is on, or a call's command or path",
+        &["reader::Copy"],
+    ),
+    row("Save the paths editor's changes", &["sessions::SavePaths"]),
+    row(
+        "Leave the paths editor without saving",
+        &["sessions::CancelPaths"],
+    ),
+    row("Rename the folder shown", &["sidebar::Rename"]),
+    row(
+        "Narrow windows: show the sidebar; otherwise move between the sidebar and the page",
+        &["shell::ToggleSidebar"],
+    ),
+    row(
+        "Move between the sidebar and the page",
+        &["shell::FocusOther"],
+    ),
+    row(
+        "Close what is on top, or leave Settings",
+        &["shell::Dismiss"],
+    ),
+];
+
+impl ShortcutRow {
+    /// The keycaps of its actions' bindings on this platform, each once, in the table's
+    /// order.
+    pub fn keycaps(&self) -> Vec<SharedString> {
+        let macos: &[Shortcut] = if cfg!(target_os = "macos") {
+            MACOS_SHORTCUTS
+        } else {
+            &[]
+        };
+        let mut keycaps: Vec<SharedString> = Vec::new();
+        for name in self.actions {
+            for shortcut in SHORTCUTS.iter().chain(macos) {
+                let label = shortcut.label();
+                if (shortcut.action)().name() == *name && !keycaps.contains(&label) {
+                    keycaps.push(label);
+                }
+            }
+        }
+        keycaps
+    }
+}
 
 /**
  * The keys every Mac app has (DESIGN §5, "macOS"), bound on macOS only: anywhere in the window
@@ -238,6 +432,7 @@ pub fn label_as(keys: &str, caps: Keycaps) -> SharedString {
         "up" => "↑".to_string(),
         "down" => "↓".to_string(),
         "escape" => "Esc".to_string(),
+        "backspace" if caps == Keycaps::Symbols => "⌫".to_string(),
         other if other.chars().count() > 1 => capitalize(other),
         other => other.to_uppercase(),
     };
@@ -300,6 +495,56 @@ mod tests {
     }
 
     #[test]
+    fn every_row_of_settings_shows_keys_that_are_bound() {
+        for row in SHORTCUT_ROWS {
+            for name in row.actions {
+                assert!(
+                    SHORTCUTS
+                        .iter()
+                        .any(|shortcut| (shortcut.action)().name() == *name),
+                    "{name} ({}) is bound to no key",
+                    row.does
+                );
+            }
+        }
+        let caps = |does: &str| {
+            SHORTCUT_ROWS
+                .iter()
+                .find(|row| row.does == does)
+                .unwrap()
+                .keycaps()
+        };
+        assert_eq!(caps("Settings"), [OPEN_SETTINGS.label()]);
+        /* On macOS ⌘⌫ moves to Trash as Delete does; Backspace alone never does. */
+        let trash = caps("Move the focused or selected sessions to Trash");
+        assert_eq!(trash[0], TRASH.label());
+        assert_eq!(trash.len(), if cfg!(target_os = "macos") { 2 } else { 1 });
+        assert!(!trash.contains(&label("backspace")));
+        /* ↑ is bound for the cards and for Unsorted's rows: shown once. */
+        assert_eq!(
+            caps("Move between sessions"),
+            ["left", "right", "up", "down"].map(label)
+        );
+    }
+
+    /// A key that works wherever the keyboard is in the window, or in the reader, can't be
+    /// added without a row in Settings › Shortcuts.
+    #[test]
+    fn every_key_of_the_whole_window_and_the_reader_has_a_row_in_settings() {
+        let listed: HashSet<&str> = SHORTCUT_ROWS
+            .iter()
+            .flat_map(|row| row.actions.iter().copied())
+            .collect();
+        for shortcut in (SHORTCUTS.iter()).filter(|it| [SHELL, READER].contains(&it.context)) {
+            let name = (shortcut.action)().name();
+            assert!(
+                listed.contains(name),
+                "{name} has no row in Settings › Shortcuts"
+            );
+        }
+    }
+
+    #[test]
     fn labels_read_as_design_writes_them() {
         let words = |keys| label_as(keys, Keycaps::Words);
         assert_eq!(words("secondary-k"), "Ctrl K");
@@ -316,5 +561,7 @@ mod tests {
         assert_eq!(symbols("cmd-shift-alt-ctrl-x"), "⌃⌥⇧⌘X");
         assert_eq!(symbols("escape"), "Esc");
         assert_eq!(symbols("secondary-,"), "⌘,");
+        assert_eq!(symbols("cmd-backspace"), "⌘⌫");
+        assert_eq!(words("backspace"), "Backspace");
     }
 }

@@ -12,7 +12,7 @@ use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::catalogue::Shelf;
 use sb_core::search::{
-    self, Filters, Key, Limit, MatchKind, Names, Query, Results, SearchError, Searched,
+    self, Calendar, Filters, Key, Limit, MatchKind, Names, Query, Results, SearchError, Searched,
 };
 use sb_core::transcript::{At, Content};
 use sb_test_support::{Agent, FileAgent, Items, ProjectsTree};
@@ -28,6 +28,7 @@ for_both_agents!(
     the_filters_narrow_what_is_found,
     the_index_emptied_and_built_again_finds_the_same,
     the_search_text_is_made_again_when_it_is_missing_or_unreadable,
+    a_search_file_of_an_older_layout_is_made_again_by_the_start_index,
     a_session_in_trash_is_found_only_there_and_one_deleted_for_good_nowhere,
     the_first_matches_of_a_session_are_given_and_the_rest_counted,
     a_term_in_any_script_is_found_as_the_index_folds_it,
@@ -84,6 +85,7 @@ fn names<A: Agent>(bench: &Bench<A>) -> Names<'static> {
         folders: catalogue.folders().unwrap().leak(),
         locations: catalogue.locations().unwrap().leak(),
         agents: vec![bench.agent.provider().id()].leak(),
+        calendar: Calendar::Local,
     }
 }
 
@@ -137,7 +139,7 @@ fn a_sessions_text_is_found_where_it_is_and_tool_output_is_not<A: Agent + Defaul
     let transcript = bench.agent.provider().parse(&items);
     let conversation = transcript.conversation.unwrap();
     for found in shown {
-        assert!(!found.subagent && !found.cut);
+        assert!(found.subagent.is_none() && !found.cut);
         assert_eq!(found.snippet.hits.len(), 1, "{found:?}");
         let hit = found.snippet.hits[0].clone();
         assert_eq!(&found.snippet.text[hit], "parse_args");
@@ -485,6 +487,32 @@ fn the_search_text_is_made_again_when_it_is_missing_or_unreadable<A: Agent + Def
     bench.assert_verifies();
 }
 
+/**
+ * A search file an older release left, of another layout, is made again by the first index
+ * after a start, before anything searches: the archive is searchable once the start index ends.
+ */
+fn a_search_file_of_an_older_layout_is_made_again_by_the_start_index<A: Agent + Default>() {
+    let (mut bench, _) = bench::<A>();
+    let before = find(&bench, "parse_args");
+    bench.close();
+    let search = bench.dir().join("search.db");
+    toolbox_store::rusqlite::Connection::open(&search)
+        .unwrap()
+        .execute(
+            "UPDATE migrations SET domain = 'scrollback-search' WHERE domain = 'scrollback-search-2'",
+            [],
+        )
+        .unwrap();
+    bench.reopen();
+    assert_eq!(
+        bench.index().searchable,
+        2,
+        "the start index makes it all again"
+    );
+    assert_eq!(bench.archive().unsearchable().unwrap(), 0);
+    assert_eq!(find(&bench, "parse_args"), before);
+}
+
 fn a_session_in_trash_is_found_only_there_and_one_deleted_for_good_nowhere<A: Agent + Default>() {
     let (bench, [first, second]) = bench::<A>();
     let catalogue = bench.archive().catalogue();
@@ -601,17 +629,34 @@ fn a_subagents_text_opens_its_session_at_the_call_and_a_title_comes_first() {
     );
     let title = &results.sessions[0].shown[0];
     assert_eq!(
-        (title.kind, title.at, title.subagent),
-        (MatchKind::Title, None, false)
+        (title.kind, title.at, &title.subagent),
+        (MatchKind::Title, None, &None)
     );
     let inside = &results.sessions[1].shown[0];
-    assert_eq!((inside.kind, inside.subagent), (MatchKind::Reply, true));
+    assert_eq!(inside.kind, MatchKind::Reply);
     let items = Items::of(&bench.agent, &said.key);
-    let conversation = bench.agent.provider().parse(&items).conversation.unwrap();
+    let provider = bench.agent.provider();
+    let conversation = provider.parse(&items).conversation.unwrap();
     let Some(At::Block { block, .. }) = inside.at else {
         panic!("{inside:?}");
     };
     assert!(matches!(conversation[block].content, Content::ToolCall(_)));
+    /* And where in the subagent's own conversation the text is: its reply. */
+    let place = inside
+        .subagent
+        .as_ref()
+        .expect("the text is the subagent's");
+    let Some(own) = provider
+        .subagent(&items, &place.item)
+        .conversation()
+        .cloned()
+    else {
+        panic!("{place:?} is no subagent's conversation");
+    };
+    assert_eq!(place.turn, 0);
+    assert!(
+        matches!(&own[place.block].content, Content::Reply { text } if text.contains("frobnicator"))
+    );
     bench.assert_verifies();
 }
 
@@ -693,6 +738,7 @@ fn a_date_is_the_start_of_its_day_month_or_year_in_local_time() {
         folders: &[],
         locations: &[],
         agents: &[],
+        calendar: Calendar::Local,
     };
     let at = |input: &str| search::query(input, &names).0.filters;
     let midnight = |year, month, day| {
@@ -720,6 +766,56 @@ fn a_date_is_the_start_of_its_day_month_or_year_in_local_time() {
             "{not_a_date}"
         );
     }
+    /* Read in UTC, as the app shows dates under a pinned calendar. */
+    let utc = Names {
+        calendar: Calendar::Utc,
+        ..names
+    };
+    assert_eq!(
+        search::query("after:2026-03-05", &utc).0.filters.after,
+        Some(
+            chrono::Utc
+                .with_ymd_and_hms(2026, 3, 5, 0, 0, 0)
+                .unwrap()
+                .timestamp_millis()
+        )
+    );
+}
+
+#[test]
+fn a_quote_inside_quotes_is_written_with_a_backslash() {
+    let parsed = search::parse(r#"branch:"say \"hi\"" "a \"b\" c" plain"#);
+    assert_eq!(parsed.tokens[0].value, r#"say "hi""#);
+    assert_eq!(parsed.terms, [r#"a "b" c"#, "plain"]);
+    /* Outside quotes a backslash is text, as in a Windows path. */
+    assert_eq!(search::parse(r"C:\Users\user").terms, [r"C:\Users\user"]);
+    /* Inside quotes `\"` is a quote, `\\"` a backslash that closes them, so a quoted path can
+    end in one; every other backslash is text, so a network path keeps its two. */
+    assert_eq!(
+        search::parse(r#""\\wsl.localhost\Ubuntu-24.04\home\user\my app" x"#).terms,
+        [r"\\wsl.localhost\Ubuntu-24.04\home\user\my app", "x"]
+    );
+    assert_eq!(
+        search::parse(r#""\\server\share\" x"#).terms,
+        [r#"\\server\share" x"#],
+        "an escaped quote, and nothing closes the quotes"
+    );
+    assert_eq!(
+        search::parse(r#""D:\Projects\app\\" error"#).terms,
+        [r"D:\Projects\app\", "error"]
+    );
+    assert_eq!(
+        search::parse(r#""D:\Projects\app\" error"#).terms,
+        [r#"D:\Projects\app" error"#],
+        "the quote is escaped, and nothing closes the quotes"
+    );
+    /* Three in a row before a quote: one that is text, then one that closes the quotes. */
+    assert_eq!(search::parse(r#""a\\\"b c"#).terms, [r"a\\b", "c"]);
+    assert_eq!(
+        search::parse(r#"folder:"x\\" y"#).tokens[0].value,
+        r"x\",
+        "a token's value reads the same"
+    );
 }
 
 #[test]
@@ -742,6 +838,7 @@ fn in_names_a_page_before_a_folder_and_folder_names_a_folder() {
         folders: &folders,
         locations: &[],
         agents: &[],
+        calendar: Calendar::Local,
     };
     let shelf = |input: &str| search::query(input, &names).0.filters.shelf;
     assert_eq!(shelf("in:trash"), Shelf::Trash);
@@ -829,6 +926,9 @@ fn no_text_is_written_for_a_session_deleted_while_it_is_parsed<A: Agent + Defaul
     assert_eq!(made.searchable, 1);
     assert_eq!(docs(), 1);
     assert_eq!(find(&bench, "parse_args in:all").total_sessions, 0);
+    /* Its files leave files/ in the background (PLAN §4.5); verify counts them as still to be
+    removed until then, which `Bench::delete_for_good` waits out and this delete can't. */
+    bench.archive().wait_for_removals();
     bench.assert_verifies();
 }
 

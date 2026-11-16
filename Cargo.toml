@@ -14,7 +14,50 @@ publish = false
 # sibling apps. Pinned exactly; bump all of these together, starting in toolbox-rs.
 gpui = { package = "gpui-pre", version = "=0.3.11" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11" }
-gpui-component = "=0.9.0"
+# gpui-component's base: the rich text view (`TextView`, its style, range highlights and the
+# window-wide text selection) that `sb_ui::markdown` renders prompts and replies with (PLAN D11).
+gpui-base = "=0.9.0"
+# The tree-sitter grammars `sb_ui::syntax` highlights fenced code with (PLAN §9): gpui-component's
+# `tree-sitter-languages`, as dv enables them, less those whose C code aborts the process on some
+# input, which nothing can catch (`sb_ui::syntax`'s `grammars_never_abort`): Bash (nested
+# heredocs), Kotlin (nested string templates) and YAML (deep indentation).
+gpui-component = { version = "=0.9.0", features = [
+    "tree-sitter-astro",
+    "tree-sitter-c",
+    "tree-sitter-cmake",
+    "tree-sitter-cpp",
+    "tree-sitter-csharp",
+    "tree-sitter-css",
+    "tree-sitter-diff",
+    "tree-sitter-ejs",
+    "tree-sitter-elixir",
+    "tree-sitter-erb",
+    "tree-sitter-go",
+    "tree-sitter-graphql",
+    "tree-sitter-html",
+    "tree-sitter-java",
+    "tree-sitter-javascript",
+    "tree-sitter-jsdoc",
+    "tree-sitter-lua",
+    "tree-sitter-make",
+    "tree-sitter-markdown",
+    "tree-sitter-php",
+    "tree-sitter-proto",
+    "tree-sitter-python",
+    "tree-sitter-ruby",
+    "tree-sitter-rust",
+    "tree-sitter-scala",
+    "tree-sitter-sql",
+    "tree-sitter-svelte",
+    "tree-sitter-swift",
+    "tree-sitter-toml",
+    "tree-sitter-tsx",
+    "tree-sitter-typescript",
+    "tree-sitter-zig",
+] }
+# What `sb_ui::syntax` runs those grammars with, to give up on a parse or a query past its
+# deadline. gpui-component's own pin; already in the tree.
+tree-sitter = "=0.26.13"
 
 # ---- internal crates (docs/PLAN.md §3)
 sb_core = { path = "crates/sb_core" }
@@ -38,6 +81,9 @@ toolbox_store = { git = "https://github.com/kylekz/toolbox-rs", tag = "v0.5.2" }
 
 # ---- shared third-party
 anyhow = "1.0"
+# What `TextView`'s highlighter, which runs without a context, asks the reader service for
+# (`sb_ui::services::reader::highlights`). gpui's own; already in the tree.
+async-channel = "2.5"
 # Images inside a transcript are base64 (`sb_core::transcript::Stored`).
 base64 = "0.22"
 # The catalogue's daily backup is named by the local calendar day (`toolbox_store`'s own pin).
@@ -47,8 +93,25 @@ dirs = "6"
 # Windows only: the scrollback binary's icon and version resource (`crates/scrollback/build.rs`).
 embed-resource = "3.0"
 env_logger = "0.11"
+# The size of an image in a transcript, read from its header before gpui decodes it
+# (`sb_ui::services::reader`); gpui's own pin, the formats a transcript holds.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 log = "0.4"
+# The line and word diff of an edit's body (`sb_ui::services::reader::shape::diff`), dv's, whose
+# word marks are lifted with it (PLAN D15).
+imara-diff = "0.2"
+# The Markdown parser gpui-base's `TextView` uses: `sb_ui::markdown` sanitises a body at the
+# spans it reports before `TextView` sees it. Already in the tree through gpui-base.
+markdown = "1.0.0"
+# The general category of a character (`sb_ui::hostile`: combining marks). Already in the tree.
+unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
+# A link's real destination, its host as the browser would read it (`sb_ui::markdown`). Already
+# in the tree.
+url = "2.5"
 pretty_assertions = "1.4"
+# A content search's pattern, found again in what it returned to mark it (`sb_ui`'s reader):
+# linear in what it searches whatever the pattern. Already in the tree.
+regex = "1.13"
 # Apple systems only: `fsync` without the full flush std's `sync_all` does there
 # (`sb_core::archive`).
 rustix = "1"

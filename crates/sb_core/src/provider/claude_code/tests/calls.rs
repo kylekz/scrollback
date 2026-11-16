@@ -60,7 +60,10 @@ fn a_session_with_a_call_of_each_kind_of_tool() {
         "structuredPatch": [], "originalFile": null,
     });
     t.result_with(&call, json!("The file was created."), false, written);
-    let call = t.call("Grep", json!({ "pattern": "fn main", "path": "src" }));
+    let call = t.call(
+        "Grep",
+        json!({ "pattern": "fn main", "path": "src", "type": "rust", "glob": "*.rs", "output_mode": "content" }),
+    );
     let found = json!({ "mode": "content", "numFiles": 1, "numMatches": 2 });
     t.result_with(&call, json!("src/main.rs:10:fn main() {"), false, found);
     let call = t.call("Glob", json!({ "pattern": "**/*.rs" }));
@@ -100,12 +103,12 @@ fn a_session_with_a_call_of_each_kind_of_tool() {
   Bash: shell "cargo build" (Some("Build the app"))
     Failed Exit(101) "Exit code 101\nerror: expected `;`"
   Read: read /home/user/code/app/src/main.rs from line Some(10) for Some(20)
-    Ok Lines(1) "10\tfn main() {"
+    Ok Lines { lines: 1, total: Some(40) } "10\tfn main() {"
   Edit: edit /home/user/code/app/src/main.rs: "let a = \"1\"" to "let a = \"1\";", all: true
-    Ok Changed { added: 2, removed: 1 } "The file was updated."
+    Ok Changed { added: 2, removed: 1, start: Some((10, 10)) } "The file was updated."
   Write: write /home/user/code/app/notes.md: "# Notes\n"
     Ok Written { new: true, lines: 1 } "The file was created."
-  Grep: content search "fn main" in Some("src")
+  Grep: content search "fn main" in Some("src") of Some("rust, *.rs") for Some("content")
     Ok Matches(2) "src/main.rs:10:fn main() {"
   Glob: file search "**/*.rs" in None
     Ok Matches(1) "src/main.rs"
@@ -187,6 +190,22 @@ fn tool_names_map_to_the_common_kinds() {
         ("bash", ToolKind::Other),
     ] {
         assert_eq!(tools::kind(name), kind, "{name}");
+    }
+}
+
+#[test]
+fn each_mapped_tool_has_the_label_its_row_shows() {
+    for (name, label) in [
+        ("Bash", Some("bash")),
+        ("TodoWrite", Some("todos")),
+        ("Agent", Some("agent")),
+        ("Task", Some("agent")),
+        ("WebSearch", Some("search")),
+        ("WebFetch", Some("fetch")),
+        ("mcp__tracker__search_issues", Some("mcp")),
+        ("Teleport", None),
+    ] {
+        assert_eq!(tools::label(name), label, "{name}");
     }
 }
 
@@ -595,4 +614,41 @@ fn content_that_cannot_be_loaded_says_why() {
             ..
         })
     ));
+}
+
+#[test]
+fn a_reads_numbering_is_named_and_an_edits_start_never_overflows() {
+    let mut tree = ProjectsTree::new();
+    let mut session = session(&mut tree);
+    let t = &mut session.transcript;
+    t.prompt("Read and edit.");
+    for text in ["    10\tfn main() {", "    10→fn main() {", "fn main() {"] {
+        let call = t.call(
+            "Read",
+            json!({ "file_path": "/home/user/code/app/main.rs" }),
+        );
+        t.result(&call, json!(text));
+    }
+    let call = t.call(
+        "Edit",
+        json!({ "file_path": "a.rs", "old_string": "a\nb", "new_string": "a\nc" }),
+    );
+    let patch = json!({ "structuredPatch": [{ "oldStart": u64::MAX, "newStart": u64::MAX,
+                                              "lines": [" a", "-b", "+c"] }] });
+    t.result_with(&call, json!("ok"), false, patch);
+    let (transcript, _) = parse(&tree, &session);
+    let conversation = own(&transcript);
+    let result = |id: usize| call_in(conversation, id).result.clone().unwrap();
+    assert_eq!(
+        (1..4).map(|id| result(id).numbered).collect::<Vec<_>>(),
+        [Some('\t'), Some('→'), None]
+    );
+    assert_eq!(
+        result(4).brief,
+        Some(Brief::Changed {
+            added: 1,
+            removed: 1,
+            start: Some((u64::MAX, u64::MAX))
+        })
+    );
 }

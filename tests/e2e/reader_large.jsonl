@@ -1,0 +1,53 @@
+{"scenario": {"window_size": "1440x900", "fixture": "reader-large", "description": "The reader's budgets (docs/PLAN.md §14) on a session of 500 calls in a main transcript of about 100 MB, with subagents of a few hundred more: opened from fc's page, scrolled a screen at a time, its last call opened, Full calls and back. The steps' times are in the transcript; the assertions are on what is drawn"}}
+{"cmd": "wait_ready", "timeout_ms": 120000}
+{"cmd": "settle", "timeout_ms": 120000, "expect": {"pointer": "/library/counts/all", "equals": 9}}
+{"cmd": "set_appearance", "material": "opaque"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "click", "target": "sidebar/folder/fc"}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 6}}
+
+// Opening: the header at once, then the column once the main transcript is parsed, within the budget of first paint (500 ms).
+{"cmd": "click", "target": "card/0/title"}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/reader/state", "equals": "open"}, {"pointer": "/library/open", "equals": "A long session to measure the reader"}], "expect_result": {"pointer": "/elapsed_ms", "lte": 500}}
+{"cmd": "screenshot", "name": "large-top-1440-dark"}
+
+// A screen at a time, twenty times: each step waits for its frame.
+{"cmd": "key", "keystroke": "pagedown"}
+{"cmd": "key", "keystroke": "pagedown"}
+{"cmd": "key", "keystroke": "pagedown"}
+{"cmd": "key", "keystroke": "pagedown"}
+{"cmd": "key", "keystroke": "pagedown"}
+{"cmd": "key", "keystroke": "pagedown"}
+{"cmd": "key", "keystroke": "pagedown"}
+{"cmd": "key", "keystroke": "pagedown"}
+{"cmd": "key", "keystroke": "pagedown"}
+{"cmd": "key", "keystroke": "pagedown"}
+{"cmd": "scroll", "target": "reader/column", "dy": -400}
+{"cmd": "scroll", "target": "reader/column", "dy": -400}
+{"cmd": "scroll", "target": "reader/column", "dy": -400}
+{"cmd": "scroll", "target": "reader/column", "dy": -400}
+{"cmd": "scroll", "target": "reader/column", "dy": -400}
+{"cmd": "scroll", "target": "reader/column", "dy": -400}
+{"cmd": "scroll", "target": "reader/column", "dy": -400}
+{"cmd": "scroll", "target": "reader/column", "dy": -400}
+{"cmd": "scroll", "target": "reader/column", "dy": -400}
+{"cmd": "scroll", "target": "reader/column", "dy": -400}
+{"cmd": "settle", "expect": {"pointer": "/reader/markdown_states", "lte": 120}}
+
+// The last call, near the end of the transcript, started a subagent of 20 MB: it is read when opened.
+{"cmd": "key", "keystroke": "end"}
+{"cmd": "settle"}
+{"cmd": "key", "keystroke": "up", "expect": {"pointer": "/reader/focused/kind", "equals": "call"}}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": [{"pointer": "/reader/open_calls", "equals": 1}, {"pointer": "/reader/loads/subagents/loaded", "equals": 1}]}
+{"cmd": "screenshot", "name": "large-last-call-1440-dark"}
+
+// Full calls on the whole session; then back.
+{"cmd": "key", "keystroke": "e"}
+{"cmd": "settle", "timeout_ms": 30000, "expect": {"pointer": "/reader/full_calls", "equals": true}}
+{"cmd": "key", "keystroke": "home"}
+{"cmd": "settle", "timeout_ms": 30000}
+{"cmd": "screenshot", "name": "large-full-calls-1440-dark"}
+{"cmd": "key", "keystroke": "e"}
+{"cmd": "key", "keystroke": "alt-left"}
+{"cmd": "settle", "expect": {"pointer": "/reader/state", "equals": "closed"}}

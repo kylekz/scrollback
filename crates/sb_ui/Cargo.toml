@@ -18,17 +18,29 @@ automation = ["gpui_automation/enabled"]
 
 [dependencies]
 anyhow.workspace = true
+async-channel.workspace = true
 # Dates are shown in the machine's time zone (`format`).
 chrono.workspace = true
 gpui.workspace = true
+gpui-base.workspace = true
 gpui-component.workspace = true
 gpui_appearance.workspace = true
 gpui_automation.workspace = true
+image.workspace = true
+imara-diff.workspace = true
 log.workspace = true
+markdown.workspace = true
+regex.workspace = true
 sb_core.workspace = true
+# The app's settings file (`services::settings`), written through a temporary file, and a
+# tool call's input, pretty-printed in its body (`services::reader`).
+serde_json.workspace = true
+tempfile.workspace = true
+tree-sitter.workspace = true
+unicode-properties.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
 sb_test_support.workspace = true
-tempfile.workspace = true

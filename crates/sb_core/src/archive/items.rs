@@ -11,18 +11,31 @@
 
 use std::cell::RefCell;
 use std::io::{self, Read};
+use std::sync::Arc;
 
-use super::{Archive, Problem, Result, VersionReader};
-use crate::catalogue::{Reading, SessionId};
+use super::{Archive, Problem, Result, SegmentCache, VersionReader};
+use crate::catalogue::{CatalogueError, Reading, SessionId};
 use crate::provider::{SessionItem, SessionItems};
 
 /// The archived items of one session, by key, and the version each is read at.
 pub struct ArchivedSession<'a> {
     archive: &'a Archive,
+    pinned: Pinned,
+    fault: RefCell<Option<String>>,
+    cache: Option<Arc<SegmentCache>>,
+}
+
+/**
+ * A session's items as an [`ArchivedSession`] read them: each at the version it was read at.
+ * The reader keeps it to load a part of the session long after parsing it
+ * ([`Archive::pinned_session`]), and gets the bytes it parsed even when a sync has started a
+ * newer version since.
+ */
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pinned {
     list: Vec<SessionItem>,
     /// The version of each item of `list`.
     versions: Vec<i64>,
-    fault: RefCell<Option<String>>,
 }
 
 impl Archive {
@@ -33,6 +46,43 @@ impl Archive {
             &self.catalogue.session_items(id)?,
         ))
     }
+
+    /**
+     * The items of the session `id`, each at its reading copy but the item `key`, read at its
+     * version `version`: to read a version that is not the reading copy (PLAN §4.2, DESIGN
+     * §4.3). A version that is not one of that item's is not read.
+     */
+    pub fn session_at(
+        &self,
+        id: &SessionId,
+        key: &str,
+        version: i64,
+    ) -> Result<ArchivedSession<'_>> {
+        let readings = self.catalogue.session_items(id)?;
+        let item = readings
+            .iter()
+            .find(|reading| reading.key == key)
+            .ok_or_else(|| CatalogueError::NotAnItem(key.to_string()))?
+            .item;
+        let length = self
+            .catalogue
+            .versions(item)?
+            .into_iter()
+            .find(|it| it.id == version)
+            .ok_or(CatalogueError::NotOfItem { version, item })?
+            .length;
+        Ok(ArchivedSession::of(self, &readings).at(key, version, length))
+    }
+
+    /// A session's items at the versions `pinned` holds, read through `cache`.
+    pub fn pinned_session(&self, pinned: &Pinned, cache: Arc<SegmentCache>) -> ArchivedSession<'_> {
+        ArchivedSession {
+            archive: self,
+            pinned: pinned.clone(),
+            fault: RefCell::default(),
+            cache: Some(cache),
+        }
+    }
 }
 
 impl<'a> ArchivedSession<'a> {
@@ -40,26 +90,42 @@ impl<'a> ArchivedSession<'a> {
     pub(crate) fn of(archive: &'a Archive, readings: &[Reading]) -> Self {
         Self {
             archive,
-            list: readings
-                .iter()
-                .map(|reading| SessionItem {
-                    key: reading.key.clone(),
-                    kind: reading.kind,
-                    length: reading.length,
-                })
-                .collect(),
-            versions: readings.iter().map(|reading| reading.version).collect(),
+            pinned: Pinned {
+                list: readings
+                    .iter()
+                    .map(|reading| SessionItem {
+                        key: reading.key.clone(),
+                        kind: reading.kind,
+                        length: reading.length,
+                    })
+                    .collect(),
+                versions: readings.iter().map(|reading| reading.version).collect(),
+            },
             fault: RefCell::default(),
+            cache: None,
         }
     }
 
     /// The same items, with the item `key` read at its version `version`, of `length` bytes.
     pub(crate) fn at(mut self, key: &str, version: i64, length: u64) -> Self {
         if let Ok(at) = self.find(key) {
-            self.list[at].length = length;
-            self.versions[at] = version;
+            self.pinned.list[at].length = length;
+            self.pinned.versions[at] = version;
         }
         self
+    }
+
+    /// Which version each item is read at, to read them so again later.
+    pub fn pinned(&self) -> &Pinned {
+        &self.pinned
+    }
+
+    /// The same items, read through `cache`.
+    pub fn with_cache(self, cache: Arc<SegmentCache>) -> Self {
+        Self {
+            cache: Some(cache),
+            ..self
+        }
     }
 
     /// Why a read of one of the items failed, if one did for a reason that is not the stored
@@ -70,7 +136,8 @@ impl<'a> ArchivedSession<'a> {
 
     /// Where the item `key` is in the list, which is in the order of the keys.
     fn find(&self, key: &str) -> std::result::Result<usize, usize> {
-        self.list
+        self.pinned
+            .list
             .binary_search_by(|item| item.key.as_str().cmp(key))
     }
 
@@ -86,14 +153,18 @@ impl<'a> ArchivedSession<'a> {
 
 impl SessionItems for ArchivedSession<'_> {
     fn list(&self) -> &[SessionItem] {
-        &self.list
+        &self.pinned.list
     }
 
     /// A segment that is not what the catalogue records fails the read where it is reached
     /// (PLAN §4.4), and the parser says so in the transcript.
     fn open(&self, key: &str, offset: u64) -> io::Result<Box<dyn Read + '_>> {
         let at = self.find(key).map_err(|_| io::ErrorKind::NotFound)?;
-        match self.archive.read_version_from(self.versions[at], offset) {
+        let version = self.pinned.versions[at];
+        match self
+            .archive
+            .read_version_cached(version, offset, self.cache.clone())
+        {
             Ok(reader) => Ok(Box::new(Watched {
                 reader,
                 session: self,

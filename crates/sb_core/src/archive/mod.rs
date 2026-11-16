@@ -24,6 +24,7 @@ mod disk;
 mod items;
 mod layout;
 mod segment;
+mod stats;
 mod verify;
 
 use std::collections::{BTreeSet, HashSet};
@@ -43,11 +44,16 @@ use crate::location::LocationId;
 use crate::search::{SearchError, SearchIndex};
 
 pub use delete::Deleted;
-pub use items::ArchivedSession;
+pub use items::{ArchivedSession, Pinned};
 pub(crate) use layout::item_folder;
-pub use segment::{Problem, SEGMENT_BYTES, VersionReader};
+pub use segment::{Problem, SEGMENT_BYTES, SegmentCache, VersionReader};
 pub(crate) use segment::{RangeWriter, Sealed};
-pub use verify::{Damage, Unread, VerifyReport};
+pub use stats::{ArchiveStats, Holds, id_in, open_or_make, resolved, what_is_in};
+pub(crate) use verify::LAST_VERIFY_VERSION;
+pub use verify::{
+    Damage, DamageKind, DamageRecord, KEPT_DAMAGES, LastVerify, Unread, VerifyProgress,
+    VerifyReport,
+};
 
 /// The layout this build writes, in `archive.json`.
 const FORMAT: u32 = 1;
@@ -127,9 +133,14 @@ pub enum ArchiveError {
     UnknownVersion(i64),
     #[error("verify was cancelled")]
     Cancelled,
-    /// A session is not deleted for good while its location is being synced.
+    /// A session is not deleted for good, nor its tombstone put back, while its location is
+    /// being synced.
     #[error("location {0} is being synced")]
     Syncing(LocationId),
+    /// An archive is not made inside another, nor around one (PLAN §4.4): opening the outer
+    /// would empty the inner's `tmp/`, and a sync of either could reach the other's files.
+    #[error("{} is inside the archive in {}, or holds one", .dir.display(), .other.display())]
+    Nested { dir: PathBuf, other: PathBuf },
     #[error(transparent)]
     Catalogue(#[from] CatalogueError),
     #[error(transparent)]
@@ -199,16 +210,31 @@ impl Archive {
     /// nor what is left of one.
     pub fn create(dir: &Path) -> Result<Self> {
         let dir = &absolute(dir)?;
+        let manifest_path = dir.join(layout::MANIFEST);
+        /* The refusals that look at the folder alone come first: what is left of an archive
+        is refused without walking its files. */
+        let refusal = |dir: &Path| {
+            if manifest_path.exists() {
+                return Some(ArchiveError::AlreadyAnArchive(dir.to_path_buf()));
+            }
+            fs::read_dir(dir.join(layout::FILES))
+                .is_ok_and(|mut entries| entries.next().is_some())
+                .then(|| ArchiveError::HoldsAnArchivesFiles(dir.to_path_buf()))
+        };
+        if let Some(refused) = refusal(dir) {
+            return Err(refused);
+        }
+        if let Some(other) = stats::archive_around(dir).or_else(|| stats::archive_within(dir)) {
+            return Err(ArchiveError::Nested {
+                dir: dir.to_path_buf(),
+                other,
+            });
+        }
         fs::create_dir_all(dir).map_err(io_error("create", dir))?;
         let lock = lock(dir)?;
-        let manifest_path = dir.join(layout::MANIFEST);
-        if manifest_path.exists() {
-            return Err(ArchiveError::AlreadyAnArchive(dir.to_path_buf()));
-        }
-        let holds_files =
-            fs::read_dir(dir.join(layout::FILES)).is_ok_and(|mut entries| entries.next().is_some());
-        if holds_files {
-            return Err(ArchiveError::HoldsAnArchivesFiles(dir.to_path_buf()));
+        /* Again under the lock: another scrollback may have made one meanwhile. */
+        if let Some(refused) = refusal(dir) {
+            return Err(refused);
         }
         let (catalogue, tmp) = Self::prepare(dir)?;
         /* A catalogue that is here already is what a create that was cut short left, with
@@ -368,14 +394,30 @@ impl Archive {
     /// The content of a version from its byte `offset` on. Only the segment that holds that
     /// byte and the ones after it are read; each is checked as [`Archive::read_version`] does.
     pub fn read_version_from(&self, version: i64, offset: u64) -> Result<VersionReader> {
+        self.read_version_cached(version, offset, None)
+    }
+
+    /// [`Archive::read_version_from`], keeping the segments it decodes in `cache` and taking
+    /// those already there from it.
+    pub(crate) fn read_version_cached(
+        &self,
+        version: i64,
+        offset: u64,
+        cache: Option<Arc<SegmentCache>>,
+    ) -> Result<VersionReader> {
         let stored = self
             .catalogue
             .stored_version(version)?
             .ok_or(ArchiveError::UnknownVersion(version))?;
-        Ok(self.reader(stored, offset))
+        Ok(self.reader(stored, offset, cache))
     }
 
-    fn reader(&self, stored: Stored, start: u64) -> VersionReader {
+    fn reader(
+        &self,
+        stored: Stored,
+        start: u64,
+        cache: Option<Arc<SegmentCache>>,
+    ) -> VersionReader {
         VersionReader::new(
             self.dir
                 .join(layout::item_dir(
@@ -388,6 +430,7 @@ impl Archive {
             stored.version.length,
             stored.version.hash,
             start,
+            cache,
         )
     }
 

@@ -64,6 +64,7 @@ fn colours(c: SbColors) -> Vec<(&'static str, (u32, u32))> {
         blue,
         green_soft,
         red_soft,
+        danger_fill,
         yellow_soft,
         blue_soft,
         scrim,
@@ -116,6 +117,7 @@ fn colours(c: SbColors) -> Vec<(&'static str, (u32, u32))> {
         ("blue", blue),
         ("green-soft", green_soft),
         ("red-soft", red_soft),
+        ("danger-fill", danger_fill),
         ("yellow-soft", yellow_soft),
         ("blue-soft", blue_soft),
         ("scrim", scrim),
@@ -182,6 +184,7 @@ fn dark_tokens_match_design() {
         // rgba(138,184,240,.14)
         ("green-soft", (0x8fd694, 130)),
         ("red-soft", (0xf08a7e, 130)),
+        ("danger-fill", (0xb9594f, 1000)),
         ("yellow-soft", (0xf2c482, 140)),
         ("blue-soft", (0x8ab8f0, 140)),
         // rgba(5,6,8,.58)
@@ -249,6 +252,7 @@ fn light_tokens_match_design() {
         // rgba(29,95,158,.10)
         ("green-soft", (0x17703f, 100)),
         ("red-soft", (0xb42a2a, 90)),
+        ("danger-fill", (0xb42a2a, 1000)),
         ("yellow-soft", (0x845400, 100)),
         ("blue-soft", (0x1d5f9e, 100)),
         // rgba(40,36,28,.30)
@@ -372,6 +376,16 @@ fn the_lowest_text_tier_meets_the_contrast_floor() {
 }
 
 #[test]
+fn white_on_the_danger_fill_meets_the_contrast_floor() {
+    /* DESIGN §4.8's Delete for good: white text on `danger-fill`, in both appearances. */
+    for appearance in [Appearance::Dark, Appearance::Light] {
+        let fill = SbColors::new(appearance, Material::Opaque).danger_fill;
+        let ratio = contrast_ratio(gpui::white(), fill);
+        assert!(ratio >= 4.5, "{appearance:?}: {ratio:.2}");
+    }
+}
+
+#[test]
 fn shadows_match_design() {
     // DESIGN §1.1 `shadow-pop`: 0 28px 70px rgba(0,0,0,.55), 0 2px 10px rgba(0,0,0,.35). gpui's
     // blur radius is half of CSS's.
@@ -469,6 +483,58 @@ fn the_type_scale_matches_design() {
             semibold,
         ),
         ("lead", &scale.lead, &fonts.ui, 14., 21., regular),
+        // Reading: prose 15/24, inside nested panels and results 13/20; h2 17/24 and h3 14/20
+        // at 600; inline code 12.5; code 12px on 19–20px rows.
+        ("reading", &scale.reading, &fonts.ui, 15., 24., regular),
+        (
+            "reading_nested",
+            &scale.reading_nested,
+            &fonts.ui,
+            13.,
+            20.,
+            regular,
+        ),
+        ("heading1", &scale.heading1, &fonts.ui, 20., 28., semibold),
+        ("heading2", &scale.heading2, &fonts.ui, 17., 24., semibold),
+        ("heading3", &scale.heading3, &fonts.ui, 14., 20., semibold),
+        (
+            "inline_code",
+            &scale.inline_code,
+            &fonts.mono,
+            12.5,
+            18.,
+            regular,
+        ),
+        (
+            "code_block",
+            &scale.code_block,
+            &fonts.mono,
+            12.,
+            20.,
+            regular,
+        ),
+        ("code", &scale.code, &fonts.mono, 12., 19., regular),
+        // §4.2.2: the message's author at 600 over 12px; §4.2.3: a row's name and target in
+        // mono; §4.2.5: a thought 12.5 collapsed, 13/20 open.
+        ("author", &scale.author, &fonts.ui, 12., 16., semibold),
+        ("activity", &scale.activity, &fonts.mono, 12., 16., regular),
+        (
+            "activity_name",
+            &scale.activity_name,
+            &fonts.mono,
+            12.,
+            16.,
+            medium,
+        ),
+        ("thought", &scale.thought, &fonts.ui, 12.5, 20., regular),
+        (
+            "thought_open",
+            &scale.thought_open,
+            &fonts.ui,
+            13.,
+            20.,
+            regular,
+        ),
         (
             "sheet_title",
             &scale.sheet_title,
@@ -484,6 +550,8 @@ fn the_type_scale_matches_design() {
             (family, px(size), px(line_height), weight),
             "{name}"
         );
+        // Source and output are drawn as written, without ligatures.
+        assert_eq!(spec.ligatures, *family != fonts.mono, "{name}");
     }
 }
 
@@ -576,6 +644,46 @@ fn sizes_radii_and_spacing_match_design() {
     );
     assert_eq!((sizes.tile_glyph, sizes.hover_button), (px(26.), px(26.)));
     assert_eq!(sizes.reader_header_height, px(44.));
+
+    // §1.4, §4.2: the reading column at most 720 with 32 at its sides, 28 above and 16
+    // between blocks; activity rows 26, 24 nested, a tool's name 44 wide, a body indented
+    // 30; a call's header 26 and footer 24; a thought's row 22; a prompt's thumbnail 200 ×
+    // 116 with a 24 caption; a tool's image at most 320 high; a segment 22; Copy 22 square
+    // and the star 24.
+    assert_eq!(
+        (
+            sizes.reading_width,
+            sizes.reading_side,
+            sizes.reading_top,
+            sizes.block_gap
+        ),
+        (px(720.), px(32.), px(28.), px(16.))
+    );
+    assert_eq!(
+        [
+            sizes.activity_row,
+            sizes.activity_row_nested,
+            sizes.activity_name_width,
+            sizes.activity_name_max,
+            sizes.call_indent,
+            sizes.call_header,
+            sizes.call_footer,
+            sizes.thought_row,
+        ],
+        [26., 24., 44., 96., 30., 26., 24., 22.].map(px)
+    );
+    assert_eq!(
+        [
+            sizes.shot_width,
+            sizes.shot_height,
+            sizes.shot_caption,
+            sizes.tool_image_max_height,
+            sizes.segment_height,
+            sizes.small_button,
+            sizes.star_button,
+        ],
+        [200., 116., 24., 320., 22., 22., 24.].map(px)
+    );
 
     // The steps of the spacing scale 4 / 6 / 8 / 12 / 16 / 24 / 32 drawn so far.
     let spacing = Spacing::default();
