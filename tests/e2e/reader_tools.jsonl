@@ -8,9 +8,10 @@
 {"cmd": "click", "target": "card/2/title"}
 {"cmd": "settle", "expect": [{"pointer": "/library/open", "equals": "Downloads: paste a whole playlist"}, {"pointer": "/reader/state", "equals": "open"}, {"pointer": "/reader/facts", "equals": true}]}
 
-// The facts margin: the session, its turns, its calls by kind. 268 wide at the main area's right.
+// The facts margin: the session, its turns, its calls by kind. 268 wide at the main area's right; a turn's row keeps inside its 16 padding, its prompt cut short.
 {"cmd": "bounds", "target": "reader/facts", "expect_result": [{"pointer": "/w", "gte": 267, "lte": 269}]}
 {"cmd": "bounds", "target": "reader/facts/turn/1", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "reader/facts/turn/2", "expect_result": [{"pointer": "/x", "gte": 1188, "lte": 1190}, {"pointer": "/w", "gte": 234, "lte": 236}]}
 {"cmd": "screenshot", "name": "facts-1440-dark"}
 
 // A command: `$ command` with Copy, its output, and a footer with its exit status and Copy output.
@@ -21,10 +22,10 @@
 
 // A read: its file and lines, numbered and highlighted; an edit's diff: the hunk, the gutter, the words marked.
 {"cmd": "click", "target": "reader/call/main/2"}
-{"cmd": "click", "target": "reader/call/main/3"}
-{"cmd": "settle", "expect": {"pointer": "/reader/loads/bodies/loaded", "equals": 3}}
 {"cmd": "scroll", "target": "reader/column", "dy": -400}
 {"cmd": "settle"}
+{"cmd": "click", "target": "reader/call/main/3"}
+{"cmd": "settle", "expect": {"pointer": "/reader/loads/bodies/loaded", "equals": 3}}
 {"cmd": "bounds", "target": "reader/body/main/3", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "screenshot", "name": "tool-read-edit-1440-dark"}
 
@@ -68,7 +69,12 @@
 {"cmd": "screenshot", "name": "tool-web-mcp-960-light"}
 {"cmd": "click", "target": "reader/facts-toggle"}
 {"cmd": "settle", "expect": {"pointer": "/reader/facts", "equals": true}}
+// Too short for all of it, the margin scrolls as a whole and the turns keep their rows.
+{"cmd": "bounds", "target": "reader/facts/turn/3", "expect_result": {"pointer": "/visible/h", "gte": 21}}
 {"cmd": "screenshot", "name": "facts-overlay-960-light"}
+{"cmd": "scroll", "target": "reader/facts", "dy": -400}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "facts-overlay-end-960-light"}
 {"cmd": "key", "keystroke": "escape"}
 {"cmd": "settle", "expect": {"pointer": "/reader/facts", "equals": false}}
 {"cmd": "pin_appearance", "appearance": "dark"}

@@ -24,6 +24,8 @@
 {"cmd": "click", "target": "reader/history/read/1"}
 {"cmd": "settle", "expect": [{"pointer": "/reader/viewing", "equals": 1}, {"pointer": "/reader/history", "equals": null}]}
 {"cmd": "bounds", "target": "reader/older", "expect_result": {"pointer": "/visible", "not_equals": null}}
+// "v1 of 3 · older" leaves History no room beside it in the margin's value column: it goes under, whole.
+{"cmd": "bounds", "target": "reader/facts/history", "expect_result": {"pointer": "/x", "lte": 1364}}
 {"cmd": "screenshot", "name": "versions-older-1440-dark"}
 {"cmd": "click", "target": "reader/facts/history"}
 {"cmd": "settle"}

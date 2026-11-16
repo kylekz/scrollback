@@ -39,6 +39,8 @@ pub const HISTORY_WIDTH: f32 = 440.;
 pub const HISTORY_SHOWN: usize = 50;
 /// A turn's row in the facts.
 const TURN_ROW: f32 = 22.;
+/// The fewest turns the facts show, however short the window: past them the margin scrolls.
+const MIN_TURNS: usize = 4;
 
 /// The kinds of call the facts count, each under one label (DESIGN §4.2.8 "Calls").
 const CALL_KINDS: &[(&str, &[ToolKind])] = &[
@@ -231,10 +233,12 @@ impl ReaderView {
             facts.push(
                 kv(
                     "Version",
+                    /* History goes under the number when both don't fit ("v2 of 4 · older"). */
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
-                        .gap(theme.spacing.md)
+                        .gap_x(theme.spacing.md)
                         .child(
                             div()
                                 .text_color(if older { c.yellow } else { c.fg2 })
@@ -322,6 +326,7 @@ impl ReaderView {
                         let on = current == Some(index);
                         div()
                             .id(("facts-turn", index))
+                            .w_full()
                             .flex()
                             .items_center()
                             .gap(px(6.))
@@ -376,8 +381,7 @@ impl ReaderView {
         })
         .track_scroll(&self.turns_scroll)
         .flex_1()
-        .min_h_0()
-        .mr(px(-4.));
+        .min_h(px(TURN_ROW * count.min(MIN_TURNS) as f32));
 
         /* Calls by kind, of the session's own conversation, counted as it was parsed. */
         let mut calls: BTreeMap<usize, usize> = BTreeMap::new();
@@ -408,7 +412,9 @@ impl ReaderView {
                 )
         });
         let hair = || div().flex_none().h(px(1.)).bg(c.line_subtle);
+        /* In a short window the margin scrolls as a whole, the turns keeping a few rows. */
         div()
+            .id("reader-facts")
             .flex()
             .flex_col()
             .gap(px(14.))
@@ -421,7 +427,8 @@ impl ReaderView {
             .bg(c.bg_panel)
             .border_l_1()
             .border_color(c.line_subtle)
-            .overflow_hidden()
+            .overflow_x_hidden()
+            .overflow_y_scroll()
             .child(
                 div()
                     .flex_none()
@@ -776,10 +783,10 @@ impl ReaderView {
                         .text_color(c.fg3)
                         .text_spec(&theme.text.secondary)
                         .child(icon(SbIcon::Info, theme.sizes.icon_sm, c.fg3))
-                        .child(
+                        .child(div().flex_1().min_w_0().child(
                             "Subagent transcripts and tool results have their own versions, \
                              listed with each call.",
-                        ),
+                        )),
                 )
             })
             .automation_target("reader/history")

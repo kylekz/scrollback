@@ -432,6 +432,8 @@ pub fn label_as(keys: &str, caps: Keycaps) -> SharedString {
         "up" => "↑".to_string(),
         "down" => "↓".to_string(),
         "escape" => "Esc".to_string(),
+        "pageup" => "Page Up".to_string(),
+        "pagedown" => "Page Down".to_string(),
         "backspace" if caps == Keycaps::Symbols => "⌫".to_string(),
         other if other.chars().count() > 1 => capitalize(other),
         other => other.to_uppercase(),
@@ -563,5 +565,7 @@ mod tests {
         assert_eq!(symbols("secondary-,"), "⌘,");
         assert_eq!(symbols("cmd-backspace"), "⌘⌫");
         assert_eq!(words("backspace"), "Backspace");
+        assert_eq!(words("pageup"), "Page Up");
+        assert_eq!(symbols("pagedown"), "Page Down");
     }
 }
