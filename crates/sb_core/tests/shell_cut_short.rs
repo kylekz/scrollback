@@ -14,11 +14,13 @@ use std::time::{Duration, Instant};
 
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
-use sb_core::transport::{PrefixRequest, RangeRequest, ShellTransport, Transport, TransportError};
+use sb_core::transport::{
+    Launcher, PrefixRequest, RangeRequest, ShellTransport, Transport, TransportError,
+};
 use sb_test_support::shells;
 use tempfile::TempDir;
 
-use common::shell::{Collect, launched, noise, text};
+use common::shell::{Collect, noise, text};
 
 /// Every warning logged in this process.
 static WARNED: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -49,6 +51,27 @@ fn far_side(dir: &Path, first: &str, later: &str) -> ShellTransport {
     launched(&format!(
         "echo run >>'{dir}/runs'; if mkdir '{dir}/ran' 2>/dev/null; then {first}; else {later}; fi"
     ))
+}
+
+/**
+ * [`common::shell::launched`], in the userland `SB_TEST_SHELL_VIA` names when it names one:
+ * the stand-ins' `head`, `cat` and shell are then that userland's, as `shells()` are.
+ */
+fn launched(line: &str) -> ShellTransport {
+    let via = std::env::var(sb_test_support::SHELL_VIA).unwrap_or_default();
+    let mut words = via.split_whitespace().map(str::to_string).chain([
+        "env".to_string(),
+        "-i".to_string(),
+        format!("PATH={}", std::env::var("PATH").unwrap()),
+        "HOME=/nonexistent".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        line.to_string(),
+    ]);
+    ShellTransport::new(Launcher::Command {
+        program: words.next().unwrap().into(),
+        args: words.collect(),
+    })
 }
 
 /// How many times the launcher in `dir` was run, and the warnings that name it.
@@ -246,8 +269,12 @@ fn a_script_the_launcher_would_not_take_is_said_to_be_unwritten() {
         .collect();
     let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
     let dir = tempfile::tempdir().unwrap();
-    let closed = "exec 0<&-; echo 'no such distro' >&2; exit 3";
-    let said = match far_side(dir.path(), closed, closed).stat(&paths) {
+    /* On this machine whatever the userland: a container's client would take the script. */
+    let closed = common::shell::launched(&format!(
+        "echo run >>'{}/runs'; exec 0<&-; echo 'no such distro' >&2; exit 3",
+        text(dir.path())
+    ));
+    let said = match closed.stat(&paths) {
         Err(TransportError::Failed(said)) => said,
         other => panic!("{other:?}"),
     };

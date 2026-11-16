@@ -69,7 +69,8 @@ const LOGGED: usize = 1024;
  * How a shell words a script that ends in the middle (lowercased): bash and dash say "syntax
  * error" or bash "unexpected EOF while looking for matching"; ksh "syntax error at line N:
  * `{' unmatched"; zsh "parse error near", "unmatched '" or "closing brace expected"; busybox
- * ash "syntax error: unexpected end of file". A script that arrived whole always parses.
+ * ash "syntax error: unexpected end of file (expecting "}")", "syntax error: unterminated
+ * quoted string" or "syntax error: missing '}'". A script that arrived whole always parses.
  */
 const UNFINISHED: [&str; 5] = [
     "syntax error",
@@ -516,6 +517,8 @@ mod tests {
         let dash = "sh: 12: Syntax error: end of file unexpected (expecting \"}\")\n";
         assert!(again(&wsl, ended(2, dash, "")));
         assert!(again(&ssh, ended(1, "zsh: unmatched '\n", "Welcome!\n")));
+        let busybox = "sh: syntax error: unterminated quoted string\n";
+        assert!(again(&ssh, ended(2, busybox, "")));
         /* Anything else, however it looks. */
         for (launcher, unanswered) in [
             (&wsl, ended(0, "", "Welcome!\n")),

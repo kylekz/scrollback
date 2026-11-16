@@ -130,12 +130,14 @@ fn a_launcher_that_fails_says_why_in_its_own_words() {
         Err(TransportError::Failed(said)) => said,
         other => panic!("{other:?}"),
     };
-    /* Its verdict first, and last how far the script was written to it. */
+    /* Its verdict first, and last how far the script was written to it: whole into the pipe,
+    or not at all when it ended first. */
     let said = failed(launched("echo 'no such distro' >&2; exit 3"));
     let said: Vec<&str> = said.lines().collect();
     assert_eq!(said[0], "no such distro");
     assert!(
-        said[1].starts_with("the script was written whole ("),
+        said[1].starts_with("the script was written whole (")
+            || said[1].starts_with("the script could not be written: "),
         "{said:?}"
     );
     assert!(failed(launched("exit 3")).contains("ended before it answered"));
