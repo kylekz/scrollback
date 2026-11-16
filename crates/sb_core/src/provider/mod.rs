@@ -117,7 +117,9 @@ impl ItemKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScannedItem {
     /// The provider's name for the item, stable across passes: for a file, its path relative to
-    /// the agent's root.
+    /// the agent's root. A key names one item for good: once the owner deletes the session it
+    /// was of, sync skips the key (PLAN §4.5), so a provider that gives it to other content
+    /// later has that content skipped too, until the owner removes the session's tombstone.
     pub key: String,
     pub kind: ItemKind,
     /// The provider's id of the session the item belongs to, if it belongs to one.

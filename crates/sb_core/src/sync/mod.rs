@@ -16,9 +16,10 @@ use thiserror::Error;
 use toolbox_process::CancelToken;
 
 use crate::archive::{Archive, ArchiveError};
-use crate::catalogue::{self, Catalogue, CatalogueError};
+use crate::catalogue::{self, Catalogue, CatalogueError, SessionId};
 use crate::location::{LocationId, LocationKind};
-use crate::provider::{Provider, ProviderError, ProviderId, Source, Unlisted};
+use crate::provider::{Provider, ProviderError, ProviderId, ScannedItem, Source, Unlisted};
+use crate::search::SearchError;
 use crate::transport::{Transport, TransportError, wsl};
 
 pub use index::{IndexReport, index, index_session};
@@ -49,6 +50,8 @@ pub enum SyncError {
     Archive(#[from] ArchiveError),
     #[error(transparent)]
     Catalogue(#[from] CatalogueError),
+    #[error(transparent)]
+    Search(#[from] SearchError),
 }
 
 /// How long an item may keep changing under every pass that reads it before a pass counts it
@@ -110,6 +113,12 @@ pub struct PassReport {
     pub unlisted: Vec<Unlisted>,
     /// What the provider does not archive, such as symbolic links.
     pub skipped: Vec<Unlisted>,
+    /// Of `scanned`, the items of sessions the owner deleted for good, which are not archived
+    /// again (PLAN §4.5).
+    pub deleted: usize,
+    /// The sessions deleted for good (their tombstones) that those items are of: sessions that
+    /// still exist at the location, and may be going on there, unarchived.
+    pub deleted_sessions: Vec<SessionId>,
     /// Bytes read from the location.
     pub bytes_fetched: u64,
     /// The bytes that went into segments.
@@ -309,6 +318,8 @@ pub fn sync_location(
             index,
         });
     }
+    /* A log a read held when a delete for good was to empty it is emptied now. */
+    catalogue.retry_empty_log();
     Ok(passes)
 }
 
@@ -363,18 +374,27 @@ fn pass(
     catalogue.record_provider(location, provider.as_str(), retention_days, &source.root())?;
 
     let scan = source.scan()?;
-    progress(&Progress::Scanned {
-        items: scan.items.len(),
-    });
+    let scanned = scan.items.len();
+    progress(&Progress::Scanned { items: scanned });
     stop_if_cancelled()?;
 
+    let archived = catalogue.archived(location, provider.as_str())?;
+    /* What the owner deleted for good is not archived again (PLAN §4.5). */
+    let (skips, met) = catalogue.tombstoned(location, provider.as_str())?.skips(
+        &scan.items,
+        archived
+            .iter()
+            .map(|archived| (archived.item.key.as_str(), archived.item.session.as_deref())),
+    );
+    let items: Vec<ScannedItem> = scan
+        .items
+        .into_iter()
+        .zip(skips)
+        .filter_map(|(item, skip)| (!skip).then_some(item))
+        .collect();
     /* What could not be listed may hold items: none that is missing from the scan is taken
     for missing at the source. */
-    let plan = plan::plan(
-        &scan.items,
-        scan.unlisted.is_empty(),
-        catalogue.archived(location, provider.as_str())?,
-    );
+    let plan = plan::plan(&items, scan.unlisted.is_empty(), archived);
     progress(&Progress::Planned {
         items: plan.work.len(),
         bytes: plan.work.iter().map(|planned| planned.length).sum(),
@@ -383,7 +403,16 @@ fn pass(
 
     catalogue.record_scan(&plan.seen, &plan.gone)?;
     let mut report = PassReport {
-        scanned: scan.items.len(),
+        scanned,
+        deleted: scanned - items.len(),
+        deleted_sessions: met
+            .into_iter()
+            .map(|key| SessionId {
+                location: location.clone(),
+                provider: provider.as_str().to_string(),
+                key,
+            })
+            .collect(),
         unchanged: plan.unchanged,
         touched: plan.back,
         gone: plan.gone.len(),

@@ -8,6 +8,13 @@
 //!
 //! It also reports what `files/` holds that the catalogue doesn't record. Nothing else looks
 //! for that, and nothing moves it but [`Archive::set_aside_uncatalogued`], when the owner asks.
+//! The files of a session deleted for good that are still to be removed are reported apart:
+//! they are the archive's to remove, not the owner's to set aside.
+//!
+//! A version deleted for good while verify reads it is neither reported nor marked: verify
+//! marks a version only while its id is still of the version it read.
+//!
+//! And it checks the search index against the text it indexes, making it again if they differ.
 
 use std::fs;
 use std::io::{self, Read as _};
@@ -16,7 +23,8 @@ use std::sync::PoisonError;
 
 use toolbox_process::CancelToken;
 
-use super::{Archive, ArchiveError, Problem, accounted, layout};
+use super::{Archive, ArchiveError, Problem, layout};
+use crate::catalogue::Stored;
 use crate::location::LocationId;
 
 /// A version whose stored bytes are not the ones that were archived.
@@ -50,8 +58,14 @@ pub struct VerifyReport {
     pub damaged: Vec<Damage>,
     pub unread: Vec<Unread>,
     /// What is under `files/` that the catalogue doesn't record, by its path relative to the
-    /// archive. A folder is one path, whatever it holds.
+    /// archive. A folder is one path, whatever it holds; a folder that holds no file is none.
     pub uncatalogued: Vec<PathBuf>,
+    /// The folders of items of sessions deleted for good that are still to be removed, as
+    /// removing them failed (another program holds a file in them) or would go through a link,
+    /// by their paths relative to the archive. Every start tries again.
+    pub removing: Vec<PathBuf>,
+    /// The search index did not match the text it indexes, and was made again from it.
+    pub search_rebuilt: bool,
 }
 
 impl Archive {
@@ -60,28 +74,35 @@ impl Archive {
         /* What `files/` holds beyond what the catalogue records now, less what it records once
         no segment is between its place and its commit: every file found is then either
         recorded or not going to be. */
-        let mut uncatalogued = self.uncatalogued(&accounted(&self.catalogue.stored()?))?;
+        let removing = self.removing()?;
+        let mut uncatalogued =
+            self.uncatalogued(&self.accounted(&self.catalogue.stored()?)?, &removing)?;
         let stored = {
             let _quiet = self.placing.write().unwrap_or_else(PoisonError::into_inner);
             self.catalogue.stored()?
         };
         if !uncatalogued.is_empty() {
-            let accounted = accounted(&stored);
+            let accounted = self.accounted(&stored)?;
             uncatalogued.retain(|path| !accounted.contains(path));
         }
         let mut report = VerifyReport {
             uncatalogued,
+            removing: removing
+                .into_iter()
+                .filter(|path| self.dir.join(path).exists())
+                .collect(),
+            /* Search that is not available is the next start's to make again. */
+            search_rebuilt: match self.search_index() {
+                Ok(search) => !search.check()?,
+                Err(_) => false,
+            },
             ..VerifyReport::default()
         };
         let mut damaged = Vec::new();
         let mut repaired = Vec::new();
         let mut buffer = vec![0; 128 * 1024];
         for stored in stored {
-            let (id, number, was_damaged) = (
-                stored.version.id,
-                stored.version.number,
-                stored.version.damaged,
-            );
+            let (number, was_damaged) = (stored.version.number, stored.version.damaged);
             let dir = self
                 .dir
                 .join(layout::item_dir(
@@ -105,6 +126,10 @@ impl Archive {
                 stored.provider.clone(),
                 stored.key.clone(),
             );
+            let read = Stored {
+                segments: Vec::new(),
+                ..stored.clone()
+            };
             let mut reader = self.reader(stored, 0);
             let mut problems = Vec::new();
             let mut unread = None;
@@ -126,16 +151,18 @@ impl Archive {
                 }
             }
             if !problems.is_empty() {
-                damaged.push(id);
-                report.damaged.push(Damage {
-                    location: location.clone(),
-                    provider: provider.clone(),
-                    key: key.clone(),
-                    version: number,
-                    problems,
-                });
+                damaged.push((
+                    read,
+                    Damage {
+                        location: location.clone(),
+                        provider: provider.clone(),
+                        key: key.clone(),
+                        version: number,
+                        problems,
+                    },
+                ));
             } else if unread.is_none() && was_damaged {
-                repaired.push(id);
+                repaired.push(read);
             }
             if let Some(error) = unread {
                 report.unread.push(Unread {
@@ -147,8 +174,17 @@ impl Archive {
                 });
             }
         }
-        self.catalogue.set_damaged(&damaged, true)?;
-        self.catalogue.set_damaged(&repaired, false)?;
+        let marks: Vec<(&Stored, bool)> = damaged
+            .iter()
+            .map(|(read, _)| (read, true))
+            .chain(repaired.iter().map(|read| (read, false)))
+            .collect();
+        let there = self.catalogue.mark_as_read(&marks)?;
+        report.damaged = damaged
+            .into_iter()
+            .zip(there)
+            .filter_map(|((_, damage), there)| there.then_some(damage))
+            .collect();
         Ok(report)
     }
 }

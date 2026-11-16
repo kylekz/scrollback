@@ -443,6 +443,9 @@ impl Sidebar {
             Some(Shelf::All) => counts.all,
             Some(Shelf::Starred) => counts.starred,
             Some(Shelf::Unsorted) => counts.unsorted,
+            // Trash's row counts what is there, though it has no page yet.
+            Some(Shelf::Trash) => counts.trash,
+            None if target == "sidebar/trash" => counts.trash,
             Some(Shelf::Folder(_)) | None => 0,
         };
         let selected = enabled && shelf == Some(library.highlighted());

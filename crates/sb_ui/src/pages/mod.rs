@@ -317,6 +317,7 @@ impl Render for MainArea {
                     Shelf::All => "All sessions".into(),
                     Shelf::Starred => "Starred".into(),
                     Shelf::Unsorted => "Unsorted".into(),
+                    Shelf::Trash => "Trash".into(),
                     Shelf::Folder(folder) => library
                         .folder(folder)
                         .map_or_else(SharedString::default, |it| it.name.clone().into()),

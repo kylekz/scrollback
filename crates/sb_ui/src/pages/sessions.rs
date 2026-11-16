@@ -1074,6 +1074,7 @@ impl Render for SessionsView {
                     .folder(folder)
                     .map_or_else(SharedString::default, |it| it.name.clone().into()),
             ),
+            Shelf::Trash => (SbIcon::Trash, "Trash".into()),
             Shelf::All | Shelf::Unsorted => (SbIcon::Layers, "All sessions".into()),
         };
         let page: Option<&SessionsPage> = library.sessions();

@@ -12,6 +12,9 @@ use sb_test_support::Agent;
 use common::{Bench, for_both_agents};
 
 for_both_agents!(
+    removing_one_location_leaves_the_others_as_they_were,
+    an_item_with_several_versions_is_held_once,
+    a_session_in_trash_is_held_and_one_deleted_for_good_is_not,
     removing_a_location_keeps_everything_archived_from_it,
     a_removed_place_added_again_carries_on_from_its_archive,
     the_archive_says_what_it_holds_from_each_agent_there,
@@ -82,12 +85,7 @@ fn the_archive_says_what_it_holds_from_each_agent_there<A: Agent + Default>() {
     let bench = bench::<A>();
     let catalogue = bench.archive().catalogue();
     let provider = bench.agent.provider();
-    let bytes: u64 = bench
-        .items()
-        .iter()
-        .flat_map(|item| catalogue.versions(item.id).unwrap())
-        .map(|version| version.length)
-        .sum();
+    let bytes = newest_lengths(&bench);
     let holdings = catalogue.holdings().unwrap();
     assert_eq!(
         holdings,
@@ -95,6 +93,7 @@ fn the_archive_says_what_it_holds_from_each_agent_there<A: Agent + Default>() {
             location: bench.location.clone(),
             provider: provider.id().to_string(),
             sessions: 2,
+            trashed: 0,
             bytes,
             since: holdings[0].since,
         }]
@@ -132,4 +131,59 @@ fn a_survey_says_how_much_a_first_sync_copies<A: Agent + Default>() {
     /* What the first sync then stores is that many bytes. */
     let report = bench.sync().report;
     assert_eq!(found.bytes, report.bytes_stored);
+}
+
+/// Each item's newest version's length, summed: what [`Holding::bytes`] counts.
+fn newest_lengths<A: Agent>(bench: &Bench<A>) -> u64 {
+    let catalogue = bench.archive().catalogue();
+    bench
+        .items()
+        .iter()
+        .filter_map(|item| catalogue.versions(item.id).unwrap().last().cloned())
+        .map(|version| version.length)
+        .sum()
+}
+
+fn removing_one_location_leaves_the_others_as_they_were<A: Agent + Default>() {
+    let bench = bench::<A>();
+    let catalogue = bench.archive().catalogue();
+    let others = [
+        LocationKind::Wsl {
+            distro: "Ubuntu-24.04".to_string(),
+        },
+        LocationKind::Ssh {
+            host: "user@macbook".to_string(),
+        },
+    ]
+    .map(|kind| catalogue.add_location(kind, "another").unwrap());
+    catalogue.remove_location(&bench.location).unwrap();
+    for other in others {
+        assert_eq!(catalogue.location(&other.id).unwrap(), Some(other));
+    }
+}
+
+fn an_item_with_several_versions_is_held_once<A: Agent + Default>() {
+    let mut agent = A::default();
+    let key = agent.add_session(8);
+    let mut bench = Bench::new(agent);
+    bench.sync();
+    bench.agent.rewrite(&key);
+    bench.sync();
+    assert!(bench.versions(&key).len() > 1);
+    let held = bench.archive().catalogue().holdings().unwrap();
+    assert_eq!(held[0].bytes, newest_lengths(&bench));
+}
+
+fn a_session_in_trash_is_held_and_one_deleted_for_good_is_not<A: Agent + Default>() {
+    let bench = bench::<A>();
+    let catalogue = bench.archive().catalogue();
+    let sessions = bench.sessions();
+    catalogue.trash(&sessions[0].id).unwrap();
+    let held = catalogue.holdings().unwrap();
+    assert_eq!((held[0].sessions, held[0].trashed), (2, 1));
+    let deletion = catalogue.deletion(&sessions[0].id).unwrap();
+    bench.archive().delete_for_good(&deletion).unwrap();
+    let held = catalogue.holdings().unwrap();
+    assert_eq!((held[0].sessions, held[0].trashed), (1, 0));
+    assert_eq!(held[0].bytes, newest_lengths(&bench));
 }

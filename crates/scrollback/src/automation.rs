@@ -35,8 +35,8 @@
 //!   `not_installed`, `missing`, `other`).
 //! - `sheet`: the locations sheet while it is open (`null` otherwise): the name of its
 //!   `selected` location, and its `dialog` (`add`, `remove` or `null`).
-//! - `library`: `shelf` (`all`, `starred`, `unsorted`, or `{"folder": name}`), `counts` (`all`,
-//!   `starred`, `unsorted`), `folders` (each with its `name`, its `parent`'s name and its
+//! - `library`: `shelf` (`all`, `starred`, `unsorted`, `trash`, or `{"folder": name}`), `counts`
+//!   (`all`, `starred`, `unsorted`), `folders` (each with its `name`, its `parent`'s name and its
 //!   `sessions`, in the catalogue's order), `sessions` and `groups` (how many the shown page
 //!   lists, `null` while it loads or is of the other kind), the titles of the `selected` and
 //!   the `open` session, and `error` (why the library couldn't be read, or `null`).
@@ -319,6 +319,7 @@ fn library(cx: &App) -> Value {
             Shelf::All => json!("all"),
             Shelf::Starred => json!("starred"),
             Shelf::Unsorted => json!("unsorted"),
+            Shelf::Trash => json!("trash"),
             Shelf::Folder(folder) => json!({ "folder": name(folder) }),
         },
         "counts": {

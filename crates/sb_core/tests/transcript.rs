@@ -223,8 +223,8 @@ fn an_agent_of_another_shape_parses_into_the_same_model() {
             .collect::<Vec<_>>(),
         [
             (at(0, 0), SpanKind::Prompt, "List the files."),
-            (at(0, 1), SpanKind::ToolCall, "ls"),
-            (at(0, 2), SpanKind::ToolCall, "c.txt"),
+            (at(0, 1), SpanKind::Command, "ls"),
+            (at(0, 2), SpanKind::Path, "c.txt"),
             (at(0, 5), SpanKind::Reply, "Two files."),
             (at(1, 7), SpanKind::Prompt, "Thanks."),
         ]
