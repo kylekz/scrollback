@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# The release workflow's two steps around script/package (.github/workflows/release.yml), the
+# same for each platform's channel (`win`, `osx`). Run only on GitHub's runners, by the workflow:
+#
+#   script/release-feed previous <channel> <dir>
+#       the latest published release's full package for <channel>, from this repository's
+#       GitHub Releases into <dir>, which `vpk pack` makes the delta from and checks the new
+#       version against. Needs vpk and gh, GH_TOKEN, GITHUB_REPOSITORY
+#   script/release-feed files <channel> <out> <upload>
+#       this release's files from script/package's <out> into <upload>: the packages and the
+#       installer vpk lists in assets.<channel>.json, the feed releases.<channel>.json and
+#       assets.<channel>.json, and on Windows the older RELEASES
+set -euo pipefail
+
+usage() {
+    echo "usage: script/release-feed previous <channel> <dir> | files <channel> <out> <upload>" >&2
+}
+
+case "${1:-}" in
+    previous)
+        if [[ $# -ne 3 ]]; then
+            usage
+            exit 2
+        fi
+        channel="$2"
+        dir="$3"
+        : "${GH_TOKEN:?script/release-feed: previous needs GH_TOKEN}"
+        : "${GITHUB_REPOSITORY:?script/release-feed: previous needs GITHUB_REPOSITORY}"
+        vpk="$(command -v vpk 2> /dev/null || echo "$HOME/.dotnet/tools/vpk")"
+        mkdir -p "$dir"
+        "$vpk" download github --repoUrl "https://github.com/$GITHUB_REPOSITORY" \
+            --channel "$channel" --outputDir "$dir" --token "$GH_TOKEN"
+        # vpk says nothing went wrong when it finds no release, or when a download fails its
+        # checksum: make sure the package is there whenever the latest release has this
+        # channel's feed.
+        latest="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts \
+            --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // ""')"
+        if [[ -n "$latest" ]] && gh release view "$latest" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' | grep -qx "releases.$channel.json" &&
+            ! compgen -G "$dir/*-full.nupkg" > /dev/null; then
+            echo "script/release-feed: vpk didn't download the $channel full package of the" \
+                "latest release, $latest" >&2
+            exit 1
+        fi
+        ls -l "$dir"
+        ;;
+    files)
+        if [[ $# -ne 4 ]]; then
+            usage
+            exit 2
+        fi
+        channel="$2"
+        out="$3"
+        upload="$4"
+        mkdir -p "$upload"
+        jq -r '.[].RelativeFileName' "$out/assets.$channel.json" | tr -d '\r' |
+            while read -r name; do
+                cp "$out/$name" "$upload/"
+            done
+        cp "$out/releases.$channel.json" "$out/assets.$channel.json" "$upload/"
+        if [[ -f "$out/RELEASES" ]]; then
+            cp "$out/RELEASES" "$upload/"
+        fi
+        ls -l "$upload"
+        ;;
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    *)
+        usage
+        exit 2
+        ;;
+esac
