@@ -388,3 +388,26 @@ fn a_session_opened_at_a_search_match_fills_find_at_that_match(cx: &mut TestAppC
     /* The current match is the one flashed, not the first. */
     assert!(current.unwrap().starts_with(&flashed), "{flashed}");
 }
+
+/// How long Find takes over the reader's budget session (PLAN §14), in release:
+/// `cargo test --release -p sb_ui find_over_the_budget_session -- --ignored --nocapture`.
+#[gpui::test]
+#[ignore = "a measurement"]
+fn find_over_the_budget_session(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    synced(
+        |tree| {
+            reader::large(tree, reader::Large::BUDGET);
+        },
+        cx,
+    );
+    open("A long session to measure the reader", cx);
+    for query in ["cargo test --package part_9", "e"] {
+        let started = std::time::Instant::now();
+        cx.simulate_keystrokes("secondary-f");
+        cx.simulate_input(query);
+        cx.run_until_parked();
+        let count = snapshot(&shell, cx).find.unwrap().1;
+        eprintln!("{query}: {count:?} in {:?}", started.elapsed());
+    }
+}
