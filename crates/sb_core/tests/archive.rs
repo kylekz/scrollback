@@ -655,6 +655,47 @@ fn verify_finds_every_problem_of_a_version() {
     );
 }
 
+/**
+ * The damaged versions are listed by session, not in the order they were archived: that order
+ * follows how a location's file system lists its folders, which differs from one to another.
+ */
+#[test]
+fn verify_lists_damage_by_session_whatever_order_it_was_archived_in() {
+    let mut agent = FileAgent::new();
+    let first = agent.add_session(20);
+    let second = agent.add_session(20);
+    assert!(first < second);
+    let mut bench = Bench::new(agent);
+    bench.sync();
+    /* The first's newest version is archived after the second's. */
+    bench.agent.rewrite(&first);
+    bench.sync();
+    assert!(bench.versions(&first)[1].id > bench.versions(&second)[0].id);
+    for key in [&first, &second] {
+        let newest = bench.segment_files_of(key).pop().unwrap();
+        fs::remove_file(newest).unwrap();
+    }
+
+    let report = bench.archive().verify(&CancelToken::new()).unwrap();
+    let listed: Vec<(&str, u32)> = report
+        .damaged
+        .iter()
+        .map(|damage| (damage.key.as_str(), damage.version))
+        .collect();
+    assert_eq!(listed, [(first.as_str(), 2), (second.as_str(), 1)]);
+    let recorded: Vec<String> = bench
+        .archive()
+        .catalogue()
+        .last_verify()
+        .unwrap()
+        .unwrap()
+        .damaged
+        .into_iter()
+        .map(|damage| damage.key)
+        .collect();
+    assert_eq!(recorded, [first, second]);
+}
+
 #[test]
 fn verify_finds_segments_that_do_not_follow_one_another() {
     let (bench, key) = two_segments();

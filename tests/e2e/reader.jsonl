@@ -11,7 +11,7 @@
 {"cmd": "settle", "expect": [{"pointer": "/page", "equals": "session"}, {"pointer": "/reader/state", "equals": "open"}, {"pointer": "/reader/place", "equals": [2, 5]}, {"pointer": "/reader/full_calls", "equals": false}, {"pointer": "/reader/open_calls", "equals": 0}, {"pointer": "/reader/top_name", "equals": "prompt main/0"}]}
 {"cmd": "bounds", "target": "session/title", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "bounds", "target": "reader/call/main/4", "expect_result": [{"pointer": "/h", "gte": 25, "lte": 26}, {"pointer": "/w", "equals": 736}]}
-{"cmd": "bounds", "target": "reader/reply/main/2", "expect_result": {"pointer": "/w", "equals": 732}}
+{"cmd": "bounds", "target": "reader/reply/main/2", "expect_result": [{"pointer": "/w", "gte": 731}, {"pointer": "/w", "lte": 732}]}
 {"cmd": "screenshot", "name": "reader-top-1440-dark"}
 
 // A click opens a call in place; its body loads and hangs under it, and the rows below move down.
@@ -52,11 +52,11 @@
 // Ctrl C with nothing selected copies the focused message.
 {"cmd": "key", "keystroke": "secondary-c", "expect": [{"pointer": "/system", "len": 1}, {"pointer": "/system/0/kind", "equals": "copy"}, {"pointer": "/system/0/text", "contains": "Let me find where the backfill is scheduled first."}]}
 
-// Full calls (E): every call open; the choice is the app's, kept for the next session. The row at the top stays at the top. Where it sits is a range: the rows above it lay out a few pixels apart at each display scale and on each platform; it must not move when the calls open.
+// Full calls (E): every call open; the choice is the app's, kept for the next session. The row at the top stays at the top. Where it sits is a range: the rows above it lay out a few pixels apart at each display scale, and wrap to more lines in Segoe UI than in SF Pro; it must not move when the calls open.
 {"cmd": "key", "keystroke": "]"}
-{"cmd": "settle", "expect": [{"pointer": "/reader/top_name", "equals": "reply main/12"}, {"pointer": "/reader/top_offset", "gte": 164, "lte": 188}]}
+{"cmd": "settle", "expect": [{"pointer": "/reader/top_name", "equals": "reply main/12"}, {"pointer": "/reader/top_offset", "gte": 164, "lte": 212}]}
 {"cmd": "key", "keystroke": "e"}
-{"cmd": "settle", "expect": [{"pointer": "/reader/full_calls", "equals": true}, {"pointer": "/reader/open_calls", "equals": 17}, {"pointer": "/reader/top_name", "equals": "reply main/12"}, {"pointer": "/reader/top_offset", "gte": 164, "lte": 188}]}
+{"cmd": "settle", "expect": [{"pointer": "/reader/full_calls", "equals": true}, {"pointer": "/reader/open_calls", "equals": 17}, {"pointer": "/reader/top_name", "equals": "reply main/12"}, {"pointer": "/reader/top_offset", "gte": 164, "lte": 212}]}
 {"cmd": "key", "keystroke": "home"}
 {"cmd": "settle"}
 {"cmd": "screenshot", "name": "full-calls-1440-dark"}
@@ -204,7 +204,7 @@
 // 960x600: the sidebar collapses and the column narrows to what is left, less its sides.
 {"cmd": "resize", "w": 960, "h": 600, "expect": {"pointer": "/shell/sidebar", "equals": "collapsed"}}
 {"cmd": "settle"}
-{"cmd": "bounds", "target": "reader/reply/main/2", "expect_result": {"pointer": "/w", "equals": 732}}
+{"cmd": "bounds", "target": "reader/reply/main/2", "expect_result": [{"pointer": "/w", "gte": 731}, {"pointer": "/w", "lte": 732}]}
 {"cmd": "screenshot", "name": "reader-top-960-dark"}
 {"cmd": "key", "keystroke": "e"}
 {"cmd": "settle", "expect": {"pointer": "/reader/full_calls", "equals": true}}

@@ -328,6 +328,17 @@ impl Archive {
             .zip(there)
             .filter_map(|((_, damage), there)| there.then_some(damage))
             .collect();
+        /* By session, not in the order the versions were archived, which follows how each
+        location's file system lists its folders: the same archive lists the same, first
+        [`KEPT_DAMAGES`] too, wherever it is verified. */
+        report.damaged.sort_by(|a, b| {
+            (a.location.as_str(), &a.provider, &a.key, a.version).cmp(&(
+                b.location.as_str(),
+                &b.provider,
+                &b.key,
+                b.version,
+            ))
+        });
         self.catalogue.record_verify(&LastVerify {
             at: catalogue::now_ms(),
             took_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
