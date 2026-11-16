@@ -44,13 +44,17 @@ impl Command {
 
     /**
      * Whether it does something with the main area in the key context `page` (the shown
-     * page's, [`crate::pages::Showing`]): the shell's commands and the pages do everywhere,
-     * a page's only where that context binds its action too.
+     * page's, [`crate::pages::Showing`]), `folder` saying whether that is a folder's page or
+     * over one: the shell's commands and the pages do everywhere, but those of
+     * [`ON_A_FOLDER`] only with a folder shown; a page's only where that context binds its
+     * action too.
      */
-    pub fn available(&self, page: &str) -> bool {
+    pub fn available(&self, page: &str, folder: bool) -> bool {
         match self.run {
             Run::Show(_) => true,
-            Run::Key(shortcut) if shortcut.context == keymap::SHELL => true,
+            Run::Key(shortcut) if shortcut.context == keymap::SHELL => {
+                folder || !ON_A_FOLDER.contains(&(shortcut.action)().name())
+            }
             Run::Key(shortcut) => {
                 let name = (shortcut.action)().name();
                 (keymap::SHORTCUTS.iter())
@@ -206,12 +210,15 @@ pub const NOT_COMMANDS: &[&str] = &[
     "reader::Bottom",
 ];
 
+/// The shell's actions that act on the folder shown, and so do nothing without one.
+pub const ON_A_FOLDER: &[&str] = &["sidebar::Rename"];
+
 /// The commands whose names `terms` ask for that do something on the page whose key context
-/// is `page`.
-pub fn matching(terms: &[String], page: &str) -> Vec<&'static Command> {
+/// is `page`, with a folder shown or not ([`Command::available`]).
+pub fn matching(terms: &[String], page: &str, folder: bool) -> Vec<&'static Command> {
     COMMANDS
         .iter()
-        .filter(|command| command.matches(terms) && command.available(page))
+        .filter(|command| command.matches(terms) && command.available(page, folder))
         .collect()
 }
 
@@ -242,7 +249,7 @@ mod tests {
     }
 
     fn names(text: &str, page: &str) -> Vec<&'static str> {
-        (matching(&terms(text), page).iter())
+        (matching(&terms(text), page, false).iter())
             .map(|it| it.name)
             .collect()
     }
@@ -316,5 +323,13 @@ mod tests {
             ["Go to the next turn", "Go to the previous turn"]
         );
         assert_eq!(names("settings", reader), ["Open Settings"]);
+        /* Renaming the folder shown needs a folder shown. */
+        let rename = |folder| {
+            (matching(&terms("rename"), keymap::SESSIONS, folder).iter())
+                .map(|it| it.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rename(false), Vec::<&str>::new());
+        assert_eq!(rename(true), ["Rename the folder shown"]);
     }
 }

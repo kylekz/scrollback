@@ -239,6 +239,11 @@ pub struct Palette {
     sync: Entity<SyncService>,
     /// The search again that index news asked for, until it runs.
     again: Option<gpui::Task<()>>,
+    /// What the tokens can name that doesn't change while the palette is open: the agents,
+    /// by their ids and their names, and the dates offered.
+    agents: Vec<(ProviderId, String)>,
+    agent_ids: Vec<ProviderId>,
+    dates: Vec<String>,
     _subscriptions: [Subscription; 4],
 }
 
@@ -307,6 +312,20 @@ impl Palette {
             ],
             folders: library.read(cx).folders().to_vec(),
             again: None,
+            agents: (cx.services().providers.iter())
+                .map(|provider| (provider.id(), provider.display().name.to_string()))
+                .collect(),
+            agent_ids: (cx.services().providers.iter())
+                .map(|provider| provider.id())
+                .collect(),
+            dates: format::month_of(format::now()).map_or_else(Vec::new, |(year, month)| {
+                vec![
+                    format!("{year}-{month:02}"),
+                    year.to_string(),
+                    (year - 1).to_string(),
+                    (year - 2).to_string(),
+                ]
+            }),
             input,
             chips: Vec::new(),
             highlight: 0,
@@ -362,29 +381,16 @@ impl Palette {
     fn known<T>(&self, cx: &App, with: impl FnOnce(&Known<'_>) -> T) -> T {
         let library = self.library.read(cx);
         let sync = self.sync.read(cx);
-        let providers = &cx.services().providers;
-        let agents: Vec<(ProviderId, String)> = (providers.iter())
-            .map(|provider| (provider.id(), provider.display().name.to_string()))
-            .collect();
-        let agent_ids: Vec<ProviderId> = agents.iter().map(|(id, _)| *id).collect();
         let (models, branches) = self.search.read(cx).values();
-        let dates = format::month_of(format::now()).map_or_else(Vec::new, |(year, month)| {
-            vec![
-                format!("{year}-{month:02}"),
-                year.to_string(),
-                (year - 1).to_string(),
-                (year - 2).to_string(),
-            ]
-        });
         with(&Known {
             folders: library.folders(),
             locations: sync.locations().unwrap_or_default(),
-            agents: &agents,
-            agent_ids: &agent_ids,
+            agents: &self.agents,
+            agent_ids: &self.agent_ids,
             models: &models,
             model_name: &|model| agents::any_model(model, None, cx),
             branches: &branches,
-            dates: &dates,
+            dates: &self.dates,
             calendar: format::calendar(),
         })
     }
@@ -399,7 +405,8 @@ impl Palette {
             )
         });
         let page = Showing::now(cx).key_context();
-        let commands = commands::matching(&asked.query.terms, page);
+        let folder = matches!(self.library.read(cx).shelf(), Shelf::Folder(_));
+        let commands = commands::matching(&asked.query.terms, page, folder);
         let search = self.search.read(cx);
         let mut view = View {
             text,
@@ -627,7 +634,7 @@ impl Palette {
                 return;
             }
             Row::RecentSession(at) => (self.search.read(cx).recent_sessions().nth(at))
-                .map(|session| (session.clone(), None)),
+                .map(|session| (Session::clone(session), None)),
             Row::Session(at) | Row::Match(at, _) => found(at).map(|(answered, found)| {
                 let shown = match row {
                     Row::Match(_, shown) => found.shown.get(shown),
@@ -1244,7 +1251,7 @@ impl Palette {
         let mut row = 0;
         if view.lists_recent() {
             let search = self.search.read(cx);
-            let sessions: Vec<Session> = search.recent_sessions().cloned().collect();
+            let sessions: Vec<Arc<Session>> = search.recent_sessions().cloned().collect();
             let searches: Vec<String> = search.recent_searches().cloned().collect();
             if !sessions.is_empty() {
                 children.push(group("Recent sessions"));

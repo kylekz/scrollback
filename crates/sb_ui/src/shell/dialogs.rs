@@ -23,7 +23,7 @@ use sb_core::filing::FolderId;
 use super::Shell;
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{ButtonKind, button, icon, location_tag};
+use crate::components::{ButtonKind, button, focus_ring, icon, location_tag};
 use crate::format;
 use crate::icons::SbIcon;
 use crate::keymap;
@@ -41,6 +41,35 @@ pub(super) enum Asking {
     /// Delete for good, of the session, with why its last confirmation was refused.
     DeleteForGood(SessionId, Option<Refusal>),
     Save,
+}
+
+/// Which dialog the library asks for, as it says it: compared with the one open each frame
+/// without copying the session's id.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Asked<'a> {
+    Delete(FolderId),
+    DeleteForGood(&'a SessionId, Option<Refusal>),
+    Save,
+}
+
+impl Asking {
+    fn asked(&self) -> Asked<'_> {
+        match self {
+            Self::Delete(folder) => Asked::Delete(*folder),
+            Self::DeleteForGood(id, refused) => Asked::DeleteForGood(id, *refused),
+            Self::Save => Asked::Save,
+        }
+    }
+}
+
+impl Asked<'_> {
+    fn asking(self) -> Asking {
+        match self {
+            Self::Delete(folder) => Asking::Delete(folder),
+            Self::DeleteForGood(id, refused) => Asking::DeleteForGood(id.clone(), refused),
+            Self::Save => Asking::Save,
+        }
+    }
 }
 
 /// The dialog open, and where the keyboard was before it opened.
@@ -64,15 +93,16 @@ impl Shell {
      */
     pub(super) fn follow_dialogs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let library = cx.services().library.read(cx);
-        let asking = match (library.deleting(), library.for_good(), library.asked()) {
-            (Some(folder), ..) => Some(Asking::Delete(folder)),
-            (None, Some(asked), _) => Some(Asking::DeleteForGood(
-                asked.session.id.clone(),
-                asked.refused,
-            )),
-            (None, None, Some(_)) => Some(Asking::Save),
+        let asked = match (library.deleting(), library.for_good(), library.asked()) {
+            (Some(folder), ..) => Some(Asked::Delete(folder)),
+            (None, Some(asked), _) => Some(Asked::DeleteForGood(&asked.session.id, asked.refused)),
+            (None, None, Some(_)) => Some(Asked::Save),
             (None, None, None) => None,
         };
+        if asked == self.dialog.as_ref().map(|open| open.asking.asked()) {
+            return;
+        }
+        let asking = asked.map(Asked::asking);
         match (asking, &mut self.dialog) {
             /* Another session asked about, or a refusal to read: Cancel has the keyboard
             again, so Enter never confirms what the owner hasn't seen. */
@@ -249,7 +279,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let c = &theme.colors;
-        let accent = c.accent;
+        let (accent, ring) = (c.accent, focus_ring(false, theme));
         let ForGood {
             session,
             deletion,
@@ -428,7 +458,7 @@ impl Shell {
                             button("for-good-cancel", ButtonKind::Plain, false, true, theme)
                                 .track_focus(cancel)
                                 // Its ring shows from the start: the keyboard is on it.
-                                .focus(move |style| style.border_color(accent))
+                                .focus(move |style| style.border_color(accent).shadow(ring))
                                 .on_click(answer(false))
                                 .child("Cancel")
                                 .automation_target("for-good/cancel"),

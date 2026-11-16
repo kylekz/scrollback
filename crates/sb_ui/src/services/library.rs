@@ -1981,6 +1981,8 @@ impl LibraryService {
         cx: &mut Context<Self>,
     ) {
         let (number, toast) = std::mem::take(&mut self.toast_in_hand);
+        /* Taken whether or not it was written: a refused Undo leaves no number behind. */
+        let undo = self.undos.remove(&number);
         let written = match (&change, written) {
             (_, Ok(written)) => written,
             (Change::FolderFrom { group, .. }, Err(error)) => {
@@ -2105,7 +2107,7 @@ impl LibraryService {
         }
         // An Undo says it is done, or what it couldn't put back; it has no Undo of its own.
         let toast = match toast {
-            _ if !self.undos.remove(&number) => toast,
+            _ if !undo => toast,
             Some(Toast { undo: None, text }) => Some(Toast { text, undo: None }),
             _ => Some(Toast {
                 text: "Undone".to_string(),

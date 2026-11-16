@@ -73,7 +73,8 @@ pub struct SearchService {
     unsearchable: usize,
     /// The models and the branches the archive's sessions have, the commonest first.
     values: (Arc<[String]>, Arc<[String]>),
-    recent_sessions: VecDeque<Session>,
+    /// Shared, so that the palette draws them each frame without copying them.
+    recent_sessions: VecDeque<Arc<Session>>,
     recent_searches: VecDeque<String>,
     _observers: [Subscription; 2],
 }
@@ -94,7 +95,7 @@ impl SearchService {
                     if this.recent_sessions.front().map(|it| &it.id) != Some(&open.id) {
                         let open = open.clone();
                         this.recent_sessions.retain(|it| it.id != open.id);
-                        this.recent_sessions.push_front(open);
+                        this.recent_sessions.push_front(Arc::new(open));
                         this.recent_sessions.truncate(RECENT);
                         cx.notify();
                     }
@@ -155,7 +156,7 @@ impl SearchService {
     }
 
     /// The sessions opened last, the latest first.
-    pub fn recent_sessions(&self) -> impl Iterator<Item = &Session> {
+    pub fn recent_sessions(&self) -> impl Iterator<Item = &Arc<Session>> {
         self.recent_sessions.iter()
     }
 
@@ -241,7 +242,7 @@ impl SearchService {
                         .retain_mut(|kept| match read.get(&kept.id) {
                             None => true,
                             Some(Some(now)) if now.trashed.is_none() => {
-                                *kept = now.clone();
+                                *kept = Arc::new(now.clone());
                                 true
                             }
                             Some(_) => false,
