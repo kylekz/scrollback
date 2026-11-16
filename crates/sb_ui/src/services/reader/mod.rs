@@ -428,6 +428,11 @@ impl OpenSession {
         }
     }
 
+    /// Which subagent started which, once it is asked for ([`ReaderService::want_placement`]).
+    pub fn placement(&self) -> Option<&Load<Arc<Placement>>> {
+        self.placement.as_ref()
+    }
+
     /// What the subagent `item` says it is, once read or placed.
     pub fn names(&self, item: &str) -> Names {
         if let Some(Load::Loaded(read)) = self.subagents.get(item) {
