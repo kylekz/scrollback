@@ -363,8 +363,9 @@ fn tab_walks_the_buttons_and_never_strands_the_keyboard(cx: &mut TestAppContext)
             break;
         }
     }
-    // The title bar's Sync all, the sidebar's rows and its two buttons, the main area.
-    assert_eq!(stops, 5);
+    // The page's filter field, the title bar's Sync all, the sidebar's rows and its two
+    // buttons, the main area.
+    assert_eq!(stops, 6);
     // Shift Tab goes the other way: to the sidebar's buttons, where the page's keys still work.
     cx.simulate_keystrokes("shift-tab");
     assert!(!main_focused(&shell, cx));
@@ -380,8 +381,8 @@ fn tab_reaches_a_groups_buttons_and_enter_presses_them(cx: &mut TestAppContext) 
     library(cx).update(cx, |library, cx| library.show(Shelf::Unsorted, cx));
     cx.run_until_parked();
     assert!(main_focused(&shell, cx));
-    // The first group's toggle, then its Create folder from this path.
-    cx.simulate_keystrokes("tab");
+    // The filter field, the first group's toggle, then its Create folder from this path.
+    cx.simulate_keystrokes("tab tab");
     press(cx, "enter");
     cx.simulate_keystrokes("down");
     let first = library(cx).read_with(cx, |library, _| {
@@ -443,10 +444,11 @@ fn an_arrow_from_a_session_in_a_closed_group_goes_on_from_where_it_is(cx: &mut T
     let selected_id = |cx: &mut VisualTestContext| {
         library(cx).read_with(cx, |library, _| library.selected().cloned())
     };
-    // The second group's session, then that group closed: its toggle is the third Tab stop.
+    // The second group's session, then that group closed: its toggle is the fourth Tab stop,
+    // after the filter field and the first group's toggle and button.
     cx.simulate_keystrokes("down down down");
     assert_eq!(selected_id(cx), Some(session(1, 0, cx)));
-    cx.simulate_keystrokes("tab tab tab");
+    cx.simulate_keystrokes("tab tab tab tab");
     press(cx, "enter");
     cx.simulate_keystrokes("f6 f6");
     assert!(main_focused(&shell, cx));

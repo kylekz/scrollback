@@ -10,7 +10,7 @@
 
 use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, SharedString};
 
-use crate::actions::{app, first_run, library, locations, sessions, shell, sidebar};
+use crate::actions::{app, first_run, library, locations, menu, sessions, shell, sidebar};
 
 /// Key context of the shell's root element: everything in the main window.
 pub const SHELL: &str = "Shell";
@@ -31,6 +31,10 @@ pub const LOCATIONS_LIST: &str = "LocationsList";
 /// Key context of a dialog over the sheet or the first run: adding a location (DESIGN
 /// §4.12), confirming a removal.
 pub const LOCATION_DIALOG: &str = "LocationDialog";
+/// Key context of an open menu.
+pub const MENU: &str = "Menu";
+/// Key context of a folder's paths editor (DESIGN §4.7).
+pub const PATHS_EDITOR: &str = "PathsEditor";
 
 /// One row of the keymap.
 #[derive(Clone, Copy)]
@@ -93,6 +97,12 @@ pub const BACK: Shortcut = shortcut!("alt-left", SHELL, library::Back);
 pub const STAR: Shortcut = shortcut!("s", SESSIONS, sessions::Star);
 /// `Ctrl L`. Named, because the Locations overline's label says it.
 pub const LOCATIONS: Shortcut = shortcut!("secondary-l", SHELL, shell::OpenLocations);
+/// `Delete`, `M`, `Enter` and `Shift F10` on a page of sessions. Named, because the session
+/// menu and the hover bar say them.
+pub const TRASH: Shortcut = shortcut!("delete", SESSIONS, sessions::Trash);
+pub const MOVE: Shortcut = shortcut!("m", SESSIONS, sessions::Move);
+pub const OPEN: Shortcut = shortcut!("enter", SESSIONS, sessions::Open);
+pub const MENU_KEY: Shortcut = shortcut!("shift-f10", SESSIONS, sessions::Menu);
 
 /// Every binding scrollback defines.
 pub const SHORTCUTS: &[Shortcut] = &[
@@ -114,11 +124,31 @@ pub const SHORTCUTS: &[Shortcut] = &[
     shortcut!("right", SESSIONS, sessions::Right),
     shortcut!("up", SESSIONS, sessions::Up),
     shortcut!("down", SESSIONS, sessions::Down),
-    shortcut!("enter", SESSIONS, sessions::Open),
+    OPEN,
     STAR,
+    TRASH,
+    // The Mac keyboard's delete key is Backspace.
+    shortcut!("backspace", SESSIONS, sessions::Trash),
+    MOVE,
+    MENU_KEY,
+    shortcut!("secondary-a", SESSIONS, sessions::SelectAll),
     shortcut!("up", UNSORTED, sessions::Up),
     shortcut!("down", UNSORTED, sessions::Down),
     shortcut!("enter", UNSORTED, sessions::Open),
+    shortcut!("s", UNSORTED, sessions::Star),
+    shortcut!("delete", UNSORTED, sessions::Trash),
+    shortcut!("backspace", UNSORTED, sessions::Trash),
+    shortcut!("m", UNSORTED, sessions::Move),
+    shortcut!("shift-f10", UNSORTED, sessions::Menu),
+    shortcut!("up", MENU, menu::Previous),
+    shortcut!("down", MENU, menu::Next),
+    shortcut!("enter", MENU, menu::Choose),
+    shortcut!("space", MENU, menu::Choose),
+    shortcut!("right", MENU, menu::Open),
+    shortcut!("left", MENU, menu::Back),
+    shortcut!("escape", MENU, menu::Close),
+    shortcut!("secondary-enter", PATHS_EDITOR, sessions::SavePaths),
+    shortcut!("escape", PATHS_EDITOR, sessions::CancelPaths),
     shortcut!("enter", FIRST_RUN, first_run::Add),
     LOCATIONS,
     shortcut!("escape", LOCATIONS_SHEET, locations::Close),

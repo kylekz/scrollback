@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement as _, IntoElement, ParentElement as _, Render, Role,
+    Focusable, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, Role,
     ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _,
     Subscription, Task, UniformListScrollHandle, Window, div, prelude::FluentBuilder as _, px,
     uniform_list,
@@ -46,9 +46,12 @@ use crate::components::{
 };
 use crate::icons::SbIcon;
 use crate::keymap;
+use crate::menu;
 use crate::pages::Showing;
+use crate::pages::menus::{self, FOLDER_MENU_WIDTH};
 use crate::services::library::LibraryEvent;
 use crate::services::{ActiveServices as _, LibraryService, SyncService};
+use crate::services::{Dragged, DropTarget};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 use tree::TreeRow;
 
@@ -100,6 +103,12 @@ const NEW_FOLDER_NAME: &str = "New folder";
 /// How often the locations' "synced 2 min ago" is drawn again.
 const CLOCK_TICK: Duration = Duration::from_secs(30);
 
+/// How long a drag rests on a closed folder before it opens (DESIGN §4.1).
+const HOVER_OPEN: Duration = Duration::from_millis(500);
+
+/// How a folder's row that is dragged stays in place (`.srow.ghost`).
+const LIFTED_ROW_OPACITY: f32 = 0.45;
+
 pub enum SidebarEvent {
     /// A row was picked: a narrow window's overlay closes (DESIGN §2).
     Picked,
@@ -133,6 +142,8 @@ pub struct Sidebar {
     scroll: UniformListScrollHandle,
     /// The location rows' own scroll, which the arrows' row is kept in view of.
     location_scroll: ScrollHandle,
+    /// The closed folder a drag rests on, until it opens.
+    opening: Option<(FolderId, Task<()>)>,
     _observers: [Subscription; 3],
     _clock: Task<()>,
 }
@@ -153,6 +164,7 @@ impl Sidebar {
             _observers: [
                 cx.observe(&library, |this, _, cx| {
                     this.rebuild(cx);
+                    this.follow_drag(cx);
                     cx.notify();
                 }),
                 cx.observe(&sync, |this: &mut Self, sync, cx| {
@@ -193,6 +205,7 @@ impl Sidebar {
             location_cursor: None,
             scroll: UniformListScrollHandle::new(),
             location_scroll: ScrollHandle::new(),
+            opening: None,
         }
     }
 
@@ -512,6 +525,12 @@ impl Sidebar {
             Some(Shelf::Folder(_)) | None => 0,
         };
         let selected = enabled && shelf == Some(library.highlighted());
+        // Trash takes sessions dropped on it (DESIGN §4.1), though it has no page yet.
+        let trash = target == "sidebar/trash" && enabled;
+        let targeted = trash
+            && library
+                .drag()
+                .is_some_and(|drag| drag.targets(DropTarget::Trash, library));
         // Unsorted's count is an accent while there is something to file, selected or not.
         let count_color = if known && shelf == Some(Shelf::Unsorted) && value > 0 {
             c.accent_text
@@ -525,10 +544,23 @@ impl Sidebar {
                 this.shadow(focus_ring(true, theme))
             })
             .id(target)
+            .debug_selector(move || target.replace('/', "-"))
             .role(Role::ListItem)
             // A row with no page yet is drawn as the rows that can't be opened are.
-            .when(enabled && shelf.is_none(), |this| {
+            .when(enabled && shelf.is_none() && !targeted, |this| {
                 this.opacity(DISABLED_ROWS_OPACITY)
+            })
+            .when(targeted, |this| {
+                this.bg(c.accent_soft)
+                    .text_color(c.accent_text)
+                    .shadow(vec![drop_ring(theme)])
+            })
+            .map(|this| {
+                if trash {
+                    crate::drag::target(this, DropTarget::Trash)
+                } else {
+                    this
+                }
             })
             .when_some(shelf.filter(|_| enabled), |this, shelf| {
                 this.cursor_pointer()
@@ -562,7 +594,7 @@ impl Sidebar {
     /// the keyboard is on the rows.
     fn folder_row(
         &self,
-        row: TreeRow,
+        (at, row): (usize, TreeRow),
         (marked, keyboard): (Option<FolderId>, bool),
         theme: &SbTheme,
         cx: &mut Context<Self>,
@@ -573,6 +605,55 @@ impl Sidebar {
         let id = folder.id;
         let name: SharedString = folder.name.clone().into();
         let selected = marked == Some(id);
+        let drag = library.drag();
+        let targeted = drag.is_some_and(|drag| drag.targets(DropTarget::Folder(id), library));
+        // Where a folder dropped above or below this row would go, drawn as a line there.
+        let line = drag.and_then(|drag| match drag.over {
+            Some(
+                over @ DropTarget::Between {
+                    row, below, depth, ..
+                },
+            ) if row == at && drag.targets(over, library) => Some((below, depth)),
+            _ => None,
+        });
+        let lifted = crate::drag::lifts(library, |what| *what == Dragged::Folder(id));
+        let parent = folder.parent;
+        let sibling = (library.folders().iter())
+            .filter(|it| it.parent == parent)
+            .position(|it| it.id == id)
+            .unwrap_or(0);
+        let depth = row.depth;
+        let has_open_children = row.open && row.has_children;
+        let pick = move |what: &Dragged,
+                         bounds: gpui::Bounds<gpui::Pixels>,
+                         pointer: gpui::Point<gpui::Pixels>| {
+            let quarter = bounds.size.height / 4.;
+            let y = pointer.y - bounds.top();
+            match what {
+                Dragged::Folder(_) if y < quarter => DropTarget::Between {
+                    parent,
+                    index: sibling,
+                    row: at,
+                    below: false,
+                    depth,
+                },
+                Dragged::Folder(_) if y > quarter * 3. && !has_open_children => {
+                    DropTarget::Between {
+                        parent,
+                        index: sibling + 1,
+                        row: at,
+                        below: true,
+                        depth,
+                    }
+                }
+                _ => DropTarget::Folder(id),
+            }
+        };
+        let owns = move |over: DropTarget| match over {
+            DropTarget::Folder(folder) => folder == id,
+            DropTarget::Between { row, .. } => row == at,
+            DropTarget::Trash => false,
+        };
         let sessions = library.counts().folders.get(&id).copied().unwrap_or(0);
         let renaming = self
             .renaming
@@ -611,28 +692,80 @@ impl Sidebar {
                     move || format!("sidebar/folder-chevron/{name}").into()
                 })
         });
+        let group: SharedString = format!("folder-row-{}", id.0).into();
+        let is_renaming = renaming.is_some();
         // The list gives every row the same height: the row and the 1px gap under it.
         div()
+            .relative()
             .h(theme.sizes.sidebar_row_height + px(1.))
+            .children(line.map(|(below, depth)| {
+                // The insertion line (DESIGN §4.1): 2px of `accent`, in as far as its level.
+                div()
+                    .absolute()
+                    .left(
+                        theme.spacing.md
+                            + theme.sizes.folder_indent * depth.min(INDENTED_LEVELS) as f32,
+                    )
+                    .right_0()
+                    .h(px(2.))
+                    .rounded(px(1.))
+                    .bg(c.accent)
+                    .map(|this| {
+                        if below {
+                            this.bottom(px(-1.))
+                        } else {
+                            this.top(px(-1.))
+                        }
+                    })
+                    .automation_target("sidebar/insertion")
+            }))
             .child(
                 row_base(selected, theme)
                     .id(("folder", row.folder))
+                    .debug_selector({
+                        let name = name.clone();
+                        move || format!("sidebar-folder-{name}")
+                    })
+                    .group(group.clone())
+                    .relative()
                     .role(Role::ListItem)
                     .cursor_pointer()
                     .map(|this| {
                         if renaming.is_some() {
                             // The row is an input while its folder is named (`.inp.focus`).
                             this.bg(c.s1).border_1().border_color(c.accent)
+                        } else if targeted {
+                            this.bg(c.accent_soft)
+                                .text_color(c.accent_text)
+                                .shadow(vec![drop_ring(theme)])
                         } else if selected {
                             this.when(keyboard, |this| this.shadow(focus_ring(true, theme)))
                         } else {
                             this.hover(|style| style.bg(c.s2))
                         }
                     })
+                    .when(lifted, |this| this.opacity(LIFTED_ROW_OPACITY))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.show(Shelf::Folder(id), cx);
                         cx.emit(SidebarEvent::Picked);
                     }))
+                    .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                        menu::open(
+                            menus::folder_menu(id, true),
+                            event.position,
+                            FOLDER_MENU_WIDTH,
+                            window,
+                            cx,
+                        );
+                    })
+                    .map(|this| crate::drag::target_by(this, pick, owns))
+                    .map(|this| {
+                        if is_renaming {
+                            this
+                        } else {
+                            crate::drag::source(this, Dragged::Folder(id))
+                        }
+                    })
                     // The levels' guides and the chevron's place, with no gap between them,
                     // so that each level moves the row's glyph in by the indent alone. A
                     // level's guide runs under the middle of its folder's chevron.
@@ -660,7 +793,13 @@ impl Sidebar {
                     .child(icon(
                         SbIcon::Folder,
                         theme.sizes.icon,
-                        if selected { c.fg2 } else { c.fg3 },
+                        if targeted {
+                            c.accent_text
+                        } else if selected {
+                            c.fg2
+                        } else {
+                            c.fg3
+                        },
                     ))
                     .map(|this| match renaming {
                         Some(input) => this.child(
@@ -693,7 +832,50 @@ impl Sidebar {
                                     .text_ellipsis()
                                     .child(name.clone()),
                             )
-                            .child(count(sessions, if selected { c.fg2 } else { c.fg3 }, theme)),
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .ml_auto()
+                                    .group_hover(group.clone(), |style| style.opacity(0.))
+                                    .child(count(
+                                        sessions,
+                                        if targeted {
+                                            c.accent_text
+                                        } else if selected {
+                                            c.fg2
+                                        } else {
+                                            c.fg3
+                                        },
+                                        theme,
+                                    )),
+                            )
+                            // `⋯` in the count's place under the pointer: the folder's menu.
+                            .child(
+                                icon_button(
+                                    ("folder-more", row.folder),
+                                    theme.sizes.section_button,
+                                    theme,
+                                )
+                                .absolute()
+                                .right(theme.spacing.sm)
+                                .opacity(0.)
+                                .group_hover(group, |style| style.opacity(1.))
+                                .aria_label("Folder actions")
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    menu::open(
+                                        menus::folder_menu(id, true),
+                                        window.mouse_position(),
+                                        FOLDER_MENU_WIDTH,
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .child(icon(SbIcon::Ellipsis, theme.sizes.icon_sm, c.fg2))
+                                .automation_target_with(
+                                    move || format!("sidebar/folder-more/{}", id.0).into(),
+                                ),
+                            ),
                     })
                     .automation_target_with(move || format!("sidebar/folder/{name}").into()),
             )
@@ -712,9 +894,57 @@ impl Sidebar {
             self.keyboard(window) && self.location_cursor.is_none(),
         );
         range
-            .filter_map(|at| self.tree.get(at).copied())
-            .map(|row| self.folder_row(row, marked, &theme, cx))
+            .filter_map(|at| Some((at, self.tree.get(at).copied()?)))
+            .map(|(at, row)| self.folder_row((at, row), marked, &theme, cx))
             .collect()
+    }
+
+    /**
+     * Opens a closed folder that a drag has been over for 500 ms (DESIGN §4.1); the library
+     * says where the drag is.
+     */
+    fn follow_drag(&mut self, cx: &mut Context<Self>) {
+        let library = self.library.read(cx);
+        let over = library
+            .drag()
+            .filter(|drag| drag.moved)
+            .and_then(|drag| match drag.over {
+                Some(DropTarget::Folder(folder)) => Some(folder),
+                _ => None,
+            });
+        let closed = over.filter(|folder| {
+            !self.open.contains(folder)
+                && library
+                    .folders()
+                    .iter()
+                    .any(|it| it.parent == Some(*folder))
+        });
+        let Some(folder) = closed else {
+            self.opening = None;
+            return;
+        };
+        if self
+            .opening
+            .as_ref()
+            .is_some_and(|(opening, _)| *opening == folder)
+        {
+            return;
+        }
+        let timer = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HOVER_OPEN).await;
+            this.update(cx, |this, cx| {
+                this.opening = None;
+                let still = this.library.read(cx).drag().and_then(|drag| drag.over)
+                    == Some(DropTarget::Folder(folder));
+                if still {
+                    this.open.insert(folder);
+                    this.rebuild(cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        self.opening = Some((folder, timer));
     }
 
     /**
@@ -759,6 +989,17 @@ fn row_base(selected: bool, theme: &SbTheme) -> Div {
                 this.text_color(c.fg2)
             }
         })
+}
+
+/// The 1px inset `accent` ring of a drop target (`.srow.drop`).
+fn drop_ring(theme: &SbTheme) -> gpui::BoxShadow {
+    gpui::BoxShadow {
+        color: theme.colors.accent,
+        offset: gpui::point(px(0.), px(0.)),
+        blur_radius: px(0.),
+        spread_radius: px(1.),
+        inset: true,
+    }
 }
 
 /// What a row says for its count while the archive can't be opened (DESIGN §4.14).

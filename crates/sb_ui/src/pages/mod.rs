@@ -14,6 +14,10 @@
 pub mod first_run;
 mod first_sync;
 mod header;
+#[cfg(test)]
+mod interaction_tests;
+pub(crate) mod menus;
+pub mod paths_editor;
 pub mod sessions;
 mod states;
 #[cfg(test)]
@@ -29,13 +33,13 @@ use gpui::{
 use sb_core::catalogue::Shelf;
 
 use crate::actions::first_run::Add;
-use crate::actions::sessions::{Down, Left, Open, Right, Star, Up};
+use crate::actions::sessions::{Down, Left, Menu, Move, Open, Right, SelectAll, Star, Trash, Up};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{ButtonKind, bad_banner, button};
 use crate::keymap;
 use crate::services::{ActiveServices as _, ArchiveState, LibraryService, LocationStatus};
-use crate::theme::{ActiveTheme as _, SbTheme};
+use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 use first_run::FirstRun;
 use sessions::SessionsView;
 use unsorted::UnsortedView;
@@ -173,6 +177,49 @@ impl MainArea {
         }
     }
 
+    /**
+     * Whether a text field of the page has the keyboard: a single-letter key or `Delete` is
+     * then the field's (DESIGN §5), and goes on to it.
+     */
+    fn typing(&self, window: &Window, cx: &mut Context<Self>) -> bool {
+        let typing = match Showing::now(cx) {
+            Showing::Sessions => self.sessions.read(cx).is_typing(window, cx),
+            Showing::Unsorted => self.unsorted.read(cx).is_typing(window, cx),
+            _ => false,
+        };
+        if typing {
+            cx.propagate();
+        }
+        typing
+    }
+
+    /// Does `sessions` on a page of sessions, or `unsorted` on Unsorted.
+    fn each_page(
+        &mut self,
+        cx: &mut Context<Self>,
+        sessions: impl FnOnce(&mut SessionsView, &mut Context<SessionsView>),
+        unsorted: impl FnOnce(&mut UnsortedView, &mut Context<UnsortedView>),
+    ) {
+        match Showing::now(cx) {
+            Showing::Sessions => self.sessions.update(cx, sessions),
+            Showing::Unsorted => self.unsorted.update(cx, unsorted),
+            _ => {}
+        }
+    }
+
+    /// Opens the selected session's menu, or with `moving` its Move to folder.
+    fn menu(&mut self, moving: bool, window: &mut Window, cx: &mut Context<Self>) {
+        match Showing::now(cx) {
+            Showing::Sessions => self.sessions.update(cx, |sessions, cx| {
+                sessions.menu_selected(moving, window, cx)
+            }),
+            Showing::Unsorted => self.unsorted.update(cx, |unsorted, cx| {
+                unsorted.menu_selected(moving, window, cx)
+            }),
+            _ => {}
+        }
+    }
+
     /// Whether `Enter` is for one of the page's buttons: `Tab` has put the keyboard on it,
     /// and the key is left to press it.
     fn enter_presses_a_button(&self, window: &Window, cx: &mut Context<Self>) -> bool {
@@ -287,7 +334,7 @@ impl MainArea {
 }
 
 impl Render for MainArea {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.sb_theme().clone();
         let showing = Showing::now(cx);
         let services = cx.services();
@@ -345,11 +392,33 @@ impl Render for MainArea {
             .on_action(cx.listener(|this, _: &Up, _, cx| this.step(0, -1, cx)))
             .on_action(cx.listener(|this, _: &Down, _, cx| this.step(0, 1, cx)))
             .on_action(cx.listener(Self::open))
-            .on_action(cx.listener(|this, _: &Star, _, cx| {
-                this.sessions
-                    .update(cx, |sessions, cx| sessions.star_selected(cx));
+            .on_action(cx.listener(|this, _: &Star, window, cx| {
+                if !this.typing(window, cx) {
+                    this.each_page(cx, SessionsView::star_selected, UnsortedView::star_selected);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Trash, window, cx| {
+                if !this.typing(window, cx) {
+                    this.each_page(
+                        cx,
+                        SessionsView::trash_selected,
+                        UnsortedView::trash_selected,
+                    );
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Move, window, cx| {
+                if !this.typing(window, cx) {
+                    this.menu(true, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Menu, window, cx| this.menu(false, window, cx)))
+            .on_action(cx.listener(|this, _: &SelectAll, window, cx| {
+                if !this.typing(window, cx) {
+                    this.each_page(cx, SessionsView::select_all, |_, _| {});
+                }
             }))
             .on_action(cx.listener(Self::add))
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -366,5 +435,178 @@ impl Render for MainArea {
                 )
             })
             .child(div().flex_1().min_h_0().children(page))
+            .children(
+                showing
+                    .is_library()
+                    .then(|| self.toast(&theme, cx))
+                    .flatten(),
+            )
+            .children(self.deleting(window, &theme, cx))
+    }
+}
+
+/// How far above the main area's foot a toast sits (DESIGN §4.14).
+const TOAST_BOTTOM: gpui::Pixels = gpui::px(24.);
+
+impl MainArea {
+    /**
+     * The toast (DESIGN §4.14): at the bottom centre of the main area, `s2`, radius 8,
+     * `shadow-pop`, what was done and Undo where it can be undone.
+     */
+    fn toast(&self, theme: &SbTheme, cx: &Context<Self>) -> Option<AnyElement> {
+        let c = &theme.colors;
+        let toast = cx.services().library.read(cx).toast()?;
+        Some(
+            div()
+                .absolute()
+                .bottom(TOAST_BOTTOM)
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(theme.spacing.lg)
+                        .py(theme.spacing.md)
+                        .pl(theme.spacing.lg)
+                        .pr(theme.spacing.md)
+                        .rounded(theme.radii.row)
+                        .border_1()
+                        .border_color(c.line)
+                        .bg(c.s2)
+                        .shadow(theme.shadows.pop.clone())
+                        .child(
+                            div()
+                                .child(toast.text.clone())
+                                .automation_target("toast/text"),
+                        )
+                        .when(toast.can_undo(), |this| {
+                            this.child(
+                                div()
+                                    .id("toast-undo")
+                                    .role(Role::Button)
+                                    .text_color(c.accent_text)
+                                    .font_weight(theme.text.control.weight)
+                                    .cursor_pointer()
+                                    .on_click(|_, _, cx| {
+                                        let library = cx.services().library.clone();
+                                        library.update(cx, LibraryService::undo);
+                                    })
+                                    .child("Undo")
+                                    .automation_target("toast/undo"),
+                            )
+                        })
+                        .child(
+                            crate::components::icon_button(
+                                "toast-dismiss",
+                                theme.sizes.control_small_height,
+                                theme,
+                            )
+                            .aria_label("Dismiss")
+                            .on_click(|_, _, cx| {
+                                let library = cx.services().library.clone();
+                                library.update(cx, LibraryService::dismiss_toast);
+                            })
+                            .child(crate::components::icon(
+                                crate::icons::SbIcon::X,
+                                theme.sizes.icon_sm,
+                                c.fg2,
+                            )),
+                        )
+                        .automation_target("toast"),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /**
+     * Delete folder… (DESIGN §4.1): "Delete fc? Its 447 sessions go to Unsorted and are filed
+     * again by the rules; its subfolders move up to its parent. Nothing is deleted from the
+     * archive." with Cancel and Delete folder. `Enter` doesn't confirm.
+     */
+    fn deleting(&self, window: &Window, theme: &SbTheme, cx: &Context<Self>) -> Option<AnyElement> {
+        let c = &theme.colors;
+        let library = cx.services().library.read(cx);
+        let folder = library.folder(library.deleting()?)?;
+        let counts = &library.counts().folders;
+        let inside: usize = (library.folders().iter())
+            .filter(|it| it.parent == Some(folder.id))
+            .filter_map(|it| counts.get(&it.id))
+            .sum();
+        let own = counts
+            .get(&folder.id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(inside);
+        let answer = |delete: bool| {
+            move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                let library = cx.services().library.clone();
+                library.update(cx, |library, cx| library.answer_delete(delete, cx));
+            }
+        };
+        let dialog = crate::overlay::surface(theme)
+            .w(theme.sizes.dialog_width)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(theme.spacing.md)
+                    .p(theme.sizes.dialog_padding)
+                    .child(
+                        div()
+                            .flex()
+                            .gap(theme.spacing.xs)
+                            .text_spec(&theme.text.sheet_title)
+                            .child("Delete")
+                            .child(
+                                div()
+                                    .flex()
+                                    .child(div().italic().child(folder.name.clone()))
+                                    .child("?"),
+                            ),
+                    )
+                    .child(div().text_color(c.fg2).child(format!(
+                        "Its {} go to Unsorted and are filed again by the rules; its \
+                         subfolders move up to its parent. Nothing is deleted from the \
+                         archive.",
+                        crate::format::plural(own, "session")
+                    ))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(theme.spacing.md)
+                    .p(theme.sizes.dialog_padding)
+                    .border_t_1()
+                    .border_color(c.line_subtle)
+                    .bg(c.s1)
+                    .child(
+                        button("delete-cancel", ButtonKind::Plain, false, true, theme)
+                            .on_click(answer(false))
+                            .child("Cancel")
+                            .automation_target("delete-folder/cancel"),
+                    )
+                    .child(
+                        button("delete-confirm", ButtonKind::Danger, false, true, theme)
+                            .on_click(answer(true))
+                            .child("Delete folder")
+                            .automation_target("delete-folder/confirm"),
+                    ),
+            )
+            .debug_selector(|| "delete-folder".into())
+            .automation_target("delete-folder");
+        Some(crate::overlay::modal(
+            dialog,
+            crate::overlay::Layer::Dialog,
+            window,
+            theme,
+            |_, cx| {
+                let library = cx.services().library.clone();
+                library.update(cx, |library, cx| library.answer_delete(false, cx));
+            },
+        ))
     }
 }

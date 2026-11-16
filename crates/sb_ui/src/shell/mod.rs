@@ -225,7 +225,22 @@ impl Shell {
     }
 
     fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sidebar_open {
+        let library = cx.services().library.clone();
+        let (dragging, deleting, asked) = {
+            let library = library.read(cx);
+            (
+                library.drag().is_some(),
+                library.deleting().is_some(),
+                library.asked().is_some(),
+            )
+        };
+        if dragging {
+            crate::drag::end(window, cx);
+        } else if deleting {
+            library.update(cx, |library, cx| library.answer_delete(false, cx));
+        } else if asked {
+            library.update(cx, |library, cx| library.answer(false, cx));
+        } else if self.sidebar_open {
             self.sidebar_open = false;
             self.main.focus_handle(cx).focus(window, cx);
             cx.notify();
@@ -386,6 +401,18 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &OpenLocations, window, cx| {
                 this.open_locations(None, window, cx);
             }))
+            // A drag is measured from its press, and ends wherever it is let go (`crate::drag`).
+            .capture_any_mouse_down(|event, _, cx| crate::drag::pressed(event.position, cx))
+            .on_drag_move::<crate::drag::Drag>(|event, _, cx| {
+                crate::drag::moved(event.event.position, cx);
+            })
+            .capture_any_mouse_up(cx.listener(|_, _, window, cx| {
+                cx.defer_in(window, |_, window, cx| {
+                    if !cx.has_active_drag() && cx.services().library.read(cx).drag().is_some() {
+                        crate::drag::end(window, cx);
+                    }
+                });
+            }))
             .relative()
             .size_full()
             .flex()
@@ -432,6 +459,7 @@ impl Render for Shell {
                     .map(|(sheet, ..)| sheet.clone())
                     .and_then(|sheet| sheet.update(cx, |sheet, cx| sheet.dialog_layer(window, cx))),
             )
+            .children(crate::menu::layer(window, cx))
     }
 }
 

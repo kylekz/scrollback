@@ -6,21 +6,41 @@
 //! sessions costs what the visible rows do. The rows are laid out again only when the page's
 //! sessions or the number of columns change.
 //!
-//! **Keyboard** (DESIGN §4.4): the arrows move the selection between cards in reading order,
-//! `Enter` opens the selected session and `S` stars it.
+//! **The filter row** narrows and orders the page and switches it between cards and the list
+//! (DESIGN §4.4, §4.5; [`crate::services::view`]); each page keeps how it was set while the app
+//! runs. The list view ([`list`]) is the same sessions as virtual rows, with the same
+//! selection, menu and drag.
 //!
-//! Filters, sort, the list view and the hover bar's other actions come with later tasks.
+//! **Selection:** a click selects a session, `Ctrl` adds or takes one away, `Shift` selects the
+//! run from the selected one, `Ctrl A` everything shown. Its menu (right-click, the hover bar's
+//! `⋯`, `Shift F10`), `Delete`, `S`, `M` and a drag act on the selection when the session is
+//! in it.
+//!
+//! **Keyboard** (DESIGN §4.4, §5): the arrows move the selection between cards in reading
+//! order (in the list, `↑` and `↓`), `Enter` opens the selected session, `S` stars it,
+//! `Delete` moves it to Trash, `M` opens Move to folder and `Shift F10` its menu. Single
+//! letters are the filter field's while it has the keyboard.
+//!
+//! **A folder's paths** show as chips that drag onto another folder, or as the paths editor
+//! ([`crate::pages::paths_editor`]), which an empty folder opens by default.
 
+mod filter_row;
+mod list;
+
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 
+use gpui::Focusable as _;
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Div, ElementId, Entity, FocusHandle,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, Role, ScrollStrategy,
-    SharedString, Size, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
-    point, prelude::FluentBuilder as _, px, size,
+    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Div, ElementId, Entity,
+    FocusHandle, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement as _, Pixels, Point, Render, Role, ScrollStrategy, SharedString, Size,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, point,
+    prelude::FluentBuilder as _, px, size,
 };
+use gpui_component::input::{InputEvent, InputState};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
@@ -30,16 +50,24 @@ use sb_core::location::LocationId;
 
 use super::first_sync;
 use super::header::{Under, header};
+use super::menus::{self, FOLDER_MENU_WIDTH, MOVE_MENU_WIDTH, SESSION_MENU_WIDTH};
+use super::paths_editor::{PathsEditor, PathsEditorEvent};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
-    Tone, focus_ring, icon, location_tag, overline, tag, tag_width, text_width, warn_chip,
+    ButtonKind, Tone, button, focus_ring, icon, icon_button, location_tag, overline, tag,
+    tag_width, text_width, warn_chip,
 };
+use crate::drag;
 use crate::format;
 use crate::icons::SbIcon;
 use crate::keymap;
+use crate::menu;
+use crate::overlay::{self, Layer};
+use crate::services::library::LibraryEvent;
 use crate::services::{
-    ActiveServices as _, LibraryService, Month, PathChip, SessionsPage, Stats, SyncService,
+    ActiveServices as _, Dragged, DropTarget, Facets, LibraryService, Month, PageView, PathChip,
+    SessionsPage, Stats, SyncService, view,
 };
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
@@ -340,8 +368,10 @@ pub struct SessionsView {
     rows: Vec<Row>,
     sizes: Rc<Vec<Size<Pixels>>>,
     columns: usize,
-    /// How wide a card is, as far as the window's width says.
+    /// How wide a card is, and the row of cards or the list, as far as the window's width
+    /// says.
     card_width: Pixels,
+    room: Pixels,
     /// What the last lines of the page's cards hold.
     line: PageLine,
     /// Whether the cards show their tool calls ([`line_fits`]).
@@ -361,7 +391,28 @@ pub struct SessionsView {
     /// Where the keyboard rests in the main area: while it is there, the selected card has
     /// the keyboard's ring.
     focus: FocusHandle,
-    _observers: [Subscription; 2],
+    /// How the page was set to show when it was laid out.
+    view: PageView,
+    /// The places in the page's sessions of those that show, in their order, and their months
+    /// as ranges of `shown`.
+    shown: Vec<usize>,
+    months: Vec<Month>,
+    /// What the filter chips offer.
+    facets: Facets,
+    /// The list view's rows (DESIGN §4.5).
+    list_rows: Vec<list::ListRow>,
+    list_sizes: Rc<Vec<Size<Pixels>>>,
+    list_scroll: VirtualListScrollHandle,
+    /// Where each session that shows was drawn last, by its place in `shown`: where its menu
+    /// opens from the keys.
+    drawn: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    /// The filter field, made with the first frame, and the page its placeholder names.
+    filter: Option<(Entity<InputState>, Subscription)>,
+    filter_for: Option<Shelf>,
+    /// The paths editor while it is open, and the folder it was asked for before it is made.
+    editor: Option<(Entity<PathsEditor>, Subscription)>,
+    edit: Option<FolderId>,
+    _observers: [Subscription; 3],
 }
 
 impl SessionsView {
@@ -375,15 +426,34 @@ impl SessionsView {
                     cx.notify();
                 }),
                 cx.observe(&sync, |_, _, cx| cx.notify()),
+                cx.subscribe(&library, |this, _, event, cx| {
+                    if let LibraryEvent::EditPaths(folder) = event {
+                        this.edit = Some(*folder);
+                        cx.notify();
+                    }
+                }),
             ],
             library,
             sync,
+            view: PageView::default(),
+            shown: Vec::new(),
+            months: Vec::new(),
+            facets: Facets::default(),
+            list_rows: Vec::new(),
+            list_sizes: Rc::default(),
+            list_scroll: VirtualListScrollHandle::new(),
+            drawn: Rc::default(),
+            filter: None,
+            filter_for: None,
+            editor: None,
+            edit: None,
             scroll: VirtualListScrollHandle::new(),
             shelf: Shelf::All,
             rows: Vec::new(),
             sizes: Rc::default(),
             columns: 0,
             card_width: px(0.),
+            room: px(0.),
             line: PageLine::default(),
             shows_calls: false,
             tags_past_caps: false,
@@ -403,7 +473,12 @@ impl SessionsView {
         if shelf != self.shelf {
             self.shelf = shelf;
             self.scroll.base_handle().set_offset(point(px(0.), px(0.)));
+            self.list_scroll
+                .base_handle()
+                .set_offset(point(px(0.), px(0.)));
+            self.editor = None;
         }
+        let view = self.library.read(cx).view();
         let viewport = window.viewport_size().width;
         let sidebar = if viewport >= theme.sizes.sidebar_collapse_width {
             theme.sizes.sidebar_width
@@ -411,14 +486,22 @@ impl SessionsView {
             px(0.)
         };
         let room = viewport - sidebar - theme.sizes.page_side * 2.;
+        self.room = room;
         let columns = columns(room, theme);
         self.card_width = (room - theme.spacing.lg * (columns as f32 - 1.)) / columns as f32;
-        if self.stale || columns != self.columns {
+        if self.stale || columns != self.columns || view != self.view {
             self.stale = false;
             self.columns = columns;
+            self.view = view;
             let page = self.library.read(cx).sessions();
-            self.rows = page.map_or_else(Vec::new, |page| rows(&page.months, columns));
+            let sessions = page.map_or(&[][..], |page| &page.sessions[..]);
+            self.shown = view::shown(sessions, &self.view, format::now());
+            self.months = view::months(sessions, &self.shown);
+            self.facets = Facets::of(sessions);
+            self.rows = rows(&self.months, columns);
             self.sizes = Rc::new(row_sizes(&self.rows, theme));
+            self.list_rows = list::rows(&self.months);
+            self.list_sizes = Rc::new(list::row_sizes(&self.list_rows, theme));
             self.line = page.map_or_else(PageLine::default, |page| {
                 PageLine::of(page, shelf, format::now())
             });
@@ -485,26 +568,68 @@ impl SessionsView {
         };
     }
 
+    /// The paths editor, while it is open.
+    pub fn editor(&self) -> Option<&Entity<PathsEditor>> {
+        self.editor.as_ref().map(|(editor, _)| editor)
+    }
+
+    /// How many sessions show.
+    pub fn shown(&self) -> usize {
+        self.shown.len()
+    }
+
     /// What the cards' last lines were last decided from.
     pub fn line_measure(&self) -> &LineMeasure {
         &self.measure
     }
 
-    /// Moves the selection (see [`moved`]); with nothing selected, selects the first session.
+    /**
+     * Moves the selection (see [`moved`]), in the list `lines` rows up or down; with nothing
+     * selected, selects the first session that shows.
+     */
     pub fn step(&mut self, by: isize, lines: isize, cx: &mut Context<Self>) {
-        let selected = self.library.read(cx).selected_index();
-        let Some(to) = selected.map_or(Some(0), |index| moved(&self.rows, index, by, lines)) else {
+        let place = self.selected_place(cx);
+        let to = if self.view.list {
+            match (place, lines) {
+                (None, _) => Some(0),
+                // The list has no columns to move between.
+                (Some(_), 0) => return,
+                (Some(place), lines) => place.checked_add_signed(lines),
+            }
+        } else {
+            place.map_or(Some(0), |place| moved(&self.rows, place, by, lines))
+        };
+        let Some(to) = to.filter(|to| *to < self.shown.len()) else {
             return;
         };
-        if let Some(row) = self
+        self.reveal(to);
+        let index = self.shown[to];
+        self.library
+            .update(cx, |library, cx| library.select_index(index, cx));
+    }
+
+    /// Scrolls the session at the place `place` into view.
+    fn reveal(&self, place: usize) {
+        if self.view.list {
+            if let Some(row) =
+                (self.list_rows.iter()).position(|row| *row == list::ListRow::Session(place))
+            {
+                self.list_scroll
+                    .scroll_to_item(row, ScrollStrategy::Nearest);
+            }
+        } else if let Some(row) = self
             .rows
             .iter()
-            .position(|row| matches!(row, Row::Cards(sessions) if sessions.contains(&to)))
+            .position(|row| matches!(row, Row::Cards(sessions) if sessions.contains(&place)))
         {
             self.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
         }
-        self.library
-            .update(cx, |library, cx| library.select_index(to, cx));
+    }
+
+    /// Where the selected session is among those that show.
+    fn selected_place(&self, cx: &App) -> Option<usize> {
+        let index = self.library.read(cx).selected_index()?;
+        self.shown.iter().position(|at| *at == index)
     }
 
     /// The selected session and where it is on the page.
@@ -521,12 +646,208 @@ impl SessionsView {
         }
     }
 
-    /// Stars the selected session, or takes its star away.
+    /// Stars the selected sessions, or takes their stars away when they all have one.
     pub fn star_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some((id, at)) = self.selected(cx) {
+        self.library.update(cx, |library, cx| {
+            let ids = library.selection();
+            let starred = ids
+                .iter()
+                .all(|id| library.session(id).is_some_and(|it| it.starred));
+            if !ids.is_empty() {
+                library.star(ids, !starred, cx);
+            }
+        });
+    }
+
+    /// Moves the selected sessions to Trash.
+    pub fn trash_selected(&mut self, cx: &mut Context<Self>) {
+        self.library.update(cx, |library, cx| {
+            let ids = library.selection();
+            if !ids.is_empty() {
+                library.trash(ids, cx);
+            }
+        });
+    }
+
+    /// Selects every session that shows.
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        let library = self.library.read(cx);
+        let Some(page) = library.sessions() else {
+            return;
+        };
+        let ids: Vec<SessionId> = (self.shown.iter())
+            .map(|at| page.sessions[*at].id.clone())
+            .collect();
+        let selected = match (library.selected().cloned(), library.selected_index()) {
+            (Some(id), at) if ids.contains(&id) => (id, at),
+            _ => match self.shown.first() {
+                Some(first) => (page.sessions[*first].id.clone(), Some(*first)),
+                None => return,
+            },
+        };
+        self.library
+            .update(cx, |library, cx| library.choose(ids, selected, cx));
+    }
+
+    /**
+     * Opens the selected session's menu, or with `moving` its Move to folder (`M`), under
+     * where it was drawn.
+     */
+    pub fn menu_selected(&mut self, moving: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(place) = self.selected_place(cx) else {
+            return;
+        };
+        let at = self.drawn.borrow().get(&place).map_or_else(
+            || window.mouse_position(),
+            |bounds| bounds.bottom_left() + point(px(12.), px(-8.)),
+        );
+        let index = self.shown[place];
+        self.open_menu(index, moving, at, window, cx);
+    }
+
+    /// Opens the menu of the session at `index` of the page at `at`.
+    fn open_menu(
+        &mut self,
+        index: usize,
+        moving: bool,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let library = self.library.read(cx);
+        let Some(session) = library
+            .sessions()
+            .and_then(|page| page.sessions.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        let ids = library.acted_on(&session.id);
+        let (entries, width) = if moving {
+            (
+                menus::move_entries(ids, session.filed, library),
+                MOVE_MENU_WIDTH,
+            )
+        } else {
+            (menus::session_menu(&session, ids, cx), SESSION_MENU_WIDTH)
+        };
+        menu::open(entries, at, width, window, cx);
+    }
+
+    /**
+     * A click on the session at the place `place`: it alone is selected; with `Ctrl` it joins
+     * the selection or leaves it; with `Shift` the run from the selected one to it is.
+     */
+    fn click(
+        &mut self,
+        place: usize,
+        event: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The page takes the keyboard, so that its keys act on what was clicked.
+        self.focus.focus(window, cx);
+        let library = self.library.read(cx);
+        let Some(page) = library.sessions() else {
+            return;
+        };
+        let index = self.shown[place];
+        let id = page.sessions[index].id.clone();
+        let modifiers = event.modifiers();
+        if event.click_count() > 1 {
             self.library
-                .update(cx, |library, cx| library.toggle_star(&id, at, cx));
+                .update(cx, |library, cx| library.open_session_at(&id, index, cx));
+        } else if modifiers.secondary(cx) {
+            let mut chosen = library.selection();
+            if let Some(at) = chosen.iter().position(|it| *it == id) {
+                chosen.remove(at);
+            } else {
+                chosen.push(id.clone());
+            }
+            self.library.update(cx, |library, cx| {
+                library.choose(chosen, (id, Some(index)), cx)
+            });
+        } else if modifiers.shift
+            && let Some(from) = self.selected_place(cx)
+        {
+            let run = from.min(place)..=from.max(place);
+            let chosen = run
+                .map(|at| page.sessions[self.shown[at]].id.clone())
+                .collect();
+            self.library.update(cx, |library, cx| {
+                library.choose(chosen, (id, Some(index)), cx)
+            });
+        } else {
+            self.library
+                .update(cx, |library, cx| library.select_session(&id, index, cx));
         }
+    }
+
+    /// A press with the right button on the session at `index`: it is selected unless it is
+    /// in the selection, and its menu opens at the pointer.
+    fn right_click(
+        &mut self,
+        index: usize,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus.focus(window, cx);
+        let library = self.library.read(cx);
+        let Some(id) = library
+            .sessions()
+            .and_then(|page| page.sessions.get(index))
+            .map(|it| it.id.clone())
+        else {
+            return;
+        };
+        if !library.is_selected(&id) {
+            self.library
+                .update(cx, |library, cx| library.select_session(&id, index, cx));
+        }
+        self.open_menu(index, false, event.position, window, cx);
+    }
+
+    /// Whether a text field of the page has the keyboard: single letters are its then.
+    pub fn is_typing(&self, window: &Window, cx: &App) -> bool {
+        self.filter
+            .as_ref()
+            .is_some_and(|(input, _)| input.focus_handle(cx).is_focused(window))
+            || self
+                .editor
+                .as_ref()
+                .is_some_and(|(editor, _)| editor.read(cx).is_typing(window, cx))
+    }
+
+    /// What a drag of the session at `index` carries: the selection when it is in it.
+    fn dragged(&self, session: &Session, cx: &App) -> Dragged {
+        let ids = self.library.read(cx).acted_on(&session.id);
+        Dragged::Sessions {
+            ids,
+            title: session
+                .title
+                .clone()
+                .unwrap_or_else(|| UNTITLED.to_string()),
+        }
+    }
+
+    /// Opens the paths editor of the folder shown; `short` for an empty folder's.
+    fn open_editor(
+        &mut self,
+        folder: FolderId,
+        short: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = cx.new(|cx| PathsEditor::new(folder, short, window, cx));
+        let heard = cx.subscribe(&editor, |this, _, event, cx| match event {
+            PathsEditorEvent::Closed => {
+                this.editor = None;
+                cx.notify();
+            }
+        });
+        self.editor = Some((editor, heard));
+        cx.notify();
     }
 
     /// The list's rows in `range`. Each keeps the page's side padding at its right, so that the
@@ -549,16 +870,26 @@ impl SessionsView {
             .map(|row| match row {
                 Row::Month(month) => div()
                     .pr(theme.sizes.page_side)
-                    .child(overline(&month_name(&page.months[*month]), &theme))
+                    .child(overline(&month_name(&self.months[*month]), &theme))
                     .into_any_element(),
-                Row::Cards(sessions) => div()
+                Row::Cards(places) => div()
                     .w_full()
                     .flex()
                     .gap(theme.spacing.lg)
                     .pr(theme.sizes.page_side)
-                    .children(sessions.clone().map(|index| {
+                    .on_children_prepainted({
+                        let (drawn, start) = (self.drawn.clone(), places.start);
+                        move |bounds, _, _| {
+                            let mut drawn = drawn.borrow_mut();
+                            for (at, bounds) in bounds.into_iter().enumerate() {
+                                drawn.insert(start + at, bounds);
+                            }
+                        }
+                    })
+                    .children(places.clone().map(|place| {
+                        let index = self.shown[place];
                         self.card(
-                            index,
+                            (place, index),
                             &page.sessions[index],
                             (now, keyboard),
                             &theme,
@@ -568,7 +899,7 @@ impl SessionsView {
                     }))
                     // A short row's cards stay as wide as a full one's: what fills the row
                     // takes a card's padding and border too.
-                    .children((sessions.len()..self.columns).map(|_| {
+                    .children((places.len()..self.columns).map(|_| {
                         div()
                             .flex_1()
                             .flex_basis(px(0.))
@@ -616,7 +947,7 @@ impl SessionsView {
     /// card.
     fn card(
         &self,
-        index: usize,
+        (index, at): (usize, usize),
         session: &Session,
         (now, keyboard): (i64, bool),
         theme: &SbTheme,
@@ -625,10 +956,17 @@ impl SessionsView {
     ) -> AnyElement {
         let c = &theme.colors;
         let library = self.library.read(cx);
-        let selected = library.selected_index() == Some(index);
+        let selected = library.is_selected(&session.id);
         // With nothing selected, the keyboard on the page is on its first card, where the arrows
         // start.
-        let ringed = keyboard && library.selected_index().unwrap_or(0) == index;
+        let ringed = keyboard
+            && library
+                .selected_index()
+                .map_or(index == 0, |selected| selected == at);
+        let lifted = drag::lifts(
+            library,
+            |what| matches!(what, Dragged::Sessions { ids, .. } if ids.contains(&session.id)),
+        );
         // The hover bar shows on the selected card and on the one under the pointer.
         let barred = selected || self.hovered.as_ref() == Some(&session.id);
         let title: SharedString = session
@@ -733,36 +1071,76 @@ impl SessionsView {
         let cut = |(natural, least): (Pixels, Pixels)| tight && natural > least;
 
         let id = session.id.clone();
-        let star = div()
-            .id(("star", index))
-            .role(Role::Button)
-            .aria_label(format!(
+        let star = hover_button(
+            ("star", index),
+            format!(
                 "{} ({})",
                 if session.starred { "Unstar" } else { "Star" },
                 keymap::STAR.label()
-            ))
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(theme.sizes.hover_button)
-            .rounded(theme.radii.control)
-            .cursor_pointer()
-            .hover(|style| style.bg(c.s3))
-            .on_click(cx.listener({
-                let id = id.clone();
-                move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.library
-                        .update(cx, |library, cx| library.toggle_star(&id, index, cx));
-                }
-            }))
-            .child(if session.starred {
-                icon(SbIcon::StarFilled, theme.sizes.icon_sm, c.yellow)
-            } else {
-                icon(SbIcon::Star, theme.sizes.icon_sm, c.fg2)
-            })
-            .automation_target_with(move || format!("card/{index}/star").into());
-        div()
+            ),
+            theme,
+        )
+        .on_click(cx.listener({
+            let id = id.clone();
+            move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.library.update(cx, |library, cx| {
+                    let ids = library.acted_on(&id);
+                    if ids.len() > 1 {
+                        let starred = !library.session(&id).is_some_and(|it| it.starred);
+                        library.star(ids, starred, cx);
+                    } else {
+                        library.toggle_star(&id, at, cx);
+                    }
+                });
+            }
+        }))
+        .child(if session.starred {
+            icon(SbIcon::StarFilled, theme.sizes.icon_sm, c.yellow)
+        } else {
+            icon(SbIcon::Star, theme.sizes.icon_sm, c.fg2)
+        })
+        .automation_target_with(move || format!("card/{index}/star").into());
+        let move_to = hover_button(
+            ("move", index),
+            format!("Move to folder ({})", keymap::MOVE.label()),
+            theme,
+        )
+        .on_click(cx.listener(move |this, _, window, cx| {
+            cx.stop_propagation();
+            this.open_menu(at, true, window.mouse_position(), window, cx);
+        }))
+        .child(icon(SbIcon::FolderInput, theme.sizes.icon_sm, c.fg2))
+        .automation_target_with(move || format!("card/{index}/move").into());
+        let trash = hover_button(
+            ("trash", index),
+            format!("Move to Trash ({})", keymap::TRASH.label()),
+            theme,
+        )
+        .on_click(cx.listener({
+            let id = id.clone();
+            move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.library.update(cx, |library, cx| {
+                    let ids = library.acted_on(&id);
+                    library.trash(ids, cx);
+                });
+            }
+        }))
+        .child(icon(SbIcon::Trash, theme.sizes.icon_sm, c.fg2))
+        .automation_target_with(move || format!("card/{index}/trash").into());
+        let more = hover_button(
+            ("more", index),
+            format!("More actions ({})", keymap::MENU_KEY.label()),
+            theme,
+        )
+        .on_click(cx.listener(move |this, _, window, cx| {
+            cx.stop_propagation();
+            this.open_menu(at, false, window.mouse_position(), window, cx);
+        }))
+        .child(icon(SbIcon::Ellipsis, theme.sizes.icon_sm, c.fg2))
+        .automation_target_with(move || format!("card/{index}/more").into());
+        let card = div()
             .id(("card", index))
             .debug_selector(move || format!("card-{index}"))
             .group("card")
@@ -781,7 +1159,11 @@ impl SessionsView {
             .bg(c.s1)
             .border_1()
             .map(|this| {
-                if ringed {
+                if lifted {
+                    this.border_dashed()
+                        .border_color(c.line_strong)
+                        .opacity(LIFTED_OPACITY)
+                } else if ringed {
                     this.border_color(c.accent).shadow(focus_ring(false, theme))
                 } else if selected {
                     this.border_color(c.line_strong)
@@ -805,18 +1187,15 @@ impl SessionsView {
                     cx.notify();
                 }
             }))
-            .on_click(cx.listener({
-                let id = id.clone();
-                move |this, event: &ClickEvent, _, cx| {
-                    this.library.update(cx, |library, cx| {
-                        if event.click_count() > 1 {
-                            library.open_session_at(&id, index, cx);
-                        } else {
-                            library.select_session(&id, index, cx);
-                        }
-                    });
-                }
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                this.click(index, event, window, cx);
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.right_click(at, event, window, cx);
+                }),
+            )
             .child(
                 div()
                     .flex()
@@ -824,7 +1203,7 @@ impl SessionsView {
                     .gap(theme.spacing.sm)
                     // The title ends short of the hover bar while the bar shows.
                     .when(barred, |this| {
-                        this.pr(theme.sizes.hover_button + theme.spacing.sm)
+                        this.pr(theme.sizes.hover_button * HOVER_BUTTONS + theme.spacing.md)
                     })
                     .child(
                         div()
@@ -840,7 +1219,7 @@ impl SessionsView {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.library.update(cx, |library, cx| {
-                                    library.open_session_at(&id, index, cx);
+                                    library.open_session_at(&id, at, cx);
                                 });
                             }))
                             .child(title)
@@ -938,11 +1317,12 @@ impl SessionsView {
                     }),
             )
             .child(
-                // The hover bar (DESIGN §4.4), with the one action there is so far.
+                // The hover bar (DESIGN §4.4).
                 div()
                     .absolute()
                     .top(theme.spacing.md)
                     .right(theme.spacing.md)
+                    .flex()
                     .p(px(2.))
                     .rounded(theme.radii.input)
                     .bg(c.s2)
@@ -951,20 +1331,79 @@ impl SessionsView {
                     .shadow(theme.shadows.card.clone())
                     /* Under the pointer it shows as soon as it is drawn; `hovered` follows
                     with the pointer's next move. */
-                    .when(!barred, |this| {
+                    .when(!barred || lifted, |this| {
                         this.opacity(0.)
                             .group_hover("card", |style| style.opacity(1.))
                     })
-                    .child(star),
-            )
+                    .child(star)
+                    .child(move_to)
+                    .child(trash)
+                    .child(more),
+            );
+        drag::source(card, self.dragged(session, cx))
             .automation_target_with(move || format!("card/{index}").into())
     }
 }
 
-/// A folder's attached paths as read-only chips (DESIGN §4.4), or what the line says while
-/// it has none. It is one line: where the chips don't fit, each gives way in its path.
-fn paths_line(paths: &[PathChip], folder: &str, sync: &SyncService, theme: &SbTheme) -> AnyElement {
+/// The hover bar's buttons: Star, Move to folder, Move to Trash, More.
+const HOVER_BUTTONS: f32 = 4.;
+
+/// How a card or a row that is dragged stays in place (`.scard.lifted`).
+const LIFTED_OPACITY: f32 = 0.45;
+
+/// What a session is called when its agent stored no title and it has no prompt.
+const UNTITLED: &str = "Untitled session";
+
+/// A button of a card's hover bar (26 square), with its label for assistive technology.
+fn hover_button(id: impl Into<ElementId>, label: String, theme: &SbTheme) -> gpui::Stateful<Div> {
+    let hover = theme.colors.s3;
+    div()
+        .id(id)
+        .role(Role::Button)
+        .aria_label(label)
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(theme.sizes.hover_button)
+        .rounded(theme.radii.control)
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover))
+}
+
+/**
+ * A folder's attached paths as chips (DESIGN §4.4), or what the line says while it has none;
+ * then Edit paths, and at the right whether a subfolder claims a path under these first. It is
+ * one line: where the chips don't fit, each gives way in its path. A chip drags onto another
+ * folder in the sidebar, which takes the path.
+ */
+fn paths_line(
+    paths: &[PathChip],
+    folder: FolderId,
+    library: &LibraryService,
+    sync: &SyncService,
+    theme: &SbTheme,
+) -> AnyElement {
     let c = &theme.colors;
+    let name = library.folder(folder).map_or("", |it| it.name.as_str());
+    let first_claim = library.attached().iter().find_map(|inner| {
+        let below = std::iter::successors(library.folder(inner.attached.folder), |it| {
+            it.parent.and_then(|parent| library.folder(parent))
+        })
+        .skip(1)
+        .any(|above| above.id == folder);
+        (below
+            && paths
+                .iter()
+                .any(|path| path.path.contains(&inner.attached.path)))
+        .then(|| {
+            (
+                library
+                    .folder(inner.attached.folder)
+                    .map_or(String::new(), |it| it.name.clone()),
+                inner.typed.clone(),
+            )
+        })
+    });
     div()
         .flex_none()
         .flex()
@@ -992,17 +1431,28 @@ fn paths_line(paths: &[PathChip], folder: &str, sync: &SyncService, theme: &SbTh
                     .text_spec(&theme.text.secondary)
                     .child(format!(
                         "None yet. Sessions started under a path you attach here file \
-                         themselves into {folder}."
+                         themselves into {name}."
                     )),
             )
         })
-        .children(paths.iter().map(|path| {
+        .children(paths.iter().enumerate().map(|(at, path)| {
             let location = path
                 .location
                 .as_ref()
                 .and_then(|location| sync.location(location));
+            let dragged = Dragged::Path {
+                path: (path.typed.clone(), path.location.clone()),
+                normal: path.path.clone(),
+                from: Some(folder),
+                sessions: path.sessions,
+            };
+            let lifted = drag::lifts(library, |what| *what == dragged);
             // A long path gives way in its middle; its location and its count stay whole.
-            div()
+            let chip = div()
+                .id(("path-chip", at))
+                .debug_selector(move || format!("path-chip-{at}"))
+                .cursor_grab()
+                .when(lifted, |this| this.border_dashed().opacity(0.5))
                 .min_w_0()
                 .flex_shrink(1.)
                 .flex()
@@ -1037,7 +1487,35 @@ fn paths_line(paths: &[PathChip], folder: &str, sync: &SyncService, theme: &SbTh
                         .text_color(c.fg3)
                         .text_spec(&theme.text.count)
                         .child(format::count(path.sessions as u64)),
-                )
+                );
+            drag::source(chip, dragged)
+                .automation_target_with(move || format!("page/path/{at}").into())
+        }))
+        .child(
+            button("edit-paths", ButtonKind::Ghost, true, true, theme)
+                .on_click(move |_, _, cx| {
+                    let library = cx.services().library.clone();
+                    library.update(cx, |library, cx| library.edit_paths(folder, cx));
+                })
+                .child(icon(SbIcon::Pen, theme.sizes.icon_xs, c.fg2))
+                .child("Edit paths")
+                .automation_target("page/edit-paths"),
+        )
+        .children(first_claim.map(|(subfolder, typed)| {
+            // One line of text, which gives way before the chips do.
+            div()
+                .ml_auto()
+                .min_w_0()
+                .flex_shrink(16.)
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_color(c.fg3)
+                .text_spec(&theme.text.secondary)
+                .child(format!(
+                    "Subfolder {subfolder} claims {} first",
+                    crate::components::middle_cut(&typed, 32)
+                ))
         }))
         .automation_target("page/paths")
 }
@@ -1048,8 +1526,17 @@ const EMPTY_GAP: Pixels = px(10.);
 const EMPTY_TILE: Pixels = px(48.);
 const EMPTY_TEXT_WIDTH: Pixels = px(460.);
 
-/// What a page says in place of its cards while it has none.
-fn empty(shelf: Shelf, folder: &str, indexing: bool, theme: &SbTheme) -> AnyElement {
+/**
+ * What a page says in place of its cards while it has none. An empty folder's is a drop area
+ * for sessions, drawn as the drop target while a drag over it would be taken (`targeted`).
+ */
+fn empty(
+    shelf: Shelf,
+    folder: &str,
+    indexing: bool,
+    targeted: bool,
+    theme: &SbTheme,
+) -> AnyElement {
     let c = &theme.colors;
     let centred = div()
         .flex_1()
@@ -1060,12 +1547,17 @@ fn empty(shelf: Shelf, folder: &str, indexing: bool, theme: &SbTheme) -> AnyElem
         .justify_center()
         .gap(EMPTY_GAP);
     match shelf {
-        Shelf::Folder(_) => centred
+        Shelf::Folder(id) => drag::target(centred, DropTarget::Folder(id))
             .mb(theme.spacing.xxl)
             .rounded(theme.radii.sheet)
             .border_1()
-            .border_dashed()
-            .border_color(c.line_strong)
+            .map(|this| {
+                if targeted {
+                    this.bg(c.accent_soft).border_color(c.accent)
+                } else {
+                    this.border_dashed().border_color(c.line_strong)
+                }
+            })
             .child(
                 div()
                     .flex()
@@ -1103,6 +1595,7 @@ impl Render for SessionsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.sb_theme().clone();
         self.lay_out(window, &theme, cx);
+        self.prepare(window, cx);
         let library = self.library.read(cx);
         let sync = self.sync.read(cx);
         let shelf = library.shelf();
@@ -1134,13 +1627,69 @@ impl Render for SessionsView {
             ),
             None => Under::Stats(stats),
         };
-        let is_folder = matches!(shelf, Shelf::Folder(_));
+        let folder = match shelf {
+            Shelf::Folder(folder) => Some(folder),
+            _ => None,
+        };
         let syncing_first = first_sync.is_some();
-        let pinned = page.and_then(|page| {
+        let pinned = (!self.view.list).then_some(()).and_then(|()| {
             let scrolled = -self.scroll.base_handle().offset().y;
-            let month = month_at(&self.rows, &self.sizes, &page.months, scrolled)?;
-            Some(month_name(page.months.get(month)?))
+            let month = month_at(&self.rows, &self.sizes, &self.months, scrolled)?;
+            Some(month_name(self.months.get(month)?))
         });
+        let targeted = folder.is_some_and(|folder| {
+            library
+                .drag()
+                .is_some_and(|drag| drag.targets(DropTarget::Folder(folder), library))
+        });
+        let editor = self.editor.as_ref().map(|(editor, _)| editor.clone());
+        let asked = library
+            .asked()
+            .is_some()
+            .then(|| self.ask_to_save(&title, window, &theme, cx));
+        let header_row = div()
+            .flex_none()
+            .flex()
+            .items_start()
+            .gap(theme.spacing.lg)
+            .child(
+                div()
+                    .id("page-header-row")
+                    .flex_1()
+                    .min_w_0()
+                    .when_some(folder, |this, folder| {
+                        // A double click on a folder's name renames it in its row.
+                        this.on_click(move |event, _, cx| {
+                            if event.click_count() > 1 {
+                                let library = cx.services().library.clone();
+                                library.update(cx, |library, cx| library.ask_rename(folder, cx));
+                            }
+                        })
+                    })
+                    .child(header(
+                        glyph,
+                        folder.is_some(),
+                        title.clone(),
+                        under,
+                        &theme,
+                    )),
+            )
+            .children(folder.map(|folder| {
+                icon_button("folder-actions", theme.sizes.control_height, &theme)
+                    .border_color(theme.colors.line)
+                    .aria_label("Folder actions")
+                    .on_click(move |_, window, cx| {
+                        menu::open(
+                            menus::folder_menu(folder, false),
+                            window.mouse_position(),
+                            FOLDER_MENU_WIDTH,
+                            window,
+                            cx,
+                        );
+                    })
+                    .child(icon(SbIcon::Ellipsis, theme.sizes.icon, theme.colors.fg2))
+                    .automation_target("page/folder-actions")
+            }));
         div()
             .size_full()
             .flex()
@@ -1148,16 +1697,19 @@ impl Render for SessionsView {
             .gap(theme.spacing.xl)
             .pt(theme.sizes.page_top)
             .px(theme.sizes.page_side)
-            .child(header(glyph, is_folder, title.clone(), under, &theme))
-            .when_some(page.filter(|_| is_folder), |this, page| {
-                this.child(paths_line(&page.paths, &title, sync, &theme))
+            .child(header_row)
+            .map(|this| match (folder, page, editor) {
+                (Some(_), Some(_), Some(editor)) => this.child(editor),
+                (Some(folder), Some(page), None) => this
+                    .child(paths_line(&page.paths, folder, library, sync, &theme))
                     .child(
                         div()
                             .flex_none()
                             .h(px(1.))
                             .mx(-theme.sizes.page_side)
                             .bg(theme.colors.line_subtle),
-                    )
+                    ),
+                _ => this,
             })
             .when_some(first_sync, |this, first_sync| {
                 this.child(first_sync::card(&first_sync, &theme, cx))
@@ -1165,13 +1717,18 @@ impl Render for SessionsView {
                         this.child(first_sync::no_folders_banner(&theme, cx))
                     })
             })
+            .when(page.is_some_and(|page| !page.sessions.is_empty()), |this| {
+                this.child(self.filter_row(window, &theme, cx))
+            })
             .map(|this| match page {
                 None => this,
                 // A first sync that has archived nothing yet says so in the header.
                 Some(page) if page.sessions.is_empty() && syncing_first => this,
                 Some(page) if page.sessions.is_empty() => {
-                    this.child(empty(shelf, &title, sync.is_indexing(), &theme))
+                    this.child(empty(shelf, &title, sync.is_indexing(), targeted, &theme))
                 }
+                Some(_) if self.shown.is_empty() => this.child(no_match(&theme, cx)),
+                Some(_) if self.view.list => this.child(self.list(folder, &theme, cx)),
                 Some(_) => this.child(
                     // The list reaches the main area's edge, and its scrollbar sits in the
                     // page's side padding, clear of the cards ([`Self::render_rows`]).
@@ -1207,7 +1764,178 @@ impl Render for SessionsView {
                         .automation_target("page/cards"),
                 ),
             })
+            .children(asked)
     }
+}
+
+impl SessionsView {
+    /**
+     * What each frame needs before it is laid out: the filter field, holding what the page
+     * shown was filtered by; and the paths editor, when it was asked for or the folder shown
+     * is empty.
+     */
+    fn prepare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let library = self.library.read(cx);
+        let shelf = library.shelf();
+        let filter = library.view().filter;
+        let name = match shelf {
+            Shelf::Folder(folder) => library.folder(folder).map(|it| it.name.clone()),
+            Shelf::Starred => Some("Starred".to_string()),
+            _ => None,
+        };
+        if self.filter.is_none() {
+            let input = cx.new(|cx| InputState::new(window, cx));
+            let heard = cx.subscribe(&input, |this, input, event, cx| {
+                if let InputEvent::Change = event {
+                    let filter = input.read(cx).value().to_string();
+                    this.library.update(cx, |library, cx| {
+                        library.set_view(
+                            PageView {
+                                filter,
+                                ..library.view()
+                            },
+                            cx,
+                        );
+                    });
+                }
+            });
+            self.filter = Some((input, heard));
+        }
+        // Another page shows: the field holds what that page was filtered by.
+        if let Some((input, _)) = &self.filter
+            && self.filter_for != Some(shelf)
+        {
+            self.filter_for = Some(shelf);
+            let placeholder = match name {
+                Some(name) => format!("Filter in {name}"),
+                None => "Filter all sessions".to_string(),
+            };
+            input.update(cx, |input, cx| {
+                input.set_placeholder(placeholder, window, cx);
+                input.set_value(filter, window, cx);
+            });
+        }
+        if let Some(folder) = self.edit.take()
+            && shelf == Shelf::Folder(folder)
+            && self.editor.is_none()
+        {
+            self.open_editor(folder, false, window, cx);
+        }
+        let empty = self
+            .library
+            .read(cx)
+            .sessions()
+            .is_some_and(|page| page.sessions.is_empty() && page.paths.is_empty());
+        if let Shelf::Folder(folder) = shelf
+            && empty
+            && self.editor.is_none()
+        {
+            self.open_editor(folder, true, window, cx);
+        }
+    }
+
+    /**
+     * The question leaving with changes to save asks (DESIGN §4.7): "Save the path changes to
+     * fc?", with Don't save, Cancel and Save.
+     */
+    fn ask_to_save(
+        &self,
+        name: &str,
+        window: &Window,
+        theme: &SbTheme,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let c = &theme.colors;
+        let answer = |save: Option<bool>| {
+            cx.listener(move |this: &mut Self, _: &ClickEvent, window, cx| {
+                if let Some(save) = save
+                    && let Some((editor, _)) = &this.editor
+                {
+                    editor.update(cx, |editor, cx| {
+                        if save {
+                            editor.save(window, cx);
+                        } else {
+                            editor.cancel(cx);
+                        }
+                    });
+                }
+                this.library
+                    .update(cx, |library, cx| library.answer(save.is_some(), cx));
+            })
+        };
+        let dialog = overlay::surface(theme)
+            .w(theme.sizes.dialog_width)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(theme.spacing.md)
+                    .p(theme.sizes.dialog_padding)
+                    .child(
+                        div()
+                            .text_spec(&theme.text.sheet_title)
+                            .child(format!("Save the path changes to {name}?")),
+                    )
+                    .child(
+                        div()
+                            .text_color(c.fg2)
+                            .child("Leaving the page without saving drops them."),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(theme.spacing.md)
+                    .p(theme.sizes.dialog_padding)
+                    .border_t_1()
+                    .border_color(c.line_subtle)
+                    .bg(c.s1)
+                    .child(
+                        button("ask-discard", ButtonKind::Plain, false, true, theme)
+                            .on_click(answer(Some(false)))
+                            .child("Don't save")
+                            .automation_target("ask/discard"),
+                    )
+                    .child(
+                        button("ask-cancel", ButtonKind::Plain, false, true, theme)
+                            .on_click(answer(None))
+                            .child("Cancel")
+                            .automation_target("ask/cancel"),
+                    )
+                    .child(
+                        button("ask-save", ButtonKind::Primary, false, true, theme)
+                            .on_click(answer(Some(true)))
+                            .child("Save")
+                            .automation_target("ask/save"),
+                    ),
+            )
+            .automation_target("ask");
+        let library = self.library.clone();
+        overlay::modal(dialog, Layer::Dialog, window, theme, move |_, cx| {
+            library.update(cx, |library, cx| library.answer(false, cx));
+        })
+    }
+}
+
+/// "No sessions match these filters", and Clear filters (DESIGN §4.4, §4.14).
+fn no_match(theme: &SbTheme, cx: &Context<SessionsView>) -> AnyElement {
+    div()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(theme.spacing.lg)
+        .text_color(theme.colors.fg2)
+        .child("No sessions match these filters")
+        .child(
+            button("clear-filters-empty", ButtonKind::Plain, true, true, theme)
+                .on_click(cx.listener(|this, _, window, cx| this.clear_filters(window, cx)))
+                .child("Clear filters")
+                .automation_target("page/no-match/clear"),
+        )
+        .automation_target("page/no-match")
 }
 
 #[cfg(test)]
