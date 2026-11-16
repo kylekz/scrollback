@@ -50,7 +50,7 @@ use gpui_component::FocusTrapElement as _;
 use gpui_component::input::{
     Backspace, Escape, IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, OutdentInline,
 };
-use sb_core::catalogue::{Filed, Folder, Session, Shelf};
+use sb_core::catalogue::{Filed, Folder, Session, SessionId, Shelf};
 use sb_core::provider::ProviderId;
 use sb_core::search::{Filter, Found, Key, Match, MatchKind, Query, Results, Token};
 use sb_core::transcript::At;
@@ -282,9 +282,7 @@ impl Palette {
                         (now, before) => now.is_some() != before.is_some(),
                     };
                     if new {
-                        this.highlight = start(&this.view(cx));
-                        this.scroll.set_offset(point(px(0.), px(0.)));
-                        this.shown_answer = answer;
+                        this.adopt(answer, cx);
                     }
                     cx.notify();
                 }),
@@ -408,7 +406,7 @@ impl Palette {
             asked,
             completions,
             commands,
-            answer: search.answer().cloned(),
+            answer: self.shown_answer.clone(),
             rows: Vec::new(),
         };
         view.rows = if view.lists_recent() {
@@ -485,6 +483,7 @@ impl Palette {
     /// the answer shown is of (the index has news).
     fn search_again(&mut self, always: bool, cx: &mut Context<Self>) {
         let view = self.view(cx);
+        let first = start(&view);
         let View { text, asked, .. } = view;
         let query = match asked.unresolved {
             Some(_) => Query::default(),
@@ -494,10 +493,51 @@ impl Palette {
         if !always && answered == Some(&query) && self.search.read(cx).is_settled() {
             return;
         }
-        self.highlight = start(&self.view(cx));
+        /* The index's news searches the same query again: the keys stay where they are. */
+        if !always {
+            self.highlight = first;
+        }
         self.search
             .update(cx, |search, cx| search.search(query, text, asked.find, cx));
         cx.notify();
+    }
+
+    /**
+     * Shows `answer`. One to the query shown already (searched again for the index's news)
+     * keeps the keys on the row they were on: the same command, session or match of it,
+     * found by the session, or the nearest row left, and the list where it was. Any other
+     * puts them on its first row ([`start`]), the list at its top.
+     */
+    fn adopt(&mut self, answer: Option<Arc<Answered>>, cx: &mut Context<Self>) {
+        let again = matches!(
+            (&answer, &self.shown_answer),
+            (Some(now), Some(before)) if now.query == before.query
+        );
+        let kept = again.then(|| self.highlighted(&self.view(cx))).flatten();
+        self.shown_answer = answer;
+        let view = self.view(cx);
+        if !again {
+            self.highlight = start(&view);
+            self.scroll.set_offset(point(px(0.), px(0.)));
+            return;
+        }
+        let last = view.rows.len().saturating_sub(1);
+        self.highlight = kept
+            .and_then(|kept| kept.place(&view))
+            .unwrap_or(self.highlight)
+            .min(last);
+    }
+
+    /// What the keys are on in `view`, to find it again in another answer to the same query.
+    fn highlighted(&self, view: &View) -> Option<Kept> {
+        let results = view.results();
+        let id = |at: usize| Some(results?.sessions.get(at)?.session.id.clone());
+        match *view.rows.get(self.highlight)? {
+            Row::Command(at) => Some(Kept::Command(at)),
+            Row::Session(at) => Some(Kept::Session(id(at)?, None)),
+            Row::Match(at, shown) => Some(Kept::Session(id(at)?, Some(shown))),
+            Row::RecentSession(_) | Row::RecentSearch(_) => None,
+        }
     }
 
     /// Adds `chip`, in place of one of its kind, and searches again.
@@ -715,6 +755,33 @@ impl Palette {
  * The row the keys start on in `view`: a command whose name is the whole query, else the
  * first session found, else the first row (a command, when there is one).
  */
+/// The row the keys were on, as an answer to the same query finds it again.
+enum Kept {
+    Command(usize),
+    /// A session's row, or the match at this place among those it shows.
+    Session(SessionId, Option<usize>),
+}
+
+impl Kept {
+    /// Its place among `view`'s rows: a match the session no longer shows is its last one.
+    fn place(&self, view: &View) -> Option<usize> {
+        let row = match self {
+            Self::Command(at) => Row::Command(*at),
+            Self::Session(id, shown) => {
+                let results = view.results()?;
+                let (at, found) = (results.sessions.iter().enumerate())
+                    .find(|(_, found)| found.session.id == *id)?;
+                match shown {
+                    None => Row::Session(at),
+                    Some(_) if found.shown.is_empty() => Row::Session(at),
+                    Some(shown) => Row::Match(at, (*shown).min(found.shown.len() - 1)),
+                }
+            }
+        };
+        view.rows.iter().position(|it| *it == row)
+    }
+}
+
 fn start(view: &View) -> usize {
     let exact = (view.commands.iter())
         .position(|command| command.name.eq_ignore_ascii_case(view.asked.find.trim()));

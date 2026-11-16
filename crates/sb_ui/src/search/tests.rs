@@ -257,6 +257,68 @@ fn the_scope_is_the_page_it_opened_over_and_search_everywhere_drops_it(cx: &mut 
     assert_eq!(found(cx), Some(vec![SESSIONS[1].title.to_string()]));
 }
 
+/// The session and the match of the row the keys are on.
+fn on(palette: &Entity<Palette>, cx: &mut VisualTestContext) -> Option<(String, Option<usize>)> {
+    let row = rows(palette, cx).get(highlight(palette, cx)).copied()?;
+    let Some(Answer::Found(results)) = answer(cx) else {
+        return None;
+    };
+    let title = |at: usize| results.sessions[at].session.title.clone();
+    match row {
+        Row::Session(at) => Some((title(at)?, None)),
+        Row::Match(at, shown) => Some((title(at)?, Some(shown))),
+        _ => None,
+    }
+}
+
+/**
+ * The index's news searches the query again (a first sync's sessions coming in): the keys stay
+ * on the session and the match they were on, wherever the new answer puts it, and an answer
+ * to another query starts again from its first session.
+ */
+#[gpui::test]
+fn searching_the_same_query_again_keeps_the_keys_where_they_were(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    let palette = open_palette(&shell, cx);
+    typed("the", cx);
+    cx.simulate_keystrokes("down down down");
+    let before = on(&palette, cx).expect("on a session's row or match");
+    let at = highlight(&palette, cx);
+
+    palette.update(cx, |palette, cx| palette.search_again(true, cx));
+    cx.run_until_parked();
+    assert_eq!(highlight(&palette, cx), at);
+    assert_eq!(on(&palette, cx), Some(before.clone()));
+
+    // The same query answered with the sessions in another order: the keys follow theirs.
+    let Some(Answer::Found(mut results)) = answer(cx) else {
+        panic!("the query found sessions");
+    };
+    results.sessions.reverse();
+    let asked = service(cx).read_with(cx, |search, _| {
+        let it = search.answer().expect("an answer");
+        (it.query.clone(), it.text.clone(), it.find.clone())
+    });
+    service(cx).update(cx, |search, cx| {
+        search.answered(
+            Answered {
+                query: asked.0,
+                text: asked.1,
+                find: asked.2,
+                answer: Answer::Found(results),
+                took: Duration::ZERO,
+            },
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert_eq!(on(&palette, cx), Some(before));
+
+    // Another query starts from its first session.
+    typed(" upload", cx);
+    assert_eq!(rows(&palette, cx)[highlight(&palette, cx)], Row::Session(0));
+}
+
 #[gpui::test]
 fn the_arrows_wrap_and_enter_opens_the_session_at_the_match(cx: &mut TestAppContext) {
     let (shell, cx) = open_shell(cx);
