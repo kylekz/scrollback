@@ -583,8 +583,8 @@ impl SessionsView {
         let barred = selected || self.hovered.as_ref() == Some(&session.id);
         let title: SharedString = session
             .title
-            .clone()
-            .unwrap_or_else(|| "Untitled session".to_string())
+            .as_deref()
+            .map_or_else(|| "Untitled session".to_string(), crate::hostile::label)
             .into();
         // With one agent in the archive a card names the model alone (DESIGN §4.2.10).
         let model = agents::model(&session.id.provider, &session.models, cx);
@@ -768,7 +768,9 @@ impl SessionsView {
                     .text_ellipsis()
                     .text_color(c.fg2)
                     .text_spec(&theme.text.secondary)
-                    .child(session.first_prompt.clone().unwrap_or_default()),
+                    .child(crate::hostile::label(
+                        session.first_prompt.as_deref().unwrap_or_default(),
+                    )),
             )
             .child(
                 div()

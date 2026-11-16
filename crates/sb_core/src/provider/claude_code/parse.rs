@@ -218,7 +218,41 @@ pub(super) fn parse(items: &dyn SessionItems) -> Transcript {
     }
 }
 
+/**
+ * The name of the subagent whose records are kept in the session's own transcript `item`, in
+ * the tree that starts at the record `uuid`: what its conversation's `item` is, so that each
+ * such subagent is one of its own, and what [`subagent`] reads it by.
+ */
+fn inline_key(item: &str, uuid: &str) -> String {
+    format!("{item}#{uuid}")
+}
+
+/// Whether the conversation `key` is a subagent's kept in the transcript `item` ([`inline_key`]).
+pub(super) fn is_inline(key: &str, item: &str) -> bool {
+    key.strip_prefix(item)
+        .is_some_and(|rest| rest.starts_with('#'))
+}
+
 pub(super) fn subagent(items: &dyn SessionItems, key: &str) -> Subagent {
+    /* A subagent kept in the session's own transcript: read with it, and found by its name. */
+    if let Some((item, _)) = key.rsplit_once('#')
+        && items
+            .list()
+            .iter()
+            .any(|it| it.key == item && it.kind == ItemKind::Transcript)
+    {
+        let transcript = parse(items);
+        let under_calls = transcript
+            .conversation
+            .iter()
+            .flat_map(|conversation| conversation.calls())
+            .flat_map(|(_, call)| call.subagents.iter());
+        return under_calls
+            .chain(&transcript.unattached)
+            .find(|subagent| matches!(subagent, Subagent::Read { .. }) && &**subagent.item() == key)
+            .cloned()
+            .unwrap_or_else(|| Subagent::Unread { item: key.into() });
+    }
     let mut conversation = Reading::of(items, key, &saved(items.list()), false)
         .finish(items)
         .conversation;
@@ -1055,6 +1089,19 @@ impl<'a> Reading<'a> {
         }
 
         let hidden = hidden(&self.nodes, &parent, &order);
+        /* Apart, each tree is a conversation of its own, named by the item and its first
+        record (`inline_key`), which `subagent` reads it by again. */
+        let mut uuids: Vec<Option<&str>> = vec![None; self.nodes.len()];
+        for (uuid, &node) in &self.by_uuid {
+            uuids[node] = Some(uuid);
+        }
+        let names: Vec<Arc<str>> = uuids
+            .iter()
+            .map(|uuid| match uuid {
+                Some(uuid) => inline_key(&self.item, uuid).into(),
+                None => self.item.clone(),
+            })
+            .collect();
         /* The conversation each record goes into: that of its tree's first record, or the
         one there is. */
         let mut builders: Vec<Builder> = Vec::new();
@@ -1068,7 +1115,7 @@ impl<'a> Reading<'a> {
                 _ if !apart => 0,
                 Some(parent) => of[parent],
                 None => {
-                    builders.push(Builder::new(self.item.clone()));
+                    builders.push(Builder::new(names[node].clone()));
                     builders.len() - 1
                 }
             };

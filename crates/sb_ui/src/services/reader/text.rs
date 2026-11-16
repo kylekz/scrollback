@@ -21,8 +21,8 @@ const NOTE_EVERY: usize = 64;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Text {
     pub text: String,
-    /// When `text` is only the head of something longer: about how many bytes more there are
-    /// (as stored, so escapes count as written).
+    /// When `text` is only the head of something longer: how many bytes more there are, as
+    /// stored (an escape counts as written).
     pub rest: Option<u64>,
     /// Where every [`NOTE_EVERY`]th line drawn starts.
     notes: Vec<usize>,

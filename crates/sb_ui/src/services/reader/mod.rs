@@ -38,6 +38,7 @@ pub mod text;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use gpui::{AppContext as _, Context, Entity, Subscription};
 use sb_core::archive::{Archive, ArchivedSession, Pinned, SegmentCache};
@@ -238,7 +239,19 @@ impl OpenSession {
             Some(Load::Loaded(placement)) => Some(
                 self.unattached
                     .iter()
-                    .filter(|item| !placement.parents.contains_key(*item))
+                    .filter(|item| match placement.parents.get(*item) {
+                        None => true,
+                        /* Placed under a subagent whose calls, once read, don't start it after
+                        all: it is drawn here rather than nowhere. */
+                        Some(parent) => match self.subagents.get(parent) {
+                            Some(Load::Loaded(read)) => {
+                                !read.conversation.calls().any(|(_, call)| {
+                                    call.subagents.iter().any(|it| it.item() == *item)
+                                })
+                            }
+                            _ => false,
+                        },
+                    })
                     .cloned()
                     .collect(),
             ),
@@ -412,6 +425,14 @@ pub struct ReaderService {
     generation: u64,
     /// The loads of this generation not landed yet.
     loading: usize,
+    /**
+     * Cleared when the session closes: a load of it that hasn't started by then never does,
+     * so that a closed session's queue doesn't keep the background threads from the next.
+     * (One already running runs on: every read and parse is bounded.)
+     */
+    alive: Arc<AtomicBool>,
+    /// The images being decoded ([`Decoding`]): at most [`DECODES`].
+    decoding: Arc<AtomicUsize>,
     _observers: [Subscription; 2],
 }
 
@@ -434,6 +455,8 @@ impl ReaderService {
             full_calls: false,
             generation: 0,
             loading: 0,
+            alive: Arc::new(AtomicBool::new(true)),
+            decoding: Arc::default(),
         }
     }
 
@@ -481,7 +504,13 @@ impl ReaderService {
             &mut open.opened
         };
         if !set.remove(&toggle) {
-            set.insert(toggle);
+            set.insert(toggle.clone());
+        }
+        /* Show fewer: the whole read for Show all goes, the head is enough again. */
+        if let Toggle::AllLines(at, part) = &toggle
+            && !open.is_open(&toggle, full_calls)
+        {
+            open.wholes.remove(&(at.clone(), *part));
         }
         cx.notify();
     }
@@ -539,6 +568,8 @@ impl ReaderService {
     fn close(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         self.loading = 0;
+        self.alive.store(false, Ordering::Relaxed);
+        self.alive = Arc::new(AtomicBool::new(true));
         let before = std::mem::replace(&mut self.state, ReaderState::Closed);
         if let ReaderState::Open(open) = &before {
             for image in open.images.values() {
@@ -611,10 +642,13 @@ impl ReaderService {
         let (pinned, cache, provider) = (open.pinned.clone(), open.cache.clone(), open.provider);
         let providers = self.providers.clone();
         let generation = self.generation;
+        let alive = self.alive.clone();
         self.loading += 1;
         let job = cx.background_spawn(async move {
-            let items = archive.pinned_session(&pinned, cache);
-            work(providers[provider].as_ref(), &items)
+            alive.load(Ordering::Relaxed).then(|| {
+                let items = archive.pinned_session(&pinned, cache);
+                work(providers[provider].as_ref(), &items)
+            })
         });
         cx.spawn(async move |this, cx| {
             let value = job.await;
@@ -623,7 +657,7 @@ impl ReaderService {
                     return;
                 }
                 this.loading -= 1;
-                if let ReaderState::Open(open) = &mut this.state {
+                if let (ReaderState::Open(open), Some(value)) = (&mut this.state, value) {
                     done(open, value, cx);
                 }
                 cx.notify();
@@ -693,12 +727,10 @@ impl ReaderService {
                 let head = |stored: &Stored, json: bool| {
                     stored
                         .load_head(items, HEAD_BYTES)
-                        .map(|(text, whole)| {
-                            Arc::new(if whole {
-                                Text::new(if json { pretty(text) } else { text })
-                            } else {
-                                let rest = stored.length.saturating_sub(text.len() as u64);
-                                Text::head(text, rest)
+                        .map(|(text, rest)| {
+                            Arc::new(match rest {
+                                0 => Text::new(if json { pretty(text) } else { text }),
+                                rest => Text::head(text, rest),
                             })
                         })
                         .map_err(|error| error.to_string())
@@ -753,7 +785,10 @@ impl ReaderService {
             move |_, items| {
                 stored
                     .load_text(items)
-                    .map(|text| Arc::new(Text::new(text)))
+                    /* The input as its head shows it when it is whole: pretty-printed. */
+                    .map(|text| {
+                        Arc::new(Text::new(if part.is_none() { pretty(text) } else { text }))
+                    })
                     .map_err(|error| error.to_string())
             },
             {
@@ -772,27 +807,28 @@ impl ReaderService {
         let Some(open) = self.open_session() else {
             return;
         };
+        /* What the body shows, when it shows all of it. */
         if let Some(Load::Loaded(body)) = open.body(at) {
-            let texts: Vec<&Arc<Text>> = if output {
+            let parts: Vec<&Result<Arc<Text>, String>> = if output {
                 body.output
                     .iter()
                     .filter_map(|part| match part {
-                        Part::Text(Ok(text)) => Some(text),
-                        _ => None,
+                        Part::Text(text) => Some(text),
+                        Part::Image => None,
                     })
                     .collect()
             } else {
-                body.input.as_ref().ok().into_iter().collect()
+                vec![&body.input]
             };
-            if texts.iter().all(|text| text.rest.is_none()) {
-                let text = texts
-                    .iter()
-                    .map(|text| text.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if !text.is_empty() {
-                    crate::system::copy_text(text, cx);
-                }
+            if parts
+                .iter()
+                .all(|part| part.as_ref().is_ok_and(|it| it.rest.is_none()))
+            {
+                let parts = parts.into_iter().map(|part| match part {
+                    Ok(text) => Ok(text.text.clone()),
+                    Err(why) => Err(why.clone()),
+                });
+                copy_parts(parts, cx);
                 return;
             }
         }
@@ -816,15 +852,13 @@ impl ReaderService {
             move |_, items| {
                 stored
                     .iter()
-                    .filter_map(|stored| stored.load_text(items).ok())
+                    .map(|stored| {
+                        let text = stored.load_text(items).map_err(|error| error.to_string())?;
+                        Ok(if output { text } else { pretty(text) })
+                    })
                     .collect::<Vec<_>>()
-                    .join("\n")
             },
-            |_, text, cx| {
-                if !text.is_empty() {
-                    crate::system::copy_text(text, cx);
-                }
-            },
+            |_, parts, cx| copy_parts(parts.into_iter(), cx),
             cx,
         );
     }
@@ -974,17 +1008,16 @@ impl ReaderService {
         let Some(image) = image.cloned() else {
             return;
         };
+        if self.decoding.load(Ordering::Relaxed) >= DECODES {
+            return;
+        }
         let claimed = key.clone();
+        /* Counted from now; dropped with the work if it isn't started after all. */
+        let decoding = Decoding::start(&self.decoding);
         self.load(
-            |open| {
-                open.images
-                    .values()
-                    .filter(|it| matches!(it, Load::Loading))
-                    .count()
-                    < DECODES
-                    && claim(&mut open.images, &claimed)
-            },
+            |open| claim(&mut open.images, &claimed),
             move |_, items| {
+                let _decoding = decoding;
                 image
                     .data
                     .load(items)
@@ -999,6 +1032,26 @@ impl ReaderService {
             },
             cx,
         );
+    }
+}
+
+/**
+ * A decode being run, counted in the service's `decoding` from when it is asked for until it
+ * ends, or is dropped without running: not by its row's `Loading`, which a row that lets go
+ * of it removes while it runs on.
+ */
+struct Decoding(Arc<AtomicUsize>);
+
+impl Decoding {
+    fn start(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count.clone())
+    }
+}
+
+impl Drop for Decoding {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1029,8 +1082,32 @@ fn loaded<T>(result: Result<T, String>) -> Load<T> {
     }
 }
 
-/// `text` pretty-printed when it is JSON, else as it is.
+/**
+ * Copies `parts` as a body shows them, joined: each as it reads, its bidirectional controls
+ * shown (`⟦U+202E⟧`), and one that couldn't be read saying so.
+ */
+fn copy_parts(parts: impl Iterator<Item = Result<String, String>>, cx: &mut gpui::App) {
+    let text = parts
+        .map(|part| match part {
+            Ok(text) => crate::hostile::bidi(&text).into_owned(),
+            Err(why) => format!("[This part couldn't be read: {why}]"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !text.is_empty() {
+        crate::system::copy_text(text, cx);
+    }
+}
+
+/// The most of a call's input pretty-printed as JSON: past it, parsing it to print it again
+/// takes long and holds several copies; it is shown as it was sent.
+const PRETTY_BYTES: usize = 1024 * 1024;
+
+/// `text` pretty-printed when it is JSON of at most [`PRETTY_BYTES`], else as it is.
 fn pretty(text: String) -> String {
+    if text.len() > PRETTY_BYTES {
+        return text;
+    }
     serde_json::from_str::<serde_json::Value>(&text)
         .ok()
         .and_then(|value| serde_json::to_string_pretty(&value).ok())

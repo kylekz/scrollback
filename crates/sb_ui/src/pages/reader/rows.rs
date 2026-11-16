@@ -761,11 +761,13 @@ impl Rows<'_> {
         }
         if !self.drawn.insert(item.clone()) {
             self.push(panel(PanelPart::Repeat), space);
-            if let Some(last) = self.rows.last_mut() {
-                last.opens = true;
-                last.closes += 1;
+            if !alone {
+                if let Some(last) = self.rows.last_mut() {
+                    last.opens = true;
+                    last.closes += 1;
+                }
+                self.depth -= 1;
             }
-            self.depth -= 1;
             return;
         }
         let outer = std::mem::replace(

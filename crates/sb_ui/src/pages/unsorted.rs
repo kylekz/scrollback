@@ -505,8 +505,8 @@ impl UnsortedView {
         let selected = self.library.read(cx).selected() == Some(&session.id);
         let title: SharedString = session
             .title
-            .clone()
-            .unwrap_or_else(|| "Untitled session".to_string())
+            .as_deref()
+            .map_or_else(|| "Untitled session".to_string(), crate::hostile::label)
             .into();
         let model = agents::model(&session.id.provider, &session.models, cx)
             .unwrap_or_else(|| agents::name(&session.id.provider, cx));
@@ -561,7 +561,9 @@ impl UnsortedView {
                             .overflow_hidden()
                             .text_ellipsis()
                             .text_color(c.fg3)
-                            .child(session.first_prompt.clone().unwrap_or_default()),
+                            .child(crate::hostile::label(
+                                session.first_prompt.as_deref().unwrap_or_default(),
+                            )),
                     ),
             )
             .child(

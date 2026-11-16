@@ -4,11 +4,11 @@
 //! reaches it.
 //!
 //! A body is first scanned without parsing ([`regions`]): the Markdown parser recurses once per
-//! level of nesting and takes time quadratic in nesting and in a paragraph's delimiters, so a
-//! paragraph past [`MAX_NESTING`], and what follows once [`DELIMITER_COST`] is spent, is never
-//! parsed and is shown as plain text, as is a body past [`MARKDOWN_BYTES`]. The rest is parsed
-//! on a thread of its own with a stack of [`PARSE_STACK`], and its tree taken apart without
-//! recursing.
+//! level of nesting and takes time at least quadratic in nesting and in a paragraph's
+//! delimiters, so a paragraph nested past [`MAX_NESTING`] or longer than a block may be, and
+//! what follows once [`DELIMITER_COST`] is spent, is never parsed and is shown as plain text,
+//! as is a body past [`MARKDOWN_BYTES`]. The rest is parsed on a thread of its own with a stack
+//! of [`PARSE_STACK`], and its tree taken apart without recursing.
 //!
 //! The parsed body is cut between its top-level blocks into pieces, each sanitised on its own:
 //! blocks are grouped up to [`PIECE_BYTES`], a single block may be up to [`BLOCK_BYTES`]
@@ -48,10 +48,10 @@ pub const DEFINITION_BYTES: usize = 8 * 1024;
  */
 pub const MAX_NESTING: usize = 32;
 /**
- * The most a body's paragraphs may cost the parser, as the sum over its paragraphs of the
- * square of their delimiters (runs of `*`, `_`, `~`, backticks and `$`, and each `[` and `<`):
- * matching them is quadratic. 2,000 delimiters in one paragraph were measured at about 30 ms
- * on a release build.
+ * The most a body's paragraphs may cost the parser: the sum over its paragraphs of the square
+ * of their delimiters, each `*`, `_`, `~`, `[` and `<` and each run of backticks or `$`.
+ * Matching delimiters is at least quadratic in their number. At the bound, the slowest bodies
+ * tried (links, emphasis, brackets) parsed in 15 ms or less on a release build.
  */
 pub const DELIMITER_COST: u64 = 4_000_000;
 /// A body longer than this is shown as plain text without being parsed.
@@ -131,15 +131,17 @@ impl Prose {
 fn markdown_pieces(text: &str) -> Option<Vec<Piece>> {
     let root = markdown::to_mdast(text, &options()).ok()?;
     let blocks: Vec<&Node> = root.children().into_iter().flatten().collect();
-    let definitions: HashMap<&str, &str> = blocks
-        .iter()
-        .filter_map(|node| match node {
-            Node::Definition(definition) => {
-                Some((definition.identifier.as_str(), span(node, text)?))
-            }
-            _ => None,
-        })
-        .collect();
+    /* Of definitions of the same name, the first is the one Markdown follows. */
+    let mut definitions: HashMap<&str, &str> = HashMap::new();
+    for node in &blocks {
+        if let Node::Definition(definition) = node
+            && let Some(source) = span(node, text)
+        {
+            definitions
+                .entry(definition.identifier.as_str())
+                .or_insert(source);
+        }
+    }
     let mut pieces = Vec::new();
     let flush = |group: &mut Option<Group>, pieces: &mut Vec<Piece>| {
         let Some(group) = group.take() else {
@@ -224,21 +226,34 @@ fn dismantle(root: Node) {
 
 /**
  * `text` cut into the runs to parse and the runs not to, in order, by a scan line by line that
- * never parses: a paragraph (the lines up to a blank one; a fenced block is never cut) is not
- * parsed if a line of it nests past [`MAX_NESTING`] (its quote and list markers, and its
- * indentation before them at two columns a level), and once the paragraphs parsed would cost
- * past [`DELIMITER_COST`], nothing after is.
+ * never parses. A paragraph is the lines up to a blank one; a fenced block is never cut. One is
+ * not parsed if a line of it nests past [`MAX_NESTING`] (its quote and list markers, and
+ * outside a fence its indentation before them at two columns a level), if it is longer than
+ * [`BLOCK_BYTES`] ([`CODE_BYTES`] with a fence in it), which the view couldn't be handed
+ * anyway; and once the paragraphs parsed would cost past [`DELIMITER_COST`], nothing after is.
+ *
+ * A fence opens only as CommonMark opens one, and as narrowly: three or more backticks or
+ * tildes at most three columns in from the line's last container marker, a backtick fence's
+ * info string holding no backtick. It closes at a closing fence, or at the first line that no
+ * longer carries the containers it opened in (fewer quote markers, or a list item's content
+ * left). A line read as a fence that isn't one is only scanned less: the scan errs that way.
  */
 fn regions(text: &str) -> Vec<(Range<usize>, bool)> {
     let mut regions: Vec<(Range<usize>, bool)> = Vec::new();
     let mut spent = false;
     let mut cost: u64 = 0;
-    let mut finish = |range: Range<usize>, deep: bool, delimiters: u64| {
-        let own = delimiters * delimiters;
-        let parse = !deep && !spent && cost + own <= DELIMITER_COST;
+    let mut finish = |range: Range<usize>, paragraph: &Paragraph| {
+        let own = paragraph.delimiters * paragraph.delimiters;
+        let limit = if paragraph.fenced {
+            CODE_BYTES
+        } else {
+            BLOCK_BYTES
+        };
+        let fits = !paragraph.deep && range.len() <= limit;
+        let parse = fits && !spent && cost + own <= DELIMITER_COST;
         if parse {
             cost += own;
-        } else if !deep {
+        } else if fits {
             spent = true;
         }
         match regions.last_mut() {
@@ -246,61 +261,154 @@ fn regions(text: &str) -> Vec<(Range<usize>, bool)> {
             _ => regions.push((range, parse)),
         }
     };
-    let mut fence: Option<(char, usize)> = None;
-    let (mut start, mut deep, mut delimiters) = (0, false, 0);
-    let mut at = 0;
+    let mut fence: Option<Fence> = None;
+    let mut paragraph = Paragraph::default();
+    let (mut start, mut at) = (0, 0);
     for line in text.split_inclusive('\n') {
         at += line.len();
-        let indent: usize = line
-            .chars()
-            .map_while(|c| match c {
-                ' ' => Some(1),
-                '\t' => Some(4),
-                _ => None,
-            })
-            .sum();
-        let mut depth = indent / 2;
-        let mut rest = line.trim_start_matches([' ', '\t']);
-        while let Some(after) = rest.strip_prefix('>').or_else(|| list_marker(rest)) {
-            depth += 1;
-            rest = after.trim_start_matches([' ', '\t']);
-        }
-        if let Some((mark, length)) = fence {
-            let run = rest.chars().take_while(|c| *c == mark).count();
-            if run >= length && rest[run * mark.len_utf8()..].trim().is_empty() {
-                fence = None;
+        let prefix = Prefix::of(line.trim_end_matches(['\n', '\r']));
+        if let Some(open) = &fence {
+            let carried = prefix.quotes >= open.quotes
+                && (open.content == 0 || prefix.blank || prefix.indent >= open.content);
+            if carried {
+                paragraph.deep |= prefix.quotes + prefix.lists > MAX_NESTING;
+                let run = prefix.rest.chars().take_while(|c| *c == open.mark).count();
+                if run >= open.length && prefix.rest[run * open.mark.len_utf8()..].trim().is_empty()
+                {
+                    fence = None;
+                }
+                continue;
             }
+            fence = None;
+        }
+        paragraph.deep |= prefix.indent / 2 + prefix.quotes + prefix.lists > MAX_NESTING;
+        if let Some(open) = Fence::opens(&prefix) {
+            fence = Some(open);
+            paragraph.fenced = true;
             continue;
         }
-        deep |= depth > MAX_NESTING;
-        for mark in ['`', '~'] {
-            let run = rest.chars().take_while(|c| *c == mark).count();
-            if run >= 3 {
-                fence = Some((mark, run));
-            }
-        }
-        if fence.is_some() {
-            continue;
-        }
-        if rest.trim().is_empty() {
-            finish(start..at, deep, delimiters);
-            (start, deep, delimiters) = (at, false, 0);
+        if prefix.blank {
+            finish(start..at, &paragraph);
+            (start, paragraph) = (at, Paragraph::default());
             continue;
         }
         let mut previous = '\0';
-        for c in rest.chars() {
+        for c in prefix.rest.chars() {
             match c {
-                '[' | '<' => delimiters += 1,
-                '*' | '_' | '~' | '`' | '$' if c != previous => delimiters += 1,
+                /* Each mark of emphasis counts: the parser's time grows faster than the
+                square of a run's length. */
+                '[' | '<' | '*' | '_' | '~' => paragraph.delimiters += 1,
+                '`' | '$' if c != previous => paragraph.delimiters += 1,
                 _ => {}
             }
             previous = c;
         }
     }
     if start < text.len() {
-        finish(start..text.len(), deep, delimiters);
+        finish(start..text.len(), &paragraph);
     }
     regions
+}
+
+/// What the scan knows of a paragraph so far.
+#[derive(Default)]
+struct Paragraph {
+    deep: bool,
+    fenced: bool,
+    delimiters: u64,
+}
+
+/// The containers a line carries: its quote and list markers, where its content starts.
+struct Prefix<'a> {
+    quotes: usize,
+    lists: usize,
+    /// The columns of whitespace before the first marker (or the content, with none).
+    indent: usize,
+    /// The column the last list marker's content starts at; 0 with none.
+    content: usize,
+    /// The columns of whitespace between the last marker and the content.
+    inset: usize,
+    rest: &'a str,
+    blank: bool,
+}
+
+impl<'a> Prefix<'a> {
+    fn of(line: &'a str) -> Self {
+        /* The columns of the whitespace `text` starts with, and what follows it. */
+        fn space(text: &str) -> (usize, &str) {
+            let columns = text
+                .chars()
+                .map_while(|c| match c {
+                    ' ' => Some(1),
+                    '\t' => Some(4),
+                    _ => None,
+                })
+                .sum();
+            (columns, text.trim_start_matches([' ', '\t']))
+        }
+        let (indent, mut rest) = space(line);
+        let (mut quotes, mut lists, mut content) = (0, 0, 0);
+        let mut column = indent;
+        let mut inset = indent;
+        loop {
+            if let Some(after) = rest.strip_prefix('>') {
+                quotes += 1;
+                (inset, rest) = space(after);
+                column += 1 + inset;
+            } else if let Some(after) = list_marker(rest) {
+                lists += 1;
+                let marker = rest.len() - after.len();
+                (inset, rest) = space(after);
+                column += marker + inset;
+                content = column - inset + inset.clamp(1, 4);
+            } else {
+                break;
+            }
+        }
+        Self {
+            quotes,
+            lists,
+            indent,
+            content,
+            inset,
+            blank: rest.trim().is_empty(),
+            rest,
+        }
+    }
+}
+
+/// An open fence: its mark and length, and the containers it opened in.
+struct Fence {
+    mark: char,
+    length: usize,
+    quotes: usize,
+    content: usize,
+}
+
+impl Fence {
+    /// The fence the line `prefix` opens, by CommonMark's rules, if it opens one.
+    fn opens(prefix: &Prefix) -> Option<Self> {
+        let markers = prefix.quotes + prefix.lists;
+        /* After a marker, one column of the whitespace belongs to it. */
+        let indent = if markers == 0 {
+            prefix.indent
+        } else {
+            prefix.inset.saturating_sub(1)
+        };
+        if indent > 3 {
+            return None;
+        }
+        ['`', '~'].into_iter().find_map(|mark| {
+            let length = prefix.rest.chars().take_while(|c| *c == mark).count();
+            let info = &prefix.rest[length * mark.len_utf8()..];
+            (length >= 3 && !(mark == '`' && info.contains('`'))).then_some(Self {
+                mark,
+                length,
+                quotes: prefix.quotes,
+                content: prefix.content,
+            })
+        })
+    }
 }
 
 /// What follows a list item's marker (`-`, `*`, `+`, `1.`, `1)`) at the start of `line`, if
@@ -476,22 +584,39 @@ mod tests {
 
     #[test]
     fn no_body_overflows_a_worker_stack_or_keeps_the_parser_long() {
-        for body in [
-            "- ".repeat(2_000) + "x",
-            ">".repeat(200_000),
-            "- ".repeat(100_000) + "x",
-            "1. ".repeat(100_000) + "x",
-            "[".repeat(200_000),
-            "*a".repeat(200_000),
-            "[a](".repeat(50_000),
-            "`".repeat(300_000),
-            "<a ".repeat(100_000),
-            "![".repeat(100_000),
-            "*a ".repeat(16_000) + &"a*".repeat(16_000),
-            (0..200)
-                .map(|n| format!("{}- level\n", "  ".repeat(n)))
-                .collect(),
-        ] {
+        for body in
+            [
+                "- ".repeat(2_000) + "x",
+                ">".repeat(200_000),
+                "- ".repeat(100_000) + "x",
+                "1. ".repeat(100_000) + "x",
+                "[".repeat(200_000),
+                "*a".repeat(200_000),
+                "[a](".repeat(50_000),
+                "`".repeat(300_000),
+                "<a ".repeat(100_000),
+                "![".repeat(100_000),
+                "*a ".repeat(16_000) + &"a*".repeat(16_000),
+                (0..200)
+                    .map(|n| format!("{}- level\n", "  ".repeat(n)))
+                    .collect(),
+            ]
+            .into_iter()
+            /* Runs of emphasis whose parse time grows faster than their square. */
+            .chain([20_000, 100_000, 250_000].into_iter().flat_map(|n| {
+                ["*", "_"].map(|mark| format!("{}a{}", mark.repeat(n), mark.repeat(n)))
+            }))
+            /* What a fence could be mistaken for, to stop the scan looking: an info string with a
+            backtick, an indented one, one in a list item that ends without closing it. */
+            .chain(
+                ["```x`\n", "para\n    ```\n", "- ```\nX\n\n"]
+                    .into_iter()
+                    .flat_map(|opener| {
+                        [">".repeat(80_000), "*a".repeat(80_000)]
+                            .map(|after| format!("{opener}{after}"))
+                    }),
+            )
+        {
             let start: String = body.chars().take(12).collect();
             let (prose, took) = on_a_worker_stack(body);
             assert!(!prose.pieces.is_empty(), "{start:?}");
@@ -550,6 +675,27 @@ mod tests {
         let (prose, took) = on_a_worker_stack(format!("para [d1]\n\n{definitions}"));
         assert!(!prose.pieces.is_empty());
         assert!(took.as_secs_f64() < 2.0, "{took:?}");
+    }
+
+    #[test]
+    fn a_reference_carries_the_first_of_its_definitions() {
+        let filler = "a".repeat(PIECE_BYTES - 10);
+        let body = format!(
+            "{filler}\n\nSee [the bank][b].\n\n[b]: https://bank.example\n\n{filler}\n\n[b]: https://evil.example"
+        );
+        let prose = Prose::markdown(&body);
+        let carried: Vec<&str> = prose
+            .pieces
+            .iter()
+            .filter_map(|piece| match piece {
+                Piece::Markdown(markdown) if markdown.as_str().contains("[the bank][b]") => {
+                    Some(markdown.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(carried.len(), 1);
+        assert!(carried[0].contains("bank.example") && !carried[0].contains("evil.example"));
     }
 
     #[test]

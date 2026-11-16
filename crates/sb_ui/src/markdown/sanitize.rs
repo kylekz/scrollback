@@ -6,6 +6,8 @@
 //! reports, so code is left alone. Then the result is parsed again the view's way, and if any
 //! image or raw HTML is left in it, the whole body is shown literally instead.
 
+use std::collections::HashMap;
+
 use markdown::ParseOptions;
 use markdown::mdast::Node;
 
@@ -60,6 +62,15 @@ fn edit(source: &str, options: &ParseOptions) -> Option<String> {
         return Some(source.to_string());
     }
     let root = markdown::to_mdast(source, options).ok()?;
+    /* Where a reference link goes: its definition's, the first one of its name. */
+    let mut definitions: HashMap<&str, &str> = HashMap::new();
+    for node in root.children().into_iter().flatten() {
+        if let Node::Definition(definition) = node {
+            definitions
+                .entry(definition.identifier.as_str())
+                .or_insert(definition.url.as_str());
+        }
+    }
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     /* Each node with whether its parent is the document itself, where HTML is a block. */
     let mut stack: Vec<(&Node, bool)> = root
@@ -100,10 +111,15 @@ fn edit(source: &str, options: &ParseOptions) -> Option<String> {
                     edits.push((start, end, prose));
                 }
             }
-            Node::Link(link) => {
+            Node::Link(_) | Node::LinkReference(_) => {
                 let (_, end, _) = span()?;
-                if let Some(host) = spoofed(&node.to_string(), &link.url) {
-                    edits.push((end, end, format!(" (to {host})")));
+                let url = match node {
+                    Node::Link(link) => Some(link.url.as_str()),
+                    Node::LinkReference(link) => definitions.get(link.identifier.as_str()).copied(),
+                    _ => None,
+                };
+                if let Some(site) = url.and_then(|url| spoofed(&node.to_string(), url)) {
+                    edits.push((end, end, format!(" (to {site})")));
                 }
                 stack.extend(node.children().into_iter().flatten().map(|it| (it, false)));
             }
@@ -229,31 +245,34 @@ pub fn literal(text: &str) -> String {
 }
 
 /**
- * The site a link to `url` goes to, when its text `text` is a web address of another site, and
- * the site's name is plain enough to show as it is.
+ * The site a link to `url` goes to, when its text `text` names a web address of another site:
+ * the host as a browser reads it from `url` (after any user name, an international name in its
+ * ASCII form), or "another site" when it has none a browser would show.
  */
 fn spoofed(text: &str, url: &str) -> Option<String> {
+    /* The host of `address`, without `www.`, if it parses as a web address. */
     fn host(address: &str) -> Option<String> {
-        let rest = address.trim();
-        let rest = ["https://", "http://"]
-            .iter()
-            .find_map(|scheme| {
-                rest.get(..scheme.len())?
-                    .eq_ignore_ascii_case(scheme)
-                    .then(|| &rest[scheme.len()..])
-            })
-            .unwrap_or(rest);
-        let host = rest.split(['/', '?', '#']).next()?.to_ascii_lowercase();
-        let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
-        let plain = host.contains('.')
-            && host
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'));
-        plain.then_some(host)
+        let parsed = url::Url::parse(address).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return None;
+        }
+        let host = parsed.host_str()?;
+        Some(host.strip_prefix("www.").unwrap_or(host).to_string())
     }
-    let shown = host(text)?;
-    let real = host(url)?;
-    (shown != real).then_some(real)
+    let text = text.trim();
+    /* Text that reads as an address: one written whole, or a name with a dot and no spaces. */
+    let shown = if text.contains("://") {
+        host(text)
+    } else if text.contains('.') && !text.contains(char::is_whitespace) {
+        host(&format!("http://{text}"))
+    } else {
+        None
+    }?;
+    match host(url) {
+        Some(real) if real == shown => None,
+        Some(real) => Some(real),
+        None => Some("another site".to_string()),
+    }
 }
 
 /// `url` when it is a web address that can sit in a link's `<…>` as it is.
@@ -384,6 +403,34 @@ mod tests {
             sanitize("[https://bank.example/login](https://evil.example/x)"),
             "[https://bank.example/login](https://evil.example/x) (to evil.example)"
         );
+        for (source, note) in [
+            /* By reference, its first definition: the one the view follows. */
+            (
+                "[https://bank.example][r]\n\n[r]: https://evil.example/x\n[r]: https://bank.example",
+                "[https://bank.example][r] (to evil.example)",
+            ),
+            /* A user name before the host, a backslash for a slash, an international name. */
+            (
+                "[https://bank.example](https://bank.example@evil.example/)",
+                "(to evil.example)",
+            ),
+            (
+                "[https://bank.example](https://evil.example\\bank.example/x)",
+                "(to evil.example)",
+            ),
+            (
+                "[https://bank.example](https://b\u{0430}nk.example/)",
+                "(to xn--bnk-6cd.example)",
+            ),
+            (
+                "[https://bank.example](javascript:alert(1))",
+                "(to another site)",
+            ),
+        ] {
+            let out = sanitize(source);
+            assert!(out.contains(note), "{source:?}: {out:?}");
+            assert_inert(&out);
+        }
         for source in [
             "[https://example.com](https://www.example.com/docs)",
             "[the docs](https://evil.example/x)",

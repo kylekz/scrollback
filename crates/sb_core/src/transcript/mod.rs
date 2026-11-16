@@ -623,17 +623,17 @@ impl Stored {
     }
 
     /**
-     * The start of the content as text, from about its first `limit` bytes as stored, and
-     * whether that is all of it: what shows the start of something that may be large without
-     * reading it whole. Base64 content is read whole.
+     * The start of the content as text, from about its first `limit` bytes as stored, and how
+     * many bytes as stored are after it (none when it is all of it): what shows the start of
+     * something that may be large without reading it whole. Base64 content is read whole.
      */
     pub fn load_head(
         &self,
         items: &dyn SessionItems,
         limit: u64,
-    ) -> Result<(String, bool), LoadError> {
+    ) -> Result<(String, u64), LoadError> {
         if self.length <= limit || self.encoding == Encoding::Base64 {
-            return Ok((self.load_text(items)?, true));
+            return Ok((self.load_text(items)?, 0));
         }
         let mut bytes = Vec::new();
         items
@@ -655,27 +655,73 @@ impl Stored {
             _ => bytes.len(),
         };
         let head = String::from_utf8_lossy(&bytes[..whole]);
-        match self.encoding {
+        /* Closed where it was cut, less what may be half of an escape or of a surrogate pair:
+        found in the text as written, not in what it decodes to. */
+        let used = match self.encoding {
+            Encoding::JsonString => whole_escapes(&head),
+            _ => head.len(),
+        };
+        let text = match self.encoding {
             Encoding::JsonString => {
-                /* Closed where it was cut, less what may be half of an escape or of a
-                surrogate pair. */
-                let ends = head.char_indices().rev().take(13).map(|(at, _)| at);
-                std::iter::once(head.len())
-                    .chain(ends)
-                    .find_map(|end| {
-                        json_string(&format!("{}\"", &head[..end]))
-                            .filter(|text| !text.ends_with(char::REPLACEMENT_CHARACTER))
-                    })
-                    .ok_or_else(|| LoadError::Encoding {
-                        item: self.item.clone(),
-                        offset: self.offset,
-                        encoding: self.encoding,
-                    })
+                json_string(&format!("{}\"", &head[..used])).ok_or_else(|| LoadError::Encoding {
+                    item: self.item.clone(),
+                    offset: self.offset,
+                    encoding: self.encoding,
+                })?
             }
-            _ => Ok(head.into_owned()),
-        }
-        .map(|head| (head, false))
+            _ => head.into_owned(),
+        };
+        Ok((text, self.length - used as u64))
     }
+}
+
+/**
+ * How much of `literal`, the start of a JSON string cut anywhere (its opening quote included),
+ * ends at the end of a whole character: not inside an escape, nor between the two escapes of a
+ * surrogate pair.
+ */
+fn whole_escapes(literal: &str) -> usize {
+    let bytes = literal.as_bytes();
+    let unit = |at: usize| {
+        literal
+            .get(at + 2..at + 6)
+            .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+    };
+    let (mut at, mut whole) = (1, 1);
+    while at < bytes.len() {
+        if bytes[at] != b'\\' {
+            at += literal[at..].chars().next().map_or(1, char::len_utf8);
+            whole = at;
+            continue;
+        }
+        match bytes.get(at + 1) {
+            None => break,
+            Some(b'u') => {}
+            Some(_) => {
+                at += 2;
+                whole = at;
+                continue;
+            }
+        }
+        if at + 6 > bytes.len() {
+            break;
+        }
+        at += 6;
+        if unit(at - 6).is_some_and(|it| (0xD800..0xDC00).contains(&it)) {
+            /* A high surrogate: whole with its low one, or with what follows it when that is
+            no escape; the cut may be inside the low one's escape. */
+            let rest = &literal[at..];
+            if rest.len() < 6 && b"\\u".starts_with(&rest.as_bytes()[..rest.len().min(2)]) {
+                break;
+            }
+            if rest.starts_with("\\u") && unit(at).is_some_and(|it| (0xDC00..0xE000).contains(&it))
+            {
+                at += 6;
+            }
+        }
+        whole = at;
+    }
+    whole
 }
 
 /**
@@ -768,25 +814,41 @@ mod tests {
             stored(&plain, Encoding::Plain)
                 .load_head(&plain, 3)
                 .unwrap(),
-            ("ab".to_string(), false)
+            ("ab".to_string(), 4)
         );
         assert_eq!(
             stored(&plain, Encoding::Plain)
                 .load_head(&plain, 64)
                 .unwrap(),
-            ("ab\u{e9}cd".to_string(), true)
+            ("ab\u{e9}cd".to_string(), 0)
         );
         /* A JSON string cut inside an escape, wherever. */
         let json = Bytes(br#""a\n\u00e9\ud83c\udf89 b""#.to_vec());
         for limit in 2..json.0.len() as u64 {
-            let (head, whole) = stored(&json, Encoding::JsonString)
+            let (head, rest) = stored(&json, Encoding::JsonString)
                 .load_head(&json, limit)
                 .unwrap();
-            assert!(!whole);
+            assert!(rest > 0 && rest >= json.0.len() as u64 - limit);
             assert!(
                 "a\n\u{e9}\u{1F389} b".starts_with(&head),
                 "{limit}: {head:?}"
             );
+        }
+        /* Replacement characters the text holds, written or escaped, are text like any other;
+        a high surrogate cut from its low one, before anything or before a wide character, is
+        not kept. */
+        for text in [
+            format!("\"{}xyz\"", "\u{FFFD}".repeat(40)),
+            format!("\"{}xyz\"", "\\ufffd".repeat(10)),
+            "\"ab\\ud83c中文中文中文\"".to_string(),
+        ] {
+            let json = Bytes(text.into_bytes());
+            for limit in 2..json.0.len() as u64 {
+                let (head, _) = stored(&json, Encoding::JsonString)
+                    .load_head(&json, limit)
+                    .unwrap();
+                assert!(head.len() as u64 <= limit, "{limit}: {head:?}");
+            }
         }
     }
 

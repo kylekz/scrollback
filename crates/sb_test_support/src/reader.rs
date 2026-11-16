@@ -1097,9 +1097,46 @@ pub fn tangled(tree: &mut ProjectsTree) -> String {
                 json!({ "description": "Again", "prompt": "Again.", "subagent_type": "Explore" }),
             );
             s.result(&call, json!("Again."), json!({ "agentId": starts }));
+            /* A second result for the call, and a result for no call: neither starts anything,
+            whatever it names. */
+            s.result(&call, json!("Again?"), json!({ "agentId": twice_id }));
+            let orphan = Call {
+                id: format!("toolu_orphan_{prefix}"),
+                uuid: format!("orphan_{prefix}"),
+            };
+            s.result(&orphan, json!("Lost."), json!({ "agentId": twice_id }));
         }
         s.at("08:00:03").reply(HAIKU, "Done.");
     }
+    session.session_key().to_string()
+}
+
+/**
+ * A session of fc with two subagents kept in its own transcript, as earlier releases kept
+ * them, neither under a call. Returns its key.
+ */
+pub fn inline(tree: &mut ProjectsTree) -> String {
+    let mut session = tree.session(FC, 0);
+    session.title("Reader fixture: subagents kept in the session's transcript");
+    let t = &mut session.transcript;
+    t.set_time("2026-11-05T08:00:00.000Z");
+    t.prompt("Look around twice.");
+    let after = t.reply_by(OPUS_46, "Looking.");
+    for (message, prompt) in [(93, "First look."), (94, "Second look.")] {
+        t.record(
+            "user",
+            json!({ "isSidechain": true, "parentUuid": null,
+                    "message": { "role": "user", "content": prompt } }),
+        );
+        t.assistant(
+            message,
+            HAIKU,
+            json!([{ "type": "text", "text": format!("Done: {prompt}") }]),
+            json!({ "isSidechain": true }),
+        );
+        t.follow(&after);
+    }
+    t.reply_by(OPUS_46, "Both looked.");
     session.session_key().to_string()
 }
 

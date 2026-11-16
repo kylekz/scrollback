@@ -26,6 +26,7 @@ fn library(cx: &mut TestAppContext) -> (Entity<LibraryService>, Entity<ReaderSer
     reader::subagents_only(&mut tree);
     reader::hostile(&mut tree, 64 * 1024);
     reader::tangled(&mut tree);
+    reader::inline(&mut tree);
     let file = tree.path(&format!("projects/{backfill}.jsonl"));
     init(tree, cx);
     cx.update(|cx| {
@@ -566,6 +567,55 @@ fn subagents_that_claim_each_other_are_each_reached_and_drawn_once(cx: &mut Test
 }
 
 #[gpui::test]
+fn subagents_kept_in_the_sessions_transcript_are_each_their_own(cx: &mut TestAppContext) {
+    let (library, reader, _) = library(cx);
+    open(
+        &library,
+        "Reader fixture: subagents kept in the session's transcript",
+        cx,
+    );
+    reader.update(cx, |reader, cx| reader.set_full_calls(true, cx));
+    draw_all(&reader, cx);
+    let items = reader.read_with(cx, |reader, _| {
+        let open = reader.open_session().unwrap();
+        let unattached = open.unattached().expect("placed");
+        assert_eq!(unattached.len(), 2, "{unattached:?}");
+        assert_ne!(unattached[0], unattached[1]);
+        let rows = rows(open, true, None);
+        let mut keys = HashSet::new();
+        for row in &rows {
+            assert!(keys.insert(row.key()), "{:?} twice", row.kind);
+            assert!(!matches!(
+                row.kind,
+                RowKind::Panel {
+                    part: PanelPart::Repeat,
+                    ..
+                }
+            ));
+        }
+        unattached
+    });
+    /* Let go of and read again, each is still its own conversation. */
+    for (item, prompt) in items.iter().zip(["First look.", "Second look."]) {
+        reader.update(cx, |reader, cx| {
+            reader.release(vec![Held::Subagent(item.clone())], cx);
+            reader.want_subagent(item, cx);
+        });
+        cx.run_until_parked();
+        reader.read_with(cx, |reader, _| {
+            let Some(Load::Loaded(read)) = reader.open_session().unwrap().subagent(item) else {
+                panic!("{item} is read again");
+            };
+            assert_eq!(read.conversation.item, *item);
+            let first = read.conversation.turns()[0].blocks[0];
+            assert!(
+                matches!(&read.conversation[first].content, Content::Prompt { text, .. } if text == prompt)
+            );
+        });
+    }
+}
+
+#[gpui::test]
 fn the_providers_outlines_agree_with_its_subagents_read_whole(cx: &mut TestAppContext) {
     let (library, reader, _) = library(cx);
     for title in [
@@ -580,27 +630,7 @@ fn the_providers_outlines_agree_with_its_subagents_read_whole(cx: &mut TestAppCo
             let provider = reader.providers[open.provider].as_ref();
             let mut outlines = provider.outlines(&items);
             outlines.sort_by(|a, b| a.item.cmp(&b.item));
-            let mut whole: Vec<Outline> = items
-                .list()
-                .iter()
-                .filter(|item| item.kind == sb_core::provider::ItemKind::Subagent)
-                .filter_map(|item| match provider.subagent(&items, &item.key) {
-                    Subagent::Read {
-                        kind,
-                        description,
-                        conversation,
-                    } => Some(Outline {
-                        item: conversation.item.clone(),
-                        kind,
-                        description,
-                        started: conversation
-                            .calls()
-                            .flat_map(|(_, call)| call.subagents.iter().map(|it| it.item().clone()))
-                            .collect(),
-                    }),
-                    Subagent::Unread { .. } => None,
-                })
-                .collect();
+            let mut whole = sb_core::provider::outlines_by_reading(provider, &items);
             whole.sort_by(|a, b| a.item.cmp(&b.item));
             assert!(!whole.is_empty());
             assert_eq!(outlines, whole, "{title}");
@@ -723,7 +753,7 @@ fn the_library_steps_to_the_next_session_of_the_page_and_stars_the_open_one(
     let (library, reader, _) = library(cx);
     open(&library, "Throttle yt-dlp metadata backfill", cx);
     let (at, of) = library.read_with(cx, |library, _| library.open_place().unwrap());
-    assert_eq!(of, 5);
+    assert_eq!(of, 6);
     let step = if at + 1 < of { 1 } else { -1 };
     library.update(cx, |library, cx| library.open_step(step, cx));
     cx.run_until_parked();

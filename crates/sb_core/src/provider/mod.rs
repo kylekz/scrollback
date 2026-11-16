@@ -18,6 +18,7 @@ mod session;
 
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 
 use thiserror::Error;
 use toolbox_store::rusqlite;
@@ -245,32 +246,13 @@ pub trait Provider: Send + Sync {
 
     /**
      * Every subagent of the session whose items are `items`, outlined: what it says it is and
-     * the subagents its calls started, which is what places it among the others. By default
-     * each is read whole with [`Provider::subagent`]; a provider that can find the calls
-     * without reading a conversation outlines them more cheaply.
+     * the subagents its calls started (sorted by key), which is what places it among the
+     * others. By default each is read whole ([`outlines_by_reading`]); a provider that can
+     * find the calls without reading a conversation outlines them more cheaply, and must agree
+     * with that.
      */
     fn outlines(&self, items: &dyn SessionItems) -> Vec<Outline> {
-        items
-            .list()
-            .iter()
-            .filter(|item| item.kind == ItemKind::Subagent)
-            .filter_map(|item| match self.subagent(items, &item.key) {
-                Subagent::Read {
-                    kind,
-                    description,
-                    conversation,
-                } => Some(Outline {
-                    item: conversation.item.clone(),
-                    kind,
-                    description,
-                    started: conversation
-                        .calls()
-                        .flat_map(|(_, call)| call.subagents.iter().map(|it| it.item().clone()))
-                        .collect(),
-                }),
-                Subagent::Unread { .. } => None,
-            })
-            .collect()
+        outlines_by_reading(self, items)
     }
 
     /**
@@ -281,6 +263,39 @@ pub trait Provider: Send + Sync {
      * location too.
      */
     fn classify(&self, key: &str) -> (ItemKind, Option<String>);
+}
+
+/// [`Provider::outlines`] of every subagent of `items`, each read whole with
+/// [`Provider::subagent`].
+pub fn outlines_by_reading<P: Provider + ?Sized>(
+    provider: &P,
+    items: &dyn SessionItems,
+) -> Vec<Outline> {
+    items
+        .list()
+        .iter()
+        .filter(|item| item.kind == ItemKind::Subagent)
+        .filter_map(|item| match provider.subagent(items, &item.key) {
+            Subagent::Read {
+                kind,
+                description,
+                conversation,
+            } => {
+                let mut started: Vec<Arc<str>> = conversation
+                    .calls()
+                    .flat_map(|(_, call)| call.subagents.iter().map(|it| it.item().clone()))
+                    .collect();
+                started.sort_unstable();
+                Some(Outline {
+                    item: conversation.item.clone(),
+                    kind,
+                    description,
+                    started,
+                })
+            }
+            Subagent::Unread { .. } => None,
+        })
+        .collect()
 }
 
 /**

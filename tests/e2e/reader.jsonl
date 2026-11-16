@@ -113,10 +113,10 @@
 {"cmd": "key", "keystroke": "j"}
 {"cmd": "settle", "expect": [{"pointer": "/reader/place", "equals": [4, 5]}, {"pointer": "/reader/state", "equals": "open"}]}
 {"cmd": "screenshot", "name": "hostile-top-1440-dark"}
-// Ctrl C on a reply copies what the transcript holds, not what sanitising made of it.
+// Ctrl C on a reply copies it as it was written and shown: its bidirectional control as the marker it is shown as, never the control.
 {"cmd": "click", "target": "reader/reply/main/6"}
 {"cmd": "key", "keystroke": "secondary-c"}
-{"cmd": "settle", "expect": {"pointer": "/system/last_copied", "equals": "Copied as written: <b>bold</b> at https://example.com/x and \u202etxt.exe"}}
+{"cmd": "settle", "expect": {"pointer": "/system/last_copied", "equals": "Copied as written: <b>bold</b> at https://example.com/x and ⟦U+202E⟧txt.exe"}}
 {"cmd": "scroll", "target": "reader/column", "dy": -900}
 {"cmd": "settle"}
 {"cmd": "screenshot", "name": "hostile-deep-1440-dark"}

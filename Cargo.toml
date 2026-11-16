@@ -93,6 +93,11 @@ log = "0.4"
 # The Markdown parser gpui-base's `TextView` uses: `sb_ui::markdown` sanitises a body at the
 # spans it reports before `TextView` sees it. Already in the tree through gpui-base.
 markdown = "1.0.0"
+# The general category of a character (`sb_ui::hostile`: combining marks). Already in the tree.
+unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
+# A link's real destination, its host as the browser would read it (`sb_ui::markdown`). Already
+# in the tree.
+url = "2.5"
 pretty_assertions = "1.4"
 # Apple systems only: `fsync` without the full flush std's `sync_all` does there
 # (`sb_core::archive`).

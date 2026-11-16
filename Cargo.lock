@@ -6016,6 +6016,8 @@ dependencies = [
  "sb_test_support",
  "serde_json",
  "tempfile",
+ "unicode-properties",
+ "url",
 ]
 
 [[package]]

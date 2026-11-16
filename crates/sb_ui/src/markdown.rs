@@ -51,15 +51,6 @@ impl Sanitized {
     }
 }
 
-/**
- * Text selected in a body as it was shown, with what sanitising added taken out again: the
- * zero-width spaces that keep a tag or an image from being read as one, and the bidirectional
- * controls shown as their code points put back. What is copied is what the transcript holds.
- */
-pub fn shown_to_source(shown: &str) -> String {
-    crate::hostile::unbidi(shown).replace('\u{200B}', "")
-}
-
 /// The size a body is set at (DESIGN §1.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Size {
@@ -241,7 +232,7 @@ fn code_block_header(block: &CodeBlock, header: CodeHeader) -> impl IntoElement 
                 .rounded(px(5.))
                 .cursor_pointer()
                 .hover(move |this| this.text_color(header.hover))
-                .on_click(move |_, _, cx| crate::system::copy_text(shown_to_source(&code), cx))
+                .on_click(move |_, _, cx| crate::system::copy_text(code.to_string(), cx))
                 .child("Copy"),
         )
 }

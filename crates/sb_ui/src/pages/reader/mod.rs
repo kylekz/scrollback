@@ -378,7 +378,7 @@ impl ReaderView {
         let selected = self
             .states
             .values()
-            .map(|(state, _)| crate::markdown::shown_to_source(&state.read(cx).selected_text()))
+            .map(|(state, _)| state.read(cx).selected_text())
             .find(|text| !text.is_empty());
         if let Some(text) = selected {
             crate::system::copy_text(text, cx);
@@ -393,10 +393,12 @@ impl ReaderView {
         };
         let text = match &row.kind {
             RowKind::Call { at, .. } => open.call(at).and_then(|call| match &call.input {
-                ToolInput::Shell { command, .. } => Some(command.clone()),
+                ToolInput::Shell { command, .. } => {
+                    Some(crate::hostile::bidi(command).into_owned())
+                }
                 ToolInput::Read { path, .. }
                 | ToolInput::Edit { path, .. }
-                | ToolInput::Write { path, .. } => Some(path.clone()),
+                | ToolInput::Write { path, .. } => Some(crate::hostile::bidi(path).into_owned()),
                 _ => None,
             }),
             _ => row.block().and_then(|at| message_text(open, at)),
@@ -801,10 +803,15 @@ impl ReaderView {
     }
 }
 
-/// The text of the message at `at`, a prompt or a reply, to copy as it was written.
+/**
+ * The text of the message at `at`, a prompt or a reply, to copy: as it was written, its
+ * bidirectional controls as they were shown (`⟦U+202E⟧`), never the controls themselves.
+ */
 fn message_text(open: &OpenSession, at: &BlockRef) -> Option<String> {
     match &open.block(at)?.content {
-        Content::Prompt { text, .. } | Content::Reply { text } => Some(text.clone()),
+        Content::Prompt { text, .. } | Content::Reply { text } => {
+            Some(crate::hostile::bidi(text).into_owned())
+        }
         _ => None,
     }
 }
@@ -965,6 +972,16 @@ impl Render for ReaderView {
                     .child(
                         div()
                             .id("reader-column")
+                            /* A body's own Copy, with text selected in it, is the reader's
+                            instead, through the system's seam: caught on the way down to the
+                            body, in the column only, so that any text input elsewhere keeps
+                            its own. */
+                            .capture_action(cx.listener(
+                                |this, _: &gpui_base::input::Copy, _, cx| {
+                                    this.copy(cx);
+                                    cx.stop_propagation();
+                                },
+                            ))
                             .relative()
                             .flex_1()
                             .min_h_0()
@@ -1057,16 +1074,6 @@ pub fn bind_keys(
         // What follows the last row the keyboard takes (a body, how the session ended) too.
         this.list.scroll_to_end();
     });
-    /* A body's own Copy, with text selected in it: the reader's instead, so that it copies
-    what the transcript holds and goes through the system's seam. Caught on the way down,
-    before the body's handler would write the clipboard itself. */
-    let element = {
-        let view = view.clone();
-        element.capture_action(move |_: &gpui_base::input::Copy, _, cx| {
-            view.update(cx, |this, cx| this.copy(cx));
-            cx.stop_propagation();
-        })
-    };
     element
         .on_action(|_: &act::SwitchCalls, _, cx| {
             let reader = cx.services().reader.clone();
