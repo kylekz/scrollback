@@ -10,6 +10,7 @@
 //! ([`trash`]), and the derived index of each session ([`session`]), which is read through
 //! [`library`].
 
+mod batch;
 mod folder;
 mod library;
 mod schema;
@@ -34,6 +35,7 @@ use crate::provider::{ItemKind, ScannedItem};
 use crate::search::Log;
 use crate::transport::Probe;
 
+pub use batch::{Before, Undone};
 pub use folder::{Folder, FolderPath, ProjectPath};
 pub use library::{LibraryCounts, PathGroup, Shelf};
 pub(crate) use session::{Derived, Indexed, Reading, fingerprint};
@@ -70,6 +72,9 @@ pub enum CatalogueError {
     /// A folder's name is some text, of at most [`FOLDER_NAME_CHARS`] characters.
     #[error("a folder's name is not empty and not longer than {FOLDER_NAME_CHARS} characters")]
     FolderName,
+    /// Another folder in the same place has the name, whatever its case.
+    #[error("a folder named {0} is there already")]
+    NameTaken(String),
     /// Nothing is archived of a session of this identity.
     #[error("nothing is archived of a session {} of {} at location {}", .0.key, .0.provider, .0.location)]
     NoSession(SessionId),

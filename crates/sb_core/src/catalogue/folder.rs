@@ -61,8 +61,11 @@ impl Catalogue {
         })
     }
 
-    /// Makes a folder in `parent`, or at the top, after the folders already there. Two
-    /// folders may have the same name.
+    /**
+     * Makes a folder in `parent`, or at the top, after the folders already there. Two folders
+     * in one place don't have the same name, whatever its case ([`CatalogueError::NameTaken`]);
+     * in different places they may.
+     */
     pub fn create_folder(&self, name: &str, parent: Option<FolderId>) -> Result<FolderId> {
         let name = named(name)?;
         self.db.write(|tx| create(tx, name, parent))
@@ -87,10 +90,12 @@ impl Catalogue {
         })
     }
 
+    /// Renames a folder; refused as [`Catalogue::create_folder`] refuses a name.
     pub fn rename_folder(&self, folder: FolderId, name: &str) -> Result<()> {
         let name = named(name)?;
         self.db.write(|tx| {
-            parent_of(tx, folder)?;
+            let parent = parent_of(tx, folder)?.map(FolderId);
+            free_name(tx, name, parent, Some(folder))?;
             tx.execute(
                 "UPDATE folder SET name = ?2 WHERE id = ?1",
                 params![folder.0, name],
@@ -194,8 +199,11 @@ impl Catalogue {
      * comes in. A path that names no directory, or does not say where it is from the top
      * (`~/code`, `code/app`), is [`CatalogueError::NoPath`].
      *
-     * A path is attached once for a scope. A second attach, to any folder, is refused with
-     * [`CatalogueError::PathAttached`], which names the folder that has it.
+     * A path is attached once for a scope: a second attach for the same location, or for
+     * any where it is attached for any, to any folder, is refused with
+     * [`CatalogueError::PathAttached`], which names the folder that has it. One folder may
+     * have it for two locations, for the same project on two machines, but not for one
+     * location and for any: those overlap.
      */
     pub fn attach_path(
         &self,
@@ -221,14 +229,15 @@ impl Catalogue {
 
     /**
      * Changes a folder's paths in one change (DESIGN §4.7's Save): takes `detach` off it, then
-     * attaches each of `attach`, a path as typed and the one location it is for, and files by
-     * the paths it ends with. A path that is refused, as [`Catalogue::attach_path`] refuses
-     * one, or one to detach that is not attached, leaves every path as it was.
+     * attaches each of `attach`, each a path as the owner typed it and the one location it is
+     * for, and files by the paths it ends with. A path that is refused, as
+     * [`Catalogue::attach_path`] refuses one, or one to detach that the folder doesn't have,
+     * leaves every path as it was.
      */
     pub fn change_paths(
         &self,
         folder: FolderId,
-        detach: &[AttachedPath],
+        detach: &[(String, Option<LocationId>)],
         attach: &[(String, Option<LocationId>)],
     ) -> Result<()> {
         let attach = attach
@@ -240,13 +249,9 @@ impl Catalogue {
             .collect::<Result<Vec<_>>>()?;
         self.db.write(|tx| {
             parent_of(tx, folder)?;
-            for attached in detach {
-                if attached.folder != folder {
-                    return Err(CatalogueError::NotAttached(
-                        attached.path.as_str().to_string(),
-                    ));
-                }
-                self::detach(tx, attached)?;
+            for (typed, location) in detach {
+                let attached = typed_attached(tx, folder, typed, location.as_ref())?;
+                self::detach(tx, &attached)?;
             }
             for (typed, path, location) in &attach {
                 self::attach(tx, folder, typed, path, *location)?;
@@ -255,22 +260,22 @@ impl Catalogue {
         })
     }
 
-    /// Moves an attached path to the folder `to`, for the same locations and as it was
-    /// typed, and files by it there (DESIGN §4.4: a path chip dropped on another folder).
-    pub fn move_path(&self, attached: &AttachedPath, to: FolderId) -> Result<()> {
+    /**
+     * Moves the path `typed` of `from`, for `location` or for any, to the folder `to`, as it
+     * was typed and for the same locations, and files by it there (DESIGN §4.4: a path chip
+     * dropped on another folder).
+     */
+    pub fn move_path(
+        &self,
+        from: FolderId,
+        (typed, location): (&str, Option<&LocationId>),
+        to: FolderId,
+    ) -> Result<()> {
         self.db.write(|tx| {
             parent_of(tx, to)?;
-            let typed: String = tx
-                .query_row(
-                    "SELECT typed FROM folder_path
-                     WHERE folder_id = ?1 AND path = ?2 AND location_id IS ?3",
-                    params![attached.folder.0, attached.path, attached.location],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .ok_or_else(|| CatalogueError::NotAttached(attached.path.as_str().to_string()))?;
-            detach(tx, attached)?;
-            attach(tx, to, &typed, &attached.path, attached.location.as_ref())?;
+            let attached = typed_attached(tx, from, typed, location)?;
+            detach(tx, &attached)?;
+            attach(tx, to, filing::as_typed(typed), &attached.path, location)?;
             Ok(refile(tx)?)
         })
     }
@@ -409,6 +414,7 @@ fn create(connection: &Connection, name: &str, parent: Option<FolderId>) -> Resu
     if let Some(parent) = parent {
         parent_of(connection, parent)?;
     }
+    free_name(connection, name, parent, None)?;
     let parent = parent.map(|parent| parent.0);
     connection.execute(
         "INSERT INTO folder (parent_id, name, position)
@@ -418,8 +424,11 @@ fn create(connection: &Connection, name: &str, parent: Option<FolderId>) -> Resu
     Ok(FolderId(connection.last_insert_rowid()))
 }
 
-/// Attaches `path`, typed as `typed`, to a folder for `location` or for every location,
-/// without filing by it. Refused when the path is attached already for that scope.
+/**
+ * Attaches `path`, typed as `typed`, to a folder for `location` or for every location, without
+ * filing by it. Refused when the path is attached already for that scope, or to this folder for
+ * a scope that overlaps it ([`Catalogue::attach_path`]).
+ */
 fn attach(
     connection: &Connection,
     folder: FolderId,
@@ -432,8 +441,11 @@ fn attach(
         .query_row(
             "SELECT f.id, f.name, p.typed FROM folder_path p
              JOIN folder f ON f.id = p.folder_id
-             WHERE p.path = ?1 AND p.location_id IS ?2",
-            params![path, location],
+             WHERE p.path = ?1
+               AND (p.location_id IS ?2
+                    OR (p.folder_id = ?3 AND (p.location_id IS NULL OR ?2 IS NULL)))
+             ORDER BY p.location_id IS ?2 DESC",
+            params![path, location, folder.0],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
@@ -452,6 +464,31 @@ fn attach(
     Ok(())
 }
 
+/// The path of `folder` typed as `typed`, for `location` or for any.
+fn typed_attached(
+    connection: &Connection,
+    folder: FolderId,
+    typed: &str,
+    location: Option<&LocationId>,
+) -> Result<AttachedPath> {
+    let typed = filing::as_typed(typed);
+    parent_of(connection, folder)?;
+    let path: NormalPath = connection
+        .query_row(
+            "SELECT path FROM folder_path
+             WHERE folder_id = ?1 AND typed = ?2 AND location_id IS ?3",
+            params![folder.0, typed, location],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| CatalogueError::NotAttached(typed.to_string()))?;
+    Ok(AttachedPath {
+        folder,
+        path,
+        location: location.cloned(),
+    })
+}
+
 /// Takes an attached path off its folder, without filing by what is left.
 fn detach(connection: &Connection, attached: &AttachedPath) -> Result<()> {
     parent_of(connection, attached.folder)?;
@@ -467,6 +504,30 @@ fn detach(connection: &Connection, attached: &AttachedPath) -> Result<()> {
     Ok(())
 }
 
+/// Refuses `name` in `parent` when another folder there than `folder` has it, whatever its
+/// case.
+fn free_name(
+    connection: &Connection,
+    name: &str,
+    parent: Option<FolderId>,
+    folder: Option<FolderId>,
+) -> Result<()> {
+    let taken = connection
+        .prepare("SELECT id, name FROM folder WHERE parent_id IS ?1")?
+        .query_map([parent.map(|parent| parent.0)], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .any(|(id, other)| {
+            Some(FolderId(id)) != folder && other.to_lowercase() == name.to_lowercase()
+        });
+    if taken {
+        return Err(CatalogueError::NameTaken(name.to_string()));
+    }
+    Ok(())
+}
+
 /// A folder's name as it is kept: without the white space around it.
 fn named(name: &str) -> Result<&str> {
     let name = name.trim();
@@ -477,7 +538,7 @@ fn named(name: &str) -> Result<&str> {
 }
 
 /// The folder `folder` is in, `None` at the top. Fails when there is no such folder.
-fn parent_of(connection: &Connection, folder: FolderId) -> Result<Option<i64>> {
+pub(super) fn parent_of(connection: &Connection, folder: FolderId) -> Result<Option<i64>> {
     connection
         .query_row(
             "SELECT parent_id FROM folder WHERE id = ?1",
@@ -515,8 +576,8 @@ pub(super) fn file_by_rule(
     Ok(folder.is_some())
 }
 
-/// Runs the rules over every indexed session that is not filed by hand, each by the project
-/// path its row has.
+/// Runs the rules over every indexed session that is not filed by hand nor in Trash, each by
+/// the project path its row has. A session in Trash is filed when it is restored.
 fn refile(connection: &Connection) -> rusqlite::Result<()> {
     let attached = attached(connection)?;
     let filed: Vec<(SessionId, Option<NormalPath>, Option<i64>)> = connection
@@ -526,7 +587,7 @@ fn refile(connection: &Connection) -> rusqlite::Result<()> {
              LEFT JOIN session_state st
                ON st.location_id = s.location_id AND st.provider = s.provider
               AND st.session = s.session
-             WHERE COALESCE(st.by_hand, 0) = 0",
+             WHERE COALESCE(st.by_hand, 0) = 0 AND st.trashed_at IS NULL",
         )?
         .query_map([], |row| {
             let id = SessionId {
