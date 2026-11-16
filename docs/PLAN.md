@@ -197,9 +197,10 @@ Tables, in outline (the schema is `toolbox_store` migrations, append-only):
 | `folder_path` | folder, normalised path, the path as typed, location (nullable) |
 | `session_state` | session identity → folder, filed-by (rule or hand), starred, trashed-at (phase 6). Keyed by identity, never by the derived row, so it survives a rebuild of the index |
 | `reading_choice` | item → the version the owner chose to read; removed when a newer version of the item starts (§4.2) |
-| `tombstone` | session identity of a session deleted for good, and when |
+| `tombstone` | a session deleted for good: its identity, when it was deleted, its project path and when it ran (so Settings can name it), and the keys of the items it had. Nothing taken from the conversation, not even its title |
+| `removal` | files still to be removed after a delete for good: the item folder, version and offset, with the segment's length and hash |
 | `session` *(derived)* | session identity, main item, title, project path, first and last timestamp, models, branch, entrypoint, counts, tokens, parser version |
-| `session_text` *(derived)* | the FTS5 index (§10) |
+| `search.db` *(derived, a separate file)* | the search spans and their index (§10) |
 | `kv` | settings that belong to the archive |
 
 ### 4.4 Opening, locking, verify
@@ -208,15 +209,17 @@ Tables, in outline (the schema is `toolbox_store` migrations, append-only):
 - `lock` stops a second app from opening the same archive for writing.
 - **An archive folder without its database is not opened as empty.** Opening fails and names the newest backup in `backups/`; a missing `archive.json` means the folder is not an archive.
 - **Pointing the app at a different folder** opens the archive there, or creates one if the folder has none. It moves nothing; moving an archive is moving its folder and then pointing the app at it.
-- **Verify** re-hashes every segment against the catalogue and every version's running hash, and reports mismatches, missing files and files under `files/` that the catalogue doesn't record, which the owner can then have moved to `orphans/`. It repairs nothing by itself: it marks each damaged version (a missing segment, one that doesn't decode, or a hash mismatch; a read error alone marks nothing). The next sync fetches an item whose newest version is damaged whole, as a new version, when the item still exists at its location; **Fetch again from its location** runs that for one item at once. Otherwise the version stays marked and readable as far as it decodes. Reading a version checks each segment against the catalogue as it goes and fails rather than return wrong bytes.
+- **Verify** re-hashes every segment against the catalogue and every version's running hash, and reports mismatches, missing files and files under `files/` that the catalogue doesn't record, which the owner can then have moved to `orphans/`. It repairs nothing in the archive by itself (the one thing it rebuilds is the search index, which is derived): it marks each damaged version (a missing segment, one that doesn't decode, or a hash mismatch; a read error alone marks nothing). The next sync fetches an item whose newest version is damaged whole, as a new version, when the item still exists at its location; **Fetch again from its location** runs that for one item at once. Otherwise the version stays marked and readable as far as it decodes. Reading a version checks each segment against the catalogue as it goes and fails rather than return wrong bytes.
 
 ### 4.5 Deleting
 
 - **Delete** moves a session to Trash: `session_state.trashed-at` is set. Its bytes stay, sync keeps archiving its files, and it disappears from every view except Trash. **Restore** clears the mark and returns the session to its folder; if that folder was deleted meanwhile, the session goes to Unsorted and the filing rules run on it (§8).
-- **Delete for good** (from Trash, after a confirmation that names the session) removes the session's items under `files/`, their catalogue rows and its derived rows, and writes a tombstone in the same transaction as the rows. The files are removed after the commit. Nothing removes unrecorded files by itself (§4.1), so the removal is recorded as pending in the same transaction and finished on the next start if a crash interrupts it.
-- **A tombstoned session's items are skipped by sync** (§5), so deleting isn't undone by the next pass while the session still exists at its location.
+- **Delete for good** (from Trash, after a confirmation that names the session and what it holds) removes exactly what the confirmation showed: the session's items under `files/`, their catalogue rows, its derived rows and its search text, and writes a tombstone in the same transaction as the rows. If the session changed while the confirmation was open, the delete is refused and the owner is shown the new numbers. It is refused while the session's location is syncing. A location is never touched.
+- **Files are removed after the commit,** each only while it still holds the bytes the catalogue recorded (its length and hash), together with any copies of the session's items set aside under `orphans/`. Removals that could not be done (a file another program holds open) stay recorded as pending, are reported to the caller and by verify as waiting, are never set aside, and are finished in the background, by the delete itself or at the next start. Opening the archive never waits for them; the day's catalogue backup does, so no backup holds a removal still to do.
+- **Deleted text is really gone:** the search database deletes securely and its write-ahead log is truncated after a delete. What remains by design is the tombstone (the project path and dates, no title and no text), and catalogue backups made before the delete, which hold the session's title, the start of its first prompt and its project path until they age out. A removal decides by the catalogue: everything in a deleted item's folder goes unless the catalogue records an item there again.
+- **A tombstoned session's items are skipped by sync** (§5), so deleting isn't undone by the next pass while the session still exists at its location: a scanned item is dropped when its key was deleted, or when its session is a deleted one, unless the archive holds that session again. New items that appear later under a deleted session are skipped too. Each pass reports the deleted sessions it met, so the owner can be told that a session they resumed is not being backed up.
 - **Removing a tombstone** (Settings lists them) lets the next sync archive the session again, if its location still has it.
-- Trash is never emptied automatically.
+- Trash is never emptied automatically. A trashed session keeps syncing and being indexed; if a reclassification merges it with another session, the result stays in Trash.
 
 ---
 
@@ -225,7 +228,7 @@ Tables, in outline (the schema is `toolbox_store` migrations, append-only):
 One **pass** syncs one location with one provider. The engine drives it and knows nothing about the agent; the provider does the two steps that touch the location, through the location's transport (D8):
 
 1. **Scan** (provider): every item the agent has at the location: its key, kind, session, length, and a stamp that changes when the item does. For a file the stamp is its size and modification time.
-2. **Plan** (engine): drop the items of tombstoned sessions (§4.5), compare the rest with `item` and decide per item what to fetch (§4.2). Planning touches nothing at the location.
+2. **Plan** (engine): after the items of tombstoned sessions have been dropped from the scan (§4.5), compare the rest with `item` and decide per item what to fetch (§4.2). Planning touches nothing at the location.
 3. **Fetch and prove** (provider), a batch at a time: the planned byte ranges, in one stream, then one request for the source's hash up to the end of each.
 4. **Store** (engine): each proven range becomes one or more segments (§4.1); the batch is made durable and its rows are committed in one transaction. A range whose proof fails is not stored: the item is fetched whole as a new version later in the pass, or **deferred** to the next pass if it is still changing.
 5. **Index** (engine, with the provider's parser): sessions whose items changed are parsed and indexed (§7.5), and filed (§8). Which sessions are stale is decided from the catalogue, so an index that was cancelled or killed is picked up by the next pass or the next start. It runs whenever the store step ended for any reason but a cancel, after the pass's outcome is recorded. One session that fails to index is recorded and doesn't stop the others, and isn't a failure of the sync.
@@ -429,11 +432,16 @@ Nothing else changes: no migration, and no change to the archive, sync, filing, 
 
 ## 10. Search
 
-- **One FTS5 table,** a row per indexed span: session, turn, kind (title, prompt, reply, tool call), text. The tokenizer is chosen in phase 6 against real queries; `trigram` allows substring matches (paths, identifiers) at the cost of index size.
-- **Indexed:** titles, user prompts, assistant text, tool calls' commands and paths. **Not indexed in v1:** tool output and thinking (D10).
+- **The search text lives in its own database,** `search.db` beside the catalogue: a row per indexed span (session, turn and block, kind: title, prompt, reply, command, path; whether it is a subagent's) and an FTS5 index over them. It is derived: never backed up, opened only when something needs it, and made again from the archive when it is missing, damaged or out of date. If it can't be opened (another program holds it), the archive still opens and search says it is unavailable. The catalogue holds none of it, so the catalogue and its daily backups stay small and hold no transcript text.
+- **The index is `trigram`, without positions** (`detail=none`). Measured against `unicode61`: substring matches inside identifiers and paths, and CJK, are the requirement, and only trigrams find them. A term is looked up by its three-character runs and each candidate span is then checked against its text, so results are exact. On a generated corpus of 50,000 sessions the search database is about one and a half times the indexed text; the catalogue beside it stays under 100 MB.
+- **Indexed:** titles, user prompts, assistant text, tool calls' commands and paths, up to 64 KiB of any one span. **Not indexed in v1:** tool output and thinking (D10).
 - **Subagent transcripts are indexed** under their parent session. A match in one opens the parent at the call that started the subagent, expanded.
-- **Filters** (folder, location, agent, model, branch, date) are ordinary columns joined to the match.
-- **A result** carries the session and the turn, so it opens the reader at that turn.
+- **Matching ignores case, and accents on Latin letters,** exactly as the index's tokenizer folds text (Greek and other scripts fold case only). A session matches when every term appears somewhere in it. The matches shown are the spans holding any term, those holding all of them first. Sessions whose title matches come first, then the most recently active.
+- **Short terms.** A query whose terms are all ASCII and shorter than three characters asks for more typing rather than reading everything. A short term in another script (a two-character CJK word) is found by reading the text, which can be cancelled.
+- **Filters** are tokens in the query: `in:` (a page: all, starred, unsorted, trash; else a folder's name), `folder:`, `from:` (a location), `agent:`, `model:`, `branch:`, `after:` and `before:` (a year, month or day, local time). A token that names nothing is returned as such; one with no value yet is ignored. Trashed sessions are found only with `in:trash`.
+- **Indexing is two steps:** session rows first, so a first sync's library appears at once, then the text in batches; how many sessions are not yet searchable is a read.
+- **A result** carries the session, the turn and the block, so it opens the reader there.
+- **Hostile input is text:** at most 16 terms of 256 characters, no query syntax, and every scan checks for cancel.
 
 ---
 
@@ -493,7 +501,7 @@ Phase 5 is late only because Local exercises the whole pipeline on the developme
 - **Index size.** FTS5 with `trigram` over a year of prompts and replies; measured in phase 6 before the tokenizer is fixed (D10).
 - **Deleting for good is the one irreversible act** in the app (§4.5). It needs its own tests: nothing outside the session's files is removed, and a location is never touched.
 - **A writer that hides its changes.** Change detection is by size and modification time (§4.2). A program that rewrites a file in place and puts its time back, or writes through a memory map, stays invisible: the item reads as unchanged and the archive keeps the older content. Every range that is fetched is proven against the source before it is stored, so this can leave the archive behind but not wrong. A periodic deep check that re-hashes unchanged items is listed for later.
-- **`orphans/` is never emptied.** It gains a file only when an unrecorded file is in the way of a different segment, or when the owner sets strays aside after a verify. Rebuilding a catalogue from the per-item `source.json` files is listed for later.
+- **`orphans/` is emptied only by a delete for good,** which removes the set-aside copies of the items it deletes (§4.5). Otherwise it only grows: it gains a file when an unrecorded file is in the way of a different segment, or when the owner sets strays aside after a verify. Rebuilding a catalogue from the per-item `source.json` files is listed for later.
 - **A database that never stops committing** can't be snapshotted by `DbSnapshot` as built (§7.2): the pass reports it and tries again next time. Tolerating growth soundly costs more round trips and waits for the first provider that needs it.
 - **Many small segments.** A session synced while it is active gains a segment per pass. Harmless for correctness; compaction is listed for later.
 - **The same conversation in two sessions.** Resuming or forking can copy earlier history into a new transcript file, so text is archived twice and search shows both. Linking them is listed for later.
