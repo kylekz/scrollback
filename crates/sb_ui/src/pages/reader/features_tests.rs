@@ -213,6 +213,52 @@ fn find_searches_bodies_and_subagents_and_goes_to_each_match(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+fn going_to_a_match_in_a_subagent_only_find_has_read_opens_that_subagent(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    synced(
+        |tree| {
+            reader::backfill(tree);
+        },
+        cx,
+    );
+    open("Throttle yt-dlp metadata backfill", cx);
+    cx.simulate_keystrokes("secondary-f");
+    cx.simulate_input("health");
+    cx.run_until_parked();
+    draw(cx);
+    /* The subagent's matches are found by Find's own read of it; the reader hasn't read it. */
+    let current = |cx: &mut VisualTestContext| snapshot(&shell, cx).find.unwrap().2.unwrap();
+    for _ in 0..100 {
+        if current(cx).starts_with("agent-") {
+            break;
+        }
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        draw(cx);
+    }
+    let current = current(cx);
+    /* Its row name is the subagent's file name. */
+    let (name, _) = current.split_once('/').expect("a match in a subagent");
+    let of = |item: &str| item.ends_with(&format!("/{name}.jsonl"));
+    /* Going there reads the subagent and opens its panel, so the match's block is drawn. */
+    cx.update(|_, cx| {
+        let reader = cx.services().reader.read(cx);
+        let open = reader.open_session().expect("a session is open");
+        assert!(
+            open.subagents_read().any(|(item, _)| of(item)),
+            "{name} is read"
+        );
+        let laid = rows(open, reader.full_calls(), None);
+        assert!(
+            laid.iter()
+                .filter_map(|row| row.block())
+                .any(|at| of(&at.conversation)),
+            "{name}'s rows are laid out"
+        );
+    });
+}
+
+#[gpui::test]
 fn the_reader_takes_the_keys_back_from_find_only_once_it_is_closed(cx: &mut TestAppContext) {
     let (shell, cx) = open_shell(cx);
     synced(
@@ -362,6 +408,60 @@ fn an_older_version_is_read_for_a_look_and_made_the_reading_copy(cx: &mut TestAp
     });
     assert_eq!(reading, v2);
     assert!(!session("Throttle yt-dlp metadata backfill", cx).held_back);
+}
+
+#[gpui::test]
+fn another_version_read_draws_its_own_text(cx: &mut TestAppContext) {
+    let (shell, cx) = open_shell(cx);
+    let mut file = None;
+    synced(
+        |tree| {
+            let key = reader::backfill(tree);
+            file = Some(tree.path(&format!("projects/{key}.jsonl")));
+        },
+        cx,
+    );
+    /* The first prompt said otherwise, as long: a new version, the reading copy. */
+    let file = file.unwrap();
+    let whole = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(
+        &file,
+        whole.replacen("hammers YouTube", "batters YouTube", 1),
+    )
+    .unwrap();
+    let sync = cx.update(|_, cx| cx.services().sync.clone());
+    sync.update(cx, |sync, cx| sync.sync_all(cx));
+    cx.run_until_parked();
+    open("Throttle yt-dlp metadata backfill", cx);
+    let view = cx.update(|_, cx| shell.read(cx).reader_view(cx));
+    /* The first prompt's text as its Markdown state draws it. */
+    let drawn = |cx: &mut VisualTestContext| -> String {
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            let (state, _) = view
+                .states
+                .iter()
+                .find(|(piece, _)| piece.at.block.0 == 0 && piece.piece == 0)
+                .map(|(_, state)| state)
+                .expect("the first prompt is drawn");
+            state.read(cx).rendered_text().as_str().to_string()
+        })
+    };
+    assert!(drawn(cx).contains("batters YouTube"), "{}", drawn(cx));
+    let (key, first) = cx.update(|_, cx| {
+        let reader = cx.services().reader.read(cx);
+        let open = reader.open_session().unwrap();
+        (
+            open.main_key().cloned().unwrap(),
+            open.history().unwrap().versions[0].0.id,
+        )
+    });
+    let service = cx.update(|_, cx| cx.services().reader.clone());
+    service.update(cx, |reader, cx| reader.view_version(Some((key, first)), cx));
+    cx.run_until_parked();
+    draw(cx);
+    assert_eq!(snapshot(&shell, cx).viewing, Some(1));
+    assert!(drawn(cx).contains("hammers YouTube"), "{}", drawn(cx));
 }
 
 #[gpui::test]

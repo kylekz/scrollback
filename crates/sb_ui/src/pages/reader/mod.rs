@@ -372,6 +372,12 @@ impl ReaderView {
             self.list.reset(self.rows.len());
             self.focus_first();
         } else {
+            /* Parsed again (another version read): a block at the same place may say
+            something else now, so what was made from its text goes. */
+            if reopened {
+                self.states.clear();
+                self.highlights.clear();
+            }
             self.replace(0..self.rows.len(), rows);
         }
         if reopened || waited {

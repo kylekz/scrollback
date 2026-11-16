@@ -537,6 +537,16 @@ impl OpenSession {
         self.gone.as_ref()
     }
 
+    /// The subagent `item`'s conversation as Find read it for itself, if it has.
+    pub fn searched(&self, item: &str) -> Option<Arc<Conversation>> {
+        self.found
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(item)
+            .cloned()
+            .flatten()
+    }
+
     /// How many subagents Find has read for itself.
     #[cfg(test)]
     pub fn found_count(&self) -> usize {

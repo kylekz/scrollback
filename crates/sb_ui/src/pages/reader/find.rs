@@ -945,7 +945,11 @@ fn inside(open: &OpenSession, at: &BlockRef) -> Option<ReadAt> {
             }
         }
     };
-    let conversation = open.conversation(&at.conversation)?;
+    /* The subagent may be one only Find has read so far: the reader reads it on the way down. */
+    let searched = open.searched(&at.conversation);
+    let conversation = open
+        .conversation(&at.conversation)
+        .or(searched.as_deref())?;
     let turn = conversation
         .turns()
         .iter()
