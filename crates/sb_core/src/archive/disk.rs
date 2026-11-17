@@ -33,9 +33,39 @@ pub(super) fn push_dir(dir: &Path) -> io::Result<()> {
     push(&File::open(dir)?)
 }
 
-/// Windows cannot flush a directory; [`place`] makes its move durable itself.
+/// On Windows a move into a folder is written through already ([`place`]); where that is
+/// not enough, [`flush_dir`] flushes the folder too.
 #[cfg(not(unix))]
 pub(super) fn push_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// [`push_dir`], then [`settle`]: the folder's entries durable now.
+#[cfg(unix)]
+pub(super) fn flush_dir(dir: &Path) -> io::Result<()> {
+    push_dir(dir).and_then(|()| settle(dir))
+}
+
+/**
+ * Flushes the folder `dir`'s entries, through a handle opened to write it with
+ * `FILE_FLAG_BACKUP_SEMANTICS`, which is how Windows opens a folder: what was moved into it or
+ * out of it is then on disk. Some volumes (FAT drives, shares) and some permissions refuse a
+ * folder's flush; the moves themselves were written through, so that is said in the log only.
+ */
+#[cfg(windows)]
+pub(super) fn flush_dir(dir: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    let flushed = File::options()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .and_then(|folder| folder.sync_all());
+    if let Err(error) = flushed {
+        log::info!("{} couldn't be flushed: {error}", dir.display());
+    }
     Ok(())
 }
 
@@ -136,33 +166,55 @@ pub(super) fn place(file: TempPath, to: &Path) -> Result<(), (io::Error, TempPat
     move_through(file, to, 0)
 }
 
-/// Moves the written, pushed `file` over `to`, and makes the move durable.
+/// Moves the written, pushed `file` over `to`, handing it back with the error when it isn't
+/// moved.
 #[cfg(not(windows))]
-fn replace(file: TempPath, to: &Path) -> io::Result<()> {
-    file.persist(to).map_err(|error| error.error)?;
-    let dir = to.parent().unwrap_or(Path::new("."));
-    push_dir(dir).and_then(|()| settle(dir))
+fn replace(file: TempPath, to: &Path) -> Result<(), (io::Error, TempPath)> {
+    file.persist(to).map_err(|error| (error.error, error.path))
 }
 
-/// Moves the written, flushed `file` over `to`, returning once the move is on disk
-/// ([`place`]).
+/// Moves the written, flushed `file` over `to`, written through ([`place`]), handing it back
+/// with the error when it isn't moved.
 #[cfg(windows)]
-fn replace(file: TempPath, to: &Path) -> io::Result<()> {
+fn replace(file: TempPath, to: &Path) -> Result<(), (io::Error, TempPath)> {
     use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
 
-    move_through(file, to, MOVEFILE_REPLACE_EXISTING).map_err(|(error, _)| error)
+    move_through(file, to, MOVEFILE_REPLACE_EXISTING)
 }
 
 /**
  * Writes `bytes` to `path` through a file beside it that is moved over it, so a reader finds
- * the old bytes or the new, never part of them, and returns once the new ones and the move are
- * on disk: a power cut after it never brings the old file back. The app's settings are written
- * so, since which archive they name decides which folder a start opens (PLAN §4.4).
+ * the old bytes or the new, never part of them, then flushes the new file and its folder, so a
+ * power cut after it doesn't bring the old file back. The move is tried again for a moment
+ * while another program holds either file ([`retrying`]). The app's settings are written so,
+ * since which archive they name decides which folder a start opens (PLAN §4.4).
+ *
+ * `Ok` once the new file is in place: every reader finds it from then on. A flush that fails
+ * after the move can't take the move back, so it is said in the log, not as a failure, and the
+ * caller acts on the file as written.
  */
 pub fn write_durably(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
-    replace(new_file(dir, bytes)?, path)
+    let (mut file, mut tried) = (new_file(dir, bytes)?, 1);
+    loop {
+        match replace(file, path) {
+            Ok(()) => break,
+            Err((error, unplaced)) if is_held(&error) && tried < TRIES => {
+                tried += 1;
+                file = unplaced;
+                std::thread::sleep(APART);
+            }
+            Err((error, _)) => return Err(error),
+        }
+    }
+    if let Err(error) = push_at(path).and_then(|()| flush_dir(dir)) {
+        log::warn!(
+            "{} is in place, but couldn't be flushed: {error}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// `MoveFileExW` of `file` to `to` with `MOVEFILE_WRITE_THROUGH` and `flags` ([`place`]).
@@ -251,6 +303,54 @@ pub(super) fn is_held(error: &io::Error) -> bool {
             .and_then(|code| u32::try_from(code).ok()),
         Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
     )
+}
+
+/**
+ * Whether the folder `dir` is on a network file system: SMB, NFS, WebDAV or AFP, by the name
+ * `statfs` gives its file system.
+ */
+#[cfg(target_vendor = "apple")]
+pub(super) fn is_remote(dir: &Path) -> io::Result<bool> {
+    let stats = rustix::fs::statfs(dir)?;
+    let name: Vec<u8> = stats
+        .f_fstypename
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .map(|&byte| byte.cast_unsigned())
+        .collect();
+    Ok(matches!(
+        name.as_slice(),
+        b"smbfs" | b"nfs" | b"webdav" | b"afpfs" | b"cifs"
+    ))
+}
+
+/// Whether the folder `dir` is on a network drive: a share (`\\server\share`), or a drive
+/// letter mapped to one, as `GetDriveTypeW` says.
+#[cfg(windows)]
+pub(super) fn is_remote(dir: &Path) -> io::Result<bool> {
+    use std::path::{Component, Prefix};
+
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+
+    let Some(Component::Prefix(prefix)) = dir.components().next() else {
+        return Ok(false);
+    };
+    match prefix.kind() {
+        Prefix::UNC(..) | Prefix::VerbatimUNC(..) => Ok(true),
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+            let root = [u16::from(letter), u16::from(b':'), u16::from(b'\\'), 0];
+            // SAFETY: `root` is a NUL-terminated UTF-16 string that outlives the call.
+            Ok(unsafe { GetDriveTypeW(root.as_ptr()) } == DRIVE_REMOTE)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Elsewhere network file systems aren't told apart: scrollback ships for Windows and macOS.
+#[cfg(not(any(target_vendor = "apple", windows)))]
+pub(super) fn is_remote(_dir: &Path) -> io::Result<bool> {
+    Ok(false)
 }
 
 /// Elsewhere a program holding a file open keeps no other from it.

@@ -16,6 +16,10 @@ pub fn init(cx: &mut App) {
     }
     // Quitting asks first while the paths editor has changes to save (`crate::shell`).
     cx.on_action(|_: &app::Quit, cx| {
+        let settings = cx.services().settings.clone();
+        if settings.update(cx, |settings, cx| settings.quit_after_finish(cx)) {
+            return;
+        }
         let library = cx.services().library.clone();
         if library.read(cx).held().is_some() {
             library.update(cx, |library, cx| library.ask_before(Leave::Quit, cx));

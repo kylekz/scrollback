@@ -217,6 +217,11 @@ impl UnavailablePage {
         let asking = self.asking.clone()?;
         let c = &theme.colors;
         let room = overlay::room(window.viewport_size(), theme);
+        let warning = match &asking {
+            Asking::Different(folder) | Asking::Open(folder) | Asking::Make(folder) => {
+                super::settings::synced_warning(folder, theme)
+            }
+        };
         let (title, what, yes) = match &asking {
             Asking::Different(folder) => (
                 "That folder holds a different archive. Open it instead?",
@@ -267,7 +272,8 @@ impl UnavailablePage {
                             .text_color(c.fg2)
                             .text_spec(&theme.text.body)
                             .child(what),
-                    ),
+                    )
+                    .children(warning),
             )
             .child(
                 div()

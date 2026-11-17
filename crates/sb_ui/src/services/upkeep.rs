@@ -43,7 +43,7 @@ use sb_core::catalogue::{
 };
 use sb_core::location::{Location, LocationId};
 
-use super::settings::SettingsService;
+use super::settings::{SettingsService, WAIT_FOR_THE_MOVE};
 use super::{ArchiveService, SyncEvent, SyncService};
 
 /// How often a running verify's progress is read.
@@ -684,6 +684,11 @@ impl UpkeepService {
         change: impl FnOnce(&Archive, &Deleted) -> Result<Standing, ArchiveError> + Send + 'static,
     ) {
         if self.closed {
+            return;
+        }
+        if self.settings.read(cx).is_switching() {
+            self.failure = Some(WAIT_FOR_THE_MOVE.to_string());
+            cx.notify();
             return;
         }
         let Some(archive) = self.archive.read(cx).archive().cloned() else {

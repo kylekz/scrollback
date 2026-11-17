@@ -15,7 +15,7 @@
 //! ([`Ended::CutShort`]).
 
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 #[cfg(any(test, feature = "automation"))]
 use std::sync::{Condvar, MutexGuard};
@@ -25,10 +25,10 @@ use gpui::{AppContext as _, Context, Task};
 use sb_core::CancelToken;
 use sb_core::archive::{
     Archive, ArchiveError, Cleared, Move, MoveError, MovePlan, MoveProgress, MoveStage, Refusal,
-    clear_move, resolved,
+    clear_move, forget_marker, resolved,
 };
 
-use super::{Moved, Moving, SettingsService, write_newer};
+use super::{AppSettings, Moved, Moving, SettingsService, write_newer};
 use crate::format;
 #[cfg(any(test, feature = "automation"))]
 use crate::services::sync::Held;
@@ -115,6 +115,7 @@ impl Ended {
                 "what had been copied was left in {}; delete it yourself.",
                 to.display()
             ),
+            Cleared::Nothing => "nothing had been copied yet.".to_string(),
         };
         match self {
             Self::Stopped {
@@ -248,6 +249,24 @@ impl SettingsService {
         }
     }
 
+    /**
+     * Whether quitting waits, and if so has the app quit once the move's finish is over: the
+     * owner's changes held meanwhile are written then, to the archive the app comes back over,
+     * and the finish, a short one, is never cut short by a quit (PLAN §4.4).
+     */
+    pub fn quit_after_finish(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.holding {
+            self.quit_after = true;
+            cx.notify();
+        }
+        self.holding
+    }
+
+    /// Whether the app quits once the move's finish is over.
+    pub fn quits_after_finish(&self) -> bool {
+        self.quit_after
+    }
+
     /// Stops the move at its next file, unless the settings are being pointed at the copy.
     pub fn stop_move(&mut self) {
         if let Some(MoveState::Running(running)) = &self.move_state
@@ -276,6 +295,7 @@ impl SettingsService {
             id: plan.id.clone(),
             from: from.clone(),
             to: plan.target.clone(),
+            made: plan.made,
             started,
         });
         self.generation += 1;
@@ -295,11 +315,11 @@ impl SettingsService {
             async move {
                 /* Recorded before anything is made there, so a start after a crash knows. */
                 if let Err(error) = write_newer(&on_disk, &path, generation, &text) {
-                    return Copied::Ended(MoveError::Commit(error), Cleared::Removed);
+                    return Copied::Ended(MoveError::Commit(error), Cleared::Nothing);
                 }
                 let mut moving = match archive.start_move(&plan) {
                     Ok(moving) => moving,
-                    Err(error) => return Copied::Ended(error, Cleared::Removed),
+                    Err(error) => return Copied::Ended(error, Cleared::Nothing),
                 };
                 let copied = moving.copy(&archive, &cancel, &mut |progress| {
                     *reported.lock().unwrap_or_else(PoisonError::into_inner) = *progress;
@@ -403,6 +423,18 @@ impl SettingsService {
             );
             match finished {
                 Ok(moved) => (Arc::new(moved), Ok(())),
+                /* The settings file names the copy all the same (a write that failed once
+                its file was in place): the copy is the archive, and is never removed. */
+                Err(error) if names(&path, &to) => {
+                    log::warn!("the settings name {} after all: {error}", to.display());
+                    match Archive::open(&to) {
+                        Ok(moved) => {
+                            forget_marker(&to);
+                            (Arc::new(moved), Ok(()))
+                        }
+                        Err(error) => (archive, Err((error.into(), Cleared::Left))),
+                    }
+                }
                 Err(error) => {
                     let cleared = moving.abandon();
                     (archive, Err((error, cleared)))
@@ -413,6 +445,11 @@ impl SettingsService {
             let switched = switching.await;
             this.update(cx, |this, cx| {
                 this.holding = false;
+                if std::mem::take(&mut this.quit_after) {
+                    /* The services are over the archive the settings name, with the owner's
+                    held changes written to it at quit as any are. */
+                    cx.defer(|cx| cx.quit());
+                }
                 match switched {
                     Ok(()) => {
                         this.written = this.written.max(generation);
@@ -465,14 +502,18 @@ impl SettingsService {
         if self.unreadable.is_some() {
             return;
         }
-        let Some(moving) = self.settings.moving.clone() else {
-            return;
-        };
         let in_use = self
             .settings
             .archive
             .clone()
             .unwrap_or_else(|| self.default_archive());
+        let Some(moving) = self.settings.moving.clone() else {
+            /* A move whose last steps a crash cut short, once the settings named its folder,
+            left its marker there. */
+            cx.background_spawn(async move { forget_marker(&in_use) })
+                .detach();
+            return;
+        };
         /* Never so: the write that names the copy's folder takes the record out. */
         if resolved(&moving.to) == resolved(&in_use) {
             log::warn!("a move into the archive in use was still recorded; forgetting it");
@@ -483,7 +524,7 @@ impl SettingsService {
         self.move_state = Some(MoveState::Clearing(moving.clone()));
         let cleared = cx.background_spawn({
             let moving = moving.clone();
-            async move { clear_move(&moving.to, &moving.id) }
+            async move { clear_move(&moving.to, &moving.id, moving.made) }
         });
         cx.spawn(async move |this, cx| {
             let cleared = cleared.await;
@@ -526,6 +567,19 @@ impl SettingsService {
     }
 }
 
+/// Whether the settings file at `path` names `folder` as the archive's.
+fn names(path: &Path, folder: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| AppSettings::parse(&text).ok())
+        .is_some_and(|(settings, _)| {
+            let named = settings
+                .archive
+                .unwrap_or_else(|| path.with_file_name(super::ARCHIVE_FOLDER));
+            resolved(&named) == resolved(folder)
+        })
+}
+
 /// Why the archive can't be moved, in the owner's words: never the system's, which stay in the
 /// log.
 fn why_not(error: &MoveError) -> String {
@@ -547,6 +601,7 @@ fn why_not(error: &MoveError) -> String {
                 "That folder isn't empty. Choose an empty folder, or make a new one.".to_string()
             }
             Refusal::NotAFolder => "That's a file, not a folder.".to_string(),
+            Refusal::OnNetwork => ON_NETWORK.to_string(),
             Refusal::Unreadable(_) => "scrollback can't read that folder.".to_string(),
             Refusal::Unwritable(_) => "scrollback can't write to that folder.".to_string(),
             Refusal::NoRoom {
@@ -562,8 +617,8 @@ fn why_not(error: &MoveError) -> String {
             ),
         },
         MoveError::Held(path) => format!(
-            "{} is held open by another program, an antivirus scan perhaps. Try again in a \
-             moment.",
+            "{} can't be read or written: its permissions don't let scrollback in, or another \
+             program holds it (an antivirus scan, perhaps); try again in a moment",
             path.display()
         ),
         MoveError::Io { source, path, .. } if source.kind() == io::ErrorKind::StorageFull => {
@@ -585,17 +640,48 @@ fn why_not(error: &MoveError) -> String {
     }
 }
 
-/**
- * The volume `path` is on, as the owner knows it: its drive (`D:\`) on Windows, else the
- * folder itself, whose volume is less plain to name.
- */
+/// Why a change to the archive is refused while it is being moved (DESIGN §4.13): it would be
+/// written to the archive the app leaves.
+pub const WAIT_FOR_THE_MOVE: &str = "Wait for the move to finish.";
+
+/// Why no archive goes on a network drive, in the owner's words (PLAN §4.4).
+pub const ON_NETWORK: &str = "That folder is on a network drive, where the archive's catalogue \
+                              can't be kept safely. Choose a folder on this computer, or on a \
+                              drive plugged into it.";
+
+/// The volume `path` is on, as the owner knows it: its drive (`D:\`) on Windows.
+#[cfg(windows)]
 fn volume_name(path: &Path) -> String {
+    use std::path::Component;
+
     match path.components().next() {
         Some(Component::Prefix(prefix)) => {
             format!(r"{}\", prefix.as_os_str().to_string_lossy())
         }
         _ => path.display().to_string(),
     }
+}
+
+/// The volume `path` is on, as the owner knows it: where it is mounted (`/`, or
+/// `/Volumes/Backup`), the highest folder of `path` on the same device as the nearest of them
+/// there is.
+#[cfg(unix)]
+fn volume_name(path: &Path) -> String {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let device = |folder: &Path| std::fs::metadata(folder).ok().map(|it| it.dev());
+    let Some((there, on)) = path
+        .ancestors()
+        .find_map(|folder| Some((folder, device(folder)?)))
+    else {
+        return path.display().to_string();
+    };
+    let mount = there
+        .ancestors()
+        .take_while(|folder| device(folder) == Some(on))
+        .last()
+        .unwrap_or(there);
+    mount.display().to_string()
 }
 
 #[cfg(any(test, feature = "automation"))]

@@ -153,6 +153,54 @@ fn plain(path: PathBuf) -> PathBuf {
     path
 }
 
+/**
+ * Whether the folder `dir`, or the nearest one there is of those it is in, is on a network
+ * file system (SMB, NFS, WebDAV, AFP): an archive is never put there (PLAN §4.4), as SQLite's
+ * write-ahead log needs memory shared on one machine. One whose file system can't be told is
+ * taken as local, and said in the log.
+ */
+pub fn on_network(dir: &Path) -> bool {
+    let Some(there) = dir.ancestors().find(|folder| folder.is_dir()) else {
+        return false;
+    };
+    super::disk::is_remote(there).unwrap_or_else(|error| {
+        log::warn!(
+            "{}'s file system couldn't be told: {error}",
+            there.display()
+        );
+        false
+    })
+}
+
+/**
+ * The service that keeps `path` in step with the cloud, when one does, from the names its
+ * folders are given (OneDrive's, Dropbox's, iCloud Drive's and Google Drive's own and their
+ * defaults): an archive there is allowed, with a warning, as it changes often and its copies
+ * there can conflict (PLAN §4.4).
+ */
+pub fn synced_by(path: &Path) -> Option<&'static str> {
+    path.iter().find_map(|name| {
+        let name = name.to_string_lossy().to_lowercase();
+        if name == "onedrive" || name.starts_with("onedrive -") || name.starts_with("onedrive-") {
+            Some("OneDrive")
+        } else if name == "dropbox" || name.starts_with("dropbox (") || name.starts_with("dropbox-")
+        {
+            Some("Dropbox")
+        } else if matches!(
+            name.as_str(),
+            "icloud drive" | "iclouddrive" | "mobile documents"
+        ) {
+            Some("iCloud Drive")
+        } else if matches!(name.as_str(), "google drive" | "my drive")
+            || name.starts_with("googledrive-")
+        {
+            Some("Google Drive")
+        } else {
+            None
+        }
+    })
+}
+
 /// The archive `dir`, absolute, is inside, if it is inside one: the nearest folder above it
 /// that holds an `archive.json`, a link into an archive seen through.
 pub(super) fn archive_around(dir: &Path) -> Option<PathBuf> {
@@ -201,6 +249,9 @@ pub fn id_in(dir: &Path) -> Result<Option<String>> {
  * and nothing is made in either.
  */
 pub fn open_or_make(dir: &Path) -> Result<Archive> {
+    if on_network(dir) {
+        return Err(ArchiveError::OnNetwork(dir.to_path_buf()));
+    }
     match what_is_in(dir)? {
         Holds::Archive => Archive::open(dir),
         Holds::Nothing => Archive::create(dir),

@@ -50,10 +50,13 @@ pub use items::{ArchivedSession, Pinned};
 pub(crate) use layout::item_folder;
 pub use relocate::{
     Cleared, MARKER, Move, MoveError, MovePlan, MoveProgress, MoveStage, Refusal, clear_move,
+    forget_marker,
 };
 pub use segment::{Problem, SEGMENT_BYTES, SegmentCache, VersionReader};
 pub(crate) use segment::{RangeWriter, Sealed};
-pub use stats::{ArchiveStats, Holds, id_in, open_or_make, resolved, what_is_in};
+pub use stats::{
+    ArchiveStats, Holds, id_in, on_network, open_or_make, resolved, synced_by, what_is_in,
+};
 pub(crate) use verify::LAST_VERIFY_VERSION;
 pub use verify::{
     Damage, DamageKind, DamageRecord, KEPT_DAMAGES, LastVerify, Unread, VerifyProgress,
@@ -146,6 +149,10 @@ pub enum ArchiveError {
     /// would empty the inner's `tmp/`, and a sync of either could reach the other's files.
     #[error("{} is inside the archive in {}, or holds one", .dir.display(), .other.display())]
     Nested { dir: PathBuf, other: PathBuf },
+    /// The folder is on a network file system, which SQLite's write-ahead log isn't safe on
+    /// (PLAN §4.4): no archive is opened or made there by choosing it.
+    #[error("{} is on a network drive", .0.display())]
+    OnNetwork(PathBuf),
     #[error(transparent)]
     Catalogue(#[from] CatalogueError),
     #[error(transparent)]

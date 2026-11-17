@@ -23,6 +23,8 @@
 mod appearance;
 mod archive;
 mod moving;
+
+pub(crate) use moving::synced_warning;
 mod shortcuts;
 mod sync;
 #[cfg(test)]

@@ -67,7 +67,7 @@ impl SyncService {
 
     /// Fetches the item `damage` is of again from its location (the module docs).
     pub fn refetch(&mut self, damage: &DamageRecord, cx: &mut Context<Self>) {
-        if self.closed || self.paused {
+        if self.closed || self.paused || self.waits(cx) {
             return;
         }
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
@@ -161,7 +161,7 @@ impl SyncService {
     /// Fetches each of `damages` again, one after another (the module docs), unless Fetch all
     /// again runs already.
     pub fn refetch_all(&mut self, damages: Vec<DamageRecord>, cx: &mut Context<Self>) {
-        if self.closed || self.fetch_all.is_some() {
+        if self.closed || self.fetch_all.is_some() || self.waits(cx) {
             return;
         }
         for damage in &damages {

@@ -186,7 +186,8 @@ fn a_move_copies_every_file_and_the_old_folder_stays_as_it_was() {
 
 /// A crash at any step leaves the old archive in use and as it was, with what the move made
 /// removed by the next start; or, once the settings name the new folder, the new archive
-/// whole and in use.
+/// whole and in use, its marker taken away by the next start. No whole copy is ever left that
+/// nothing uses.
 #[test]
 fn a_crash_at_any_step_leaves_one_archive_whole_and_in_use() {
     let steps = [
@@ -197,7 +198,6 @@ fn a_crash_at_any_step_leaves_one_archive_whole_and_in_use() {
         Some(Step::Caught),
         Some(Step::Placed),
         Some(Step::Checked),
-        Some(Step::Unmarked),
         Some(Step::Committed),
     ];
     for step in steps {
@@ -206,11 +206,11 @@ fn a_crash_at_any_step_leaves_one_archive_whole_and_in_use() {
         let before = tree(&from);
         let target = dir.path().join("moved");
         /* The app's settings: the archive in use, and the move, recorded before it starts. */
-        let settings = RefCell::new((from.clone(), None::<(PathBuf, String)>));
+        let settings = RefCell::new((from.clone(), None::<(PathBuf, String, bool)>));
         let archive = opened(&from);
         let totals = archive.catalogue().totals().unwrap();
         let plan = archive.plan_move(&target).unwrap();
-        settings.borrow_mut().1 = Some((plan.target.clone(), plan.id.clone()));
+        settings.borrow_mut().1 = Some((plan.target.clone(), plan.id.clone(), plan.made));
         let mut moving = archive.start_move(&plan).unwrap();
         /* With no step, it is cut short as soon as it has started. */
         if let Some(step) = step {
@@ -235,21 +235,17 @@ fn a_crash_at_any_step_leaves_one_archive_whole_and_in_use() {
         /* What the next start does with what the settings say. */
         let (in_use, pending) = settings.into_inner();
         match pending {
-            Some((target, id)) => {
+            Some((target, id, made)) => {
                 assert_eq!(in_use, from, "{step:?}");
-                let cleared = clear_move(&target, &id);
-                if step == Some(Step::Unmarked) {
-                    /* A whole copy, no longer marked as the move's: left, and said. */
-                    assert_eq!(cleared, Cleared::Left);
-                    assert!(target.join(layout::MANIFEST).is_file());
-                } else {
-                    assert_eq!(cleared, Cleared::Removed, "{step:?}");
-                    assert!(!target.exists(), "{step:?}: {:?}", tree(&target).keys());
-                }
+                assert_eq!(clear_move(&target, &id, made), Cleared::Removed, "{step:?}");
+                assert!(!target.exists(), "{step:?}: {:?}", tree(&target).keys());
             }
             None => {
                 assert_eq!(step, Some(Step::Committed));
                 assert_eq!(in_use, target);
+                assert!(target.join(MARKER).is_file());
+                forget_marker(&target);
+                assert!(!target.join(MARKER).exists());
                 assert_whole(&target, totals);
             }
         }
@@ -512,13 +508,13 @@ fn only_a_folder_marked_as_the_move_is_cleared() {
     fs::write(target.join("added by hand.txt"), "mine").unwrap();
     let copied = tree(&target);
 
-    assert_eq!(clear_move(&target, "another move"), Cleared::Left);
+    assert_eq!(clear_move(&target, "another move", false), Cleared::Left);
     assert_eq!(
-        clear_move(&dir.path().join("nowhere"), &plan.id),
-        Cleared::Left
+        clear_move(&dir.path().join("nowhere"), &plan.id, true),
+        Cleared::Nothing
     );
     let held = lock(&target).unwrap();
-    assert_eq!(clear_move(&target, &plan.id), Cleared::Left);
+    assert_eq!(clear_move(&target, &plan.id, true), Cleared::Left);
     drop(held);
     assert_eq!(tree(&target), copied);
 
@@ -528,7 +524,7 @@ fn only_a_folder_marked_as_the_move_is_cleared() {
 
         let stuck = target.join(layout::ORPHANS).join(layout::FILES);
         fs::set_permissions(&stuck, fs::Permissions::from_mode(0o500)).unwrap();
-        let cleared = clear_move(&target, &plan.id);
+        let cleared = clear_move(&target, &plan.id, true);
         fs::set_permissions(&stuck, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
             matches!(&cleared, Cleared::Partly(left) if left.iter().any(|left| left.starts_with(layout::ORPHANS))),
@@ -536,7 +532,7 @@ fn only_a_folder_marked_as_the_move_is_cleared() {
         );
     }
     #[cfg(not(unix))]
-    assert_eq!(clear_move(&target, &plan.id), Cleared::Removed);
+    assert_eq!(clear_move(&target, &plan.id, true), Cleared::Removed);
     assert!(
         target.join("added by hand.txt").is_file(),
         "what isn't the move's stays"
@@ -547,6 +543,178 @@ fn only_a_folder_marked_as_the_move_is_cleared() {
     let again = dir.path().join("again");
     let plan = archive.plan_move(&again).unwrap();
     drop(archive.start_move(&plan).unwrap());
-    assert_eq!(clear_move(&again, &plan.id), Cleared::Removed);
+    assert_eq!(clear_move(&again, &plan.id, true), Cleared::Removed);
     assert!(!again.exists());
+}
+
+/// The files an operating system leaves in a folder are each folder's own: one in the archive
+/// and one in the folder moved to don't meet, the move keeps the folder's own, and a stopped
+/// move leaves it there.
+#[test]
+fn system_files_on_both_sides_stay_each_sides_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let (from, _) = archive_in(dir.path());
+    let names = [".DS_Store", "Thumbs.db", "desktop.ini", "._archive.json"];
+    for name in names {
+        fs::write(from.join(name), "the archive's").unwrap();
+    }
+    let archive = opened(&from);
+    let target = dir.path().join("chosen");
+    fs::create_dir(&target).unwrap();
+    for name in names {
+        fs::write(target.join(name), "the folder's").unwrap();
+    }
+    let mut moving = moved_into(&archive, &target);
+    moving.copy(&archive, &CancelToken::new(), &mut go).unwrap();
+    assert_eq!(moving.abandon(), Cleared::Removed);
+    for name in names {
+        assert_eq!(
+            fs::read_to_string(target.join(name)).unwrap(),
+            "the folder's"
+        );
+    }
+    let totals = archive.catalogue().totals().unwrap();
+    drop(moved(&archive, &target));
+    drop(archive);
+    assert_whole(&target, totals);
+    for name in names {
+        assert_eq!(
+            fs::read_to_string(target.join(name)).unwrap(),
+            "the folder's"
+        );
+        assert_eq!(
+            fs::read_to_string(from.join(name)).unwrap(),
+            "the archive's"
+        );
+    }
+}
+
+/// A removal under way when the finish starts, waiting on a segment's store, is waited for
+/// before the finish keeps segments from being stored: the two never wait on each other.
+#[test]
+fn a_removal_under_way_when_the_finish_starts_is_waited_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let (from, location) = archive_in(dir.path());
+    let archive = std::sync::Arc::new(opened(&from));
+    for n in 3..30 {
+        let bytes = format!("{{\"more\": {n}}}\n").repeat(50);
+        store(
+            &archive,
+            &location,
+            &format!("projects/{n}.jsonl"),
+            &format!("s{n}"),
+            bytes.as_bytes(),
+        );
+    }
+    let target = dir.path().join("moved");
+    let mut moving = moved_into(&archive, &target);
+    moving.copy(&archive, &CancelToken::new(), &mut go).unwrap();
+    /* A store holds `placing`, so the removal a delete starts waits on it. */
+    let storing = archive
+        .placing
+        .read()
+        .unwrap_or_else(PoisonError::into_inner);
+    for n in 3..30 {
+        let id = SessionId {
+            location: location.clone(),
+            provider: "fixture".to_string(),
+            key: format!("s{n}"),
+        };
+        archive.catalogue().trash(&id).unwrap();
+        let shown = archive.catalogue().deletion(&id).unwrap();
+        archive.delete_for_good(&shown).unwrap();
+    }
+    let (sent, finished) = std::sync::mpsc::channel();
+    let finishing = {
+        let archive = archive.clone();
+        std::thread::spawn(move || {
+            let moved = moving.finish(&archive, &CancelToken::new(), &mut go, |_| Ok(()));
+            sent.send(moved.map(drop).map_err(|error| error.to_string()))
+                .unwrap();
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    drop(storing);
+    let finished = finished
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the finish and the removal waited on each other");
+    finishing.join().unwrap();
+    assert_eq!(finished, Ok(()));
+    let totals = archive.catalogue().totals().unwrap();
+    drop(archive);
+    assert_whole(&target, totals);
+}
+
+/// A move cut short before its marker was written left its lock and an empty `tmp/` at most:
+/// the next start takes those away, and the folder too when the move made it, and says that
+/// nothing had been copied.
+#[test]
+fn a_move_cut_short_before_its_marker_leaves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    for made in [true, false] {
+        let target = dir.path().join(format!("made {made}"));
+        fs::create_dir(&target).unwrap();
+        if !made {
+            fs::write(target.join(".DS_Store"), "Finder's").unwrap();
+        }
+        drop(lock(&target).unwrap());
+        fs::create_dir(target.join(layout::TMP)).unwrap();
+        assert_eq!(clear_move(&target, "a move", made), Cleared::Nothing);
+        assert_eq!(target.exists(), !made);
+        if !made {
+            assert_eq!(
+                fs::read_dir(&target).unwrap().count(),
+                1,
+                "Finder's file stays"
+            );
+        }
+    }
+}
+
+/// What a move needs counts the search index the new archive makes again.
+#[test]
+fn the_room_a_move_needs_counts_the_search_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let (from, _) = archive_in(dir.path());
+    let archive = opened(&from);
+    let target = dir.path().join("moved");
+    let before = archive.plan_move(&target).unwrap().needed;
+    fs::write(
+        from.join(format!("{SEARCH_DATABASE}-wal")),
+        vec![0; 1 << 20],
+    )
+    .unwrap();
+    assert!(archive.plan_move(&target).unwrap().needed >= before + (1 << 20));
+}
+
+/// Which cloud service keeps a folder in step, from its folders' names; a local folder is not
+/// on the network.
+#[test]
+fn a_synced_folder_is_named_and_a_local_one_is_not_remote() {
+    let cases = [
+        (
+            "/Users/user/Library/CloudStorage/OneDrive-Personal/scrollback",
+            Some("OneDrive"),
+        ),
+        (
+            "/Users/user/Library/CloudStorage/Dropbox/scrollback",
+            Some("Dropbox"),
+        ),
+        ("/Users/user/Dropbox (Personal)/scrollback", Some("Dropbox")),
+        (
+            "/Users/user/Library/Mobile Documents/com~apple~CloudDocs/scrollback",
+            Some("iCloud Drive"),
+        ),
+        (
+            "/Users/user/Library/CloudStorage/GoogleDrive-user/My Drive/scrollback",
+            Some("Google Drive"),
+        ),
+        ("/Users/user/code/scrollback", None),
+        ("/Volumes/Backup/scrollback", None),
+    ];
+    for (path, service) in cases {
+        assert_eq!(synced_by(Path::new(path)), service, "{path}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!on_network(&dir.path().join("not there yet")));
 }

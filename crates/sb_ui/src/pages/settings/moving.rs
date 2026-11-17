@@ -9,11 +9,15 @@ use gpui::{
     StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _,
 };
 use gpui_component::FocusTrapElement as _;
-use sb_core::archive::MoveStage;
+use std::path::Path;
+
+use sb_core::archive::{self, MoveStage};
 
 use super::SettingsPage;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{ButtonKind, button, info_banner, kv, progress_bar, with_numbers};
+use crate::components::{
+    ButtonKind, button, info_banner, kv, progress_bar, warn_banner, with_numbers,
+};
 use crate::format;
 use crate::overlay::{self, Layer};
 use crate::pages::first_sync::ESTIMATE_AFTER_MS;
@@ -21,6 +25,24 @@ use crate::services::ActiveServices as _;
 use crate::services::settings::{Ended, MoveState, Running};
 use crate::system;
 use crate::theme::{SbTheme, StyledText as _};
+
+/**
+ * The warning a question about putting the archive in `folder` carries when a cloud service
+ * keeps the folder in step (PLAN §4.4): allowed, but the archive changes often, and a service
+ * that syncs it can make conflicting copies of its catalogue.
+ */
+pub(crate) fn synced_warning(folder: &Path, theme: &SbTheme) -> Option<AnyElement> {
+    let service = archive::synced_by(folder)?;
+    Some(
+        warn_banner(theme)
+            .child(div().flex_1().min_w_0().child(format!(
+                "This folder is synced by {service}. The archive changes often, and {service} \
+                 can make conflicting copies of it; a folder it doesn't sync is safer."
+            )))
+            .automation_target("synced-warning")
+            .into_any_element(),
+    )
+}
 
 /// How far a running move is, in words: its stage and its counts, and how long it has left
 /// once it has copied for a minute.
@@ -142,7 +164,14 @@ impl SettingsPage {
                                 .items_center()
                                 .gap(theme.spacing.md)
                                 .child(div().flex_1().min_w_0().child(with_numbers(
-                                    doing(running, format::now()),
+                                    if settings.quits_after_finish() {
+                                        format!(
+                                            "{} · scrollback quits once it is done",
+                                            doing(running, format::now())
+                                        )
+                                    } else {
+                                        doing(running, format::now())
+                                    },
                                     c.accent_text,
                                     &theme.text.secondary,
                                     theme,
@@ -320,8 +349,9 @@ impl SettingsPage {
                             .automation_target("settings/move-confirm/folder"),
                     )
                     .child(paragraph(format!(
-                        "scrollback copies {} in {} there and checks each one against what it \
-                         read, and every transcript against the catalogue. Syncing goes on \
+                        "scrollback copies {} in {} there, reads each copy back to check it \
+                         holds what was read, and checks every transcript against the \
+                         catalogue. Syncing goes on \
                          while it copies; it pauses for the last moments, while the catalogue \
                          is copied and scrollback switches to the copy.",
                         format::size(plan.bytes),
@@ -333,6 +363,7 @@ impl SettingsPage {
                          yourself."
                             .to_string(),
                     ))
+                    .children(synced_warning(&plan.target, theme))
                     .child(
                         div()
                             .flex()

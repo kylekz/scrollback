@@ -7,8 +7,8 @@
 //!
 //! **The file** is `{"v": 1, "archive": …, "mode": …, "material": …, "sync_every": …,
 //! "last_archive": {"id", "opened", "sessions", "bytes"}, "move": {"v": 1, "id", "from",
-//! "to", "started"}, "moved": {"v": 1, "from", "to", "at"}}`, as dv keeps its own (`archive`
-//! and `material` only once the owner chose them; `move` while a move of the archive runs,
+//! "to", "made", "started"}, "moved": {"v": 1, "from", "to", "at"}}`, as dv keeps its own
+//! (`archive` and `material` only once the owner chose them; `move` while a move of the archive runs,
 //! `moved` after one until the owner dismisses it: [`moving`]). A missing key takes its
 //! default, a value that can't be read is logged and takes its default, and keys this version
 //! doesn't know are written back as they were. But a file that is there and can't be read at
@@ -29,7 +29,7 @@
 
 mod moving;
 
-pub use moving::{Ended, MoveState, Running};
+pub use moving::{Ended, MoveState, Running, WAIT_FOR_THE_MOVE};
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -161,6 +161,9 @@ pub struct Moving {
     pub id: String,
     pub from: PathBuf,
     pub to: PathBuf,
+    /// Whether the move made `to`: a start after a crash takes it away again when the move
+    /// had put nothing in it yet.
+    pub made: bool,
     /// In Unix milliseconds.
     pub started: i64,
 }
@@ -202,6 +205,10 @@ impl Moving {
                 .to_string(),
             from: moving_folder(value, "from").ok_or_else(unreadable)?,
             to: moving_folder(value, "to").ok_or_else(unreadable)?,
+            made: value
+                .get("made")
+                .and_then(Value::as_bool)
+                .ok_or_else(unreadable)?,
             started: value
                 .get("started")
                 .and_then(Value::as_i64)
@@ -215,6 +222,7 @@ impl Moving {
             "id": self.id,
             "from": self.from.display().to_string(),
             "to": self.to.display().to_string(),
+            "made": self.made,
             "started": self.started,
         })
     }
@@ -458,6 +466,8 @@ pub struct SettingsService {
     /// A move is finishing: no write starts until the move's own has pointed the file at the
     /// new folder, or the move has failed ([`moving`]).
     holding: bool,
+    /// The owner asked to quit while a move finished: the app quits once it has.
+    quit_after: bool,
     /// Where the next move waits or stops, for the tests and the scenarios.
     #[cfg(any(test, feature = "automation"))]
     move_hold: moving::Hold,
@@ -495,6 +505,7 @@ impl SettingsService {
             switch: None,
             move_state: None,
             holding: false,
+            quit_after: false,
             #[cfg(any(test, feature = "automation"))]
             move_hold: moving::Hold::default(),
             install_root,
@@ -810,6 +821,7 @@ pub fn why_refused(folder: &Path, error: &archive::ArchiveError) -> String {
             folder.display(),
             other.display()
         ),
+        archive::ArchiveError::OnNetwork(_) => moving::ON_NETWORK.to_string(),
         archive::ArchiveError::Locked(_) => {
             "The archive there is open in another scrollback window.".to_string()
         }
@@ -928,6 +940,7 @@ mod tests {
                 id: "4f1c".to_string(),
                 from: PathBuf::from(from),
                 to: PathBuf::from(to),
+                made: true,
                 started: 1_791_115_200_000,
             }),
             moved: Some(Moved {
@@ -943,15 +956,17 @@ mod tests {
         );
 
         let with = |moving: Value| json!({"v": 1, "move": moving}).to_string();
-        let whole = json!({"v": 1, "id": "4f1c", "from": from, "to": to, "started": 1});
+        let whole =
+            json!({"v": 1, "id": "4f1c", "from": from, "to": to, "made": true, "started": 1});
         assert!(AppSettings::parse(&with(whole.clone())).is_ok());
         for broken in [
             json!(3),
-            json!({"v": 2, "id": "4f1c", "from": from, "to": to, "started": 1}),
-            json!({"id": "4f1c", "from": from, "to": to, "started": 1}),
-            json!({"v": 1, "from": from, "to": to, "started": 1}),
-            json!({"v": 1, "id": "4f1c", "from": "archive", "to": to, "started": 1}),
-            json!({"v": 1, "id": "4f1c", "from": from, "to": to}),
+            json!({"v": 2, "id": "4f1c", "from": from, "to": to, "made": true, "started": 1}),
+            json!({"id": "4f1c", "from": from, "to": to, "made": true, "started": 1}),
+            json!({"v": 1, "from": from, "to": to, "made": true, "started": 1}),
+            json!({"v": 1, "id": "4f1c", "from": "archive", "to": to, "made": true, "started": 1}),
+            json!({"v": 1, "id": "4f1c", "from": from, "to": to, "made": true}),
+            json!({"v": 1, "id": "4f1c", "from": from, "to": to, "started": 1}),
         ] {
             assert!(
                 AppSettings::parse(&with(broken.clone())).is_err(),

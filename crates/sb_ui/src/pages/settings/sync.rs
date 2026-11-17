@@ -16,6 +16,7 @@ use crate::components::{icon, info_banner, tab_stop};
 use crate::icons::SbIcon;
 use crate::services::ActiveServices as _;
 use crate::services::SyncEvery;
+use crate::services::settings::WAIT_FOR_THE_MOVE;
 use crate::theme::{SbTheme, StyledText as _};
 
 /// The menu button's width (`E-Settings`).
@@ -45,6 +46,15 @@ impl SettingsPage {
                 Some("When locations sync, and when one counts as stale."),
                 theme,
             ))
+            .children(cx.services().settings.read(cx).is_moving().then(|| {
+                div()
+                    .text_spec(&theme.text.secondary)
+                    .text_color(c.fg2)
+                    .child(format!(
+                        "{WAIT_FOR_THE_MOVE} Until then, these settings aren't changed."
+                    ))
+                    .automation_target("settings/sync/wait")
+            }))
             .child(setting_row(
                 "Sync every",
                 "While the app is open. Every launch syncs too, and Sync all runs whenever you \

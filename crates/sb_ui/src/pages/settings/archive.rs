@@ -315,7 +315,8 @@ impl SettingsPage {
                     .child(div().text_color(c.fg2).text_spec(&theme.text.body).child(
                         "The archive open now stays where it is, as it is. Nothing is \
                                  moved, and you can come back to it the same way.",
-                    )),
+                    ))
+                    .children(super::moving::synced_warning(&chosen.folder, theme)),
             )
             .child(
                 div()

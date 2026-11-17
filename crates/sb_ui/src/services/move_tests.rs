@@ -253,6 +253,7 @@ fn a_move_cut_short_is_cleared_away_at_the_next_start(cx: &mut TestAppContext) {
                 "move": {
                     "v": 1,
                     "id": plan.id,
+                    "made": plan.made,
                     "from": from.display().to_string(),
                     "to": to.display().to_string(),
                     "started": 1_791_115_200_000_i64,
@@ -294,6 +295,7 @@ fn a_folder_no_longer_the_moves_is_left_as_it_is(cx: &mut TestAppContext) {
             "move": {
                 "v": 1,
                 "id": "a move",
+                "made": false,
                 "from": from.display().to_string(),
                 "to": elsewhere.path().display().to_string(),
                 "started": 1_791_115_200_000_i64,
@@ -310,4 +312,47 @@ fn a_folder_no_longer_the_moves_is_left_as_it_is(cx: &mut TestAppContext) {
     });
     assert_eq!(cleared, Some(Cleared::Left));
     assert!(elsewhere.path().join("notes.txt").is_file());
+}
+
+/// While a move runs, a change that would be written to the archive it leaves is refused,
+/// saying why: the locations, Stale after.
+#[gpui::test]
+fn changes_the_move_would_lose_are_refused_while_it_runs(cx: &mut TestAppContext) {
+    init_library(cx);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let to = elsewhere.path().join("archive");
+    let settings = settings(cx);
+    settings.update(cx, |settings, cx| settings.check_move(to.clone(), cx));
+    settle(cx);
+    let (sync, location) = cx.update(|cx| {
+        let sync = cx.services().sync.clone();
+        let location = sync.read(cx).locations().unwrap()[0].id.clone();
+        (sync, location)
+    });
+    settings.update(cx, |settings, cx| settings.confirm_move(cx));
+    sync.update(cx, |sync, cx| {
+        sync.set_stale_after_days(3, cx);
+        assert_eq!(sync.stale_after_days(), 7);
+        assert_eq!(sync.refused(), Some(settings::WAIT_FOR_THE_MOVE));
+        assert_eq!(
+            sync.rename(&location, "Renamed", cx),
+            Err(settings::WAIT_FOR_THE_MOVE.to_string())
+        );
+    });
+    settle(cx);
+    cx.update(|cx| assert_eq!(cx.services().archive.read(cx).dir(), to));
+}
+
+/// A marker left in the archive in use, by a move whose last steps a crash cut short once the
+/// settings named its folder, is taken away at the start.
+#[gpui::test]
+fn a_marker_left_in_the_archive_in_use_is_taken_away_at_the_start(cx: &mut TestAppContext) {
+    let data = tempfile::tempdir().unwrap();
+    let archive = data.path().join(settings::ARCHIVE_FOLDER);
+    drop(Archive::create(&archive).unwrap());
+    std::fs::write(archive.join(sb_core::archive::MARKER), "{}").unwrap();
+    init_in(data, machine(), cx);
+    settle(cx);
+    assert!(!archive.join(sb_core::archive::MARKER).exists());
+    cx.update(|cx| assert!(cx.services().archive.read(cx).archive().is_some()));
 }

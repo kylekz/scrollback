@@ -36,11 +36,11 @@
 //!   (each session deleted for good's `location`, whether it is `allowed` again, and its
 //!   `standing`: `deleted`, `allowed` or `archived_again`; `null` before the archive is read),
 //!   `saved` (why the settings aren't being saved, or `null`), `move` (Move…: `null`, or its
-//!   `state`, `checking`, `refused` with `why`, `asking` with the `files`, `bytes`, `needed`
+//!   `state`, `checking`, `refused` with `why`, `asking` with the `files`, `bytes`, `needed`, `synced_by`
 //!   and `free` it found, `copying`, `finishing` or `switching` with `files_done`, `files`,
 //!   `bytes_done`, `bytes` and whether it is `stopping`, `clearing`, or how one that didn't
 //!   happen ended, `stopped`, `failed` with `why` or `cut_short`, each with what became of its
-//!   copy, `cleared`: `removed`, `partly` or `left`; and always the folder moved `to`), `moved`
+//!   copy, `cleared`: `removed`, `partly`, `left` or `nothing`; and always the folder moved `to`), `moved`
 //!   (the archive's last move while it is still where it went: `from` and `to`, or `null`) and
 //!   `move_held` (a move waits at `hold_move`'s hold).
 //! - `system`: what the app asked of the operating system (`sb_ui::system`), never done in a
@@ -711,6 +711,7 @@ fn move_state(state: &MoveState) -> Value {
         Cleared::Removed => "removed",
         Cleared::Partly(_) => "partly",
         Cleared::Left => "left",
+        Cleared::Nothing => "nothing",
     };
     match state {
         MoveState::Checking(folder) => {
@@ -728,6 +729,7 @@ fn move_state(state: &MoveState) -> Value {
             "bytes": plan.bytes,
             "needed": plan.needed,
             "free": plan.free,
+            "synced_by": plan.synced_by,
         }),
         MoveState::Running(running) => json!({
             "state": match running.progress.stage {

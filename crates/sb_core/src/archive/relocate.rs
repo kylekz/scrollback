@@ -42,7 +42,9 @@ use toolbox_process::CancelToken;
 use toolbox_store::Backups;
 use toolbox_store::rusqlite::{self, OpenFlags};
 
-use super::stats::{Holds, archive_around, is_system_file, resolved, what_is_in};
+use super::stats::{
+    Holds, archive_around, is_system_file, on_network, resolved, synced_by, what_is_in,
+};
 use super::{Archive, ArchiveError, disk, layout, lock, segment};
 use crate::catalogue::{self, Stored};
 use crate::hash::{Hash, Hasher};
@@ -89,6 +91,9 @@ pub enum Refusal {
     NotEmpty,
     #[error("it is a file")]
     NotAFolder,
+    /// It is on a network file system, which SQLite's write-ahead log isn't safe on.
+    #[error("it is on a network drive")]
+    OnNetwork,
     #[error("it can't be read: {0}")]
     Unreadable(#[source] io::Error),
     #[error("it can't be written: {0}")]
@@ -113,8 +118,12 @@ pub enum MoveError {
         #[source]
         source: io::Error,
     },
-    /// Another program kept the file open past the retries (an antivirus scan, say).
-    #[error("{} is held open by another program", .0.display())]
+    /// Windows kept refusing the file past the retries: another program holds it (an
+    /// antivirus scan, say), or its permissions don't let scrollback in.
+    #[error(
+        "{} can't be read or written: permissions, or another program holds it",
+        .0.display()
+    )]
     Held(PathBuf),
     /// A copy doesn't hold the bytes read from the archive, or a segment's copy not those the
     /// catalogue records when the archive's own file does.
@@ -162,13 +171,18 @@ fn io_error(action: &'static str, path: &Path) -> impl FnOnce(io::Error) -> Move
 pub struct MovePlan {
     /// The folder, absolute.
     pub target: PathBuf,
+    /// Whether it isn't there yet: the move makes it.
+    pub made: bool,
+    /// The service that syncs the folder to the cloud, if one does (OneDrive, say): the
+    /// archive changes often, and its copies there can conflict (PLAN §4.4).
+    pub synced_by: Option<&'static str>,
     /// The move's own id, which the app's settings and the new folder's marker both keep.
     pub id: String,
     /// The files copied, besides the catalogue, and how big they are.
     pub files: usize,
     pub bytes: u64,
-    /// What the move needs on the folder's volume: those files and the catalogue, and a
-    /// twentieth more for what syncs add meanwhile.
+    /// What the move needs on the folder's volume: those files, the catalogue and the search
+    /// index as big as they are here, and a twentieth more for what syncs add meanwhile.
     pub needed: u64,
     /// The volume's free space, when it could be told, and the folder it was asked of: the
     /// nearest there is of the folder and those it is in.
@@ -205,6 +219,9 @@ pub enum Cleared {
     Removed,
     /// These, relative to the folder, could not be removed: another program holds them.
     Partly(Vec<PathBuf>),
+    /// Nothing had been copied yet: what the move had made (its lock, its `tmp/`, the folder
+    /// itself if it made that) is gone, or there was nothing.
+    Nothing,
     /// The folder holds no marker of this move, or another scrollback has it open: nothing
     /// there was touched.
     Left,
@@ -236,9 +253,7 @@ pub enum Step {
     Placed,
     /// The copy is open as an archive, its segments checked.
     Checked,
-    /// The marker is gone.
-    Unmarked,
-    /// The settings name the new folder.
+    /// The settings name the new folder; its marker is still there.
     Committed,
 }
 
@@ -286,14 +301,15 @@ impl Archive {
         let target = refusal(&self.dir, target)?;
         let files = carried(&self.dir)?;
         let bytes = files.iter().map(|file| file.len).sum::<u64>();
-        let catalogue = JOURNALS
+        /* The catalogue's copy, and the search index the new archive makes again: about as
+        big as they are here. */
+        let databases = [catalogue::DATABASE, SEARCH_DATABASE]
             .iter()
-            .filter_map(|journal| {
-                fs::metadata(self.dir.join(name_of(catalogue::DATABASE, journal))).ok()
-            })
+            .flat_map(|database| JOURNALS.map(|journal| name_of(database, journal)))
+            .filter_map(|name| fs::metadata(self.dir.join(name)).ok())
             .map(|metadata| metadata.len())
             .sum::<u64>();
-        let needed = (bytes + catalogue).saturating_add((bytes + catalogue) / 20);
+        let needed = (bytes + databases).saturating_add((bytes + databases) / 20);
         let volume = nearest(&target);
         let free = disk::free_space(&volume)
             .inspect_err(|error| {
@@ -305,6 +321,8 @@ impl Archive {
             .ok();
         room(&volume, free, needed)?;
         Ok(MovePlan {
+            made: fs::symlink_metadata(&target).is_err(),
+            synced_by: synced_by(&target),
             target,
             id: uuid::Uuid::new_v4().simple().to_string(),
             files: files.len(),
@@ -387,7 +405,7 @@ impl Move {
             serde_json::to_vec_pretty(&self.marker).expect("a struct of text always serializes");
         let path = self.target.join(MARKER);
         disk::write_new(&tmp, &path, &json)
-            .and_then(|()| disk::push_dir(&self.target))
+            .and_then(|()| disk::flush_dir(&self.target))
             .map_err(io_error("write", &path))
     }
 
@@ -445,15 +463,22 @@ impl Move {
         progress: &mut dyn FnMut(&MoveProgress),
         commit: impl FnOnce(&Path) -> io::Result<()>,
     ) -> Result<Archive, MoveError> {
-        /* No segment is between its place and its commit, and nothing is removed. */
-        let _quiet = archive
+        /* Nothing is removed, and no segment is between its place and its commit. The
+        removal is held first: it takes `placing` for each item, so it is waited for before
+        `placing` is taken, never while it is held. */
+        let removals = archive.hold_removals();
+        let quiet = archive
             .placing
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        let removals = archive.hold_removals();
-        let moved = self.finishing(archive, cancel, progress, commit)?;
+        let finished = self.finishing(archive, cancel, progress, commit);
+        drop(quiet);
+        let moved = finished?;
         removals.for_good();
         moved.start_removals(true);
+        /* Once the settings name the folder, its marker says nothing more. A start finds
+        any left by a crash before this and takes it away ([`forget_marker`]). */
+        forget_marker(&self.target);
         Ok(moved)
     }
 
@@ -536,14 +561,8 @@ impl Move {
         self.check_all(&archive.dir, &moved, cancel)?;
         self.step(Step::Checked)?;
 
-        /* The marker goes before the settings name the folder, so a folder that holds one
-        is never the archive in use, and a start after a crash may remove what it holds. */
-        let marker = self.target.join(MARKER);
-        disk::retrying(|| fs::remove_file(&marker))
-            .and_then(|()| disk::push_dir(&self.target))
-            .and_then(|()| disk::settle(&self.target))
-            .map_err(io_error("remove", &marker))?;
-        self.step(Step::Unmarked)?;
+        /* The marker stays until the settings name the folder: a start after a crash before
+        then removes the copy it marks, so no whole copy is left that nothing uses. */
         progress(&MoveProgress {
             stage: MoveStage::Switching,
             ..done
@@ -659,7 +678,7 @@ impl Move {
             .iter()
             .chain([&self.target])
             .try_for_each(|folder| disk::push_dir(folder))
-            .and_then(|()| disk::settle(&self.target))
+            .and_then(|()| disk::flush_dir(&self.target))
             .map_err(io_error("flush", &self.target))
     }
 
@@ -731,23 +750,79 @@ impl Move {
 /**
  * Removes the partial copy a move cut short by a crash left in `target`: what its marker
  * names, if the marker there is of the move `id` and no scrollback has the folder open
- * (otherwise [`Cleared::Left`]). The archive the app is on is never this folder: its marker
- * goes before the app's settings name it.
+ * (otherwise [`Cleared::Left`]). A move cut short before its marker was written left at most
+ * its lock and an empty `tmp/`, and the folder itself when it `made` it: those go too
+ * ([`Cleared::Nothing`]). The archive the app is on is never this folder: the app's settings
+ * named the folder only once the move was whole.
  */
-pub fn clear_move(target: &Path, id: &str) -> Cleared {
+pub fn clear_move(target: &Path, id: &str, made: bool) -> Cleared {
+    if fs::symlink_metadata(target).is_err() {
+        return Cleared::Nothing;
+    }
     let marker = fs::read(target.join(MARKER))
         .ok()
         .and_then(|json| serde_json::from_slice::<Marker>(&json).ok())
         .filter(|marker| marker.v == MARKER_VERSION && marker.id == id);
-    let Some(marker) = marker else {
-        return Cleared::Left;
-    };
-    match lock(target) {
-        Ok(lock) => clear(target, &marker, Some(lock)),
+    let lock = match lock(target) {
+        Ok(lock) => lock,
         Err(error) => {
             log::warn!("{} is left as it is: {error}", target.display());
-            Cleared::Left
+            return Cleared::Left;
         }
+    };
+    match marker {
+        Some(marker) => clear(target, &marker, Some(lock)),
+        None if only_a_start(target) => {
+            let mut left = Vec::new();
+            remove_all(target, Path::new(layout::TMP), &mut left);
+            drop(lock);
+            remove_all(target, Path::new(layout::LOCK), &mut left);
+            if made
+                && left.is_empty()
+                && let Err(error) = fs::remove_dir(target)
+            {
+                log::warn!("{} is left: {error}", target.display());
+            }
+            if left.is_empty() {
+                Cleared::Nothing
+            } else {
+                Cleared::Partly(left)
+            }
+        }
+        None => Cleared::Left,
+    }
+}
+
+/// Whether `target` holds nothing but what a move makes before its marker: its lock and an
+/// empty `tmp/`, beside the files an operating system leaves in any folder.
+fn only_a_start(target: &Path) -> bool {
+    fs::read_dir(target).is_ok_and(|entries| {
+        entries.flatten().all(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name == layout::LOCK
+                || is_system_file(&name)
+                || name == layout::TMP
+                    && fs::read_dir(entry.path()).is_ok_and(|mut tmp| tmp.next().is_none())
+        })
+    })
+}
+
+/**
+ * Takes away the marker a move left in the folder `dir` the app's settings name, the archive
+ * in use: the move was whole when they did, and the marker says nothing more. A start calls
+ * this, for a move whose last steps a crash cut short.
+ */
+pub fn forget_marker(dir: &Path) {
+    let marker = dir.join(MARKER);
+    match disk::retrying(|| fs::remove_file(&marker)) {
+        Ok(()) => {
+            if let Err(error) = disk::flush_dir(dir) {
+                log::warn!("{error}");
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => log::warn!("{} is left: {error}", marker.display()),
     }
 }
 
@@ -832,8 +907,9 @@ fn remove_all(dir: &Path, relative: &Path, left: &mut Vec<PathBuf>) {
 /**
  * Why `target` can't take the archive in `archive`, or `target` absolute when it can (PLAN
  * §4.4): it isn't the archive's folder, inside it or around it; nor inside another archive or
- * holding one; it holds nothing but system files, or isn't there yet; and it, or the nearest
- * folder it is in, can be written. Nothing is left behind by looking.
+ * holding one; it holds nothing but system files, or isn't there yet; it isn't on a network
+ * drive; and it, or the nearest folder it is in, can be written. Nothing is left behind by
+ * looking.
  */
 fn refusal(archive: &Path, target: &Path) -> Result<PathBuf, Refusal> {
     let target = std::path::absolute(target).map_err(Refusal::Unreadable)?;
@@ -863,6 +939,9 @@ fn refusal(archive: &Path, target: &Path) -> Result<PathBuf, Refusal> {
             }
         }
         Err(error) => return Err(Refusal::Unreadable(error)),
+    }
+    if on_network(&target) {
+        return Err(Refusal::OnNetwork);
     }
     /* A file with no name, gone when it is closed. */
     tempfile::tempfile_in(nearest(&target)).map_err(Refusal::Unwritable)?;
@@ -899,10 +978,13 @@ fn name_of(database: &str, journal: &str) -> String {
  * Whether the entry `name` at the top of the archive's folder is left out of a move: the live
  * catalogue and its journals (copied with `VACUUM INTO` instead), the search index (rebuilt by
  * the new archive), work in flight, the lock, a marker some move left, and `archive.json`,
- * which the finish copies last.
+ * which the finish copies last. So are the files an operating system leaves in any folder
+ * (`.DS_Store`, `Thumbs.db`, `desktop.ini`): each folder keeps its own, the new folder may
+ * have them already, and they are never copied, named in the marker or removed.
  */
 fn left_out(name: &str) -> bool {
-    [layout::LOCK, layout::TMP, layout::MANIFEST, MARKER].contains(&name)
+    is_system_file(name)
+        || [layout::LOCK, layout::TMP, layout::MANIFEST, MARKER].contains(&name)
         || [catalogue::DATABASE, SEARCH_DATABASE]
             .iter()
             .any(|database| {

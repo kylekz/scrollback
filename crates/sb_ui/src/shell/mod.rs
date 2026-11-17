@@ -149,8 +149,13 @@ const SPRING: Duration = Duration::from_millis(500);
 impl Shell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (main, sidebar, attached) = Self::attach(window, cx);
-        // Closing the window asks first while the paths editor has changes to save.
+        /* Closing the window asks first while the paths editor has changes to save, and waits
+        for a move's finish, which quits once it is over. */
         window.on_window_should_close(cx, |_, cx| {
+            let settings = cx.services().settings.clone();
+            if settings.update(cx, |settings, cx| settings.quit_after_finish(cx)) {
+                return false;
+            }
             let library = cx.services().library.clone();
             let holding = library.read(cx).held().is_some();
             if holding {
