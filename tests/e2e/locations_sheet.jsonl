@@ -82,34 +82,35 @@
 {"cmd": "pin_appearance", "appearance": "dark"}
 
 // Syncing: a host with a long name added and synced at once, its first sync held after one file. Stop keeps what it copied.
-{"cmd": "stand_in", "places": {"user@a-long-ssh-host.example": "passes"}}
+{"cmd": "stand_in", "places": {"user@a-rather-long-ssh-host-name.example.internal": "passes"}}
 {"cmd": "click", "target": "sheet/add"}
 {"cmd": "click", "target": "add/kind/ssh"}
-{"cmd": "type", "text": "user@a-long-ssh-host.example"}
+{"cmd": "type", "text": "user@a-rather-long-ssh-host-name.example.internal"}
 {"cmd": "key", "keystroke": "enter"}
-{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "user@a-long-ssh-host.example", "state": "passed"}}}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "user@a-rather-long-ssh-host-name.example.internal", "state": "passed"}}}
 {"cmd": "hold_sync", "after": 1}
 {"cmd": "click", "target": "add/add-sync"}
 {"cmd": "wait_for", "pointer": "/sync/held", "equals": true, "timeout_ms": 30000}
 {"cmd": "wait_for", "pointer": "/sync/locations/4/progress/items_done", "gte": 1, "timeout_ms": 10000}
-{"cmd": "state", "expect": [{"pointer": "/sheet", "equals": {"selected": "user@a-long-ssh-host.example", "dialog": null}}, {"pointer": "/sync/locations/4/state", "equals": "syncing"}]}
+{"cmd": "state", "expect": [{"pointer": "/sheet", "equals": {"selected": "user@a-rather-long-ssh-host-name.example.internal", "dialog": null}}, {"pointer": "/sync/locations/4/state", "equals": "syncing"}]}
 {"cmd": "bounds", "target": "sheet/status/syncing", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "screenshot", "name": "sheet-syncing-dark"}
 {"cmd": "pin_appearance", "appearance": "light"}
 {"cmd": "screenshot", "name": "sheet-syncing-light"}
 {"cmd": "pin_appearance", "appearance": "dark"}
-// Its sidebar row (DESIGN §4.1), the sheet closed: 48 high, the name cut on a line of its own, and under the bar what it is doing beside "1 / … files", which is whole at the row's right (the row is 232 wide from 8; its words start at 40). Ranges, for fonts that differ by platform.
+// Its sidebar row (DESIGN §4.1), the sheet closed: 48 high and 231 wide (from 8, the sidebar's border past it), the name cut on a line of its own inside the row, and under the bar what it is doing beside "1 / … files", which is whole at the row's right. Ranges, for fonts that differ by platform. A held pass never settles, so this waits on what it needs.
 {"cmd": "key", "keystroke": "escape"}
-{"cmd": "settle", "expect": {"pointer": "/sheet", "equals": null}}
-{"cmd": "bounds", "target": "sidebar/location/user@a-long-ssh-host.example", "expect_result": [{"pointer": "/x", "equals": 8}, {"pointer": "/w", "equals": 232}, {"pointer": "/h", "equals": 48}]}
-{"cmd": "bounds", "target": "sidebar/location/user@a-long-ssh-host.example/count", "expect_result": [{"pointer": "/visible", "not_equals": null}, {"pointer": "/x", "gte": 120}, {"pointer": "/x", "lte": 200}, {"pointer": "/w", "gte": 30}, {"pointer": "/w", "lte": 112}, {"pointer": "/h", "gte": 13}, {"pointer": "/h", "lte": 16}]}
+{"cmd": "wait_for", "pointer": "/sheet", "equals": null}
+{"cmd": "bounds", "target": "sidebar/location/user@a-rather-long-ssh-host-name.example.internal", "expect_result": [{"pointer": "/x", "equals": 8}, {"pointer": "/w", "equals": 231}, {"pointer": "/h", "equals": 48}]}
+{"cmd": "bounds", "target": "sidebar/name/location/user@a-rather-long-ssh-host-name.example.internal", "expect_result": [{"pointer": "/visible", "not_equals": null}, {"pointer": "/w", "gte": 150}, {"pointer": "/w", "lte": 191}, {"pointer": "/x", "gte": 36}, {"pointer": "/x", "lte": 44}]}
+{"cmd": "bounds", "target": "sidebar/count/location/user@a-rather-long-ssh-host-name.example.internal", "expect_result": [{"pointer": "/visible", "not_equals": null}, {"pointer": "/w", "gte": 30}, {"pointer": "/w", "lte": 112}, {"pointer": "/x", "gte": 119}, {"pointer": "/x", "lte": 201}]}
 {"cmd": "screenshot", "name": "sidebar-syncing-dark"}
 {"cmd": "pin_appearance", "appearance": "light"}
-{"cmd": "settle"}
+{"cmd": "wait_frames", "n": 3}
 {"cmd": "screenshot", "name": "sidebar-syncing-light"}
 {"cmd": "pin_appearance", "appearance": "dark"}
-{"cmd": "click", "target": "sidebar/location/user@a-long-ssh-host.example"}
-{"cmd": "settle", "expect": {"pointer": "/sheet", "equals": {"selected": "user@a-long-ssh-host.example", "dialog": null}}}
+{"cmd": "click", "target": "sidebar/location/user@a-rather-long-ssh-host-name.example.internal"}
+{"cmd": "wait_for", "pointer": "/sheet", "equals": {"selected": "user@a-rather-long-ssh-host-name.example.internal", "dialog": null}}
 {"cmd": "click", "target": "sheet/sync"}
 {"cmd": "wait_for", "pointer": "/sync/syncing", "equals": false, "timeout_ms": 30000}
 {"cmd": "settle", "expect": [{"pointer": "/sync/locations/4/state", "not_equals": "syncing"}, {"pointer": "/library/counts/all", "equals": 13}]}

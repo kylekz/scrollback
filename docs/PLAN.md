@@ -266,7 +266,7 @@ One **pass** syncs one location with one provider. The engine drives it and know
 - **Triggers:** app start, the owner (one location or all), and an interval while the app is open. Any of them starts a stopped WSL distro to sync it *(owner)*; only listing distros never starts one (§6.3).
 - **States** a location shows: synced, syncing (files and bytes done of planned), unreachable (the launcher failed to connect: since when, last success and how long ago), failed (anything else, with the tool's message). Unreachable is not an error and isn't surfaced as one; it is recorded with the location and cleared by the next sync that reaches it. A failure to connect is the location's, recorded once, and what earlier batches stored is kept and indexed.
 - **Staleness:** a location with no successful pass for longer than the threshold is flagged. A provider can report how long its agent keeps transcripts at a location (Claude Code: `cleanupPeriodDays`, §7.3), and the flag says how close that is. The value is stored with the location, so an unreachable location uses the one last read.
-- **Progress** is reported per pass (files and bytes done, of the plan) to the sidebar and the locations sheet.
+- **Progress** is reported per pass to the sidebar and the locations sheet: files and bytes done, of the plan, then each step of the index, sessions done of those it has to do (§10).
 
 ---
 

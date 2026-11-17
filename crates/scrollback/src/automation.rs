@@ -51,9 +51,11 @@
 //! - `sync`: `syncing`, `indexing` (an index runs outside a pass), `held` (a pass waits at
 //!   `hold_sync`'s hold), and `locations`, each with its `name`, `kind` (`local`, `wsl` or
 //!   `ssh`) and `state` (`syncing` with `progress`: the `items` to fetch and `items_done`, the
-//!   `sessions` to index and `sessions_done`, the `texts` to make searchable and `texts_done`;
-//!   `synced`; `failed` with `error`; `unreachable`; or `never`), `stale` and `removing`; `removed` (the names of the locations the owner
-//!   removed); `refused` (why the owner's last change to them could not be made, or `null`);
+//!   `sessions` to index and `sessions_done`, and the `index` in hand, `null` or its `step`,
+//!   `rows` or `texts`, with how many it has `done` `of` how many; `synced`; `failed` with
+//!   `error`; `unreachable`; or `never`), `stale` and `removing`; `removed` (the names of the
+//!   locations the owner removed); `refused` (why the owner's last change to them could not be
+//!   made, or `null`);
 //!   `distros` (WSL's distros' names as listed, `null` without WSL or before they are
 //!   listed, or `{"error": …}`); and `test`, the connection test (`null`, or its `place` and
 //!   `state`: `running`, `passed`, or the failure: `unreachable`, `refused`, `host_key`,
@@ -196,7 +198,7 @@ use sb_ui::services::sync::{Refetch, TestFailure, TestState};
 use sb_ui::services::upkeep::{Fix, Standing};
 use sb_ui::services::{
     ActiveServices as _, Answer as Searched, ArchiveState, CheckResult, Dragged, DropTarget,
-    Failure, Held, LocationStatus, Page, Reach, ReadAt, ReaderState, Verdict,
+    Failure, Held, IndexStep, LocationStatus, Page, Reach, ReadAt, ReaderState, Verdict,
 };
 use sb_ui::system::{self, SystemRequest};
 use serde::Deserialize;
@@ -495,8 +497,14 @@ fn sync(cx: &App) -> Value {
                     "items_done": progress.items_done,
                     "sessions": progress.sessions,
                     "sessions_done": progress.sessions_done,
-                    "texts": progress.texts,
-                    "texts_done": progress.texts_done,
+                    "index": progress.indexing().map(|index| json!({
+                        "step": match index.step {
+                            IndexStep::Rows => "rows",
+                            IndexStep::Texts => "texts",
+                        },
+                        "done": index.done,
+                        "of": index.of,
+                    })),
                 })),
                 "stale": sync.stale(location, now).is_some(),
                 "removing": sync.is_removing(&location.id),

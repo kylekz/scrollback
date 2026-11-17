@@ -30,11 +30,8 @@ const BUSY_GAP: gpui::Pixels = px(3.);
 /// fetched, the sessions the index's step has left while it indexes, nothing while the
 /// location is scanned.
 fn doing(progress: &PassProgress) -> Option<String> {
-    if progress.is_indexing() {
-        Some(format!(
-            "{} left",
-            format::count(progress.sessions_left() as u64)
-        ))
+    if let Some(index) = progress.indexing() {
+        Some(format!("{} left", format::count(index.left() as u64)))
     } else if progress.planned {
         Some(format!(
             "{} / {} files",
@@ -56,8 +53,8 @@ fn step_name(step: IndexStep) -> &'static str {
 
 /// What a syncing location's row says under its bar (DESIGN §4.1, `E-Edge-First-Sync`).
 fn doing_line(kind: &LocationKind, progress: &PassProgress, first: bool) -> String {
-    let what = if let Some(step) = progress.index_step() {
-        step_name(step).to_string()
+    let what = if let Some(index) = progress.indexing() {
+        step_name(index.step).to_string()
     } else if !progress.planned {
         "scanning".to_string()
     } else if progress.bytes == 0 {
@@ -72,13 +69,22 @@ fn doing_line(kind: &LocationKind, progress: &PassProgress, first: bool) -> Stri
     )
 }
 
+/// What a location being indexed outside a pass says under its bar: indexing from its start,
+/// before it has said what it has to do, never scanning.
+fn indexing_line(kind: &LocationKind, progress: &PassProgress) -> String {
+    let step = progress
+        .indexing()
+        .map_or(IndexStep::Rows, |index| index.step);
+    format!("{} · {}", kind_name(kind), step_name(step))
+}
+
 /**
  * What the index of every location says under its bar. While it makes rows, why it runs:
  * after an update, when it reads again rows another version of the parser or of the index
  * made (PLAN §7.5). Then the step that makes the search index.
  */
 fn index_line(progress: &PassProgress) -> &'static str {
-    match progress.index_step() {
+    match progress.indexing().map(|index| index.step) {
         Some(IndexStep::Texts) => step_name(IndexStep::Texts),
         _ if progress.outdated > 0 => "after an update",
         _ => "every location",
@@ -144,7 +150,7 @@ impl Sidebar {
                             "Session index",
                             &progress,
                             index_line(&progress).to_string(),
-                            "sidebar/index",
+                            "index",
                             theme,
                         )
                         .automation_target("sidebar/index")
@@ -225,14 +231,15 @@ fn unreachable_line(
 /**
  * A row with work in hand (DESIGN §4.1): 48 high, its name, a bar, and under it what the
  * work is with how far it is at its right. What the work is gives way first; how far, never.
- * `target` names the row's parts for automation.
+ * Its name and its count are the automation targets `sidebar/name/<parts>` and
+ * `sidebar/count/<parts>`: outside the rows' own names, so a query for rows finds rows alone.
  */
 fn busy(
     row: Stateful<Div>,
     called: &str,
     progress: &PassProgress,
     says: String,
-    target: &str,
+    parts: &str,
     theme: &SbTheme,
 ) -> Stateful<Div> {
     let c = &theme.colors;
@@ -243,7 +250,10 @@ fn busy(
             .flex()
             .flex_col()
             .gap(BUSY_GAP)
-            .child(name(called, theme))
+            .child(
+                name(called, theme)
+                    .automation_target_with(|| format!("sidebar/name/{parts}").into()),
+            )
             .child(progress_bar(progress.fraction(), theme))
             .child(
                 div()
@@ -257,7 +267,7 @@ fn busy(
                             .text_color(c.accent_text)
                             .text_spec(&theme.text.count)
                             .child(doing)
-                            .automation_target_with(|| format!("{target}/count").into())
+                            .automation_target_with(|| format!("sidebar/count/{parts}").into())
                     })),
             ),
     )
@@ -311,7 +321,7 @@ fn location_row(
                 .child(state),
         )
     };
-    let target = format!("sidebar/location/{}", location.name);
+    let parts = format!("location/{}", location.name);
     match (status, indexing) {
         (
             LocationStatus::Syncing {
@@ -323,7 +333,7 @@ fn location_row(
             &location.name,
             &progress,
             doing_line(&location.kind, &progress, first),
-            &target,
+            &parts,
             theme,
         ),
         // What a stopped or a failed pass stored is being indexed.
@@ -331,8 +341,8 @@ fn location_row(
             row.aria_label(format!("{}: indexing", location.name)),
             &location.name,
             &progress,
-            doing_line(&location.kind, &progress, false),
-            &target,
+            indexing_line(&location.kind, &progress),
+            &parts,
             theme,
         ),
         (LocationStatus::Synced(at), None) => resting(
@@ -391,7 +401,7 @@ fn location_row(
         )
         .child(dot(None)),
     }
-    .automation_target_with(move || target.clone().into())
+    .automation_target_with(move || format!("sidebar/{parts}").into())
 }
 
 #[cfg(test)]
@@ -487,6 +497,26 @@ mod tests {
         });
         assert_eq!(doing(&progress).as_deref(), Some("1,240 left"));
         assert_eq!(doing_line(local, &progress, false), "Local · search index");
+    }
+
+    #[test]
+    fn a_location_indexed_outside_a_pass_never_says_it_scans() {
+        let ssh = LocationKind::Ssh {
+            host: "user@macbook".to_string(),
+        };
+        let mut progress = PassProgress::default();
+        assert_eq!(indexing_line(&ssh, &progress), "SSH · indexing");
+        // Nothing to make rows of: still the index's, though there is nothing to count.
+        progress.apply(&Progress::Indexing {
+            sessions: 0,
+            bytes: 0,
+            outdated: 0,
+        });
+        assert_eq!(indexing_line(&ssh, &progress), "SSH · indexing");
+        assert_eq!(doing(&progress), None);
+        progress.apply(&Progress::Searching { sessions: 4 });
+        assert_eq!(indexing_line(&ssh, &progress), "SSH · search index");
+        assert_eq!(doing(&progress).as_deref(), Some("4 left"));
     }
 
     #[test]

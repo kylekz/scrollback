@@ -115,25 +115,30 @@ pub struct PassProgress {
     pub items_done: usize,
     pub bytes: u64,
     pub bytes_done: u64,
-    /// The sessions to index and those indexed, once the fetching is over: the index's first
-    /// step, which makes their rows (PLAN §7.5).
+    /// The sessions to index and those gone through, once the fetching is over, over every
+    /// agent: the index's first step, which makes their rows (PLAN §7.5).
     pub sessions: usize,
     pub sessions_done: usize,
     /// Of `sessions`, those whose rows another version of the parser or of the index made.
     pub outdated: usize,
-    /// Whether the index is at its second step, which makes the sessions' text searchable.
-    searching: bool,
-    /// The sessions the second step has to make searchable and those it has read for it.
-    pub texts: usize,
-    pub texts_done: usize,
-    /// The sessions whose text the index has made searchable, as it goes.
+    /// The sessions whose text the index has made searchable, as it goes, over every agent.
     pub searchable_done: usize,
+    /// The index of the agent being indexed: each agent's is its own, from its start.
+    index: Option<AgentIndex>,
     /// What the agents before the one being synced added to the counts above.
     items_before: usize,
     bytes_before: u64,
     sessions_before: usize,
-    texts_before: usize,
     searchable_before: usize,
+}
+
+/// One agent's index, as far as it is (PLAN §7.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentIndex {
+    /// Its first step: the rows to make, and those gone through.
+    Rows { of: usize, done: usize },
+    /// Its second step, after `rows` rows: the text to make searchable, and that done.
+    Texts { rows: usize, of: usize, done: usize },
 }
 
 /// The step of an index a pass or an index is at (PLAN §7.5).
@@ -143,6 +148,22 @@ pub enum IndexStep {
     Rows,
     /// Making each session's text searchable.
     Texts,
+}
+
+/// How far the index in hand is: its step, and how many sessions that step has done of how
+/// many.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexProgress {
+    pub step: IndexStep,
+    pub done: usize,
+    pub of: usize,
+}
+
+impl IndexProgress {
+    /// How many sessions the step has left to do.
+    pub fn left(&self) -> usize {
+        self.of.saturating_sub(self.done)
+    }
 }
 
 impl PassProgress {
@@ -161,68 +182,89 @@ impl PassProgress {
             Progress::Indexing {
                 sessions, outdated, ..
             } => {
-                self.sessions_before = self.sessions_done;
+                (self.sessions_before, self.searchable_before) =
+                    (self.sessions_done, self.searchable_done);
                 self.sessions += sessions;
                 self.outdated += outdated;
-                self.searching = false;
+                self.index = Some(AgentIndex::Rows {
+                    of: sessions,
+                    done: 0,
+                });
             }
             Progress::Indexed { sessions, .. } => {
                 self.sessions_done = self.sessions_before + sessions;
+                if let Some(AgentIndex::Rows { done, .. }) = &mut self.index {
+                    *done = sessions;
+                }
             }
             Progress::Searching { sessions } => {
-                (self.texts_before, self.searchable_before) =
-                    (self.texts_done, self.searchable_done);
-                self.texts += sessions;
-                self.searching = true;
+                let rows = match self.index {
+                    Some(AgentIndex::Rows { of, .. }) => of,
+                    _ => 0,
+                };
+                self.index = Some(AgentIndex::Texts {
+                    rows,
+                    of: sessions,
+                    done: 0,
+                });
             }
             Progress::Searched {
                 sessions,
                 searchable,
             } => {
-                self.texts_done = self.texts_before + sessions;
                 self.searchable_done = self.searchable_before + searchable;
+                if let Some(AgentIndex::Texts { done, .. }) = &mut self.index {
+                    *done = sessions;
+                }
             }
         }
     }
 
+    /**
+     * How far the index in hand is, while it has work: the rows it makes, then the text it
+     * makes searchable. A second step with nothing to do leaves the first's, done.
+     */
+    pub fn indexing(&self) -> Option<IndexProgress> {
+        let (step, done, of) = match self.index? {
+            AgentIndex::Rows { of: 0, .. } | AgentIndex::Texts { rows: 0, of: 0, .. } => {
+                return None;
+            }
+            AgentIndex::Rows { of, done } => (IndexStep::Rows, done, of),
+            AgentIndex::Texts { rows, of: 0, .. } => (IndexStep::Rows, rows, rows),
+            AgentIndex::Texts { of, done, .. } => (IndexStep::Texts, done, of),
+        };
+        Some(IndexProgress { step, done, of })
+    }
+
     /// Whether the fetching is over and the sessions it changed are being indexed.
     pub fn is_indexing(&self) -> bool {
-        self.sessions > 0 || self.texts > 0
-    }
-
-    /// The step the index is at, while there is one.
-    pub fn index_step(&self) -> Option<IndexStep> {
-        match (self.is_indexing(), self.searching) {
-            (false, _) => None,
-            (true, false) => Some(IndexStep::Rows),
-            (true, true) => Some(IndexStep::Texts),
-        }
-    }
-
-    /// How many sessions the index's step has left to do.
-    pub fn sessions_left(&self) -> usize {
-        match self.index_step() {
-            Some(IndexStep::Rows) => self.sessions.saturating_sub(self.sessions_done),
-            Some(IndexStep::Texts) => self.texts.saturating_sub(self.texts_done),
-            None => 0,
-        }
+        self.indexing().is_some()
     }
 
     /**
      * How much of the work in hand is done, from 0 to 1: of the bytes to fetch, or of the
-     * sessions to index. An index's two steps take half the bar each, so it moves on through
-     * the second instead of standing full; an index with no rows to make is its second step
-     * alone.
+     * index of the agent being indexed. An index's two steps take half the bar each, so it
+     * moves on through the second instead of standing full; an index with no rows to make is
+     * its second step alone. Each agent's index fills the bar from its start, so a failed one
+     * leaves nothing owing to the next.
      */
     pub fn fraction(&self) -> f32 {
-        let part = |done: f64, of: f64| if of > 0. { (done / of).min(1.) } else { 1. };
-        let texts = || part(self.texts_done as f64, self.texts as f64);
-        let done = match self.index_step() {
-            None if self.planned => part(self.bytes_done as f64, self.bytes as f64),
+        let part = |done: usize, of: usize| {
+            if of > 0 {
+                (done as f64 / of as f64).min(1.)
+            } else {
+                1.
+            }
+        };
+        let done = match self.index.filter(|_| self.is_indexing()) {
+            Some(AgentIndex::Rows { of, done }) => part(done, of) / 2.,
+            Some(AgentIndex::Texts { rows: 0, of, done }) => part(done, of),
+            Some(AgentIndex::Texts { of, done, .. }) => (1. + part(done, of)) / 2.,
+            None if self.planned && self.bytes > 0 => {
+                (self.bytes_done as f64 / self.bytes as f64).min(1.)
+            }
+            None if self.planned => 1.,
             None => 0.,
-            Some(_) if self.sessions == 0 => texts(),
-            Some(IndexStep::Rows) => part(self.sessions_done as f64, self.sessions as f64) / 2.,
-            Some(IndexStep::Texts) => (1. + texts()) / 2.,
         };
         done as f32
     }

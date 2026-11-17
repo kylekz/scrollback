@@ -47,25 +47,26 @@
 {"cmd": "key", "keystroke": "escape"}
 {"cmd": "settle", "expect": [{"pointer": "/sheet/dialog", "equals": null}, {"pointer": "/sync/test", "equals": null}]}
 
-// The sidebar's overlay is as wide as the docked sidebar (DESIGN §2, §4.1): a host with a long name syncing there has its name cut on a line of its own, and its count whole at the row's right. Ranges, for fonts that differ by platform.
-{"cmd": "stand_in", "places": {"user@a-long-ssh-host.example": "passes"}}
+// The sidebar's overlay is as wide as the docked sidebar (DESIGN §2, §4.1): a host with a long name syncing there has its name cut on a line of its own inside the row, and its count whole at the row's right. Ranges, for fonts that differ by platform. A held pass never settles, so this waits on what it needs.
+{"cmd": "stand_in", "places": {"user@a-rather-long-ssh-host-name.example.internal": "passes"}}
 {"cmd": "key", "keystroke": "secondary-l"}
 {"cmd": "click", "target": "sheet/add"}
 {"cmd": "click", "target": "add/kind/ssh"}
-{"cmd": "type", "text": "user@a-long-ssh-host.example"}
+{"cmd": "type", "text": "user@a-rather-long-ssh-host-name.example.internal"}
 {"cmd": "key", "keystroke": "enter"}
-{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "user@a-long-ssh-host.example", "state": "passed"}}}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "user@a-rather-long-ssh-host-name.example.internal", "state": "passed"}}}
 {"cmd": "hold_sync", "after": 1}
 {"cmd": "click", "target": "add/add-sync"}
 {"cmd": "wait_for", "pointer": "/sync/held", "equals": true, "timeout_ms": 30000}
 {"cmd": "key", "keystroke": "escape"}
-{"cmd": "settle", "expect": {"pointer": "/sheet", "equals": null}}
+{"cmd": "wait_for", "pointer": "/sheet", "equals": null}
 {"cmd": "key", "keystroke": "secondary-b", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
-{"cmd": "bounds", "target": "sidebar/location/user@a-long-ssh-host.example", "expect_result": [{"pointer": "/w", "equals": 232}, {"pointer": "/h", "equals": 48}]}
-{"cmd": "bounds", "target": "sidebar/location/user@a-long-ssh-host.example/count", "expect_result": [{"pointer": "/visible", "not_equals": null}, {"pointer": "/w", "gte": 30}, {"pointer": "/w", "lte": 112}]}
+{"cmd": "bounds", "target": "sidebar/location/user@a-rather-long-ssh-host-name.example.internal", "expect_result": [{"pointer": "/w", "equals": 231}, {"pointer": "/h", "equals": 48}]}
+{"cmd": "bounds", "target": "sidebar/name/location/user@a-rather-long-ssh-host-name.example.internal", "expect_result": [{"pointer": "/visible", "not_equals": null}, {"pointer": "/w", "gte": 150}, {"pointer": "/w", "lte": 191}]}
+{"cmd": "bounds", "target": "sidebar/count/location/user@a-rather-long-ssh-host-name.example.internal", "expect_result": [{"pointer": "/visible", "not_equals": null}, {"pointer": "/w", "gte": 30}, {"pointer": "/w", "lte": 112}]}
 {"cmd": "screenshot", "name": "narrow-sidebar-syncing-dark"}
 {"cmd": "pin_appearance", "appearance": "light"}
-{"cmd": "settle"}
+{"cmd": "wait_frames", "n": 3}
 {"cmd": "screenshot", "name": "narrow-sidebar-syncing-light"}
 {"cmd": "pin_appearance", "appearance": "dark"}
 {"cmd": "release_sync"}

@@ -71,8 +71,9 @@ pub struct IndexReport {
  * of a parser or of the index to what is archived.
  *
  * `progress` hears how many sessions and bytes there are to index, and how far it is after
- * each session; then the same of the sessions its second step makes searchable. `cancel` stops it before the next session, with [`SyncError::Cancelled`]; what
- * was indexed stays, and the rest is still out of date for the next run.
+ * each session; then the same of the sessions its second step makes searchable. `cancel`
+ * stops it before the next session, with [`SyncError::Cancelled`]; what was indexed stays,
+ * and the rest is still out of date for the next run.
  *
  * Two indexes at once (this one beside a pass's) do no harm, only the same work twice: a row
  * says what it was made from, so one made from items that have changed since is out of date
@@ -168,14 +169,15 @@ fn run(
     });
     let mut report = IndexReport::default();
     let mut bytes = 0;
-    for (provider, stale) in stale {
+    /* How far it is counts every session gone through, those found to be none any more too. */
+    for (done, (provider, stale)) in (1..).zip(stale) {
         if cancel.is_cancelled() {
             return Err(SyncError::Cancelled);
         }
         session(archive, provider, &stale.id, &mut report)?;
         bytes += stale.bytes;
         progress(&Progress::Indexed {
-            sessions: report.sessions,
+            sessions: done,
             bytes,
         });
     }
@@ -309,9 +311,13 @@ fn searchable(
     progress: &mut dyn FnMut(&Progress),
     report: &mut IndexReport,
 ) -> Result<(), SyncError> {
+    if cancel.is_cancelled() {
+        return Err(SyncError::Cancelled);
+    }
     let catalogue = archive.catalogue();
     /* Search that is not available is left to the next index; the library is not. */
     let Ok(search) = archive.search_index() else {
+        progress(&Progress::Searching { sessions: 0 });
         return Ok(());
     };
     let gone = catalogue.text_gone()?;
@@ -324,6 +330,8 @@ fn searchable(
                 .map(|row| (*provider, row)),
         );
     }
+    let sessions = rows.len();
+    progress(&Progress::Searching { sessions });
     if gone.is_empty() && rows.is_empty() {
         return Ok(());
     }
@@ -338,16 +346,21 @@ fn searchable(
         return Err(SyncError::Cancelled);
     }
     /* Text made of a row as it is now, before its flag said so (the index emptied and built
-    again, or stopped between the two): it stays. */
+    again, or stopped between the two): it stays, and is done at once. */
     let docs = search.docs()?;
     let (kept, rows): (Vec<_>, Vec<_>) = rows
         .into_iter()
         .partition(|(_, (id, made))| docs.get(id) == Some(made));
-    catalogue.set_searchable(&kept.into_iter().map(|(_, row)| row).collect::<Vec<_>>())?;
-    let sessions = rows.len();
-    progress(&Progress::Searching { sessions });
+    let kept: Vec<_> = kept.into_iter().map(|(_, row)| row).collect();
+    if !kept.is_empty() {
+        catalogue.set_searchable(&kept)?;
+        progress(&Progress::Searched {
+            sessions: kept.len(),
+            searchable: report.searchable,
+        });
+    }
     let mut batch: Vec<Text> = Vec::new();
-    for (done, (provider, (id, made))) in (1..).zip(rows) {
+    for (done, (provider, (id, made))) in (kept.len() + 1..).zip(rows) {
         if cancel.is_cancelled() {
             return Err(SyncError::Cancelled);
         }

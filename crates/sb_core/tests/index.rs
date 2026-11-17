@@ -271,18 +271,22 @@ fn a_start_says_what_it_reads_again_and_what_it_makes_searchable<A: Agent + Defa
         ]
     );
 
-    /* Text that is already of its row is no work, though its flag said otherwise. */
+    /* Text that is already of its row, though its flag said otherwise, is done at once. */
     edit_catalogue(bench.dir(), "UPDATE session SET searchable = 0");
+    let nothing = Progress::Indexing {
+        sessions: 0,
+        bytes: 0,
+        outdated: 0,
+    };
     assert_eq!(
         index_steps(&bench, newer(&bench)),
-        [
-            Progress::Indexing {
-                sessions: 0,
-                bytes: 0,
-                outdated: 0
-            },
-            Progress::Searching { sessions: 0 },
-        ]
+        [nothing, Progress::Searching { sessions: 3 }, searched(3, 0)]
+    );
+
+    /* With nothing to do, the second step says so. */
+    assert_eq!(
+        index_steps(&bench, newer(&bench)),
+        [nothing, Progress::Searching { sessions: 0 }]
     );
 }
 

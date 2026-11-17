@@ -18,7 +18,10 @@
 //! maximize it (`Window::zoom_window`): on Windows each of these raises and activates it.
 //!
 //! Names are hierarchical so `query{prefix}` can list a group: `titlebar/…` for the title bar,
-//! `shell/…` for the regions, `sidebar/…` for the sidebar's rows.
+//! `shell/…` for the regions, `sidebar/…` for the sidebar's rows. A busy location row
+//! (`sidebar/location/<name>`, or the index's `sidebar/index`) names its name and its count
+//! `sidebar/name/location/<name>` and `sidebar/count/location/<name>` (`…/index` for the
+//! index's): outside the rows' prefixes, so a query for rows finds only rows.
 
 pub use gpui_automation::{
     AutomationTargetExt, is_background, open_window, pointer_guard, set_background,

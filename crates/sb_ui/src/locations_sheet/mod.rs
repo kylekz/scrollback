@@ -44,7 +44,9 @@ use crate::icons::SbIcon;
 use crate::keymap;
 use crate::overlay::{self, Layer};
 use crate::services::sync::{Stale, local_name, refusal};
-use crate::services::{ActiveServices as _, IndexStep, LocationStatus, PassProgress, SyncService};
+use crate::services::{
+    ActiveServices as _, IndexProgress, IndexStep, LocationStatus, PassProgress, SyncService,
+};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
 /// How often the sheet's "2 min ago" is drawn again.
@@ -1310,15 +1312,17 @@ fn syncing_line(progress: &PassProgress) -> String {
             format::count(of as u64)
         )
     };
-    match progress.index_step() {
-        Some(IndexStep::Rows) => format!(
-            "Indexing · {}",
-            sessions(progress.sessions_done, progress.sessions)
-        ),
-        Some(IndexStep::Texts) => format!(
-            "Search index · {}",
-            sessions(progress.texts_done, progress.texts)
-        ),
+    match progress.indexing() {
+        Some(IndexProgress {
+            step: IndexStep::Rows,
+            done,
+            of,
+        }) => format!("Indexing · {}", sessions(done, of)),
+        Some(IndexProgress {
+            step: IndexStep::Texts,
+            done,
+            of,
+        }) => format!("Search index · {}", sessions(done, of)),
         None if !progress.planned => "Syncing · looking for changes".to_string(),
         None if progress.items == 0 => "Syncing · nothing new".to_string(),
         None => format!(

@@ -15,7 +15,7 @@ use crate::components::{
 };
 use crate::format;
 use crate::icons::SbIcon;
-use crate::services::{IndexStep, LocationStatus, PassProgress, SyncService};
+use crate::services::{IndexProgress, IndexStep, LocationStatus, PassProgress, SyncService};
 use crate::theme::{SbTheme, StyledText as _};
 
 /// The First sync card's padding above and below (`design/project/E-Edge-First-Sync`).
@@ -66,9 +66,17 @@ fn doing(progress: &PassProgress) -> String {
             format::count(of as u64)
         )
     };
-    match progress.index_step() {
-        Some(IndexStep::Rows) => sessions(progress.sessions_done, progress.sessions, "indexed"),
-        Some(IndexStep::Texts) => sessions(progress.texts_done, progress.texts, "searchable"),
+    match progress.indexing() {
+        Some(IndexProgress {
+            step: IndexStep::Rows,
+            done,
+            of,
+        }) => sessions(done, of, "indexed"),
+        Some(IndexProgress {
+            step: IndexStep::Texts,
+            done,
+            of,
+        }) => sessions(done, of, "searchable"),
         None if progress.planned => format!(
             "{} of {} files · {}",
             format::count(progress.items_done as u64),
