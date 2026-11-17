@@ -5,7 +5,9 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::fs;
+use std::sync::{Mutex, mpsc};
 use std::thread;
 
 use pretty_assertions::assert_eq;
@@ -38,6 +40,9 @@ for_both_agents!(
     a_pass_before_the_index_of_a_start_moves_what_the_owner_decided,
     what_the_owner_decided_goes_with_a_session_that_is_split_merged_or_gone,
     sessions_parsed_at_once_are_indexed_as_one_at_a_time,
+    two_indexes_of_a_start_after_an_update_parse_each_session_once,
+    passes_beside_the_index_of_a_start_leave_it_the_backlog,
+    a_search_index_that_fails_while_rows_are_made_holds_up_none_of_them,
     an_index_stopped_while_it_parses_keeps_what_it_recorded_in_order,
     a_parser_that_stops_on_one_of_many_sessions_stops_on_that_one_alone,
 );
@@ -767,17 +772,20 @@ fn an_index_stopped_while_it_parses_keeps_what_it_recorded_in_order<A: Agent + D
     let newer = |bench: &Bench<A>| bench.meddling(Meddle::ParserVersion(parser + 1));
 
     /* Stopped while later sessions are being parsed: the rows of the twenty that did
-    something last are made again, and no other; what was parsed after them is dropped. */
+    something last are made again, and no other, and their text is written; what was parsed
+    after them is dropped. */
     let stopped = index_until(&bench, newer(&bench), 20);
     assert!(matches!(stopped, Err(SyncError::Cancelled)), "{stopped:?}");
     let by_newer: Vec<bool> = (bench.sessions().iter())
         .map(|session| session.parser_version == parser + 1)
         .collect();
     assert_eq!(by_newer, [vec![true; 20], vec![false; 28]].concat());
+    /* Of the twenty made again, the text too; the rest are still searchable as they were. */
+    assert_eq!(bench.archive().unsearchable().unwrap(), 0);
 
     /* The next index makes the rest, and then all is as one index makes it. */
     let report = bench.index_with(newer(&bench));
-    assert_eq!((report.sessions, report.searchable), (28, 48));
+    assert_eq!((report.sessions, report.searchable), (28, 28));
     let made: Vec<Session> = (bench.sessions().into_iter())
         .map(|session| Session {
             parser_version: parser,
@@ -788,6 +796,133 @@ fn an_index_stopped_while_it_parses_keeps_what_it_recorded_in_order<A: Agent + D
     assert_eq!(search_text(&bench), text);
     assert_eq!(bench.archive().unsearchable().unwrap(), 0);
     assert_eq!(bench.index_with(newer(&bench)), IndexReport::default());
+    bench.assert_verifies();
+}
+
+/// How many sessions have text in the search index, and how many rows say their text is
+/// searchable.
+fn texts_and_flags<A: Agent>(bench: &Bench<A>) -> (i64, i64) {
+    let connection =
+        toolbox_store::rusqlite::Connection::open(bench.dir().join("search.db")).unwrap();
+    let docs = connection
+        .query_row("SELECT count(*) FROM doc", [], |row| row.get(0))
+        .unwrap();
+    let flagged = read_catalogue(bench.dir(), "SELECT count(*) FROM session WHERE searchable");
+    (docs, flagged[0].parse().unwrap())
+}
+
+/// Each session parsed so far, by its first item's key, and how many times: none more than
+/// once, and `sessions` of them.
+fn parsed_once(parses: &Mutex<HashMap<String, usize>>, sessions: usize) {
+    let parses = parses.lock().unwrap();
+    let twice: Vec<_> = parses.iter().filter(|(_, times)| **times > 1).collect();
+    assert!(twice.is_empty(), "parsed more than once: {twice:?}");
+    assert_eq!(parses.len(), sessions);
+}
+
+fn two_indexes_of_a_start_after_an_update_parse_each_session_once<A: Agent + Default>() {
+    let (bench, _) = many::<A>();
+    bench.sync();
+    let parser = bench.agent.provider().parser_version();
+    let parses = Mutex::default();
+    /* Both take the backlog; one at a time, so the second finds it done. */
+    let archive = bench.archive();
+    let reports: Vec<IndexReport> = thread::scope(|scope| {
+        let both = [0, 1].map(|_| {
+            let provider = bench.meddling(Meddle::Counted(parser + 1, &parses));
+            scope.spawn(move || {
+                index(archive, None, &[provider], &CancelToken::new(), &mut |_| {}).unwrap()
+            })
+        });
+        both.map(|index| index.join().unwrap()).into()
+    });
+    assert_eq!(
+        reports.iter().map(|report| report.sessions).sum::<usize>(),
+        48
+    );
+    parsed_once(&parses, 48);
+    assert_eq!(bench.archive().unsearchable().unwrap(), 0);
+    assert_eq!(texts_and_flags(&bench), (48, 48));
+    bench.assert_verifies();
+}
+
+fn passes_beside_the_index_of_a_start_leave_it_the_backlog<A: Agent + Default>() {
+    let (bench, _) = many::<A>();
+    bench.sync();
+    let parser = bench.agent.provider().parser_version();
+    let parses = Mutex::default();
+    let ((ready, readied), (passed, passes)) = (mpsc::channel(), mpsc::channel::<()>());
+    let archive = bench.archive();
+    let passes = thread::scope(|scope| {
+        let provider = bench.meddling(Meddle::Counted(parser + 1, &parses));
+        let start = scope.spawn(move || {
+            index(
+                archive,
+                None,
+                &[provider],
+                &CancelToken::new(),
+                &mut |progress| {
+                    /* Some rows made and their text not yet written: two passes run. */
+                    if let Progress::Indexed { sessions: 10, .. } = progress {
+                        ready.send(()).unwrap();
+                        /* Or the passes failed: their end drops the sender. */
+                        let _ = passes.recv();
+                    }
+                },
+            )
+            .unwrap()
+        });
+        let passed = passed;
+        readied.recv().unwrap();
+        let passes: Vec<IndexReport> = (0..2)
+            .map(|_| {
+                let pass = bench.meddling(Meddle::Counted(parser + 1, &parses));
+                bench.synced_with(pass).index
+            })
+            .collect();
+        passed.send(()).unwrap();
+        assert_eq!(start.join().unwrap().sessions, 48);
+        passes
+    });
+    parsed_once(&parses, 48);
+    /* The passes had nothing of their own to index, and left the backlog to the start's. */
+    for pass in passes {
+        assert_eq!((pass.sessions, pass.backlog_left), (0, true));
+    }
+    assert_eq!(bench.archive().unsearchable().unwrap(), 0);
+    assert_eq!(texts_and_flags(&bench), (48, 48));
+    /* With the backlog done, a pass leaves none. */
+    let pass = bench.synced_with(bench.meddling(Meddle::ParserVersion(parser + 1)));
+    assert!(!pass.index.backlog_left);
+}
+
+fn a_search_index_that_fails_while_rows_are_made_holds_up_none_of_them<A: Agent + Default>() {
+    let (bench, _) = many::<A>();
+    bench.sync();
+    let parser = bench.agent.provider().parser_version();
+    let newer = |bench: &Bench<A>| bench.meddling(Meddle::ParserVersion(parser + 1));
+    /* Another program's hold on the search index, as an anti-virus might: each write of
+    text fails at once. */
+    let search = toolbox_store::rusqlite::Connection::open(bench.dir().join("search.db")).unwrap();
+    search
+        .execute_batch(
+            "CREATE TRIGGER held BEFORE INSERT ON doc
+             BEGIN SELECT RAISE(ABORT, 'held by another program'); END;",
+        )
+        .unwrap();
+    let report = bench.index_with(newer(&bench));
+    assert_eq!((report.sessions, report.searchable), (48, 0));
+    assert!(
+        (bench.sessions().iter()).all(|session| session.parser_version == parser + 1),
+        "every row is made"
+    );
+    assert_eq!(bench.archive().unsearchable().unwrap(), 48);
+
+    /* Let go of, the next index makes the text. */
+    search.execute_batch("DROP TRIGGER held").unwrap();
+    let report = bench.index_with(newer(&bench));
+    assert_eq!((report.sessions, report.searchable), (0, 48));
+    assert_eq!(bench.archive().unsearchable().unwrap(), 0);
     bench.assert_verifies();
 }
 

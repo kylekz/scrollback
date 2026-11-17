@@ -12,6 +12,7 @@
 #[cfg(unix)]
 pub mod shell;
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read as _;
 use std::ops::Deref;
@@ -461,6 +462,9 @@ pub enum Meddle<'a> {
     },
     /// Its parser stops, with a panic, on the session that has the item of this key.
     FaultyParser(String),
+    /// Says its parser is of this version, and counts how many times it parses each session,
+    /// by the first of its items' keys.
+    Counted(u32, &'a Mutex<HashMap<String, usize>>),
     /// Says its parser is of the next version, and of each item what this makes of its key and
     /// of what the provider says of it, in its scan as in its classifier.
     Classifier(Classifier),
@@ -546,7 +550,7 @@ impl Provider for Meddling<'_> {
 
     fn parser_version(&self) -> u32 {
         match self.meddle {
-            Meddle::ParserVersion(version) => version,
+            Meddle::ParserVersion(version) | Meddle::Counted(version, _) => version,
             Meddle::Classifier(_) => self.inner.parser_version() + 1,
             _ => self.inner.parser_version(),
         }
@@ -562,6 +566,11 @@ impl Provider for Meddling<'_> {
             && let Some(action) = action.lock().unwrap().take()
         {
             action();
+        }
+        if let Meddle::Counted(_, parses) = &self.meddle
+            && let Some(first) = items.list().iter().map(|item| &item.key).min()
+        {
+            *parses.lock().unwrap().entry(first.clone()).or_default() += 1;
         }
         if let Meddle::FaultyParser(key) = &self.meddle
             && items.list().iter().any(|item| item.key == *key)

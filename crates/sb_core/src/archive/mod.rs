@@ -33,7 +33,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -208,6 +208,8 @@ pub struct Archive {
     placing: Arc<RwLock<()>>,
     /// The background removal of deleted items' files ([`delete`]).
     removals: Arc<delete::Removals>,
+    /// Held by the index that takes the backlog ([`Archive::backlog`]).
+    backlog: Mutex<()>,
     _lock: File,
 }
 
@@ -372,8 +374,26 @@ impl Archive {
             syncing: Mutex::default(),
             placing: Arc::default(),
             removals: Arc::default(),
+            backlog: Mutex::default(),
             _lock: lock,
         })
+    }
+
+    /**
+     * Leave to take the index's backlog (PLAN §7.5): the rows another version of the parser
+     * or of the index made, and the text not yet of its rows. One index takes it at a time, so
+     * no two parse the same sessions for it; `wait` waits for leave (the index of every
+     * location, which is what takes it), else none is given while another index has it.
+     */
+    pub(crate) fn backlog(&self, wait: bool) -> Option<MutexGuard<'_, ()>> {
+        if wait {
+            return Some(self.backlog.lock().unwrap_or_else(PoisonError::into_inner));
+        }
+        match self.backlog.try_lock() {
+            Ok(held) => Some(held),
+            Err(std::sync::TryLockError::Poisoned(held)) => Some(held.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     }
 
     /// The search text (`crate::search`), opened now if it was not before ([`open_search`]).
@@ -740,6 +760,13 @@ fn open_search(
     })?;
     if anew {
         catalogue.none_searchable()?;
+    } else {
+        /* A row says its text is searchable only when the text is there: the two are written
+        to two files, and a crash between could leave one without the other. */
+        let unflagged = catalogue.unflag_without(&search.docs()?)?;
+        if unflagged > 0 {
+            log::warn!("{unflagged} sessions' text was not searchable as their rows said");
+        }
     }
     let search = Arc::new(search);
     *slot = Some(Arc::clone(&search));
@@ -1416,12 +1443,8 @@ mod tests {
         );
     }
 
-    /**
-     * A delete for good that stopped between its commit and taking the session's text out of
-     * the search index: the next start takes it out, and no other session's.
-     */
-    #[test]
-    fn the_text_of_a_session_deleted_before_a_crash_is_taken_out_at_the_next_start() {
+    /// An archive with two sessions, `doomed` and `kept`, each with a row and its text.
+    fn two_with_text() -> (tempfile::TempDir, Archive, [SessionId; 2]) {
         use crate::catalogue::Indexed;
         use crate::search::Text;
         let (dir, archive, location) = archive();
@@ -1468,7 +1491,22 @@ mod tests {
             })
             .collect();
         let search = archive.search_index().unwrap();
-        assert_eq!(search.record(&texts, |_| Ok(true)).unwrap().len(), 2);
+        let flag = |written: &[_]| Ok(catalogue.set_searchable(written)?);
+        assert_eq!(search.record(&texts, |_| Ok(true), flag).unwrap(), 2);
+        assert_eq!(catalogue.count_unsearchable().unwrap(), 0);
+        drop(search);
+        (dir, archive, sessions)
+    }
+
+    /**
+     * A delete for good that stopped between its commit and taking the session's text out of
+     * the search index: the next start takes it out, and no other session's.
+     */
+    #[test]
+    fn the_text_of_a_session_deleted_before_a_crash_is_taken_out_at_the_next_start() {
+        let (dir, archive, sessions) = two_with_text();
+        let catalogue = archive.catalogue();
+        let search = archive.search_index().unwrap();
         catalogue.trash(&sessions[0]).unwrap();
         catalogue
             .delete_for_good(&catalogue.deletion(&sessions[0]).unwrap())
@@ -1479,5 +1517,64 @@ mod tests {
         archive.wait_for_removals();
         let docs = archive.search_index().unwrap().docs().unwrap();
         assert_eq!(docs.into_keys().collect::<Vec<_>>(), [sessions[1].clone()]);
+    }
+
+    /// Forgetting as many sessions as have text, none of them with any, forgets none: the
+    /// text of the rest stays.
+    #[test]
+    fn forgetting_sessions_without_text_leaves_the_text_of_the_rest() {
+        let (_dir, archive, sessions) = two_with_text();
+        let search = archive.search_index().unwrap();
+        let without = ["never", "indexed"].map(|key| SessionId {
+            key: key.to_string(),
+            ..sessions[0].clone()
+        });
+        search.forget(&without).unwrap();
+        assert_eq!(search.docs().unwrap().len(), 2);
+        search.forget(&sessions).unwrap();
+        assert!(search.docs().unwrap().is_empty());
+    }
+
+    /**
+     * A row that says its text is searchable when the text is not there (a crash between the
+     * two databases' writes) is said not to be once search is opened, and the next index
+     * makes its text.
+     */
+    #[test]
+    fn a_row_whose_text_is_not_there_is_unflagged_when_search_opens() {
+        let (dir, archive, sessions) = two_with_text();
+        archive
+            .search_index()
+            .unwrap()
+            .forget(&sessions[..1])
+            .unwrap();
+        assert_eq!(archive.catalogue().count_unsearchable().unwrap(), 0);
+        drop(archive);
+        let archive = Archive::open(dir.path()).unwrap();
+        archive.search_index().unwrap();
+        let unsearchable = archive.catalogue().unsearchable(None, None).unwrap();
+        assert_eq!(
+            unsearchable
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            [sessions[0].clone()]
+        );
+    }
+
+    /// What an index says a row is made of is what the catalogue says it is.
+    #[test]
+    fn what_a_row_is_made_of_is_said_the_same_by_both() {
+        use crate::catalogue::{Indexed, made};
+        let (_dir, archive, sessions) = two_with_text();
+        let catalogue = archive.catalogue();
+        let from = Hash::of(b"items");
+        catalogue
+            .record_session(&sessions[1], 7, from, Indexed::Faulted("x"), None, None)
+            .unwrap();
+        assert_eq!(
+            catalogue.made_of(&sessions[1]).unwrap(),
+            Some(made(from, 7))
+        );
     }
 }

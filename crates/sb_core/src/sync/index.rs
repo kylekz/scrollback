@@ -9,28 +9,33 @@
 //! - **A pass** ends by indexing the sessions of its location and provider whose items are no
 //!   longer what their row was made from, or that have no row. So a pass that stops before or
 //!   while it indexes leaves sessions that the next pass takes up.
-//! - **[`index`]**, at a start and in the background, indexes those and every session whose
-//!   row was made by another version of the parser or of the index, which is how a new parser
-//!   reaches everything already archived. It first has each provider say again what every
-//!   archived item is, when its parser's version is not the one that last said.
+//! - **[`index`]**, at a start and in the background, indexes those and the backlog: every
+//!   session whose row was made by another version of the parser or of the index, which is how
+//!   a new parser reaches everything already archived, and the text not yet of its rows. It
+//!   first has each provider say again what every archived item is, when its parser's version
+//!   is not the one that last said. One index takes the backlog at a time
+//!   ([`Archive::backlog`]), so passes beside a start's index don't parse it again.
 //! - **[`index_session`]** indexes one session at once: after the owner chose a version to
 //!   read, say.
 //!
 //! An index is two steps. The first makes each session's row, so a first sync's sessions are
 //! in the library as soon as they can be, and from the same parse its text, which is written
-//! to search ([`crate::search`]) some sessions at a time. The second makes searchable the
-//! sessions whose text is still not of their row as it is now, the newest first: those the
-//! first step had no text of (the search index made anew, or a row made by an index that
-//! stopped before it wrote the text), each parsed again. How many are left is
-//! [`crate::archive::Archive::unsearchable`].
+//! to search ([`crate::search`]) some sessions at a time. The second, the backlog's, makes
+//! searchable the sessions whose text is still not of their row as it is now, the newest
+//! first: those the first step had no text of (the search index made anew, or text an index
+//! could not write), each parsed again. How many are left is
+//! [`crate::archive::Archive::unsearchable`]. The library never waits on search: a search
+//! index that fails is let go of for the rest of the step ([`without_search`]).
 //!
 //! Each step parses several sessions at once, on threads of its own ([`in_order`]), each
 //! session from its start with every subagent read; what came of each is recorded on the
 //! index's own thread in the order the sessions are taken in, each row committed on its own,
 //! so the library has it at once. A parse keeps nothing but what its row and its text are made
-//! of, and at most twice as many sessions as there are threads are parsed and not yet
-//! recorded: the memory an index takes is that of its [`workers`] largest sessions'
-//! transcript models (PLAN §7.5). No catalogue transaction is open while a session is parsed.
+//! of (of each span, what search keeps), and at most twice as many sessions as there are
+//! threads are parsed and not yet recorded: the memory an index takes is that of its
+//! [`workers`] largest sessions' transcript models and a batch of text (PLAN §7.5). However
+//! many indexes run, no more than [`workers`] sessions are parsed at once ([`PARSING`]). No
+//! catalogue transaction is open while a session is parsed.
 //!
 //! This is also where a version is held back for how it parses (PLAN §4.2), since only here
 //! are transcripts parsed: [`parses_worse`].
@@ -38,10 +43,10 @@
 use std::any::Any;
 use std::borrow::Cow;
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, mpsc};
 use std::thread;
 
 use toolbox_process::CancelToken;
@@ -51,7 +56,7 @@ use crate::archive::{Archive, ArchivedSession};
 use crate::catalogue::{Derived, Held, Indexed, Reading, RowMade, SessionId, fingerprint, made};
 use crate::location::LocationId;
 use crate::provider::{ItemKind, Provider};
-use crate::search::{SearchIndex, Text};
+use crate::search::{self, Kept, SearchError, SearchIndex, Text};
 use crate::transcript::{self, Content, Conversation, Ending, SessionIndex, Subagent, Transcript};
 
 /// What an index did.
@@ -72,13 +77,18 @@ pub struct IndexReport {
     /// The sessions it deleted for good, of conversations the owner deleted for good (PLAN
     /// §4.5): arriving from another location, or made again, they are not archived again.
     pub deleted: Vec<SessionId>,
+    /// It left the backlog (PLAN §7.5), text not yet of its rows, to the index of every
+    /// location: it was a pass's, or another index had the backlog.
+    pub backlog_left: bool,
 }
 
 /**
  * Indexes every session of `providers`' agents whose index is out of date (the module docs),
  * at `location` or, with `None`, at every location: the sessions not indexed yet first, then
  * the newest (PLAN §7.5). This is the index of a start, and the one that takes a new version
- * of a parser or of the index to what is archived.
+ * of a parser or of the index to what is archived: the backlog, which one index takes at a
+ * time ([`Archive::backlog`]). The index of every location waits for it; one of a location
+ * leaves it to the index that has it, and indexes what changed, as a pass does.
  *
  * `progress` hears how many sessions and bytes there are to index, and how far it is after
  * each session; then the same of the sessions its second step makes searchable. `cancel` stops
@@ -97,7 +107,15 @@ pub fn index(
     progress: &mut dyn FnMut(&Progress),
 ) -> Result<IndexReport, SyncError> {
     let providers: Vec<&dyn Provider> = providers.iter().map(Box::as_ref).collect();
-    run(archive, location, &providers, true, cancel, progress)
+    let backlog = archive.backlog(location.is_none());
+    run(
+        archive,
+        location,
+        &providers,
+        backlog.is_some(),
+        cancel,
+        progress,
+    )
 }
 
 /// Indexes the sessions of `provider` at `location` whose items changed: what a pass ends with.
@@ -141,7 +159,8 @@ pub fn index_session(
             None => None,
         },
     };
-    report.searchable += record(archive, &Vec::from_iter(text))?;
+    let search = archive.search_index()?;
+    report.searchable += record(archive, &search, &Vec::from_iter(text))?;
     /* A session of a conversation the owner deleted is deleted for good by its index. */
     if archive.catalogue().pending_removals()? > 0 {
         archive.start_removals(false);
@@ -149,8 +168,9 @@ pub fn index_session(
     Ok(report)
 }
 
-/// Indexes what is out of date; with `backlog`, also what another version of a parser or of
-/// the index made.
+/// Indexes what is out of date; with `backlog`, which is to have leave to take it
+/// ([`Archive::backlog`]), also what another version of a parser or of the index made, and
+/// the text not yet of its rows.
 fn run(
     archive: &Archive,
     location: Option<&LocationId>,
@@ -182,20 +202,13 @@ fn run(
         outdated,
     });
     let mut report = IndexReport::default();
-    /* Opened first: one made anew says no row's text is searchable before any is made. */
-    let search = archive.search_index().ok();
-    /* Text that another version made of half the sessions or more is taken out whole, and
-    written anew: taking it out span by span costs far more (PLAN §10). */
-    if let Some(search) = &search
-        && outdated > 0
-        && 2 * outdated >= search.texts()?
-    {
-        search.clear()?;
-        catalogue.none_searchable()?;
-    }
+    /* Opened first: one made anew says no row's text is searchable before any is made. The
+    library never waits on search: without it, the text is left to the second step, or to the
+    next index. */
+    let mut search = archive.search_index().ok();
     let sessions = stale.len();
     let (mut done, mut bytes, mut batch) = (0, 0, Batch::default());
-    in_order(
+    let indexed = in_order(
         stale,
         cancel,
         |(provider, stale)| {
@@ -204,12 +217,12 @@ fn run(
         },
         |(provider, stale, parsed)| {
             let text = record_parse(archive, provider, &stale.id, parsed?, &mut report)?;
-            if let (Some(search), Some(text)) = (&search, text) {
-                batch.add_new(search, text)?;
+            if let (Some(_), Some(text)) = (&search, text) {
+                batch.add(text);
             }
             done += 1;
             if batch.is_full() || done == sessions {
-                report.searchable += batch.write(archive)?;
+                report.searchable += batch.write_or_drop(archive, &mut search)?;
             }
             bytes += stale.bytes;
             /* How far it is counts every session gone through, those found to be none any
@@ -221,8 +234,23 @@ fn run(
             });
             Ok(())
         },
-    )?;
-    searchable(archive, location, providers, cancel, progress, &mut report)?;
+    );
+    /* What was made is written, the index stopped or not. */
+    if matches!(indexed, Ok(()) | Err(SyncError::Cancelled)) {
+        report.searchable += batch.write_or_drop(archive, &mut search)?;
+    }
+    indexed?;
+    let made = if backlog {
+        searchable(archive, location, providers, cancel, progress, &mut report)
+    } else {
+        /* The text of the rows it made is written; the rest is the backlog's. */
+        report.backlog_left = archive.catalogue().count_unsearchable()? > 0;
+        progress(&Progress::Searching { sessions: 0 });
+        forget_gone(archive)
+    };
+    if let Err(error) = made.and_then(|()| compact(archive, backlog, &report)) {
+        without_search(error)?;
+    }
     /* What the index deleted for good (PLAN §4.5): sessions of conversations the owner
     deleted, and what they left that is no session's. */
     if catalogue.pending_removals()? > 0 {
@@ -339,8 +367,6 @@ const TEXTS: usize = 256;
 struct Batch {
     texts: Vec<Text>,
     bytes: usize,
-    /// Rows whose text in the search index is already of them: only their flags are to say so.
-    kept: Vec<(SessionId, String)>,
 }
 
 impl Batch {
@@ -349,28 +375,84 @@ impl Batch {
         self.texts.push(text);
     }
 
-    /// Adds `text`, or the row it is of to `kept` when `search` holds that text already.
-    fn add_new(&mut self, search: &SearchIndex, text: Text) -> Result<(), SyncError> {
-        if search.made_of(&text.id)?.as_deref() == Some(&*text.made) {
-            self.kept.push((text.id, text.made));
-        } else {
-            self.add(text);
-        }
-        Ok(())
-    }
-
     fn is_full(&self) -> bool {
-        self.texts.len() + self.kept.len() >= TEXTS || self.bytes >= TEXT_BYTES
+        self.texts.len() >= TEXTS || self.bytes >= TEXT_BYTES
     }
 
     /// Writes what was added ([`record`]) and empties it. Returns how many texts were written.
-    fn write(&mut self, archive: &Archive) -> Result<usize, SyncError> {
-        archive
-            .catalogue()
-            .set_searchable(&std::mem::take(&mut self.kept))?;
+    fn write(&mut self, archive: &Archive, search: &SearchIndex) -> Result<usize, SyncError> {
         self.bytes = 0;
-        record(archive, &std::mem::take(&mut self.texts))
+        record(archive, search, &std::mem::take(&mut self.texts))
     }
+
+    /**
+     * [`Batch::write`] to `search`, if there is search. Search that fails is said in the log
+     * and let go of for the rest of the step, with what was added: the next step, or the next
+     * index, makes that text ([`without_search`]).
+     */
+    fn write_or_drop(
+        &mut self,
+        archive: &Archive,
+        search: &mut Option<Arc<SearchIndex>>,
+    ) -> Result<usize, SyncError> {
+        let Some(index) = search else {
+            *self = Self::default();
+            return Ok(0);
+        };
+        match self.write(archive, index) {
+            Ok(written) => Ok(written),
+            Err(error) => {
+                without_search(error)?;
+                *search = None;
+                Ok(0)
+            }
+        }
+    }
+}
+
+/**
+ * What a search that fails while an index makes its text comes to: nothing, said in the log;
+ * the text is left to the next index, and the library never waits on search. What fails in
+ * the catalogue is the index's failure, as is a cancel.
+ */
+fn without_search(error: SyncError) -> Result<(), SyncError> {
+    match error {
+        SyncError::Search(SearchError::Catalogue(_)) => Err(error),
+        SyncError::Search(error) => {
+            log::warn!("search text is left to the next index: {error}");
+            Ok(())
+        }
+        error => Err(error),
+    }
+}
+
+/**
+ * Makes the search index again from its text when the index with the `backlog` wrote a
+ * quarter of the text or more ([`SearchIndex::scrub`]): text written again is marked deleted
+ * in the index, not taken out, and after an update had the index write most of it again,
+ * what was marked would stay until the index's parts merge, at several times its size.
+ */
+fn compact(archive: &Archive, backlog: bool, report: &IndexReport) -> Result<(), SyncError> {
+    if !backlog || report.searchable == 0 {
+        return Ok(());
+    }
+    if let Some(search) = archive.search_index_if_open()
+        && report.searchable * 4 >= search.texts()?
+    {
+        search.scrub()?;
+    }
+    Ok(())
+}
+
+/// Takes the text of the sessions whose rows went out of the search index, if it is open.
+fn forget_gone(archive: &Archive) -> Result<(), SyncError> {
+    let catalogue = archive.catalogue();
+    let gone = catalogue.text_gone()?;
+    if let (false, Some(search)) = (gone.is_empty(), archive.search_index_if_open()) {
+        search.forget(&gone)?;
+        catalogue.text_forgotten(&gone)?;
+    }
+    Ok(())
 }
 
 /**
@@ -425,24 +507,25 @@ fn searchable(
     if cancel.is_cancelled() {
         return Err(SyncError::Cancelled);
     }
-    /* Text made of a row as it is now, before its flag said so (the index emptied and built
-    again, or stopped between the two): it stays, and is done at once. */
-    let docs = search.docs()?;
-    let (kept, rows): (Vec<_>, Vec<_>) = rows
-        .into_iter()
-        .partition(|(_, (id, made))| docs.get(id) == Some(made));
-    let kept: Vec<_> = kept.into_iter().map(|(_, row)| row).collect();
+    /* Text made of a row as it is now, before its flag said so (an index stopped between the
+    two, say): it stays, and is done at once. */
+    let kept = search.keep(rows.iter().map(|(_, row)| row.clone()).collect(), |kept| {
+        Ok(catalogue.set_searchable(kept)?)
+    })?;
+    let kept: HashSet<SessionId> = kept.into_iter().map(|(id, _)| id).collect();
+    let rows: Vec<_> = (rows.into_iter())
+        .filter(|(_, (id, _))| !kept.contains(id))
+        .collect();
     /* What the first step wrote is not counted here: this step counts from its start. */
     let (mut done, mut searchable) = (kept.len(), 0);
     if !kept.is_empty() {
-        catalogue.set_searchable(&kept)?;
         progress(&Progress::Searched {
             sessions: done,
             searchable,
         });
     }
     let mut batch = Batch::default();
-    in_order(
+    let made = in_order(
         rows,
         cancel,
         |(provider, (id, made))| text(archive, provider, id, made),
@@ -452,7 +535,9 @@ fn searchable(
                 batch.add(text);
             }
             if batch.is_full() || done == sessions {
-                searchable += batch.write(archive)?;
+                let written = batch.write(archive, &search)?;
+                searchable += written;
+                report.searchable += written;
             }
             progress(&Progress::Searched {
                 sessions: done,
@@ -460,32 +545,87 @@ fn searchable(
             });
             Ok(())
         },
-    )?;
-    report.searchable += searchable;
-    Ok(())
+    );
+    /* What was read is written, the step stopped or not. */
+    if let Err(SyncError::Cancelled) = made {
+        report.searchable += batch.write(archive, &search)?;
+    }
+    made
 }
 
-/// How many sessions an index parses at once at most: it is work in the background, beside
-/// the app and whatever else the owner runs.
+/// How many sessions are parsed at once at most, over every index the app runs: indexing is
+/// work in the background, beside the app and whatever else the owner runs.
 const MOST_WORKERS: usize = 4;
 
-/// How many sessions an index parses at once: one fewer than the processors there are, so one
-/// is left for the rest, and at most [`MOST_WORKERS`].
+/// How big a parsing thread's stack is: set, so it is the same on every platform.
+const STACK: usize = 8 * 1024 * 1024;
+
+/// How many sessions are parsed at once, over every index the app runs: one fewer than the
+/// processors there are, so one is left for the rest, and at most [`MOST_WORKERS`].
 fn workers() -> usize {
-    thread::available_parallelism()
-        .map_or(1, |processors| processors.get() - 1)
-        .clamp(1, MOST_WORKERS)
+    static WORKERS: OnceLock<usize> = OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        thread::available_parallelism()
+            .map_or(1, |processors| processors.get() - 1)
+            .clamp(1, MOST_WORKERS)
+    })
+}
+
+/// What a session is parsed under ([`Permits`]): every index's parsing threads share them.
+static PARSING: Permits = Permits::new();
+
+/**
+ * Leave to parse a session, of which there are [`workers`]: two indexes at once (a start's and
+ * a pass's, or two passes') parse no more at once than one does. Only the threads that parse
+ * take them; an index's own thread, which records, never waits for one.
+ */
+struct Permits {
+    taken: Mutex<usize>,
+    freed: Condvar,
+}
+
+impl Permits {
+    const fn new() -> Self {
+        Self {
+            taken: Mutex::new(0),
+            freed: Condvar::new(),
+        }
+    }
+
+    /// Waits for leave, and takes it until the permit is dropped.
+    fn take(&self) -> Permit<'_> {
+        let mut taken = self.taken.lock().unwrap_or_else(PoisonError::into_inner);
+        while *taken >= workers() {
+            taken = self
+                .freed
+                .wait(taken)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *taken += 1;
+        Permit(self)
+    }
+}
+
+/// Leave to parse ([`Permits::take`]), given back when dropped.
+struct Permit<'a>(&'a Permits);
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        *self.0.taken.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
+        self.0.freed.notify_one();
+    }
 }
 
 /**
- * Runs `work` on each of `jobs` on [`workers`] threads (fewer for fewer jobs), and hands what
- * came of each to `take` on this thread, in the order of `jobs`. At most twice as many jobs as
- * there are threads are begun and not yet taken, so what was made waits for its turn without
- * piling up.
+ * Runs `work` on each of `jobs` on [`workers`] threads (fewer for fewer jobs), each job with
+ * leave to parse ([`PARSING`]), and hands what came of each to `take` on this thread, in the
+ * order of `jobs`. At most twice as many jobs as there are threads are begun and not yet
+ * taken, so what was made waits for its turn without piling up. Threads that can't be started
+ * are done without; with none, the jobs are run on this thread, one at a time.
  *
- * `cancel` stops it before it takes the next result, with [`SyncError::Cancelled`]; `take`
- * failing stops it with its error. Either way no job is begun after, and what was begun and
- * not taken is dropped once the threads have ended the jobs they were running.
+ * `cancel` stops it before it begins or takes the next job, with [`SyncError::Cancelled`];
+ * `take` failing stops it with its error. Either way no job is begun after, and what was begun
+ * and not taken is dropped once the threads have ended the jobs they were running.
  */
 fn in_order<J: Send, R: Send>(
     jobs: Vec<J>,
@@ -516,21 +656,24 @@ fn in_order_on<J: Send, R: Send>(
     if jobs.is_empty() {
         return Ok(());
     }
-    let ahead = 2 * workers;
     let stopped = AtomicBool::new(false);
     let (begin, begun) = mpsc::channel::<(usize, J)>();
     let begun = Mutex::new(begun);
     let (end, ended) = mpsc::channel::<(usize, Ended<R>)>();
+    let work = &work;
     thread::scope(|scope| {
-        for _ in 0..workers {
-            let (begun, end, work, stopped) = (&begun, end.clone(), &work, &stopped);
-            scope.spawn(move || {
+        let mut spawned = 0;
+        while spawned < workers {
+            let (begun, end, stopped) = (&begun, end.clone(), &stopped);
+            let worker = move || {
                 loop {
                     let next = begun.lock().unwrap_or_else(PoisonError::into_inner).recv();
                     let Ok((at, job)) = next else {
                         break;
                     };
-                    let ended = if stopped.load(Ordering::Relaxed) || cancel.is_cancelled() {
+                    let stop = || stopped.load(Ordering::Relaxed) || cancel.is_cancelled();
+                    let permit = (!stop()).then(|| PARSING.take());
+                    let ended = if permit.is_none() || stop() {
                         Ended::Dropped
                     } else {
                         match panic::catch_unwind(AssertUnwindSafe(|| work(job))) {
@@ -538,17 +681,36 @@ fn in_order_on<J: Send, R: Send>(
                             Err(fault) => Ended::Panicked(fault),
                         }
                     };
+                    drop(permit);
                     if end.send((at, ended)).is_err() {
                         break;
                     }
                 }
-            });
+            };
+            let thread = thread::Builder::new()
+                .name("index-parse".to_string())
+                .stack_size(STACK)
+                .spawn_scoped(scope, worker);
+            if let Err(error) = thread {
+                log::warn!("an index parses on {spawned} threads, not {workers}: {error}");
+                break;
+            }
+            spawned += 1;
         }
         drop(end);
+        if spawned == 0 {
+            drop(begin);
+            return one_at_a_time(jobs, cancel, work, take);
+        }
+        let ahead = 2 * spawned;
         let mut jobs = jobs.into_iter().enumerate();
         let mut waiting = BTreeMap::new();
         let (mut started, mut taken) = (0, 0);
         let taking = loop {
+            /* Nothing more is begun once it is cancelled. */
+            if cancel.is_cancelled() {
+                break Err(SyncError::Cancelled);
+            }
             while started < taken + ahead
                 && let Some(job) = jobs.next()
             {
@@ -558,9 +720,6 @@ fn in_order_on<J: Send, R: Send>(
             }
             if taken == started {
                 break Ok(());
-            }
-            if cancel.is_cancelled() {
-                break Err(SyncError::Cancelled);
             }
             let ended = loop {
                 if let Some(ended) = waiting.remove(&taken) {
@@ -594,18 +753,35 @@ fn in_order_on<J: Send, R: Send>(
     })
 }
 
-/// Writes `texts`, of those sessions whose rows are still what the texts were made of, and
-/// says so of their rows. Returns how many were written.
-fn record(archive: &Archive, texts: &[Text]) -> Result<usize, SyncError> {
+/// [`in_order`] on this thread alone, without leave to parse: what it does when it can start
+/// no thread.
+fn one_at_a_time<J, R>(
+    jobs: Vec<J>,
+    cancel: &CancelToken,
+    work: impl Fn(J) -> R,
+    mut take: impl FnMut(R) -> Result<(), SyncError>,
+) -> Result<(), SyncError> {
+    for job in jobs {
+        if cancel.is_cancelled() {
+            return Err(SyncError::Cancelled);
+        }
+        take(work(job))?;
+    }
+    Ok(())
+}
+
+/// Writes `texts` to `search`, of those sessions whose rows are still what the texts were
+/// made of, and says so of their rows. Returns how many were written.
+fn record(archive: &Archive, search: &SearchIndex, texts: &[Text]) -> Result<usize, SyncError> {
     if texts.is_empty() {
         return Ok(0);
     }
     let catalogue = archive.catalogue();
-    let written = archive.search_index()?.record(texts, |text| {
-        Ok(catalogue.made_of(&text.id)?.as_deref() == Some(&*text.made))
-    })?;
-    catalogue.set_searchable(&written)?;
-    Ok(written.len())
+    Ok(search.record(
+        texts,
+        |text| Ok(catalogue.made_of(&text.id)?.as_deref() == Some(&*text.made)),
+        |written| Ok(catalogue.set_searchable(written)?),
+    )?)
 }
 
 /**
@@ -647,7 +823,7 @@ fn text(
         id,
         made,
         title: index.title,
-        spans: index.spans,
+        spans: search::kept(index.spans),
     }))
 }
 
@@ -665,7 +841,10 @@ enum Outcome {
     Read {
         /// Which of the readings the session's own conversation was parsed from.
         main: Option<usize>,
+        /// Its index, but for its spans.
         index: Box<SessionIndex>,
+        /// Its spans, as search keeps them: only so much of each is kept until it is written.
+        spans: Vec<Kept>,
         ending: Option<Ending>,
     },
     /// The archive could not be read, for the reason given.
@@ -707,15 +886,20 @@ fn parse(
         let own = transcript.conversation.as_ref();
         Ok::<_, SyncError>(match items.fault() {
             Some(fault) => Outcome::Unread(format!("the archive could not be read: {fault}")),
-            None => Outcome::Read {
-                main: own.and_then(|own| {
-                    readings
-                        .iter()
-                        .position(|reading| *reading.key == *own.item)
-                }),
-                index: Box::new(transcript::index(&transcript)),
-                ending: own.map(|own| own.ending.clone()),
-            },
+            None => {
+                let mut index = transcript::index(&transcript);
+                let spans = search::kept(std::mem::take(&mut index.spans));
+                Outcome::Read {
+                    main: own.and_then(|own| {
+                        readings
+                            .iter()
+                            .position(|reading| *reading.key == *own.item)
+                    }),
+                    index: Box::new(index),
+                    spans,
+                    ending: own.map(|own| own.ending.clone()),
+                }
+            }
         })
     }));
     let outcome = match parsed {
@@ -768,6 +952,7 @@ fn record_parse(
         Outcome::Read {
             main,
             index,
+            spans,
             ending,
         } => {
             let derived = Derived {
@@ -796,7 +981,7 @@ fn record_parse(
                 id: id.clone(),
                 made,
                 title: index.title,
-                spans: index.spans,
+                spans,
             }))
         }
         /* Read again by the next index, which may find the text then. */
@@ -1115,5 +1300,27 @@ mod tests {
         let fault = ended.expect_err("the panic reaches this thread");
         assert!(said(fault.as_ref()).contains("the work stops"));
         assert_eq!(taken, (0..30).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn several_at_once_parse_no_more_at_once_than_one_does() {
+        let (running, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let work = |job: usize| {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            thread::sleep(Duration::from_micros(300));
+            running.fetch_sub(1, Ordering::SeqCst);
+            job
+        };
+        thread::scope(|scope| {
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    let cancel = CancelToken::new();
+                    in_order_on(MOST_WORKERS, (0..60).collect(), &cancel, work, |_| Ok(()))
+                        .unwrap();
+                });
+            }
+        });
+        assert!(most.load(Ordering::SeqCst) <= workers(), "{most:?} at once");
     }
 }

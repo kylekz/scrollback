@@ -256,8 +256,13 @@ impl Remover {
             if let Err(error) = self.remove_deleted() {
                 log::warn!("files of deleted sessions are left for later: {error}");
             }
-            if let Err(error) = self.forget_gone_text() {
-                log::warn!("the text of deleted sessions is left for later: {error}");
+            match self.forget_gone_text() {
+                Ok(()) => {
+                    if let Err(error) = self.scrub() {
+                        log::warn!("the files are scrubbed of deleted sessions later: {error}");
+                    }
+                }
+                Err(error) => log::warn!("the text of deleted sessions is left for later: {error}"),
             }
             if backup && !self.removals.stop.load(Ordering::Relaxed) {
                 backup = false;
@@ -297,6 +302,24 @@ impl Remover {
         let search = open_search(&self.dir, &self.search, &self.catalogue)?;
         search.forget(&gone)?;
         Ok(self.catalogue.text_forgotten(&gone)?)
+    }
+
+    /**
+     * Scrubs the search index and the catalogue of what is left in their files of the sessions
+     * deleted for good since they last were (PLAN §4.5), once their text is out of the index:
+     * a delete for good leaves the mark ([`Catalogue::to_scrub`]) in the transaction that
+     * deletes, so a crash before this leaves it for the next start.
+     */
+    fn scrub(&self) -> Result<()> {
+        if self.removals.stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let Some(mark) = self.catalogue.to_scrub()? else {
+            return Ok(());
+        };
+        open_search(&self.dir, &self.search, &self.catalogue)?.scrub()?;
+        self.catalogue.scrub()?;
+        Ok(self.catalogue.scrubbed(&mark)?)
     }
 
     /// Removes the files of deleted items that are pending, one item at a time (the module

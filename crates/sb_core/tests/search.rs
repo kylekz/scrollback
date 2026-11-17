@@ -721,6 +721,82 @@ fn text_made_again_is_the_text_as_it_is_now_and_nothing_else() {
     bench.assert_verifies();
 }
 
+/**
+ * A session deleted for good leaves none of its text anywhere in the archive's databases or
+ * their logs (PLAN §4.5): not in the search index's text, its entries of text replaced before,
+ * nor the free space of a page, of the search index or of the catalogue.
+ */
+#[test]
+fn text_deleted_for_good_is_in_no_file() {
+    const SAID: &str = "zanzibarquokka";
+    let mut tree = ProjectsTree::new();
+    let mut doomed = tree.session("/home/user/code/app", 0);
+    for turn in 0..40 {
+        doomed
+            .transcript
+            .prompt(&format!("Turn {turn}: where is the {SAID} kept?"));
+        doomed
+            .transcript
+            .reply(&format!("The {SAID} is in drawer {turn}."));
+    }
+    let mut others: Vec<_> = (0..30)
+        .map(|n| tree.session(&format!("/home/user/code/app{n}"), 0))
+        .collect();
+    for (n, other) in others.iter_mut().enumerate() {
+        for turn in 0..10 {
+            other
+                .transcript
+                .prompt(&format!("Session {n}, turn {turn}: a plain question."));
+            other
+                .transcript
+                .reply("A plain answer, long enough to fill a page or two.");
+        }
+    }
+    let key = doomed.key.clone();
+    let bench = Bench::new(FileAgent::on(tree));
+    bench.sync();
+    /* Its text is written again once, as an update's index does, and its old text is marked
+    deleted in the search index. */
+    let content = String::from_utf8(bench.agent.content(&key)).unwrap();
+    bench
+        .agent
+        .overwrite(&key, content.replace("drawer", "cupboard").as_bytes());
+    bench.sync();
+    assert_eq!(find(&bench, SAID).total_sessions, 1);
+
+    let id = bench.session_id(&key);
+    bench.archive().catalogue().trash(&id).unwrap();
+    bench.delete_for_good(&id).unwrap();
+    assert_eq!(find(&bench, &format!("{SAID} in:all")).total_matches, 0);
+    for name in ["scrollback.db", "search.db"] {
+        for suffix in ["", "-wal"] {
+            let file = bench.dir().join(format!("{name}{suffix}"));
+            let bytes = fs::read(&file).unwrap_or_default();
+            let found = bytes
+                .windows(SAID.len())
+                .filter(|it| *it == SAID.as_bytes());
+            assert_eq!(found.count(), 0, "{} holds it", file.display());
+        }
+    }
+    /* Nor does the index hold an entry it marked deleted: it is as one made from the text
+    there is. */
+    let search = toolbox_store::rusqlite::Connection::open(bench.dir().join("search.db")).unwrap();
+    let entries = || -> i64 {
+        search
+            .query_row("SELECT sum(length(block)) FROM span_text_data", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+    let scrubbed = entries();
+    search
+        .execute("INSERT INTO span_text (span_text) VALUES ('rebuild')", [])
+        .unwrap();
+    assert_eq!(scrubbed, entries());
+    bench.assert_search_index_intact();
+    bench.assert_verifies();
+}
+
 /// What is pasted whole into a prompt is searched as far as its first tens of kilobytes, and
 /// the match says so.
 #[test]

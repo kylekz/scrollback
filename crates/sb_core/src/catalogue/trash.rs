@@ -565,6 +565,51 @@ impl Catalogue {
     }
 }
 
+/// The key in `kv` of how many deletes for good the files are still to be scrubbed of.
+const TO_SCRUB: &str = "deleted_to_scrub";
+
+impl Catalogue {
+    /**
+     * Whether a delete for good was committed that the archive's files are still to be
+     * scrubbed of (PLAN §4.5): what is left of its text in the free space of pages of the
+     * catalogue and of the search index, and in entries of the search index that were marked
+     * deleted. A mark that grows with each delete for good, for [`Catalogue::scrubbed`].
+     */
+    pub(crate) fn to_scrub(&self) -> Result<Option<String>> {
+        self.db.read(|c| {
+            Ok(
+                c.query_row("SELECT value FROM kv WHERE key = ?1", [TO_SCRUB], |row| {
+                    row.get(0)
+                })
+                .optional()?,
+            )
+        })
+    }
+
+    /// The files were scrubbed of the deletes for good up to `mark` ([`Catalogue::to_scrub`]):
+    /// one committed since is still to be.
+    pub(crate) fn scrubbed(&self, mark: &str) -> Result<()> {
+        self.db.write(|tx| {
+            tx.execute(
+                "DELETE FROM kv WHERE key = ?1 AND value = ?2",
+                [TO_SCRUB, mark],
+            )?;
+            Ok(())
+        })
+    }
+
+    /**
+     * Writes the catalogue's file anew (`VACUUM`) and empties its log: what a delete freed is
+     * then in no page, nor in the free space of a page it rebalanced, which `secure_delete`
+     * doesn't overwrite (PLAN §4.5). Reads go on meanwhile; writes wait.
+     */
+    pub(crate) fn scrub(&self) -> Result<()> {
+        crate::search::vacuum(&self.dir().join(super::DATABASE))?;
+        self.log.empty();
+        Ok(())
+    }
+}
+
 /**
  * Deletes the session `id` for good in the transaction `tx`: its items' rows and its own, and
  * what the owner decided about it; a tombstone in their place; and the removal of its files,
@@ -572,6 +617,13 @@ impl Catalogue {
  */
 pub(super) fn forget(tx: &rusqlite::Connection, id: &SessionId) -> Result<()> {
     let identity = params![id.location, id.provider, id.key];
+    /* What the files still hold of it is scrubbed out of them in the background
+    ([`Catalogue::to_scrub`]). */
+    tx.execute(
+        "INSERT INTO kv (key, value) VALUES (?1, '1')
+         ON CONFLICT (key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+        [TO_SCRUB],
+    )?;
     let mut items: Vec<(i64, String, String)> = tx
         .prepare(
             "SELECT id, key, item_id FROM item

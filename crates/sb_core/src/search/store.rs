@@ -10,16 +10,19 @@
 //! title, if the session has one, is at place 0, and its prompts, replies and tool calls follow
 //! from place 1 in the order of its conversation.
 //!
-//! Deleting is meant to leave nothing: FTS5's `secure-delete` takes a span's entries out of the
-//! index instead of marking them deleted, SQLite's `secure_delete` overwrites what is freed, and
-//! the write-ahead log is emptied after a session is forgotten ([`SearchIndex::forget`]).
+//! Text taken out of the index, written again ([`SearchIndex::record`]) or forgotten
+//! ([`SearchIndex::forget`]), is marked deleted, and goes as the index merges its parts: FTS5's
+//! `secure-delete`, which takes it out at once, costs a search of the index for each of a
+//! span's trigrams, far more than writing the span, and an index after an update writes most
+//! of the text again; nor can the two be mixed, since taking out securely what was marked
+//! deleted before leaves the index damaged. Of a session made again as it was, nothing is
+//! written; of one that grew, its new spans.
 //!
-//! Taking a span out that way costs a search of the index for each of its trigrams, far more
-//! than writing it, so a session's text written again replaces only the spans that differ from
-//! those at the same places ([`SearchIndex::record`]): a session that grew adds its new spans
-//! alone, and text made the same again changes nothing. An index that is to make most of the
-//! text again, of rows another version of the parser or of the index made, empties it first
-//! ([`SearchIndex::clear`]) and writes it all anew.
+//! Deleting for good is meant to leave nothing (PLAN §4.5). Its text is forgotten at once, so
+//! search no longer finds it; SQLite's `secure_delete` overwrites what a write frees; and the
+//! write-ahead log is emptied. What is still left of it then, its entries the index marked
+//! deleted and copies of cells a page kept as it was rebalanced, goes when the archive's
+//! background removal scrubs the file ([`SearchIndex::scrub`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -53,8 +56,13 @@ const SPAN_BYTES: usize = 64 * 1024;
 /// subagent's conversation they are.
 const SCHEMA: Schema = Schema {
     domain: "scrollback-search-2",
-    steps: &[TEXT],
+    steps: &[TEXT, MARKED_DELETED],
 };
+
+/// Text taken out of the index is marked deleted, not taken out at once (the module docs).
+const MARKED_DELETED: &str = "
+INSERT INTO span_text (span_text, rank) VALUES ('secure-delete', 0);
+";
 
 /// `detail = none`: the index holds which spans have each run of three characters, not where,
 /// which is a quarter of the size; whether a span holds a term is then read from its text
@@ -104,14 +112,43 @@ pub(crate) struct Text {
     pub id: SessionId,
     pub made: String,
     pub title: Option<String>,
-    pub spans: Vec<Span>,
+    pub spans: Vec<Kept>,
 }
 
 impl Text {
-    /// About how many bytes the text holds.
+    /// About how many bytes the text takes in memory.
     pub(crate) fn bytes(&self) -> usize {
-        self.spans.iter().map(|span| span.text.len()).sum()
+        let title = self.title.as_ref().map_or(0, String::len);
+        let spans = self.spans.iter().map(|kept| {
+            let subagent = kept.span.subagent.as_ref().map_or(0, |it| it.item.len());
+            std::mem::size_of::<Kept>() + kept.span.text.len() + subagent
+        });
+        title + spans.sum::<usize>()
     }
+}
+
+/// A span as the index keeps it: the start of its text, at most [`SPAN_BYTES`], and whether
+/// that is all of it.
+pub(crate) struct Kept {
+    pub span: Span,
+    pub cut: bool,
+}
+
+/// `spans` as the index keeps them ([`Kept`]): what is left out of each is let go at once, so
+/// a session's text waiting to be written holds a few tens of kilobytes of each span at most.
+pub(crate) fn kept(spans: Vec<Span>) -> Vec<Kept> {
+    spans
+        .into_iter()
+        .map(|mut span| {
+            let kept = start(&span.text, SPAN_BYTES).len();
+            let cut = kept < span.text.len();
+            if cut {
+                span.text.truncate(kept);
+                span.text.shrink_to_fit();
+            }
+            Kept { span, cut }
+        })
+        .collect()
 }
 
 /// The open `search.db`.
@@ -120,8 +157,10 @@ pub(crate) struct SearchIndex {
     db: Database,
     log: Log,
     /// Held by whoever writes a session's text and checks first that the catalogue still has
-    /// its row as it was made from, and by whoever forgets a session: so no text is written
-    /// after the session it is of was deleted for good.
+    /// its row as it was made from, until the row says its text is searchable; by whoever says
+    /// that of text already written; and by whoever forgets a session. So no text is written
+    /// after the session it is of was deleted for good, and no row says it is searchable when
+    /// its text is not there.
     writing: Mutex<()>,
 }
 
@@ -200,39 +239,70 @@ impl SearchIndex {
         })
     }
 
-    /// What the row of the session `id` was made from when its text was, if it has text.
-    pub(crate) fn made_of(&self, id: &SessionId) -> Result<Option<String>, SearchError> {
-        self.db.read(|c| {
-            Ok(c.query_row(
-                "SELECT made FROM doc WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
-                params![id.location, id.provider, id.key],
-                |row| row.get(0),
-            )
-            .optional()?)
-        })
-    }
-
     /**
      * Replaces the text of each of `texts`' sessions with its own, in one transaction: of each
      * that `still` says, once nothing else writes or forgets, the catalogue still has the row
-     * the text was made of. Returns those written, each session with what its text was made of.
+     * the text was made of. Then, before anything else writes or forgets, `written` hears
+     * those whose text is now that, each session with what its text was made of, for their
+     * rows to say so. Returns how many were written: text the index has already is not.
      */
     pub(crate) fn record(
         &self,
         texts: &[Text],
         still: impl Fn(&Text) -> Result<bool, SearchError>,
-    ) -> Result<Vec<(SessionId, String)>, SearchError> {
-        let written = self.write_texts(texts, still);
+        written: impl FnOnce(&[(SessionId, String)]) -> Result<(), SearchError>,
+    ) -> Result<usize, SearchError> {
+        let recorded = (|| {
+            let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+            let (done, wrote) = self.write_texts(texts, still)?;
+            written(&done)?;
+            Ok(wrote)
+        })();
         self.log.retry();
-        written
+        recorded
     }
 
+    /**
+     * Of `rows`, each a session with what its row is made from, those whose text is already
+     * of that (an index stopped before it said so, say): `kept` hears them before anything
+     * else writes or forgets, for their rows to say so. Returns them.
+     */
+    pub(crate) fn keep(
+        &self,
+        rows: Vec<(SessionId, String)>,
+        kept: impl FnOnce(&[(SessionId, String)]) -> Result<(), SearchError>,
+    ) -> Result<Vec<(SessionId, String)>, SearchError> {
+        if rows.is_empty() {
+            return Ok(rows);
+        }
+        let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+        let same: Vec<_> = self.db.read(|c| {
+            let mut made = c.prepare(
+                "SELECT made FROM doc WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+            )?;
+            let mut same = Vec::new();
+            for (id, row) in rows {
+                let text: Option<String> = made
+                    .query_row(params![id.location, id.provider, id.key], |row| row.get(0))
+                    .optional()?;
+                if text.as_ref() == Some(&row) {
+                    same.push((id, row));
+                }
+            }
+            Ok::<_, SearchError>(same)
+        })?;
+        kept(&same)?;
+        Ok(same)
+    }
+
+    /// Writes the text of those of `texts` that `still` says are of their rows, under
+    /// [`SearchIndex::writing`]: [`SearchIndex::record`]. Returns them, and how many of them
+    /// it wrote.
     fn write_texts(
         &self,
         texts: &[Text],
         still: impl Fn(&Text) -> Result<bool, SearchError>,
-    ) -> Result<Vec<(SessionId, String)>, SearchError> {
-        let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+    ) -> Result<(Vec<(SessionId, String)>, usize), SearchError> {
         let mut kept = Vec::new();
         for text in texts {
             if still(text)? {
@@ -240,9 +310,13 @@ impl SearchIndex {
             }
         }
         if kept.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         self.db.write(|tx| {
+            let mut wrote = 0;
+            let mut made = tx.prepare(
+                "SELECT made FROM doc WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+            )?;
             let mut doc = tx.prepare(
                 "INSERT INTO doc (location_id, provider, session, made) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT (location_id, provider, session) DO UPDATE SET made = excluded.made
@@ -257,11 +331,23 @@ impl SearchIndex {
             let mut same = tx.prepare(
                 "SELECT kind = ?2 AND subagent IS ?3 AND sub_turn IS ?4 AND sub_block IS ?5
                         AND turn IS ?6 AND block IS ?7 AND unattached IS ?8 AND cut = ?9
-                        AND text = ?10
+                        AND text = ?10, text
                  FROM span WHERE id = ?1",
             )?;
+            let mut unindex = tx.prepare(
+                "INSERT INTO span_text (span_text, rowid, text) VALUES ('delete', ?1, ?2)",
+            )?;
+            let mut unspan = tx.prepare("DELETE FROM span WHERE id = ?1")?;
             for text in &kept {
                 let id = &text.id;
+                /* Made again as it was: the text is the same. */
+                let before: Option<String> = made
+                    .query_row(params![id.location, id.provider, id.key], |row| row.get(0))
+                    .optional()?;
+                if before.as_ref() == Some(&text.made) {
+                    continue;
+                }
+                wrote += 1;
                 let doc: i64 = doc.query_row(
                     params![id.location, id.provider, id.key, text.made],
                     |row| row.get(0),
@@ -274,26 +360,35 @@ impl SearchIndex {
                 }
                 let places = i64::try_from(text.spans.len()).map_or(SPANS, |spans| spans + 1);
                 forget_range(tx, first + places.min(SPANS), first + SPANS - 1)?;
-                let title = text
-                    .title
-                    .as_deref()
-                    .map(|title| (0, MatchKind::Title, None, None, title));
-                let spans = (1..SPANS).zip(&text.spans).map(|(place, span)| {
+                let title = text.title.as_deref().map(|title| {
+                    let kept = start(title, SPAN_BYTES);
+                    (
+                        0,
+                        MatchKind::Title,
+                        None,
+                        None,
+                        kept,
+                        kept.len() < title.len(),
+                    )
+                });
+                let spans = (1..SPANS).zip(&text.spans).map(|(place, kept)| {
+                    let span = &kept.span;
+                    let at = Some(span.at);
                     (
                         place,
                         span.kind.into(),
                         span.subagent.as_ref(),
-                        Some(span.at),
+                        at,
                         &*span.text,
+                        kept.cut,
                     )
                 });
-                for (place, kind, subagent, at, body) in title.into_iter().chain(spans) {
+                for (place, kind, subagent, at, kept, cut) in title.into_iter().chain(spans) {
                     let (turn, block, unattached) = match at {
                         None => (None, None, None),
                         Some(At::Block { turn, block }) => (Some(turn), Some(block.0), None),
                         Some(At::Unattached(place)) => (None, None, Some(place)),
                     };
-                    let kept = start(body, SPAN_BYTES);
                     let id = first + place;
                     let row = params![
                         id,
@@ -304,56 +399,76 @@ impl SearchIndex {
                         turn,
                         block,
                         unattached,
-                        kept.len() < body.len(),
+                        cut,
                         kept
                     ];
                     /* A span as it was is left: taking it out costs far more than writing
                     it (the module docs). */
-                    match same.query_row(row, |row| row.get(0)).optional()? {
-                        Some(true) => continue,
-                        Some(false) => forget_range(tx, id, id)?,
+                    let before = same
+                        .query_row(row, |row| {
+                            Ok((row.get::<_, bool>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .optional()?;
+                    match before {
+                        Some((true, _)) => continue,
+                        Some((false, before)) => {
+                            unindex.execute(params![id, before])?;
+                            unspan.execute([id])?;
+                        }
                         None => {}
                     }
                     span.execute(row)?;
                     index.execute(params![id, kept])?;
                 }
             }
-            Ok(kept
-                .iter()
+            let done = (kept.iter())
                 .map(|text| (text.id.clone(), text.made.clone()))
-                .collect())
+                .collect();
+            Ok((done, wrote))
         })
     }
 
     /// Takes out the text of `sessions`, and leaves none of it in the file or its log
-    /// ([`checkpoint`]).
+    /// ([`Log::empty`]) but what [`SearchIndex::scrub`] takes.
     pub(crate) fn forget(&self, sessions: &[SessionId]) -> Result<(), SearchError> {
         if sessions.is_empty() {
             return Ok(());
         }
-        /* Every session's, as when the index was emptied: all of it at once. */
-        if sessions.len() >= self.texts()? {
-            return self.clear();
-        }
-        {
+        let forgot = {
             let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
             self.db.write(|tx| {
                 let mut find = tx.prepare(
                     "SELECT id FROM doc WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
                 )?;
+                let mut docs = Vec::new();
                 for id in sessions {
-                    let doc: Option<i64> = find
-                        .query_row(params![id.location, id.provider, id.key], |row| row.get(0))
-                        .optional()?;
-                    if let Some(doc) = doc {
-                        forget_spans(tx, doc)?;
+                    docs.extend(
+                        find.query_row(params![id.location, id.provider, id.key], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .optional()?,
+                    );
+                }
+                let all: usize = tx.query_row("SELECT count(*) FROM doc", [], |row| row.get(0))?;
+                if !docs.is_empty() && docs.len() == all {
+                    /* Every session's that has text: all of it at once. */
+                    tx.execute_batch(
+                        "INSERT INTO span_text (span_text) VALUES ('delete-all');
+                         DELETE FROM span;
+                         DELETE FROM doc;",
+                    )?;
+                } else {
+                    for doc in &docs {
+                        forget_spans(tx, *doc)?;
                         tx.execute("DELETE FROM doc WHERE id = ?1", [doc])?;
                     }
                 }
-                Ok::<_, SearchError>(())
-            })?;
+                Ok::<_, SearchError>(!docs.is_empty())
+            })?
+        };
+        if forgot {
+            self.log.empty();
         }
-        self.log.empty();
         Ok(())
     }
 
@@ -363,18 +478,24 @@ impl SearchIndex {
             .read(|c| Ok(c.query_row("SELECT count(*) FROM doc", [], |row| row.get(0))?))
     }
 
-    /// Takes out every session's text.
-    pub(crate) fn clear(&self) -> Result<(), SearchError> {
+    /**
+     * Takes out of the file what is left of text that went (PLAN §4.5): the entries of
+     * replaced text the index has marked deleted and not yet merged away (FTS5's `rebuild`
+     * makes the index again from the spans there are), and the copies of cells a page kept
+     * after it was rebalanced, which `secure_delete` doesn't reach (`VACUUM` writes the file
+     * anew). Then empties the log. Searches go on meanwhile, of the index as it was; writes
+     * wait.
+     */
+    pub(crate) fn scrub(&self) -> Result<(), SearchError> {
         {
             let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
             self.db.write(|tx| {
-                tx.execute_batch(
-                    "INSERT INTO span_text (span_text) VALUES ('delete-all');
-                     DELETE FROM span;
-                     DELETE FROM doc;",
-                )?;
-                Ok::<_, SearchError>(())
+                Ok::<_, SearchError>(
+                    tx.execute("INSERT INTO span_text (span_text) VALUES ('rebuild')", [])
+                        .map(drop)?,
+                )
             })?;
+            vacuum(&self.log.path)?;
         }
         self.log.empty();
         Ok(())
@@ -447,6 +568,17 @@ fn in_use(path: &Path) -> Result<(), SearchError> {
         /* Anything else is for the open to judge: a file that is no database is made anew. */
         _ => Ok(()),
     }
+}
+
+/**
+ * Writes the database at `path` anew (`VACUUM`), on a connection of its own, once a write
+ * under way has ended. Nothing a delete freed is in any page of it after, nor in a page a
+ * delete rebalanced.
+ */
+pub(crate) fn vacuum(path: &Path) -> rusqlite::Result<()> {
+    let connection = Connection::open(disk::for_sqlite(path, disk::SQLITE_FILE))?;
+    connection.busy_timeout(Duration::from_secs(30))?;
+    connection.execute_batch("VACUUM")
 }
 
 /// Takes out the spans of the doc `doc`, from the index and from `span`.

@@ -818,6 +818,47 @@ impl Catalogue {
         })
     }
 
+    /**
+     * Says the text of each session whose row says it is searchable is not, unless `docs`
+     * (each session with text, with what its row was made from then) holds the text of its
+     * row as it is now. Returns how many it said it of: rows that said so of text that is not
+     * there, which a crash between the two databases' writes can leave.
+     */
+    pub(crate) fn unflag_without(&self, docs: &HashMap<SessionId, String>) -> Result<usize> {
+        let flagged: Vec<(SessionId, String)> = self.db.read(|c| -> Result<_> {
+            Ok(c.prepare(&format!(
+                "SELECT s.location_id, s.provider, s.session, {MADE_FROM} FROM session s
+                 WHERE s.searchable = 1"
+            ))?
+            .query_map([], |row| {
+                let id = SessionId {
+                    location: row.get(0)?,
+                    provider: row.get(1)?,
+                    key: row.get(2)?,
+                };
+                Ok((id, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+        })?;
+        let wrong: Vec<SessionId> = (flagged.into_iter())
+            .filter(|(id, made)| docs.get(id) != Some(made))
+            .map(|(id, _)| id)
+            .collect();
+        if wrong.is_empty() {
+            return Ok(0);
+        }
+        self.db.write(|tx| {
+            let mut unflag = tx.prepare(
+                "UPDATE session SET searchable = 0
+                 WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+            )?;
+            for id in &wrong {
+                unflag.execute(params![id.location, id.provider, id.key])?;
+            }
+            Ok(wrong.len())
+        })
+    }
+
     /// Says no session's text is of its row: the search index is new.
     pub(crate) fn none_searchable(&self) -> Result<()> {
         self.db.write(|tx| {
