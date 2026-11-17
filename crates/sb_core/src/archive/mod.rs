@@ -24,6 +24,7 @@ mod disk;
 mod items;
 mod kin;
 mod layout;
+mod relocate;
 mod segment;
 mod stats;
 mod verify;
@@ -45,12 +46,19 @@ use crate::location::LocationId;
 use crate::search::{SearchError, SearchIndex};
 
 pub use delete::Deleted;
+pub use disk::write_durably;
 pub use items::{ArchivedSession, Pinned};
 pub use kin::KinMemo;
 pub(crate) use layout::item_folder;
+pub use relocate::{
+    Cleared, MARKER, Move, MoveError, MovePlan, MoveProgress, MoveStage, Refusal, clear_move,
+    forget_marker,
+};
 pub use segment::{Problem, SEGMENT_BYTES, SegmentCache, VersionReader};
 pub(crate) use segment::{RangeWriter, Sealed};
-pub use stats::{ArchiveStats, Holds, id_in, open_or_make, resolved, what_is_in};
+pub use stats::{
+    ArchiveStats, Holds, id_in, on_network, open_or_make, resolved, synced_by, what_is_in,
+};
 pub(crate) use verify::LAST_VERIFY_VERSION;
 pub use verify::{
     Damage, DamageKind, DamageRecord, KEPT_DAMAGES, LastVerify, Unread, VerifyProgress,
@@ -143,6 +151,10 @@ pub enum ArchiveError {
     /// would empty the inner's `tmp/`, and a sync of either could reach the other's files.
     #[error("{} is inside the archive in {}, or holds one", .dir.display(), .other.display())]
     Nested { dir: PathBuf, other: PathBuf },
+    /// The folder is on a network file system, which SQLite's write-ahead log isn't safe on
+    /// (PLAN §4.4): no archive is opened or made there by choosing it.
+    #[error("{} is on a network drive", .0.display())]
+    OnNetwork(PathBuf),
     #[error(transparent)]
     Catalogue(#[from] CatalogueError),
     #[error(transparent)]
@@ -282,7 +294,18 @@ impl Archive {
             }
             Err(error) => return Err(io_error("read", &manifest_path)(error)),
         }
-        let lock = lock(dir)?;
+        let archive = Self::open_locked(dir, lock(dir)?)?;
+        /* What a delete for good left to remove, and then today's backup, which so holds no
+        removal still to do; in the background, as nothing else waits for them. */
+        archive.start_removals(true);
+        Ok(archive)
+    }
+
+    /// Opens the archive in `dir`, absolute and holding an `archive.json`, whose `lock` is
+    /// held already, and starts nothing in the background: [`Archive::open`], and a move
+    /// opening its copy (`relocate`).
+    fn open_locked(dir: &Path, lock: File) -> Result<Self> {
+        let manifest_path = dir.join(layout::MANIFEST);
         if !dir.join(catalogue::DATABASE).is_file() {
             return Err(ArchiveError::CatalogueMissing {
                 dir: dir.to_path_buf(),
@@ -315,9 +338,6 @@ impl Archive {
         if !dir.join(crate::search::SEARCH_DATABASE).exists() {
             archive.catalogue.none_searchable()?;
         }
-        /* What a delete for good left to remove, and then today's backup, which so holds no
-        removal still to do; in the background, as nothing else waits for them. */
-        archive.start_removals(true);
         Ok(archive)
     }
 

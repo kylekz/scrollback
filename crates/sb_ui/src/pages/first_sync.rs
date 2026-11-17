@@ -22,7 +22,7 @@ use crate::theme::{SbTheme, StyledText as _};
 const CARD_PADDING: Pixels = px(14.);
 
 /// How long a first sync runs before it says how long it has left (DESIGN §4.14).
-const ESTIMATE_AFTER_MS: i64 = 60_000;
+pub(super) const ESTIMATE_AFTER_MS: i64 = 60_000;
 
 /// The first syncs that are running.
 pub struct FirstSync {

@@ -166,6 +166,13 @@ impl Archive {
         self.removals.wait();
     }
 
+    /// Stops the background removal before its next item and waits for it; nothing is removed
+    /// until the guard is dropped, which starts it again (a move's finish, `relocate`).
+    pub(super) fn hold_removals(&self) -> RemovalsHeld<'_> {
+        self.removals.stop();
+        RemovalsHeld { archive: self }
+    }
+
     /**
      * Starts the background removal, or has the one under way go round again. With `backup`,
      * as a start does, it then takes the day's backup of the catalogue, once nothing is left to
@@ -217,6 +224,27 @@ impl Archive {
             );
         }
         Ok(accounted)
+    }
+}
+
+/// The background removal held ([`Archive::hold_removals`]).
+pub(super) struct RemovalsHeld<'a> {
+    archive: &'a Archive,
+}
+
+impl RemovalsHeld<'_> {
+    /// Keeps the removal stopped: the archive has been left for good, and nothing more is to
+    /// be removed from it.
+    pub(super) fn for_good(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for RemovalsHeld<'_> {
+    /// Lets the removal go on with what is pending, as a delete would.
+    fn drop(&mut self) {
+        self.archive.removals.stop.store(false, Ordering::Relaxed);
+        self.archive.start_removals(false);
     }
 }
 

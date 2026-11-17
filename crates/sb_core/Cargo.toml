@@ -26,12 +26,19 @@ toolbox_store.workspace = true
 uuid.workspace = true
 zstd.workspace = true
 
-# Apple systems only: the plain `fsync` std does not expose there (`sb_core::archive`).
-[target.'cfg(target_vendor = "apple")'.dependencies]
+# Unix only: the plain `fsync` std does not expose on Apple systems, and a volume's free space
+# (`sb_core::archive`).
+[target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs"] }
 
+# The move into place that is on disk when it returns, a volume's free space and whether it is
+# a network drive, and the codes of a file another program holds (`sb_core::archive`).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_WindowsProgramming",
+] }
 
 [dev-dependencies]
 pretty_assertions.workspace = true

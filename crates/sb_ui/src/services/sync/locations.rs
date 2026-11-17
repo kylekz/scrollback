@@ -27,6 +27,8 @@ use sb_core::transport::{Launcher, Probe, TransportError};
 
 use super::{Survey, SyncService, surveyed};
 use crate::format;
+use crate::services::ActiveServices as _;
+use crate::services::settings::WAIT_FOR_THE_MOVE;
 
 /// After how many days without a good sync a location is stale until the owner says otherwise
 /// in Settings (DESIGN §4.11, whose board says "warning after 7 days"; §4.13), and the most and
@@ -348,6 +350,20 @@ impl SyncService {
     }
 
     /**
+     * Whether the owner's change to the locations or to how soon one is stale waits, and is
+     * refused saying so: the archive is being moved (DESIGN §4.13), and a change written now
+     * would be written to the archive the app leaves.
+     */
+    pub(super) fn waits(&mut self, cx: &mut Context<Self>) -> bool {
+        let waits = cx.services().settings.read(cx).is_switching();
+        if waits {
+            self.refused = Some(WAIT_FOR_THE_MOVE.to_string());
+            cx.notify();
+        }
+        waits
+    }
+
+    /**
      * Makes a location stale after `days` without a good sync, within [`STALE_AFTER_RANGE`],
      * for this archive: it is kept in its catalogue. Shown at once; a write the catalogue
      * refuses is said like any change to the locations.
@@ -357,6 +373,9 @@ impl SyncService {
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return;
         };
+        if days != self.stale_after && self.waits(cx) {
+            return;
+        }
         if days == self.stale_after || self.closed {
             return;
         }
@@ -445,7 +464,10 @@ impl SyncService {
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return;
         };
-        if self.is_adding(&kind) || refusal(&kind, self.locations.iter().flatten()).is_some() {
+        if self.is_adding(&kind)
+            || refusal(&kind, self.locations.iter().flatten()).is_some()
+            || self.waits(cx)
+        {
             return;
         }
         let name = match self.restoring(&kind) {
@@ -562,6 +584,9 @@ impl SyncService {
         if let Some(problem) = name_problem(name, self.names_taken(Some(id))) {
             return Err(problem);
         }
+        if cx.services().settings.read(cx).is_switching() {
+            return Err(WAIT_FOR_THE_MOVE.to_string());
+        }
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
             return Ok(());
         };
@@ -597,7 +622,10 @@ impl SyncService {
     /// Removes a location (module docs): its pass or its refetch, if one runs, is stopped
     /// first.
     pub fn remove(&mut self, id: &LocationId, cx: &mut Context<Self>) {
-        if self.archive.read(cx).archive().is_none() || !self.removing.insert(id.clone()) {
+        if self.archive.read(cx).archive().is_none()
+            || self.waits(cx)
+            || !self.removing.insert(id.clone())
+        {
             return;
         }
         if self.passes.contains_key(id) || self.refetching.contains_key(id) {

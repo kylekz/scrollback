@@ -15,11 +15,15 @@
 //! - **Anything else** (its catalogue is gone, its folder holds what is left of one): the
 //!   archive's words, and the same three ways on as a folder that isn't there.
 //!
+//! After a move of the archive, a line says where it was moved from (the old copy, unless the
+//! owner deleted it, opens as it was); after a move from here that didn't finish, that the app
+//! stayed here.
+//!
 //! Every way on goes through `SettingsService::use_folder`, which needs no archive open. A
 //! different folder asks first, as Settings does: whether its archive opens or a new one is
 //! made there. The question takes the keyboard, and `Esc` (the shell's `Dismiss`) closes it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui::{
     AnyElement, AppContext as _, Context, FocusHandle, InteractiveElement as _, IntoElement,
@@ -36,8 +40,8 @@ use crate::format;
 use crate::icons::SbIcon;
 use crate::overlay::{self, Layer};
 use crate::services::archive::Failure;
-use crate::services::settings::{Switch, why_refused};
-use crate::services::{ActiveServices as _, ArchiveState};
+use crate::services::settings::{Ended, MoveState, Switch, why_refused};
+use crate::services::{ActiveServices as _, ArchiveState, SettingsService};
 use crate::system;
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
@@ -213,6 +217,11 @@ impl UnavailablePage {
         let asking = self.asking.clone()?;
         let c = &theme.colors;
         let room = overlay::room(window.viewport_size(), theme);
+        let warning = match &asking {
+            Asking::Different(folder) | Asking::Open(folder) | Asking::Make(folder) => {
+                super::settings::synced_warning(folder, theme)
+            }
+        };
         let (title, what, yes) = match &asking {
             Asking::Different(folder) => (
                 "That folder holds a different archive. Open it instead?",
@@ -263,7 +272,8 @@ impl UnavailablePage {
                             .text_color(c.fg2)
                             .text_spec(&theme.text.body)
                             .child(what),
-                    ),
+                    )
+                    .children(warning),
             )
             .child(
                 div()
@@ -343,6 +353,7 @@ impl Render for UnavailablePage {
         let failure = failure.clone();
         let folder = archive.dir().display().to_string();
         let settings = services.settings.read(cx);
+        let moved = moved_line(archive.dir(), settings);
         let last = settings.settings().last.clone();
         let switch = settings.switch().cloned();
         let opening = settings.is_switching();
@@ -555,6 +566,13 @@ impl Render for UnavailablePage {
                         )
                     })
                     .child(paragraph(said))
+                    .children(moved.map(|moved| {
+                        div()
+                            .text_spec(&theme.text.secondary)
+                            .text_color(c.fg2)
+                            .child(moved)
+                            .automation_target("archive/moved")
+                    }))
                     .child(buttons)
                     .children(note.map(|(color, text)| {
                         div()
@@ -568,6 +586,33 @@ impl Render for UnavailablePage {
             )
             .children(self.question(window, &theme, cx))
             .into_any_element()
+    }
+}
+
+/**
+ * What a move of the archive says of the folder `dir` that can't be opened (DESIGN §4.14):
+ * that the archive was moved here, and where the old copy may still be; or that a move from
+ * here didn't finish, so the app stayed here.
+ */
+fn moved_line(dir: &Path, settings: &SettingsService) -> Option<String> {
+    if let Some(moved) = settings.moved_here(dir) {
+        return Some(format!(
+            "Moved here from {} on {}. If you haven't deleted that folder, Use a different \
+             folder… opens the archive there as it was before the move.",
+            moved.from.display(),
+            format::day(moved.at, format::now())
+        ));
+    }
+    match settings.move_state() {
+        Some(MoveState::Ended(Ended::CutShort { from, to, .. }))
+            if archive::resolved(from) == archive::resolved(dir) =>
+        {
+            Some(format!(
+                "A move to {} didn't finish; scrollback stayed on this folder.",
+                to.display()
+            ))
+        }
+        _ => None,
     }
 }
 

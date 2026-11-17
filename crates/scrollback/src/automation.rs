@@ -35,8 +35,14 @@
 //!   and `fetch_all`, Fetch all again's `done` and `total` while it runs, or `null`), `deleted`
 //!   (each session deleted for good's `location`, whether it is `allowed` again, and its
 //!   `standing`: `deleted`, `allowed` or `archived_again`; `null` before the archive is read),
-//!   and `saved` (why the settings
-//!   aren't being saved, or `null`).
+//!   `saved` (why the settings aren't being saved, or `null`), `move` (Move…: `null`, or its
+//!   `state`, `checking`, `refused` with `why`, `asking` with the `files`, `bytes`, `needed`, `synced_by`
+//!   and `free` it found, `copying`, `finishing` or `switching` with `files_done`, `files`,
+//!   `bytes_done`, `bytes` and whether it is `stopping`, `clearing`, or how one that didn't
+//!   happen ended, `stopped`, `failed` with `why` or `cut_short`, each with what became of its
+//!   copy, `cleared`: `removed`, `partly`, `left` or `nothing`; and always the folder moved `to`), `moved`
+//!   (the archive's last move while it is still where it went: `from` and `to`, or `null`) and
+//!   `move_held` (a move waits at `hold_move`'s hold).
 //! - `system`: what the app asked of the operating system (`sb_ui::system`), never done in a
 //!   scripted run, oldest first: each request's `kind` (`reveal` with its `path`,
 //!   `pick_folder`, `open_url` with its `url`, `copy` with the `text` copied).
@@ -152,6 +158,10 @@
 //! - `release_sync {until?}` lets the waiting pass go on, and clears a hold no pass has
 //!   reached. Stopping the pass does too. With `until`, the pass waits again once it has
 //!   stored that many items, which steps it through a sync.
+//! - `hold_move {after}` makes the next move of the archive wait once it has copied `after`
+//!   files, and `release_move {}` lets it go on (Stop does too); both reply with
+//!   `state.settings`. The app is not settled while a move runs: wait for
+//!   `/settings/move_held` instead.
 //! - `stand_in {distros?, places?}` sets what the stand-ins answer from then on: `distros`,
 //!   WSL's installed distros (each `{name, running?, default?, utility?}`; `[]` is WSL with
 //!   none) or `{"error": …}` for a `wsl.exe` that fails, which are listed again at once; and
@@ -169,6 +179,7 @@ use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Context, Entity, Window};
 use gpui_appearance::{Appearance, Material, Mode};
 use gpui_automation::AutomationHost;
+use sb_core::archive::{Cleared, MoveStage};
 use sb_core::catalogue::{SessionId, Shelf};
 use sb_core::location::LocationKind;
 use sb_core::transcript::At;
@@ -180,7 +191,7 @@ use sb_core::transport::{
 use sb_ui::Shell;
 use sb_ui::pages::sessions::LineMeasure;
 use sb_ui::search::Palette;
-use sb_ui::services::settings::Switch;
+use sb_ui::services::settings::{Ended, MoveState, Switch};
 use sb_ui::services::sync::{Refetch, TestFailure, TestState};
 use sb_ui::services::upkeep::{Fix, Standing};
 use sb_ui::services::{
@@ -260,6 +271,8 @@ impl AutomationHost for ScrollbackAutomation {
             "set_appearance",
             "hold_sync",
             "release_sync",
+            "hold_move",
+            "release_move",
             "stand_in",
             "answer_picker",
             "update_ready",
@@ -333,6 +346,18 @@ impl AutomationHost for ScrollbackAutomation {
                     None => sync.release(),
                 });
                 sync(cx)
+            }),
+            "hold_move" => serde_json::from_value(args).map(|HoldMove { after }| {
+                let settings = cx.services().settings.clone();
+                settings.update(cx, |settings, _| {
+                    settings.hold_move_after(after, Held::Pause)
+                });
+                self::settings(self.shell.read(cx), cx)
+            }),
+            "release_move" => serde_json::from_value(args).map(|ReleaseMove {}| {
+                let settings = cx.services().settings.clone();
+                settings.update(cx, |settings, _| settings.release_move());
+                self::settings(self.shell.read(cx), cx)
             }),
             "stand_in" => serde_json::from_value(args).map(|StandIn { distros, places }| {
                 stage().places.extend(places);
@@ -679,7 +704,85 @@ fn settings(shell: &Shell, cx: &App) -> Value {
             },
         })).collect::<Vec<_>>()),
         "saved": settings.save_failure(),
+        "move": settings.move_state().map(move_state),
+        "moved": settings.moved_here(&archive).map(|moved| json!({
+            "from": moved.from.display().to_string(),
+            "to": moved.to.display().to_string(),
+        })),
+        "move_held": settings.is_move_held(),
     })
+}
+
+/// `state.settings.move`: where Move… stands.
+fn move_state(state: &MoveState) -> Value {
+    let cleared = |cleared: &Cleared| match cleared {
+        Cleared::Removed => "removed",
+        Cleared::Partly(_) => "partly",
+        Cleared::Left => "left",
+        Cleared::Nothing => "nothing",
+    };
+    match state {
+        MoveState::Checking(folder) => {
+            json!({ "state": "checking", "to": folder.display().to_string() })
+        }
+        MoveState::Refused { folder, why } => json!({
+            "state": "refused",
+            "to": folder.display().to_string(),
+            "why": why,
+        }),
+        MoveState::Asking(plan) => json!({
+            "state": "asking",
+            "to": plan.target.display().to_string(),
+            "files": plan.files,
+            "bytes": plan.bytes,
+            "needed": plan.needed,
+            "free": plan.free,
+            "synced_by": plan.synced_by,
+        }),
+        MoveState::Running(running) => json!({
+            "state": match running.progress.stage {
+                MoveStage::Copying => "copying",
+                MoveStage::Finishing => "finishing",
+                MoveStage::Switching => "switching",
+            },
+            "to": running.plan.target.display().to_string(),
+            "files_done": running.progress.files_done,
+            "files": running.progress.files,
+            "bytes_done": running.progress.bytes_done,
+            "bytes": running.progress.bytes,
+            "stopping": running.is_stopping(),
+        }),
+        MoveState::Clearing(moving) => {
+            json!({ "state": "clearing", "to": moving.to.display().to_string() })
+        }
+        MoveState::Ended(ended) => match ended {
+            Ended::Stopped {
+                to, cleared: what, ..
+            } => json!({
+                "state": "stopped",
+                "to": to.display().to_string(),
+                "cleared": cleared(what),
+            }),
+            Ended::Failed {
+                to,
+                why,
+                cleared: what,
+                ..
+            } => json!({
+                "state": "failed",
+                "to": to.display().to_string(),
+                "why": why,
+                "cleared": cleared(what),
+            }),
+            Ended::CutShort {
+                to, cleared: what, ..
+            } => json!({
+                "state": "cut_short",
+                "to": to.display().to_string(),
+                "cleared": cleared(what),
+            }),
+        },
+    }
 }
 
 /// `state.palette`: the search palette, while it is open.
@@ -898,6 +1001,18 @@ struct HoldSync {
 struct ReleaseSync {
     until: Option<usize>,
 }
+
+/// `hold_move {"after": files}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HoldMove {
+    after: usize,
+}
+
+/// `release_move {}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseMove {}
 
 /// `stand_in {distros?, places?}`.
 #[derive(Debug, Deserialize)]

@@ -6,7 +6,8 @@
 //! it or inside another archive, and a folder that holds anything but an archive are refused
 //! at once, and any other asks to confirm, saying whether its archive opens or a new one is made
 //! there. Confirmed, the app moves onto it (`SettingsService::use_folder`). While it does, every
-//! action on the page is disabled: nothing more is to start on the archive being left.
+//! action on the page is disabled: nothing more is to start on the archive being left. So it is
+//! while **Move…** ([`super::moving`]) looks at a folder or moves the archive into it.
 
 use gpui::{
     AnyElement, AppContext as _, Context, InteractiveElement as _, IntoElement, ParentElement as _,
@@ -131,6 +132,7 @@ impl SettingsPage {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(theme.spacing.md)
                     .child(
@@ -160,6 +162,18 @@ impl SettingsPage {
                         .child(icon(SbIcon::Folder, theme.sizes.icon_xs, c.fg2))
                         .child("Use a different folder…")
                         .automation_target("settings/archive/use-folder"),
+                    )
+                    .child(
+                        button("settings-move", ButtonKind::Plain, true, !opening, theme)
+                            .debug_selector(|| "settings-move".into())
+                            .when(!opening, |this| {
+                                this.on_click(
+                                    cx.listener(|this, _, _, cx| this.choose_move_folder(cx)),
+                                )
+                            })
+                            .child(icon(SbIcon::FolderInput, theme.sizes.icon_xs, c.fg2))
+                            .child("Move…")
+                            .automation_target("settings/archive/move"),
                     ),
             )
             .child(
@@ -167,11 +181,13 @@ impl SettingsPage {
                     .text_spec(&theme.text.secondary)
                     .text_color(c.fg3)
                     .child(
-                        "An archive already in that folder opens; an empty folder gets a new \
-                         one. This archive stays where it is. The setting lives with the app, \
-                         not in the archive.",
+                        "Move… copies this archive into an empty folder and switches to it. Use \
+                         a different folder… opens the archive already in a folder, or makes a \
+                         new one in an empty folder; this archive stays where it is. The \
+                         setting lives with the app, not in the archive.",
                     ),
             )
+            .children(self.move_lines(theme, cx))
             .children(switch.map(|switch| {
                 match switch {
                     Switch::Opening(folder) => div()
@@ -299,7 +315,8 @@ impl SettingsPage {
                     .child(div().text_color(c.fg2).text_spec(&theme.text.body).child(
                         "The archive open now stays where it is, as it is. Nothing is \
                                  moved, and you can come back to it the same way.",
-                    )),
+                    ))
+                    .children(super::moving::synced_warning(&chosen.folder, theme)),
             )
             .child(
                 div()

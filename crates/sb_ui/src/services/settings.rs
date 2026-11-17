@@ -6,24 +6,32 @@
 //! with the archive.
 //!
 //! **The file** is `{"v": 1, "archive": …, "mode": …, "material": …, "sync_every": …,
-//! "last_archive": {"id", "opened", "sessions", "bytes"}}`, as dv keeps its own (`archive`
-//! and `material` only once the owner chose them). A missing key takes its default, a value
-//! that can't be read is logged and takes its default, and keys this version doesn't know are
-//! written back as they were. But a file that is there and can't be read at all (not JSON, a
-//! newer version's, an archive folder that isn't a full path) is not guessed at: no archive is
-//! opened or made, the archive-unavailable page says why (DESIGN §4.14), and the file is not
-//! written until the owner chooses an archive there. The folder is always written in full. A
-//! change is written at once in the background through a temporary file and a rename, so a
-//! crash never leaves half a file; one made while a write runs is written after it. A write
-//! that fails is said in Settings and tried again with the next change and when the app quits.
+//! "last_archive": {"id", "opened", "sessions", "bytes"}, "move": {"v": 1, "id", "from",
+//! "to", "made", "started"}, "moved": {"v": 1, "from", "to", "at"}}`, as dv keeps its own
+//! (`archive` and `material` only once the owner chose them; `move` while a move of the archive runs,
+//! `moved` after one until the owner dismisses it: [`moving`]). A missing key takes its
+//! default, a value that can't be read is logged and takes its default, and keys this version
+//! doesn't know are written back as they were. But a file that is there and can't be read at
+//! all (not JSON, a newer version's, an archive folder that isn't a full path, a `move` that
+//! can't be read) is not guessed at: no archive is opened or made, the archive-unavailable page
+//! says why (DESIGN §4.14), and the file is not written until the owner chooses an archive
+//! there. The folder is always written in full. A change is written at once in the background
+//! through a temporary file moved over the file, flushed so that a power cut after it never
+//! brings the old file back; one made while a write runs is written after it. A write that
+//! fails is said in Settings and tried again with the next change and when the app quits.
+//! While a move finishes no write starts: the move's own is the one that names the new folder.
 //!
 //! **The service** also says whether Settings is shown in the main area, and carries out
 //! **Use a different folder…** ([`SettingsService::use_folder`]): the archive there is opened,
 //! or made when the folder holds nothing (PLAN §4.4), and only once it is open is the app
 //! moved onto it ([`super::reopen`]); a folder that holds anything else is refused. Nothing is
-//! moved, and the archive left stays as it is.
+//! moved, and the archive left stays as it is. **Move…** is [`moving`]'s.
 
-use std::io::{self, Write as _};
+mod moving;
+
+pub use moving::{Ended, MoveState, Running, WAIT_FOR_THE_MOVE};
+
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -139,6 +147,107 @@ impl LastArchive {
     }
 }
 
+/// The `"v"` of `move` and `moved` this version writes.
+const MOVE_VERSION: u64 = 1;
+
+/**
+ * A move of the archive under way (PLAN §4.4): written before anything is made in `to`, and
+ * taken out by the very write that points `archive` at `to`. A start that finds one knows the
+ * move was cut short, with the archive still in `from`.
+ */
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Moving {
+    /// The move's id, which its marker in `to` names too.
+    pub id: String,
+    pub from: PathBuf,
+    pub to: PathBuf,
+    /// Whether the move made `to`: a start after a crash takes it away again when the move
+    /// had put nothing in it yet.
+    pub made: bool,
+    /// In Unix milliseconds.
+    pub started: i64,
+}
+
+/// The archive's last move, kept until the owner dismisses it: where the old copy is, which
+/// is theirs to delete (DESIGN §4.13).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Moved {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    /// In Unix milliseconds.
+    pub at: i64,
+}
+
+/// `value`'s `"v"`, if it is this version's, and its folder `key` as a full path.
+fn moving_folder(value: &Value, key: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(value.get(key)?.as_str()?);
+    path.is_absolute().then_some(path)
+}
+
+impl Moving {
+    /// The record, or why it can't be read: then nothing is (the module docs).
+    fn parse(value: &Value) -> Result<Self, String> {
+        let unreadable = || format!("its move of the archive, {value}, can't be read");
+        match value.get("v").and_then(Value::as_u64) {
+            Some(MOVE_VERSION) => {}
+            Some(v) if v > MOVE_VERSION => {
+                return Err(format!(
+                    "its move of the archive was written by a newer scrollback (version {v})"
+                ));
+            }
+            _ => return Err(unreadable()),
+        }
+        Ok(Self {
+            id: value
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(unreadable)?
+                .to_string(),
+            from: moving_folder(value, "from").ok_or_else(unreadable)?,
+            to: moving_folder(value, "to").ok_or_else(unreadable)?,
+            made: value
+                .get("made")
+                .and_then(Value::as_bool)
+                .ok_or_else(unreadable)?,
+            started: value
+                .get("started")
+                .and_then(Value::as_i64)
+                .ok_or_else(unreadable)?,
+        })
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "v": MOVE_VERSION,
+            "id": self.id,
+            "from": self.from.display().to_string(),
+            "to": self.to.display().to_string(),
+            "made": self.made,
+            "started": self.started,
+        })
+    }
+}
+
+impl Moved {
+    fn parse(value: &Value) -> Option<Self> {
+        (value.get("v")?.as_u64()? == MOVE_VERSION).then_some(())?;
+        Some(Self {
+            from: moving_folder(value, "from")?,
+            to: moving_folder(value, "to")?,
+            at: value.get("at")?.as_i64()?,
+        })
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "v": MOVE_VERSION,
+            "from": self.from.display().to_string(),
+            "to": self.to.display().to_string(),
+            "at": self.at,
+        })
+    }
+}
+
 /// The settings file's contents.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AppSettings {
@@ -151,6 +260,10 @@ pub struct AppSettings {
     pub sync_every: SyncEvery,
     /// The archive last opened.
     pub last: Option<LastArchive>,
+    /// A move of the archive under way, or cut short.
+    pub moving: Option<Moving>,
+    /// The archive's last move, until the owner dismisses it.
+    pub moved: Option<Moved>,
     /// Keys this version doesn't know, written back as they were read.
     extra: Map<String, Value>,
 }
@@ -211,6 +324,15 @@ impl AppSettings {
                 problems.push(format!("\"last_archive\" is {last}; forgetting it"));
             }
         }
+        if let Some(moving) = object.remove("move") {
+            settings.moving = Some(Moving::parse(&moving)?);
+        }
+        if let Some(moved) = object.remove("moved") {
+            settings.moved = Moved::parse(&moved);
+            if settings.moved.is_none() {
+                problems.push(format!("\"moved\" is {moved}; forgetting it"));
+            }
+        }
         settings.extra = object;
         Ok((settings, problems))
     }
@@ -229,6 +351,12 @@ impl AppSettings {
         object.insert("sync_every".to_string(), json!(self.sync_every.key()));
         if let Some(last) = &self.last {
             object.insert("last_archive".to_string(), last.to_json());
+        }
+        if let Some(moving) = &self.moving {
+            object.insert("move".to_string(), moving.to_json());
+        }
+        if let Some(moved) = &self.moved {
+            object.insert("moved".to_string(), moved.to_json());
         }
         object.extend(self.extra.clone());
         let mut text = serde_json::to_string_pretty(&Value::Object(object))
@@ -283,32 +411,16 @@ pub fn load(data_dir: &Path) -> Loaded {
     }
 }
 
-/**
- * Writes `contents` to `path` through a temporary file beside it and a rename, so a reader sees
- * the old file or the new one, never part of one; on Unix the folder is flushed after, so the
- * rename itself survives a crash.
- */
-fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let temporary = tempfile::NamedTempFile::new_in(dir)?;
-    temporary.as_file().write_all(contents.as_bytes())?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
-    #[cfg(unix)]
-    std::fs::File::open(dir)?.sync_all()?;
-    Ok(())
-}
-
 /// Writes `text`, the settings as of `generation`, unless the file holds a later generation
-/// already.
-fn write_newer(on_disk: &Mutex<u64>, path: &Path, generation: u64, text: &str) -> io::Result<()> {
+/// already (the module docs); whether it was written.
+fn write_newer(on_disk: &Mutex<u64>, path: &Path, generation: u64, text: &str) -> io::Result<bool> {
     let mut newest = on_disk.lock().unwrap_or_else(PoisonError::into_inner);
-    if *newest < generation {
-        write_atomically(path, text)?;
-        *newest = generation;
+    if *newest >= generation {
+        return Ok(false);
     }
-    Ok(())
+    archive::write_durably(path, text.as_bytes())?;
+    *newest = generation;
+    Ok(true)
 }
 
 /// A different folder being opened as the archive (the module docs).
@@ -349,6 +461,16 @@ pub struct SettingsService {
     /// Whether Settings is shown in the main area.
     shown: bool,
     switch: Option<Switch>,
+    /// Move… ([`moving`]): where it stands, from the folder being looked at to how it ended.
+    move_state: Option<moving::MoveState>,
+    /// A move is finishing: no write starts until the move's own has pointed the file at the
+    /// new folder, or the move has failed ([`moving`]).
+    holding: bool,
+    /// The owner asked to quit while a move finished: the app quits once it has.
+    quit_after: bool,
+    /// Where the next move waits or stops, for the tests and the scenarios.
+    #[cfg(any(test, feature = "automation"))]
+    move_hold: moving::Hold,
     /// The installer's folder, in an installed copy: its uninstaller removes it, so no
     /// archive may be there ([`Self::refusal`]).
     install_root: Option<PathBuf>,
@@ -368,7 +490,7 @@ impl SettingsService {
         install_root: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self {
+        let mut this = Self {
             path: loaded.data_dir.join(SETTINGS_FILE),
             data_dir: loaded.data_dir,
             settings: loaded.settings,
@@ -381,12 +503,19 @@ impl SettingsService {
             save_failure: None,
             shown: false,
             switch: None,
+            move_state: None,
+            holding: false,
+            quit_after: false,
+            #[cfg(any(test, feature = "automation"))]
+            move_hold: moving::Hold::default(),
             install_root,
             _quit: cx.on_app_quit(|this: &mut Self, _| {
                 this.flush();
                 async {}
             }),
-        }
+        };
+        this.recover_move(cx);
+        this
     }
 
     pub fn settings(&self) -> &AppSettings {
@@ -438,9 +567,10 @@ impl SettingsService {
         self.switch.as_ref()
     }
 
-    /// Whether the app is moving onto another archive: nothing else is to be started.
+    /// Whether the app is moving onto another archive, or moving the archive: nothing else is
+    /// to be started.
     pub fn is_switching(&self) -> bool {
-        matches!(self.switch, Some(Switch::Opening(_)))
+        matches!(self.switch, Some(Switch::Opening(_))) || self.is_moving()
     }
 
     /// Nothing is being written or switched to: automation's `settled`.
@@ -521,17 +651,10 @@ impl SettingsService {
      * with an archive open or not), the archive open now, or a folder inside it.
      */
     pub fn refusal(&self, folder: &Path, cx: &gpui::App) -> Option<&'static str> {
-        let chosen = resolved(folder);
-        if self
-            .install_root
-            .as_deref()
-            .is_some_and(|root| chosen.starts_with(resolved(root)))
-        {
-            return Some(
-                "That folder is inside scrollback's install folder, which uninstalling removes. \
-                 Choose one outside it.",
-            );
+        if let Some(why) = self.inside_install(folder) {
+            return Some(why);
         }
+        let chosen = resolved(folder);
         let archive = cx.services().archive.read(cx);
         archive.archive()?;
         let current = resolved(archive.dir());
@@ -542,6 +665,18 @@ impl SettingsService {
         } else {
             None
         }
+    }
+
+    /// Why no archive may be in `folder`: it is inside the installer's folder, which its
+    /// uninstaller removes.
+    fn inside_install(&self, folder: &Path) -> Option<&'static str> {
+        self.install_root
+            .as_deref()
+            .is_some_and(|root| resolved(folder).starts_with(resolved(root)))
+            .then_some(
+                "That folder is inside scrollback's install folder, which uninstalling removes. \
+                 Choose one outside it.",
+            )
     }
 
     /**
@@ -625,7 +760,11 @@ impl SettingsService {
     /// Writes the settings as they are now unless a write runs; that one writes again when it
     /// ends, if they changed meanwhile. One that fails is tried again with the next change.
     fn save(&mut self, cx: &mut Context<Self>) {
-        if self.saving.is_some() || self.written == self.generation || self.unreadable.is_some() {
+        if self.saving.is_some()
+            || self.written == self.generation
+            || self.unreadable.is_some()
+            || self.holding
+        {
             return;
         }
         let (path, generation, text) =
@@ -638,7 +777,7 @@ impl SettingsService {
             this.update(cx, |this, cx| {
                 this.saving = None;
                 match written {
-                    Ok(()) => {
+                    Ok(_) => {
                         this.written = generation;
                         this.save_failure = None;
                         this.save(cx);
@@ -654,12 +793,13 @@ impl SettingsService {
         }));
     }
 
-    /// Writes what is unwritten, now: the app is quitting.
+    /// Writes what is unwritten, now: the app is quitting. Not while a move finishes: what the
+    /// file says then is the move's to write.
     fn flush(&mut self) {
-        if self.written != self.generation && self.unreadable.is_none() {
+        if self.written != self.generation && self.unreadable.is_none() && !self.holding {
             let text = self.settings.to_json();
             match write_newer(&self.on_disk, &self.path, self.generation, &text) {
-                Ok(()) => self.written = self.generation,
+                Ok(_) => self.written = self.generation,
                 Err(error) => log::error!("the settings couldn't be saved at quit: {error}"),
             }
         }
@@ -681,6 +821,7 @@ pub fn why_refused(folder: &Path, error: &archive::ArchiveError) -> String {
             folder.display(),
             other.display()
         ),
+        archive::ArchiveError::OnNetwork(_) => moving::ON_NETWORK.to_string(),
         archive::ArchiveError::Locked(_) => {
             "The archive there is open in another scrollback window.".to_string()
         }
@@ -775,6 +916,66 @@ mod tests {
         ] {
             assert!(AppSettings::parse(text).is_err(), "{text}");
         }
+    }
+
+    /// A move under way and the last one are kept as they were written. A move that can't be
+    /// read makes the file unreadable, as an archive folder does: it says where the archive is
+    /// while it runs. The last move, which only says where the old copy is, is forgotten.
+    #[test]
+    fn a_move_is_kept_and_one_that_cant_be_read_is_not_guessed_at() {
+        let (from, to) = if cfg!(windows) {
+            (
+                r"C:\Users\user\AppData\Local\scrollback\archive",
+                r"D:\scrollback",
+            )
+        } else {
+            (
+                "/Users/user/Library/Application Support/scrollback/archive",
+                "/Volumes/Backup/scrollback",
+            )
+        };
+        let settings = AppSettings {
+            archive: Some(PathBuf::from(to)),
+            moving: Some(Moving {
+                id: "4f1c".to_string(),
+                from: PathBuf::from(from),
+                to: PathBuf::from(to),
+                made: true,
+                started: 1_791_115_200_000,
+            }),
+            moved: Some(Moved {
+                from: PathBuf::from(from),
+                to: PathBuf::from(to),
+                at: 1_791_115_260_000,
+            }),
+            ..AppSettings::default()
+        };
+        assert_eq!(
+            AppSettings::parse(&settings.to_json()),
+            Ok((settings, Vec::new()))
+        );
+
+        let with = |moving: Value| json!({"v": 1, "move": moving}).to_string();
+        let whole =
+            json!({"v": 1, "id": "4f1c", "from": from, "to": to, "made": true, "started": 1});
+        assert!(AppSettings::parse(&with(whole.clone())).is_ok());
+        for broken in [
+            json!(3),
+            json!({"v": 2, "id": "4f1c", "from": from, "to": to, "made": true, "started": 1}),
+            json!({"id": "4f1c", "from": from, "to": to, "made": true, "started": 1}),
+            json!({"v": 1, "from": from, "to": to, "made": true, "started": 1}),
+            json!({"v": 1, "id": "4f1c", "from": "archive", "to": to, "made": true, "started": 1}),
+            json!({"v": 1, "id": "4f1c", "from": from, "to": to, "made": true}),
+            json!({"v": 1, "id": "4f1c", "from": from, "to": to, "started": 1}),
+        ] {
+            assert!(
+                AppSettings::parse(&with(broken.clone())).is_err(),
+                "{broken}"
+            );
+        }
+        let (read, problems) =
+            AppSettings::parse(&json!({"v": 1, "moved": {"v": 2}}).to_string()).unwrap();
+        assert_eq!((read.moved, problems.len()), (None, 1));
     }
 
     /// A write of an older snapshot that ends after a newer one (a background save after the

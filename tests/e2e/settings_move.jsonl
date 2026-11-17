@@ -1,0 +1,63 @@
+{"scenario": {"window_size": "1440x900", "fixture": "settings", "description": "Move… (DESIGN §4.13, PLAN §4.4) over the archive Settings captures, damaged transcripts and all: a folder that holds something is refused in words before any question; an empty one is asked about with what the move copies and needs; the move, held after its first files, shows its progress and Stop; let go, the app is on the copy, which a verify checks, and the card says where the old folder is, with Show in the file manager for it and no way to delete it; the next start opens the copy. Each state captured dark and light"}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/sync/syncing", "equals": false}, {"pointer": "/settings/move", "equals": null}, {"pointer": "/settings/moved", "equals": null}]}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+{"cmd": "key", "keystroke": "secondary-,"}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "settings"}, {"pointer": "/settings/default", "equals": true}]}
+{"cmd": "bounds", "target": "settings/archive/move", "expect_result": {"pointer": "/visible", "not_equals": null}}
+
+// A folder that holds something is refused in words, before any question, and nothing is made there.
+{"cmd": "answer_picker", "folder": "${workspace}"}
+{"cmd": "click", "target": "settings/archive/move"}
+{"cmd": "settle", "expect": [{"pointer": "/settings/move/state", "equals": "refused"}, {"pointer": "/settings/move/why", "contains": "isn't empty"}]}
+{"cmd": "bounds", "target": "settings/move/refused", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "refused-dark"}
+{"cmd": "click", "target": "settings/move/dismiss"}
+{"cmd": "settle", "expect": {"pointer": "/settings/move", "equals": null}}
+
+// An empty folder: the question says what is copied, what it needs and what the volume has free; Cancel is where the keyboard is.
+{"cmd": "answer_picker", "folder": "${out_dir}/moved-archive"}
+{"cmd": "click", "target": "settings/archive/move"}
+{"cmd": "settle", "expect": [{"pointer": "/settings/move/state", "equals": "asking"}, {"pointer": "/settings/move/files", "gte": 10}, {"pointer": "/settings/move/to", "contains": "moved-archive"}]}
+{"cmd": "bounds", "target": "settings/move-confirm", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "settings/move-confirm/room", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "confirm-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "confirm-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// Moving, held after its first files so that nothing depends on the machine's speed: the bar, the counts and Stop. Syncing goes on meanwhile; the app is settled again only once the move is over.
+{"cmd": "hold_move", "after": 2, "expect_result": {"pointer": "/move_held", "equals": false}}
+{"cmd": "click", "target": "settings/move-confirm/ok"}
+{"cmd": "wait_for", "pointer": "/settings/move_held", "equals": true, "timeout_ms": 30000}
+{"cmd": "wait_for", "pointer": "/settings/move/files_done", "equals": 2, "timeout_ms": 10000}
+{"cmd": "state", "expect": [{"pointer": "/settings/move/state", "equals": "copying"}, {"pointer": "/settings/archive", "contains": "archive"}, {"pointer": "/settings/default", "equals": true}]}
+{"cmd": "bounds", "target": "settings/move/progress", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "settings/move/stop", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "moving-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "wait_frames", "n": 3}
+{"cmd": "screenshot", "name": "moving-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// Let go, it finishes: the app is on the copy, Settings still shows, a verify of the copy finds the two damaged transcripts the archive had, and the card says where the old folder is.
+{"cmd": "release_move", "expect_result": {"pointer": "/move_held", "equals": false}}
+{"cmd": "settle", "timeout_ms": 60000, "expect": [{"pointer": "/settings/move", "equals": null}, {"pointer": "/page", "equals": "settings"}, {"pointer": "/settings/archive", "contains": "moved-archive"}, {"pointer": "/settings/default", "equals": false}, {"pointer": "/settings/moved/to", "contains": "moved-archive"}, {"pointer": "/settings/verify/running", "equals": false}, {"pointer": "/settings/verify/last/problems", "len": 2}, {"pointer": "/settings/stats/sessions", "gte": 1}]}
+{"cmd": "bounds", "target": "settings/moved", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "moved-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "moved-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+
+// Show in the file manager is for the old folder, through the seam; nothing offers to delete it.
+{"cmd": "click", "target": "settings/moved/reveal"}
+{"cmd": "settle", "expect": [{"pointer": "/system", "len": 3}, {"pointer": "/system/2/kind", "equals": "reveal"}, {"pointer": "/system/2/path", "contains": "archive"}]}
+{"cmd": "query", "prefix": "settings/moved/", "expect_result": {"pointer": "", "len": 2}}
+
+// The next start opens the copy, and still says where the old folder is.
+{"restart": {}}
+{"cmd": "wait_ready", "timeout_ms": 30000}
+{"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/settings/archive", "contains": "moved-archive"}, {"pointer": "/settings/moved/to", "contains": "moved-archive"}, {"pointer": "/settings/move", "equals": null}]}
