@@ -21,7 +21,8 @@
 //! Deleting for good is meant to leave nothing (PLAN §4.5). Its text is forgotten at once, so
 //! search no longer finds it; SQLite's `secure_delete` overwrites what a write frees; and the
 //! write-ahead log is emptied. What is still left of it then, its entries the index marked
-//! deleted, goes when the archive's background removal compacts the index
+//! deleted and copies of cells a rebalance left in the unused middle of a page, goes when the
+//! archive's background removal compacts the index and writes the file anew
 //! ([`SearchIndex::compact`]).
 
 use std::collections::{BTreeSet, HashMap};
@@ -174,11 +175,22 @@ pub(crate) struct SearchIndex {
     /// text is written after the session it is of was deleted for good, and no row says it is
     /// searchable when its text is not there.
     writing: Mutex<()>,
-    /// A compaction runs ([`SearchIndex::compact`]): text that would wait for it is left to the
-    /// index's backlog instead, so rows never wait on it.
+    /// Held by the compaction under way ([`SearchIndex::compact`]), one at a time.
+    compaction: Mutex<()>,
+    /// A compaction runs: text that would wait for it may be left to the index's backlog
+    /// instead ([`SearchIndex::record`]), so rows never wait on it.
     compacting: AtomicBool,
-    /// What stops the compaction under way, while one runs.
+    /// What stops the compaction's statement under way, while one runs.
     interrupt: Mutex<Option<rusqlite::InterruptHandle>>,
+}
+
+/// What [`SearchIndex::record`] did with text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Recorded {
+    /// It wrote so many sessions' text: text the index had already is not counted.
+    Written(usize),
+    /// The index is being compacted, and the text was left for the backlog, as asked.
+    Deferred,
 }
 
 impl std::fmt::Debug for SearchIndex {
@@ -229,6 +241,7 @@ impl SearchIndex {
                 db,
                 log: Log::new(path),
                 writing: Mutex::default(),
+                compaction: Mutex::default(),
                 compacting: AtomicBool::new(false),
                 interrupt: Mutex::default(),
             },
@@ -271,24 +284,31 @@ impl SearchIndex {
      * that `still` says, once nothing else writes or forgets, the catalogue still has the row
      * the text was made of. Then, before anything else writes or forgets, `written` hears
      * those whose text is now that, each session with what its text was made of, for their
-     * rows to say so. Returns how many were written: text the index has already is not.
+     * rows to say so.
      *
-     * While the index is compacted none is written, and none of the rows says so: what is
-     * being indexed doesn't wait for it, and the text is the backlog's (PLAN §10).
+     * While the index is compacted, with `wait` it waits for the compaction to end; without,
+     * none is written and none of the rows says so ([`Recorded::Deferred`]): what is being
+     * indexed doesn't wait for it, and the text is the backlog's (PLAN §10).
      */
     pub(crate) fn record(
         &self,
         texts: &[Text],
+        wait: bool,
         still: impl Fn(&Text) -> Result<bool, SearchError>,
         written: impl FnOnce(&[(SessionId, String)]) -> Result<(), SearchError>,
-    ) -> Result<usize, SearchError> {
+    ) -> Result<Recorded, SearchError> {
         let recorded = (|| {
-            let Some(_writing) = self.writing_unless_compacting() else {
-                return Ok(0);
+            let writing = if wait {
+                Some(self.writing.lock().unwrap_or_else(PoisonError::into_inner))
+            } else {
+                self.writing_unless_compacting()
+            };
+            let Some(_writing) = writing else {
+                return Ok(Recorded::Deferred);
             };
             let (done, wrote) = self.write_texts(texts, still)?;
             written(&done)?;
-            Ok(wrote)
+            Ok(Recorded::Written(wrote))
         })();
         self.log.retry();
         recorded
@@ -533,79 +553,95 @@ impl SearchIndex {
     pub(crate) fn compaction_due(&self) -> Result<bool, SearchError> {
         self.db.read(|c| {
             let marked: i64 = c.query_row("SELECT spans FROM marked", [], |row| row.get(0))?;
+            if marked == 0 {
+                return Ok(false);
+            }
             let spans: i64 = c.query_row("SELECT count(*) FROM span", [], |row| row.get(0))?;
-            Ok(marked > 0 && marked * COMPACT_SHARE >= spans)
+            Ok(marked * COMPACT_SHARE >= spans)
         })
     }
 
-    /// About how much room on its disk compacting the index takes: a copy of the index's
-    /// entries, written once into the database's log and once into the database, before the
-    /// parts it replaces are let go of.
-    pub(crate) fn compaction_room(&self) -> Result<u64, SearchError> {
+    /**
+     * How much room on its disk a compaction takes at most ([`SearchIndex::compact`]): the
+     * index's entries three times over (a new copy of them, in the log and then in the
+     * database, and the pages of the old one overwritten, as `secure_delete` does, in the log);
+     * and with `vacuum`, the file twice more (a copy made aside, and its pages in the log).
+     */
+    pub(crate) fn compaction_room(&self, vacuum: bool) -> Result<u64, SearchError> {
         self.db.read(|c| {
             let entries: i64 = c.query_row(
                 "SELECT coalesce(sum(length(block)), 0) FROM span_text_data",
                 [],
                 |row| row.get(0),
             )?;
-            Ok(u64::try_from(entries).unwrap_or(0).saturating_mul(2))
+            let file: i64 = c.query_row(
+                "SELECT page_count * page_size FROM pragma_page_count, pragma_page_size",
+                [],
+                |row| row.get(0),
+            )?;
+            let (entries, file) = (as_bytes(entries), as_bytes(file));
+            let vacuumed = if vacuum { file.saturating_mul(2) } else { 0 };
+            Ok(entries.saturating_mul(3).saturating_add(vacuumed))
         })
     }
 
     /**
-     * Compacts the index: FTS5's `optimize` merges it into one part, and leaves out what was
-     * marked deleted, whose pages SQLite's `secure_delete` overwrites as it lets them go. Then
-     * empties the log, so what was taken out is in no file (PLAN §4.5). Searches go on
-     * meanwhile, of the index as it was; text being written is left to the backlog
-     * ([`SearchIndex::record`]); a forget waits. `stop` is asked every few tens of milliseconds
-     * and ends it at once, with nothing changed ([`SearchError::Cancelled`]). A log a read held
-     * is [`SearchError::Unavailable`]: compacted, but not yet out of every file.
+     * Compacts the index: FTS5's `rebuild` makes it again from the spans there are, so it
+     * holds nothing that was marked deleted; the pages it lets go of SQLite's `secure_delete`
+     * overwrites. (`optimize`, which merges the parts instead, took about a second less on a
+     * few thousand sessions and left nearly three times the entries for the same text.) With
+     * `vacuum` (a delete for good's, PLAN §4.5), it then writes the file anew (`VACUUM`), so
+     * no page keeps a copy of a cell a rebalance left in it, which `secure_delete` doesn't
+     * reach. Then empties the log, so what was taken out is in no file. Searches go on
+     * meanwhile, of the index as it was; text being written is left to the backlog, or waits,
+     * as its writer asks ([`SearchIndex::record`]); a forget waits. One compaction runs at a
+     * time.
+     *
+     * The disk is to have the room ([`SearchIndex::compaction_room`]), else it is
+     * [`SearchError::Unavailable`], saying what it needs. `stop` is asked every few tens of
+     * milliseconds and ends it at once, with nothing changed ([`SearchError::Cancelled`]). A
+     * log a read held is [`SearchError::Unavailable`] too: compacted, but not yet out of every
+     * file.
      */
-    pub(crate) fn compact(&self, stop: &(dyn Fn() -> bool + Sync)) -> Result<(), SearchError> {
+    pub(crate) fn compact(
+        &self,
+        vacuum: bool,
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), SearchError> {
+        let _one = self
+            .compaction
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let needs = self.compaction_room(vacuum)?;
+        if let Ok(free) = disk::free_space(self.log.path.parent().unwrap_or(Path::new(".")))
+            && free < needs
+        {
+            return Err(SearchError::Unavailable(format!(
+                "compacting the search index takes about {} MB free, and there are {} MB",
+                needs >> 20,
+                free >> 20
+            )));
+        }
         self.compacting.store(true, Ordering::Relaxed);
-        let ended = AtomicBool::new(false);
-        let compacted = thread::scope(|scope| {
-            scope.spawn(|| {
-                while !ended.load(Ordering::Relaxed) {
-                    if stop() {
-                        let handle = self
-                            .interrupt
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner);
-                        if let Some(handle) = &*handle {
-                            handle.interrupt();
-                        }
-                    }
-                    thread::sleep(WATCH);
-                }
-            });
-            let writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
-            let compacted = self.db.write(|tx| {
-                *self
-                    .interrupt
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Some(tx.get_interrupt_handle());
-                let optimized = if stop() {
-                    Err(SearchError::Cancelled)
-                } else {
+        let compacted = self.watched(stop, || {
+            let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+            self.db.write(|tx| {
+                self.interruptible(tx, || {
                     tx.execute_batch(
-                        "INSERT INTO span_text (span_text) VALUES ('optimize');
-                             UPDATE marked SET spans = 0;",
+                        "INSERT INTO span_text (span_text) VALUES ('rebuild');
+                         UPDATE marked SET spans = 0;",
                     )
-                    .map_err(|error| match error.sqlite_error_code() {
-                        Some(rusqlite::ErrorCode::OperationInterrupted) => SearchError::Cancelled,
-                        _ => error.into(),
-                    })
-                };
-                *self
-                    .interrupt
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = None;
-                optimized
-            });
-            drop(writing);
-            ended.store(true, Ordering::Relaxed);
-            compacted
+                })
+            })?;
+            if vacuum {
+                /* Outside a transaction, so on a connection of its own; nothing else writes
+                while `writing` is held. */
+                let connection =
+                    Connection::open(disk::for_sqlite(&self.log.path, disk::SQLITE_FILE))?;
+                connection.busy_timeout(Duration::from_secs(5))?;
+                self.interruptible(&connection, || connection.execute_batch("VACUUM"))?;
+            }
+            Ok(())
         });
         self.compacting.store(false, Ordering::Relaxed);
         if compacted.is_err() {
@@ -620,6 +656,66 @@ impl SearchIndex {
             ));
         }
         Ok(())
+    }
+
+    /// Runs `work` while a thread asks `stop` every few tens of milliseconds and interrupts
+    /// what [`SearchIndex::interruptible`] runs when it says to. With no thread to be had, it
+    /// is asked once, before.
+    fn watched(
+        &self,
+        stop: &(dyn Fn() -> bool + Sync),
+        work: impl FnOnce() -> Result<(), SearchError>,
+    ) -> Result<(), SearchError> {
+        if stop() {
+            return Err(SearchError::Cancelled);
+        }
+        let ended = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let watching = thread::Builder::new()
+                .name("search-compact".to_string())
+                .spawn_scoped(scope, || {
+                    while !ended.load(Ordering::Relaxed) {
+                        if stop() {
+                            let handle = self
+                                .interrupt
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner);
+                            if let Some(handle) = &*handle {
+                                handle.interrupt();
+                            }
+                        }
+                        thread::sleep(WATCH);
+                    }
+                });
+            if let Err(error) = watching {
+                log::warn!("a compaction can't be stopped once it begins: {error}");
+            }
+            let worked = work();
+            ended.store(true, Ordering::Relaxed);
+            worked
+        })
+    }
+
+    /// Runs `statement` on `connection` so that a stop ([`SearchIndex::watched`]) interrupts
+    /// it, which is [`SearchError::Cancelled`].
+    fn interruptible(
+        &self,
+        connection: &Connection,
+        statement: impl FnOnce() -> rusqlite::Result<()>,
+    ) -> Result<(), SearchError> {
+        *self
+            .interrupt
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(connection.get_interrupt_handle());
+        let ran = statement();
+        *self
+            .interrupt
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        ran.map_err(|error| match error.sqlite_error_code() {
+            Some(rusqlite::ErrorCode::OperationInterrupted) => SearchError::Cancelled,
+            _ => error.into(),
+        })
     }
 
     /**
@@ -693,6 +789,11 @@ fn in_use(path: &Path) -> Result<(), SearchError> {
 
 /// How often a compaction asks whether it is to stop.
 const WATCH: Duration = Duration::from_millis(25);
+
+/// A size SQLite gave, as bytes: none when it is below zero.
+fn as_bytes(size: i64) -> u64 {
+    u64::try_from(size).unwrap_or(0)
+}
 
 /// Counts `spans` more as marked deleted in the index ([`MARKED_DELETED`]).
 fn mark(connection: &Connection, spans: i64) -> rusqlite::Result<()> {
@@ -840,23 +941,28 @@ mod tests {
         let (first, again) = (text("a"), text("b"));
         let written = search.record(
             &[first],
+            false,
             |_| Ok(true),
             |done| {
                 said.lock().unwrap().extend_from_slice(done);
                 Ok(())
             },
         );
-        assert_eq!(written.unwrap(), 0);
+        assert_eq!(written.unwrap(), Recorded::Deferred);
         assert!(said.lock().unwrap().is_empty());
         drop(held);
         search.compacting.store(false, Ordering::Relaxed);
         assert_eq!(
-            search.record(&[again], |_| Ok(true), |_| Ok(())).unwrap(),
-            1
+            search
+                .record(&[again], false, |_| Ok(true), |_| Ok(()))
+                .unwrap(),
+            Recorded::Written(1)
         );
     }
 
     /// A compaction that is to stop ends with nothing changed: what is marked stays counted.
+    /// This stops it at the check before it begins; the interrupt of a statement under way is
+    /// not reached here, as when it fires depends on how long the statement takes.
     #[test]
     fn a_compaction_stopped_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -868,8 +974,12 @@ mod tests {
             title: Some("Another title".to_string()),
             spans: Vec::new(),
         };
-        search.record(&[first], |_| Ok(true), |_| Ok(())).unwrap();
-        search.record(&[again], |_| Ok(true), |_| Ok(())).unwrap();
+        search
+            .record(&[first], false, |_| Ok(true), |_| Ok(()))
+            .unwrap();
+        search
+            .record(&[again], false, |_| Ok(true), |_| Ok(()))
+            .unwrap();
         let marked = || -> i64 {
             search
                 .read(|c| Ok(c.query_row("SELECT spans FROM marked", [], |row| row.get(0))?))
@@ -877,11 +987,11 @@ mod tests {
         };
         assert_eq!(marked(), 1);
         assert!(matches!(
-            search.compact(&|| true),
+            search.compact(false, &|| true),
             Err(SearchError::Cancelled)
         ));
         assert_eq!(marked(), 1);
-        search.compact(&|| false).unwrap();
+        search.compact(false, &|| false).unwrap();
         assert_eq!(marked(), 0);
     }
 }

@@ -60,13 +60,79 @@ impl Unscrubbed {
     }
 }
 
+/// The largest catalogue [`vacuum_catalogue`] writes anew: one written in about a second, so
+/// that no write waits for it long enough to give up (five seconds). A catalogue holds a few
+/// megabytes per thousand sessions.
+const VACUUM_MOST: u64 = 128 * 1024 * 1024;
+
+/// How often, and how far apart, [`vacuum_catalogue`] tries for the database while another
+/// connection writes: ten seconds in all.
+const VACUUM_TRIES: u32 = 100;
+const VACUUM_APART: std::time::Duration = std::time::Duration::from_millis(100);
+
+/**
+ * Writes the catalogue's file anew (`VACUUM`), on a connection of its own, so no page of
+ * it keeps a copy of a cell a delete's rebalance left there, which `secure_delete`
+ * doesn't overwrite (PLAN §4.5). It never waits on a write: while one holds the database
+ * it tries again a moment later, and gives up after a while; and a write never waits on it
+ * long, as it is done only for a catalogue that is written anew in about a second
+ * ([`VACUUM_MOST`]), the larger one said in the log and left. Its disk is to have room for
+ * the file twice over. `stop` ends it between tries.
+ */
+fn vacuum_catalogue(dir: &Path, stop: &(dyn Fn() -> bool + Sync)) -> Result<(), SearchError> {
+    let path = dir.join(crate::catalogue::DATABASE);
+    let size = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
+    if size > VACUUM_MOST {
+        log::warn!(
+            "the catalogue is {} MB: too large to write anew without holding writes up",
+            size >> 20
+        );
+        return Ok(());
+    }
+    if let Ok(free) = disk::free_space(dir)
+        && free < size.saturating_mul(2)
+    {
+        return Err(SearchError::Unavailable(format!(
+            "writing the catalogue anew takes about {} MB free, and there are {} MB",
+            size.saturating_mul(2) >> 20,
+            free >> 20
+        )));
+    }
+    let connection =
+        toolbox_store::rusqlite::Connection::open(disk::for_sqlite(&path, disk::SQLITE_FILE))?;
+    connection.busy_timeout(std::time::Duration::ZERO)?;
+    for _ in 0..VACUUM_TRIES {
+        if stop() {
+            break;
+        }
+        match connection.execute_batch("VACUUM") {
+            Err(error)
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(
+                        toolbox_store::rusqlite::ErrorCode::DatabaseBusy
+                            | toolbox_store::rusqlite::ErrorCode::DatabaseLocked
+                    )
+                ) =>
+            {
+                std::thread::sleep(VACUUM_APART);
+            }
+            vacuumed => return Ok(vacuumed?),
+        }
+    }
+    Err(SearchError::Unavailable(
+        "the catalogue was written to all along, and is written anew later".to_string(),
+    ))
+}
+
 /**
  * Erases what is left in the archive's files of the sessions deleted for good since this last
  * did (PLAN §4.5), if any were: a delete for good marks the catalogue in its own transaction
  * ([`Catalogue::to_scrub`]), and the mark is taken off only once both files are erased, so a
- * crash or a failure leaves it for the next try. The catalogue's part is its log, emptied, and
- * is done whatever becomes of the search index's: the index compacted without the entries it
- * marked deleted ([`SearchIndex::compact`]), when its disk has the room, until `stop` says.
+ * crash or a failure leaves it for the next try. The catalogue's part (its file written anew,
+ * [`vacuum_catalogue`], and its log emptied) is done whatever becomes of the search index's:
+ * the index compacted without the entries it marked deleted and written anew
+ * ([`SearchIndex::compact`]), when its disk has the room, until `stop` says.
  */
 fn scrub(
     dir: &Path,
@@ -80,23 +146,14 @@ fn scrub(
     let Some(mark) = catalogue.to_scrub()? else {
         return Ok(());
     };
+    let vacuumed = vacuum_catalogue(dir, stop);
     let logged = catalogue.empty_log();
     if !catalogue.text_gone()?.is_empty() {
         return Err(SearchError::Unavailable("deleted text is still in the index".into()).into());
     }
     let search = open_search(dir, search, catalogue)?;
-    let needs = search.compaction_room()?;
-    if let Ok(free) = disk::free_space(dir)
-        && free < needs
-    {
-        return Err(SearchError::Unavailable(format!(
-            "erasing it takes about {} MB free, and there are {} MB",
-            needs >> 20,
-            free >> 20
-        ))
-        .into());
-    }
-    search.compact(stop)?;
+    search.compact(true, stop)?;
+    vacuumed?;
     if !logged {
         return Err(SearchError::Unavailable("a read held the catalogue's log".to_string()).into());
     }
@@ -243,7 +300,7 @@ impl Archive {
         drop(job);
         let needs = self
             .search_index_if_open()
-            .and_then(|search| search.compaction_room().ok());
+            .and_then(|search| search.compaction_room(true).ok());
         Ok(Some(Unscrubbed {
             needs,
             free: disk::free_space(&self.dir).ok(),

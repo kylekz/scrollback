@@ -1337,6 +1337,39 @@ fn stale_sessions_are_indexed_newest_first_after_those_never_indexed() {
     assert_eq!(bench.index_with(newer(&bench)).sessions, 2);
 }
 
+/**
+ * A session whose row was made, and whose text the archive can't be read for when it is to
+ * be made (the search index made anew, then a segment another program holds): its row is to
+ * be read again by the next index of a start, and no pass takes it for a backlog meanwhile.
+ */
+#[cfg(unix)]
+#[test]
+fn a_row_whose_text_cant_be_read_is_read_again_and_no_backlog() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut bench = files();
+    let session = bench.agent.tree_mut().session("/home/user/code/app", 8);
+    let key = session.key.clone();
+    bench.sync();
+    bench.close();
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(bench.dir().join(format!("search.db{suffix}")));
+    }
+    bench.reopen();
+    let segments = bench.segment_files_of(&key);
+    let locked = segments.last().unwrap();
+    fs::set_permissions(locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let report = bench.index();
+    assert_eq!((report.sessions, report.searchable), (0, 0));
+    let pass = bench.sync().index;
+    assert_eq!((pass.sessions, pass.backlog_left), (0, false));
+    /* Once it can be read, the next index of a start reads it again, and makes its text. */
+    fs::set_permissions(locked, fs::Permissions::from_mode(0o644)).unwrap();
+    let report = bench.index();
+    assert_eq!((report.sessions, report.searchable), (1, 1));
+    assert_eq!(bench.archive().unsearchable().unwrap(), 0);
+}
+
 #[cfg(unix)]
 #[test]
 fn a_read_the_system_fails_is_tried_again_and_changes_nothing() {

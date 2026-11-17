@@ -500,8 +500,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                      another version"
                 ),
                 Progress::Searching { sessions } => {
-                    println!("making {sessions} sessions searchable");
+                    println!(
+                        "making {sessions} sessions searchable after {:.1?}",
+                        started.elapsed()
+                    );
                 }
+                Progress::Compacting => {
+                    println!(
+                        "compacting the search index after {:.1?}",
+                        started.elapsed()
+                    );
+                }
+                Progress::Waiting => println!("waiting for another index"),
                 _ => {}
             },
         )?;

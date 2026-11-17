@@ -471,7 +471,7 @@ pub(super) fn place_retrying(file: TempPath, to: &Path) -> Result<(), (io::Error
 
 /// How many bytes the volume `dir`, an existing folder, has free for this user.
 #[cfg(unix)]
-pub(super) fn free_space(dir: &Path) -> io::Result<u64> {
+pub(crate) fn free_space(dir: &Path) -> io::Result<u64> {
     let stats = rustix::fs::statvfs(dir)?;
     Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
 }
@@ -480,7 +480,7 @@ pub(super) fn free_space(dir: &Path) -> io::Result<u64> {
 /// counts), from `GetDiskFreeSpaceExW`, which follows a folder that is another volume's
 /// mount point.
 #[cfg(windows)]
-pub(super) fn free_space(dir: &Path) -> io::Result<u64> {
+pub(crate) fn free_space(dir: &Path) -> io::Result<u64> {
     use std::os::windows::ffi::OsStrExt as _;
 
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;

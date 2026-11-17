@@ -56,7 +56,7 @@ use crate::archive::{Archive, ArchivedSession};
 use crate::catalogue::{Derived, Held, Indexed, Reading, RowMade, SessionId, fingerprint, made};
 use crate::location::LocationId;
 use crate::provider::{ItemKind, Provider};
-use crate::search::{self, Kept, SearchError, SearchIndex, Text};
+use crate::search::{self, Kept, Recorded, SearchError, SearchIndex, Text};
 use crate::transcript::{self, Content, Conversation, Ending, SessionIndex, Subagent, Transcript};
 
 /// What an index did.
@@ -168,7 +168,10 @@ pub fn index_session(
         },
     };
     let search = archive.search_index()?;
-    report.searchable += record(archive, &search, &Vec::from_iter(text))?;
+    /* One session's, in the background: it waits for a compaction rather than leave it. */
+    if let Recorded::Written(written) = record(archive, &search, &Vec::from_iter(text), true)? {
+        report.searchable += written;
+    }
     /* A session of a conversation the owner deleted is deleted for good by its index. */
     if archive.catalogue().pending_removals()? > 0 {
         archive.start_removals(false);
@@ -218,7 +221,7 @@ fn run(
     let sessions = stale.len();
     let (mut done, mut bytes, mut batch) = (0, 0, Batch::default());
     let indexed = thread::scope(|scope| {
-        let writer = texts.writer(scope);
+        let mut writer = texts.writer(scope);
         let indexed = in_order(
             stale,
             cancel,
@@ -415,9 +418,14 @@ impl Batch {
     }
 
     /// Writes what was added ([`record`]) and empties it. Returns how many texts were written.
+    /// Writes what was added ([`record`]), waiting for a compaction, and empties it. Returns
+    /// how many texts were written.
     fn write(&mut self, archive: &Archive, search: &SearchIndex) -> Result<usize, SyncError> {
         self.bytes = 0;
-        record(archive, search, &std::mem::take(&mut self.texts))
+        match record(archive, search, &std::mem::take(&mut self.texts), true)? {
+            Recorded::Written(written) => Ok(written),
+            Recorded::Deferred => Ok(0),
+        }
     }
 }
 
@@ -460,11 +468,13 @@ impl<'a> Texts<'a> {
         let Some(search) = self.search.filter(|_| self.wanted()) else {
             return Ok(());
         };
-        match record(self.archive, search, &batch.texts) {
-            Ok(written) => {
+        /* While the index is compacted the rows go on, and their text is the backlog's. */
+        match record(self.archive, search, &batch.texts, false) {
+            Ok(Recorded::Written(written)) => {
                 self.written.fetch_add(written, Ordering::Relaxed);
                 Ok(())
             }
+            Ok(Recorded::Deferred) => Ok(()),
             Err(error) => {
                 without_search(error)?;
                 self.wanted.store(false, Ordering::Relaxed);
@@ -515,17 +525,17 @@ struct Writer<'scope> {
 }
 
 impl Writer<'_> {
-    /// Hands `batch` over to be written, or writes it, with no thread.
-    fn write(&self, batch: Batch) -> Result<(), SyncError> {
+    /// Hands `batch` over to be written, or writes it, with no thread. A writer that stopped
+    /// is ended at once, and what stopped it is returned: nothing more is made for it.
+    fn write(&mut self, batch: Batch) -> Result<(), SyncError> {
         if batch.texts.is_empty() {
             return Ok(());
         }
         match &self.send {
-            /* A writer that stopped says why when it is ended. */
-            Some(send) => {
-                let _ = send.send(batch);
-                Ok(())
-            }
+            Some(send) => match send.send(batch) {
+                Ok(()) => Ok(()),
+                Err(_) => self.join(),
+            },
             None => self.texts.write(batch),
         }
     }
@@ -533,6 +543,11 @@ impl Writer<'_> {
     /// Waits for what was handed over to be written. Returns what stopped the writer, if
     /// anything did; a panic in it is this thread's.
     fn end(mut self) -> Result<(), SyncError> {
+        self.join()
+    }
+
+    /// [`Writer::end`], leaving it with no writer: what it is handed then is written here.
+    fn join(&mut self) -> Result<(), SyncError> {
         drop(self.send.take());
         match self.thread.take().map(thread::ScopedJoinHandle::join) {
             None => Ok(()),
@@ -581,7 +596,7 @@ fn compact(
         return Ok(());
     }
     progress(&Progress::Compacting);
-    match search.compact(&|| cancel.is_cancelled()) {
+    match search.compact(false, &|| cancel.is_cancelled()) {
         Err(SearchError::Cancelled) => Err(SyncError::Cancelled),
         compacted => Ok(compacted?),
     }
@@ -915,13 +930,19 @@ fn one_at_a_time<J, R>(
 
 /// Writes `texts` to `search`, of those sessions whose rows are still what the texts were
 /// made of, and says so of their rows. Returns how many were written.
-fn record(archive: &Archive, search: &SearchIndex, texts: &[Text]) -> Result<usize, SyncError> {
+fn record(
+    archive: &Archive,
+    search: &SearchIndex,
+    texts: &[Text],
+    wait: bool,
+) -> Result<Recorded, SyncError> {
     if texts.is_empty() {
-        return Ok(0);
+        return Ok(Recorded::Written(0));
     }
     let catalogue = archive.catalogue();
     Ok(search.record(
         texts,
+        wait,
         |text| Ok(catalogue.made_of(&text.id)?.as_deref() == Some(&*text.made)),
         |written| Ok(catalogue.set_searchable(written)?),
     )?)
@@ -956,7 +977,12 @@ fn text(
     }));
     let index = match parsed {
         Ok(Some(index)) => index,
-        Ok(None) => return Ok(None),
+        /* The archive could not be read for it, though its row was made: it is to be read
+        again, by the next index of a start, and is no backlog meanwhile. */
+        Ok(None) => {
+            catalogue.read_again(&id, &made)?;
+            return Ok(None);
+        }
         Err(_) => SessionIndex {
             title: catalogue.session(&id)?.and_then(|session| session.title),
             ..SessionIndex::default()

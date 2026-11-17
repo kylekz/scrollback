@@ -734,6 +734,10 @@ fn text_made_again_is_the_text_as_it_is_now_and_nothing_else() {
  * those of its text replaced before among them, nor the free space of a page, of the search
  * index or of the catalogue. `TERM` is a prompt of its own of three of a character nothing
  * else holds: the index's one term that starts with it, held whole wherever it is.
+ *
+ * It fails without the compaction, or without `secure_delete` on either database. It does
+ * not reach the copies of cells a rebalance can leave in the unused middle of a page, which
+ * take particular page splits to leave; the `VACUUM` the scrub ends with is for those.
  */
 #[test]
 fn text_deleted_for_good_is_in_no_file() {

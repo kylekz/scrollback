@@ -918,6 +918,25 @@ impl Catalogue {
     }
 
     /**
+     * Says the session `id`'s row, while it is made from what `made` says, is to be read again
+     * (`retry`): the archive could not be read for its text. The next index of a start reads
+     * it again; until then its text is no index's backlog.
+     */
+    pub(crate) fn read_again(&self, id: &SessionId, made: &str) -> Result<()> {
+        self.db.write(|tx| {
+            tx.execute(
+                &format!(
+                    "UPDATE session AS s SET retry = 1
+                     WHERE s.location_id = ?1 AND s.provider = ?2 AND s.session = ?3
+                       AND {MADE_FROM} = ?4"
+                ),
+                params![id.location, id.provider, id.key, made],
+            )?;
+            Ok(())
+        })
+    }
+
+    /**
      * Whether the row of the session `id` is made from what `made` says ([`Catalogue::made`])
      * and is not to be read again: it is current, and an index has nothing to make of it.
      */

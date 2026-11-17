@@ -1492,7 +1492,10 @@ mod tests {
             .collect();
         let search = archive.search_index().unwrap();
         let flag = |written: &[_]| Ok(catalogue.set_searchable(written)?);
-        assert_eq!(search.record(&texts, |_| Ok(true), flag).unwrap(), 2);
+        assert_eq!(
+            search.record(&texts, false, |_| Ok(true), flag).unwrap(),
+            crate::search::Recorded::Written(2)
+        );
         assert_eq!(catalogue.count_unsearchable().unwrap(), 0);
         drop(search);
         (dir, archive, sessions)
