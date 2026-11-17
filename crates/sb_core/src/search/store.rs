@@ -618,6 +618,13 @@ impl SearchIndex {
             .compaction
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        /* A delete for good's is for nothing while a read holds the log, which its pages go
+        through: it is left for later, before any of it is done. */
+        if vacuum && !self.log.empty_now() {
+            return Err(SearchError::Unavailable(
+                "a read holds the search index's log".to_string(),
+            ));
+        }
         let dir = self.log.path.parent().unwrap_or(Path::new("."));
         if let Some(lack) = disk::lacking(dir, self.compaction_room(vacuum)?) {
             let disk = match lack.disk {
@@ -657,7 +664,7 @@ impl SearchIndex {
             self.log.empty();
         }
         compacted?;
-        if !self.log.empty() {
+        if !self.log.empty_now() {
             return Err(SearchError::Unavailable(
                 "a read held the search index's log".to_string(),
             ));
@@ -876,20 +883,35 @@ impl Log {
      * Moves everything in the log into the database and empties the log, so what a write took
      * out of the database is in no file any more. A read under way holds the log: this tries
      * again for a moment (never waiting on a lock), and then leaves it to [`Log::retry`],
-     * saying so in the log.
+     * saying so in the log. Returns whether it emptied it.
      */
     pub(crate) fn empty(&self) -> bool {
+        self.empty_trying(TRIES)
+    }
+
+    /**
+     * [`Log::empty`], tried for a fifth of a second: what work that can wait does (the
+     * background removal's scrub), so a read that holds the log costs it little, and it is
+     * tried again later; a checkpoint of the app's own, a moment long, is waited out.
+     */
+    pub(crate) fn empty_now(&self) -> bool {
+        self.empty_trying(SOON)
+    }
+
+    fn empty_trying(&self, tries: u32) -> bool {
         let emptied = (|| {
             let connection = Connection::open(disk::for_sqlite(&self.path, disk::SQLITE_FILE))?;
             connection.busy_timeout(Duration::ZERO)?;
-            for _ in 0..TRIES {
+            for tried in 1..=tries {
                 let busy: i64 = connection
                     .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
                     .unwrap_or(1);
                 if busy == 0 {
                     return Ok(true);
                 }
-                thread::sleep(APART);
+                if tried < tries {
+                    thread::sleep(APART);
+                }
             }
             Ok::<_, rusqlite::Error>(false)
         })();
@@ -917,6 +939,8 @@ impl Log {
 
 /// How often, and how far apart, emptying a log that a read holds is tried: a second in all.
 const TRIES: u32 = 10;
+/// How often [`Log::empty_now`] tries, as far apart: a fifth of a second in all.
+const SOON: u32 = 3;
 const APART: Duration = Duration::from_millis(100);
 
 #[cfg(test)]

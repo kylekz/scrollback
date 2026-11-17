@@ -199,13 +199,22 @@ fn scrub(
     if stop() {
         return Ok(());
     }
-    let mut failed = None;
+    let (mut failed, mut took_off) = (None, false);
     if let Some(mark) = catalogue.to_scrub(Scrub::Catalogue)?
         && !too_large.load(Ordering::Relaxed)
     {
-        match vacuum_catalogue(dir, stop) {
-            Ok(Vacuumed::Done) if catalogue.empty_log() => {
+        /* While a read holds the log, which the pages written anew go through, it is for
+        nothing: it is left for later, before it is done (and the delete's own emptying of the
+        log, which waited a moment, is not waited for again). */
+        let vacuumed = if catalogue.empty_log_now() {
+            vacuum_catalogue(dir, stop)
+        } else {
+            Err(SearchError::Unavailable("a read holds the catalogue's log".to_string()).into())
+        };
+        match vacuumed {
+            Ok(Vacuumed::Done) if catalogue.empty_log_now() => {
                 catalogue.scrubbed(Scrub::Catalogue, &mark)?;
+                took_off = true;
             }
             Ok(Vacuumed::Done) => {
                 failed = Some(SearchError::Unavailable(
@@ -231,6 +240,13 @@ fn scrub(
         let search = open_search(dir, search, catalogue)?;
         search.compact(true, stop)?;
         catalogue.scrubbed(Scrub::Search, &mark)?;
+        took_off = true;
+    }
+    /* What taking a mark off wrote is out of the catalogue's log too, if nothing holds it: it
+    says nothing of the text, but the log is to be left empty. With nothing to erase, nothing
+    is touched. */
+    if took_off {
+        let _ = catalogue.empty_log_now();
     }
     failed.map_or(Ok(()), |error| Err(error.into()))
 }

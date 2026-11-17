@@ -286,16 +286,17 @@ fn run(
     if let Err(error) = made.and_then(|()| compact(archive, backlog, cancel, progress)) {
         without_search(error)?;
     }
+    /* A log a read held when a delete for good was to empty it is emptied now: first, so the
+    background removal started next doesn't find it being emptied. */
+    catalogue.retry_empty_log();
+    if let Some(search) = archive.search_index_if_open() {
+        search.retry_empty_log();
+    }
     /* What the index deleted for good (PLAN §4.5): sessions of conversations the owner
     deleted, and what they left that is no session's; and deleted text still to be erased from
     the files, which the background removal tries again. */
     if catalogue.pending_removals()? > 0 || archive.scrub_wanted()? {
         archive.start_removals(false);
-    }
-    /* A log a read held when a delete for good was to empty it is emptied now. */
-    catalogue.retry_empty_log();
-    if let Some(search) = archive.search_index_if_open() {
-        search.retry_empty_log();
     }
     Ok(report)
 }

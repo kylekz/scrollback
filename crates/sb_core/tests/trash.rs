@@ -1030,8 +1030,9 @@ fn a_session_merged_with_one_in_trash_stays_in_trash<A: Agent + Default>() {
 
 /**
  * A read under way holds a database's log, which a delete for good empties so its text is in
- * no file: the delete does not wait on it for more than a moment, and the next index, once the
- * read is over, empties the log.
+ * no file: the delete does not wait on it for more than a moment, nor does the background
+ * scrub of what is left of the text, which is left for later; the next index, once the read is
+ * over, empties the log, and the scrub is done.
  */
 fn a_read_that_holds_a_log_neither_stalls_a_delete_nor_keeps_its_text<A: Agent + Default>() {
     use toolbox_store::rusqlite::Connection;
@@ -1059,8 +1060,11 @@ fn a_read_that_holds_a_log_neither_stalls_a_delete_nor_keeps_its_text<A: Agent +
         "{:?}",
         started.elapsed()
     );
+    assert!(bench.archive().unscrubbed().unwrap().is_some());
     drop(readers);
     bench.index();
+    bench.archive().wait_for_removals();
+    assert_eq!(bench.archive().unscrubbed().unwrap(), None);
     for name in ["scrollback.db-wal", "search.db-wal"] {
         let log = dir.join(name);
         assert!(

@@ -444,6 +444,11 @@ impl Catalogue {
         self.log.empty()
     }
 
+    /// [`Catalogue::empty_log`], tried once ([`Log::empty_now`]).
+    pub(crate) fn empty_log_now(&self) -> bool {
+        self.log.empty_now()
+    }
+
     /// Empties the log, if a read held it the last time it was to be emptied.
     pub(crate) fn retry_empty_log(&self) {
         self.log.retry();
