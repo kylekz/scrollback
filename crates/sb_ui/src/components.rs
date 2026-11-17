@@ -13,7 +13,6 @@ use gpui::{
     relative, svg,
 };
 use sb_core::catalogue::Session;
-
 use sb_core::location::{Location, LocationId, LocationKind};
 use unicode_segmentation::UnicodeSegmentation as _;
 

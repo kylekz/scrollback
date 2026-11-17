@@ -58,6 +58,7 @@ mod tests;
 mod tools;
 
 pub(super) use audit::audit;
+pub(super) use desktop::audit as register_audit;
 
 use std::path::Path;
 
@@ -67,7 +68,7 @@ use super::{
     CopyRecord, Display, FileClass, FileTree, Hashed, ItemKind, ItemPrefix, ItemRange, Mark,
     Provider, ProviderError, ProviderId, RangeFailure, Scan, SessionItems, Source,
 };
-use crate::transcript::{CopyOf, Origin, Outline, Subagent, Transcript};
+use crate::transcript::{CopyWords, Outline, Subagent, Transcript};
 use crate::transport::{Env, Halt, RangeSink, Transport};
 
 pub(super) const ID: ProviderId = ProviderId::new("claude-code");
@@ -84,6 +85,7 @@ const COPY_FOLDER: &str = "ssh-";
 /// How the desktop app's copies are shown (PLAN §7.7).
 const COPY_LABEL: &str = "Claude Desktop's copy";
 const COPY_ORIGIN: &str = "Ran over SSH; the copy doesn't record which machine.";
+const COPY_RAN_ON: &str = "Ran over SSH on";
 
 /// How long transcripts are kept when `settings.json` doesn't say (Claude Code's documented
 /// default).
@@ -128,30 +130,35 @@ impl Provider for Agent {
         let env = transport.env(&["CLAUDE_CONFIG_DIR", desktop::APPDATA])?;
         let apps = app_folders(&env);
         let root = root(env);
-        /* The desktop app's folder is looked for in the same call, so a location without it
-        costs nothing more. */
-        let mut paths = vec![format!("{root}/{SUBTREE}")];
-        paths.extend(
-            (apps.iter()).map(|app| format!("{app}/{}/{}", desktop::APP_FOLDER, desktop::SUBTREE)),
-        );
-        let found = transport.stat(&paths.iter().map(String::as_str).collect::<Vec<_>>())?;
-        let app = (apps.into_iter().zip(&found[1..]))
-            .find_map(|(app, found)| found.is_some().then_some(app));
-        Ok(found[0].is_some().then(|| {
-            Box::new(Data {
-                tree: FileTree::new(transport, root.clone(), SUBTREE, classify),
-                desktop: app.map(|app| {
-                    FileTree::new(
-                        transport,
-                        format!("{app}/{}", desktop::APP_FOLDER),
-                        desktop::SUBTREE,
-                        desktop::classify,
-                    )
-                }),
-                transport,
-                root,
-            }) as Box<dyn Source>
-        }))
+        if transport.stat(&[&format!("{root}/{SUBTREE}")])?[0].is_none() {
+            return Ok(None);
+        }
+        /* The desktop app's folder is looked for apart, and nothing about it fails the
+        agent's own pass. */
+        let paths: Vec<String> = (apps.iter())
+            .map(|app| format!("{app}/{}/{}", desktop::APP_FOLDER, desktop::SUBTREE))
+            .collect();
+        let app = match transport.stat(&paths.iter().map(String::as_str).collect::<Vec<_>>()) {
+            Ok(found) => (apps.into_iter().zip(found))
+                .find_map(|(app, found)| found.is_some().then_some(app)),
+            Err(error) => {
+                log::warn!("the desktop app's folder could not be looked for: {error}");
+                None
+            }
+        };
+        Ok(Some(Box::new(Data {
+            tree: FileTree::new(transport, root.clone(), SUBTREE, classify),
+            desktop: app.map(|app| {
+                FileTree::new(
+                    transport,
+                    format!("{app}/{}", desktop::APP_FOLDER),
+                    desktop::SUBTREE,
+                    desktop::classify,
+                )
+            }),
+            transport,
+            root,
+        })))
     }
 
     fn parser_version(&self) -> u32 {
@@ -179,10 +186,11 @@ impl Provider for Agent {
         (class.kind, class.session)
     }
 
-    fn copy_of(&self, session: &str) -> Option<CopyOf> {
-        is_copy(session).then(|| CopyOf {
+    fn copy_of(&self, session: &str) -> Option<CopyWords> {
+        is_copy(session).then(|| CopyWords {
             label: COPY_LABEL.to_string(),
-            origin: Origin::Unsaid(COPY_ORIGIN.to_string()),
+            unsaid: COPY_ORIGIN.to_string(),
+            ran_on: COPY_RAN_ON.to_string(),
         })
     }
 
@@ -304,13 +312,24 @@ impl Source for Data<'_> {
 
     fn scan(&mut self) -> Result<Scan, ProviderError> {
         let mut scan = self.tree.scan()?;
-        if let Some(desktop) = &mut self.desktop {
-            let more = desktop.scan()?;
-            /* Of the app's folder, only its records are archived (the module docs). */
-            scan.items
-                .extend((more.items.into_iter()).filter(|item| desktop::is_record(&item.key)));
-            scan.unlisted.extend(more.unlisted);
-            scan.skipped.extend(more.skipped);
+        /* Of the app's folder, only its records are archived (the module docs). What can't be
+        listed there is no shortfall of the agent's own: it is logged, and the records that
+        were listed are taken. One that can't be scanned at all is as none. */
+        match self.desktop.as_mut().map(FileTree::scan) {
+            Some(Ok(more)) => {
+                scan.items
+                    .extend((more.items.into_iter()).filter(|item| desktop::is_record(&item.key)));
+                if !more.unlisted.is_empty() {
+                    log::warn!(
+                        "{} places in the desktop app's folder could not be listed",
+                        more.unlisted.len()
+                    );
+                }
+            }
+            Some(Err(error)) => {
+                log::warn!("the desktop app's folder could not be listed: {error}");
+            }
+            None => {}
         }
         Ok(scan)
     }
@@ -585,6 +604,45 @@ mod source_tests {
             Agent.conversation_of(&format!("projects/{FOLDER}/agent-a1.jsonl")),
             None
         );
+    }
+
+    /// Requests of the two trees, interleaved, are asked tree by tree in order, and each range
+    /// reaches the sink under its index in the whole fetch.
+    #[test]
+    fn requests_of_both_trees_keep_their_order_and_their_indexes() {
+        let keys = [
+            "projects/a.jsonl",
+            "claude-code-sessions/s/a.json",
+            "claude-code-sessions/s/b.json",
+            "projects/b.jsonl",
+        ];
+        let runs: Vec<(usize, usize)> = Data::runs(&keys, |key| key)
+            .into_iter()
+            .map(|(first, run)| (first, run.len()))
+            .collect();
+        assert_eq!(runs, [(0, 1), (1, 2), (3, 1)]);
+
+        /// What reached it: each call's index, and the bytes of each `data`.
+        #[derive(Default)]
+        struct Seen(Vec<(usize, Vec<u8>)>);
+        impl RangeSink for Seen {
+            fn data(&mut self, request: usize, bytes: &[u8]) -> Result<(), Halt> {
+                self.0.push((request, bytes.to_vec()));
+                Ok(())
+            }
+            fn end(&mut self, request: usize, _: Result<(), RangeFailure>) -> Result<(), Halt> {
+                self.0.push((request, Vec::new()));
+                Ok(())
+            }
+        }
+        let mut seen = Seen::default();
+        let mut shifted = Shifted {
+            sink: &mut seen,
+            by: 3,
+        };
+        shifted.data(0, b"x").unwrap();
+        shifted.end(0, Ok(())).unwrap();
+        assert_eq!(seen.0, [(3, b"x".to_vec()), (3, Vec::new())]);
     }
 
     #[test]

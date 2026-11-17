@@ -15,9 +15,9 @@ use gpui::{
     Styled as _, Window, div, prelude::FluentBuilder as _, px, uniform_list,
 };
 use gpui_component::tooltip::Tooltip;
-use sb_core::catalogue::{Compared, Held, History, Reason, Session, SessionId};
+use sb_core::catalogue::{Compared, Held, History, Origin, Reason, Session, SessionId};
 use sb_core::location::LocationId;
-use sb_core::transcript::{Origin, ToolKind};
+use sb_core::transcript::ToolKind;
 
 use super::ReaderView;
 use super::calls::kind_icon;
@@ -413,11 +413,12 @@ impl ReaderView {
                             .child(line(format!("Kept on {}.", kept(&session.id.location))))
                             .child(line(match &copy.origin {
                                 Origin::Unsaid(words) => hostile::label(words),
-                                Origin::Host(host) => {
-                                    format!("Ran over SSH on {}.", hostile::label(host))
+                                /* The provider's words before the machine's name. */
+                                Origin::Host { ran_on, host } => {
+                                    format!("{} {}.", hostile::label(ran_on), hostile::label(host))
                                 }
-                                Origin::Location(at) => {
-                                    format!("Ran over SSH on {}.", kept(at))
+                                Origin::Location { ran_on, location } => {
+                                    format!("{} {}.", hostile::label(ran_on), kept(location))
                                 }
                             }))
                             .children(original.map(|original| {

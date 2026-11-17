@@ -194,8 +194,9 @@ fn run(
 
 /**
  * Makes again what `provider`'s records at `location` (or at every location) say of where
- * copies ran, from its archived register items (PLAN §7.7). The archive being unreadable, or
- * the provider stopping on them, leaves what was recorded before; neither fails the index.
+ * copies ran, from its archived register items (PLAN §7.7), unless they are what they were
+ * last read whole from. A record the archive can't read is left out and the rest are taken;
+ * the provider stopping on them leaves what was recorded before; neither fails the index.
  */
 fn copy_records(
     archive: &Archive,
@@ -214,14 +215,33 @@ fn copy_records(
     let id = provider.id();
     for location in locations {
         let readings = catalogue.register_items(&location, id.as_str())?;
+        /* Records read whole from these very versions are not read again. */
+        let made = format!(
+            "{} {}",
+            fingerprint(&readings).to_hex(),
+            provider.parser_version()
+        );
+        if catalogue
+            .copy_records_made(&location, id.as_str())?
+            .as_deref()
+            == Some(&made)
+        {
+            continue;
+        }
         let read = panic::catch_unwind(AssertUnwindSafe(|| {
             let items = ArchivedSession::of(archive, &readings);
             let records = provider.copy_records(&items);
-            items.fault().is_none().then_some(records)
+            (records, items.fault().is_none())
         }));
         match read {
-            Ok(Some(records)) => catalogue.record_copies(&location, id.as_str(), &records)?,
-            Ok(None) => log::warn!("{id}'s records of copies could not be read from the archive"),
+            /* A record that could not be read is left out; the rest are taken, and what it
+            said before is kept until it is read. */
+            Ok((records, whole)) => {
+                if !whole {
+                    log::warn!("some of {id}'s records of copies could not be read");
+                }
+                catalogue.record_copies(&location, id.as_str(), &records, whole, &made)?;
+            }
             Err(fault) => log::warn!(
                 "{id} stopped on its records of copies: {}",
                 said(fault.as_ref())

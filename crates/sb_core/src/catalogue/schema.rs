@@ -15,7 +15,6 @@ pub(super) const SCHEMA: Schema = Schema {
         CHECKS,
         SETTINGS,
         COPIES,
-        COPY_RECORDS,
     ],
 };
 
@@ -335,14 +334,17 @@ CREATE TABLE kv (
 ";
 
 /// Copies of a session kept elsewhere (PLAN §7.7): what the library matches them to their
-/// originals by, and what it shows a copy as.
+/// originals by, what it shows a copy as, and where a copy ran as the records an app keeps
+/// beside its copies say.
 const COPIES: &str = "
 -- Derived: the agent's own id for the conversation, which its copies share; NULL when the
--- session's items don't say. copy_label and copy_origin are the provider's words for a copy of
--- a session that ran elsewhere, NULL for an original.
+-- session's items don't say. copy_label, copy_origin and copy_ran_on are the provider's words
+-- for a copy of a session that ran elsewhere, NULL for an original.
 ALTER TABLE session ADD COLUMN conversation TEXT;
 ALTER TABLE session ADD COLUMN copy_label TEXT;
 ALTER TABLE session ADD COLUMN copy_origin TEXT CHECK ((copy_label IS NULL) = (copy_origin IS NULL));
+-- The provider's words before the name of the machine a copy ran on, when that is known.
+ALTER TABLE session ADD COLUMN copy_ran_on TEXT;
 
 -- The sessions of one conversation, which the library shows once.
 CREATE INDEX session_conversation ON session (provider, conversation)
@@ -360,15 +362,13 @@ ALTER TABLE tombstone ADD COLUMN conversation TEXT;
 ALTER TABLE tombstone ADD COLUMN copy_label TEXT;
 CREATE INDEX tombstone_conversation ON tombstone (provider, conversation)
     WHERE conversation IS NOT NULL;
-";
 
-/// Where a copy ran, as the records an app keeps beside its copies say (PLAN §7.7).
-const COPY_RECORDS: &str = "
 -- Derived from the location's register items at each index: the host a conversation ran on
 -- over SSH and its transcript's path there, as the app at the location recorded them, and the
 -- key the provider makes of that path (the original's item's key where it ran). resolved
 -- and ran_at are the last attribution's: whether this machine's ssh resolved the host, and
--- the SSH location it is the same place as.
+-- the SSH location it is the same place as. sources: the keys of the register items that say
+-- it, as JSON, which are deleted for good with the conversation.
 CREATE TABLE copy_record (
     location_id TEXT NOT NULL REFERENCES location (id),
     provider TEXT NOT NULL,
@@ -376,6 +376,7 @@ CREATE TABLE copy_record (
     host TEXT,
     path TEXT,
     key TEXT,
+    sources TEXT NOT NULL DEFAULT '[]',
     resolved INTEGER NOT NULL DEFAULT 0,
     ran_at TEXT REFERENCES location (id),
     PRIMARY KEY (location_id, provider, conversation)

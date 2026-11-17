@@ -224,10 +224,16 @@ pub struct Reach {
 /**
  * Says again where the copies kept here ran (PLAN §7.7), after a sync or an index. Nothing
  * about it stops what ran before it: an error is logged, and the next one tries again.
+ * Returns how many copies' attribution changed.
  */
-fn attributed(archive: &Archive, resolve: &dyn ResolveHost) {
-    if let Err(error) = attribute(archive, resolve) {
-        log::warn!("could not say where copies ran: {error}");
+fn attributed(archive: &Archive, resolve: &dyn ResolveHost, cancel: &CancelToken) -> usize {
+    match attribute(archive, resolve, cancel) {
+        Ok(changed) => changed,
+        Err(SyncError::Cancelled) => 0,
+        Err(error) => {
+            log::warn!("could not say where copies ran: {error}");
+            0
+        }
     }
 }
 
@@ -450,6 +456,10 @@ pub struct SyncService {
     /// Background jobs other than passes and indexes: reading and adding locations, looking
     /// at this machine.
     jobs: usize,
+    /// Where copies ran is being said ([`Self::attribute_copies`]), and is to be said again
+    /// once that is done.
+    attributing: bool,
+    attribute_again: bool,
     stop_index: CancelToken,
     #[cfg(any(test, feature = "automation"))]
     hold: Hold,
@@ -514,6 +524,8 @@ impl SyncService {
             fetch_all: None,
             clock: clock(cx),
             jobs: 0,
+            attributing: false,
+            attribute_again: false,
             stop_index: CancelToken::new(),
             #[cfg(any(test, feature = "automation"))]
             hold: Hold::default(),
@@ -776,7 +788,6 @@ impl SyncService {
         let job = cx.background_spawn({
             let (id, kind) = (id.clone(), location.kind.clone());
             let (providers, connect) = (self.providers.clone(), self.connect.clone());
-            let resolve = self.resolve.clone();
             #[cfg(any(test, feature = "automation"))]
             let hold = self.hold.clone();
             let (cancel, reported) = (cancel.clone(), reported.clone());
@@ -798,10 +809,6 @@ impl SyncService {
                         hold.reached(progress, &cancel);
                     },
                 );
-                /* Not once the pass is stopped: the app may be moving onto another archive. */
-                if !cancel.is_cancelled() {
-                    attributed(&archive, resolve.as_ref());
-                }
                 (synced, archive.catalogue().location(&id))
             }
         });
@@ -811,6 +818,7 @@ impl SyncService {
                 let (synced, location) = job.await;
                 this.update(cx, |this, cx| {
                     this.passes.remove(&id);
+                    this.attribute_copies(cx);
                     /* Only this location's facts are taken from what the job read: another
                     may have been added since. */
                     match location {
@@ -936,9 +944,8 @@ impl SyncService {
         let job = cx.background_spawn({
             let (providers, stop) = (self.providers.clone(), self.stop_index.clone());
             let (location, reported) = (location.clone(), reported.clone());
-            let resolve = self.resolve.clone();
             async move {
-                let indexed = index(
+                index(
                     &archive,
                     location.as_ref(),
                     &providers,
@@ -949,11 +956,7 @@ impl SyncService {
                             .unwrap_or_else(PoisonError::into_inner)
                             .apply(progress);
                     },
-                );
-                if !stop.is_cancelled() {
-                    attributed(&archive, resolve.as_ref());
-                }
-                indexed
+                )
             }
         });
         cx.spawn({
@@ -962,6 +965,7 @@ impl SyncService {
                 let indexed = job.await;
                 this.update(cx, |this, cx| {
                     this.indexes.remove(&location);
+                    this.attribute_copies(cx);
                     if this.indexed(indexed) {
                         // What the locations hold counts the sessions just indexed.
                         this.read_details(cx);
@@ -1116,6 +1120,38 @@ impl SyncService {
     #[cfg(any(test, feature = "automation"))]
     pub fn is_held(&self) -> bool {
         self.hold.state().waiting
+    }
+
+    /**
+     * Says again where the copies kept on this machine ran (PLAN §7.7), its own job after a
+     * pass or an index, so that no location shows syncing while hosts are resolved. One runs
+     * at a time; asked meanwhile, another follows it. A change refreshes what shows sessions.
+     * It is stopped with the indexes, before it writes, when the app leaves the archive.
+     */
+    fn attribute_copies(&mut self, cx: &mut Context<Self>) {
+        if self.attributing {
+            self.attribute_again = true;
+            return;
+        }
+        let Some(archive) = self.archive.read(cx).archive().cloned() else {
+            return;
+        };
+        self.attributing = true;
+        let (resolve, cancel) = (self.resolve.clone(), self.stop_index.clone());
+        self.run(
+            cx,
+            move || attributed(&archive, resolve.as_ref(), &cancel),
+            |this, changed, cx| {
+                this.attributing = false;
+                if changed > 0 {
+                    this.read_details(cx);
+                    cx.emit(SyncEvent::Archived);
+                }
+                if std::mem::take(&mut this.attribute_again) {
+                    this.attribute_copies(cx);
+                }
+            },
+        );
     }
 
     /// Runs `work`, which blocks on the archive or on this machine's files, on the background

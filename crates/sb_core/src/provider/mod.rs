@@ -23,24 +23,8 @@ use std::sync::Arc;
 use thiserror::Error;
 use toolbox_store::rusqlite;
 
-use crate::transcript::{CopyOf, Outline, Subagent, Transcript};
+use crate::transcript::{CopyWords, Outline, Subagent, Transcript};
 
-/**
- * What the records an app keeps beside its copies say of where one conversation ran (PLAN
- * §7.7), in the app's own words: nothing here is checked against a location.
- */
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CopyRecord {
-    /// The agent's id for the conversation, as [`crate::transcript::Facts::conversation`].
-    pub conversation: String,
-    /// The host it ran on over SSH, as the app handed it to `ssh`.
-    pub host: Option<String>,
-    /// The path its transcript had on that machine.
-    pub path: Option<String>,
-    /// The key the provider gives the transcript at `path` where it ran: what the original's
-    /// item is keyed by, if it is archived from there.
-    pub key: Option<String>,
-}
 use crate::transport::{Halt, RangeSink, Transport, TransportError};
 
 pub use crate::transport::{Hashed, RangeFailure, Unlisted};
@@ -168,6 +152,40 @@ pub struct Scan {
     pub skipped: Vec<Unlisted>,
 }
 
+/**
+ * What the records an app keeps beside its copies say of where one conversation ran (PLAN
+ * §7.7), in the app's own words: nothing here is checked against a location.
+ */
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyRecord {
+    /// The agent's id for the conversation, as [`crate::transcript::Facts::conversation`].
+    pub conversation: String,
+    /// The host it ran on over SSH, as the app handed it to `ssh`.
+    pub host: Option<String>,
+    /// The path its transcript had on that machine.
+    pub path: Option<String>,
+    /// The key the provider gives the transcript at `path` where it ran: what the original's
+    /// item is keyed by, if it is archived from there.
+    pub key: Option<String>,
+    /// The keys of the register items that say this: the app's records of the session, which
+    /// are deleted for good with it (PLAN §4.5).
+    pub sources: Vec<String>,
+}
+
+/// What a check of one register item says (the `check` example, [`register_audit`]): counts'
+/// worth, nothing a record says.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegisterAudit {
+    /// Whether it is JSON.
+    pub json: bool,
+    /// Whether it is larger than the provider reads a record up to.
+    pub too_large: bool,
+    /// The agent's ids of the conversations it names.
+    pub ids: Vec<String>,
+    /// Whether it marks subagents its app left out of the copy.
+    pub truncated: bool,
+}
+
 /// The first `length` bytes of the item `key`, to be hashed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemPrefix {
@@ -292,7 +310,7 @@ pub trait Provider: Send + Sync {
      * Like [`Provider::classify`], it is said from the id alone, so a copy is known for one
      * whether or not its transcript can be read.
      */
-    fn copy_of(&self, _session: &str) -> Option<CopyOf> {
+    fn copy_of(&self, _session: &str) -> Option<CopyWords> {
         None
     }
 
@@ -361,6 +379,14 @@ pub fn audit(
     transcript: &Transcript,
 ) -> Option<Audit> {
     (provider == claude_code::ID).then(|| claude_code::audit(items, transcript))
+}
+
+/**
+ * For development (the `check` example): what the provider makes of the register item
+ * `bytes` ([`RegisterAudit`]). `None` for a provider that keeps no register.
+ */
+pub fn register_audit(provider: ProviderId, bytes: &[u8]) -> Option<RegisterAudit> {
+    (provider == claude_code::ID).then(|| claude_code::register_audit(bytes))
 }
 
 /**

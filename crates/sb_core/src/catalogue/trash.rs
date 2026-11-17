@@ -572,7 +572,7 @@ impl Catalogue {
  */
 pub(super) fn forget(tx: &rusqlite::Connection, id: &SessionId) -> Result<()> {
     let identity = params![id.location, id.provider, id.key];
-    let items: Vec<(i64, String, String)> = tx
+    let mut items: Vec<(i64, String, String)> = tx
         .prepare(
             "SELECT id, key, item_id FROM item
              WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
@@ -623,6 +623,37 @@ pub(super) fn forget(tx: &rusqlite::Connection, id: &SessionId) -> Result<()> {
             conversation
         ],
     )?;
+    /* A copy's record, the app's own file of that session, goes with it (PLAN §4.5). */
+    if let (Some(_), Some(conversation)) = (&copy, &conversation) {
+        let sources: Option<String> = tx
+            .query_row(
+                "SELECT sources FROM copy_record
+                 WHERE location_id = ?1 AND provider = ?2 AND conversation = ?3",
+                params![id.location, id.provider, conversation],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let keys: Vec<String> = sources
+            .and_then(|sources| serde_json::from_str(&sources).ok())
+            .unwrap_or_default();
+        let mut register = tx.prepare(
+            "SELECT id, key, item_id FROM item
+             WHERE location_id = ?1 AND provider = ?2 AND key = ?3 AND kind = 'register'",
+        )?;
+        for key in keys {
+            items.extend(
+                register
+                    .query_row(params![id.location, id.provider, key], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .optional()?,
+            );
+        }
+        tx.execute(
+            "DELETE FROM copy_record WHERE location_id = ?1 AND provider = ?2 AND conversation = ?3",
+            params![id.location, id.provider, conversation],
+        )?;
+    }
     tx.execute(
         "INSERT OR IGNORE INTO text_gone (location_id, provider, session)
          VALUES (?1, ?2, ?3)",

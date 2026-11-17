@@ -294,13 +294,15 @@ pub(super) fn sidecar<T: DeserializeOwned>(
     items: &dyn SessionItems,
     key: &str,
 ) -> Result<Option<T>, String> {
-    if !items.list().iter().any(|item| item.key == key) {
-        return Ok(None);
-    }
+    /* Asked of the items by key, which they find without a walk of the list. */
+    let file = match items.open(key, 0) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
     let mut json = Vec::new();
-    items
-        .open(key, 0)
-        .and_then(|file| file.take(SIDECAR_BYTES + 1).read_to_end(&mut json))
+    file.take(SIDECAR_BYTES + 1)
+        .read_to_end(&mut json)
         .map_err(|error| error.to_string())?;
     if json.len() as u64 > SIDECAR_BYTES {
         return Err(format!("it is larger than {SIDECAR_BYTES} bytes"));

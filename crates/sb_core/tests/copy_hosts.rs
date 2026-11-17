@@ -8,39 +8,57 @@ use std::collections::HashMap;
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::archive::Archive;
-use sb_core::catalogue::{Catalogue, Session, SessionId, Shelf};
+use sb_core::catalogue::{Catalogue, Filed, Origin, Session, SessionId, Shelf};
 use sb_core::location::{LocationId, LocationKind};
 use sb_core::provider;
 use sb_core::search::{Filters, Limit, Query, Searched};
 use sb_core::sync::{attribute, index, sync_location};
-use sb_core::transcript::Origin;
+use sb_core::transport::ssh_config::Resolution;
 use sb_core::transport::{ResolveHost, Resolved, Transport};
 use sb_test_support::{DesktopCopy, ProjectsTree, Session as Written};
 use tempfile::TempDir;
 
 const PROJECT: &str = "/home/user/code/app";
 
-/// `ssh -G` as a table: a host it doesn't hold fails to resolve.
-struct Table(HashMap<&'static str, (&'static str, &'static str, u16)>);
+/// Where a host ends: its name, user, port and jump host.
+type End = (&'static str, &'static str, u16, Option<&'static str>);
+
+/// `ssh -G` as a table: a host it doesn't hold it answers nothing for.
+struct Table(HashMap<&'static str, End>);
 
 impl ResolveHost for Table {
-    fn resolve(&self, host: &str) -> Option<Resolved> {
-        self.0.get(host).map(|(hostname, user, port)| Resolved {
-            hostname: (*hostname).to_string(),
-            user: (*user).to_string(),
-            port: *port,
-        })
+    fn resolve(&self, host: &str) -> Resolution {
+        Ok(self
+            .0
+            .get(host)
+            .map(|(hostname, user, port, jump)| Resolved {
+                hostname: (*hostname).to_string(),
+                user: (*user).to_string(),
+                port: *port,
+                proxy_jump: jump.map(str::to_string),
+                proxy_command: None,
+            }))
+    }
+}
+
+/// `ssh -G` that can't be asked at all: missing, failing or too slow.
+struct Unasked;
+
+impl ResolveHost for Unasked {
+    fn resolve(&self, _: &str) -> Resolution {
+        Err("ssh is not there".to_string())
     }
 }
 
 /// Where the alias `buildbox` ends, as `user@build.example` does.
 fn table() -> Table {
     Table(HashMap::from([
-        ("buildbox", ("build.example", "user", 22)),
-        ("user@build.example", ("build.example", "user", 22)),
-        ("other@build.example", ("build.example", "other", 22)),
-        ("buildbox-alt-port", ("build.example", "user", 2222)),
-        ("elsewhere", ("elsewhere.example", "user", 22)),
+        ("buildbox", ("build.example", "user", 22, None)),
+        ("user@build.example", ("build.example", "user", 22, None)),
+        ("other@build.example", ("build.example", "other", 22, None)),
+        ("buildbox-alt-port", ("build.example", "user", 2222, None)),
+        ("elsewhere", ("elsewhere.example", "user", 22, None)),
+        ("behind-a", ("build.example", "user", 22, Some("bastion-a"))),
     ]))
 }
 
@@ -120,12 +138,12 @@ impl Machines {
     /// Syncs this machine and attributes its copies through `resolve`.
     fn sync_here(&self, resolve: &dyn ResolveHost) {
         self.sync_at(&self.here, &self.pc.transport());
-        attribute(&self.archive, resolve).unwrap();
+        attribute(&self.archive, resolve, &CancelToken::new()).unwrap();
     }
 
     fn sync_host(&self, resolve: &dyn ResolveHost) {
         self.sync_at(&self.host, &self.remote.transport());
-        attribute(&self.archive, resolve).unwrap();
+        attribute(&self.archive, resolve, &CancelToken::new()).unwrap();
     }
 
     fn the_one(&self) -> Session {
@@ -187,7 +205,13 @@ fn an_alias_and_user_at_host_that_end_alike_are_one_machine() {
     let host = machines.host.clone();
     assert_eq!(
         machines.origin(),
-        (Some(host.clone()), Some(Origin::Location(host.clone())))
+        (
+            Some(host.clone()),
+            Some(Origin::Location {
+                ran_on: "Ran over SSH on".to_string(),
+                location: host.clone()
+            })
+        )
     );
     let shown = machines.the_one();
     assert_eq!(shown.id, machines.id(&machines.here, &copy.folder));
@@ -206,16 +230,27 @@ fn an_alias_and_user_at_host_that_end_alike_are_one_machine() {
 
 #[test]
 fn another_user_or_port_is_another_machine_named_by_its_host() {
-    for (n, host) in ["other@build.example", "buildbox-alt-port", "elsewhere"]
-        .into_iter()
-        .enumerate()
+    for (n, host) in [
+        "other@build.example",
+        "buildbox-alt-port",
+        "elsewhere",
+        "behind-a",
+    ]
+    .into_iter()
+    .enumerate()
     {
         let mut machines = Machines::new();
         machines.copied(n, host);
         machines.sync_here(&table());
         assert_eq!(
             machines.origin(),
-            (None, Some(Origin::Host(host.to_string()))),
+            (
+                None,
+                Some(Origin::Host {
+                    ran_on: "Ran over SSH on".to_string(),
+                    host: host.to_string()
+                })
+            ),
             "{host}"
         );
         let shown = machines.the_one();
@@ -243,9 +278,14 @@ fn a_host_ssh_can_t_resolve_leaves_the_copy_as_the_app_s_copy() {
     machines.sync_here(&Table(HashMap::new()));
     assert_eq!(machines.origin(), (None, unsaid()));
     /* Once it does, the next attribution says so; and when it no longer does, it unsays it. */
-    attribute(&machines.archive, &table()).unwrap();
+    attribute(&machines.archive, &table(), &CancelToken::new()).unwrap();
     assert_eq!(machines.origin().0, Some(machines.host.clone()));
-    attribute(&machines.archive, &Table(HashMap::new())).unwrap();
+    attribute(
+        &machines.archive,
+        &Table(HashMap::new()),
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(machines.origin(), (None, unsaid()));
 }
 
@@ -368,7 +408,7 @@ fn a_reindex_makes_the_attribution_again() {
         &mut |_| {},
     )
     .unwrap();
-    attribute(&machines.archive, &table()).unwrap();
+    attribute(&machines.archive, &table(), &CancelToken::new()).unwrap();
     assert_eq!(machines.origin().0, Some(machines.host.clone()));
 }
 
@@ -397,4 +437,160 @@ fn only_the_app_s_session_records_are_archived() {
         .filter(|key| !key.starts_with("projects/"))
         .collect();
     assert_eq!(archived, [kept]);
+}
+
+/// `ssh` that can't be asked keeps what was said last, of a copy's host and of a location's;
+/// one whose string is the location's own is that location even then.
+#[test]
+fn ssh_that_can_t_be_asked_keeps_the_last_attribution() {
+    let mut machines = Machines::new();
+    machines.copied(1, "buildbox");
+    machines.sync_here(&table());
+    let host = machines.host.clone();
+    assert_eq!(machines.origin().0, Some(host.clone()));
+    attribute(&machines.archive, &Unasked, &CancelToken::new()).unwrap();
+    assert_eq!(machines.origin().0, Some(host.clone()));
+
+    let mut machines = Machines::new();
+    machines.copied(1, "user@build.example");
+    machines.sync_here(&Unasked);
+    assert_eq!(machines.origin().0, Some(machines.host.clone()));
+}
+
+/// A copy's location moving refiles it: by the path attached for the location it ran at, never
+/// one it was filed in by hand.
+#[test]
+fn a_copy_is_filed_by_the_location_it_ran_at_and_refiled_as_that_moves() {
+    let mut machines = Machines::new();
+    machines.copied(1, "buildbox");
+    let catalogue = machines.catalogue();
+    let folder = catalogue.create_folder("app", None).unwrap();
+    catalogue
+        .attach_path(folder, PROJECT, Some(&machines.host))
+        .unwrap();
+    machines.sync_here(&table());
+    assert_eq!(machines.the_one().filed, Filed::ByRule(folder));
+    /* ssh no longer makes it that machine: it is from no location, and unfiled. */
+    attribute(
+        &machines.archive,
+        &Table(HashMap::new()),
+        &CancelToken::new(),
+    )
+    .unwrap();
+    assert_eq!(machines.the_one().filed, Filed::Unsorted);
+    /* Filed by hand, it stays wherever its location goes. */
+    let id = machines.the_one().id;
+    let other = machines.catalogue().create_folder("mine", None).unwrap();
+    machines.catalogue().file_by_hand(&id, other).unwrap();
+    attribute(&machines.archive, &table(), &CancelToken::new()).unwrap();
+    assert_eq!(machines.the_one().filed, Filed::ByHand(other));
+}
+
+/// Of two locations that are one machine the one added first is taken; one removed is none.
+#[test]
+fn the_location_added_first_wins_and_a_removed_one_is_none() {
+    let mut machines = Machines::new();
+    machines.copied(1, "buildbox");
+    let alias = machines
+        .catalogue()
+        .add_location(
+            LocationKind::Ssh {
+                host: "buildbox".to_string(),
+            },
+            "buildbox",
+        )
+        .unwrap()
+        .id;
+    machines.sync_here(&table());
+    assert_eq!(machines.origin().0, Some(machines.host.clone()));
+    machines
+        .catalogue()
+        .remove_location(&machines.host)
+        .unwrap();
+    attribute(&machines.archive, &table(), &CancelToken::new()).unwrap();
+    assert_eq!(machines.origin().0, Some(alias.clone()));
+    machines.catalogue().remove_location(&alias).unwrap();
+    attribute(&machines.archive, &table(), &CancelToken::new()).unwrap();
+    assert!(matches!(machines.origin().1, Some(Origin::Host { .. })));
+}
+
+/// Two records that disagree on a conversation's host say none: the copy is the app's.
+#[test]
+fn records_that_disagree_say_no_host() {
+    let mut machines = Machines::new();
+    let (session, _) = machines.copied(1, "buildbox");
+    let path = machines.remote.location_path(&session.key);
+    machines
+        .pc
+        .desktop_ssh_record(2, &session.id, "elsewhere", &path);
+    machines.sync_here(&table());
+    assert_eq!(machines.origin(), (None, unsaid()));
+}
+
+/// Without the desktop app's folder the agent syncs as before, and copies are the app's.
+#[test]
+fn an_agent_without_the_app_s_folder_syncs_as_before() {
+    let mut machines = Machines::new();
+    let session = machines.remote.session(PROJECT, 2);
+    machines.pc.desktop_copy(&session);
+    machines.sync_here(&table());
+    assert_eq!(machines.origin(), (None, unsaid()));
+}
+
+/// A copy matched to a deleted original only by its recorded path is deleted with it: it does
+/// not come back as a copy.
+#[test]
+fn a_copy_named_by_path_of_a_deleted_transcript_is_deleted_too() {
+    let mut machines = Machines::new();
+    let (session, copy) = machines.copied(1, "elsewhere");
+    let file = machines.pc.path(&copy.key);
+    let text = std::fs::read_to_string(&file)
+        .unwrap()
+        .replace(PROJECT, "/home/user/code/elsewhere");
+    std::fs::write(&file, text).unwrap();
+    machines.pc.set_modified(
+        &copy.key,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+    );
+    /* The original is deleted for good before the copy is archived. */
+    machines.sync_host(&table());
+    let original = machines.id(&machines.host, session.session_key());
+    machines.catalogue().trash(&original).unwrap();
+    let deletion = machines.catalogue().deletion(&original).unwrap();
+    machines.archive.delete_for_good(&deletion).unwrap();
+    machines.sync_here(&table());
+    assert_eq!(
+        machines
+            .catalogue()
+            .session(&machines.id(&machines.here, &copy.folder))
+            .unwrap(),
+        None
+    );
+}
+
+/// Deleting a copy for good takes the app's record of its session with it.
+#[test]
+fn deleting_a_copy_takes_its_record() {
+    let mut machines = Machines::new();
+    machines.copied(1, "buildbox");
+    machines.sync_here(&table());
+    let id = machines.the_one().id;
+    machines.catalogue().trash(&id).unwrap();
+    let deletion = machines.catalogue().deletion(&id).unwrap();
+    machines.archive.delete_for_good(&deletion).unwrap();
+    let registers = (machines.catalogue())
+        .items(&machines.here, provider::builtin()[0].id().as_str())
+        .unwrap()
+        .into_iter()
+        .filter(|item| !item.key.starts_with("projects/"))
+        .count();
+    assert_eq!(registers, 0);
+    machines.sync_here(&table());
+    assert!(
+        machines
+            .catalogue()
+            .sessions(Shelf::All)
+            .unwrap()
+            .is_empty()
+    );
 }

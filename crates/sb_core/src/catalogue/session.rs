@@ -23,7 +23,7 @@ use crate::filing::{FolderId, NormalPath};
 use crate::hash::{Hash, Hasher};
 use crate::location::LocationId;
 use crate::provider::ItemKind;
-use crate::transcript::{CopyOf, Ending, INDEX_VERSION, Origin, SessionIndex, Tokens, Totals};
+use crate::transcript::{CopyWords, Ending, INDEX_VERSION, SessionIndex, Tokens, Totals};
 
 /// A session's identity (PLAN §2.1): the location it was pulled from, its agent's provider,
 /// and that provider's id for it.
@@ -111,12 +111,47 @@ impl Session {
         match &self.copy {
             None => Some(&self.id.location),
             Some(CopyOf {
-                origin: Origin::Location(location),
+                origin: Origin::Location { location, .. },
                 ..
             }) => Some(location),
             Some(_) => None,
         }
     }
+}
+
+/// What a session is a copy as (PLAN §7.7): the provider's label, and where it ran as far as
+/// anything says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyOf {
+    /// What the copy is, shown where a location would be: "Some App's copy".
+    pub label: String,
+    pub origin: Origin,
+}
+
+impl CopyOf {
+    /// What the tag of a copy that is from no location says: the host it ran on when that is
+    /// known, else what the copy is.
+    pub fn tag(&self) -> &str {
+        match &self.origin {
+            Origin::Host { host, .. } => host,
+            Origin::Unsaid(_) | Origin::Location { .. } => &self.label,
+        }
+    }
+}
+
+/// Where a copy of a session ran (PLAN §7.7), each with the provider's words for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Nothing says which machine: "Ran over SSH; …".
+    Unsaid(String),
+    /// On this host, as the app that kept the copy recorded it, which this machine's `ssh`
+    /// resolves and is none of the locations. `ran_on` is said before it: "Ran over SSH on".
+    Host { ran_on: String, host: String },
+    /// At this location: the SSH location this machine's `ssh` makes the recorded host.
+    Location {
+        ran_on: String,
+        location: LocationId,
+    },
 }
 
 /// How another session's main transcript compares with a session's, by the versions of each
@@ -367,6 +402,8 @@ macro_rules! copy_columns {
             ".copy_label, ",
             $x,
             ".copy_origin, ",
+            $x,
+            ".copy_ran_on, ",
             recorded!("CASE WHEN r.resolved THEN r.host END", $x),
             ", ",
             recorded!("r.ran_at", $x)
@@ -553,7 +590,7 @@ const DERIVED: [&str; 27] = [
 
 /// What a row says of the session whatever came of its index, after [`DERIVED`]: whether it
 /// is a copy, which its provider says from its id alone ([`crate::provider::Provider::copy_of`]).
-const COPY: [&str; 2] = ["copy_label", "copy_origin"];
+const COPY: [&str; 3] = ["copy_label", "copy_origin", "copy_ran_on"];
 
 /// What a row says of the index that made it, after [`DERIVED`]. These are all that an index
 /// that could not parse the session sets of a row that is there.
@@ -872,7 +909,7 @@ impl Catalogue {
         parser_version: u32,
         from: Hash,
         indexed: Indexed<'_>,
-        copy: Option<&CopyOf>,
+        copy: Option<&CopyWords>,
         known: Option<&str>,
     ) -> Result<RowMade> {
         let nothing = SessionIndex::default();
@@ -905,12 +942,6 @@ impl Catalogue {
         let (own, all) = (usage(&index.own), usage(&index.all));
         /* SQLite's integers are signed: a count past their range is recorded as the greatest. */
         let count = |count: u64| i64::try_from(count).unwrap_or(i64::MAX);
-        /* A provider says a copy from its id alone, in its words; where the copy ran is the
-        catalogue's to add, from the copy's record (`copy_from`). */
-        let words = copy.map(|copy| match &copy.origin {
-            Origin::Unsaid(words) => words.as_str(),
-            Origin::Host(_) | Origin::Location(_) => "",
-        });
         let columns: Vec<&str> = DERIVED.into_iter().chain(COPY).chain(MADE).collect();
         /* Of a row that is there, a session that was not parsed changes only whether it is a
         copy, why, and what the row is made by and from. */
@@ -983,7 +1014,8 @@ impl Catalogue {
                     derived.as_ref().is_some_and(|derived| derived.held_back),
                     index.conversation,
                     copy.map(|copy| &copy.label),
-                    words,
+                    copy.map(|copy| &copy.unsaid),
+                    copy.map(|copy| &copy.ran_on),
                     failure,
                     retry,
                     parser_version,
@@ -1001,7 +1033,8 @@ impl Catalogue {
                 return unparsed_row(tx, id, copy.is_some(), known);
             }
             if let Some(conversation) = &index.conversation
-                && tombstoned(tx, id, conversation, index.project_path.as_deref())?
+                && (tombstoned(tx, id, conversation, index.project_path.as_deref())?
+                    || (copy.is_some() && path_tombstoned(tx, id, conversation)?))
             {
                 super::trash::forget(tx, id)?;
                 return Ok(RowMade::Deleted);
@@ -1045,8 +1078,8 @@ impl Catalogue {
                         key: row.get(2)?,
                     },
                     copy: copy_from(row, 3)?,
-                    theirs: (row.get(7)?, row.get(8)?, row.get(9)?),
-                    ours: (row.get(10)?, row.get(11)?, row.get(12)?),
+                    theirs: (row.get(8)?, row.get(9)?, row.get(10)?),
+                    ours: (row.get(11)?, row.get(12)?, row.get(13)?),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?)
@@ -1562,6 +1595,31 @@ fn unparsed_row(
     Ok(RowMade::Made { filed: false })
 }
 
+/**
+ * Whether the record of the copy `id` (of the conversation `conversation`) names a transcript
+ * the owner deleted for good where it ran, as [`names_transcript`] names one archived: a
+ * deleted conversation does not come back as a copy matched by its path alone (PLAN §4.5).
+ */
+fn path_tombstoned(
+    connection: &Connection,
+    id: &SessionId,
+    conversation: &str,
+) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM copy_record r
+             JOIN tombstone_item ti ON ti.provider = r.provider AND ti.key = r.key
+             JOIN location l ON l.id = ti.location_id AND l.kind IN ('wsl', 'ssh')
+             JOIN location_provider lp
+               ON lp.location_id = ti.location_id AND lp.provider = ti.provider
+             WHERE r.location_id = ?1 AND r.provider = ?2 AND r.conversation = ?3
+               AND substr(r.path, 1, length(lp.root) + 1) = lp.root || '/'
+         )",
+        params![id.location, id.provider, conversation],
+        |row| row.get(0),
+    )
+}
+
 /// The items of one session, by key: after [`reading`].
 const OF_SESSION: &str =
     "WHERE i.location_id = ?1 AND i.provider = ?2 AND i.session = ?3 ORDER BY i.key";
@@ -1734,13 +1792,21 @@ pub(super) fn session_from(row: &Row<'_>) -> rusqlite::Result<Session> {
 
 /// What a session is a copy as, from the columns [`copy_columns`] names, at `at` and after it.
 fn copy_from(row: &Row<'_>, at: usize) -> rusqlite::Result<Option<CopyOf>> {
-    let (Some(label), Some(words)) = (row.get(at)?, row.get(at + 1)?) else {
+    let (Some(label), Some(unsaid)) = (row.get(at)?, row.get(at + 1)?) else {
         return Ok(None);
     };
-    let origin = match (row.get(at + 3)?, row.get(at + 2)?) {
-        (Some(location), _) => Origin::Location(location),
-        (None, Some(host)) => Origin::Host(host),
-        (None, None) => Origin::Unsaid(words),
+    let ran_on: Option<String> = row.get(at + 2)?;
+    let ran_on = || ran_on.clone().unwrap_or_default();
+    let origin = match (row.get(at + 4)?, row.get(at + 3)?) {
+        (Some(location), _) => Origin::Location {
+            ran_on: ran_on(),
+            location,
+        },
+        (None, Some(host)) => Origin::Host {
+            ran_on: ran_on(),
+            host,
+        },
+        (None, None) => Origin::Unsaid(unsaid),
     };
     Ok(Some(CopyOf { label, origin }))
 }
@@ -1815,9 +1881,10 @@ mod tests {
             provider: "fixture".to_string(),
             key: "copied".to_string(),
         };
-        let copy = CopyOf {
+        let words = CopyWords {
             label: "A copy".to_string(),
-            origin: Origin::Unsaid("Ran elsewhere.".to_string()),
+            unsaid: "Ran elsewhere.".to_string(),
+            ran_on: "Ran on".to_string(),
         };
         catalogue
             .record_session(
@@ -1825,11 +1892,15 @@ mod tests {
                 1,
                 Hash::of(b""),
                 Indexed::Faulted("no"),
-                Some(&copy),
+                Some(&words),
                 None,
             )
             .unwrap();
         let row = catalogue.session(&id).unwrap().unwrap();
+        let copy = CopyOf {
+            label: "A copy".to_string(),
+            origin: Origin::Unsaid("Ran elsewhere.".to_string()),
+        };
         assert_eq!((row.ran_at(), &row.copy), (None, &Some(copy)));
     }
 

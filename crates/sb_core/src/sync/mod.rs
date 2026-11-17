@@ -6,12 +6,13 @@
 //! pass continues from the catalogue. A sync only adds (PLAN §2.3): it never changes or deletes
 //! a stored segment, and nothing is ever written to a location.
 
+mod attribute;
 mod index;
 mod plan;
 mod refetch;
 mod store;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use thiserror::Error;
 use toolbox_process::CancelToken;
@@ -21,8 +22,9 @@ use crate::catalogue::{self, Catalogue, CatalogueError, SessionId};
 use crate::location::{LocationId, LocationKind};
 use crate::provider::{Provider, ProviderError, ProviderId, ScannedItem, Source, Unlisted};
 use crate::search::SearchError;
-use crate::transport::{ResolveHost, Resolved, Transport, TransportError, wsl};
+use crate::transport::{Transport, TransportError, wsl};
 
+pub use attribute::attribute;
 pub use index::{IndexReport, index, index_session};
 pub use refetch::refetch;
 
@@ -335,40 +337,6 @@ pub fn sync_location(
     /* A log a read held when a delete for good was to empty it is emptied now. */
     catalogue.retry_empty_log();
     Ok(passes)
-}
-
-/**
- * Says where each copy kept at This PC's location ran, where its app's records name a host
- * (PLAN §7.7): resolves each host recorded there, and each SSH location's, through `resolve`
- * (this machine's `ssh -G`, or a stand-in), each host string once, and attributes a copy to
- * the location whose host ends where its own does. A host that doesn't resolve is no match.
- * Run after every sync of any location and after a start's index. Returns how many records'
- * attribution changed.
- */
-pub fn attribute(archive: &Archive, resolve: &dyn ResolveHost) -> Result<usize, SyncError> {
-    let catalogue = archive.catalogue();
-    let hosts = catalogue.copy_hosts()?;
-    let mut resolved: HashMap<&str, Option<Resolved>> = HashMap::new();
-    for host in hosts.recorded.iter().chain(
-        (hosts.locations.iter())
-            .filter(|_| !hosts.recorded.is_empty())
-            .map(|(_, host)| host),
-    ) {
-        resolved
-            .entry(host)
-            .or_insert_with(|| resolve.resolve(host));
-    }
-    let places = (hosts.recorded.iter())
-        .map(|host| {
-            let place = resolved[host.as_str()].as_ref().map(|it| {
-                (hosts.locations.iter())
-                    .find(|(_, at)| resolved[at.as_str()].as_ref() == Some(it))
-                    .map(|(id, _)| id.clone())
-            });
-            (host.clone(), place)
-        })
-        .collect();
-    Ok(catalogue.attribute_copies(&places)?)
 }
 
 /**

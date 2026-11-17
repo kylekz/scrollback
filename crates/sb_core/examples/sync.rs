@@ -594,7 +594,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// Says where the copies kept on this machine ran, through this machine's `ssh -G`, as the app
 /// does after a sync (PLAN §7.7), and how many copies' attribution that changed.
 fn attributed(archive: &Archive) -> Result<(), Box<dyn Error>> {
-    let changed = attribute(archive, &SshConfig)?;
+    let changed = attribute(archive, &SshConfig::default(), &CancelToken::new())?;
     println!("where copies ran: {changed} changed");
     Ok(())
 }

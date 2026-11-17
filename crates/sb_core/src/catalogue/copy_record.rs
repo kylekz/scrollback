@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use toolbox_store::rusqlite::{self, params};
 
+use super::session::SHOWN;
 use super::{Catalogue, Result, folder};
 use crate::location::LocationId;
 use crate::provider::CopyRecord;
@@ -14,44 +15,59 @@ use crate::provider::CopyRecord;
 /// the SSH locations a copy can be attributed to.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Hosts {
-    /// Every distinct host recorded at a location of this machine, as recorded.
+    /// Every distinct host recorded at a location of this machine for a copy shown alone, as
+    /// recorded.
     pub recorded: Vec<String>,
     /// Each SSH location that is not removed, with its host, the first added first.
     pub locations: Vec<(LocationId, String)>,
 }
 
+/// The `kv` key of what the copy records of `provider` at `location` were read from.
+fn made_key(location: &LocationId, provider: &str) -> String {
+    format!("copy_records.{}.{provider}", location.as_str())
+}
+
 impl Catalogue {
     /**
      * Records what `records` say, which `provider`'s records at `location` say now, in place
-     * of what they said before. A conversation whose host is as it was keeps what the last
-     * attribution made of it; one with another host is unresolved until the next.
+     * of what they said before, and that they were read from the register items `made` (a
+     * fingerprint, [`Catalogue::copy_records_made`]). A conversation whose host is as it was
+     * keeps what the last attribution made of it; one with another host is unresolved until
+     * the next. With `whole` false, some record could not be read: what is not among `records`
+     * is kept, and `made` is not, so the next index reads them all again. A copy whose
+     * location this takes away is filed again by the rules (PLAN §8), in the same transaction.
      */
     pub(crate) fn record_copies(
         &self,
         location: &LocationId,
         provider: &str,
         records: &[CopyRecord],
+        whole: bool,
+        made: &str,
     ) -> Result<()> {
         self.db.write(|tx| {
-            let mut was: HashMap<String, Option<String>> = tx
+            let mut was: HashMap<String, (Option<String>, bool)> = tx
                 .prepare(
-                    "SELECT conversation, host FROM copy_record
+                    "SELECT conversation, host, ran_at IS NOT NULL FROM copy_record
                      WHERE location_id = ?1 AND provider = ?2",
                 )?
                 .query_map(params![location, provider], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
+                    Ok((row.get(0)?, (row.get(1)?, row.get(2)?)))
                 })?
                 .collect::<rusqlite::Result<_>>()?;
             let mut upsert = tx.prepare(
-                "INSERT INTO copy_record (location_id, provider, conversation, host, path, key)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO copy_record
+                     (location_id, provider, conversation, host, path, key, sources)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT (location_id, provider, conversation) DO UPDATE SET
                      path = excluded.path,
                      key = excluded.key,
+                     sources = excluded.sources,
                      resolved = CASE WHEN host IS excluded.host THEN resolved ELSE 0 END,
                      ran_at = CASE WHEN host IS excluded.host THEN ran_at END,
                      host = excluded.host",
             )?;
+            let mut moved = false;
             for record in records {
                 upsert.execute(params![
                     location,
@@ -59,30 +75,57 @@ impl Catalogue {
                     record.conversation,
                     record.host,
                     record.path,
-                    record.key
+                    record.key,
+                    serde_json::to_string(&record.sources).expect("keys always serialize")
                 ])?;
-                was.remove(&record.conversation);
+                if let Some((host, attributed)) = was.remove(&record.conversation) {
+                    moved |= attributed && host != record.host;
+                }
             }
-            let mut forget = tx.prepare(
-                "DELETE FROM copy_record
-                 WHERE location_id = ?1 AND provider = ?2 AND conversation = ?3",
-            )?;
-            for conversation in was.keys() {
-                forget.execute(params![location, provider, conversation])?;
+            if whole {
+                let mut forget = tx.prepare(
+                    "DELETE FROM copy_record
+                     WHERE location_id = ?1 AND provider = ?2 AND conversation = ?3",
+                )?;
+                for (conversation, (_, attributed)) in &was {
+                    forget.execute(params![location, provider, conversation])?;
+                    moved |= *attributed;
+                }
+                tx.execute(
+                    "INSERT INTO kv (key, value) VALUES (?1, ?2)
+                     ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    params![made_key(location, provider), made],
+                )?;
+            }
+            if moved {
+                folder::refile(tx)?;
             }
             Ok(())
         })
     }
 
+    /// What the copy records of `provider` at `location` were last read from, whole: a
+    /// fingerprint of its register items and the parser's version ([`Catalogue::record_copies`]).
+    pub(crate) fn copy_records_made(
+        &self,
+        location: &LocationId,
+        provider: &str,
+    ) -> Result<Option<String>> {
+        self.setting(&made_key(location, provider))
+    }
+
     /// The hosts the next attribution resolves ([`Hosts`]).
     pub(crate) fn copy_hosts(&self) -> Result<Hosts> {
         self.db.read(|c| {
+            /* Only of copies shown alone: nothing shows where a hidden one ran. */
             let recorded = c
-                .prepare(
+                .prepare(&format!(
                     "SELECT DISTINCT r.host FROM copy_record r
                      JOIN location l ON l.id = r.location_id AND l.kind = 'local'
-                     WHERE r.host IS NOT NULL ORDER BY r.host",
-                )?
+                     JOIN session s ON s.location_id = r.location_id AND s.provider = r.provider
+                      AND s.conversation = r.conversation AND s.copy_label IS NOT NULL
+                     WHERE r.host IS NOT NULL AND {SHOWN} ORDER BY r.host"
+                ))?
                 .query_map([], |row| row.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
             let locations = c

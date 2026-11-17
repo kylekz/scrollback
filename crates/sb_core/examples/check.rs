@@ -22,11 +22,14 @@
 //! where the provider finds them for the first home (under `%APPDATA%`, which `--appdata`
 //! names for a home given, else `<home>/AppData/Roaming` when there is one; or under
 //! `<home>/Library/Application Support`), and it counts the copies with a record, with a host,
-//! with a host this machine's `ssh -G` resolves (it connects to nothing), with one that is the
-//! same machine as a host given with `--location` (any number of them, as the SSH locations
-//! would be added), and with one that doesn't resolve; how the recorded transcript paths are
-//! written, and how many name their original's file; which of a record's fields a copy
-//! folder's id is in; and the records' `subagentsTruncatedFor` beside the copies' loose
+//! with a host this machine's `ssh -G` resolves (it opens no SSH connection, but runs the
+//! owner's `Match exec` commands and may look names up in DNS with `CanonicalizeHostname`
+//! set), with one that is the same machine as a host given with `--location` (any number of
+//! them, as the SSH locations would be added), and with one that doesn't resolve; how the
+//! recorded transcript paths are written, and how many name their original's file; which of
+//! a record's fields a copy folder's id is in (a field's name printed only as far as it is an
+//! identifier); the records too large to be read as one, and the records'
+//! `subagentsTruncatedFor` beside the copies' loose
 //! subagents left unattached. Of each copy with an original, it reads the subagents of both
 //! and counts those attached in both, in the original only (by how the original's were found:
 //! in a workflow's folder, with a `.meta.json`, or by their call's id alone), in the copy only,
@@ -46,7 +49,8 @@ use std::io::{self, Cursor, Read};
 use std::path::Path;
 
 use sb_core::provider::{
-    self, CopyRecord, ItemKind, ItemRange, Provider, ProviderId, SessionItem, SessionItems, Source,
+    self, CopyRecord, ItemKind, ItemRange, Provider, ProviderId, RegisterAudit, SessionItem,
+    SessionItems, Source,
 };
 use sb_core::transcript::{
     BlockId, Content, Conversation, Ending, Subagent, ToolInput, ToolKind, Transcript,
@@ -694,24 +698,42 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let mut hosts = Hosts::new(&args.locations);
     for provider in &providers {
+        /* What the provider makes of the register as a whole, and of each file of it. */
         let mut records = Vec::new();
         let mut raw = Vec::new();
+        let mut by_source: BTreeMap<usize, Vec<SessionItem>> = BTreeMap::new();
         for (source, item) in &register {
+            by_source.entry(*source).or_default().push(item.clone());
+        }
+        for (source, list) in by_source {
             let items = Session {
-                source: &sources[*source],
-                list: vec![item.clone()],
+                source: &sources[source],
+                list,
             };
             records.extend(provider.copy_records(&items));
-            let mut bytes = Vec::new();
-            let json = items
-                .open(&item.key, 0)
-                .and_then(|mut file| file.read_to_end(&mut bytes))
-                .ok()
-                .and_then(|_| serde_json::from_slice::<Value>(&bytes).ok());
-            hosts.counts.add("register files", 1);
-            match json {
-                Some(json) => raw.push(json),
-                None => hosts.counts.add("register files that are not JSON", 1),
+            for item in &items.list {
+                let mut bytes = Vec::new();
+                if items
+                    .open(&item.key, 0)
+                    .and_then(|mut file| file.read_to_end(&mut bytes))
+                    .is_err()
+                {
+                    hosts.counts.add("register files that could not be read", 1);
+                    continue;
+                }
+                let Some(audit) = provider::register_audit(provider.id(), &bytes) else {
+                    continue;
+                };
+                hosts.counts.add("register files", 1);
+                if audit.too_large {
+                    hosts
+                        .counts
+                        .add("register files too large to be read as records", 1);
+                }
+                if !audit.json {
+                    hosts.counts.add("register files that are not JSON", 1);
+                }
+                raw.push((audit, serde_json::from_slice::<Value>(&bytes).ok()));
             }
         }
         for copy in
@@ -812,6 +834,7 @@ struct Hosts {
     /// What each host given with `--location` resolves to, of those that do.
     locations: Vec<Resolved>,
     resolved: HashMap<String, Option<Resolved>>,
+    ssh: SshConfig,
 }
 
 impl Hosts {
@@ -830,9 +853,10 @@ impl Hosts {
             counts.add(what, 0);
         }
         counts.add("hosts given with --location", locations.len() as u64);
+        let ssh = SshConfig::default();
         let resolved: Vec<Resolved> = locations
             .iter()
-            .filter_map(|host| SshConfig.resolve(host))
+            .filter_map(|host| ssh.resolve(host).ok().flatten())
             .collect();
         counts.add(
             "hosts given with --location that resolve",
@@ -842,18 +866,20 @@ impl Hosts {
             counts,
             locations: resolved,
             resolved: HashMap::new(),
+            ssh,
         }
     }
 
     /**
      * Counts the copy `copy` against the provider's records `records` and the register files
-     * read as JSON, `raw`, with its original, if one was found.
+     * as the provider audits them, each with its JSON, `raw`, with its original, if one was
+     * found.
      */
     fn copy(
         &mut self,
         copy: &Parsed,
         records: &[CopyRecord],
-        raw: &[Value],
+        raw: &[(RegisterAudit, Option<Value>)],
         original: Option<&Parsed>,
     ) {
         self.counts.add("copies", 1);
@@ -861,22 +887,16 @@ impl Hosts {
             self.counts.add("copies with no conversation id", 1);
             return;
         };
-        let files: Vec<&Value> = raw.iter().filter(|it| names(it, conversation)).collect();
+        let files: Vec<&(RegisterAudit, Option<Value>)> = (raw.iter())
+            .filter(|(audit, _)| audit.ids.iter().any(|id| id == conversation))
+            .collect();
         if !files.is_empty() {
             self.counts.add("copies with a record", 1);
         }
         if files.len() > 1 {
             self.counts.add("copies with more than one record", 1);
         }
-        let truncated = files
-            .iter()
-            .any(|file| match file.get("subagentsTruncatedFor") {
-                None | Some(Value::Null | Value::Bool(false)) => false,
-                Some(Value::Array(it)) => !it.is_empty(),
-                Some(Value::String(it)) => !it.is_empty(),
-                Some(Value::Object(it)) => !it.is_empty(),
-                Some(_) => true,
-            });
+        let truncated = files.iter().any(|(audit, _)| audit.truncated);
         let unattached = copy.unattached > 0;
         if truncated {
             self.counts
@@ -903,8 +923,8 @@ impl Hosts {
         }
         /* Which of the record's fields the copy's folder's id (after its first `-`) is in. */
         if let Some((_, id)) = copy.key.split_once('-') {
-            for file in &files {
-                for field in fields_holding(file, id) {
+            for (_, file) in &files {
+                for field in file.iter().flat_map(|file| fields_holding(file, id)) {
                     self.counts.add(
                         format!("copies whose folder's id is in the record's {field}"),
                         1,
@@ -947,7 +967,7 @@ impl Hosts {
         let resolved = self
             .resolved
             .entry(host.clone())
-            .or_insert_with(|| SshConfig.resolve(host))
+            .or_insert_with(|| self.ssh.resolve(host).ok().flatten())
             .clone();
         match resolved {
             Some(resolved) => {
@@ -968,19 +988,11 @@ impl Hosts {
     }
 }
 
-/// Whether the record `file` names the conversation `id` among its session ids.
-fn names(file: &Value, id: &str) -> bool {
-    let one = ["cliSessionId", "lastAssistantCliSessionId"]
-        .into_iter()
-        .filter_map(|field| file.get(field));
-    let many = ["priorCliSessionIds", "priorRemoteCliSessionIds"]
-        .into_iter()
-        .filter_map(|field| file.get(field)?.as_array())
-        .flatten();
-    one.chain(many).any(|value| value.as_str() == Some(id))
-}
-
-/// The names (as JSON pointers) of the text fields of `file` that hold `id`.
+/**
+ * The names (as JSON pointers) of the text fields of `file` that hold `id`. A name is printed
+ * only as far as it is an identifier: a part of it with anything but ASCII letters, digits and
+ * `_` is printed as `*`, so no value a record holds can be printed as a field's name.
+ */
 fn fields_holding(file: &Value, id: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut pending = vec![(String::new(), file)];
@@ -988,11 +1000,14 @@ fn fields_holding(file: &Value, id: &str) -> Vec<String> {
         match value {
             Value::String(text) if text.contains(id) => found.push(at),
             Value::Object(fields) => {
-                pending.extend(
-                    fields
-                        .iter()
-                        .map(|(name, value)| (format!("{at}/{name}"), value)),
-                );
+                pending.extend(fields.iter().map(|(name, value)| {
+                    let identifier = !name.is_empty()
+                        && name
+                            .bytes()
+                            .all(|it| it.is_ascii_alphanumeric() || it == b'_');
+                    let name = if identifier { name.as_str() } else { "*" };
+                    (format!("{at}/{name}"), value)
+                }));
             }
             Value::Array(values) => {
                 pending.extend(values.iter().map(|value| (format!("{at}/[]"), value)));

@@ -1118,7 +1118,7 @@ fn stage() -> MutexGuard<'static, Stage> {
  * The name a place of `kind` goes by and how it answers: as the scenario said, or else a
  * distro passes when there is a stand-in home to read it from and a host is asleep. A place
  * that would pass with no stand-in home can't be reached: it is never read as this machine.
- * This machine is `None`: it is read as it is.
+ * This machine is `None`: it is read through [`stand_ins`]' home for it.
  */
 fn answer<'a>(kind: &'a LocationKind, home: Option<&str>) -> Option<(&'a str, Answer)> {
     let (name, otherwise) = match kind {
@@ -1144,9 +1144,12 @@ fn answer<'a>(kind: &'a LocationKind, home: Option<&str>) -> Option<(&'a str, An
  * How a scripted run reaches its locations, or `None` for a run without the driver, which
  * reaches them as their kinds say. Never the distro or the host a location names, which would
  * be the machine's own and not the scenario's, and never through `wsl.exe` or `ssh`. This
- * machine is read with the scenario's home as its home, where the runner points its agent;
- * hosts a copy's records name resolve as `ssh` with no config would make them
- * (`sb_core::transport::ssh_config::NoConfig`), never through `ssh -G`. A place that
+ * machine is read with the scenario's home (`--automation-wsl-home`) as its home and only the
+ * variables that point inside it, where the runner points its agent; without that folder, with
+ * a home that isn't there, so its agent is not found. Either way nothing of the person's own
+ * is read, the desktop app's folder included (PLAN §7.3). Hosts a copy's records name resolve
+ * as `ssh` with no config would make them (`sb_core::transport::ssh_config::NoConfig`), never
+ * through `ssh -G`. A place that
  * passes is read from the folder `--automation-wsl-home` names ([`StandInHome`]); without one
  * it can't be reached, so a distro or a host is never read as this machine. Any other place
  * fails every call as the scenario said ([`Answer`]). The connection test answers the same
@@ -1167,9 +1170,15 @@ pub fn stand_ins(cli: &Cli) -> Option<Reach> {
         connect: Arc::new(
             move |kind, _| match (answer(kind, home.as_deref()), &home) {
                 /* This machine as the scenario's home, so that nothing kept beside the home's
-                agent (the desktop app's folder, PLAN §7.3) is read from the person's own. */
+                agent (the desktop app's folder, PLAN §7.3) is read from the person's own;
+                without one, as a home that isn't there, which holds nothing. */
                 (None, Some(home)) => Box::new(StandInHome { home: home.clone() }),
-                (None, None) => Box::new(LocalTransport),
+                (None, None) => Box::new(StandInHome {
+                    home: std::env::temp_dir()
+                        .join("scrollback-automation-no-home")
+                        .display()
+                        .to_string(),
+                }),
                 (Some((_, Answer::Passes)), _) => Box::new(StandInHome {
                     home: home.clone().unwrap_or_default(),
                 }),
@@ -1463,17 +1472,21 @@ mod tests {
         assert_eq!((reach.distros)(&cancel).unwrap(), None);
         /* A host a copy's record names resolves through the stand-in, never `ssh -G`, which
         is refused before it starts. */
-        assert!(reach.resolve.resolve("user@macbook.invalid").is_some());
+        assert!(matches!(
+            reach.resolve.resolve("user@macbook.invalid"),
+            Ok(Some(_))
+        ));
         assert!(matches!(
             sb_core::transport::SshConfig::run("user@macbook.invalid"),
             Err(TransportError::Failed(said)) if said.starts_with(LAUNCH_REFUSED)
         ));
-        assert_eq!(
+        /* Refused is "could not be asked", which keeps what was said before. */
+        assert!(
             sb_core::transport::ResolveHost::resolve(
-                &sb_core::transport::SshConfig,
+                &sb_core::transport::SshConfig::default(),
                 "user@macbook.invalid"
-            ),
-            None
+            )
+            .is_err()
         );
     }
 

@@ -17,10 +17,10 @@
 //! taken from it unambiguously.
 
 use std::collections::BTreeMap;
+use std::io::Read as _;
 
 use serde_json::Value;
 
-use super::parse::sidecar;
 use crate::provider::{CopyRecord, FileClass, ItemKind, SessionItems};
 
 /// The folder of the desktop app's records, under the app's data folder. Keys of the items in
@@ -31,6 +31,9 @@ pub(super) const SUBTREE: &str = "claude-code-sessions";
 /// `Library/Application Support` on macOS.
 pub(super) const APP_FOLDER: &str = "Claude";
 pub(super) const MAC_SUPPORT: &str = "Library/Application Support";
+
+/// The most a record is read up to: one larger is not one of the app's.
+const RECORD_BYTES: u64 = 1024 * 1024;
 
 /// The variable that names Windows' roaming application data folder.
 pub(super) const APPDATA: &str = "APPDATA";
@@ -73,21 +76,22 @@ struct Said {
 
 /**
  * What the records among `register` say of where each conversation ran: one record for each
- * id a file names, with what the files that name it agree on. Where two files say different
- * things of one conversation (another host, another path), that thing is not said; a
- * conversation of which nothing is said is left out.
+ * id a file names, with what the files that name it agree on, and those files. A path is said
+ * only of the id it names (the transcript `<id>.jsonl`), not of the session's prior ones. Where
+ * two files say different things of one conversation (another host, another path), that thing
+ * is not said; a conversation of which nothing is said is left out. A file that can't be read
+ * or isn't JSON says nothing.
  */
 pub(super) fn copy_records(register: &dyn SessionItems) -> Vec<CopyRecord> {
     /* Each conversation's host and path, each `None` while no file has said it and
-    `Some(None)` once two files disagreed. */
-    type Agreed = (Option<Option<String>>, Option<Option<String>>);
+    `Some(None)` once two files disagreed, and the files that named it. */
+    type Agreed = (Option<Option<String>>, Option<Option<String>>, Vec<String>);
     let mut agreed: BTreeMap<String, Agreed> = BTreeMap::new();
-    let keys: Vec<&str> = (register.list().iter())
-        .filter(|item| item.kind == ItemKind::Register)
-        .map(|item| item.key.as_str())
-        .collect();
-    for key in keys {
-        let Ok(Some(record)) = sidecar::<Value>(register, key) else {
+    for item in register.list() {
+        if item.kind != ItemKind::Register {
+            continue;
+        }
+        let Some(record) = read(register, &item.key) else {
             continue;
         };
         let said = said(&record);
@@ -95,23 +99,71 @@ pub(super) fn copy_records(register: &dyn SessionItems) -> Vec<CopyRecord> {
             continue;
         }
         for id in ids(&record) {
-            let (host, path) = agreed.entry(id).or_default();
+            let (host, path, sources) = agreed.entry(id.clone()).or_default();
             agree(host, said.host.as_ref());
-            agree(path, said.path.as_ref());
+            let named = (said.path.as_ref()).filter(|path| names(path, &id));
+            agree(path, named);
+            sources.push(item.key.clone());
         }
     }
     agreed
         .into_iter()
-        .filter_map(|(conversation, (host, path))| {
+        .filter_map(|(conversation, (host, path, sources))| {
             let (host, path) = (host.flatten(), path.flatten());
             (host.is_some() || path.is_some()).then(|| CopyRecord {
                 key: path.as_deref().and_then(key_of),
                 conversation,
                 host,
                 path,
+                sources,
             })
         })
         .collect()
+}
+
+/// The record at `key` of `register`, read as JSON: `None` when it can't be read, is larger
+/// than a record is, or isn't JSON.
+fn read(register: &dyn SessionItems, key: &str) -> Option<Value> {
+    let mut json = Vec::new();
+    register
+        .open(key, 0)
+        .and_then(|file| file.take(RECORD_BYTES + 1).read_to_end(&mut json))
+        .ok()?;
+    if json.len() as u64 > RECORD_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&json).ok()
+}
+
+/// Whether the transcript path `path` is the transcript of the session `id`: `…/<id>.jsonl`.
+fn names(path: &str, id: &str) -> bool {
+    path.rsplit(['/', '\\'])
+        .next()
+        .and_then(|name| name.strip_suffix(".jsonl"))
+        == Some(id)
+}
+
+/// What a check of the records says of one (the `check` example): the session ids it names,
+/// whether it marks subagents left out (`subagentsTruncatedFor`), and whether it is larger
+/// than a record is read up to. Nothing it says.
+pub(in crate::provider) fn audit(bytes: &[u8]) -> crate::provider::RegisterAudit {
+    let record: Option<Value> = serde_json::from_slice(bytes).ok();
+    let truncated = match record
+        .as_ref()
+        .and_then(|it| it.get("subagentsTruncatedFor"))
+    {
+        None | Some(Value::Null | Value::Bool(false)) => false,
+        Some(Value::Array(it)) => !it.is_empty(),
+        Some(Value::String(it)) => !it.is_empty(),
+        Some(Value::Object(it)) => !it.is_empty(),
+        Some(_) => true,
+    };
+    crate::provider::RegisterAudit {
+        json: record.is_some(),
+        too_large: bytes.len() as u64 > RECORD_BYTES,
+        ids: record.as_ref().map(ids).unwrap_or_default(),
+        truncated,
+    }
 }
 
 /**
@@ -220,12 +272,20 @@ mod tests {
         }
     }
 
-    fn record(conversation: &str, host: Option<&str>, path: Option<&str>) -> CopyRecord {
+    fn record(
+        conversation: &str,
+        host: Option<&str>,
+        path: Option<&str>,
+        sources: &[&str],
+    ) -> CopyRecord {
         CopyRecord {
             conversation: conversation.to_string(),
             host: host.map(str::to_string),
             path: path.map(str::to_string),
             key: path.and_then(key_of),
+            sources: (sources.iter())
+                .map(|key| format!("{SUBTREE}/{key}"))
+                .collect(),
         }
     }
 
@@ -268,10 +328,16 @@ mod tests {
                     "sshRemoteTranscriptPath": "/home/user/.claude/projects/-a/{ONE}.jsonl"}}"#
             ),
         )]);
+        /* The path is the transcript of one of them, and said of that one alone. */
         let path = format!("/home/user/.claude/projects/-a/{ONE}.jsonl");
+        let file = ["s1/local_s1.json"];
         assert_eq!(
             copy_records(&files),
-            [ONE, TWO, THREE].map(|id| record(id, Some("buildbox"), Some(&path)))
+            [
+                record(ONE, Some("buildbox"), Some(&path), &file),
+                record(TWO, Some("buildbox"), None, &file),
+                record(THREE, Some("buildbox"), None, &file),
+            ]
         );
     }
 
@@ -313,17 +379,18 @@ mod tests {
                     "sshRemoteTranscriptPath": "{path}"}}"#
             )
         };
+        let (one, two) = (format!("/p/{ONE}.jsonl"), format!("/p/{TWO}.jsonl"));
         let files = Files::of(&[
-            ("a/a.json", &file(ONE, "buildbox", "/p/one.jsonl")),
-            ("b/b.json", &file(ONE, "user@buildbox", "/p/one.jsonl")),
-            ("c/c.json", &file(TWO, "buildbox", "/p/two.jsonl")),
-            ("d/d.json", &file(TWO, "buildbox", "/p/two.jsonl")),
+            ("a/a.json", &file(ONE, "buildbox", &one)),
+            ("b/b.json", &file(ONE, "user@buildbox", &one)),
+            ("c/c.json", &file(TWO, "buildbox", &two)),
+            ("d/d.json", &file(TWO, "buildbox", &two)),
         ]);
         assert_eq!(
             copy_records(&files),
             [
-                record(ONE, None, Some("/p/one.jsonl")),
-                record(TWO, Some("buildbox"), Some("/p/two.jsonl")),
+                record(ONE, None, Some(&one), &["a/a.json", "b/b.json"]),
+                record(TWO, Some("buildbox"), Some(&two), &["c/c.json", "d/d.json"]),
             ]
         );
     }
