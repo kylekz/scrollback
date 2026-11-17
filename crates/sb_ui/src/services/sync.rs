@@ -35,8 +35,11 @@
 //! sync asked for while that index runs starts when it is over, so that the row says one thing
 //! at a time and the pass does not index again what the index is indexing. The start's index
 //! of every location is not waited for: passes start beside it, since a first sync must not
-//! wait on a full re-index, and both are safe together: each indexes what the catalogue says
-//! is stale, a session at a time, at worst one twice.
+//! wait on a full re-index. A pass's index makes the rows and the text of what the pass
+//! changed and no more; the backlog (rows another version of the parser or of the index made,
+//! and text not yet of its rows) is the index of every location's alone, so the two never
+//! parse the same sessions for it. A pass that finds a backlog with no such index running
+//! starts one, so it is never left.
 //!
 //! **The owner's locations** ([`locations`]): adding, renaming and removing one are the
 //! service's writes, each on a background job, as are the connection test and the listing of
@@ -156,8 +159,12 @@ impl AgentIndex {
         Some(IndexProgress { step, done, of })
     }
 
-    /// How much of it is done, from 0 to 1: its two steps take half each, and one with no
-    /// rows to make is its second step alone.
+    /**
+     * How much of it is done, from 0 to 1, of the step in hand: the first, which makes the
+     * rows and nearly all the text with them, fills the bar; a second with text still to make
+     * (the search index made anew, or text an index stopped before it wrote) fills it again
+     * from empty, and one with none leaves the first's full.
+     */
     fn fraction(self) -> f64 {
         let part = |done: usize, of: usize| {
             if of > 0 {
@@ -167,9 +174,7 @@ impl AgentIndex {
             }
         };
         match self {
-            Self::Rows { of, done } => part(done, of) / 2.,
-            Self::Texts { rows: 0, of, done } => part(done, of),
-            Self::Texts { of, done, .. } => (1. + part(done, of)) / 2.,
+            Self::Rows { of, done } | Self::Texts { of, done, .. } => part(done, of),
         }
     }
 }
@@ -287,9 +292,8 @@ impl PassProgress {
 
     /**
      * How much of the work in hand is done, from 0 to 1: of the bytes to fetch, or of the
-     * index of the agent being indexed. An index's two steps take half the bar each, so it
-     * moves on through the second instead of standing full. Each agent's index fills the bar
-     * from its start, so a failed one leaves nothing owing to the next.
+     * step of the index of the agent being indexed ([`AgentIndex::fraction`]). Each agent's
+     * index fills the bar from its start, so a failed one leaves nothing owing to the next.
      */
     pub fn fraction(&self) -> f32 {
         let done = match self.working() {
@@ -967,11 +971,13 @@ impl SyncService {
                     /* A stop is said until the next pass ends some other way: then that
                     pass's word stands, a failure or not reaching it among them. */
                     this.stopped.remove(&id);
-                    let (mut changed, mut whole) = (false, true);
+                    let (mut changed, mut whole, mut backlog) = (false, true, false);
                     match synced {
                         Ok(passes) => {
                             this.errors.remove(&id);
                             for pass in passes {
+                                backlog |=
+                                    pass.index.as_ref().is_ok_and(|report| report.backlog_left);
                                 match pass.outcome {
                                     Ok(report) => {
                                         changed |=
@@ -1019,6 +1025,11 @@ impl SyncService {
                     if !whole {
                         // What it stored before it ended is indexed, so that it shows.
                         this.index(Some(id.clone()), cx);
+                    }
+                    /* What a pass leaves (the module docs) is taken by the index of every
+                    location: the one running, or one started for it. */
+                    if backlog {
+                        this.index(None, cx);
                     }
                     // A location the owner removed while it synced goes once its pass is over.
                     if this.removing.contains(&id) {

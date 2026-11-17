@@ -923,7 +923,7 @@ fn a_locations_progress_runs_over_each_of_its_agents() {
         (5, 10, 500, 1000)
     );
     assert_eq!(progress.fraction(), 0.5);
-    // Then the sessions they changed are indexed: their rows, the first half of the bar.
+    // Then the sessions they changed are indexed: their rows, and their text, fill the bar.
     let indexing = |sessions| Progress::Indexing {
         sessions,
         bytes: 0,
@@ -941,20 +941,21 @@ fn a_locations_progress_runs_over_each_of_its_agents() {
     progress.apply(&indexing(8));
     progress.apply(&indexed(2, 0));
     assert!(progress.is_indexing());
-    assert_eq!(at(&progress), (Some((IndexStep::Rows, 6)), 0.125));
+    assert_eq!(at(&progress), (Some((IndexStep::Rows, 6)), 0.25));
     // Their text, made from the same parse, is written a batch at a time as they are.
     progress.apply(&indexed(8, 4));
     assert_eq!(progress.searchable_done, 4);
-    assert_eq!(at(&progress), (Some((IndexStep::Rows, 0)), 0.5));
-    // Then their text, the second half: what is left counts what it has to make searchable.
+    assert_eq!(at(&progress), (Some((IndexStep::Rows, 0)), 1.));
+    /* Then text the first step could not make, the search index's own bar from empty: what
+    is left counts what it has to make searchable. */
     progress.apply(&Progress::Searching { sessions: 4 });
-    assert_eq!(at(&progress), (Some((IndexStep::Texts, 4)), 0.5));
+    assert_eq!(at(&progress), (Some((IndexStep::Texts, 4)), 0.));
     progress.apply(&searched(1, 0));
-    assert_eq!(at(&progress), (Some((IndexStep::Texts, 3)), 0.625));
+    assert_eq!(at(&progress), (Some((IndexStep::Texts, 3)), 0.25));
     // Text written is news of its own.
     progress.apply(&searched(2, 2));
     assert_eq!(progress.searchable_done, 6);
-    assert_eq!(at(&progress), (Some((IndexStep::Texts, 2)), 0.75));
+    assert_eq!(at(&progress), (Some((IndexStep::Texts, 2)), 0.5));
     /* The first agent's index fails there. The second's starts the bar again from its own
     start, owing nothing of the first, and counts only its own. */
     progress.apply(&indexing(2));
@@ -962,7 +963,7 @@ fn a_locations_progress_runs_over_each_of_its_agents() {
     progress.apply(&indexed(2, 0));
     progress.apply(&Progress::Searching { sessions: 2 });
     progress.apply(&searched(1, 1));
-    assert_eq!(at(&progress), (Some((IndexStep::Texts, 1)), 0.75));
+    assert_eq!(at(&progress), (Some((IndexStep::Texts, 1)), 0.5));
     progress.apply(&searched(2, 2));
     assert_eq!(at(&progress), (Some((IndexStep::Texts, 0)), 1.));
     // The counts over every agent go on.
@@ -1044,6 +1045,7 @@ fn an_agent_with_nothing_to_index_shows_the_index_before_it_done() {
     progress.apply(&Progress::Indexed {
         sessions: 3,
         bytes: 0,
+        searchable: 0,
     });
     progress.apply(&Progress::Searching { sessions: 3 });
     progress.apply(&Progress::Searched {
