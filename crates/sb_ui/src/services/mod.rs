@@ -73,7 +73,7 @@ pub use search::{Answer, Answered, SearchService};
 pub use settings::{SettingsService, SyncEvery};
 #[cfg(any(test, feature = "automation"))]
 pub use sync::Held;
-pub use sync::{LocationStatus, PassProgress, Reach, SyncEvent, SyncService};
+pub use sync::{IndexStep, LocationStatus, PassProgress, Reach, SyncEvent, SyncService};
 pub use updates::{CheckResult, Off, Updater, UpdatesService};
 pub use upkeep::UpkeepService;
 pub use view::{DateRange, Facets, GroupSort, PageView, UnsortedView};

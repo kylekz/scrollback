@@ -26,6 +26,7 @@ for_both_agents!(
     a_pass_indexes_the_sessions_it_archived,
     a_session_that_grew_is_indexed_again_and_one_that_did_not_is_not,
     a_new_version_of_the_parser_or_of_the_index_is_for_a_start_to_take_to_everything,
+    a_start_says_what_it_reads_again_and_what_it_makes_searchable,
     the_index_emptied_and_built_again_is_as_it_was_with_what_the_owner_did,
     an_index_that_stops_is_taken_up_from_the_catalogue,
     a_session_its_parser_stops_on_keeps_what_was_known_of_it,
@@ -219,6 +220,70 @@ fn a_new_version_of_the_parser_or_of_the_index_is_for_a_start_to_take_to_everyth
     assert_eq!(bench.sync().index.sessions, 0);
     assert_eq!(bench.index().sessions, 3);
     assert_eq!(bench.sessions(), before);
+}
+
+/// Every progress event of an index of a start with `provider`.
+fn index_steps<A: Agent>(bench: &Bench<A>, provider: Box<dyn Provider + '_>) -> Vec<Progress> {
+    let mut steps = Vec::new();
+    index(
+        bench.archive(),
+        None,
+        &[provider],
+        &CancelToken::new(),
+        &mut |progress| steps.push(*progress),
+    )
+    .unwrap();
+    steps
+}
+
+fn a_start_says_what_it_reads_again_and_what_it_makes_searchable<A: Agent + Default>() {
+    let (bench, _) = bench::<A>();
+    bench.sync();
+
+    /* Rows an older parser made: each is read again, then made searchable again, one at a
+    time, the text written with the last. */
+    let newer = |bench: &Bench<A>| {
+        bench.meddling(Meddle::ParserVersion(
+            bench.agent.provider().parser_version() + 1,
+        ))
+    };
+    let steps = index_steps(&bench, newer(&bench));
+    assert!(matches!(
+        steps[0],
+        Progress::Indexing {
+            sessions: 3,
+            outdated: 3,
+            ..
+        }
+    ));
+    assert!(matches!(steps[3], Progress::Indexed { sessions: 3, .. }));
+    let searched = |sessions, searchable| Progress::Searched {
+        sessions,
+        searchable,
+    };
+    assert_eq!(
+        steps[4..],
+        [
+            Progress::Searching { sessions: 3 },
+            searched(1, 0),
+            searched(2, 0),
+            searched(3, 3),
+        ]
+    );
+
+    /* Text that is already of its row is no work, though its flag said otherwise. */
+    edit_catalogue(bench.dir(), "UPDATE session SET searchable = 0");
+    assert_eq!(
+        index_steps(&bench, newer(&bench)),
+        [
+            Progress::Indexing {
+                sessions: 0,
+                bytes: 0,
+                outdated: 0
+            },
+            Progress::Searching { sessions: 0 },
+        ]
+    );
 }
 
 fn the_index_emptied_and_built_again_is_as_it_was_with_what_the_owner_did<A: Agent + Default>() {

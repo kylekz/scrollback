@@ -51,8 +51,8 @@
 //! - `sync`: `syncing`, `indexing` (an index runs outside a pass), `held` (a pass waits at
 //!   `hold_sync`'s hold), and `locations`, each with its `name`, `kind` (`local`, `wsl` or
 //!   `ssh`) and `state` (`syncing` with `progress`: the `items` to fetch and `items_done`, the
-//!   `sessions` to index and `sessions_done`; `synced`; `failed` with `error`; `unreachable`;
-//!   or `never`), `stale` and `removing`; `removed` (the names of the locations the owner
+//!   `sessions` to index and `sessions_done`, the `texts` to make searchable and `texts_done`;
+//!   `synced`; `failed` with `error`; `unreachable`; or `never`), `stale` and `removing`; `removed` (the names of the locations the owner
 //!   removed); `refused` (why the owner's last change to them could not be made, or `null`);
 //!   `distros` (WSL's distros' names as listed, `null` without WSL or before they are
 //!   listed, or `{"error": …}`); and `test`, the connection test (`null`, or its `place` and
@@ -495,6 +495,8 @@ fn sync(cx: &App) -> Value {
                     "items_done": progress.items_done,
                     "sessions": progress.sessions,
                     "sessions_done": progress.sessions_done,
+                    "texts": progress.texts,
+                    "texts_done": progress.texts_done,
                 })),
                 "stale": sync.stale(location, now).is_some(),
                 "removing": sync.is_removing(&location.id),

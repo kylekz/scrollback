@@ -4,6 +4,9 @@
 //! that runs when the app starts, in a row of its own. Why a sync failed is the main area's
 //! to say in full (`crate::pages`); the row says that it did. A row opens the locations
 //! sheet with its location selected (DESIGN §4.1).
+//!
+//! A row's name has its first line to itself. A busy row says what it is doing under its
+//! bar, cut first, and how far it is at the right of that, which is never cut.
 
 use gpui::{
     AnyElement, Context, Div, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Role,
@@ -17,20 +20,20 @@ use crate::automation::AutomationTargetExt as _;
 use crate::components::{focus_ring, icon, kind_icon, kind_name, progress_bar, with_numbers};
 use crate::format;
 use crate::icons::SbIcon;
-use crate::services::{LocationStatus, PassProgress};
+use crate::services::{IndexStep, LocationStatus, PassProgress};
 use crate::theme::{SbTheme, StyledText as _};
 
 /// The gap between the lines of a row that shows a bar (`design/project/sb.css`, `.loc`).
 const BUSY_GAP: gpui::Pixels = px(3.);
 
-/// What a syncing location's row says at its right: files while they are fetched, sessions
-/// while they are indexed, nothing while the location is scanned.
+/// How far a busy row's work is, at the right of its last line: files while they are
+/// fetched, the sessions the index's step has left while it indexes, nothing while the
+/// location is scanned.
 fn doing(progress: &PassProgress) -> Option<String> {
     if progress.is_indexing() {
         Some(format!(
-            "{} / {} sessions",
-            format::count(progress.sessions_done as u64),
-            format::count(progress.sessions as u64)
+            "{} left",
+            format::count(progress.sessions_left() as u64)
         ))
     } else if progress.planned {
         Some(format!(
@@ -43,10 +46,18 @@ fn doing(progress: &PassProgress) -> Option<String> {
     }
 }
 
+/// What an index's step is called on a row: making the rows, then the search index.
+fn step_name(step: IndexStep) -> &'static str {
+    match step {
+        IndexStep::Rows => "indexing",
+        IndexStep::Texts => "search index",
+    }
+}
+
 /// What a syncing location's row says under its bar (DESIGN §4.1, `E-Edge-First-Sync`).
 fn doing_line(kind: &LocationKind, progress: &PassProgress, first: bool) -> String {
-    let what = if progress.is_indexing() {
-        "indexing".to_string()
+    let what = if let Some(step) = progress.index_step() {
+        step_name(step).to_string()
     } else if !progress.planned {
         "scanning".to_string()
     } else if progress.bytes == 0 {
@@ -59,6 +70,19 @@ fn doing_line(kind: &LocationKind, progress: &PassProgress, first: bool) -> Stri
         kind_name(kind),
         if first { "first sync · " } else { "" }
     )
+}
+
+/**
+ * What the index of every location says under its bar. While it makes rows, why it runs:
+ * after an update, when it reads again rows another version of the parser or of the index
+ * made (PLAN §7.5). Then the step that makes the search index.
+ */
+fn index_line(progress: &PassProgress) -> &'static str {
+    match progress.index_step() {
+        Some(IndexStep::Texts) => step_name(IndexStep::Texts),
+        _ if progress.outdated > 0 => "after an update",
+        _ => "every location",
+    }
 }
 
 impl Sidebar {
@@ -119,7 +143,8 @@ impl Sidebar {
                             row("index", SbIcon::Layers, theme).aria_label("Indexing sessions"),
                             "Session index",
                             &progress,
-                            "indexing every location".to_string(),
+                            index_line(&progress).to_string(),
+                            "sidebar/index",
                             theme,
                         )
                         .automation_target("sidebar/index")
@@ -156,7 +181,8 @@ fn name(name: &str, theme: &SbTheme) -> Div {
         .child(name.to_string())
 }
 
-/// A row's second line, its numbers in the face for numbers (DESIGN §1.3).
+/// A row's last line, its numbers in the face for numbers (DESIGN §1.3), cut before what
+/// follows it.
 fn line(text: String, color: Hsla, theme: &SbTheme) -> Div {
     div()
         .min_w_0()
@@ -196,13 +222,17 @@ fn unreachable_line(
     }
 }
 
-/// A row with work in hand (DESIGN §4.1): 48 high, how far the work is at the right of its
-/// name, a bar, and what the work is under it.
+/**
+ * A row with work in hand (DESIGN §4.1): 48 high, its name, a bar, and under it what the
+ * work is with how far it is at its right. What the work is gives way first; how far, never.
+ * `target` names the row's parts for automation.
+ */
 fn busy(
     row: Stateful<Div>,
     called: &str,
     progress: &PassProgress,
     says: String,
+    target: &str,
     theme: &SbTheme,
 ) -> Stateful<Div> {
     let c = &theme.colors;
@@ -213,26 +243,28 @@ fn busy(
             .flex()
             .flex_col()
             .gap(BUSY_GAP)
+            .child(name(called, theme))
+            .child(progress_bar(progress.fraction(), theme))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .child(name(called, theme))
+                    .gap(theme.spacing.md)
+                    .child(line(says, c.fg3, theme).flex_1())
                     .children(doing(progress).map(|doing| {
                         div()
-                            .ml_auto()
+                            .flex_none()
                             .text_color(c.accent_text)
                             .text_spec(&theme.text.count)
                             .child(doing)
+                            .automation_target_with(|| format!("{target}/count").into())
                     })),
-            )
-            .child(progress_bar(progress.fraction(), theme))
-            .child(line(says, c.fg3, theme)),
+            ),
     )
 }
 
 /// A location's row (DESIGN §4.1): 40 high, its kind's icon, its name at 500, and its state
-/// on a second line; 48 high with a bar while it syncs or is indexed.
+/// on a second line; 48 high with a bar and a third line while it syncs or is indexed.
 fn location_row(
     location: &Location,
     status: LocationStatus,
@@ -291,6 +323,7 @@ fn location_row(
             &location.name,
             &progress,
             doing_line(&location.kind, &progress, first),
+            &target,
             theme,
         ),
         // What a stopped or a failed pass stored is being indexed.
@@ -298,7 +331,8 @@ fn location_row(
             row.aria_label(format!("{}: indexing", location.name)),
             &location.name,
             &progress,
-            format!("{kind} · indexing"),
+            doing_line(&location.kind, &progress, false),
+            &target,
             theme,
         ),
         (LocationStatus::Synced(at), None) => resting(
@@ -430,15 +464,50 @@ mod tests {
             "Local · first sync · 41 of 96 MB"
         );
 
+        // Indexing: what is left of each step, which falls through both.
         progress.apply(&Progress::Indexing {
             sessions: 1418,
             bytes: 0,
+            outdated: 0,
         });
         progress.apply(&Progress::Indexed {
             sessions: 362,
             bytes: 0,
         });
-        assert_eq!(doing(&progress).as_deref(), Some("362 / 1,418 sessions"));
+        assert_eq!(doing(&progress).as_deref(), Some("1,056 left"));
         assert_eq!(doing_line(local, &progress, false), "Local · indexing");
+        progress.apply(&Progress::Indexed {
+            sessions: 1418,
+            bytes: 0,
+        });
+        progress.apply(&Progress::Searching { sessions: 1418 });
+        progress.apply(&Progress::Searched {
+            sessions: 178,
+            searchable: 0,
+        });
+        assert_eq!(doing(&progress).as_deref(), Some("1,240 left"));
+        assert_eq!(doing_line(local, &progress, false), "Local · search index");
+    }
+
+    #[test]
+    fn the_session_index_says_why_it_runs() {
+        let mut progress = PassProgress::default();
+        progress.apply(&Progress::Indexing {
+            sessions: 1418,
+            bytes: 0,
+            outdated: 0,
+        });
+        assert_eq!(index_line(&progress), "every location");
+        // Rows another version made, read again after an update (PLAN §7.5).
+        let mut updated = PassProgress::default();
+        updated.apply(&Progress::Indexing {
+            sessions: 1418,
+            bytes: 0,
+            outdated: 1400,
+        });
+        assert_eq!(index_line(&updated), "after an update");
+        assert_eq!(doing(&updated).as_deref(), Some("1,418 left"));
+        updated.apply(&Progress::Searching { sessions: 1418 });
+        assert_eq!(index_line(&updated), "search index");
     }
 }

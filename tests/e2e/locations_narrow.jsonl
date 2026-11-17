@@ -1,4 +1,4 @@
-{"scenario": {"window_size": "960x600", "fixture": "locations", "description": "The locations sheet and the add dialog in the smallest window (DESIGN §2: 960 × 600): both keep inside the window, the margin around them, and scroll what doesn't fit; Tab stays inside the sheet. Captured dark and light"}}
+{"scenario": {"window_size": "960x600", "fixture": "locations", "description": "The locations sheet and the add dialog in the smallest window (DESIGN §2: 960 × 600): both keep inside the window, the margin around them, and scroll what doesn't fit; Tab stays inside the sheet; and a syncing row with a long name in the sidebar's overlay. Captured dark and light"}}
 {"cmd": "wait_ready", "timeout_ms": 30000}
 {"cmd": "settle", "timeout_ms": 30000, "expect": [{"pointer": "/page", "equals": "sessions"}, {"pointer": "/shell/sidebar", "equals": "collapsed"}]}
 {"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
@@ -46,3 +46,27 @@
 {"cmd": "pin_appearance", "appearance": "dark"}
 {"cmd": "key", "keystroke": "escape"}
 {"cmd": "settle", "expect": [{"pointer": "/sheet/dialog", "equals": null}, {"pointer": "/sync/test", "equals": null}]}
+
+// The sidebar's overlay is as wide as the docked sidebar (DESIGN §2, §4.1): a host with a long name syncing there has its name cut on a line of its own, and its count whole at the row's right. Ranges, for fonts that differ by platform.
+{"cmd": "stand_in", "places": {"user@a-long-ssh-host.example": "passes"}}
+{"cmd": "key", "keystroke": "secondary-l"}
+{"cmd": "click", "target": "sheet/add"}
+{"cmd": "click", "target": "add/kind/ssh"}
+{"cmd": "type", "text": "user@a-long-ssh-host.example"}
+{"cmd": "key", "keystroke": "enter"}
+{"cmd": "settle", "expect": {"pointer": "/sync/test", "equals": {"place": "user@a-long-ssh-host.example", "state": "passed"}}}
+{"cmd": "hold_sync", "after": 1}
+{"cmd": "click", "target": "add/add-sync"}
+{"cmd": "wait_for", "pointer": "/sync/held", "equals": true, "timeout_ms": 30000}
+{"cmd": "key", "keystroke": "escape"}
+{"cmd": "settle", "expect": {"pointer": "/sheet", "equals": null}}
+{"cmd": "key", "keystroke": "secondary-b", "expect": {"pointer": "/shell/sidebar", "equals": "overlay"}}
+{"cmd": "bounds", "target": "sidebar/location/user@a-long-ssh-host.example", "expect_result": [{"pointer": "/w", "equals": 232}, {"pointer": "/h", "equals": 48}]}
+{"cmd": "bounds", "target": "sidebar/location/user@a-long-ssh-host.example/count", "expect_result": [{"pointer": "/visible", "not_equals": null}, {"pointer": "/w", "gte": 30}, {"pointer": "/w", "lte": 112}]}
+{"cmd": "screenshot", "name": "narrow-sidebar-syncing-dark"}
+{"cmd": "pin_appearance", "appearance": "light"}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "narrow-sidebar-syncing-light"}
+{"cmd": "pin_appearance", "appearance": "dark"}
+{"cmd": "release_sync"}
+{"cmd": "wait_for", "pointer": "/sync/syncing", "equals": false, "timeout_ms": 30000}

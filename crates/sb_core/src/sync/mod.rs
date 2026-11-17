@@ -83,13 +83,23 @@ pub enum Progress {
     Fetched { bytes: u64 },
     /// So many of the planned items are dealt with: stored, or left for another pass.
     Stored { items: usize },
-    /// What there is to index: this many sessions, whose transcripts hold this many bytes.
-    Indexing { sessions: usize, bytes: u64 },
+    /// What there is to index: this many sessions, whose transcripts hold this many bytes. Of
+    /// them, `outdated` have rows another version of the parser or of the index made: what an
+    /// index of a start reads again after an update (PLAN §7.5).
+    Indexing {
+        sessions: usize,
+        bytes: u64,
+        outdated: usize,
+    },
     /// So many of those sessions are indexed, and so many of those bytes read.
     Indexed { sessions: usize, bytes: u64 },
-    /// So many sessions' text is made searchable so far by the index's second step, counted
-    /// from its start: said after each batch of text it writes, so search finds more.
-    Searchable { sessions: usize },
+    /// What the index's second step has to make searchable: this many sessions, whose text is
+    /// not of their rows as they are now.
+    Searching { sessions: usize },
+    /// So many of those sessions are read for their text, and so many sessions' text is
+    /// searchable so far, counted from the step's start. The text is written a batch at a
+    /// time, so `searchable` grows when search finds more.
+    Searched { sessions: usize, searchable: usize },
 }
 
 /// An item a pass did not archive, and why.

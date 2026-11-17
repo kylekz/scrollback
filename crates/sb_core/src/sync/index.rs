@@ -71,7 +71,7 @@ pub struct IndexReport {
  * of a parser or of the index to what is archived.
  *
  * `progress` hears how many sessions and bytes there are to index, and how far it is after
- * each session. `cancel` stops it before the next session, with [`SyncError::Cancelled`]; what
+ * each session; then the same of the sessions its second step makes searchable. `cancel` stops it before the next session, with [`SyncError::Cancelled`]; what
  * was indexed stays, and the rest is still out of date for the next run.
  *
  * Two indexes at once (this one beside a pass's) do no harm, only the same work twice: a row
@@ -164,6 +164,7 @@ fn run(
     progress(&Progress::Indexing {
         sessions: stale.len(),
         bytes: stale.iter().map(|(_, stale)| stale.bytes).sum(),
+        outdated: stale.iter().filter(|(_, stale)| stale.outdated).count(),
     });
     let mut report = IndexReport::default();
     let mut bytes = 0;
@@ -333,6 +334,9 @@ fn searchable(
     if rows.is_empty() {
         return Ok(());
     }
+    if cancel.is_cancelled() {
+        return Err(SyncError::Cancelled);
+    }
     /* Text made of a row as it is now, before its flag said so (the index emptied and built
     again, or stopped between the two): it stays. */
     let docs = search.docs()?;
@@ -340,23 +344,23 @@ fn searchable(
         .into_iter()
         .partition(|(_, (id, made))| docs.get(id) == Some(made));
     catalogue.set_searchable(&kept.into_iter().map(|(_, row)| row).collect::<Vec<_>>())?;
+    let sessions = rows.len();
+    progress(&Progress::Searching { sessions });
     let mut batch: Vec<Text> = Vec::new();
-    for (provider, (id, made)) in rows {
+    for (done, (provider, (id, made))) in (1..).zip(rows) {
         if cancel.is_cancelled() {
             return Err(SyncError::Cancelled);
         }
         batch.extend(text(archive, provider, id, made)?);
-        if batch.len() >= TEXTS || batch.iter().map(Text::bytes).sum::<usize>() >= TEXT_BYTES {
+        if done == sessions
+            || batch.len() >= TEXTS
+            || batch.iter().map(Text::bytes).sum::<usize>() >= TEXT_BYTES
+        {
             report.searchable += record(archive, &std::mem::take(&mut batch))?;
-            progress(&Progress::Searchable {
-                sessions: report.searchable,
-            });
         }
-    }
-    if !batch.is_empty() {
-        report.searchable += record(archive, &batch)?;
-        progress(&Progress::Searchable {
-            sessions: report.searchable,
+        progress(&Progress::Searched {
+            sessions: done,
+            searchable: report.searchable,
         });
     }
     Ok(())

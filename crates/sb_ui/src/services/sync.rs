@@ -115,15 +115,34 @@ pub struct PassProgress {
     pub items_done: usize,
     pub bytes: u64,
     pub bytes_done: u64,
-    /// The sessions to index and those indexed, once the fetching is over.
+    /// The sessions to index and those indexed, once the fetching is over: the index's first
+    /// step, which makes their rows (PLAN §7.5).
     pub sessions: usize,
     pub sessions_done: usize,
+    /// Of `sessions`, those whose rows another version of the parser or of the index made.
+    pub outdated: usize,
+    /// Whether the index is at its second step, which makes the sessions' text searchable.
+    searching: bool,
+    /// The sessions the second step has to make searchable and those it has read for it.
+    pub texts: usize,
+    pub texts_done: usize,
     /// The sessions whose text the index has made searchable, as it goes.
     pub searchable_done: usize,
     /// What the agents before the one being synced added to the counts above.
     items_before: usize,
     bytes_before: u64,
     sessions_before: usize,
+    texts_before: usize,
+    searchable_before: usize,
+}
+
+/// The step of an index a pass or an index is at (PLAN §7.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexStep {
+    /// Making each session's row: what the library shows.
+    Rows,
+    /// Making each session's text searchable.
+    Texts,
 }
 
 impl PassProgress {
@@ -139,37 +158,73 @@ impl PassProgress {
             }
             Progress::Fetched { bytes } => self.bytes_done = self.bytes_before + bytes,
             Progress::Stored { items } => self.items_done = self.items_before + items,
-            Progress::Indexing { sessions, .. } => {
+            Progress::Indexing {
+                sessions, outdated, ..
+            } => {
                 self.sessions_before = self.sessions_done;
                 self.sessions += sessions;
+                self.outdated += outdated;
+                self.searching = false;
             }
             Progress::Indexed { sessions, .. } => {
                 self.sessions_done = self.sessions_before + sessions;
             }
-            Progress::Searchable { sessions } => self.searchable_done = sessions,
+            Progress::Searching { sessions } => {
+                (self.texts_before, self.searchable_before) =
+                    (self.texts_done, self.searchable_done);
+                self.texts += sessions;
+                self.searching = true;
+            }
+            Progress::Searched {
+                sessions,
+                searchable,
+            } => {
+                self.texts_done = self.texts_before + sessions;
+                self.searchable_done = self.searchable_before + searchable;
+            }
         }
     }
 
     /// Whether the fetching is over and the sessions it changed are being indexed.
     pub fn is_indexing(&self) -> bool {
-        self.sessions > 0
+        self.sessions > 0 || self.texts > 0
     }
 
-    /// How much of the work in hand is done, from 0 to 1: of the bytes to fetch, or of the
-    /// sessions to index.
-    pub fn fraction(&self) -> f32 {
-        let (done, of) = if self.is_indexing() {
-            (self.sessions_done as f64, self.sessions as f64)
-        } else {
-            (self.bytes_done as f64, self.bytes as f64)
-        };
-        if of > 0. {
-            (done / of).min(1.) as f32
-        } else if self.planned {
-            1.
-        } else {
-            0.
+    /// The step the index is at, while there is one.
+    pub fn index_step(&self) -> Option<IndexStep> {
+        match (self.is_indexing(), self.searching) {
+            (false, _) => None,
+            (true, false) => Some(IndexStep::Rows),
+            (true, true) => Some(IndexStep::Texts),
         }
+    }
+
+    /// How many sessions the index's step has left to do.
+    pub fn sessions_left(&self) -> usize {
+        match self.index_step() {
+            Some(IndexStep::Rows) => self.sessions.saturating_sub(self.sessions_done),
+            Some(IndexStep::Texts) => self.texts.saturating_sub(self.texts_done),
+            None => 0,
+        }
+    }
+
+    /**
+     * How much of the work in hand is done, from 0 to 1: of the bytes to fetch, or of the
+     * sessions to index. An index's two steps take half the bar each, so it moves on through
+     * the second instead of standing full; an index with no rows to make is its second step
+     * alone.
+     */
+    pub fn fraction(&self) -> f32 {
+        let part = |done: f64, of: f64| if of > 0. { (done / of).min(1.) } else { 1. };
+        let texts = || part(self.texts_done as f64, self.texts as f64);
+        let done = match self.index_step() {
+            None if self.planned => part(self.bytes_done as f64, self.bytes as f64),
+            None => 0.,
+            Some(_) if self.sessions == 0 => texts(),
+            Some(IndexStep::Rows) => part(self.sessions_done as f64, self.sessions as f64) / 2.,
+            Some(IndexStep::Texts) => (1. + texts()) / 2.,
+        };
+        done as f32
     }
 }
 

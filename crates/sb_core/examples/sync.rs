@@ -490,10 +490,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             None,
             &provider::builtin(),
             &CancelToken::new(),
-            &mut |progress| {
-                if let Progress::Indexing { sessions, bytes } = progress {
-                    println!("indexing {sessions} sessions, {bytes} bytes");
+            &mut |progress| match progress {
+                Progress::Indexing {
+                    sessions,
+                    bytes,
+                    outdated,
+                } => println!(
+                    "indexing {sessions} sessions, {bytes} bytes; {outdated} of them made by \
+                     another version"
+                ),
+                Progress::Searching { sessions } => {
+                    println!("making {sessions} sessions searchable");
                 }
+                _ => {}
             },
         )?;
         println!("{} in {:.1?}", indexed(&report), started.elapsed());
@@ -554,11 +563,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "fetched {items} of {} items, {fetched} of {} bytes",
                 planned.0, planned.1
             ),
-            Progress::Indexing { sessions, bytes } => {
+            Progress::Indexing {
+                sessions, bytes, ..
+            } => {
                 indexing = Some(Instant::now());
                 println!("indexing {sessions} sessions, {bytes} bytes");
             }
-            Progress::Indexed { .. } | Progress::Searchable { .. } => {}
+            Progress::Searching { sessions } => {
+                println!("making {sessions} sessions searchable");
+            }
+            Progress::Indexed { .. } | Progress::Searched { .. } => {}
         },
     )?;
     if passes.is_empty() {

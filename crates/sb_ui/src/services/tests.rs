@@ -923,23 +923,85 @@ fn a_locations_progress_runs_over_each_of_its_agents() {
         (5, 10, 500, 1000)
     );
     assert_eq!(progress.fraction(), 0.5);
-    // Then the sessions they changed are indexed.
+    // Then the sessions they changed are indexed: their rows, the first half of the bar.
     progress.apply(&Progress::Indexing {
         sessions: 8,
         bytes: 0,
+        outdated: 0,
     });
     progress.apply(&Progress::Indexed {
         sessions: 2,
         bytes: 0,
     });
     assert!(progress.is_indexing());
-    assert_eq!(progress.fraction(), 0.25);
-    // Their text made searchable is news of its own, which the fraction doesn't count.
-    progress.apply(&Progress::Searchable { sessions: 2 });
+    assert_eq!(progress.index_step(), Some(IndexStep::Rows));
+    assert_eq!((progress.sessions_left(), progress.fraction()), (6, 0.125));
+    progress.apply(&Progress::Indexed {
+        sessions: 8,
+        bytes: 0,
+    });
+    assert_eq!((progress.sessions_left(), progress.fraction()), (0, 0.5));
+    // Then their text, the second half: what is left counts what it has to make searchable.
+    progress.apply(&Progress::Searching { sessions: 4 });
+    assert_eq!(progress.index_step(), Some(IndexStep::Texts));
+    assert_eq!((progress.sessions_left(), progress.fraction()), (4, 0.5));
+    progress.apply(&Progress::Searched {
+        sessions: 1,
+        searchable: 0,
+    });
+    assert_eq!((progress.sessions_left(), progress.fraction()), (3, 0.625));
+    // Text written is news of its own.
+    progress.apply(&Progress::Searched {
+        sessions: 2,
+        searchable: 2,
+    });
     assert_eq!(progress.searchable_done, 2);
-    assert_eq!(progress.fraction(), 0.25);
+    assert_eq!((progress.sessions_left(), progress.fraction()), (2, 0.75));
+    // A second agent's index starts again at its rows, and adds to the counts.
+    progress.apply(&Progress::Indexing {
+        sessions: 2,
+        bytes: 0,
+        outdated: 0,
+    });
+    assert_eq!(progress.index_step(), Some(IndexStep::Rows));
+    assert_eq!(progress.sessions_left(), 2);
+    progress.apply(&Progress::Searching { sessions: 2 });
+    progress.apply(&Progress::Searched {
+        sessions: 1,
+        searchable: 1,
+    });
+    assert_eq!(
+        (
+            progress.texts_done,
+            progress.texts,
+            progress.searchable_done
+        ),
+        (3, 6, 3)
+    );
+    assert_eq!(progress.sessions_left(), 3);
     // A pass with nothing to fetch is done once it is planned.
     let mut nothing = PassProgress::default();
     nothing.apply(&Progress::Planned { items: 0, bytes: 0 });
     assert_eq!(nothing.fraction(), 1.);
+}
+
+#[test]
+fn an_index_with_only_text_to_make_has_the_whole_bar() {
+    let mut progress = PassProgress::default();
+    progress.apply(&Progress::Indexing {
+        sessions: 0,
+        bytes: 0,
+        outdated: 0,
+    });
+    assert!(!progress.is_indexing());
+    // Text that is already of its row is no work: nothing to show.
+    progress.apply(&Progress::Searching { sessions: 0 });
+    assert!(!progress.is_indexing());
+    progress.apply(&Progress::Searching { sessions: 10 });
+    progress.apply(&Progress::Searched {
+        sessions: 5,
+        searchable: 0,
+    });
+    assert_eq!(progress.index_step(), Some(IndexStep::Texts));
+    assert_eq!((progress.sessions_left(), progress.fraction()), (5, 0.5));
 }

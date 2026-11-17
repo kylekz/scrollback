@@ -270,16 +270,39 @@ fn a_pass_cancelled_at_each_step_resumes<A: Agent + Default>() {
             (bench, keys)
         };
         /* Scanned, planned, each of the three ranges fetched, and the batch stored; then what
-        there is to index, each of the three sessions indexed, and their text made
-        searchable. */
+        there is to index and each of the three sessions indexed; then what there is to make
+        searchable and each of the three read for its text, written with the last. */
         let all = steps(&prepare().0);
         assert_eq!(all[0], Progress::Scanned { items: 3 });
         assert!(matches!(all[1], Progress::Planned { items: 3, .. }));
         assert_eq!(all[5], Progress::Stored { items: 3 });
-        assert!(matches!(all[6], Progress::Indexing { sessions: 3, .. }));
+        assert!(matches!(
+            all[6],
+            Progress::Indexing {
+                sessions: 3,
+                outdated: 0,
+                ..
+            }
+        ));
         assert!(matches!(all[9], Progress::Indexed { sessions: 3, .. }));
-        assert_eq!(all[10], Progress::Searchable { sessions: 3 });
-        assert_eq!(all.len(), 11);
+        assert_eq!(
+            all[10..],
+            [
+                Progress::Searching { sessions: 3 },
+                Progress::Searched {
+                    sessions: 1,
+                    searchable: 0
+                },
+                Progress::Searched {
+                    sessions: 2,
+                    searchable: 0
+                },
+                Progress::Searched {
+                    sessions: 3,
+                    searchable: 3
+                },
+            ]
+        );
 
         for stop_at in 0..all.len() {
             let (bench, keys) = prepare();

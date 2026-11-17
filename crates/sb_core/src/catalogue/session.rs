@@ -230,6 +230,8 @@ pub(crate) struct Stale {
     /// What stale sessions are ordered by, the greatest first: a session with no row before
     /// any with one, and those by when they last did something.
     pub recency: i64,
+    /// Its row was made by another version of the parser or of the index.
+    pub outdated: bool,
 }
 
 /// What a session's row says of how it was made, and when the session ended.
@@ -703,6 +705,7 @@ impl Catalogue {
                                 .filter(read)
                                 .map(|reading| reading.length)
                                 .sum(),
+                            outdated: row.as_ref().is_some_and(|made| !made.by_these),
                             recency: row.map_or(i64::MAX, |made| made.ended.unwrap_or(i64::MIN)),
                         });
                     }

@@ -44,7 +44,7 @@ use crate::icons::SbIcon;
 use crate::keymap;
 use crate::overlay::{self, Layer};
 use crate::services::sync::{Stale, local_name, refusal};
-use crate::services::{ActiveServices as _, LocationStatus, PassProgress, SyncService};
+use crate::services::{ActiveServices as _, IndexStep, LocationStatus, PassProgress, SyncService};
 use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
 /// How often the sheet's "2 min ago" is drawn again.
@@ -1301,25 +1301,32 @@ fn with_dot(dot: gpui::Div, line: gpui::Div, theme: &SbTheme) -> AnyElement {
 }
 
 /// What a syncing location's row says under its bar (DESIGN §4.11): "Syncing · 38 of 212
-/// files · 41.2 of 96.0 MB".
+/// files · 41.2 of 96.0 MB"; then each step of the index (PLAN §7.5).
 fn syncing_line(progress: &PassProgress) -> String {
-    if progress.is_indexing() {
+    let sessions = |done: usize, of: usize| {
         format!(
-            "Indexing · {} of {} sessions",
-            format::count(progress.sessions_done as u64),
-            format::count(progress.sessions as u64)
+            "{} of {} sessions",
+            format::count(done as u64),
+            format::count(of as u64)
         )
-    } else if !progress.planned {
-        "Syncing · looking for changes".to_string()
-    } else if progress.items == 0 {
-        "Syncing · nothing new".to_string()
-    } else {
-        format!(
+    };
+    match progress.index_step() {
+        Some(IndexStep::Rows) => format!(
+            "Indexing · {}",
+            sessions(progress.sessions_done, progress.sessions)
+        ),
+        Some(IndexStep::Texts) => format!(
+            "Search index · {}",
+            sessions(progress.texts_done, progress.texts)
+        ),
+        None if !progress.planned => "Syncing · looking for changes".to_string(),
+        None if progress.items == 0 => "Syncing · nothing new".to_string(),
+        None => format!(
             "Syncing · {} of {} files · {}",
             format::count(progress.items_done as u64),
             format::count(progress.items as u64),
             format::bytes_of(progress.bytes_done, progress.bytes, " of ")
-        )
+        ),
     }
 }
 
@@ -1394,7 +1401,19 @@ mod tests {
         progress.apply(&Progress::Indexing {
             sessions: 12,
             bytes: 0,
+            outdated: 0,
         });
         assert_eq!(syncing_line(&progress), "Indexing · 0 of 12 sessions");
+        progress.apply(&Progress::Indexed {
+            sessions: 12,
+            bytes: 0,
+        });
+        // The second step counts again, of what it makes searchable.
+        progress.apply(&Progress::Searching { sessions: 12 });
+        progress.apply(&Progress::Searched {
+            sessions: 5,
+            searchable: 0,
+        });
+        assert_eq!(syncing_line(&progress), "Search index · 5 of 12 sessions");
     }
 }

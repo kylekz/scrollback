@@ -15,7 +15,7 @@ use crate::components::{
 };
 use crate::format;
 use crate::icons::SbIcon;
-use crate::services::{LocationStatus, PassProgress, SyncService};
+use crate::services::{IndexStep, LocationStatus, PassProgress, SyncService};
 use crate::theme::{SbTheme, StyledText as _};
 
 /// The First sync card's padding above and below (`design/project/E-Edge-First-Sync`).
@@ -57,23 +57,25 @@ pub fn running(sync: &SyncService) -> Option<FirstSync> {
     })
 }
 
-/// How far one location's pass is, in words.
+/// How far one location's pass is, in words: each step of its index in turn (PLAN §7.5).
 fn doing(progress: &PassProgress) -> String {
-    if progress.is_indexing() {
+    let sessions = |done: usize, of: usize, what: &str| {
         format!(
-            "{} of {} sessions indexed",
-            format::count(progress.sessions_done as u64),
-            format::count(progress.sessions as u64)
+            "{} of {} sessions {what}",
+            format::count(done as u64),
+            format::count(of as u64)
         )
-    } else if progress.planned {
-        format!(
+    };
+    match progress.index_step() {
+        Some(IndexStep::Rows) => sessions(progress.sessions_done, progress.sessions, "indexed"),
+        Some(IndexStep::Texts) => sessions(progress.texts_done, progress.texts, "searchable"),
+        None if progress.planned => format!(
             "{} of {} files · {}",
             format::count(progress.items_done as u64),
             format::count(progress.items as u64),
             format::bytes_of(progress.bytes_done, progress.bytes, " of ")
-        )
-    } else {
-        "scanning".to_string()
+        ),
+        None => "scanning".to_string(),
     }
 }
 
@@ -252,8 +254,15 @@ mod tests {
         indexing.apply(&Progress::Indexing {
             sessions: 418,
             bytes: 0,
+            outdated: 0,
         });
         assert_eq!(doing(&indexing), "0 of 418 sessions indexed");
+        indexing.apply(&Progress::Searching { sessions: 418 });
+        indexing.apply(&Progress::Searched {
+            sessions: 40,
+            searchable: 0,
+        });
+        assert_eq!(doing(&indexing), "40 of 418 sessions searchable");
     }
 
     #[test]
