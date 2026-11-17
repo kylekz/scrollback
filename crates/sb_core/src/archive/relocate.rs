@@ -531,8 +531,8 @@ impl Move {
         let database = archive.dir.join(catalogue::DATABASE);
         /* Nothing writes the catalogue now, so its copy is the whole of it: rows that differ
         are a failure, not a reason to take it again. */
-        let copy = Backups::new(&tmp, "scrollback")
-            .before(&database, "move")?
+        let copy = Backups::new(disk::for_sqlite(&tmp, disk::SQLITE_FOLDER), "scrollback")
+            .before(&disk::for_sqlite(&database, disk::SQLITE_FILE), "move")?
             .path;
         let copy = TempPath::try_from_path(&copy).map_err(io_error("read", &copy))?;
         same_rows(&database, &copy)?;
@@ -1305,7 +1305,7 @@ fn same_rows(database: &Path, copy: &Path) -> Result<(), MoveError> {
 /// that can't write.
 fn rows(path: &Path) -> Result<BTreeMap<String, i64>, MoveError> {
     let connection = rusqlite::Connection::open_with_flags(
-        path,
+        disk::for_sqlite(path, disk::SQLITE_FILE),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     let tables: Vec<String> = connection

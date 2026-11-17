@@ -265,11 +265,17 @@ fn move_through(mut file: TempPath, to: &Path, flags: u32) -> Result<(), (io::Er
  */
 #[cfg(windows)]
 fn verbatim(path: &Path) -> std::borrow::Cow<'_, Path> {
+    verbatim_past(path, 0)
+}
+
+/// [`verbatim`] once `path` and `margin` more characters would run past 260.
+#[cfg(windows)]
+fn verbatim_past(path: &Path, margin: usize) -> std::borrow::Cow<'_, Path> {
     use std::borrow::Cow;
     use std::path::{Component, PathBuf, Prefix};
 
     const LONGEST: usize = 259;
-    if path.as_os_str().len() <= LONGEST {
+    if path.as_os_str().len() + margin <= LONGEST {
         return Cow::Borrowed(path);
     }
     let Some(Component::Prefix(prefix)) = path.components().next() else {
@@ -283,6 +289,29 @@ fn verbatim(path: &Path) -> std::borrow::Cow<'_, Path> {
             text.trim_start_matches(r"\\")
         ))),
         _ => Cow::Borrowed(path),
+    }
+}
+
+/// Room for the files SQLite names beside a database: `-journal`, `-wal`, `-shm`.
+pub(crate) const SQLITE_FILE: usize = 16;
+/// Room for the files a backup or a move names in a folder of its own: a prefix, a UTC time,
+/// a label and SQLite's own beside each.
+pub(crate) const SQLITE_FOLDER: usize = 96;
+
+/**
+ * `path` as SQLite takes it, a database or a folder it makes one in (`margin` is
+ * [`SQLITE_FILE`] or [`SQLITE_FOLDER`]): on Windows, with `\\?\` once what SQLite names there
+ * could run past 260 characters. std's calls add the prefix themselves, but SQLite's own file
+ * calls don't, and fail ("unable to open database") on a longer path, so an archive in a deep
+ * folder couldn't be opened, moved to, or backed up. Elsewhere the path is as it is.
+ */
+pub(crate) fn for_sqlite(path: &Path, margin: usize) -> std::borrow::Cow<'_, Path> {
+    #[cfg(windows)]
+    return verbatim_past(path, margin);
+    #[cfg(not(windows))]
+    {
+        let _ = margin;
+        std::borrow::Cow::Borrowed(path)
     }
 }
 

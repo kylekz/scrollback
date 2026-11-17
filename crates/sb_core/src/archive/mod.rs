@@ -20,7 +20,7 @@
 //!   is not opened, and one is not created over a folder that holds a catalogue or files.
 
 mod delete;
-mod disk;
+pub(crate) mod disk;
 mod items;
 mod kin;
 mod layout;

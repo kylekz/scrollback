@@ -31,7 +31,7 @@ use toolbox_store::rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql
 use toolbox_store::rusqlite::{self, Connection, OptionalExtension as _, Row, ToSql, params};
 use toolbox_store::{Backups, Database, OpenOptions};
 
-use crate::archive::item_folder;
+use crate::archive::{disk, item_folder};
 use crate::filing::FolderId;
 use crate::hash::Hash;
 use crate::location::{Location, LocationId, LocationKind, Unreachable};
@@ -428,7 +428,8 @@ impl Catalogue {
     pub(crate) fn open(dir: &Path) -> Result<Self> {
         let backups = backups(dir);
         let options = OpenOptions::new(&schema::SCHEMA).backups(&backups);
-        let db = Database::open(&dir.join(DATABASE), &options)?;
+        let path = dir.join(DATABASE);
+        let db = Database::open(&disk::for_sqlite(&path, disk::SQLITE_FILE), &options)?;
         /* What a write frees is overwritten (PLAN §4.5), on the one connection that writes. */
         db.write(|tx| Ok::<_, CatalogueError>(tx.pragma_update(None, "secure_delete", true)?))?;
         Ok(Self {
@@ -1283,7 +1284,11 @@ fn stored_from(row: &Row<'_>) -> rusqlite::Result<Stored> {
 
 /// The archive's backups of its catalogue.
 pub(crate) fn backups(dir: &Path) -> Backups {
-    Backups::new(dir.join("backups"), "scrollback")
+    let backups = dir.join("backups");
+    Backups::new(
+        disk::for_sqlite(&backups, disk::SQLITE_FOLDER).into_owned(),
+        "scrollback",
+    )
 }
 
 /// The most recent backup of the catalogue of the archive in `dir`, if there is one.

@@ -112,6 +112,37 @@ fn a_synced_archive_moves_whole_and_the_old_folder_stays_as_it_was<A: Agent + De
     assert_eq!(tree(bench.dir()), before);
 }
 
+/**
+ * On Windows, a folder past 260 characters, given as the folder picker and the settings
+ * file give it now: without `\\?\`. std's calls add the prefix themselves; SQLite's own
+ * don't, so the catalogue's copy, the moved archive's opening and its backups each need it.
+ */
+#[cfg(windows)]
+#[test]
+fn an_archive_moves_into_a_folder_past_260_characters_and_opens_there() {
+    let mut agent = sb_test_support::FileAgent::new();
+    for records in [5, 20] {
+        agent.add_session(records);
+    }
+    let bench = Bench::new(agent);
+    bench.sync();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let mut deep = std::path::absolute(elsewhere.path()).unwrap();
+    while deep.as_os_str().len() < 280 {
+        deep.push("a folder with a rather long name");
+    }
+    assert!(!deep.to_string_lossy().starts_with(r"\\?\"));
+    let moved = moved(&bench, &deep, || {});
+    assert_same(&bench, &moved);
+    drop(moved);
+    /* Opened again there, as the next start does. */
+    let again = Archive::open(&deep).unwrap();
+    assert_eq!(
+        again.catalogue().totals().unwrap(),
+        bench.archive().catalogue().totals().unwrap()
+    );
+}
+
 fn a_sync_while_the_files_are_copied_is_carried<A: Agent + Default>() {
     let mut agent = A::default();
     let grown = agent.add_session(10);

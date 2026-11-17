@@ -25,6 +25,7 @@ use toolbox_store::rusqlite::{self, Connection, OptionalExtension as _, params};
 use toolbox_store::{Database, OpenOptions, Schema};
 
 use super::{MatchKind, SearchError};
+use crate::archive::disk;
 use crate::catalogue::SessionId;
 use crate::transcript::{At, Span};
 
@@ -131,7 +132,7 @@ impl SearchIndex {
             in_use(&path)?;
         }
         let options = OpenOptions::new(&SCHEMA);
-        let db = match Database::open(&path, &options) {
+        let db = match Database::open(&disk::for_sqlite(&path, disk::SQLITE_FILE), &options) {
             Err(
                 toolbox_store::Error::Corrupt { .. }
                 | toolbox_store::Error::Foreign(_)
@@ -146,7 +147,7 @@ impl SearchIndex {
                     let _ = std::fs::remove_file(file);
                 }
                 anew = true;
-                Database::open(&path, &options)?
+                Database::open(&disk::for_sqlite(&path, disk::SQLITE_FILE), &options)?
             }
             opened => opened?,
         };
@@ -374,13 +375,16 @@ impl SearchIndex {
  * be in use, which is not damage.
  */
 fn in_use(path: &Path) -> Result<(), SearchError> {
-    let tried = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .and_then(|connection| {
-            connection.busy_timeout(Duration::from_secs(1))?;
-            connection.query_row("SELECT count(*) FROM sqlite_schema", [], |row| {
-                row.get::<_, i64>(0)
-            })
-        });
+    let tried = Connection::open_with_flags(
+        disk::for_sqlite(path, disk::SQLITE_FILE),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )
+    .and_then(|connection| {
+        connection.busy_timeout(Duration::from_secs(1))?;
+        connection.query_row("SELECT count(*) FROM sqlite_schema", [], |row| {
+            row.get::<_, i64>(0)
+        })
+    });
     match tried {
         Err(rusqlite::Error::SqliteFailure(failure, _))
             if matches!(
@@ -454,7 +458,7 @@ impl Log {
      */
     pub(crate) fn empty(&self) {
         let emptied = (|| {
-            let connection = Connection::open(&self.path)?;
+            let connection = Connection::open(disk::for_sqlite(&self.path, disk::SQLITE_FILE))?;
             connection.busy_timeout(Duration::ZERO)?;
             for _ in 0..TRIES {
                 let busy: i64 = connection
