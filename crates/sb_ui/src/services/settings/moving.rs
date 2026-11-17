@@ -785,7 +785,11 @@ mod tests {
                 failed.text
             );
         }
-        assert!(failed.text.contains("\u{2026}/scrollback was removed."));
+        /* `to` ends in a part joined with the platform's separator: `\` on Windows. */
+        assert!(failed.text.contains(&format!(
+            "\u{2026}{}scrollback was removed.",
+            std::path::MAIN_SEPARATOR
+        )));
 
         let io = why_not(&MoveError::Io {
             action: "store",
