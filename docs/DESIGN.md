@@ -197,7 +197,18 @@ An `agent` activity row whose body is the **nested panel** (`nest`): `bg-panel`,
 
 #### 4.2.8 Facts margin
 268 wide, `bg-panel`, 18/16 padding, a left hairline. Three blocks separated by hairlines:
-- **Session** (`kv` rows, label column 128 in `fg3`): From (the location tag), Path (mono 11.5), Branch (git-branch glyph), Agent (mark and name; §6), Models, When (date and duration), Tokens (in · out), Version ("v3 of 3", or "v2 of 4 · older" in `yellow`, and **History**, §4.3), Source (only when gone, §4.14). Each value can be selected and copied.
+- **Session:** the facts one under another, 10 apart, each a **label above its value** (§6). The label is 11px/14px 500 `fg3` in sentence case: the overline without its capitals, so that it stays quieter than the blocks' own overlines. The value is 12px/16px `fg2` and takes the margin's whole width (236). In order:
+  - **From:** the location tag.
+  - **Path:** mono 11.5/16, one line.
+  - **Branch:** the git-branch glyph and the branch in mono 11.5/16, one line.
+  - **Agent** (only with more than one agent in the archive, §4.2.10): the mark and the name.
+  - **Models:** one per line, each after the agent's mark (§4.2.10).
+  - **When:** two lines: the day ("19 Dec 2025", the year only when it isn't this one), then the start and how long the session ran ("12:11 · 1 h 44 min").
+  - **Tokens:** one line, "11.6M in · 297k out", numbers as everywhere else (Geist Mono, the short forms of §4.2.6).
+  - **Version:** "v3 of 3", or "v2 of 4 · older" in `yellow`, then **History** (§4.3) on the same line, or on a line of its own where both don't fit.
+  - **Source** (only when gone, §4.14): "gone since 12 Nov".
+
+  **Nothing wraps.** Each line of a value stays one line; one too long for the width is cut in its middle with an ellipsis, never broken mid-word or across lines, so a path keeps its last folder and a branch its end. Path and Branch show their whole value in a tooltip on hover, and a click on either copies it whole (the facts are not part of the column's text selection, and a value cut on screen still copies uncut).
 - **Turns** ("Turns · 38"): one row per prompt: the turn number (on long sessions), the time, the start of the prompt truncated. The current turn (the one at the top of the reading column) on `s3` in `fg`; the others `fg2`. A click scrolls the column to that turn. On a session whose turns don't fit, the list scrolls on its own and keeps the current turn in view; `[` / `]` move to the previous / next turn. While Find is active, each turn with matches shows a `warn` chip with its count, and the header says "14 matches in 5". This list is what replaces concept B's gutter; there is no other scrubber or minimap.
 - **Calls:** one row per kind with its icon and count, labelled by kind, not by any agent's tool names (Shell, Read, Search, Edit / Write, Agents, Todos, Web, MCP, Other); a click filters nothing (hiding by kind is later, FEATURES Later).
 
@@ -402,6 +413,7 @@ macOS uses `Cmd` for every `Ctrl` above, keycaps in its menu symbols (`⌘K`, `�
 - **Narrow windows** (§2): the boards are all 1440 × 900; the Facts toggle, the collapsible sidebar and the reduced card and list columns are not drawn.
 - **Materials** (§3): the boards draw the Opaque values only. The translucent title bar and sidebar alphas are proposals, now measured on Windows 11 over a dark desktop. Mica, light: fine, almost identical to Opaque. Mica, dark: the sidebar lands within one code value of the main area, so only the hairline separates them. Acrylic at 50%, light: the sidebar turns mid grey and `fg3` falls to about 2:1, `fg2` to about 3:1; dark is about 4.3:1 for `fg3` on average and worse over bright patches. **Open (owner):** raise the alphas, tint the dark Mica sidebar, or accept this for the opt-in material.
 - **Title bar:** the boards always show the search field, Sync all and Settings; the first run and the unavailable archive hide or disable them (§4.10, §4.14). `E-Edge-Archive-Missing` still shows them enabled. Build per this file.
+- **Facts margin layout** (§4.2.8): the reader boards draw the Session facts as `kv` rows, a 128 label column beside a narrow value, in which a path, a branch, a day and time and the tokens wrap or are cut off at 268. This file stacks each label above its value, which takes the margin's whole width, one line per value cut in its middle where it is too long. Build per this file.
 - **Overline letter-spacing** (§1.3) is not drawn: this gpui has no letter-spacing. Add it when gpui does.
 - **Caption buttons** on Windows use Windows' own 10px glyphs with its Close hover red, as dv does, not the boards' Lucide glyphs.
 - **The phase 0 shell** (PLAN §13) draws the search field, Sync all and Settings disabled, and a disabled New folder `+` and Sync glyph in the sidebar, because the first-run screen that hides them (§4.10, `E-First-Run`) arrives in phase 3.
