@@ -14,6 +14,11 @@ use crate::provider::{ItemKind, ScannedItem};
 /// Every file under a folder with its length, time and bytes, by its path relative to it.
 type Tree = BTreeMap<PathBuf, (u64, Option<SystemTime>, Vec<u8>)>;
 
+/**
+ * Every file under `dir` with its length, time and bytes, but a folder's own `lock`: a move
+ * holds its target's while it copies, and on Windows that is a byte-range lock no other
+ * handle can read through (error 33), where elsewhere the lock is advisory.
+ */
 fn tree(dir: &Path) -> Tree {
     let mut found = Tree::new();
     let mut folders = vec![dir.to_path_buf()];
@@ -22,6 +27,8 @@ fn tree(dir: &Path) -> Tree {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 folders.push(path);
+            } else if path == dir.join(layout::LOCK) {
+                continue;
             } else {
                 let metadata = fs::metadata(&path).unwrap();
                 found.insert(
