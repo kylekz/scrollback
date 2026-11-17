@@ -181,6 +181,10 @@ pub struct ReaderView {
     facts_turn: Option<usize>,
     /// Whether the facts show over the column, in a window too narrow for the margin.
     facts_open: bool,
+    /// The layouts of the facts' Path and Branch drawn last, which hold their text as cut to
+    /// fit once laid out: what the tests read the cut from.
+    #[cfg(test)]
+    facts_cut: Vec<gpui::TextLayout>,
     /// The image a tool returned shown full size, over the column.
     full_image: Option<ImageKey>,
     /// Whether the margin showed last frame: the window was wide enough.
@@ -218,6 +222,8 @@ impl ReaderView {
             turns_scroll: UniformListScrollHandle::new(),
             facts_turn: None,
             facts_open: false,
+            #[cfg(test)]
+            facts_cut: Vec::new(),
             full_image: None,
             wide: true,
             generation: 0,

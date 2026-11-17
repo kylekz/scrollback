@@ -13,7 +13,9 @@
 //! With [`Extra::Large`], This PC also holds the large session of the reader's budgets
 //! (PLAN §14); with [`Extra::Versions`], toolbox-rs also holds the session of `E-Versions`,
 //! whose transcript has three versions: the first extended by a second sync, a second that
-//! rewrote it, and a third, shorter, held back (DESIGN §4.3).
+//! rewrote it, and a third, shorter, held back (DESIGN §4.3); with [`Extra::Facts`], fc also
+//! holds a session whose facts are as long as they come, which loads two memory files on its
+//! way (DESIGN §4.2.8, §4.2.11).
 
 use std::path::Path;
 
@@ -33,6 +35,7 @@ pub enum Extra {
     None,
     Large,
     Versions,
+    Facts,
 }
 
 /// Syncs `tree` into `location`, all of it.
@@ -159,8 +162,14 @@ pub fn build(archive_dir: &Path, scratch: &Path, extra: Extra) -> Result<()> {
     reader::audit(&mut pc);
     let mut damaged = pc.session(FC, 40);
     damaged.title("A session damaged in the archive");
-    if extra == Extra::Large {
-        reader::large(&mut pc, Large::BUDGET);
+    match extra {
+        Extra::Large => {
+            reader::large(&mut pc, Large::BUDGET);
+        }
+        Extra::Facts => {
+            reader::facts(&mut pc);
+        }
+        Extra::None | Extra::Versions => {}
     }
     let here = catalogue.add_location(LocationKind::Local, "This PC")?;
     sync(&archive, &here.id, &pc, &providers)?;

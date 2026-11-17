@@ -9,10 +9,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, ClickEvent, Context, InteractiveElement as _, IntoElement, ListOffset,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, div,
-    prelude::FluentBuilder as _, px, uniform_list,
+    AnyElement, ClickEvent, Context, Div, InteractiveElement as _, IntoElement, ListOffset,
+    ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _,
+    StyledText, TextLayout, div, prelude::FluentBuilder as _, px, uniform_list,
 };
+use gpui_component::tooltip::Tooltip;
 use sb_core::catalogue::{Held, History, Reason};
 use sb_core::transcript::ToolKind;
 
@@ -22,14 +23,15 @@ use super::rows::RowKind;
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
-    ButtonKind, Tone, button, icon, icon_button, kv, location_tag, low_chip, overline, warn_chip,
+    ButtonKind, Tone, button, icon, icon_button, location_tag, low_chip, middle_cut, overline,
+    warn_chip,
 };
 use crate::format;
 use crate::hostile;
 use crate::icons::SbIcon;
 use crate::services::ActiveServices as _;
 use crate::services::reader::OpenSession;
-use crate::theme::{ActiveTheme as _, StyledText as _};
+use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
 /// The facts margin's width (DESIGN §1.4) and the History popover's.
 pub const FACTS_WIDTH: f32 = 268.;
@@ -41,6 +43,8 @@ pub const HISTORY_SHOWN: usize = 50;
 const TURN_ROW: f32 = 22.;
 /// The fewest turns the facts show, however short the window: past them the margin scrolls.
 const MIN_TURNS: usize = 4;
+/// The widest the tooltip of a path or a branch is: a longer one wraps in it.
+const TOOLTIP_WIDTH: f32 = 480.;
 
 /// The kinds of call the facts count, each under one label (DESIGN §4.2.8 "Calls").
 const CALL_KINDS: &[(&str, &[ToolKind])] = &[
@@ -61,6 +65,82 @@ pub struct HistoryOf {
     pub key: Arc<str>,
     pub history: Arc<History>,
     pub main: bool,
+}
+
+/// A fact of the session (DESIGN §4.2.8): its label, and under it its value across the margin.
+fn fact(label: &'static str, value: impl IntoElement, theme: &SbTheme) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(
+            div()
+                .text_color(theme.colors.fg3)
+                .text_spec(&theme.text.overline)
+                .child(label),
+        )
+        .child(
+            div()
+                .text_color(theme.colors.fg2)
+                .text_spec(&theme.text.secondary)
+                .child(value),
+        )
+}
+
+/// One line of a fact's value: never wrapped, and cut in its middle where it doesn't fit.
+fn line(text: impl IntoElement) -> Div {
+    div()
+        .min_w_0()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis_middle()
+        .child(text)
+}
+
+/**
+ * A value that may be long, a path or a branch, on one line in mono after `glyph`: cut in its
+ * middle where it doesn't fit, so its end shows; whole in a tooltip on hover, and copied whole
+ * by a click. A value longer than any label is cut in its middle before it is drawn. With the
+ * layout of its text, which holds the text as drawn, cut, once it is laid out.
+ */
+fn whole(
+    id: &'static str,
+    value: &str,
+    glyph: Option<SbIcon>,
+    theme: &SbTheme,
+) -> (Stateful<Div>, TextLayout) {
+    let shown = SharedString::from(hostile::label(&middle_cut(value, hostile::LABEL_CHARS)));
+    let copied = hostile::bidi(value).into_owned();
+    let text = StyledText::new(shown.clone());
+    let layout = text.layout().clone();
+    let mono = theme.fonts.mono.clone();
+    let element = div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .flex()
+        .items_center()
+        .gap(theme.spacing.xs)
+        .cursor_pointer()
+        .children(glyph.map(|glyph| icon(glyph, theme.sizes.icon_xs, theme.colors.fg3)))
+        .child(
+            line(text)
+                .flex_1()
+                .font_family(mono.clone())
+                .text_size(px(11.5)),
+        )
+        .tooltip(move |window, cx| {
+            let (shown, mono) = (shown.clone(), mono.clone());
+            Tooltip::element(move |_, _| {
+                div()
+                    .max_w(px(TOOLTIP_WIDTH))
+                    .font_family(mono.clone())
+                    .child(shown.clone())
+                    .debug_selector(|| format!("{id}-whole"))
+            })
+            .build(window, cx)
+        })
+        .on_click(move |_, _, cx| crate::system::copy_text(copied.clone(), cx));
+    (element, layout)
 }
 
 /// The number of the version with id `id` in `history`.
@@ -134,87 +214,125 @@ impl ReaderView {
             .iter()
             .find(|location| location.id == session.id.location)
             .map(|location| location_tag(location.name.clone(), &location.kind, false, &theme));
-        let value = |text: String| div().child(text);
-        let numbers = |text: String| div().text_spec(&theme.text.number).child(text);
+        let now = format::now();
         let mut facts: Vec<AnyElement> = Vec::new();
-        facts.extend(
-            location.map(|tag| kv("From", div().flex().child(tag), &theme).into_any_element()),
-        );
+        facts.extend(location.map(|tag| {
+            fact(
+                "From",
+                div()
+                    .flex()
+                    .child(tag.flex_shrink(1.).min_w_0().text_ellipsis_middle()),
+                &theme,
+            )
+            .into_any_element()
+        }));
+        let mut cut = Vec::new();
         if let Some(path) = &session.project_path {
+            let (value, layout) = whole("facts-path", path, None, &theme);
+            cut.push(layout);
             facts.push(
-                kv(
+                fact(
                     "Path",
-                    div()
-                        .font_family(theme.fonts.mono.clone())
-                        .text_size(px(11.5))
-                        .child(hostile::label(path)),
+                    value.automation_target("reader/facts/path/value"),
                     &theme,
                 )
-                .into_any_element(),
+                .automation_target("reader/facts/path"),
             );
         }
         if let Some(branch) = &session.branch {
+            let (value, layout) = whole("facts-branch", branch, Some(SbIcon::GitBranch), &theme);
+            cut.push(layout);
             facts.push(
-                kv(
+                fact(
                     "Branch",
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(theme.spacing.xs)
-                        .child(icon(SbIcon::GitBranch, theme.sizes.icon_xs, c.fg3))
-                        .child(hostile::label(branch)),
+                    value.automation_target("reader/facts/branch/value"),
                     &theme,
                 )
-                .into_any_element(),
+                .automation_target("reader/facts/branch"),
             );
+        }
+        #[cfg(test)]
+        {
+            self.facts_cut = cut;
         }
         if library.agents() > 1 {
             facts.push(
-                kv(
+                fact(
                     "Agent",
                     div()
                         .flex()
                         .items_center()
                         .gap(theme.spacing.xs)
                         .child(agents::mark(&provider, theme.sizes.icon_xs, cx))
-                        .child(agents::name(&provider, cx)),
+                        .child(line(agents::name(&provider, cx)).flex_1()),
                     &theme,
                 )
                 .into_any_element(),
             );
         }
         if !session.models.is_empty() {
-            let models: Vec<String> = session
+            let models: Vec<Div> = session
                 .models
                 .iter()
-                .map(|model| hostile::label(&agents::model_name(&provider, model, cx)))
+                .map(|model| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(theme.spacing.xs)
+                        .child(agents::mark(&provider, theme.sizes.icon_xs, cx))
+                        .child(
+                            line(hostile::label(&agents::model_name(&provider, model, cx)))
+                                .flex_1(),
+                        )
+                })
                 .collect();
-            facts.push(kv("Models", value(models.join(", ")), &theme).into_any_element());
+            facts.push(
+                fact(
+                    "Models",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .debug_selector(|| "facts-models".into())
+                        .children(models),
+                    &theme,
+                )
+                .automation_target("reader/facts/models"),
+            );
         }
         if let Some(started) = session.started {
-            let mut when = format!(
-                "{} {}",
-                format::day(started, format::now()),
-                format::clock(started)
-            );
+            let mut time = format::clock(started);
             if let Some(ended) = session.ended {
-                when.push_str(&format!(" · {}", format::duration(ended - started)));
+                time.push_str(&format!(" · {}", format::duration(ended - started)));
             }
-            facts.push(kv("When", numbers(when), &theme).into_any_element());
+            facts.push(
+                fact(
+                    "When",
+                    div()
+                        .text_spec(&theme.text.number)
+                        .child(
+                            line(format::day(started, now)).debug_selector(|| "facts-day".into()),
+                        )
+                        .child(line(time).debug_selector(|| "facts-time".into())),
+                    &theme,
+                )
+                .automation_target("reader/facts/when"),
+            );
         }
         let tokens = session.all.tokens;
         if tokens.input + tokens.output > 0 {
             facts.push(
-                kv(
+                fact(
                     "Tokens",
-                    numbers(format!(
+                    line(format!(
                         "{} in · {} out",
                         format::tokens(tokens.input + tokens.cache_read + tokens.cache_write),
                         format::tokens(tokens.output)
-                    )),
+                    ))
+                    .text_spec(&theme.text.number)
+                    .debug_selector(|| "facts-tokens".into()),
                     &theme,
                 )
-                .into_any_element(),
+                .automation_target("reader/facts/tokens"),
             );
         }
         if let (Some(history), Some(key)) = (open.history(), open.main_key()) {
@@ -231,7 +349,7 @@ impl ReaderView {
                 main: true,
             };
             facts.push(
-                kv(
+                fact(
                     "Version",
                     /* History goes under the number when both don't fit ("v2 of 4 · older"). */
                     div()
@@ -240,13 +358,16 @@ impl ReaderView {
                         .items_center()
                         .gap_x(theme.spacing.md)
                         .child(
-                            div()
-                                .text_color(if older { c.yellow } else { c.fg2 })
-                                .child(if older {
-                                    format!("v{read} of {of} · older")
-                                } else {
-                                    format!("v{read} of {of}")
-                                }),
+                            line(if older {
+                                format!("v{read} of {of} · older")
+                            } else {
+                                format!("v{read} of {of}")
+                            })
+                            .text_color(if older {
+                                c.yellow
+                            } else {
+                                c.fg2
+                            }),
                         )
                         .child(
                             div()
@@ -254,6 +375,7 @@ impl ReaderView {
                                 .flex()
                                 .items_center()
                                 .gap(theme.spacing.xs)
+                                .whitespace_nowrap()
                                 .text_color(c.accent_text)
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -272,12 +394,9 @@ impl ReaderView {
         }
         if let Some(gone) = open.gone() {
             facts.push(
-                kv(
+                fact(
                     "Source",
-                    div().child(format!(
-                        "gone since {}",
-                        format::day(gone.since, format::now())
-                    )),
+                    line(format!("gone since {}", format::day(gone.since, now))),
                     &theme,
                 )
                 .automation_target("reader/facts/source"),
@@ -437,7 +556,7 @@ impl ReaderView {
                     .flex_none()
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
+                    .gap(px(10.))
                     .child(overline("Session", &theme))
                     .children(facts),
             )

@@ -32,6 +32,8 @@
 //!   against (docs/PLAN.md §14).
 //! - `"reader-versions"`: the same, with `E-Versions`' session, whose newest version is held
 //!   back (docs/DESIGN.md §4.3).
+//! - `"reader-facts"`: the same, with a session whose facts are as long as they come and which
+//!   loads memory files on its way (docs/DESIGN.md §4.2.8, §4.2.11).
 //! - `"locations"`: an archive in the data dir with one location of each kind, the host's
 //!   last good sync twelve days ago, and this machine's agent in the home
 //!   ([`fixture::locations`]): the locations sheet's states (docs/DESIGN.md §4.11).
@@ -90,6 +92,7 @@ enum Library {
     Reader,
     ReaderLarge,
     ReaderVersions,
+    ReaderFacts,
     Locations,
     ArchiveRemains,
     Settings,
@@ -282,7 +285,10 @@ impl RunnerApp for Scrollback {
                     },
                 )?;
             }
-            Library::Reader | Library::ReaderLarge | Library::ReaderVersions => {
+            Library::Reader
+            | Library::ReaderLarge
+            | Library::ReaderVersions
+            | Library::ReaderFacts => {
                 std::fs::remove_dir_all(&home)?;
                 reader::build(
                     &cx.data_dir.join("archive"),
@@ -290,6 +296,7 @@ impl RunnerApp for Scrollback {
                     match header.fixture {
                         Library::ReaderLarge => reader::Extra::Large,
                         Library::ReaderVersions => reader::Extra::Versions,
+                        Library::ReaderFacts => reader::Extra::Facts,
                         _ => reader::Extra::None,
                     },
                 )?;

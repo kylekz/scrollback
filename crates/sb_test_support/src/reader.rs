@@ -1165,6 +1165,58 @@ pub fn inline(tree: &mut ProjectsTree) -> String {
     session.session_key().to_string()
 }
 
+/// Where [`facts`]' session ran: a folder of fc's 200 characters deep.
+pub const LONG_PATH: &str = "/home/user/code/fc/crates/fc_downloads/src/importers/playlists/\
+    regression-fixtures/a-folder-name-long-enough-to-overflow-the-facts-margin/\
+    and-one-more-after-it/until-the-whole-path-is-two-hundred-long";
+/// The branch [`facts`]' session ran on, longer than the facts margin is wide.
+pub const LONG_BRANCH: &str =
+    "feature/playlist-import-keeps-the-order-of-tracks-across-pages-and-retries";
+/// The memory files [`facts`]' session loads, as the agent shows them: under fc.
+pub const MEMORY_FILES: [&str; 2] = ["crates/fc_ui/CLAUDE.md", "crates/fc_downloads/CLAUDE.md"];
+/// What the first memory file [`facts`]' session loads says, as Markdown.
+pub const NESTED_MEMORY: &str = "# fc_ui\n\nThe UI crate. Views never hard-code a colour: \
+    every colour is a token of the theme.\n\n- Run `cargo test -p fc_ui` after a change here.\n\
+    - Keep views free of I/O.\n";
+
+/**
+ * A session of fc whose facts are as long as they come (DESIGN §4.2.8): it ran 200 characters
+ * deep in fc, on a long branch, for 1 h 44 min, with four models; on its way it loaded two
+ * subfolders' memory files, the second's text no longer the file's on disk. Returns its key.
+ */
+pub fn facts(tree: &mut ProjectsTree) -> String {
+    let mut session = tree.session(FC, 0);
+    session.title("Reader fixture: facts as long as they come");
+    let mut s = Script::new(&mut session.transcript, "2025-12-19", "f");
+    s.records.carry("cwd", json!(LONG_PATH));
+    s.records.carry("gitBranch", json!(LONG_BRANCH));
+    s.at("12:11:00")
+        .prompt("Keep the playlist's order when an import retries a page.");
+    s.at("12:11:20").reply(
+        OPUS_55,
+        "The importer appends each page as it lands, so a retried page goes to the end.",
+    );
+    s.at("12:12:00").records.nested_memory(
+        &format!("{FC}/{}", MEMORY_FILES[0]),
+        MEMORY_FILES[0],
+        NESTED_MEMORY,
+        false,
+    );
+    s.at("12:30:00")
+        .reply(HAIKU, "Pages now carry their index.");
+    s.at("13:01:00").records.nested_memory(
+        &format!("{FC}/{}", MEMORY_FILES[1]),
+        MEMORY_FILES[1],
+        "Downloads go through `fc_downloads::queue`, never straight to disk.",
+        true,
+    );
+    s.at("13:20:00")
+        .reply(FABLE, "The queue keeps them in order too.");
+    s.at("13:55:00")
+        .reply(OPUS_46, "Done: a retried page lands where it was.");
+    session.session_key().to_string()
+}
+
 /// What [`large`] writes.
 #[derive(Clone, Copy, Debug)]
 pub struct Large {
