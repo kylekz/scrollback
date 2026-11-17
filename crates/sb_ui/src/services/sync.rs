@@ -125,6 +125,8 @@ pub struct PassProgress {
     pub searchable_done: usize,
     /// The index of the agent being indexed: each agent's is its own, from its start.
     index: Option<AgentIndex>,
+    /// The last agent's index that had work, as it ended: what shows while the next has none.
+    ended: Option<IndexProgress>,
     /// What the agents before the one being synced added to the counts above.
     items_before: usize,
     bytes_before: u64,
@@ -139,6 +141,37 @@ enum AgentIndex {
     Rows { of: usize, done: usize },
     /// Its second step, after `rows` rows: the text to make searchable, and that done.
     Texts { rows: usize, of: usize, done: usize },
+}
+
+impl AgentIndex {
+    /// How far it is, while it has work. A second step with nothing to do leaves the first's,
+    /// done.
+    fn progress(self) -> Option<IndexProgress> {
+        let (step, done, of) = match self {
+            Self::Rows { of: 0, .. } | Self::Texts { rows: 0, of: 0, .. } => return None,
+            Self::Rows { of, done } => (IndexStep::Rows, done, of),
+            Self::Texts { rows, of: 0, .. } => (IndexStep::Rows, rows, rows),
+            Self::Texts { of, done, .. } => (IndexStep::Texts, done, of),
+        };
+        Some(IndexProgress { step, done, of })
+    }
+
+    /// How much of it is done, from 0 to 1: its two steps take half each, and one with no
+    /// rows to make is its second step alone.
+    fn fraction(self) -> f64 {
+        let part = |done: usize, of: usize| {
+            if of > 0 {
+                (done as f64 / of as f64).min(1.)
+            } else {
+                1.
+            }
+        };
+        match self {
+            Self::Rows { of, done } => part(done, of) / 2.,
+            Self::Texts { rows: 0, of, done } => part(done, of),
+            Self::Texts { of, done, .. } => (1. + part(done, of)) / 2.,
+        }
+    }
 }
 
 /// The step of an index a pass or an index is at (PLAN §7.5).
@@ -186,6 +219,12 @@ impl PassProgress {
                     (self.sessions_done, self.searchable_done);
                 self.sessions += sessions;
                 self.outdated += outdated;
+                if let Some(ended) = self.index.and_then(AgentIndex::progress) {
+                    self.ended = Some(IndexProgress {
+                        done: ended.of,
+                        ..ended
+                    });
+                }
                 self.index = Some(AgentIndex::Rows {
                     of: sessions,
                     done: 0,
@@ -220,20 +259,18 @@ impl PassProgress {
         }
     }
 
+    /// The index in hand, while it has work.
+    fn working(&self) -> Option<AgentIndex> {
+        self.index.filter(|index| index.progress().is_some())
+    }
+
     /**
      * How far the index in hand is, while it has work: the rows it makes, then the text it
-     * makes searchable. A second step with nothing to do leaves the first's, done.
+     * makes searchable. Once an agent's index has had work, one after it with none shows
+     * that one as it ended, done, rather than the fetching before them.
      */
     pub fn indexing(&self) -> Option<IndexProgress> {
-        let (step, done, of) = match self.index? {
-            AgentIndex::Rows { of: 0, .. } | AgentIndex::Texts { rows: 0, of: 0, .. } => {
-                return None;
-            }
-            AgentIndex::Rows { of, done } => (IndexStep::Rows, done, of),
-            AgentIndex::Texts { rows, of: 0, .. } => (IndexStep::Rows, rows, rows),
-            AgentIndex::Texts { of, done, .. } => (IndexStep::Texts, done, of),
-        };
-        Some(IndexProgress { step, done, of })
+        self.working().and_then(AgentIndex::progress).or(self.ended)
     }
 
     /// Whether the fetching is over and the sessions it changed are being indexed.
@@ -244,22 +281,13 @@ impl PassProgress {
     /**
      * How much of the work in hand is done, from 0 to 1: of the bytes to fetch, or of the
      * index of the agent being indexed. An index's two steps take half the bar each, so it
-     * moves on through the second instead of standing full; an index with no rows to make is
-     * its second step alone. Each agent's index fills the bar from its start, so a failed one
-     * leaves nothing owing to the next.
+     * moves on through the second instead of standing full. Each agent's index fills the bar
+     * from its start, so a failed one leaves nothing owing to the next.
      */
     pub fn fraction(&self) -> f32 {
-        let part = |done: usize, of: usize| {
-            if of > 0 {
-                (done as f64 / of as f64).min(1.)
-            } else {
-                1.
-            }
-        };
-        let done = match self.index.filter(|_| self.is_indexing()) {
-            Some(AgentIndex::Rows { of, done }) => part(done, of) / 2.,
-            Some(AgentIndex::Texts { rows: 0, of, done }) => part(done, of),
-            Some(AgentIndex::Texts { of, done, .. }) => (1. + part(done, of)) / 2.,
+        let done = match self.working() {
+            Some(index) => index.fraction(),
+            None if self.ended.is_some() => 1.,
             None if self.planned && self.bytes > 0 => {
                 (self.bytes_done as f64 / self.bytes as f64).min(1.)
             }

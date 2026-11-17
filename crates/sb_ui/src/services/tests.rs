@@ -1017,3 +1017,40 @@ fn a_second_step_with_nothing_to_do_leaves_the_first_done() {
     progress.apply(&Progress::Searching { sessions: 0 });
     assert_eq!(at(&progress), (Some((IndexStep::Rows, 0)), 1.));
 }
+
+#[test]
+fn an_agent_with_nothing_to_index_shows_the_index_before_it_done() {
+    let indexing = |sessions| Progress::Indexing {
+        sessions,
+        bytes: 0,
+        outdated: 0,
+    };
+    let mut progress = PassProgress::default();
+    progress.apply(&Progress::Planned {
+        items: 4,
+        bytes: 400,
+    });
+    progress.apply(&Progress::Fetched { bytes: 400 });
+    progress.apply(&Progress::Stored { items: 4 });
+    // The first agent's index, cut short in its second step.
+    progress.apply(&indexing(3));
+    progress.apply(&Progress::Indexed {
+        sessions: 3,
+        bytes: 0,
+    });
+    progress.apply(&Progress::Searching { sessions: 3 });
+    progress.apply(&Progress::Searched {
+        sessions: 1,
+        searchable: 0,
+    });
+    // The second agent's has no rows to make: the first's shows, done, not the fetching.
+    progress.apply(&indexing(0));
+    assert_eq!(at(&progress), (Some((IndexStep::Texts, 0)), 1.));
+    progress.apply(&Progress::Searching { sessions: 0 });
+    assert_eq!(at(&progress), (Some((IndexStep::Texts, 0)), 1.));
+    // Nor text: the same. With text, its own.
+    let mut text = progress;
+    text.apply(&indexing(0));
+    text.apply(&Progress::Searching { sessions: 4 });
+    assert_eq!(at(&text), (Some((IndexStep::Texts, 4)), 0.));
+}

@@ -76,7 +76,7 @@ fn doing(progress: &PassProgress) -> String {
             step: IndexStep::Texts,
             done,
             of,
-        }) => sessions(done, of, "searchable"),
+        }) => sessions(done, of, "read for search"),
         None if progress.planned => format!(
             "{} of {} files · {}",
             format::count(progress.items_done as u64),
@@ -270,7 +270,9 @@ mod tests {
             sessions: 40,
             searchable: 0,
         });
-        assert_eq!(doing(&indexing), "40 of 418 sessions searchable");
+        /* Read, not yet searchable: text is written some sessions at a time, so search finds
+        them a batch later. */
+        assert_eq!(doing(&indexing), "40 of 418 sessions read for search");
     }
 
     #[test]

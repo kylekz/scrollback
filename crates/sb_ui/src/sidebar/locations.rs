@@ -51,11 +51,15 @@ fn step_name(step: IndexStep) -> &'static str {
     }
 }
 
-/// What a syncing location's row says under its bar (DESIGN §4.1, `E-Edge-First-Sync`).
+/**
+ * What a syncing location's row says under its bar (DESIGN §4.1, `E-Edge-First-Sync`). Once
+ * it indexes, the step takes the room "first sync" had, so it is never what is cut.
+ */
 fn doing_line(kind: &LocationKind, progress: &PassProgress, first: bool) -> String {
-    let what = if let Some(index) = progress.indexing() {
-        step_name(index.step).to_string()
-    } else if !progress.planned {
+    if progress.is_indexing() {
+        return indexing_line(kind, progress);
+    }
+    let what = if !progress.planned {
         "scanning".to_string()
     } else if progress.bytes == 0 {
         "nothing new".to_string()
@@ -497,6 +501,31 @@ mod tests {
         });
         assert_eq!(doing(&progress).as_deref(), Some("1,240 left"));
         assert_eq!(doing_line(local, &progress, false), "Local · search index");
+        // A first sync's index says its step where "first sync" was, so the step is not cut.
+        assert_eq!(doing_line(local, &progress, true), "Local · search index");
+    }
+
+    #[test]
+    fn a_first_syncs_index_names_its_step_in_place_of_first_sync() {
+        let local = &LocationKind::Local;
+        let mut progress = PassProgress::default();
+        progress.apply(&Progress::Planned {
+            items: 212,
+            bytes: 96 << 20,
+        });
+        progress.apply(&Progress::Fetched { bytes: 41 << 20 });
+        assert_eq!(
+            doing_line(local, &progress, true),
+            "Local · first sync · 41 of 96 MB"
+        );
+        progress.apply(&Progress::Indexing {
+            sessions: 2,
+            bytes: 0,
+            outdated: 0,
+        });
+        assert_eq!(doing_line(local, &progress, true), "Local · indexing");
+        progress.apply(&Progress::Searching { sessions: 2 });
+        assert_eq!(doing_line(local, &progress, true), "Local · search index");
     }
 
     #[test]
