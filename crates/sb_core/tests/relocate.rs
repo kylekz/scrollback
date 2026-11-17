@@ -25,12 +25,15 @@ for_both_agents!(
 /**
  * Every file under `dir` with its length, time and bytes, by its path relative to `dir`, but
  * the databases' shared memory, which every reader of an open database writes its read marks
- * in, and which holds nothing that is kept.
+ * in, and which holds nothing that is kept, and the archive's `lock`, which a move never copies
+ * and which the open archive holds: on Windows a byte-range lock that no other handle can read
+ * through (error 33), where elsewhere the lock is advisory.
  */
 fn tree(dir: &Path) -> BTreeMap<PathBuf, (u64, Option<SystemTime>, Vec<u8>)> {
     common::files_under(dir)
         .into_iter()
         .filter(|path| !path.to_string_lossy().ends_with("-shm"))
+        .filter(|path| path.strip_prefix(dir).ok() != Some(Path::new("lock")))
         .map(|path| {
             let metadata = fs::metadata(&path).unwrap();
             let bytes = fs::read(&path).unwrap();
