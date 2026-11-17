@@ -52,8 +52,9 @@
 //!   `hold_sync`'s hold), and `locations`, each with its `name`, `kind` (`local`, `wsl` or
 //!   `ssh`) and `state` (`syncing` with `progress`: the `items` to fetch and `items_done`, the
 //!   `sessions` to index and `sessions_done`, and the `index` in hand, `null` or its `step`,
-//!   `rows` or `texts`, with how many it has `done` `of` how many; `synced`; `failed` with
-//!   `error`; `unreachable`; or `never`), `stale` and `removing`; `removed` (the names of the
+//!   `rows`, `texts`, `waiting` or `compacting`, with how many it has `done` `of` how many
+//!   (none for the last two); `synced`; `failed` with `error`; `unreachable`; or `never`),
+//!   `stale` and `removing`; `removed` (the names of the
 //!   locations the owner removed); `refused` (why the owner's last change to them could not be
 //!   made, or `null`);
 //!   `distros` (WSL's distros' names as listed, `null` without WSL or before they are
@@ -501,6 +502,8 @@ fn sync(cx: &App) -> Value {
                         "step": match index.step {
                             IndexStep::Rows => "rows",
                             IndexStep::Texts => "texts",
+                            IndexStep::Waiting => "waiting",
+                            IndexStep::Compacting => "compacting",
                         },
                         "done": index.done,
                         "of": index.of,

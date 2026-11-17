@@ -15,7 +15,7 @@ use sb_core::search::{
     self, Calendar, Filters, Key, Limit, MatchKind, Names, Query, Results, SearchError, Searched,
 };
 use sb_core::transcript::{At, Content};
-use sb_test_support::{Agent, FileAgent, Items, ProjectsTree};
+use sb_test_support::{Agent, FileAgent, Items, ProjectsTree, read_catalogue};
 use serde_json::json;
 
 use common::{Bench, for_both_agents};
@@ -695,6 +695,13 @@ fn text_made_again_is_the_text_as_it_is_now_and_nothing_else() {
         [0, 1, 1, 1]
     );
     bench.assert_search_index_intact();
+    /* The two spans that said it otherwise, its title and its first prompt, are marked
+    deleted in the index, and counted till it is compacted. */
+    let marked: i64 = toolbox_store::rusqlite::Connection::open(bench.dir().join("search.db"))
+        .unwrap()
+        .query_row("SELECT spans FROM marked", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(marked, 2);
 
     /* Its last prompt is no longer one: the version is held back, and once the owner reads it
     all the same, the prompt's text is gone from search. */
@@ -723,12 +730,15 @@ fn text_made_again_is_the_text_as_it_is_now_and_nothing_else() {
 
 /**
  * A session deleted for good leaves none of its text anywhere in the archive's databases or
- * their logs (PLAN §4.5): not in the search index's text, its entries of text replaced before,
- * nor the free space of a page, of the search index or of the catalogue.
+ * their logs (PLAN §4.5), read byte by byte: not in the search index's text, its entries,
+ * those of its text replaced before among them, nor the free space of a page, of the search
+ * index or of the catalogue. `TERM` is a prompt of its own of three of a character nothing
+ * else holds: the index's one term that starts with it, held whole wherever it is.
  */
 #[test]
 fn text_deleted_for_good_is_in_no_file() {
     const SAID: &str = "zanzibarquokka";
+    const TERM: &str = "龘龘龘";
     let mut tree = ProjectsTree::new();
     let mut doomed = tree.session("/home/user/code/app", 0);
     for turn in 0..40 {
@@ -738,6 +748,7 @@ fn text_deleted_for_good_is_in_no_file() {
         doomed
             .transcript
             .reply(&format!("The {SAID} is in drawer {turn}."));
+        doomed.transcript.prompt(TERM);
     }
     let mut others: Vec<_> = (0..30)
         .map(|n| tree.session(&format!("/home/user/code/app{n}"), 0))
@@ -764,37 +775,81 @@ fn text_deleted_for_good_is_in_no_file() {
     bench.sync();
     assert_eq!(find(&bench, SAID).total_sessions, 1);
 
+    let files = || {
+        ["scrollback.db", "search.db"]
+            .into_iter()
+            .flat_map(|name| ["", "-wal"].map(|suffix| bench.dir().join(format!("{name}{suffix}"))))
+            .collect::<Vec<_>>()
+    };
+    let holding = |what: &str| -> Vec<String> {
+        (files().into_iter())
+            .filter(|file| {
+                let bytes = fs::read(file).unwrap_or_default();
+                bytes.windows(what.len()).any(|it| it == what.as_bytes())
+            })
+            .map(|file| file.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    };
+    /* Before: the files hold it, the logs if not yet the databases. */
+    assert!(!holding(TERM).is_empty());
+
     let id = bench.session_id(&key);
     bench.archive().catalogue().trash(&id).unwrap();
     bench.delete_for_good(&id).unwrap();
     assert_eq!(find(&bench, &format!("{SAID} in:all")).total_matches, 0);
-    for name in ["scrollback.db", "search.db"] {
-        for suffix in ["", "-wal"] {
-            let file = bench.dir().join(format!("{name}{suffix}"));
-            let bytes = fs::read(&file).unwrap_or_default();
-            let found = bytes
-                .windows(SAID.len())
-                .filter(|it| *it == SAID.as_bytes());
-            assert_eq!(found.count(), 0, "{} holds it", file.display());
-        }
-    }
-    /* Nor does the index hold an entry it marked deleted: it is as one made from the text
-    there is. */
-    let search = toolbox_store::rusqlite::Connection::open(bench.dir().join("search.db")).unwrap();
-    let entries = || -> i64 {
-        search
-            .query_row("SELECT sum(length(block)) FROM span_text_data", [], |row| {
-                row.get(0)
-            })
-            .unwrap()
-    };
-    let scrubbed = entries();
-    search
-        .execute("INSERT INTO span_text (span_text) VALUES ('rebuild')", [])
-        .unwrap();
-    assert_eq!(scrubbed, entries());
+    assert_eq!(holding(SAID), Vec::<String>::new());
+    assert_eq!(holding(TERM), Vec::<String>::new());
+    assert!(bench.archive().unscrubbed().unwrap().is_none());
     bench.assert_search_index_intact();
     bench.assert_verifies();
+}
+
+/**
+ * Deleted text that could not be erased from the files yet (a read held the search index's
+ * log, here) stays marked as to be, and is said to be; the next start erases it.
+ */
+#[test]
+fn deleted_text_not_yet_erased_is_erased_at_the_next_start() {
+    const TERM: &str = "龘龘龘";
+    let mut tree = ProjectsTree::new();
+    let mut doomed = tree.session("/home/user/code/app", 0);
+    doomed.transcript.prompt("Where is it?");
+    doomed.transcript.prompt(TERM);
+    let mut kept = tree.session("/home/user/code/kept", 0);
+    kept.transcript.prompt("And this one?");
+    let key = doomed.key.clone();
+    let mut bench = Bench::new(FileAgent::on(tree));
+    bench.sync();
+    let held = |bench: &Bench<FileAgent>| {
+        let bytes = fs::read(bench.dir().join("search.db")).unwrap();
+        bytes.windows(TERM.len()).any(|it| it == TERM.as_bytes())
+    };
+
+    let reader = toolbox_store::rusqlite::Connection::open(bench.dir().join("search.db")).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM doc;")
+        .unwrap();
+    let id = bench.session_id(&key);
+    bench.archive().catalogue().trash(&id).unwrap();
+    bench.delete_for_good(&id).unwrap();
+    assert!(bench.archive().unscrubbed().unwrap().is_some());
+    let marked = |bench: &Bench<FileAgent>| {
+        read_catalogue(
+            bench.dir(),
+            "SELECT count(*) FROM kv WHERE key = 'deleted_to_scrub'",
+        )
+    };
+    assert_eq!(marked(&bench), ["1"]);
+    drop(reader);
+
+    /* As a crash would leave it: the next start erases it. */
+    bench.close();
+    bench.reopen();
+    bench.archive().wait_for_removals();
+    assert_eq!(marked(&bench), ["0"]);
+    assert!(bench.archive().unscrubbed().unwrap().is_none());
+    assert!(!held(&bench));
+    assert_eq!(find(&bench, "this one").total_sessions, 1);
 }
 
 /// What is pasted whole into a prompt is searched as far as its first tens of kilobytes, and

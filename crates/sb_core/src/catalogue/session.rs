@@ -771,7 +771,7 @@ impl Catalogue {
         self.db.read(|c| {
             Ok(c.prepare(&format!(
                 "SELECT s.location_id, s.provider, s.session, {MADE_FROM} FROM session s
-                 WHERE s.searchable = 0
+                 WHERE s.searchable = 0 AND s.retry = 0
                    AND (?1 IS NULL OR s.location_id = ?1) AND (?2 IS NULL OR s.provider = ?2)
                  {BY_ACTIVITY}"
             ))?
@@ -784,6 +784,25 @@ impl Catalogue {
                 Ok((id, row.get(3)?))
             })?
             .collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /**
+     * How many sessions of `providers`, at every location, have text an index could make
+     * that is not of their rows as they are: those [`Catalogue::unsearchable`] gives. A row
+     * the archive could not be read for has none until it is read again.
+     */
+    pub(crate) fn count_backlog(&self, providers: &[&str]) -> Result<usize> {
+        self.db.read(|c| {
+            let mut count = c.prepare(
+                "SELECT count(*) FROM session
+                 WHERE searchable = 0 AND retry = 0 AND provider = ?1",
+            )?;
+            let mut backlog = 0;
+            for provider in providers {
+                backlog += count.query_row([provider], |row| row.get::<_, usize>(0))?;
+            }
+            Ok(backlog)
         })
     }
 

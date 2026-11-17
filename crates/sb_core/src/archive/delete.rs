@@ -28,10 +28,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 
-use super::{Archive, ArchiveError, Result, accounted, layout, open_search, segment};
+use super::{Archive, ArchiveError, Result, accounted, disk, layout, open_search, segment};
 use crate::catalogue::{AllowedAgain, Catalogue, Deletion, ItemFile, Removal, SessionId, Stored};
 use crate::location::LocationId;
-use crate::search::SearchIndex;
+use crate::search::{SearchError, SearchIndex};
 
 /// What deleting a session for good did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +42,65 @@ pub struct Deleted {
     /// background removal: the session's, and any another delete left.
     /// [`Archive::pending_removals`] says how many are left later.
     pub pending: usize,
+}
+
+/// What is still to be erased of what was deleted for good ([`Archive::unscrubbed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Unscrubbed {
+    /// About how much room on its disk erasing it takes, when the search index is open.
+    pub needs: Option<u64>,
+    /// How much room there is, if it could be read.
+    pub free: Option<u64>,
+}
+
+impl Unscrubbed {
+    /// Whether the room it takes is what it waits for.
+    pub fn wants_room(&self) -> bool {
+        matches!((self.needs, self.free), (Some(needs), Some(free)) if free < needs)
+    }
+}
+
+/**
+ * Erases what is left in the archive's files of the sessions deleted for good since this last
+ * did (PLAN §4.5), if any were: a delete for good marks the catalogue in its own transaction
+ * ([`Catalogue::to_scrub`]), and the mark is taken off only once both files are erased, so a
+ * crash or a failure leaves it for the next try. The catalogue's part is its log, emptied, and
+ * is done whatever becomes of the search index's: the index compacted without the entries it
+ * marked deleted ([`SearchIndex::compact`]), when its disk has the room, until `stop` says.
+ */
+fn scrub(
+    dir: &Path,
+    search: &Mutex<Option<Arc<SearchIndex>>>,
+    catalogue: &Catalogue,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<()> {
+    if stop() {
+        return Ok(());
+    }
+    let Some(mark) = catalogue.to_scrub()? else {
+        return Ok(());
+    };
+    let logged = catalogue.empty_log();
+    if !catalogue.text_gone()?.is_empty() {
+        return Err(SearchError::Unavailable("deleted text is still in the index".into()).into());
+    }
+    let search = open_search(dir, search, catalogue)?;
+    let needs = search.compaction_room()?;
+    if let Ok(free) = disk::free_space(dir)
+        && free < needs
+    {
+        return Err(SearchError::Unavailable(format!(
+            "erasing it takes about {} MB free, and there are {} MB",
+            needs >> 20,
+            free >> 20
+        ))
+        .into());
+    }
+    search.compact(stop)?;
+    if !logged {
+        return Err(SearchError::Unavailable("a read held the catalogue's log".to_string()).into());
+    }
+    Ok(catalogue.scrubbed(&mark)?)
 }
 
 /// The archive's background removal of deleted items' files.
@@ -127,7 +186,7 @@ impl Archive {
             }
             Err(error) => log::warn!("the text of a deleted session is left for later: {error}"),
         }
-        self.catalogue.empty_log();
+        let _ = self.catalogue.empty_log();
         let pending = self.catalogue.pending_removals().unwrap_or_else(|error| {
             log::warn!("{error}");
             shown.files
@@ -154,6 +213,41 @@ impl Archive {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(self.catalogue.restore_tombstone(allowed)?)
+    }
+
+    /**
+     * Erases what is left in the archive's files of what was deleted for good, if anything is
+     * ([`scrub`]), until `stop` says to stop: what the background removal does, and what a
+     * move does before it copies.
+     */
+    pub(crate) fn scrub_deleted(&self, stop: &(dyn Fn() -> bool + Sync)) -> Result<()> {
+        scrub(&self.dir, &self.search, &self.catalogue, stop)
+    }
+
+    /**
+     * What is still to be erased of what was deleted for good (PLAN §4.5), when the background
+     * removal has tried and is not trying now: `None` when nothing is, or it is under way.
+     */
+    pub fn unscrubbed(&self) -> Result<Option<Unscrubbed>> {
+        if self.catalogue.to_scrub()?.is_none() {
+            return Ok(None);
+        }
+        let job = self
+            .removals
+            .job
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if job.running {
+            return Ok(None);
+        }
+        drop(job);
+        let needs = self
+            .search_index_if_open()
+            .and_then(|search| search.compaction_room().ok());
+        Ok(Some(Unscrubbed {
+            needs,
+            free: disk::free_space(&self.dir).ok(),
+        }))
     }
 
     /// How many deleted items' folders are still to be removed (the module docs).
@@ -256,20 +350,19 @@ impl Remover {
             if let Err(error) = self.remove_deleted() {
                 log::warn!("files of deleted sessions are left for later: {error}");
             }
-            match self.forget_gone_text() {
-                Ok(()) => {
-                    if let Err(error) = self.scrub() {
-                        log::warn!("the files are scrubbed of deleted sessions later: {error}");
-                    }
-                }
-                Err(error) => log::warn!("the text of deleted sessions is left for later: {error}"),
+            if let Err(error) = self.forget_gone_text() {
+                log::warn!("the text of deleted sessions is left for later: {error}");
+            }
+            let stop = || self.removals.stop.load(Ordering::Relaxed);
+            if let Err(error) = scrub(&self.dir, &self.search, &self.catalogue, &stop) {
+                log::warn!("deleted text is erased from the archive's files later: {error}");
             }
             if backup && !self.removals.stop.load(Ordering::Relaxed) {
                 backup = false;
                 match self.catalogue.pending_removals() {
                     Ok(0) => {
                         /* What a write before took out is in no file, nor in the backup. */
-                        self.catalogue.empty_log();
+                        let _ = self.catalogue.empty_log();
                         self.catalogue.daily_backup();
                     }
                     Ok(_) => log::warn!(
@@ -302,24 +395,6 @@ impl Remover {
         let search = open_search(&self.dir, &self.search, &self.catalogue)?;
         search.forget(&gone)?;
         Ok(self.catalogue.text_forgotten(&gone)?)
-    }
-
-    /**
-     * Scrubs the search index and the catalogue of what is left in their files of the sessions
-     * deleted for good since they last were (PLAN §4.5), once their text is out of the index:
-     * a delete for good leaves the mark ([`Catalogue::to_scrub`]) in the transaction that
-     * deletes, so a crash before this leaves it for the next start.
-     */
-    fn scrub(&self) -> Result<()> {
-        if self.removals.stop.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let Some(mark) = self.catalogue.to_scrub()? else {
-            return Ok(());
-        };
-        open_search(&self.dir, &self.search, &self.catalogue)?.scrub()?;
-        self.catalogue.scrub()?;
-        Ok(self.catalogue.scrubbed(&mark)?)
     }
 
     /// Removes the files of deleted items that are pending, one item at a time (the module

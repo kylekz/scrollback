@@ -31,7 +31,8 @@ const BUSY_GAP: gpui::Pixels = px(3.);
 /// location is scanned.
 fn doing(progress: &PassProgress) -> Option<String> {
     if let Some(index) = progress.indexing() {
-        Some(format!("{} left", format::count(index.left() as u64)))
+        /* A step that counts nothing says nothing here: its word is on the left. */
+        (index.step.counts()).then(|| format!("{} left", format::count(index.left() as u64)))
     } else if progress.planned {
         Some(format!(
             "{} / {} files",
@@ -48,6 +49,8 @@ fn step_name(step: IndexStep) -> &'static str {
     match step {
         IndexStep::Rows => "indexing",
         IndexStep::Texts => "search index",
+        IndexStep::Waiting => "waiting",
+        IndexStep::Compacting => "compacting",
     }
 }
 
@@ -89,7 +92,9 @@ fn indexing_line(kind: &LocationKind, progress: &PassProgress) -> String {
  */
 fn index_line(progress: &PassProgress) -> &'static str {
     match progress.indexing().map(|index| index.step) {
-        Some(IndexStep::Texts) => step_name(IndexStep::Texts),
+        Some(step @ (IndexStep::Texts | IndexStep::Waiting | IndexStep::Compacting)) => {
+            step_name(step)
+        }
         _ if progress.outdated > 0 => "after an update",
         _ => "every location",
     }
@@ -505,6 +510,28 @@ mod tests {
         assert_eq!(doing_line(local, &progress, false), "Local · search index");
         // A first sync's index says its step where "first sync" was, so the step is not cut.
         assert_eq!(doing_line(local, &progress, true), "Local · search index");
+        // Compacting counts nothing, so says no count: its word alone, over a full bar.
+        progress.apply(&Progress::Compacting);
+        assert_eq!(doing(&progress), None);
+        assert_eq!(doing_line(local, &progress, false), "Local · compacting");
+        assert_eq!(progress.fraction(), 1.);
+    }
+
+    #[test]
+    fn an_index_that_waits_for_the_backlog_says_so() {
+        let mut progress = PassProgress::default();
+        progress.apply(&Progress::Waiting);
+        assert_eq!(doing(&progress), None);
+        assert_eq!(index_line(&progress), "waiting");
+        assert_eq!(progress.fraction(), 0.);
+        // Then it indexes, as any index does.
+        progress.apply(&Progress::Indexing {
+            sessions: 4,
+            bytes: 0,
+            outdated: 4,
+        });
+        assert_eq!(index_line(&progress), "after an update");
+        assert_eq!(doing(&progress).as_deref(), Some("4 left"));
     }
 
     #[test]

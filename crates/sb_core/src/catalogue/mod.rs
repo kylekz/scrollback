@@ -439,8 +439,9 @@ impl Catalogue {
     }
 
     /// Empties the catalogue's write-ahead log, so what a write took out is in no file.
-    pub(crate) fn empty_log(&self) {
-        self.log.empty();
+    /// Returns whether it did: a read may hold it ([`Log::empty`]).
+    pub(crate) fn empty_log(&self) -> bool {
+        self.log.empty()
     }
 
     /// Empties the log, if a read held it the last time it was to be emptied.

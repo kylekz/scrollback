@@ -45,7 +45,7 @@ use crate::hash::Hash;
 use crate::location::LocationId;
 use crate::search::{SearchError, SearchIndex};
 
-pub use delete::Deleted;
+pub use delete::{Deleted, Unscrubbed};
 pub use disk::{plain, write_durably};
 pub use items::{ArchivedSession, Pinned};
 pub use kin::KinMemo;
@@ -1531,6 +1531,14 @@ mod tests {
         });
         search.forget(&without).unwrap();
         assert_eq!(search.docs().unwrap().len(), 2);
+        /* One session given as many times as there are sessions with text is still one. */
+        search
+            .forget(&[sessions[0].clone(), sessions[0].clone()])
+            .unwrap();
+        assert_eq!(
+            search.docs().unwrap().into_keys().collect::<Vec<_>>(),
+            [sessions[1].clone()]
+        );
         search.forget(&sessions).unwrap();
         assert!(search.docs().unwrap().is_empty());
     }

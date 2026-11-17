@@ -572,7 +572,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             Progress::Searching { sessions } => {
                 println!("making {sessions} sessions searchable");
             }
-            Progress::Indexed { .. } | Progress::Searched { .. } => {}
+            Progress::Compacting => println!("compacting the search index"),
+            Progress::Indexed { .. } | Progress::Searched { .. } | Progress::Waiting => {}
         },
     )?;
     if passes.is_empty() {

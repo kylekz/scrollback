@@ -608,6 +608,9 @@ impl SettingsPage {
                     format::plural(last.uncatalogued, "path")
                 )
             }),
+            last.unscrubbed
+                .as_ref()
+                .map(crate::pages::trash::unscrubbed_note),
         ]
         .into_iter()
         .flatten()

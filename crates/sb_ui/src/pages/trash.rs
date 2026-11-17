@@ -27,6 +27,7 @@ use gpui::{
 };
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
+use sb_core::archive::Unscrubbed;
 use sb_core::catalogue::{Filed, Session, SessionId};
 
 use super::header::{Under, header};
@@ -46,6 +47,22 @@ const ABOUT: &str = "They are hidden everywhere else but still archived, and syn
 const NOTE: &str = "Deleting for good removes a session from this archive only. Nothing is ever \
                     deleted at a location.";
 const EMPTY: &str = "Trash is empty.";
+
+/**
+ * What a note says of text deleted for good that is not yet erased from the archive's files
+ * (PLAN §4.5, DESIGN §4.8): what it waits for, room on the disk, when that is it.
+ */
+pub(crate) fn unscrubbed_note(unscrubbed: &Unscrubbed) -> String {
+    match unscrubbed.needs.filter(|_| unscrubbed.wants_room()) {
+        Some(needs) => format!(
+            "Deleted text isn't erased from the archive's files yet: that needs about {} free.",
+            format::fine_size(needs)
+        ),
+        None => "Deleted text isn't erased from the archive's files yet; it is tried again \
+                 after the next sync."
+            .to_string(),
+    }
+}
 
 /// The table's measures (`E-Trash`): its header and rows, and the columns after Session.
 const HEADER_HEIGHT: Pixels = px(30.);
@@ -535,6 +552,20 @@ impl Render for TrashView {
                         .child(icon(SbIcon::CircleAlert, theme.sizes.icon_sm, c.fg3))
                         .child(NOTE)
                         .automation_target("trash/note"),
+                )
+            })
+            .when_some(page.and_then(|page| page.unscrubbed), |this, unscrubbed| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(theme.spacing.md)
+                        .text_color(c.fg3)
+                        .text_spec(&theme.text.secondary)
+                        .child(icon(SbIcon::CircleAlert, theme.sizes.icon_sm, c.fg3))
+                        .child(unscrubbed_note(&unscrubbed))
+                        .automation_target("trash/unscrubbed"),
                 )
             })
             .when(page.is_some_and(|page| page.sessions.is_empty()), |this| {

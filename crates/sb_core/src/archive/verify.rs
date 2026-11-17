@@ -32,7 +32,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use toolbox_process::CancelToken;
 
-use super::{Archive, ArchiveError, Problem, item_folder, layout};
+use super::{Archive, ArchiveError, Problem, Unscrubbed, item_folder, layout};
 use crate::catalogue::{self, Stored};
 use crate::location::LocationId;
 
@@ -156,6 +156,10 @@ pub struct LastVerify {
     pub uncatalogued: usize,
     /// How many folders of sessions deleted for good are still to be removed.
     pub removing: usize,
+    /// What was deleted for good and is not yet erased from the archive's files, if anything
+    /// is and the background removal is not at it ([`Archive::unscrubbed`]).
+    #[serde(default)]
+    pub unscrubbed: Option<Unscrubbed>,
 }
 
 /// A version that could not be read to the end, for a reason that isn't its bytes.
@@ -187,6 +191,9 @@ pub struct VerifyReport {
     pub removing: Vec<PathBuf>,
     /// The search index did not match the text it indexes, and was made again from it.
     pub search_rebuilt: bool,
+    /// What was deleted for good and is not yet erased from the archive's files
+    /// ([`Archive::unscrubbed`]).
+    pub unscrubbed: Option<Unscrubbed>,
 }
 
 impl Archive {
@@ -227,6 +234,7 @@ impl Archive {
                 Ok(search) => !search.check()?,
                 Err(_) => false,
             },
+            unscrubbed: self.unscrubbed()?,
             ..VerifyReport::default()
         };
         let mut damaged = Vec::new();
@@ -354,6 +362,7 @@ impl Archive {
             unread: report.unread.len(),
             uncatalogued: report.uncatalogued.len(),
             removing: report.removing.len(),
+            unscrubbed: report.unscrubbed,
         })?;
         Ok(report)
     }

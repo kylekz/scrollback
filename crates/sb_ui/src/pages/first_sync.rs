@@ -77,6 +77,14 @@ fn doing(progress: &PassProgress) -> String {
             done,
             of,
         }) => sessions(done, of, "read for search"),
+        Some(IndexProgress {
+            step: IndexStep::Waiting,
+            ..
+        }) => "waiting for another index".to_string(),
+        Some(IndexProgress {
+            step: IndexStep::Compacting,
+            ..
+        }) => "compacting the search index".to_string(),
         None if progress.planned => format!(
             "{} of {} files · {}",
             format::count(progress.items_done as u64),

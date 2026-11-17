@@ -1323,6 +1323,14 @@ fn syncing_line(progress: &PassProgress) -> String {
             done,
             of,
         }) => format!("Search index · {}", sessions(done, of)),
+        Some(IndexProgress {
+            step: IndexStep::Waiting,
+            ..
+        }) => "Indexing · waiting for another index".to_string(),
+        Some(IndexProgress {
+            step: IndexStep::Compacting,
+            ..
+        }) => "Search index · compacting".to_string(),
         None if !progress.planned => "Syncing · looking for changes".to_string(),
         None if progress.items == 0 => "Syncing · nothing new".to_string(),
         None => format!(

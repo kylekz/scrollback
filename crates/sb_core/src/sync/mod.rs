@@ -107,6 +107,12 @@ pub enum Progress {
     /// which are done at once. And so many sessions' text is written so far, counted from the
     /// step's start: a batch at a time, so `searchable` grows when search finds more.
     Searched { sessions: usize, searchable: usize },
+    /// The index of every location waits for another index that has the backlog (PLAN §7.5)
+    /// to end, before it says what it has to do.
+    Waiting,
+    /// The index compacts the search index, after it wrote much of its text again (PLAN §10):
+    /// a few seconds per few thousand sessions, with no count.
+    Compacting,
 }
 
 /// An item a pass did not archive, and why.

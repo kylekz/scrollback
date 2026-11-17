@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
-use sb_core::archive::{Archive, ArchiveError, Deleted};
+use sb_core::archive::{Archive, ArchiveError, Deleted, Unscrubbed};
 use sb_core::catalogue::{
     Before, CatalogueError, Deletion, Filed, Folder, FolderPath, LibraryCounts, PathGroup,
     Restored, Session, SessionId, Shelf, Undone,
@@ -90,6 +90,9 @@ pub struct SessionsPage {
     /// On Trash's page, what each session holds in the archive (DESIGN §4.8's Size); empty
     /// on the others.
     pub sizes: HashMap<SessionId, u64>,
+    /// On Trash's page, what was deleted for good and is not yet erased from the archive's
+    /// files, when that is not under way (PLAN §4.5).
+    pub unscrubbed: Option<Unscrubbed>,
 }
 
 impl SessionsPage {
@@ -125,6 +128,7 @@ impl SessionsPage {
             stats,
             paths,
             sizes: HashMap::new(),
+            unscrubbed: None,
         }
     }
 
@@ -255,6 +259,10 @@ pub(super) fn load(archive: &Archive, shelf: Shelf) -> Result<Loaded, CatalogueE
             let mut page = SessionsPage::new(sessions, paths);
             if shelf == Shelf::Trash {
                 page.sizes = catalogue.trash_sizes()?;
+                page.unscrubbed = archive.unscrubbed().unwrap_or_else(|error| {
+                    log::warn!("{error}");
+                    None
+                });
             }
             Page::Sessions(page)
         }

@@ -107,7 +107,15 @@ pub fn index(
     progress: &mut dyn FnMut(&Progress),
 ) -> Result<IndexReport, SyncError> {
     let providers: Vec<&dyn Provider> = providers.iter().map(Box::as_ref).collect();
-    let backlog = archive.backlog(location.is_none());
+    let backlog = match (archive.backlog(false), location) {
+        (Some(held), _) => Some(held),
+        (None, Some(_)) => None,
+        /* Another index has it: this one waits, and says so. */
+        (None, None) => {
+            progress(&Progress::Waiting);
+            archive.backlog(true)
+        }
+    };
     run(
         archive,
         location,
@@ -243,17 +251,21 @@ fn run(
     let made = if backlog {
         searchable(archive, location, providers, cancel, progress, &mut report)
     } else {
-        /* The text of the rows it made is written; the rest is the backlog's. */
-        report.backlog_left = archive.catalogue().count_unsearchable()? > 0;
+        /* The text of the rows it made is written; the rest is the backlog's, which is left
+        when there is text an index could make: not when search is not to be had, nor for a
+        row the archive could not be read for, nor of an agent not in hand. */
+        let ids: Vec<&str> = providers.iter().map(|it| it.id().as_str()).collect();
+        report.backlog_left = search.is_some() && catalogue.count_backlog(&ids)? > 0;
         progress(&Progress::Searching { sessions: 0 });
         forget_gone(archive)
     };
-    if let Err(error) = made.and_then(|()| compact(archive, backlog, &report)) {
+    if let Err(error) = made.and_then(|()| compact(archive, backlog, cancel, progress)) {
         without_search(error)?;
     }
     /* What the index deleted for good (PLAN §4.5): sessions of conversations the owner
-    deleted, and what they left that is no session's. */
-    if catalogue.pending_removals()? > 0 {
+    deleted, and what they left that is no session's; and deleted text still to be erased from
+    the files, which the background removal tries again. */
+    if catalogue.pending_removals()? > 0 || catalogue.to_scrub()?.is_some() {
         archive.start_removals(false);
     }
     /* A log a read held when a delete for good was to empty it is emptied now. */
@@ -427,21 +439,32 @@ fn without_search(error: SyncError) -> Result<(), SyncError> {
 }
 
 /**
- * Makes the search index again from its text when the index with the `backlog` wrote a
- * quarter of the text or more ([`SearchIndex::scrub`]): text written again is marked deleted
- * in the index, not taken out, and after an update had the index write most of it again,
- * what was marked would stay until the index's parts merge, at several times its size.
+ * Compacts the search index ([`SearchIndex::compact`]) when the index has the `backlog` and
+ * the spans marked deleted there have come to a share of those there are
+ * ([`SearchIndex::compaction_due`]): what is marked stays until the index's parts merge, and
+ * after an update had the index write most of the text again it took the file to several
+ * times its size. `progress` hears it; `cancel` stops it at once, with nothing changed.
  */
-fn compact(archive: &Archive, backlog: bool, report: &IndexReport) -> Result<(), SyncError> {
-    if !backlog || report.searchable == 0 {
+fn compact(
+    archive: &Archive,
+    backlog: bool,
+    cancel: &CancelToken,
+    progress: &mut dyn FnMut(&Progress),
+) -> Result<(), SyncError> {
+    if cancel.is_cancelled() {
+        return Err(SyncError::Cancelled);
+    }
+    let Some(search) = archive.search_index_if_open().filter(|_| backlog) else {
+        return Ok(());
+    };
+    if !search.compaction_due()? {
         return Ok(());
     }
-    if let Some(search) = archive.search_index_if_open()
-        && report.searchable * 4 >= search.texts()?
-    {
-        search.scrub()?;
+    progress(&Progress::Compacting);
+    match search.compact(&|| cancel.is_cancelled()) {
+        Err(SearchError::Cancelled) => Err(SyncError::Cancelled),
+        compacted => Ok(compacted?),
     }
-    Ok(())
 }
 
 /// Takes the text of the sessions whose rows went out of the search index, if it is open.

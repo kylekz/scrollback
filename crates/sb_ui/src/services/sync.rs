@@ -144,6 +144,10 @@ enum AgentIndex {
     Rows { of: usize, done: usize },
     /// Its second step, after `rows` rows: the text to make searchable, and that done.
     Texts { rows: usize, of: usize, done: usize },
+    /// Before it says what it has to do, another index has the backlog, and it waits for it.
+    Waiting,
+    /// After its steps, it compacts the search index: no count.
+    Compacting,
 }
 
 impl AgentIndex {
@@ -155,6 +159,8 @@ impl AgentIndex {
             Self::Rows { of, done } => (IndexStep::Rows, done, of),
             Self::Texts { rows, of: 0, .. } => (IndexStep::Rows, rows, rows),
             Self::Texts { of, done, .. } => (IndexStep::Texts, done, of),
+            Self::Waiting => (IndexStep::Waiting, 0, 0),
+            Self::Compacting => (IndexStep::Compacting, 0, 0),
         };
         Some(IndexProgress { step, done, of })
     }
@@ -175,6 +181,8 @@ impl AgentIndex {
         };
         match self {
             Self::Rows { of, done } | Self::Texts { of, done, .. } => part(done, of),
+            Self::Waiting => 0.,
+            Self::Compacting => 1.,
         }
     }
 }
@@ -186,6 +194,17 @@ pub enum IndexStep {
     Rows,
     /// Making each session's text searchable.
     Texts,
+    /// Waiting for another index, which has the backlog, to end.
+    Waiting,
+    /// Compacting the search index, with no count.
+    Compacting,
+}
+
+impl IndexStep {
+    /// Whether the step counts sessions, so says how many it has left.
+    pub fn counts(self) -> bool {
+        matches!(self, Self::Rows | Self::Texts)
+    }
 }
 
 /// How far the index in hand is: its step, and how many sessions that step has done of how
@@ -224,7 +243,9 @@ impl PassProgress {
                     (self.sessions_done, self.searchable_done);
                 self.sessions += sessions;
                 self.outdated += outdated;
-                if let Some(ended) = self.index.and_then(AgentIndex::progress) {
+                if let Some(ended) =
+                    (self.index.and_then(AgentIndex::progress)).filter(|ended| ended.step.counts())
+                {
                     self.ended = Some(IndexProgress {
                         done: ended.of,
                         ..ended
@@ -268,6 +289,8 @@ impl PassProgress {
                     *done = sessions;
                 }
             }
+            Progress::Waiting => self.index = Some(AgentIndex::Waiting),
+            Progress::Compacting => self.index = Some(AgentIndex::Compacting),
         }
     }
 
@@ -1109,13 +1132,19 @@ impl SyncService {
                 this.update(cx, |this, cx| {
                     this.indexes.remove(&location);
                     this.attribute_copies(cx);
+                    let backlog = indexed.as_ref().is_ok_and(|report| report.backlog_left);
                     if this.indexed(indexed) {
                         // What the locations hold counts the sessions just indexed.
                         this.read_details(cx);
                         cx.emit(SyncEvent::Archived);
                     }
-                    if let Some(id) = location.filter(|id| this.waiting.remove(id)) {
-                        this.sync(&id, cx);
+                    if let Some(id) = location.as_ref().filter(|id| this.waiting.remove(*id)) {
+                        this.sync(id, cx);
+                    }
+                    /* An index of one location leaves the backlog as a pass does, to the index
+                    of every location (the module docs). */
+                    if backlog {
+                        this.index(None, cx);
                     }
                     cx.notify();
                 })

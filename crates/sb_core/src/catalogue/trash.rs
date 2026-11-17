@@ -571,9 +571,9 @@ const TO_SCRUB: &str = "deleted_to_scrub";
 impl Catalogue {
     /**
      * Whether a delete for good was committed that the archive's files are still to be
-     * scrubbed of (PLAN §4.5): what is left of its text in the free space of pages of the
-     * catalogue and of the search index, and in entries of the search index that were marked
-     * deleted. A mark that grows with each delete for good, for [`Catalogue::scrubbed`].
+     * scrubbed of (PLAN §4.5): the search index's entries of its text, which it marked
+     * deleted, and the catalogue's log, if a read held it when the delete was to empty it. A
+     * mark that grows with each delete for good, for [`Catalogue::scrubbed`].
      */
     pub(crate) fn to_scrub(&self) -> Result<Option<String>> {
         self.db.read(|c| {
@@ -596,17 +596,6 @@ impl Catalogue {
             )?;
             Ok(())
         })
-    }
-
-    /**
-     * Writes the catalogue's file anew (`VACUUM`) and empties its log: what a delete freed is
-     * then in no page, nor in the free space of a page it rebalanced, which `secure_delete`
-     * doesn't overwrite (PLAN §4.5). Reads go on meanwhile; writes wait.
-     */
-    pub(crate) fn scrub(&self) -> Result<()> {
-        crate::search::vacuum(&self.dir().join(super::DATABASE))?;
-        self.log.empty();
-        Ok(())
     }
 }
 

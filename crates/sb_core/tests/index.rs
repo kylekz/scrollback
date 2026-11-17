@@ -43,6 +43,7 @@ for_both_agents!(
     two_indexes_of_a_start_after_an_update_parse_each_session_once,
     passes_beside_the_index_of_a_start_leave_it_the_backlog,
     a_search_index_that_fails_while_rows_are_made_holds_up_none_of_them,
+    the_search_index_is_compacted_when_much_of_it_is_marked_deleted,
     an_index_stopped_while_it_parses_keeps_what_it_recorded_in_order,
     a_parser_that_stops_on_one_of_many_sessions_stops_on_that_one_alone,
 );
@@ -926,6 +927,54 @@ fn a_search_index_that_fails_while_rows_are_made_holds_up_none_of_them<A: Agent 
     bench.assert_verifies();
 }
 
+/// The spans the search index has marked deleted and not yet compacted away.
+fn marked<A: Agent>(bench: &Bench<A>) -> i64 {
+    toolbox_store::rusqlite::Connection::open(bench.dir().join("search.db"))
+        .unwrap()
+        .query_row("SELECT spans FROM marked", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn the_search_index_is_compacted_when_much_of_it_is_marked_deleted<A: Agent + Default>() {
+    let (bench, _) = many::<A>();
+    bench.sync();
+    let parser = bench.agent.provider().parser_version();
+    let newer = |version| bench.meddling(Meddle::ParserVersion(version));
+    let steps = |provider| index_steps(&bench, provider);
+
+    /* An update whose parser says every session's text as it was replaces none of it: there
+    is nothing to compact. */
+    assert!(!steps(newer(parser + 1)).contains(&Progress::Compacting));
+    assert_eq!(marked(&bench), 0);
+
+    /* Short of a quarter of the spans marked, nor then; at a quarter, the index of a start
+    compacts, and nothing is marked after. */
+    let spans: i64 = toolbox_store::rusqlite::Connection::open(bench.dir().join("search.db"))
+        .unwrap()
+        .query_row("SELECT count(*) FROM span", [], |row| row.get(0))
+        .unwrap();
+    let mark = |spans: i64| {
+        toolbox_store::rusqlite::Connection::open(bench.dir().join("search.db"))
+            .unwrap()
+            .execute("UPDATE marked SET spans = ?1", [spans])
+            .unwrap();
+    };
+    mark(spans / 4 - 1);
+    assert!(!steps(newer(parser + 2)).contains(&Progress::Compacting));
+    mark(spans / 4 + 1);
+    /* Not by a pass's index, which leaves the backlog's work to the index that has it. */
+    bench.synced_with(newer(parser + 2));
+    assert_eq!(marked(&bench), spans / 4 + 1);
+    let compacted = steps(newer(parser + 3));
+    assert_eq!(
+        compacted[compacted.len() - 2..],
+        [Progress::Searching { sessions: 0 }, Progress::Compacting]
+    );
+    assert_eq!(marked(&bench), 0);
+    bench.assert_search_index_intact();
+    bench.assert_verifies();
+}
+
 fn a_parser_that_stops_on_one_of_many_sessions_stops_on_that_one_alone<A: Agent + Default>() {
     let (bench, keys) = many::<A>();
     let faulty = bench.meddling(Meddle::FaultyParser(keys[17].clone()));
@@ -1260,9 +1309,11 @@ fn a_read_the_system_fails_is_tried_again_and_changes_nothing() {
         before
     );
     /* It is tried again by the index of every start until it can be read, and not by every
-    pass meanwhile. */
+    pass meanwhile; nor does a pass take it for a backlog, which would have the app start an
+    index of every location after each pass, for nothing. */
     assert_eq!(bench.index().failed.len(), 1);
-    assert_eq!(bench.sync().index.sessions, 0);
+    let pass = bench.sync().index;
+    assert_eq!((pass.sessions, pass.backlog_left), (0, false));
     assert_eq!(bench.index().failed.len(), 1);
     fs::set_permissions(locked, fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(bench.sync().index.sessions, 0);

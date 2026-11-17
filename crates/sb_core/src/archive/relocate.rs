@@ -458,6 +458,12 @@ impl Move {
         cancel: &CancelToken,
         progress: &mut dyn FnMut(&MoveProgress),
     ) -> Result<(), MoveError> {
+        /* What was deleted for good and not yet erased from the files is erased first (PLAN
+        §4.5), so the folder left behind is no less clean than it was. The new archive makes
+        its search index again, and its catalogue is a copy written anew, clean either way. */
+        if let Err(error) = archive.scrub_deleted(&|| cancel.is_cancelled()) {
+            log::warn!("a move goes on with deleted text not yet erased: {error}");
+        }
         let recorded = recorded(&archive.catalogue.stored().map_err(ArchiveError::from)?);
         let files = carried(&archive.dir)?;
         let mut done = MoveProgress {

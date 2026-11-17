@@ -33,7 +33,7 @@ use crate::provider::ProviderId;
 use crate::transcript::{At, InSubagent, SpanKind};
 
 pub use run::{MOST_TERMS, TERM_CHARS};
-pub(crate) use store::{Kept, Log, SEARCH_DATABASE, SearchIndex, Text, kept, vacuum};
+pub(crate) use store::{Kept, Log, SEARCH_DATABASE, SearchIndex, Text, kept};
 pub use text::{find_all, first_match};
 
 #[derive(Debug, Error)]
