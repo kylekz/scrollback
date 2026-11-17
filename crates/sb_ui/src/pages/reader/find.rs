@@ -11,10 +11,10 @@
 //! each piece drawn is searched again when it is drawn, at most [`PIECE_MATCHES`], and the
 //! current match is the one at its place among its block's.
 //!
-//! **Going to a match** opens what holds it: its call, its thought, its summary, Show all on a
-//! body whose match is past its first lines, each subagent on the way down to one inside a
-//! subagent (as opening at a search match does, [`super::place`]); then, as the rows it opened
-//! are laid out, scrolls to the row that draws it.
+//! **Going to a match** opens what holds it: its call, its thought, its summary, a loaded file's
+//! text, Show all on a body whose match is past its first lines, each subagent on the way down
+//! to one inside a subagent (as opening at a search match does, [`super::place`]); then, as the
+//! rows it opened are laid out, scrolls to the row that draws it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
@@ -561,6 +561,7 @@ impl ReaderView {
                 (Spot::Prose(it), RowKind::Prose { at, .. })
                 | (Spot::Prose(it), RowKind::Thought { at, .. })
                 | (Spot::Prose(it), RowKind::Compaction { at, .. })
+                | (Spot::Prose(it), RowKind::ContextFile { at, .. })
                 | (Spot::Prose(it), RowKind::Prompt(at))
                 | (Spot::Target(it), RowKind::Call { at, .. })
                     if it == at =>
@@ -829,6 +830,9 @@ fn opening(
         }
         (Spot::Prose(_), sb_core::transcript::Content::Compaction { .. }) => {
             toggles.push(Toggle::Summary(at.clone()))
+        }
+        (Spot::Prose(_), sb_core::transcript::Content::ContextFile { .. }) => {
+            toggles.push(Toggle::ContextFile(at.clone()))
         }
         (Spot::Part(_, part), _) => {
             let call = open.call(at)?;

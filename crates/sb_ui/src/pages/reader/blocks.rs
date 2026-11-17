@@ -1,7 +1,7 @@
-//! The reader's rows of prose (DESIGN §4.2.2, §4.2.5, §4.2.6): a prompt's header, a task's
-//! box, the pieces of a block's prose, a prompt's images, the agent's header over what it
-//! wrote, thoughts, notes, compactions, records the provider didn't know, and how a
-//! conversation ended.
+//! The reader's rows of prose (DESIGN §4.2.2, §4.2.5, §4.2.6, §4.2.11): a prompt's header, a
+//! task's box, the pieces of a block's prose, a prompt's images, the agent's header over what
+//! it wrote, thoughts, notes, compactions, files loaded into the context, records the provider
+//! didn't know, and how a conversation ended.
 
 use std::sync::Arc;
 
@@ -10,6 +10,7 @@ use gpui::{
     ObjectFit, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
     StyledImage as _, Window, div, img, prelude::FluentBuilder as _, px,
 };
+use gpui_component::tooltip::Tooltip;
 use sb_core::transcript::Content;
 
 use super::rows::{Ended, FIRST_LINES, PanelPart, ProsePart, Row, RowKind};
@@ -17,7 +18,7 @@ use super::{Piece, ReaderView, message_text};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
-    BANNER_GAP, Tone, bad_banner, focus_ring, icon, icon_button, overline, tag,
+    BANNER_GAP, Tone, bad_banner, focus_ring, icon, icon_button, middle_cut, overline, tag,
 };
 use crate::format;
 use crate::hostile;
@@ -46,6 +47,7 @@ pub fn kind_name(kind: &RowKind) -> &'static str {
         RowKind::Body { .. } => "body",
         RowKind::Panel { .. } => "panel",
         RowKind::Compaction { .. } => "compaction",
+        RowKind::ContextFile { .. } => "context-file",
         RowKind::Note(_) => "note",
         RowKind::Unrecognised { .. } => "unrecognised",
         RowKind::Raw { .. } => "raw",
@@ -80,7 +82,9 @@ pub fn row_text(row: &Row, open: &OpenSession) -> String {
             Content::Prompt { text, .. } | Content::Reply { text } | Content::Thinking { text, .. },
         ) => hostile::label(text),
         Some(Content::ToolCall(call)) => hostile::label(&call.name),
-        Some(Content::Note { text, .. }) => hostile::label(text),
+        Some(Content::Note { text, .. } | Content::ContextFile { path: text, .. }) => {
+            hostile::label(text)
+        }
         _ => String::new(),
     }
 }
@@ -104,6 +108,7 @@ pub fn focus_key(kind: &RowKind) -> Option<FocusKey<'_>> {
         | RowKind::Call { at, .. }
         | RowKind::CallIo { at, .. }
         | RowKind::Compaction { at, .. }
+        | RowKind::ContextFile { at, .. }
         | RowKind::Unrecognised { at, .. } => Some(FocusKey::Block(kind_name(kind), at)),
         RowKind::Panel {
             item,
@@ -215,6 +220,7 @@ pub fn render(
         RowKind::Author(at) => author(at, &theme, cx),
         RowKind::Thought { at, open } => thought(ix, row, at, *open, focused, &theme, cx),
         RowKind::Compaction { at, open } => compaction(ix, row, at, *open, focused, &theme, cx),
+        RowKind::ContextFile { at, open } => context_file(ix, row, at, *open, focused, &theme, cx),
         RowKind::Note(at) => note(at, &theme, cx),
         RowKind::Unrecognised { at, open } => unrecognised(ix, row, at, *open, focused, &theme, cx),
         RowKind::Raw { at, .. } => raw(at, &theme, cx),
@@ -421,7 +427,7 @@ fn prose(
 ) -> AnyElement {
     let c = &theme.colors;
     let reader = cx.services().reader.clone();
-    let (prepared, thinking, of_reply, length, name) = {
+    let (prepared, thinking, of_reply, loaded, length, name) = {
         let reader = reader.read(cx);
         let Some(open) = reader.open_session() else {
             return div().into_any_element();
@@ -434,6 +440,7 @@ fn prose(
             },
             matches!(block, Some(Content::Thinking { .. })),
             matches!(block, Some(Content::Reply { .. })),
+            matches!(block, Some(Content::ContextFile { .. })),
             match block {
                 Some(Content::Prompt { text, .. } | Content::Reply { text }) => text.len(),
                 _ => 0,
@@ -442,6 +449,8 @@ fn prose(
         )
     };
     view.hold(Held::Prose(at.clone()), ix);
+    /* A loaded file's text sits under its row as a thought's does, quieter than the column. */
+    let size = if loaded { Size::Nested } else { size };
     let piece = |index: usize| prepared.as_ref().and_then(|prose| prose.pieces.get(index));
     let content = match part {
         ProsePart::Pending => {
@@ -569,6 +578,8 @@ fn prose(
     if !reply {
         return if of_reply {
             div().pr(copy_column).child(content).into_any_element()
+        } else if loaded {
+            div().pl(px(22.)).child(content).automation_target(name)
         } else {
             content
         };
@@ -1021,6 +1032,82 @@ fn compaction(
         )
     })
     .child(rule())
+    .automation_target(name)
+}
+
+/**
+ * A file the agent loaded into its context (DESIGN §4.2.11): quietly, on one line, "Loaded" and
+ * its path cut in its middle, whole on hover, and whether its text differs from the file on
+ * disk. A click opens its text under it, as prose rows.
+ */
+fn context_file(
+    ix: usize,
+    row: &Row,
+    at: &BlockRef,
+    open: bool,
+    focused: bool,
+    theme: &SbTheme,
+    cx: &mut Context<ReaderView>,
+) -> AnyElement {
+    let c = &theme.colors;
+    let (path, differs, name) = {
+        let reader = cx.services().reader.read(cx);
+        let Some(session) = reader.open_session() else {
+            return div().into_any_element();
+        };
+        let Some(Content::ContextFile { path, differs, .. }) =
+            session.block(at).map(|block| &block.content)
+        else {
+            return div().into_any_element();
+        };
+        (
+            SharedString::from(hostile::label(&middle_cut(path, hostile::LABEL_CHARS))),
+            *differs,
+            target("context-file", at, session),
+        )
+    };
+    ringed(
+        div()
+            .id(("context-file", ix))
+            .flex()
+            .items_center()
+            .gap(theme.spacing.md)
+            .h(theme.sizes.thought_row)
+            .rounded(theme.radii.control)
+            .text_color(c.fg3)
+            .text_spec(&theme.text.secondary)
+            .whitespace_nowrap()
+            .cursor_pointer()
+            .hover(|style| style.bg(c.s1)),
+        focused,
+        theme,
+    )
+    .on_click(on_toggle(ix, row, cx))
+    .child(icon(SbIcon::FileText, theme.sizes.icon_sm, c.fg3))
+    .child(div().flex_none().child("Loaded"))
+    .child(
+        div()
+            .id(("context-file-path", ix))
+            .min_w_0()
+            .overflow_hidden()
+            .text_ellipsis_middle()
+            .text_color(c.fg2)
+            .text_spec(&theme.text.path)
+            .child(path.clone())
+            .tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx)),
+    )
+    .when(differs, |this| {
+        this.child(div().flex_none().child("(differs from the file on disk)"))
+    })
+    .child(icon(
+        if open {
+            SbIcon::ChevronDown
+        } else {
+            SbIcon::ChevronRight
+        },
+        theme.sizes.icon_xs,
+        c.fg3,
+    ))
     .automation_target(name)
 }
 

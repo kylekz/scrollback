@@ -53,7 +53,7 @@ use crate::transport::{Env, RangeSink, Transport};
 pub(super) const ID: ProviderId = ProviderId::new("claude-code");
 
 /// The version of [`parse`].
-const PARSER_VERSION: u32 = 1;
+const PARSER_VERSION: u32 = 2;
 
 /// Where the items are, under the root.
 const SUBTREE: &str = "projects";

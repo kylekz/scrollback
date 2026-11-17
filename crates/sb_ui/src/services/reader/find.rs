@@ -2,12 +2,12 @@
 //! parsed text, its subagents and its bodies included, collapsed or not, in the order the
 //! column draws them.
 //!
-//! What is searched is what is drawn ([`Spot`]): a prompt's, a reply's and a summary's text as
-//! written (the view lights the matches in what Markdown made of it), a thought's, each
-//! activity row's target, each body's texts as its kind shows them as Show all shows them
-//! ([`super::shape`]'s text-only shapes: a terminal's text without its colours, JSON printed
-//! again within its bound, an edit's text before and after, never the marks), and a web
-//! search's result titles. So a match's range is where the body draws it.
+//! What is searched is what is drawn ([`Spot`]): a prompt's, a reply's, a summary's and a loaded
+//! file's text as written (the view lights the matches in what Markdown made of it), a
+//! thought's, each activity row's target, each body's texts as its kind shows them as Show all
+//! shows them ([`super::shape`]'s text-only shapes: a terminal's text without its colours,
+//! JSON printed again within its bound, an edit's text before and after, never the marks), and
+//! a web search's result titles. So a match's range is where the body draws it.
 //!
 //! It runs off the UI thread, over the transcript's content, so it is bounded:
 //! - each body text is read up to [`PART_BYTES`], and matching is linear
@@ -43,7 +43,7 @@ pub type Read = Arc<Mutex<HashMap<Arc<str>, Option<Arc<Conversation>>>>>;
 /// Where a match is: which text of which block, as the column draws it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Spot {
-    /// A prompt's, a reply's, a thought's or a compaction's summary's text.
+    /// A prompt's, a reply's, a thought's, a compaction's summary's or a loaded file's text.
     Prose(BlockRef),
     /// What an activity row shows the call was about.
     Target(BlockRef),
@@ -223,9 +223,12 @@ impl Search<'_> {
                         self.text(Spot::Prose(at), &crate::hostile::bidi(text))?
                     }
                     Content::Compaction {
-                        summary: Some(summary),
+                        summary: Some(stored),
                         ..
-                    } => self.stored(Spot::Prose(at), summary, |text| text)?,
+                    }
+                    | Content::ContextFile { text: stored, .. } => {
+                        self.stored(Spot::Prose(at), stored, |text| text)?
+                    }
                     Content::ToolCall(call) => self.call(at, call)?,
                     _ => {}
                 }

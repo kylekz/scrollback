@@ -99,6 +99,9 @@ pub(super) const BOOKKEEPING: [&str; 18] = [
 /// The attachment that is a prompt queued while the agent was working.
 pub(super) const QUEUED: &str = "queued_command";
 
+/// The attachment that is a subfolder's memory file, loaded as the agent started working there.
+pub(super) const NESTED_MEMORY: &str = "nested_memory";
+
 /// The attachments that are context Claude Code gave the model, not conversation, and are
 /// passed over.
 pub(super) const CONTEXT: [&str; 29] = [
@@ -891,12 +894,34 @@ impl<'a> Reading<'a> {
         }
     }
 
-    /// Of the attachments, only a prompt queued while the agent was working is conversation.
+    /**
+     * Of the attachments, a prompt queued while the agent was working is conversation, and a
+     * subfolder's memory file loaded on the way is a file in the context: shown as the agent
+     * showed its path, its text where it was recorded.
+     */
     fn attachment(&mut self, record: &Record, line: &Line) {
         let Some(attachment) = record.attachment.and_then(typed::<Attachment>) else {
             return self.misfit("attachment", "attachment", line.whole());
         };
         match attachment.kind.as_str() {
+            NESTED_MEMORY => {
+                let path = attachment.display_path.or(attachment.path).and_then(string);
+                let file = attachment
+                    .content
+                    .and_then(typed::<record::MemoryFile>)
+                    .filter(|file| file.content.get().starts_with('"'));
+                match (path, file) {
+                    (Some(path), Some(file)) => {
+                        self.push(Content::ContextFile {
+                            path,
+                            text: line.text(file.content),
+                            differs: file.content_differs_from_disk == Some(true),
+                        });
+                    }
+                    (None, _) => self.misfit("attachment/nested_memory", "path", line.whole()),
+                    (_, None) => self.misfit("attachment/nested_memory", "content", line.whole()),
+                }
+            }
             QUEUED => match attachment.prompt.and_then(string) {
                 Some(text) => {
                     let origin = attachment.origin.and_then(typed::<Origin>);
@@ -1298,7 +1323,9 @@ fn hidden(nodes: &[Node], parent: &[Option<usize>], order: &[usize]) -> Vec<bool
                 .iter()
                 .find_map(|content| match content {
                     Content::Prompt { from: None, .. } => Some(true),
-                    Content::Note { .. } | Content::Unrecognised(_) => None,
+                    Content::Note { .. }
+                    | Content::ContextFile { .. }
+                    | Content::Unrecognised(_) => None,
                     _ => Some(false),
                 });
         }

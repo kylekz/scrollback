@@ -11,7 +11,8 @@ use std::io::{BufRead as _, BufReader};
 use serde_json::Value;
 
 use super::parse::{
-    BOOKKEEPING, BOUNDARY, CONTEXT, CONVERSATION, NOTICES, QUEUED, SILENT, TITLE, is_inline,
+    BOOKKEEPING, BOUNDARY, CONTEXT, CONVERSATION, NESTED_MEMORY, NOTICES, QUEUED, SILENT, TITLE,
+    is_inline,
 };
 use super::said::unknown_element;
 use crate::provider::{Audit, SessionItems};
@@ -240,7 +241,10 @@ fn recorded(items: &dyn SessionItems, key: &str, main: bool, audit: &mut Audit) 
                     .get("attachment")
                     .and_then(|attachment| attachment.get("type")?.as_str())
                     .unwrap_or_default();
-                if attachment != QUEUED && !CONTEXT.contains(&attachment) {
+                if attachment != QUEUED
+                    && attachment != NESTED_MEMORY
+                    && !CONTEXT.contains(&attachment)
+                {
                     *audit
                         .unknown
                         .entry(format!("attachment {attachment}"))
