@@ -24,6 +24,23 @@ use thiserror::Error;
 use toolbox_store::rusqlite;
 
 use crate::transcript::{CopyOf, Outline, Subagent, Transcript};
+
+/**
+ * What the records an app keeps beside its copies say of where one conversation ran (PLAN
+ * §7.7), in the app's own words: nothing here is checked against a location.
+ */
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyRecord {
+    /// The agent's id for the conversation, as [`crate::transcript::Facts::conversation`].
+    pub conversation: String,
+    /// The host it ran on over SSH, as the app handed it to `ssh`.
+    pub host: Option<String>,
+    /// The path its transcript had on that machine.
+    pub path: Option<String>,
+    /// The key the provider gives the transcript at `path` where it ran: what the original's
+    /// item is keyed by, if it is archived from there.
+    pub key: Option<String>,
+}
 use crate::transport::{Halt, RangeSink, Transport, TransportError};
 
 pub use crate::transport::{Hashed, RangeFailure, Unlisted};
@@ -103,6 +120,9 @@ pub enum ItemKind {
     ToolResult,
     /// Anything else the agent keeps: titles, metadata, memory.
     Sidecar,
+    /// What an agent's app keeps about its sessions as a whole, of no one session: records
+    /// the provider reads for where the copies the app keeps ran ([`Provider::copy_records`]).
+    Register,
 }
 
 impl ItemKind {
@@ -274,6 +294,16 @@ pub trait Provider: Send + Sync {
      */
     fn copy_of(&self, _session: &str) -> Option<CopyOf> {
         None
+    }
+
+    /**
+     * What the records an app keeps about its sessions, the location's items of kind
+     * [`ItemKind::Register`] in `register`, say of where each conversation ran (PLAN §7.7): at
+     * most one record per conversation. The records are another program's state, so one that
+     * can't be read or understood says nothing, and nothing fails.
+     */
+    fn copy_records(&self, _register: &dyn SessionItems) -> Vec<CopyRecord> {
+        Vec::new()
     }
 }
 

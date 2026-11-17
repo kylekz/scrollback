@@ -34,6 +34,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use thiserror::Error;
 
+use crate::location::LocationId;
 use crate::provider::{Provider, ProviderId, SessionItems};
 
 pub use build::Builder;
@@ -201,8 +202,31 @@ pub struct Facts {
 pub struct CopyOf {
     /// What the copy is, shown where a location would be: "Some App's copy".
     pub label: String,
-    /// Where the session ran, as far as the copy says: "Ran over SSH; …".
-    pub origin: String,
+    /// Where the session ran, as far as anything says.
+    pub origin: Origin,
+}
+
+impl CopyOf {
+    /// What the tag of a copy that is from no location says: the host it ran on when that is
+    /// known, else what the copy is.
+    pub fn tag(&self) -> &str {
+        match &self.origin {
+            Origin::Host(host) => host,
+            Origin::Unsaid(_) | Origin::Location(_) => &self.label,
+        }
+    }
+}
+
+/// Where a copy of a session ran (PLAN §7.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Nothing says which machine: the provider's words for that, "Ran over SSH; …".
+    Unsaid(String),
+    /// Over SSH on this host, as the app that kept the copy recorded it. This machine's `ssh`
+    /// resolves it, and it is none of the locations.
+    Host(String),
+    /// At this location: the SSH location this machine's `ssh` makes the recorded host.
+    Location(LocationId),
 }
 
 /// A block's place in its conversation's [`Conversation::blocks`].

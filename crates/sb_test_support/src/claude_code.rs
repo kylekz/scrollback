@@ -109,6 +109,19 @@ impl ProjectsTree {
         HomeTransport::new(self.home(), self.vars.clone())
     }
 
+    /// The path of the item `key` as the location names it: the root as the provider finds it
+    /// there, `/`, and the key. What an app that ran a session there over SSH records.
+    pub fn location_path(&self, key: &str) -> String {
+        match self
+            .vars
+            .iter()
+            .find(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+        {
+            Some((_, root)) => format!("{root}/{key}"),
+            None => format!("{}/.claude/{key}", self.home.display()),
+        }
+    }
+
     /// The file an item's key names.
     pub fn path(&self, key: &str) -> PathBuf {
         self.root.join(key)
@@ -189,6 +202,44 @@ impl ProjectsTree {
         };
         self.copy_subagents(&mut copy, session);
         copy
+    }
+
+    /**
+     * Writes the desktop app's record of one of its sessions (PLAN §7.3) as the file `name`
+     * holding `bytes`, in the app's folder under this tree's home: macOS's place for it, which
+     * the provider looks in on any system. Returns its key.
+     */
+    pub fn desktop_record(&self, name: &str, bytes: &[u8]) -> String {
+        let key = format!("claude-code-sessions/{name}");
+        write(
+            &self
+                .home
+                .join("Library/Application Support/Claude")
+                .join(&key),
+            bytes,
+        );
+        key
+    }
+
+    /**
+     * [`ProjectsTree::desktop_record`] of a session the app ran over SSH on `host` as the
+     * Claude Code session `session`, whose transcript was at `path` there. The record is
+     * shaped as the app's are; `n` names its file.
+     */
+    pub fn desktop_ssh_record(&self, n: usize, session: &str, host: &str, path: &str) -> String {
+        let desktop = format!("00000000-0000-4000-a000-{n:012x}");
+        self.desktop_record(
+            &format!("{desktop}/local_{desktop}.json"),
+            json!({
+                "sessionId": format!("local_{desktop}"),
+                "cliSessionId": session,
+                "cwd": "/home/user/code/app",
+                "sshConfig": { "id": "ssh-1", "sshHost": host, "name": "A host", "source": "user" },
+                "sshRemoteTranscriptPath": path,
+            })
+            .to_string()
+            .as_bytes(),
+        )
     }
 
     /**

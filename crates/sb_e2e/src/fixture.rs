@@ -122,10 +122,12 @@ pub fn locations(tree: &mut ProjectsTree, archive_dir: &Path, scratch: &Path) ->
 /**
  * Copies of sessions that ran elsewhere (docs/PLAN.md §7.7, DESIGN §4.2.8): an archive in
  * `archive_dir` with this machine and the distro `Ubuntu-24.04`, each synced from a tree of its
- * own under `scratch` (removed again). The distro ran a session of which this machine's desktop
- * app keeps a copy that is further along than the distro's, which synced before it; a Mac that
- * is no location ran one of which this machine keeps the only copy; and this machine ran one
- * of its own.
+ * own under `scratch` (removed again), and the host `user@macbook`, which has never synced. The
+ * distro ran a session of which this machine's desktop app keeps a copy that is further along
+ * than the distro's, which synced before it; the Mac ran one of which this machine keeps the only
+ * copy, and the app's record of it names the host by its alias, `macbook`, which `ssh` with no
+ * config takes to the same machine, so the copy is the host's (PLAN §7.7); and this machine ran
+ * one of its own.
  */
 pub fn copies(archive_dir: &Path, scratch: &Path) -> Result<()> {
     let outline = |project, title, prompt, day| Outline {
@@ -162,6 +164,12 @@ pub fn copies(archive_dir: &Path, scratch: &Path) -> Result<()> {
         9,
     ));
     here.desktop_copy(&lone);
+    here.desktop_ssh_record(
+        1,
+        &lone.id,
+        "macbook",
+        &format!("/Users/user/.claude/{}", lone.key),
+    );
 
     let archive = Archive::create(archive_dir)?;
     for (kind, name, tree) in [
@@ -177,6 +185,12 @@ pub fn copies(archive_dir: &Path, scratch: &Path) -> Result<()> {
         let location = archive.catalogue().add_location(kind, name)?;
         synced(&archive, &location.id, &tree.transport())?;
     }
+    archive.catalogue().add_location(
+        LocationKind::Ssh {
+            host: "user@macbook".to_string(),
+        },
+        "user@macbook",
+    )?;
     drop(archive);
     std::fs::remove_dir_all(scratch)?;
     Ok(())

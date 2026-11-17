@@ -23,7 +23,7 @@ use crate::filing::{FolderId, NormalPath};
 use crate::hash::{Hash, Hasher};
 use crate::location::LocationId;
 use crate::provider::ItemKind;
-use crate::transcript::{CopyOf, Ending, INDEX_VERSION, SessionIndex, Tokens, Totals};
+use crate::transcript::{CopyOf, Ending, INDEX_VERSION, Origin, SessionIndex, Tokens, Totals};
 
 /// A session's identity (PLAN §2.1): the location it was pulled from, its agent's provider,
 /// and that provider's id for it.
@@ -103,11 +103,19 @@ pub struct Session {
 impl Session {
     /**
      * The location the session ran at, as the library attributes it (PLAN §7.7): where it was
-     * pulled from, unless it is a copy, which ran on a machine the copy doesn't name. It is
-     * what every view that names a session's location shows, filters and files by.
+     * pulled from, unless it is a copy, which ran at the location its record makes it, if any:
+     * never the location that kept it. It is what every view that names a session's location
+     * shows, filters and files by.
      */
     pub fn ran_at(&self) -> Option<&LocationId> {
-        self.copy.is_none().then_some(&self.id.location)
+        match &self.copy {
+            None => Some(&self.id.location),
+            Some(CopyOf {
+                origin: Origin::Location(location),
+                ..
+            }) => Some(location),
+            Some(_) => None,
+        }
     }
 }
 
@@ -289,8 +297,76 @@ fn reading() -> String {
     )
 }
 
+/**
+ * `$value` (SQL of the columns of `r`) of the copy record of the session `$x`'s conversation
+ * where it was kept (PLAN §7.7), as an SQL value: NULL without one.
+ */
+macro_rules! recorded {
+    ($value:literal, $x:literal) => {
+        concat!(
+            "(SELECT ",
+            $value,
+            " FROM copy_record r WHERE r.location_id = ",
+            $x,
+            ".location_id AND r.provider = ",
+            $x,
+            ".provider AND r.conversation = ",
+            $x,
+            ".conversation)"
+        )
+    };
+}
+
+/**
+ * The condition, as SQL, that the record of the copy `$c` names the transcript item `$item`
+ * (SQL) where it ran (PLAN §7.7): the item is at a WSL or SSH location, has the key the
+ * provider made of the path recorded, and that path is under the root its provider last
+ * reported there. Where a session another machine's app copied ran.
+ */
+macro_rules! names_transcript {
+    ($c:literal, $item:expr) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM copy_record r
+              JOIN item i ON i.id = ",
+            $item,
+            " AND i.key = r.key
+              JOIN location l ON l.id = i.location_id AND l.kind IN ('wsl', 'ssh')
+              JOIN location_provider lp
+                ON lp.location_id = i.location_id AND lp.provider = i.provider
+              WHERE r.location_id = ",
+            $c,
+            ".location_id AND r.provider = ",
+            $c,
+            ".provider AND r.conversation = ",
+            $c,
+            ".conversation
+                AND substr(r.path, 1, length(lp.root) + 1) = lp.root || '/')"
+        )
+    };
+}
+
+/**
+ * What a session's row says of it being a copy, as [`copy_from`] reads them: the provider's
+ * label and words, the host of its record when this machine's `ssh` resolved it, and the
+ * location that host is.
+ */
+macro_rules! copy_columns {
+    ($x:literal) => {
+        concat!(
+            $x,
+            ".copy_label, ",
+            $x,
+            ".copy_origin, ",
+            recorded!("CASE WHEN r.resolved THEN r.host END", $x),
+            ", ",
+            recorded!("r.ran_at", $x)
+        )
+    };
+}
+
 /// A session's row with the owner's state of it, as [`session_from`] reads them.
-pub(super) const SESSION: &str = "
+pub(super) const SESSION: &str = concat!(
+    "
     SELECT s.location_id, s.provider, s.session, s.main_item, s.reading_version,
            s.newest_version, s.title, s.first_prompt, s.project_path, s.project, s.branch,
            s.entrypoint, s.started_at, s.ended_at, s.models,
@@ -298,18 +374,22 @@ pub(super) const SESSION: &str = "
            s.all_calls, s.all_input, s.all_output, s.all_cache_read, s.all_cache_write,
            s.ending, s.unreadable, s.unread, s.held_back, s.failure, s.parser_version,
            s.index_version, st.folder_id, COALESCE(st.by_hand, 0), COALESCE(st.starred, 0),
-           st.trashed_at, s.copy_label, s.copy_origin
+           st.trashed_at, ",
+    copy_columns!("s"),
+    "
     FROM session s
     LEFT JOIN session_state st
-      ON st.location_id = s.location_id AND st.provider = s.provider AND st.session = s.session";
+      ON st.location_id = s.location_id AND st.provider = s.provider AND st.session = s.session"
+);
 
 /// What a row was made from, in one word ([`Catalogue::made`]).
 const MADE_FROM: &str = "s.indexed_from || ' ' || s.parser_version || ' ' || s.index_version";
 
 /**
  * The condition, as SQL, that the sessions `$o` and `$s` are two of one conversation (PLAN
- * §7.7): of one provider, with the agent's one id for the conversation, started in one project
- * path as it was recorded. Every query that matches copies to originals says it so.
+ * §7.7): of one provider, with the agent's one id for the conversation, and either started in
+ * one project path as it was recorded, or one a copy whose record names the other's transcript
+ * as the path it had where it ran. Every query that matches copies to originals says it so.
  */
 macro_rules! same_conversation {
     ($o:literal, $s:literal) => {
@@ -321,11 +401,19 @@ macro_rules! same_conversation {
             $o,
             ".conversation = ",
             $s,
-            ".conversation AND ",
+            ".conversation AND (",
             $o,
             ".project_path IS ",
             $s,
-            ".project_path AND ",
+            ".project_path OR (",
+            $s,
+            ".copy_label IS NOT NULL AND ",
+            names_transcript!($s, concat!($o, ".main_item")),
+            ") OR (",
+            $o,
+            ".copy_label IS NOT NULL AND ",
+            names_transcript!($o, concat!($s, ".main_item")),
+            ")) AND ",
             $o,
             ".id <> ",
             $s,
@@ -334,7 +422,7 @@ macro_rules! same_conversation {
     };
 }
 
-pub(super) use same_conversation;
+pub(super) use {names_transcript, same_conversation};
 
 /**
  * Where the session `$x` stands among the copies of its conversation shown alone, as an SQL
@@ -377,8 +465,24 @@ pub(super) const SHOWN: &str = concat!(
     ")))"
 );
 
-/// The location `s` is attributed to (PLAN §7.7, [`Session::ran_at`]), as SQL: NULL for a copy.
-pub(super) const RAN_AT: &str = "CASE WHEN s.copy_label IS NULL THEN s.location_id END";
+/// The location `s` is attributed to (PLAN §7.7, [`Session::ran_at`]), as SQL: of a copy, the
+/// location its record makes it, else NULL.
+pub(super) const RAN_AT: &str = concat!(
+    "CASE WHEN s.copy_label IS NULL THEN s.location_id ELSE ",
+    recorded!("r.ran_at", "s"),
+    " END"
+);
+
+/// What the tag of `s` says when it is a copy attributed to no location ([`CopyOf::tag`]), as
+/// SQL: the host its record names when that resolved, else the provider's label. NULL for a
+/// session attributed to a location.
+pub(super) const COPY_TAG: &str = concat!(
+    "CASE WHEN s.copy_label IS NOT NULL AND ",
+    recorded!("r.ran_at", "s"),
+    " IS NULL THEN COALESCE((SELECT r.host FROM copy_record r WHERE r.location_id = s.location_id
+       AND r.provider = s.provider AND r.conversation = s.conversation AND r.resolved),
+       s.copy_label) END"
+);
 
 /// The session that did something last comes first; those with no time come last.
 pub(super) const BY_ACTIVITY: &str =
@@ -442,6 +546,24 @@ impl Catalogue {
                 session_from,
             )
             .optional()?)
+        })
+    }
+
+    /// The items of `provider` at `location` that are of kind register (PLAN §7.7), by key,
+    /// each at the version of it that is read.
+    pub(crate) fn register_items(
+        &self,
+        location: &LocationId,
+        provider: &str,
+    ) -> Result<Vec<Reading>> {
+        self.db.read(|c| {
+            Ok(c.prepare(&format!(
+                "{} WHERE i.location_id = ?1 AND i.provider = ?2 AND i.kind = 'register'
+                 ORDER BY i.key",
+                reading()
+            ))?
+            .query_map(params![location, provider], reading_from)?
+            .collect::<rusqlite::Result<_>>()?)
         })
     }
 
@@ -746,6 +868,12 @@ impl Catalogue {
         let (own, all) = (usage(&index.own), usage(&index.all));
         /* SQLite's integers are signed: a count past their range is recorded as the greatest. */
         let count = |count: u64| i64::try_from(count).unwrap_or(i64::MAX);
+        /* A provider says a copy from its id alone, in its words; where the copy ran is the
+        catalogue's to add, from the copy's record (`copy_from`). */
+        let words = copy.map(|copy| match &copy.origin {
+            Origin::Unsaid(words) => words.as_str(),
+            Origin::Host(_) | Origin::Location(_) => "",
+        });
         let columns: Vec<&str> = DERIVED.into_iter().chain(COPY).chain(MADE).collect();
         /* Of a row that is there, a session that was not parsed changes only whether it is a
         copy, why, and what the row is made by and from. */
@@ -776,6 +904,7 @@ impl Catalogue {
                     &id.provider,
                     conversation,
                     index.project_path.as_deref(),
+                    main.map(|main| main.item),
                 )?,
                 _ => None,
             };
@@ -813,7 +942,7 @@ impl Catalogue {
                     derived.as_ref().is_some_and(|derived| derived.held_back),
                     index.conversation,
                     copy.map(|copy| &copy.label),
-                    copy.map(|copy| &copy.origin),
+                    words,
                     failure,
                     retry,
                     parser_version,
@@ -839,8 +968,13 @@ impl Catalogue {
             if let Some(shown) = shown {
                 take_over(tx, &shown, id)?;
             }
-            let ran_at = copy.is_none().then_some(&id.location);
-            Ok(folder::file_by_rule(tx, id, project.as_ref(), ran_at)?)
+            let (_, ran_at) = folder::filing_of(tx, id)?;
+            Ok(folder::file_by_rule(
+                tx,
+                id,
+                project.as_ref(),
+                ran_at.as_ref(),
+            )?)
         })
     }
 
@@ -852,7 +986,9 @@ impl Catalogue {
     pub(crate) fn kin_read(&self, id: &SessionId) -> Result<Vec<KinRead>> {
         self.db.read(|c| {
             Ok(c.prepare(concat!(
-                "SELECT o.location_id, o.provider, o.session, o.copy_label, o.copy_origin,
+                "SELECT o.location_id, o.provider, o.session, ",
+                copy_columns!("o"),
+                ",
                         ov.id, COALESCE(ov.length, 0), ov.hash,
                         sv.id, COALESCE(sv.length, 0), sv.hash
                  FROM session s
@@ -871,8 +1007,8 @@ impl Catalogue {
                         key: row.get(2)?,
                     },
                     copy: copy_from(row, 3)?,
-                    theirs: (row.get(5)?, row.get(6)?, row.get(7)?),
-                    ours: (row.get(8)?, row.get(9)?, row.get(10)?),
+                    theirs: (row.get(7)?, row.get(8)?, row.get(9)?),
+                    ours: (row.get(10)?, row.get(11)?, row.get(12)?),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?)
@@ -1243,23 +1379,27 @@ fn unrevived(
 }
 
 /**
- * The copy of the conversation `conversation` (of `provider`, started in `project`) that the
- * library shows now ([`SHOWN`]), if one is: none while an original of it is archived.
+ * The copy of the conversation `conversation` (of `provider`, started in `project`, its main
+ * transcript the item `main`) that the library shows now ([`SHOWN`]), if one is: none while an
+ * original of it is archived. A copy is of it as [`same_conversation`] says.
  */
 fn shown_copy(
     connection: &Connection,
     provider: &str,
     conversation: &str,
     project: Option<&str>,
+    main: Option<i64>,
 ) -> rusqlite::Result<Option<SessionId>> {
     connection
         .query_row(
             &format!(
                 "SELECT s.location_id, s.provider, s.session FROM session s
-                 WHERE s.provider = ?1 AND s.conversation = ?2 AND s.project_path IS ?3
-                   AND s.copy_label IS NOT NULL AND {SHOWN}"
+                 WHERE s.provider = ?1 AND s.conversation = ?2
+                   AND (s.project_path IS ?3 OR {})
+                   AND s.copy_label IS NOT NULL AND {SHOWN}",
+                names_transcript!("s", "?4"),
             ),
-            params![provider, conversation, project],
+            params![provider, conversation, project, main],
             |row| {
                 Ok(SessionId {
                     location: row.get(0)?,
@@ -1497,12 +1637,17 @@ pub(super) fn session_from(row: &Row<'_>) -> rusqlite::Result<Session> {
     })
 }
 
-/// A copy's words from the columns `copy_label` and `copy_origin`, at `at` and after it.
+/// What a session is a copy as, from the columns [`copy_columns`] names, at `at` and after it.
 fn copy_from(row: &Row<'_>, at: usize) -> rusqlite::Result<Option<CopyOf>> {
-    Ok(match (row.get(at)?, row.get(at + 1)?) {
-        (Some(label), Some(origin)) => Some(CopyOf { label, origin }),
-        _ => None,
-    })
+    let (Some(label), Some(words)) = (row.get(at)?, row.get(at + 1)?) else {
+        return Ok(None);
+    };
+    let origin = match (row.get(at + 3)?, row.get(at + 2)?) {
+        (Some(location), _) => Origin::Location(location),
+        (None, Some(host)) => Origin::Host(host),
+        (None, None) => Origin::Unsaid(words),
+    };
+    Ok(Some(CopyOf { label, origin }))
 }
 
 #[cfg(test)]
@@ -1577,7 +1722,7 @@ mod tests {
         };
         let copy = CopyOf {
             label: "A copy".to_string(),
-            origin: "Ran elsewhere.".to_string(),
+            origin: Origin::Unsaid("Ran elsewhere.".to_string()),
         };
         catalogue
             .record_session(&id, 1, Hash::of(b""), Indexed::Faulted("no"), Some(&copy))

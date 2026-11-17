@@ -59,8 +59,10 @@ use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 use sb_core::CancelToken;
 use sb_core::archive::Archive;
 use sb_core::location::{Location, LocationId, LocationKind};
-use sb_core::sync::{Found, IndexReport, Progress, SyncError, index, survey, sync_location};
-use sb_core::transport::Transport;
+use sb_core::sync::{
+    Found, IndexReport, Progress, SyncError, attribute, index, survey, sync_location,
+};
+use sb_core::transport::{ResolveHost, Transport};
 
 use super::settings::{SettingsEvent, SettingsService, SyncEvery};
 use super::{ArchiveService, Connect, Launch, ListDistros, Providers, Tester};
@@ -214,6 +216,19 @@ pub struct Reach {
     /// The far side's home the development override reads every WSL and SSH location from,
     /// while it is on: the sheet says so (`scrollback`'s `--dev-location-home`).
     pub development_home: Option<String>,
+    /// Which machine a host is to this machine's `ssh` (PLAN §6.4): where a copy whose app
+    /// recorded the host it ran on is attributed (PLAN §7.7).
+    pub resolve: Arc<dyn ResolveHost>,
+}
+
+/**
+ * Says again where the copies kept here ran (PLAN §7.7), after a sync or an index. Nothing
+ * about it stops what ran before it: an error is logged, and the next one tries again.
+ */
+fn attributed(archive: &Archive, resolve: &dyn ResolveHost) {
+    if let Err(error) = attribute(archive, resolve) {
+        log::warn!("could not say where copies ran: {error}");
+    }
 }
 
 /// What each of `providers` finds at the place `transport` reads, an agent that could not
@@ -376,6 +391,7 @@ pub struct SyncService {
     lister: ListDistros,
     launch: Launch,
     development_home: Option<String>,
+    resolve: Arc<dyn ResolveHost>,
     /// The owner's locations; `None` until they are read from the catalogue.
     locations: Option<Vec<Location>>,
     /// The locations the owner removed, whose sessions are still in the archive.
@@ -471,6 +487,7 @@ impl SyncService {
             lister: reach.distros,
             launch: reach.launcher,
             development_home: reach.development_home,
+            resolve: reach.resolve,
             locations: None,
             removed: Vec::new(),
             details: Details::default(),
@@ -759,6 +776,7 @@ impl SyncService {
         let job = cx.background_spawn({
             let (id, kind) = (id.clone(), location.kind.clone());
             let (providers, connect) = (self.providers.clone(), self.connect.clone());
+            let resolve = self.resolve.clone();
             #[cfg(any(test, feature = "automation"))]
             let hold = self.hold.clone();
             let (cancel, reported) = (cancel.clone(), reported.clone());
@@ -780,6 +798,7 @@ impl SyncService {
                         hold.reached(progress, &cancel);
                     },
                 );
+                attributed(&archive, resolve.as_ref());
                 (synced, archive.catalogue().location(&id))
             }
         });
@@ -914,8 +933,9 @@ impl SyncService {
         let job = cx.background_spawn({
             let (providers, stop) = (self.providers.clone(), self.stop_index.clone());
             let (location, reported) = (location.clone(), reported.clone());
+            let resolve = self.resolve.clone();
             async move {
-                index(
+                let indexed = index(
                     &archive,
                     location.as_ref(),
                     &providers,
@@ -926,7 +946,9 @@ impl SyncService {
                             .unwrap_or_else(PoisonError::into_inner)
                             .apply(progress);
                     },
-                )
+                );
+                attributed(&archive, resolve.as_ref());
+                indexed
             }
         });
         cx.spawn({

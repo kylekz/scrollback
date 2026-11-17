@@ -10,7 +10,7 @@
 
 use toolbox_store::rusqlite::{self, Connection, OptionalExtension as _, params};
 
-use super::session::{RAN_AT, SHOWN, archived, set_state};
+use super::session::{COPY_TAG, RAN_AT, SHOWN, archived, set_state};
 use super::{Catalogue, CatalogueError, FOLDER_NAME_CHARS, Result, SessionId};
 use crate::filing::{self, AttachedPath, Fileable, FolderId, NormalPath};
 use crate::location::LocationId;
@@ -36,8 +36,9 @@ pub struct FolderPath {
 /// library doesn't show (PLAN §7.7).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectPath {
-    /// Where the sessions ran; `None` for copies of sessions that ran elsewhere, which say
-    /// what they are as `copy`.
+    /// Where the sessions ran; `None` for copies of sessions that ran at no location the
+    /// library knows (PLAN §7.7), whose tag says what they are as `copy` (the host they ran on,
+    /// else what the provider calls them).
     pub location: Option<LocationId>,
     pub copy: Option<String>,
     pub recorded: String,
@@ -363,7 +364,7 @@ impl Catalogue {
     pub fn project_paths(&self) -> Result<Vec<ProjectPath>> {
         let paths: Vec<ProjectPath> = self.db.read(|c| -> Result<_> {
             Ok(c.prepare(&format!(
-                "SELECT {RAN_AT} AS ran_at, s.copy_label, s.project_path, s.project,
+                "SELECT {RAN_AT} AS ran_at, {COPY_TAG} AS copy_tag, s.project_path, s.project,
                         count(*), COALESCE(sum(st.folder_id IS NULL), 0)
                  FROM session s
                  LEFT JOIN session_state st
@@ -371,7 +372,7 @@ impl Catalogue {
                   AND st.session = s.session
                  WHERE s.project IS NOT NULL AND s.project_path IS NOT NULL
                    AND st.trashed_at IS NULL AND {SHOWN}
-                 GROUP BY ran_at, s.copy_label, s.project_path
+                 GROUP BY ran_at, copy_tag, s.project_path
                  ORDER BY count(*) DESC, s.project_path"
             ))?
             .query_map([], |row| {
@@ -672,7 +673,7 @@ pub(super) fn file_by_rule(
  * Runs the rules over every indexed session that is not filed by hand nor in Trash, each by
  * the project path its row has. A session in Trash is filed when it is restored.
  */
-fn refile(connection: &Connection) -> rusqlite::Result<()> {
+pub(super) fn refile(connection: &Connection) -> rusqlite::Result<()> {
     let attached = attached(connection)?;
     type Filed = (
         SessionId,
@@ -764,16 +765,15 @@ pub(super) fn filing_of(
 ) -> rusqlite::Result<(Option<NormalPath>, Option<LocationId>)> {
     Ok(connection
         .query_row(
-            "SELECT project, copy_label IS NULL FROM session
-             WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+            &format!(
+                "SELECT s.project, {RAN_AT} FROM session s
+                 WHERE s.location_id = ?1 AND s.provider = ?2 AND s.session = ?3"
+            ),
             params![id.location, id.provider, id.key],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?
-        .map_or(
-            (None, Some(id.location.clone())),
-            |(project, original): (_, bool)| (project, original.then(|| id.location.clone())),
-        ))
+        .unwrap_or((None, Some(id.location.clone()))))
 }
 
 /// Every attached path.

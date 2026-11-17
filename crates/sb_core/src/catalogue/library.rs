@@ -52,7 +52,8 @@ pub struct PathGroup {
     /// The locations its sessions are from: one, unless the path is a drive's; none for
     /// copies of sessions that ran elsewhere, which are a place of their own (PLAN §7.7).
     pub locations: Vec<LocationId>,
-    /// What the group's sessions are copies as, when they are copies.
+    /// What the tag of the group's sessions says when they are copies attributed to no location
+    /// (PLAN §7.7): the host they ran on, else what they are copies as.
     pub copy: Option<String>,
     /// The path as its sessions recorded it, each spelling once.
     pub spellings: Vec<String>,
@@ -233,7 +234,10 @@ impl Catalogue {
             .map(|location| (location.id, location.drive_mount))
             .collect();
         for session in self.sessions(Shelf::Unsorted)? {
-            let copy = session.copy.as_ref().map(|copy| copy.label.clone());
+            /* A copy attributed to the location it ran at is grouped as that location's. */
+            let copy = (session.copy.as_ref())
+                .filter(|_| session.ran_at().is_none())
+                .map(|copy| copy.tag().to_string());
             let on_drive =
                 copy.is_none() && session.project.as_ref().is_some_and(NormalPath::is_drive);
             let location = session.ran_at().filter(|_| !on_drive).cloned();

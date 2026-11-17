@@ -96,6 +96,7 @@ fn init(
             distros: Arc::new(|_| Ok(Some(distros()))),
             launcher: Arc::new(LocationKind::launcher),
             development_home: None,
+            resolve: Arc::new(sb_core::transport::ssh_config::NoConfig),
         },
         cx,
     );
@@ -447,6 +448,7 @@ fn wsl_that_fails_to_list_says_so_in_its_words(cx: &mut TestAppContext) {
             }),
             launcher: Arc::new(LocationKind::launcher),
             development_home: None,
+            resolve: Arc::new(sb_core::transport::ssh_config::NoConfig),
         },
         cx,
     );
@@ -483,6 +485,7 @@ fn a_host_read_through_a_local_shell_passes_its_test_and_syncs(cx: &mut TestAppC
             distros: Arc::new(|_| Ok(None)),
             launcher: Arc::new(LocationKind::launcher),
             development_home: None,
+            resolve: Arc::new(sb_core::transport::ssh_config::NoConfig),
         },
         cx,
     );
@@ -522,6 +525,7 @@ fn the_development_override_is_what_a_test_runs_and_shows(cx: &mut TestAppContex
             distros: Arc::new(|_| Ok(None)),
             launcher: Arc::new(|kind| kind.launcher().map(|it| it.reading_home("/fixture"))),
             development_home: Some("/fixture".to_string()),
+            resolve: Arc::new(sb_core::transport::ssh_config::NoConfig),
         },
         cx,
     );
@@ -683,6 +687,7 @@ fn init_many(asleep: Arc<AtomicBool>, cx: &mut TestAppContext) -> Entity<SyncSer
             distros: Arc::new(|_| Ok(None)),
             launcher: Arc::new(LocationKind::launcher),
             development_home: None,
+            resolve: Arc::new(sb_core::transport::ssh_config::NoConfig),
         },
         cx,
     );

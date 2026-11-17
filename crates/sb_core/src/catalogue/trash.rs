@@ -22,7 +22,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use toolbox_store::rusqlite::{self, OptionalExtension as _, params};
 
-use super::session::{archived, same_conversation, set_state};
+use super::session::{archived, names_transcript, same_conversation, set_state};
 use super::{Catalogue, CatalogueError, Result, SessionId, now_ms};
 use crate::hash::Hash;
 use crate::location::LocationId;

@@ -1,4 +1,4 @@
-{"scenario": {"window_size": "1440x900", "fixture": "copies", "description": "Copies of sessions that ran elsewhere (DESIGN §4.2.8, PLAN §7.7): a lone copy's card, Unsorted group and facts carry the copy tag and never This PC's; an original whose copy is further along says so in its facts and opens the copy, whose facts link back; dark and light at 1440x900"}}
+{"scenario": {"window_size": "1440x900", "fixture": "copies", "description": "Copies of sessions that ran elsewhere (DESIGN §4.2.8, PLAN §7.7): a lone copy whose app recorded the host it ran on is that SSH location's in its card, Unsorted group and facts, and never This PC's; an original whose copy is further along says so in its facts and opens the copy, whose facts link back; dark and light at 1440x900"}}
 {"cmd": "wait_ready", "timeout_ms": 60000}
 {"cmd": "settle", "timeout_ms": 60000, "expect": [{"pointer": "/library/counts/all", "equals": 3}, {"pointer": "/library/counts/unsorted", "equals": 3}]}
 {"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
@@ -32,9 +32,9 @@
 {"cmd": "key", "keystroke": "alt-left"}
 {"cmd": "settle", "expect": {"pointer": "/page", "equals": "sessions"}}
 
-// The lone copy: from no location, kept on This PC.
+// The lone copy: from the Mac its app recorded it ran on, kept on This PC.
 {"cmd": "click", "target": "card/1/title"}
-{"cmd": "settle", "expect": {"pointer": "/library/open", "equals": "Rework the blog's header"}}
+{"cmd": "settle", "expect": [{"pointer": "/library/open", "equals": "Rework the blog's header"}, {"pointer": "/library/open_from", "equals": "user@macbook"}]}
 {"cmd": "bounds", "target": "reader/facts/copy", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "screenshot", "name": "copies-lone-1440-dark"}
 

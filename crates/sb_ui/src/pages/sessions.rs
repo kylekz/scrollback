@@ -163,8 +163,8 @@ fn line_width(pieces: &[Pixels], theme: &SbTheme) -> Pixels {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct PageLine {
     locations: Vec<LocationId>,
-    /// What the copies of sessions that ran elsewhere are called, which tag them in place of
-    /// a location (PLAN §7.7).
+    /// What the tags of copies of sessions that ran at no known location say, in place of a
+    /// location's (PLAN §7.7).
     copies: Vec<String>,
     subfolders: Vec<FolderId>,
     held: bool,
@@ -181,12 +181,12 @@ impl PageLine {
             ..Self::default()
         };
         for session in &page.sessions {
-            match (&session.copy, session.ran_at()) {
-                (Some(copy), _) if !line.copies.contains(&copy.label) => {
-                    line.copies.push(copy.label.clone());
-                }
-                (None, Some(location)) if !line.locations.contains(location) => {
+            match (session.ran_at(), &session.copy) {
+                (Some(location), _) if !line.locations.contains(location) => {
                     line.locations.push(location.clone());
+                }
+                (None, Some(copy)) if !line.copies.iter().any(|it| it == copy.tag()) => {
+                    line.copies.push(copy.tag().to_string());
                 }
                 _ => {}
             }

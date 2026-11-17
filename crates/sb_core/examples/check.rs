@@ -18,10 +18,25 @@
 //! would be. The second home's sessions are only parsed, to be matched,
 //! and not counted with the rest.
 //!
+//! Where copies ran (PLAN §7.7): the records the agent's app keeps of its sessions are read
+//! where the provider finds them for the first home (under `%APPDATA%`, which `--appdata`
+//! names for a home given, else `<home>/AppData/Roaming` when there is one; or under
+//! `<home>/Library/Application Support`), and it counts the copies with a record, with a host,
+//! with a host this machine's `ssh -G` resolves (it connects to nothing), with one that is the
+//! same machine as a host given with `--location` (any number of them, as the SSH locations
+//! would be added), and with one that doesn't resolve; how the recorded transcript paths are
+//! written, and how many name their original's file; which of a record's fields a copy
+//! folder's id is in; and the records' `subagentsTruncatedFor` beside the copies' loose
+//! subagents left unattached. Of each copy with an original, it reads the subagents of both
+//! and counts those attached in both, in the original only (by how the original's were found:
+//! in a workflow's folder, with a `.meta.json`, or by their call's id alone), in the copy only,
+//! and in neither.
+//!
 //! ```text
 //! cargo run --release -p sb_core --example check                    this machine's user
 //! cargo run --release -p sb_core --example check -- <home folder>   a home folder elsewhere
 //! cargo run --release -p sb_core --example check -- [<home folder>] --with <home folder>
+//!     [--appdata <folder>] [--location <host>]…
 //! ```
 
 use std::cell::RefCell;
@@ -30,12 +45,17 @@ use std::error::Error;
 use std::io::{self, Cursor, Read};
 use std::path::Path;
 
-use sb_core::provider::{self, ItemKind, ItemRange, ProviderId, SessionItem, SessionItems, Source};
+use sb_core::provider::{
+    self, CopyRecord, ItemKind, ItemRange, Provider, ProviderId, SessionItem, SessionItems, Source,
+};
 use sb_core::transcript::{
     BlockId, Content, Conversation, Ending, Subagent, ToolInput, ToolKind, Transcript,
 };
-use sb_core::transport::{Halt, LocalTransport, RangeFailure, RangeSink, Transport};
+use sb_core::transport::{
+    Halt, LocalTransport, RangeFailure, RangeSink, ResolveHost, Resolved, SshConfig, Transport,
+};
 use sb_test_support::HomeTransport;
+use serde_json::Value;
 
 /// One session's items, fetched from the location as they are asked for.
 struct Session<'a, 'b> {
@@ -298,6 +318,8 @@ struct Parsed {
     home: usize,
     source: usize,
     provider: ProviderId,
+    /// The provider's id for the session.
+    key: String,
     list: Vec<SessionItem>,
     conversation: Option<String>,
     project_path: Option<String>,
@@ -324,6 +346,8 @@ struct Copies {
     counts: Counts,
     /// Each record field's name, with how many copies have it and their originals don't.
     fields: Counts,
+    /// How the subagents of copies with an original attach beside the original's.
+    subagents: Counts,
 }
 
 impl Copies {
@@ -348,9 +372,19 @@ impl Copies {
         ] {
             counts.add(what, 0);
         }
+        let mut subagents = Counts::default();
+        for what in [
+            "subagents attached in both",
+            "subagents attached only in the original",
+            "subagents attached only in the copy",
+            "subagents attached in neither",
+        ] {
+            subagents.add(what, 0);
+        }
         Self {
             counts,
             fields: Counts::default(),
+            subagents,
         }
     }
 
@@ -422,6 +456,8 @@ impl Copies {
             .print("Copies kept of sessions that ran elsewhere");
         self.fields
             .print("Record fields in copies and not in their originals (copies with each)");
+        self.subagents
+            .print("Subagents of copies beside their original's, by file name");
     }
 }
 
@@ -437,22 +473,60 @@ fn fields(bytes: &[u8]) -> BTreeSet<String> {
         .collect()
 }
 
+/// What the command line asks for.
+#[derive(Default)]
+struct Args {
+    first: Option<String>,
+    second: Option<String>,
+    appdata: Option<String>,
+    locations: Vec<String>,
+}
+
+impl Args {
+    fn parse() -> Result<Self, Box<dyn Error>> {
+        const USAGE: &str = "usage: check [<home folder>] [--with <home folder>] \
+                             [--appdata <folder>] [--location <host>]...";
+        let mut args = Self::default();
+        let mut words = std::env::args().skip(1);
+        while let Some(word) = words.next() {
+            let mut value = || words.next().ok_or(USAGE);
+            match word.as_str() {
+                "--with" => args.second = Some(value()?),
+                "--appdata" => args.appdata = Some(value()?),
+                "--location" => args.locations.push(value()?),
+                _ if word.starts_with("--") || args.first.is_some() => return Err(USAGE.into()),
+                _ => args.first = Some(word),
+            }
+        }
+        Ok(args)
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let (first, second) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        [] => (None, None),
-        ["--with", with] => (None, Some(with)),
-        [home] => (Some(home), None),
-        [home, "--with", with] => (Some(home), Some(with)),
-        _ => return Err("usage: check [<home folder>] [--with <home folder>]".into()),
+    let args = Args::parse()?;
+    let home = |home: &str, appdata: Option<String>| -> Box<dyn Transport> {
+        let vars = appdata.map(|appdata| ("APPDATA".to_string(), appdata));
+        Box::new(HomeTransport::new(
+            Path::new(home),
+            vars.into_iter().collect(),
+        ))
     };
-    let home = |home: &str| -> Box<dyn Transport> {
-        Box::new(HomeTransport::new(Path::new(home), Vec::new()))
+    let first: Box<dyn Transport> = match (&args.first, &args.appdata) {
+        (None, None) => Box::new(LocalTransport),
+        (Some(first), appdata) => {
+            let roaming = Path::new(first).join("AppData").join("Roaming");
+            let appdata = (appdata.clone())
+                .or_else(|| roaming.is_dir().then(|| roaming.display().to_string()));
+            home(first, appdata)
+        }
+        (None, Some(appdata)) => {
+            let here = std::env::home_dir().ok_or("this user has no home folder")?;
+            home(&here.display().to_string(), Some(appdata.clone()))
+        }
     };
-    let transports: Vec<Box<dyn Transport>> =
-        std::iter::once(first.map_or_else(|| Box::new(LocalTransport) as Box<dyn Transport>, home))
-            .chain(second.map(home))
-            .collect();
+    let transports: Vec<Box<dyn Transport>> = std::iter::once(first)
+        .chain(args.second.as_deref().map(|second| home(second, None)))
+        .collect();
     let providers = provider::builtin();
     /* No provider that ships keeps anything for a pass, but the seam asks for a place. */
     let scratch = tempfile::tempdir()?;
@@ -460,6 +534,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut copies = Copies::new();
     let mut sources: Vec<RefCell<Box<dyn Source + '_>>> = Vec::new();
     let mut parsed: Vec<Parsed> = Vec::new();
+    /* The first home's register items, each with its source. */
+    let mut register: Vec<(usize, SessionItem)> = Vec::new();
     for (home, transport) in transports.iter().enumerate() {
         for provider in &providers {
             let Some(source) = provider.detect(transport.as_ref(), scratch.path())? else {
@@ -477,6 +553,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 );
             }
             for item in scanned.items {
+                if home == 0 && item.kind == ItemKind::Register {
+                    register.push((
+                        at,
+                        SessionItem {
+                            key: item.key,
+                            kind: item.kind,
+                            length: item.length,
+                        },
+                    ));
+                    continue;
+                }
                 let Some(session) = item.session else {
                     continue;
                 };
@@ -510,6 +597,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     home,
                     source: at,
                     provider: provider.id(),
+                    key: key.clone(),
                     list: items.list.clone(),
                     conversation: transcript.facts.conversation.clone(),
                     project_path: transcript.facts.project_path.clone(),
@@ -584,8 +672,335 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
         let what = copies.compare(&read(copy)?, &read(found[0])?);
         copies.unattached(copy.unattached, what);
+        let provider = (providers.iter())
+            .find(|provider| provider.id() == copy.provider)
+            .ok_or("a session of no provider")?;
+        let attached = |session: &Parsed| {
+            subagents(
+                provider.as_ref(),
+                &Session {
+                    source: &sources[session.source],
+                    list: session.list.clone(),
+                },
+            )
+        };
+        compare_subagents(
+            &mut copies.subagents,
+            &attached(copy),
+            &attached(found[0]),
+            &found[0].list,
+            &copy.list,
+        );
+    }
+    let mut hosts = Hosts::new(&args.locations);
+    for provider in &providers {
+        let mut records = Vec::new();
+        let mut raw = Vec::new();
+        for (source, item) in &register {
+            let items = Session {
+                source: &sources[*source],
+                list: vec![item.clone()],
+            };
+            records.extend(provider.copy_records(&items));
+            let mut bytes = Vec::new();
+            let json = items
+                .open(&item.key, 0)
+                .and_then(|mut file| file.read_to_end(&mut bytes))
+                .ok()
+                .and_then(|_| serde_json::from_slice::<Value>(&bytes).ok());
+            hosts.counts.add("register files", 1);
+            match json {
+                Some(json) => raw.push(json),
+                None => hosts.counts.add("register files that are not JSON", 1),
+            }
+        }
+        for copy in
+            (parsed.iter()).filter(|it| it.copy && it.home == 0 && it.provider == provider.id())
+        {
+            let original = (copy.conversation())
+                .and_then(|it| originals.get(&it))
+                .map(|found| found[0]);
+            hosts.copy(copy, &records, &raw, original);
+        }
     }
     totals.print();
     copies.print();
+    hosts.print();
     Ok(())
+}
+
+/// The keys of the subagent transcripts of the session whose items are `items`, each with
+/// whether a call was found to have started it, every subagent read.
+fn subagents(provider: &dyn Provider, items: &Session<'_, '_>) -> BTreeMap<String, bool> {
+    let mut transcript = provider.parse(items);
+    transcript.read_subagents(provider, items);
+    let unattached: HashSet<&str> = (transcript.unattached.iter())
+        .map(|subagent| &**subagent.item())
+        .collect();
+    (items.list.iter())
+        .filter(|item| item.kind == ItemKind::Subagent)
+        .map(|item| (item.key.clone(), !unattached.contains(item.key.as_str())))
+        .collect()
+}
+
+/// The file name the key `key` ends in.
+fn file_name(key: &str) -> &str {
+    key.rsplit('/').next().unwrap_or(key)
+}
+
+/**
+ * Counts how the subagents of a copy, `copy` (each by key, with whether it attached), attach
+ * beside its original's, `original`, matched by their file names: in both, in one, in neither.
+ * Of those attached in the original only, how the original's were found, from its items and
+ * the copy's: `original_items`, `copy_items`.
+ */
+fn compare_subagents(
+    counts: &mut Counts,
+    copy: &BTreeMap<String, bool>,
+    original: &BTreeMap<String, bool>,
+    original_items: &[SessionItem],
+    copy_items: &[SessionItem],
+) {
+    let by_name = |of: &BTreeMap<String, bool>| -> HashMap<String, (String, bool)> {
+        (of.iter())
+            .map(|(key, attached)| (file_name(key).to_string(), (key.clone(), *attached)))
+            .collect()
+    };
+    let (copy, original) = (by_name(copy), by_name(original));
+    let has = |items: &[SessionItem], key: &str| items.iter().any(|item| item.key == key);
+    let meta = |key: &str| format!("{}.meta.json", key.strip_suffix(".jsonl").unwrap_or(key));
+    for (name, (key, in_copy)) in &copy {
+        let Some((original_key, in_original)) = original.get(name) else {
+            counts.add("subagents of copies that their original doesn't have", 1);
+            continue;
+        };
+        match (in_copy, in_original) {
+            (true, true) => counts.add("subagents attached in both", 1),
+            (false, false) => counts.add("subagents attached in neither", 1),
+            (true, false) => counts.add("subagents attached only in the copy", 1),
+            (false, true) => {
+                counts.add("subagents attached only in the original", 1);
+                let how = if original_key.contains("/workflows/") {
+                    "in a workflow's folder"
+                } else if has(original_items, &meta(original_key)) {
+                    "with a .meta.json beside it"
+                } else {
+                    "by its call's id alone"
+                };
+                counts.add(
+                    format!("subagents attached only in the original, found there {how}"),
+                    1,
+                );
+                if has(copy_items, &meta(key)) {
+                    counts.add("subagents attached only in the original, the copy keeping a .meta.json beside it", 1);
+                }
+            }
+        }
+    }
+    counts.add(
+        "subagents of originals that their copy doesn't have",
+        original
+            .keys()
+            .filter(|name| !copy.contains_key(*name))
+            .count() as u64,
+    );
+}
+
+/// Where the copies ran, as the app's records say and this machine's `ssh -G` makes of them.
+struct Hosts {
+    counts: Counts,
+    /// What each host given with `--location` resolves to, of those that do.
+    locations: Vec<Resolved>,
+    resolved: HashMap<String, Option<Resolved>>,
+}
+
+impl Hosts {
+    fn new(locations: &[String]) -> Self {
+        let mut counts = Counts::default();
+        for what in [
+            "copies",
+            "copies with a record",
+            "copies with a host",
+            "copies whose host ssh -G resolves",
+            "copies whose host is a --location's machine",
+            "copies whose host doesn't resolve",
+            "copies whose record has subagentsTruncatedFor",
+            "copies with loose subagents left unattached",
+        ] {
+            counts.add(what, 0);
+        }
+        counts.add("hosts given with --location", locations.len() as u64);
+        let resolved: Vec<Resolved> = locations
+            .iter()
+            .filter_map(|host| SshConfig.resolve(host))
+            .collect();
+        counts.add(
+            "hosts given with --location that resolve",
+            resolved.len() as u64,
+        );
+        Self {
+            counts,
+            locations: resolved,
+            resolved: HashMap::new(),
+        }
+    }
+
+    /**
+     * Counts the copy `copy` against the provider's records `records` and the register files
+     * read as JSON, `raw`, with its original, if one was found.
+     */
+    fn copy(
+        &mut self,
+        copy: &Parsed,
+        records: &[CopyRecord],
+        raw: &[Value],
+        original: Option<&Parsed>,
+    ) {
+        self.counts.add("copies", 1);
+        let Some(conversation) = copy.conversation.as_deref() else {
+            self.counts.add("copies with no conversation id", 1);
+            return;
+        };
+        let files: Vec<&Value> = raw.iter().filter(|it| names(it, conversation)).collect();
+        if !files.is_empty() {
+            self.counts.add("copies with a record", 1);
+        }
+        if files.len() > 1 {
+            self.counts.add("copies with more than one record", 1);
+        }
+        let truncated = files
+            .iter()
+            .any(|file| match file.get("subagentsTruncatedFor") {
+                None | Some(Value::Null | Value::Bool(false)) => false,
+                Some(Value::Array(it)) => !it.is_empty(),
+                Some(Value::String(it)) => !it.is_empty(),
+                Some(Value::Object(it)) => !it.is_empty(),
+                Some(_) => true,
+            });
+        let unattached = copy.unattached > 0;
+        if truncated {
+            self.counts
+                .add("copies whose record has subagentsTruncatedFor", 1);
+        }
+        if unattached {
+            self.counts
+                .add("copies with loose subagents left unattached", 1);
+        }
+        match (truncated, unattached) {
+            (true, true) => self.counts.add(
+                "copies with subagentsTruncatedFor and loose subagents left unattached",
+                1,
+            ),
+            (false, true) => self.counts.add(
+                "copies with loose subagents left unattached and no subagentsTruncatedFor",
+                1,
+            ),
+            (true, false) => self.counts.add(
+                "copies with subagentsTruncatedFor and every loose subagent attached",
+                1,
+            ),
+            (false, false) => {}
+        }
+        /* Which of the record's fields the copy's folder's id (after its first `-`) is in. */
+        if let Some((_, id)) = copy.key.split_once('-') {
+            for file in &files {
+                for field in fields_holding(file, id) {
+                    self.counts.add(
+                        format!("copies whose folder's id is in the record's {field}"),
+                        1,
+                    );
+                }
+            }
+        }
+        let Some(record) = records.iter().find(|it| it.conversation == conversation) else {
+            return;
+        };
+        if let Some(path) = &record.path {
+            self.counts.add("copies with a recorded transcript path", 1);
+            self.counts.add(
+                match path.chars().next() {
+                    Some('/') => "copies with a recorded transcript path written from /",
+                    Some('~') => "copies with a recorded transcript path written from ~",
+                    _ => "copies with a recorded transcript path written otherwise",
+                },
+                1,
+            );
+            if record.key.is_some() {
+                self.counts.add(
+                    "copies with a recorded transcript path the provider makes a key of",
+                    1,
+                );
+            }
+            if let (Some(key), Some(original)) = (&record.key, original)
+                && original.list.iter().any(|item| item.key == *key)
+            {
+                self.counts.add(
+                    "copies with a recorded transcript path that is their original's key",
+                    1,
+                );
+            }
+        }
+        let Some(host) = &record.host else {
+            return;
+        };
+        self.counts.add("copies with a host", 1);
+        let resolved = self
+            .resolved
+            .entry(host.clone())
+            .or_insert_with(|| SshConfig.resolve(host))
+            .clone();
+        match resolved {
+            Some(resolved) => {
+                self.counts.add("copies whose host ssh -G resolves", 1);
+                if self.locations.contains(&resolved) {
+                    self.counts
+                        .add("copies whose host is a --location's machine", 1);
+                }
+            }
+            None => self.counts.add("copies whose host doesn't resolve", 1),
+        }
+    }
+
+    fn print(&self) {
+        self.counts
+            .print("Where copies ran, as the app's records say");
+        println!("  distinct hosts recorded: {}", self.resolved.len());
+    }
+}
+
+/// Whether the record `file` names the conversation `id` among its session ids.
+fn names(file: &Value, id: &str) -> bool {
+    let one = ["cliSessionId", "lastAssistantCliSessionId"]
+        .into_iter()
+        .filter_map(|field| file.get(field));
+    let many = ["priorCliSessionIds", "priorRemoteCliSessionIds"]
+        .into_iter()
+        .filter_map(|field| file.get(field)?.as_array())
+        .flatten();
+    one.chain(many).any(|value| value.as_str() == Some(id))
+}
+
+/// The names (as JSON pointers) of the text fields of `file` that hold `id`.
+fn fields_holding(file: &Value, id: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![(String::new(), file)];
+    while let Some((at, value)) = pending.pop() {
+        match value {
+            Value::String(text) if text.contains(id) => found.push(at),
+            Value::Object(fields) => {
+                pending.extend(
+                    fields
+                        .iter()
+                        .map(|(name, value)| (format!("{at}/{name}"), value)),
+                );
+            }
+            Value::Array(values) => {
+                pending.extend(values.iter().map(|value| (format!("{at}/[]"), value)));
+            }
+            _ => {}
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
 }

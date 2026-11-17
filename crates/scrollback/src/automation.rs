@@ -59,7 +59,9 @@
 //!   (`all`, `starred`, `unsorted`, `trash`), `folders` (each with its `name`, its `parent`'s name and its
 //!   `sessions`, in the catalogue's order), `sessions` and `groups` (how many the shown page
 //!   lists, `null` while it loads or is of the other kind), the titles of the `selected` and
-//!   the `open` session, and `error` (why the library couldn't be read, or `null`).
+//!   the `open` session, what the tag of where the open session is from says (`open_from`: the
+//!   location's name, or a copy's tag, PLAN §7.7), and `error` (why the library couldn't be
+//!   read, or `null`).
 //!   It also has the titles of the `selection` (the sessions selected together, or the
 //!   selected one); the `drag` under way (`null`, or `what` is dragged: `{"sessions": n}`,
 //!   `{"path": typed}` or `{"folder": name}`; whether it has `moved` past the 4px threshold;
@@ -600,6 +602,11 @@ fn library(cx: &App) -> Value {
         "selected": library.selected().and_then(title),
         "held": library.held().and_then(name),
         "open": library.open_session().and_then(|session| session.title.clone()),
+        "open_from": library.open_session().and_then(|session| {
+            let sync = cx.services().sync.read(cx);
+            sb_ui::components::Place::of(session, |id| sync.location(id))
+                .map(|place| place.name().to_string())
+        }),
         "error": library.failure(),
     })
 }
@@ -1022,7 +1029,9 @@ fn answer<'a>(kind: &'a LocationKind, home: Option<&str>) -> Option<(&'a str, An
  * How a scripted run reaches its locations, or `None` for a run without the driver, which
  * reaches them as their kinds say. Never the distro or the host a location names, which would
  * be the machine's own and not the scenario's, and never through `wsl.exe` or `ssh`. This
- * machine is read as it is, and the runner points it at the scenario's home. A place that
+ * machine is read with the scenario's home as its home, where the runner points its agent;
+ * hosts a copy's records name resolve as `ssh` with no config would make them
+ * (`sb_core::transport::ssh_config::NoConfig`), never through `ssh -G`. A place that
  * passes is read from the folder `--automation-wsl-home` names ([`StandInHome`]); without one
  * it can't be reached, so a distro or a host is never read as this machine. Any other place
  * fails every call as the scenario said ([`Answer`]). The connection test answers the same
@@ -1040,16 +1049,21 @@ pub fn stand_ins(cli: &Cli) -> Option<Reach> {
         .map(|home| home.display().to_string());
     let tested = home.clone();
     Some(Reach {
-        connect: Arc::new(move |kind, _| match answer(kind, home.as_deref()) {
-            None => Box::new(LocalTransport),
-            Some((_, Answer::Passes)) => Box::new(StandInHome {
-                home: home.clone().unwrap_or_default(),
-            }),
-            Some((name, answered)) => Box::new(Failing {
-                name: name.to_string(),
-                answered,
-            }),
-        }),
+        connect: Arc::new(
+            move |kind, _| match (answer(kind, home.as_deref()), &home) {
+                /* This machine as the scenario's home, so that nothing kept beside the home's
+                agent (the desktop app's folder, PLAN §7.3) is read from the person's own. */
+                (None, Some(home)) => Box::new(StandInHome { home: home.clone() }),
+                (None, None) => Box::new(LocalTransport),
+                (Some((_, Answer::Passes)), _) => Box::new(StandInHome {
+                    home: home.clone().unwrap_or_default(),
+                }),
+                (Some((name, answered)), _) => Box::new(Failing {
+                    name: name.to_string(),
+                    answered,
+                }),
+            },
+        ),
         tester: Arc::new(move |launcher, _| {
             let kind = match launcher {
                 Launcher::Wsl { distro } => LocationKind::Wsl {
@@ -1085,6 +1099,7 @@ pub fn stand_ins(cli: &Cli) -> Option<Reach> {
         distros: Arc::new(|_| stage().distros.clone().map_err(TransportError::Failed)),
         launcher: Arc::new(LocationKind::launcher),
         development_home: None,
+        resolve: Arc::new(sb_core::transport::ssh_config::NoConfig),
     })
 }
 
@@ -1166,6 +1181,7 @@ pub fn development_override(home: &str) -> Reach {
         distros: Arc::new(sb_core::transport::wsl::distros),
         launcher: Arc::new(launch),
         development_home: Some(home.to_string()),
+        resolve: Arc::new(sb_core::transport::ssh_config::NoConfig),
     }
 }
 
@@ -1330,6 +1346,20 @@ mod tests {
             assert!(refused(kind.transport(&cancel).env(&[])), "{kind:?}");
         }
         assert_eq!((reach.distros)(&cancel).unwrap(), None);
+        /* A host a copy's record names resolves through the stand-in, never `ssh -G`, which
+        is refused before it starts. */
+        assert!(reach.resolve.resolve("user@macbook.invalid").is_some());
+        assert!(matches!(
+            sb_core::transport::SshConfig::run("user@macbook.invalid"),
+            Err(TransportError::Failed(said)) if said.starts_with(LAUNCH_REFUSED)
+        ));
+        assert_eq!(
+            sb_core::transport::ResolveHost::resolve(
+                &sb_core::transport::SshConfig,
+                "user@macbook.invalid"
+            ),
+            None
+        );
     }
 
     #[test]

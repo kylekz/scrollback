@@ -11,6 +11,7 @@
 //! [`library`].
 
 mod batch;
+mod copy_record;
 mod folder;
 mod kv;
 mod library;
@@ -184,6 +185,7 @@ impl ItemKind {
             Self::Subagent => "subagent",
             Self::ToolResult => "tool_result",
             Self::Sidecar => "sidecar",
+            Self::Register => "register",
         }
     }
 }
@@ -202,6 +204,7 @@ impl FromSql for ItemKind {
             Self::Subagent,
             Self::ToolResult,
             Self::Sidecar,
+            Self::Register,
         ]
         .into_iter()
         .find(|kind| kind.as_str() == text)

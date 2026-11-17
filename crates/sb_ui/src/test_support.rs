@@ -105,6 +105,7 @@ pub fn init_with(
             distros: Arc::new(|_| Ok(None)),
             launcher: Arc::new(LocationKind::launcher),
             development_home: None,
+            resolve: Arc::new(sb_core::transport::ssh_config::NoConfig),
         },
         cx,
     );
@@ -144,6 +145,7 @@ pub fn init_reaching(
                     distros: elsewhere.distros,
                     launcher: elsewhere.launcher,
                     development_home: elsewhere.development_home,
+                    resolve: elsewhere.resolve,
                 },
                 updater: services::Updater::Off(services::Off::Development),
                 install_root: None,
@@ -184,6 +186,7 @@ pub fn init_answering(cx: &mut TestAppContext) {
             distros: Arc::new(|_| Ok(None)),
             launcher: Arc::new(LocationKind::launcher),
             development_home: None,
+            resolve: Arc::new(sb_core::transport::ssh_config::NoConfig),
         },
         cx,
     );

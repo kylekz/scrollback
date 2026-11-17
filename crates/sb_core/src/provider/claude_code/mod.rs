@@ -34,11 +34,20 @@
 //! that the session is a copy, so the library shows its original in its place once that is
 //! archived.
 //!
+//! **The desktop app's records** ([`desktop`]). The app keeps a JSON file per session in its
+//! own data folder, outside the root: `Claude/claude-code-sessions/` under `$APPDATA` when
+//! that is set, else under the home's `Library/Application Support`. Wherever a location has
+//! that folder, every file in it is an item of no session, keyed by its path relative to the
+//! app's data folder (`claude-code-sessions/…`, which no key under the root starts with); its
+//! `.json` files are of kind register, and [`Agent::copy_records`] reads them for the host and
+//! the transcript's path each conversation had where it ran (PLAN §7.7).
+//!
 //! [`parse`] turns a session's archived files into the transcript model, [`tools`] maps
 //! Claude Code's tools onto the common kinds, and [`audit`] counts a session's records another
 //! way to check the parse against.
 
 mod audit;
+mod desktop;
 mod outline;
 mod parse;
 mod record;
@@ -54,11 +63,11 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::{
-    Display, FileClass, FileTree, Hashed, ItemKind, ItemPrefix, ItemRange, Mark, Provider,
-    ProviderError, ProviderId, RangeFailure, Scan, SessionItems, Source,
+    CopyRecord, Display, FileClass, FileTree, Hashed, ItemKind, ItemPrefix, ItemRange, Mark,
+    Provider, ProviderError, ProviderId, RangeFailure, Scan, SessionItems, Source,
 };
-use crate::transcript::{CopyOf, Outline, Subagent, Transcript};
-use crate::transport::{Env, RangeSink, Transport};
+use crate::transcript::{CopyOf, Origin, Outline, Subagent, Transcript};
+use crate::transport::{Env, Halt, RangeSink, Transport};
 
 pub(super) const ID: ProviderId = ProviderId::new("claude-code");
 
@@ -115,11 +124,29 @@ impl Provider for Agent {
         transport: &'a dyn Transport,
         _scratch: &'a Path,
     ) -> Result<Option<Box<dyn Source + 'a>>, ProviderError> {
-        let root = root(transport.env(&["CLAUDE_CONFIG_DIR"])?);
-        let present = transport.stat(&[&format!("{root}/{SUBTREE}")])?[0].is_some();
-        Ok(present.then(|| {
+        let env = transport.env(&["CLAUDE_CONFIG_DIR", desktop::APPDATA])?;
+        let apps = app_folders(&env);
+        let root = root(env);
+        /* The desktop app's folder is looked for in the same call, so a location without it
+        costs nothing more. */
+        let mut paths = vec![format!("{root}/{SUBTREE}")];
+        paths.extend(
+            (apps.iter()).map(|app| format!("{app}/{}/{}", desktop::APP_FOLDER, desktop::SUBTREE)),
+        );
+        let found = transport.stat(&paths.iter().map(String::as_str).collect::<Vec<_>>())?;
+        let app = (apps.into_iter().zip(&found[1..]))
+            .find_map(|(app, found)| found.is_some().then_some(app));
+        Ok(found[0].is_some().then(|| {
             Box::new(Data {
                 tree: FileTree::new(transport, root.clone(), SUBTREE, classify),
+                desktop: app.map(|app| {
+                    FileTree::new(
+                        transport,
+                        format!("{app}/{}", desktop::APP_FOLDER),
+                        desktop::SUBTREE,
+                        desktop::classify,
+                    )
+                }),
                 transport,
                 root,
             }) as Box<dyn Source>
@@ -143,16 +170,43 @@ impl Provider for Agent {
     }
 
     fn classify(&self, key: &str) -> (ItemKind, Option<String>) {
-        let class = classify(key);
+        let class = if is_desktop(key) {
+            desktop::classify(key)
+        } else {
+            classify(key)
+        };
         (class.kind, class.session)
     }
 
     fn copy_of(&self, session: &str) -> Option<CopyOf> {
         is_copy(session).then(|| CopyOf {
             label: COPY_LABEL.to_string(),
-            origin: COPY_ORIGIN.to_string(),
+            origin: Origin::Unsaid(COPY_ORIGIN.to_string()),
         })
     }
+
+    fn copy_records(&self, register: &dyn SessionItems) -> Vec<CopyRecord> {
+        desktop::copy_records(register)
+    }
+}
+
+/// Where the desktop app may keep its data folder at a location with the environment `env`:
+/// under `$APPDATA` when it is set (Windows), and under the home's `Library/Application
+/// Support` (macOS).
+fn app_folders(env: &Env) -> Vec<String> {
+    (env.vars
+        .get(desktop::APPDATA)
+        .filter(|dir| !dir.is_empty())
+        .cloned())
+    .into_iter()
+    .chain([format!("{}/{}", env.home, desktop::MAC_SUPPORT)])
+    .collect()
+}
+
+/// Whether `key` is an item of the desktop app's folder rather than of the root.
+fn is_desktop(key: &str) -> bool {
+    key.strip_prefix(desktop::SUBTREE)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /**
@@ -197,11 +251,42 @@ fn root(mut env: Env) -> String {
     }
 }
 
-/// Claude Code's data at one location.
+/// Claude Code's data at one location: the root's tree, and the desktop app's records where
+/// the location has them.
 struct Data<'a> {
     tree: FileTree<'a>,
+    desktop: Option<FileTree<'a>>,
     transport: &'a dyn Transport,
     root: String,
+}
+
+impl<'a> Data<'a> {
+    /// The tree the item `key` is in.
+    fn tree_of(&mut self, key: &str) -> &mut FileTree<'a> {
+        match &mut self.desktop {
+            Some(desktop) if is_desktop(key) => desktop,
+            _ => &mut self.tree,
+        }
+    }
+
+    /**
+     * `requests` split into the runs of them that are in one tree, in order, each with its
+     * first request's index: a transport answers in the order asked (PLAN §4.1), so the runs
+     * are asked one after another.
+     */
+    fn runs<T>(requests: &[T], key: impl Fn(&T) -> &str) -> Vec<(usize, &[T])> {
+        let mut runs = Vec::new();
+        let mut start = 0;
+        for at in 1..=requests.len() {
+            if at == requests.len()
+                || is_desktop(key(&requests[at])) != is_desktop(key(&requests[start]))
+            {
+                runs.push((start, &requests[start..at]));
+                start = at;
+            }
+        }
+        runs
+    }
 }
 
 impl Source for Data<'_> {
@@ -210,14 +295,25 @@ impl Source for Data<'_> {
     }
 
     fn scan(&mut self) -> Result<Scan, ProviderError> {
-        self.tree.scan()
+        let mut scan = self.tree.scan()?;
+        if let Some(desktop) = &mut self.desktop {
+            let more = desktop.scan()?;
+            scan.items.extend(more.items);
+            scan.unlisted.extend(more.unlisted);
+            scan.skipped.extend(more.skipped);
+        }
+        Ok(scan)
     }
 
     fn hash_prefixes(
         &mut self,
         requests: &[ItemPrefix],
     ) -> Result<Vec<Result<Hashed, RangeFailure>>, ProviderError> {
-        self.tree.hash_prefixes(requests)
+        let mut hashed = Vec::with_capacity(requests.len());
+        for (_, run) in Self::runs(requests, |request| &request.key) {
+            hashed.extend(self.tree_of(&run[0].key).hash_prefixes(run)?);
+        }
+        Ok(hashed)
     }
 
     fn fetch(
@@ -225,7 +321,11 @@ impl Source for Data<'_> {
         requests: &[ItemRange],
         sink: &mut dyn RangeSink,
     ) -> Result<(), ProviderError> {
-        self.tree.fetch(requests, sink)
+        for (first, run) in Self::runs(requests, |request| &request.key) {
+            self.tree_of(&run[0].key)
+                .fetch(run, &mut Shifted { sink, by: first })?;
+        }
+        Ok(())
     }
 
     fn retention_days(&mut self) -> Result<Option<u32>, ProviderError> {
@@ -234,6 +334,22 @@ impl Source for Data<'_> {
                 .read_small(&format!("{}/settings.json", self.root))?
                 .as_deref(),
         ))
+    }
+}
+
+/// A sink fed a run of requests that starts at the index `by` of the whole fetch.
+struct Shifted<'s> {
+    sink: &'s mut dyn RangeSink,
+    by: usize,
+}
+
+impl RangeSink for Shifted<'_> {
+    fn data(&mut self, request: usize, bytes: &[u8]) -> Result<(), Halt> {
+        self.sink.data(request + self.by, bytes)
+    }
+
+    fn end(&mut self, request: usize, result: Result<(), RangeFailure>) -> Result<(), Halt> {
+        self.sink.end(request + self.by, result)
     }
 }
 

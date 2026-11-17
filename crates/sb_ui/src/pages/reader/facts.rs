@@ -17,7 +17,7 @@ use gpui::{
 use gpui_component::tooltip::Tooltip;
 use sb_core::catalogue::{Compared, Held, History, Reason, Session, SessionId};
 use sb_core::location::LocationId;
-use sb_core::transcript::ToolKind;
+use sb_core::transcript::{Origin, ToolKind};
 
 use super::ReaderView;
 use super::calls::kind_icon;
@@ -404,7 +404,15 @@ impl ReaderView {
                             .gap(px(2.))
                             .child(tag_line(&copy.label))
                             .child(line(format!("Kept on {}.", kept(&session.id.location))))
-                            .child(line(hostile::label(&copy.origin)))
+                            .child(line(match &copy.origin {
+                                Origin::Unsaid(words) => hostile::label(words),
+                                Origin::Host(host) => {
+                                    format!("Ran over SSH on {}.", hostile::label(host))
+                                }
+                                Origin::Location(at) => {
+                                    format!("Ran over SSH on {}.", kept(at))
+                                }
+                            }))
                             .children(original.map(|original| {
                                 read(
                                     "Read the original",

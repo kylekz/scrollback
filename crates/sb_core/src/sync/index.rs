@@ -148,6 +148,7 @@ fn run(
         if backlog {
             catalogue.reclassify(location, id.as_str(), parser, &|key| provider.classify(key))?;
         }
+        copy_records(archive, location, *provider)?;
         let (sessions, gone) = catalogue.stale(location, id.as_str(), parser, backlog)?;
         catalogue.forget_sessions(&gone)?;
         stale.extend(sessions.into_iter().map(|stale| (*provider, stale)));
@@ -182,6 +183,45 @@ fn run(
         search.retry_empty_log();
     }
     Ok(report)
+}
+
+/**
+ * Makes again what `provider`'s records at `location` (or at every location) say of where
+ * copies ran, from its archived register items (PLAN §7.7). The archive being unreadable, or
+ * the provider stopping on them, leaves what was recorded before; neither fails the index.
+ */
+fn copy_records(
+    archive: &Archive,
+    location: Option<&LocationId>,
+    provider: &dyn Provider,
+) -> Result<(), SyncError> {
+    let catalogue = archive.catalogue();
+    let locations = match location {
+        Some(location) => vec![location.clone()],
+        None => catalogue
+            .locations()?
+            .into_iter()
+            .map(|location| location.id)
+            .collect(),
+    };
+    let id = provider.id();
+    for location in locations {
+        let readings = catalogue.register_items(&location, id.as_str())?;
+        let read = panic::catch_unwind(AssertUnwindSafe(|| {
+            let items = ArchivedSession::of(archive, &readings);
+            let records = provider.copy_records(&items);
+            items.fault().is_none().then_some(records)
+        }));
+        match read {
+            Ok(Some(records)) => catalogue.record_copies(&location, id.as_str(), &records)?,
+            Ok(None) => log::warn!("{id}'s records of copies could not be read from the archive"),
+            Err(fault) => log::warn!(
+                "{id} stopped on its records of copies: {}",
+                said(fault.as_ref())
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// How much text the second step of an index writes at a time: the sessions parsed for it,

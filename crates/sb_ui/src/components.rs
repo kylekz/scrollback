@@ -13,6 +13,7 @@ use gpui::{
     relative, svg,
 };
 use sb_core::catalogue::Session;
+
 use sb_core::location::{Location, LocationId, LocationKind};
 use unicode_segmentation::UnicodeSegmentation as _;
 
@@ -250,19 +251,25 @@ pub fn copy_tag(label: &str, small: bool, theme: &SbTheme) -> Div {
 #[derive(Clone, Copy, Debug)]
 pub enum Place<'a> {
     Location(&'a Location),
-    /// A copy of a session that ran elsewhere, by what the provider calls the copy.
+    /// A copy of a session that ran at no location the library knows, by the host it ran on
+    /// when that is known, else by what the provider calls the copy.
     Copy(&'a str),
 }
 
 impl<'a> Place<'a> {
-    /// Where `session` ran: its location, which `location` finds, unless it is a copy.
+    /**
+     * Where `session` ran: the location it is attributed to ([`Session::ran_at`]), which
+     * `location` finds; else, for a copy, what its tag says
+     * ([`sb_core::transcript::CopyOf::tag`]).
+     */
     pub fn of(
         session: &'a Session,
         location: impl FnOnce(&LocationId) -> Option<&'a Location>,
     ) -> Option<Self> {
-        match &session.copy {
-            Some(copy) => Some(Self::Copy(&copy.label)),
-            None => location(&session.id.location).map(Self::Location),
+        match (session.ran_at(), &session.copy) {
+            (Some(at), _) => location(at).map(Self::Location),
+            (None, Some(copy)) => Some(Self::Copy(copy.tag())),
+            (None, None) => None,
         }
     }
 

@@ -109,6 +109,7 @@ fn start(
         distros: Arc::new(wsl::distros),
         launcher: Arc::new(LocationKind::launcher),
         development_home: None,
+        resolve: Arc::new(sb_core::transport::SshConfig),
     };
     // A scripted run reaches only what its scenario put there; a development run with the
     // override reads its distros and hosts from a folder of generated data.

@@ -51,9 +51,9 @@ use sb_core::catalogue::{Catalogue, Compared, Session, Shelf};
 use sb_core::location::LocationKind;
 use sb_core::provider;
 use sb_core::search::{self, Calendar, Limit, Names, Searched};
-use sb_core::sync::{IndexReport, Progress, SyncError, index, sync_location};
+use sb_core::sync::{IndexReport, Progress, SyncError, attribute, index, sync_location};
 use sb_core::transcript::Ending;
-use sb_core::transport::{Launcher, ShellTransport, Transport, wsl};
+use sb_core::transport::{Launcher, ShellTransport, SshConfig, Transport, wsl};
 
 const USAGE: &str = "usage: sync <archive folder> [<location>]
        sync <archive folder> verify | set-aside | index | reindex
@@ -459,6 +459,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             },
         )?;
         println!("{} in {:.1?}", indexed(&report), started.elapsed());
+        attributed(&archive)?;
         let after = catalogue.sessions(Shelf::All)?;
         let differ = before
             .iter()
@@ -584,6 +585,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             .map(|indexing| indexing.elapsed())
             .unwrap_or_default()
     );
+    attributed(&archive)?;
     print_index(catalogue)?;
+    Ok(())
+}
+
+/// Says where the copies kept on this machine ran, through this machine's `ssh -G`, as the app
+/// does after a sync (PLAN §7.7), and how many copies' attribution that changed.
+fn attributed(archive: &Archive) -> Result<(), Box<dyn Error>> {
+    let changed = attribute(archive, &SshConfig)?;
+    println!("where copies ran: {changed} changed");
     Ok(())
 }

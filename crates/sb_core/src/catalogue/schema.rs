@@ -15,6 +15,7 @@ pub(super) const SCHEMA: Schema = Schema {
         CHECKS,
         SETTINGS,
         COPIES,
+        COPY_RECORDS,
     ],
 };
 
@@ -359,6 +360,26 @@ ALTER TABLE tombstone ADD COLUMN conversation TEXT;
 ALTER TABLE tombstone ADD COLUMN copy_label TEXT;
 CREATE INDEX tombstone_conversation ON tombstone (provider, conversation)
     WHERE conversation IS NOT NULL;
+";
+
+/// Where a copy ran, as the records an app keeps beside its copies say (PLAN §7.7).
+const COPY_RECORDS: &str = "
+-- Derived from the location's register items at each index: the host a conversation ran on
+-- over SSH and its transcript's path there, as the app at the location recorded them, and the
+-- key the provider makes of that path (the original's item's key where it ran). resolved
+-- and ran_at are the last attribution's: whether this machine's ssh resolved the host, and
+-- the SSH location it is the same place as.
+CREATE TABLE copy_record (
+    location_id TEXT NOT NULL REFERENCES location (id),
+    provider TEXT NOT NULL,
+    conversation TEXT NOT NULL,
+    host TEXT,
+    path TEXT,
+    key TEXT,
+    resolved INTEGER NOT NULL DEFAULT 0,
+    ran_at TEXT REFERENCES location (id),
+    PRIMARY KEY (location_id, provider, conversation)
+) STRICT, WITHOUT ROWID;
 ";
 
 #[cfg(test)]

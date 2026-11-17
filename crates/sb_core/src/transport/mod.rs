@@ -17,6 +17,7 @@
 mod launching;
 mod local;
 mod shell;
+pub mod ssh_config;
 pub mod wsl;
 
 use std::collections::HashMap;
@@ -29,6 +30,7 @@ use crate::hash::Hash;
 pub use launching::{LAUNCH_REFUSED, refuse_launchers};
 pub use local::LocalTransport;
 pub use shell::{Launcher, Probe, ShellTransport, quoted};
+pub use ssh_config::{ResolveHost, Resolved, SshConfig};
 
 /// Why a listing leaves something out on purpose ([`Listing::skipped`]), and why a name can't
 /// be listed: the same words from every transport.
