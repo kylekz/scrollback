@@ -140,15 +140,19 @@ impl Archive {
     }
 
     /**
-     * Puts back a tombstone the owner removed ([`Catalogue::restore_tombstone`]), unless its
-     * location is being synced ([`ArchiveError::Syncing`]): the sync may be archiving the
-     * session again as it is put back.
+     * Puts back the tombstones the owner removed ([`Catalogue::restore_tombstone`]), unless the
+     * location of any of them is being synced ([`ArchiveError::Syncing`]): the sync may be
+     * archiving the session again as it is put back.
      */
     pub fn restore_tombstone(&self, allowed: &AllowedAgain) -> Result<()> {
-        let location = &allowed.tombstone.session.location;
-        let _syncing = self
-            .begin_sync(location)
-            .ok_or_else(|| ArchiveError::Syncing(location.clone()))?;
+        let _syncing = allowed
+            .locations()
+            .into_iter()
+            .map(|location| {
+                self.begin_sync(location)
+                    .ok_or_else(|| ArchiveError::Syncing(location.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(self.catalogue.restore_tombstone(allowed)?)
     }
 

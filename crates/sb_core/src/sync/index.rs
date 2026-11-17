@@ -38,7 +38,7 @@ use toolbox_process::CancelToken;
 
 use super::{Progress, SyncError};
 use crate::archive::{Archive, ArchivedSession};
-use crate::catalogue::{Derived, Held, Indexed, Reading, SessionId, fingerprint};
+use crate::catalogue::{Derived, Held, Indexed, Reading, RowMade, SessionId, fingerprint};
 use crate::location::LocationId;
 use crate::provider::{ItemKind, Provider};
 use crate::search::Text;
@@ -59,6 +59,9 @@ pub struct IndexReport {
     pub held_back: usize,
     /// The sessions whose text was made searchable.
     pub searchable: usize,
+    /// The sessions it deleted for good, of conversations the owner deleted for good (PLAN
+    /// §4.5): arriving from another location, or made again, they are not archived again.
+    pub deleted: Vec<SessionId>,
 }
 
 /**
@@ -124,6 +127,10 @@ pub fn index_session(
             .into_iter()
             .collect();
         report.searchable += record(archive, &texts)?;
+    }
+    /* A session of a conversation the owner deleted is deleted for good by its index. */
+    if archive.catalogue().pending_removals()? > 0 {
+        archive.start_removals(false);
     }
     Ok(report)
 }
@@ -417,9 +424,10 @@ fn session(
                         reading.kind.is_transcript() && reading.newest_held.is_some()
                     }),
                 };
-                let filed =
-                    catalogue.record_session(id, parser, from, Indexed::Parsed(derived), copy)?;
-                report.filed += usize::from(filed);
+                match catalogue.record_session(id, parser, from, Indexed::Parsed(derived), copy)? {
+                    RowMade::Made { filed } => report.filed += usize::from(filed),
+                    RowMade::Deleted => report.deleted.push(id.clone()),
+                }
                 return Ok(());
             }
             Err(fault) => {

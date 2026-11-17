@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
-use sb_core::archive::Archive;
+use sb_core::archive::{Archive, ArchiveError};
 use sb_core::catalogue::{
     Catalogue, CatalogueError, Compared, Filed, Kin, LibraryCounts, Session, SessionId, Shelf,
 };
@@ -18,7 +18,7 @@ use sb_core::filing::FolderId;
 use sb_core::location::{LocationId, LocationKind};
 use sb_core::provider;
 use sb_core::search::{Filters, Limit, Query, Searched};
-use sb_core::sync::{index, sync_location};
+use sb_core::sync::{IndexReport, index, sync_location};
 use sb_core::transcript::Subagent;
 use sb_core::transport::Transport;
 use sb_test_support::{
@@ -96,8 +96,10 @@ impl Machines {
         }
     }
 
-    /// Syncs `location` through `transport` with every provider.
-    fn sync_at(&self, location: &LocationId, transport: &dyn Transport) {
+    /// Syncs `location` through `transport` with every provider. Returns what each pass's
+    /// index did.
+    fn sync_at(&self, location: &LocationId, transport: &dyn Transport) -> Vec<IndexReport> {
+        let mut indexed = Vec::new();
         for pass in sync_location(
             &self.archive,
             location,
@@ -110,8 +112,9 @@ impl Machines {
         {
             let report = pass.outcome.unwrap();
             assert!(report.failed.is_empty(), "{:?}", report.failed);
-            pass.index.unwrap();
+            indexed.push(pass.index.unwrap());
         }
+        indexed
     }
 
     /// Indexes what is out of date, as a start does.
@@ -472,6 +475,14 @@ fn deleting_the_original_also_takes_the_same_session_from_another_location() {
     assert_eq!(machines.shown(Shelf::All).len(), 2);
     let original = machines.original(&session);
     machines.catalogue().trash(&original).unwrap();
+    /* Only what is in Trash is deleted for good (D14): the same session from the host is
+    still in the library, so it goes to Trash first. */
+    let from_host = machines.id(&host, session.session_key());
+    assert!(matches!(
+        machines.catalogue().deletion(&original),
+        Err(CatalogueError::AlsoShown(also)) if also == from_host
+    ));
+    machines.catalogue().trash(&from_host).unwrap();
     let deletion = machines.catalogue().deletion(&original).unwrap();
     let also: Vec<(&LocationId, bool)> = (deletion.also.iter())
         .map(|also| (&also.session.location, also.copy.is_some()))
@@ -572,7 +583,9 @@ fn a_duplicate_trashed_before_copies_were_known_leaves_its_original_alone() {
         &format!(
             "UPDATE session SET copy_label = NULL, copy_origin = NULL WHERE session = '{0}';
              INSERT INTO session_state (location_id, provider, session, trashed_at)
-             VALUES ('{1}', '{2}', '{0}', 1);",
+             VALUES ('{1}', '{2}', '{0}', 1);
+             UPDATE session SET index_version = 2;
+             UPDATE session SET ended_at = ended_at + 1000 WHERE session = '{0}';",
             copy_id.key,
             copy_id.location.as_str(),
             copy_id.provider
@@ -586,6 +599,51 @@ fn a_duplicate_trashed_before_copies_were_known_leaves_its_original_alone() {
     assert_eq!((&shown.id, shown.trashed), (&original, None));
 }
 
+/**
+ * An original whose first row was made without a parse (its items could not be read), then
+ * read: it is new to its conversation then, and takes over what was decided of the copy shown
+ * in its place.
+ */
+#[test]
+fn an_original_read_after_a_first_row_without_a_conversation_takes_over() {
+    let mut machines = Machines::new();
+    let session = machines.ran_remotely("upload");
+    let copy = machines.pc.desktop_copy(&session);
+    machines.sync(true);
+    let (original, copy_id) = (machines.original(&session), machines.copy(&copy));
+    /* As if the original's first index could not read it: no conversation, to be read again;
+    and the copy trashed while shown alone. */
+    edit_catalogue(
+        machines.dir(),
+        &format!(
+            "UPDATE session SET conversation = NULL, retry = 1, indexed_from = hex(zeroblob(32))
+             WHERE location_id = '{0}';
+             DELETE FROM session_state;
+             INSERT INTO session_state (location_id, provider, session, trashed_at, as_copy)
+             VALUES ('{1}', '{2}', '{3}', 1, 1);",
+            original.location.as_str(),
+            copy_id.location.as_str(),
+            copy_id.provider,
+            copy_id.key
+        ),
+    );
+    assert_eq!(machines.shown(Shelf::Trash)[0].id, copy_id);
+    machines.index();
+    let trashed = machines.shown(Shelf::Trash);
+    assert_eq!(
+        trashed.iter().map(|it| &it.id).collect::<Vec<_>>(),
+        [&original]
+    );
+    let copy_state = read_catalogue(
+        machines.dir(),
+        &format!(
+            "SELECT count(*) FROM session_state WHERE session = '{}'",
+            copy_id.key
+        ),
+    );
+    assert_eq!(copy_state, ["0"]);
+}
+
 /// A session deleted for good before its copy was archived: the copy is not archived after.
 #[test]
 fn a_copy_arriving_after_its_original_was_deleted_for_good_is_deleted_too() {
@@ -596,7 +654,9 @@ fn a_copy_arriving_after_its_original_was_deleted_for_good_is_deleted_too() {
     machines.delete(&original);
 
     let copy = machines.pc.desktop_copy(&session);
-    machines.sync(false);
+    /* The index that met it deleted it for good, and says so. */
+    let indexed = machines.sync_at(&machines.here, &machines.pc.transport());
+    assert_eq!(indexed[0].deleted, [machines.copy(&copy)]);
     machines.archive.wait_for_removals();
     assert!(machines.shown(Shelf::All).is_empty() && machines.shown(Shelf::Trash).is_empty());
     assert_eq!(
@@ -604,7 +664,9 @@ fn a_copy_arriving_after_its_original_was_deleted_for_good_is_deleted_too() {
         None
     );
     assert_eq!(machines.found("upload", Filters::default()), []);
-    /* Its keys are tombstoned: the next sync takes nothing of it. */
+    /* Its keys are tombstoned: the next sync takes nothing of it, nor of the original. */
+    machines.sync(true);
+    assert!(machines.shown(Shelf::All).is_empty());
     machines.sync(false);
     assert!(
         (machines
@@ -795,4 +857,56 @@ fn a_copy_deleted_before_copies_were_known_is_not_brought_back_by_its_subagents(
     );
     machines.sync(false);
     assert!(machines.shown(Shelf::All).is_empty());
+}
+
+/// Undoing Allow puts back the tombstones of every session of the conversation, so it waits
+/// while any of their locations is syncing, not only the first one's.
+#[test]
+fn undoing_allow_waits_for_the_sync_of_any_location_of_the_conversation() {
+    let mut machines = Machines::new();
+    let session = machines.ran_remotely("upload");
+    machines.pc.desktop_copy(&session);
+    machines.sync(true);
+    let original = machines.original(&session);
+    machines.delete(&original);
+    let allowed = machines.catalogue().remove_tombstone(&original).unwrap();
+    assert_eq!(allowed.tombstone.with.len(), 1);
+
+    /* This machine, which kept the copy, syncs while the owner undoes. */
+    let mut refused = None;
+    sync_location(
+        &machines.archive,
+        &machines.here,
+        &machines.pc.transport(),
+        &provider::builtin(),
+        &CancelToken::new(),
+        &mut |_| {
+            refused.get_or_insert_with(|| machines.archive.restore_tombstone(&allowed));
+        },
+    )
+    .unwrap();
+    assert!(matches!(refused, Some(Err(ArchiveError::Syncing(_)))));
+}
+
+/// A row of the provider at the session's project path made by an older parser may not say
+/// which conversation it is: deleting for good waits for it to be made again.
+#[test]
+fn delete_for_good_waits_for_rows_an_older_parser_made() {
+    let mut machines = Machines::new();
+    let session = machines.ran_remotely("upload");
+    machines.pc.desktop_copy(&session);
+    machines.sync(true);
+    let original = machines.original(&session);
+    machines.catalogue().trash(&original).unwrap();
+    edit_catalogue(
+        machines.dir(),
+        &format!(
+            "UPDATE session SET parser_version = parser_version - 1 WHERE location_id = '{}'",
+            machines.here.as_str()
+        ),
+    );
+    assert!(matches!(
+        machines.catalogue().deletion(&original),
+        Err(CatalogueError::StillIndexing(_))
+    ));
 }

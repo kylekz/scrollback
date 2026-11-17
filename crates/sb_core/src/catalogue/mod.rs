@@ -41,7 +41,7 @@ pub use batch::{Before, Restored, Undone};
 pub use folder::{Folder, FolderPath, ProjectPath};
 pub use library::{LibraryCounts, PathGroup, Shelf};
 pub use session::{Compared, Filed, History, Kin, Session, SessionId, Usage};
-pub(crate) use session::{Derived, Indexed, Reading, fingerprint};
+pub(crate) use session::{Derived, Indexed, Reading, RowMade, fingerprint};
 pub use trash::{AllowedAgain, AlsoDeleted, Deletion, Tombstone};
 pub(crate) use trash::{ItemFile, Removal};
 
@@ -110,6 +110,11 @@ pub enum CatalogueError {
     /// session of it once the index has made each one's row again: not yet.
     #[error("the sessions like {} of {} at location {} are still being indexed", .0.key, .0.provider, .0.location)]
     StillIndexing(SessionId),
+    /// The same session archived from another location (this one's [`SessionId`]) is still
+    /// in the library, out of Trash: only what is in Trash is deleted for good (D14), so it
+    /// goes to Trash first.
+    #[error("the same session at location {} is not in Trash", .0.location)]
+    AlsoShown(SessionId),
     /// The session holds more than one transcript of its own, of which only the first is read:
     /// it is not deleted for good, as the owner could not see what that removes.
     #[error("the session {} of {} at location {} holds more than one transcript", .0.key, .0.provider, .0.location)]

@@ -52,6 +52,12 @@ enum Asked<'a> {
     Save,
 }
 
+/// What the confirmation of a delete for good says of later syncs, whatever else it says
+/// (DESIGN §4.8).
+const LATER_SYNCS: &str = "Later syncs will skip it and any copy of it, from any location, so \
+                           it won't come back (resuming it starts a new session, which is \
+                           archived); you can allow it again in Settings › Archive.";
+
 impl Asking {
     fn asked(&self) -> Asked<'_> {
         match self {
@@ -371,9 +377,8 @@ impl Shell {
                 .items_center()
                 .gap(theme.spacing.xs);
             if deletion.at_location {
-                let rest = "Nothing is deleted there. Later syncs will skip it and any copy of it, \
-                            from any location, so it won't come back; you can allow it again in \
-                            Settings › Archive.";
+                let rest = format!("Nothing is deleted there. {LATER_SYNCS}");
+                let length = rest.len();
                 let bold = "Nothing is deleted there.".len();
                 let run = |len, weight, color| TextRun {
                     len,
@@ -399,7 +404,7 @@ impl Shell {
                     // A line of its own, so that it wraps inside the dialog.
                     .child(div().w_full().child(StyledText::new(rest).with_runs(vec![
                         run(bold, FontWeight::SEMIBOLD, c.fg),
-                        run(rest.len() - bold, FontWeight::NORMAL, c.fg2),
+                        run(length - bold, FontWeight::NORMAL, c.fg2),
                     ])))
             } else if deletion.also.iter().any(|also| also.at_location) {
                 /* Another of it is still where it was kept: this is not the last of it. */
@@ -407,6 +412,7 @@ impl Shell {
                     Some(tag) => line.child("It is no longer on").child(tag).child("."),
                     None => line.child("It is no longer at its location."),
                 }
+                .child(div().w_full().child(LATER_SYNCS))
             } else {
                 match tag {
                     Some(tag) => line
@@ -417,6 +423,7 @@ impl Shell {
                         "It is no longer at its location either, so this removes the last copy.",
                     ),
                 }
+                .child(div().w_full().child(LATER_SYNCS))
             }
         });
         /* Its project's path is a transcript's: drawn as a label, as its model is. */
@@ -485,6 +492,17 @@ impl Shell {
                                     elsewhere.map(|it| it.automation_target("for-good/elsewhere")),
                                 )
                                 .children(also)
+                                /* A copy's original is of the conversation deleted, wherever
+                                it is (PLAN §4.5). */
+                                .children(session.copy.is_some().then(|| {
+                                    div()
+                                        .child(
+                                            "The session it is a copy of won't be archived from \
+                                             the machine it ran on either, if that machine is \
+                                             added.",
+                                        )
+                                        .automation_target("for-good/original")
+                                }))
                                 .children(refused.map(|why| {
                                     div()
                                         .text_color(c.yellow)

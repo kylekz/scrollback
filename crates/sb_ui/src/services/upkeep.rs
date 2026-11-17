@@ -380,8 +380,12 @@ impl UpkeepService {
     /// Whether a change to one of the location `id`'s sessions deleted for good is being
     /// written.
     pub fn is_writing_at(&self, id: &LocationId) -> bool {
-        (self.deleted.iter())
-            .any(|deleted| deleted.writing && deleted.tombstone.session.location == *id)
+        (self.deleted.iter()).any(|deleted| {
+            deleted.writing
+                && std::iter::once(&deleted.tombstone)
+                    .chain(&deleted.tombstone.with)
+                    .any(|tombstone| tombstone.session.location == *id)
+        })
     }
 
     pub fn verifying(&self) -> Option<&Verifying> {

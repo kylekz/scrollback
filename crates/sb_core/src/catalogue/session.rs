@@ -208,6 +208,16 @@ struct Made {
     ended: Option<i64>,
 }
 
+/// What became of a session's row ([`Catalogue::record_session`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowMade {
+    /// It was made, and the rules moved the session into a folder or not.
+    Made { filed: bool },
+    /// It was not: the session is of a conversation the owner deleted for good (PLAN §4.5),
+    /// and was deleted for good in its place, as a pass would have skipped it.
+    Deleted,
+}
+
 /// What an index derived from a session.
 pub(crate) struct Derived<'a> {
     /// The item the session's own conversation was parsed from.
@@ -827,8 +837,7 @@ impl Catalogue {
      * A session of a conversation the owner deleted for good (PLAN §4.5, §7.7), arriving from
      * any location, is deleted for good in the same transaction, as its key would have been
      * skipped. An original whose row is new takes over what the owner decided about the copy
-     * shown in its place until now ([`take_over`]). Returns whether the rules moved the
-     * session into a folder.
+     * shown in its place until now ([`take_over`]). Returns what became of the row.
      */
     pub(crate) fn record_session(
         &self,
@@ -837,7 +846,7 @@ impl Catalogue {
         from: Hash,
         indexed: Indexed<'_>,
         copy: Option<&CopyOf>,
-    ) -> Result<bool> {
+    ) -> Result<RowMade> {
         let nothing = SessionIndex::default();
         let (derived, failure, retry) = match indexed {
             Indexed::Parsed(derived) => (Some(derived), None, false),
@@ -887,12 +896,16 @@ impl Catalogue {
             /* A session the owner deleted for good while it was parsed gets no row: there is
             nothing of it left to make one from. */
             if !has_items(tx, id)? {
-                return Ok(false);
+                return Ok(RowMade::Made { filed: false });
             }
+            /* New to its conversation: no row of it said which conversation it is before (one
+            made while its items could not be read says none). Only what was decided of a copy
+            shown alone ever moves, so taking over again later moves nothing twice. */
             let new: bool = tx.query_row(
                 "SELECT NOT EXISTS (
                      SELECT 1 FROM session
                      WHERE location_id = ?1 AND provider = ?2 AND session = ?3
+                       AND conversation IS NOT NULL
                  )",
                 params![id.location, id.provider, id.key],
                 |row| row.get(0),
@@ -957,24 +970,21 @@ impl Catalogue {
                 params![id.location, id.provider, id.key],
             )?;
             if derived.is_none() {
-                return Ok(false);
+                return Ok(RowMade::Made { filed: false });
             }
             if let Some(conversation) = &index.conversation
                 && tombstoned(tx, id, conversation, index.project_path.as_deref())?
             {
                 super::trash::forget(tx, id)?;
-                return Ok(false);
+                return Ok(RowMade::Deleted);
             }
             if let Some(shown) = shown {
                 take_over(tx, &shown, id)?;
             }
             let (_, ran_at) = folder::filing_of(tx, id)?;
-            Ok(folder::file_by_rule(
-                tx,
-                id,
-                project.as_ref(),
-                ran_at.as_ref(),
-            )?)
+            Ok(RowMade::Made {
+                filed: folder::file_by_rule(tx, id, project.as_ref(), ran_at.as_ref())?,
+            })
         })
     }
 
@@ -1341,20 +1351,29 @@ fn unrevived(
             Ok((row.get(0)?, row.get(1)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    for (key, tombstone) in deleted {
-        let (ItemKind::Transcript, Some(now)) = classifier(&key) else {
-            continue;
-        };
-        let now = SessionId {
-            location: location.clone(),
-            provider: provider.to_string(),
-            key: now,
-        };
-        let items: Vec<(i64, String, String, ItemKind)> = tx
-            .prepare(
-                "SELECT id, key, item_id, kind FROM item
-                 WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
-            )?
+    /* Only a deleted transcript's key can make a session own transcript now. */
+    let revived: Vec<(String, SessionId)> = (deleted.into_iter())
+        .filter_map(|(key, tombstone)| match classifier(&key) {
+            (ItemKind::Transcript, Some(now)) => Some((
+                tombstone,
+                SessionId {
+                    location: location.clone(),
+                    provider: provider.to_string(),
+                    key: now,
+                },
+            )),
+            _ => None,
+        })
+        .collect();
+    if revived.is_empty() {
+        return Ok(());
+    }
+    let mut select = tx.prepare(
+        "SELECT id, key, item_id, kind FROM item
+         WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+    )?;
+    for (tombstone, now) in revived {
+        let items: Vec<(i64, String, String, ItemKind)> = select
             .query_map(params![now.location, now.provider, now.key], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
@@ -1755,10 +1774,11 @@ mod tests {
             ending: None,
             held_back: false,
         };
-        assert!(
-            !catalogue
+        assert_eq!(
+            catalogue
                 .record_session(&id, 1, Hash::of(b""), Indexed::Parsed(derived), None)
-                .unwrap()
+                .unwrap(),
+            RowMade::Made { filed: false }
         );
         assert_eq!(catalogue.session(&id).unwrap(), None);
     }

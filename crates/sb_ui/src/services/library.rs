@@ -537,7 +537,8 @@ impl Refusal {
         match self {
             Self::Changed => "It changed since this was shown. These are its numbers now.",
             Self::Syncing(_) => {
-                "Where it or its copy is kept is being synced. Try again once the sync is done."
+                "Where it, its copy or the same session from another location is kept is being \
+                 synced. Try again once the sync is done."
             }
         }
     }
@@ -1680,7 +1681,7 @@ impl LibraryService {
                         );
                         let session = asked.session.clone();
                         this.for_good = None;
-                        let said = this.not_deleted(&session, &error.into());
+                        let said = this.not_deleted(&session, &error.into(), cx);
                         this.show_toast(
                             Toast {
                                 text: said,
@@ -1733,8 +1734,14 @@ impl LibraryService {
             return;
         };
         if let (true, Some(deletion)) = (delete, asked.deletion) {
-            self.chosen.remove(&deletion.session);
-            if self.selected() == Some(&deletion.session) {
+            /* Every session it deletes: the one asked and the others of its conversation. */
+            for id in deletion.sessions() {
+                self.chosen.remove(id);
+            }
+            if self
+                .selected()
+                .is_some_and(|selected| deletion.sessions().any(|id| id == selected))
+            {
                 self.selected = None;
             }
             let session = Box::new(asked.session);
@@ -2144,7 +2151,7 @@ impl LibraryService {
             }
             (Change::DeleteForGood { session, .. }, Err(error)) => {
                 log::warn!("{} was refused: {error}", change.what());
-                let said = self.not_deleted(session, &error);
+                let said = self.not_deleted(session, &error, cx);
                 self.show_toast(
                     Toast {
                         text: said,
@@ -2321,7 +2328,7 @@ impl LibraryService {
      * Why deleting `session` for good was refused, as the owner knows it. Its title is cut to
      * [`REFUSAL_TITLE`] characters, so that why still shows in a narrow window's toast.
      */
-    fn not_deleted(&self, session: &Session, error: &ArchiveError) -> String {
+    fn not_deleted(&self, session: &Session, error: &ArchiveError, cx: &App) -> String {
         let title = crate::components::middle_cut(&title_of(session), REFUSAL_TITLE);
         match error {
             ArchiveError::Catalogue(CatalogueError::NotInTrash(_)) => {
@@ -2339,8 +2346,14 @@ impl LibraryService {
                  it holds now"
             ),
             ArchiveError::Catalogue(CatalogueError::StillIndexing(_)) => format!(
-                "“{title}” wasn't deleted: its copies elsewhere are still being indexed. Try \
-                 again once the index is done"
+                "“{title}” wasn't deleted: this project is still being indexed. Try again once \
+                 the index is done"
+            ),
+            ArchiveError::Catalogue(CatalogueError::AlsoShown(also)) => format!(
+                "“{title}” wasn't deleted: the same session from {} is still in your library. \
+                 Move it to Trash too, then delete for good",
+                (self.sync.read(cx).location(&also.location))
+                    .map_or_else(|| "another location".to_string(), |it| label(&it.name))
             ),
             ArchiveError::Catalogue(CatalogueError::SeveralTranscripts(_)) => format!(
                 "“{title}” wasn't deleted: it, or a copy of it, holds more than one transcript, \

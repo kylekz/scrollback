@@ -376,21 +376,28 @@ impl ReaderView {
                 .flex()
                 .child(copy_tag(label, false, &theme).flex_shrink(1.).min_w_0())
         };
+        /* A link the keyboard reaches with Tab, as every control is (DESIGN §4.1). */
         let read = |label: &'static str, id: SessionId, target: String| {
-            div()
-                .id(SharedString::from(target.clone()))
-                .flex()
-                .items_center()
-                .gap(theme.spacing.xs)
-                .text_color(c.accent_text)
-                .cursor_pointer()
-                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                    let library = cx.services().library.clone();
-                    library.update(cx, |library, cx| library.open_kin(id.clone(), cx));
-                }))
-                .child(icon(SbIcon::Copy, theme.sizes.icon_xs, c.accent_text))
-                .child(line(label))
-                .automation_target(target)
+            tab_stop(
+                div()
+                    .id(SharedString::from(target.clone()))
+                    .flex()
+                    .items_center()
+                    .gap(theme.spacing.xs)
+                    .border_1()
+                    .border_color(gpui::transparent_black())
+                    .rounded(theme.radii.small)
+                    .text_color(c.accent_text)
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                        let library = cx.services().library.clone();
+                        library.update(cx, |library, cx| library.open_kin(id.clone(), cx));
+                    })),
+                &theme,
+            )
+            .child(icon(SbIcon::Copy, theme.sizes.icon_xs, c.accent_text))
+            .child(line(label))
+            .automation_target(target)
         };
         match &session.copy {
             Some(copy) => {

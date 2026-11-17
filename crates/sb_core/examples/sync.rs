@@ -197,11 +197,12 @@ fn test(place: &Place) -> Result<(), Box<dyn Error>> {
 fn indexed(report: &IndexReport) -> String {
     format!(
         "indexed {} sessions: {} could not be parsed, {} filed by a rule, {} versions held \
-         back for how they parse",
+         back for how they parse, {} deleted for good as of a conversation deleted for good",
         report.sessions,
         report.failed.len(),
         report.filed,
-        report.held_back
+        report.held_back,
+        report.deleted.len()
     )
 }
 
