@@ -71,8 +71,11 @@
 
 // A new folder, blog, is empty: its page opens the short editor with Unsorted's blog path suggested; Attach files it at once.
 {"cmd": "key", "keystroke": "secondary-shift-n"}
-{"cmd": "type", "text": "blog\n"}
 {"cmd": "settle"}
+{"cmd": "bounds", "target": "sidebar/folder-rename", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "type", "text": "blog\n"}
+{"cmd": "settle", "expect": {"pointer": "/library/shelf", "equals": {"folder": "dv"}}}
+{"cmd": "bounds", "target": "sidebar/folder/blog", "expect_result": {"pointer": "/visible", "not_equals": null}}
 {"cmd": "click", "target": "sidebar/folder/blog"}
 {"cmd": "settle", "expect": [{"pointer": "/library/shelf", "equals": {"folder": "blog"}}, {"pointer": "/page_view/editor/short", "equals": true}]}
 {"cmd": "bounds", "target": "paths/suggested/0", "expect_result": {"pointer": "/visible", "not_equals": null}}
