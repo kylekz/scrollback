@@ -9,20 +9,21 @@ use gpui::{
     StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _,
 };
 use gpui_component::FocusTrapElement as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sb_core::archive::{self, MoveStage};
 
 use super::SettingsPage;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
-    ButtonKind, button, info_banner, kv, progress_bar, warn_banner, with_numbers,
+    ButtonKind, button, info_banner, kv, path_in_words, paths_tooltip, progress_bar, warn_banner,
+    with_numbers,
 };
 use crate::format;
 use crate::overlay::{self, Layer};
 use crate::pages::first_sync::ESTIMATE_AFTER_MS;
 use crate::services::ActiveServices as _;
-use crate::services::settings::{Ended, MoveState, Running};
+use crate::services::settings::{Ended, MoveState, Running, Said};
 use crate::system;
 use crate::theme::{SbTheme, StyledText as _};
 
@@ -54,7 +55,7 @@ fn doing(running: &Running, now: i64) -> String {
     match progress.stage {
         MoveStage::Copying => {
             let elapsed = now - running.started;
-            let done = progress.bytes_done as f64 / progress.bytes.max(1) as f64;
+            let done = progress.fraction();
             let left = if elapsed >= ESTIMATE_AFTER_MS && done > 0. {
                 format!(
                     "{} left",
@@ -78,7 +79,7 @@ fn doing(running: &Running, now: i64) -> String {
             format::plural(progress.files, "file")
         ),
         MoveStage::Switching => {
-            format!("Switching to {}…", running.plan.target.display())
+            format!("Switching to {}…", path_in_words(&running.plan.target))
         }
     }
 }
@@ -112,6 +113,14 @@ impl SettingsPage {
                 .text_color(color)
                 .child(text)
         };
+        /* Words that name paths, cut, with the paths whole in a tooltip. */
+        let said = |id: &'static str, said: &Said, color| {
+            line(said.text.clone(), color)
+                .id(id)
+                .when(!said.paths.is_empty(), |this| {
+                    this.tooltip(paths_tooltip(id, &said.paths))
+                })
+        };
         let dismiss = |id: &'static str, target: &'static str| {
             button(id, ButtonKind::Ghost, true, true, theme)
                 .debug_selector(move || id.to_string())
@@ -125,16 +134,24 @@ impl SettingsPage {
         let mut lines = Vec::new();
         match settings.move_state() {
             Some(MoveState::Checking(folder)) => lines.push(
-                line(format!("Checking {}…", folder.display()), c.accent_text)
-                    .automation_target("settings/move/checking")
-                    .into_any_element(),
+                line(
+                    format!("Checking {}…", path_in_words(folder)),
+                    c.accent_text,
+                )
+                .id("settings-move-checking")
+                .tooltip(paths_tooltip(
+                    "settings-move-checking",
+                    std::slice::from_ref(folder),
+                ))
+                .automation_target("settings/move/checking")
+                .into_any_element(),
             ),
             Some(MoveState::Refused { why, .. }) => lines.push(
                 div()
                     .flex()
                     .items_start()
                     .gap(theme.spacing.md)
-                    .child(line(why.clone(), c.red))
+                    .child(said("settings-move-refused-words", why, c.red))
                     .child(dismiss(
                         "settings-move-refused-dismiss",
                         "settings/move/dismiss",
@@ -145,10 +162,7 @@ impl SettingsPage {
             Some(MoveState::Running(running)) => {
                 let progress = running.progress;
                 let fraction = match progress.stage {
-                    MoveStage::Copying if progress.bytes > 0 => {
-                        progress.bytes_done as f32 / progress.bytes as f32
-                    }
-                    MoveStage::Copying => 0.,
+                    MoveStage::Copying => progress.fraction() as f32,
                     MoveStage::Finishing | MoveStage::Switching => 1.,
                 };
                 let stop = running.can_stop() && !running.is_stopping();
@@ -163,19 +177,31 @@ impl SettingsPage {
                                 .flex()
                                 .items_center()
                                 .gap(theme.spacing.md)
-                                .child(div().flex_1().min_w_0().child(with_numbers(
-                                    if settings.quits_after_finish() {
-                                        format!(
-                                            "{} · scrollback quits once it is done",
-                                            doing(running, format::now())
-                                        )
-                                    } else {
-                                        doing(running, format::now())
-                                    },
-                                    c.accent_text,
-                                    &theme.text.secondary,
-                                    theme,
-                                )))
+                                .child(
+                                    div()
+                                        .id("settings-move-doing")
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(with_numbers(
+                                            if settings.quits_after_finish() {
+                                                format!(
+                                                    "{} · scrollback quits once it is done",
+                                                    doing(running, format::now())
+                                                )
+                                            } else {
+                                                doing(running, format::now())
+                                            },
+                                            c.accent_text,
+                                            &theme.text.secondary,
+                                            theme,
+                                        ))
+                                        .when(progress.stage == MoveStage::Switching, |this| {
+                                            this.tooltip(paths_tooltip(
+                                                "settings-move-doing",
+                                                std::slice::from_ref(&running.plan.target),
+                                            ))
+                                        }),
+                                )
                                 .when(stop, |this| {
                                     this.child(
                                         button(
@@ -213,7 +239,7 @@ impl SettingsPage {
                         .flex()
                         .items_start()
                         .gap(theme.spacing.md)
-                        .child(line(ended.words(), color))
+                        .child(said("settings-move-ended-words", &ended.words(), color))
                         .child(dismiss(
                             "settings-move-ended-dismiss",
                             "settings/move/dismiss",
@@ -226,10 +252,10 @@ impl SettingsPage {
         }
         if let Some(moved) = settings.moved_here(&dir) {
             let old = moved.from.clone();
-            let said = format!(
+            let words = format!(
                 "Moved from {} on {}. That folder is as it was. Delete it yourself once you're \
                  satisfied that everything is here.",
-                old.display(),
+                path_in_words(&old),
                 format::day(moved.at, format::now())
             );
             lines.push(
@@ -241,7 +267,9 @@ impl SettingsPage {
                             .flex()
                             .flex_col()
                             .gap(theme.spacing.md)
-                            .child(said)
+                            .child(div().id("settings-moved-words").child(words).tooltip(
+                                paths_tooltip("settings-moved-words", std::slice::from_ref(&old)),
+                            ))
                             .child(
                                 div()
                                     .flex()
@@ -319,6 +347,18 @@ impl SettingsPage {
             Some(free) => format!("{} on {}", format::size(free), plan.volume.display()),
             None => "Not known".to_string(),
         };
+        /* A path on a line of its own, cut in its middle: a path wraps anywhere, a Windows one
+        straight after its drive. */
+        let path_line = |id: &'static str, text: String, paths: &[PathBuf]| {
+            div()
+                .id(id)
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis_middle()
+                .whitespace_nowrap()
+                .child(text)
+                .tooltip(paths_tooltip(id, paths))
+        };
         let cancel = |cx: &mut gpui::App| {
             let settings = cx.services().settings.clone();
             settings.update(cx, |settings, cx| settings.cancel_move(cx));
@@ -338,15 +378,14 @@ impl SettingsPage {
                     .p(theme.spacing.xl)
                     .child(div().text_spec(&theme.text.sheet_title).child(title))
                     .child(
-                        div()
-                            .min_w_0()
-                            .text_spec(&theme.text.path)
-                            .text_color(c.fg)
-                            .overflow_hidden()
-                            .text_ellipsis_middle()
-                            .whitespace_nowrap()
-                            .child(plan.target.display().to_string())
-                            .automation_target("settings/move-confirm/folder"),
+                        path_line(
+                            "settings-move-confirm-folder",
+                            plan.target.display().to_string(),
+                            std::slice::from_ref(&plan.target),
+                        )
+                        .text_spec(&theme.text.path)
+                        .text_color(c.fg)
+                        .automation_target("settings/move-confirm/folder"),
                     )
                     .child(paragraph(format!(
                         "scrollback copies {} in {} there, reads each copy back to check it \
@@ -374,7 +413,15 @@ impl SettingsPage {
                                 div().child(format!("about {}", format::size(plan.needed))),
                                 theme,
                             ))
-                            .child(kv("Free", div().child(free), theme))
+                            .child(kv(
+                                "Free",
+                                path_line(
+                                    "settings-move-confirm-free",
+                                    free,
+                                    std::slice::from_ref(&plan.volume),
+                                ),
+                                theme,
+                            ))
                             .automation_target("settings/move-confirm/room"),
                     ),
             )

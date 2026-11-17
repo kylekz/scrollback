@@ -46,13 +46,13 @@ use crate::location::LocationId;
 use crate::search::{SearchError, SearchIndex};
 
 pub use delete::Deleted;
-pub use disk::write_durably;
+pub use disk::{plain, write_durably};
 pub use items::{ArchivedSession, Pinned};
 pub use kin::KinMemo;
 pub(crate) use layout::item_folder;
 pub use relocate::{
     Cleared, MARKER, Move, MoveError, MovePlan, MoveProgress, MoveStage, Refusal, clear_move,
-    forget_marker,
+    forget_marker, volume_of,
 };
 pub use segment::{Problem, SEGMENT_BYTES, SegmentCache, VersionReader};
 pub(crate) use segment::{RangeWriter, Sealed};

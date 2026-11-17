@@ -272,6 +272,17 @@ fn load(archive: &Archive, shown: usize, allowed: Vec<SessionId>) -> Result<Load
     })
 }
 
+/// Whether the move that put the archive where it is still owes it a verify
+/// ([`UpkeepService::verify_after_move`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoveVerify {
+    /// The archive isn't open yet.
+    Unasked,
+    /// When the last verify ran is being read.
+    Asking,
+    Asked,
+}
+
 /// A verify while it runs.
 pub struct Verifying {
     pub progress: VerifyProgress,
@@ -304,7 +315,8 @@ pub struct UpkeepService {
     /// The app is opening another archive to move onto: the archive isn't read meanwhile
     /// ([`super::pause`]).
     paused: bool,
-    _observers: [Subscription; 1],
+    move_verify: MoveVerify,
+    _observers: [Subscription; 2],
 }
 
 impl UpkeepService {
@@ -315,14 +327,17 @@ impl UpkeepService {
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
-            _observers: [cx.subscribe(&sync, |this, _, event: &SyncEvent, cx| {
-                if this.settings.read(cx).is_shown() {
-                    match event {
-                        SyncEvent::Archived => this.refresh(cx),
-                        SyncEvent::Stored => this.measure(cx),
+            _observers: [
+                cx.subscribe(&sync, |this, _, event: &SyncEvent, cx| {
+                    if this.settings.read(cx).is_shown() {
+                        match event {
+                            SyncEvent::Archived => this.refresh(cx),
+                            SyncEvent::Stored => this.measure(cx),
+                        }
                     }
-                }
-            })],
+                }),
+                cx.observe(&archive, |this, _, cx| this.verify_after_move(cx)),
+            ],
             archive,
             settings: settings.clone(),
             stats: None,
@@ -339,7 +354,52 @@ impl UpkeepService {
             jobs: 0,
             closed: false,
             paused: false,
+            move_verify: MoveVerify::Unasked,
         }
+    }
+
+    /**
+     * Verifies the archive, once it is open, when a move put it where it is and no verify has
+     * ended since (PLAN §4.4). A move verifies its copy as soon as the app is on it, but a quit
+     * during the move's finish quits once the finish is over, before that verify can end, and
+     * a verify stopped keeps nothing: the next start runs it then, in the background, and what
+     * it finds is the move's verify, as it would have been.
+     */
+    fn verify_after_move(&mut self, cx: &mut Context<Self>) {
+        if self.move_verify != MoveVerify::Unasked || self.closed || self.paused {
+            return;
+        }
+        let Some(archive) = self.archive.read(cx).archive().cloned() else {
+            return;
+        };
+        let Some(moved) = self
+            .settings
+            .read(cx)
+            .moved_here(archive.dir())
+            .map(|it| it.at)
+        else {
+            self.move_verify = MoveVerify::Asked;
+            return;
+        };
+        self.move_verify = MoveVerify::Asking;
+        let last = cx.background_spawn(async move { archive.catalogue().last_verify() });
+        cx.spawn(async move |this, cx| {
+            let last = last.await;
+            this.update(cx, |this, cx| {
+                this.move_verify = MoveVerify::Asked;
+                match last {
+                    Ok(last) if last.as_ref().is_none_or(|last| last.at < moved) => {
+                        log::info!("the archive's move wasn't verified; verifying it now");
+                        this.verify(cx);
+                    }
+                    Ok(_) => {}
+                    Err(error) => log::warn!("the archive's last verify couldn't be read: {error}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// How big the archive is, once it has been measured.
@@ -405,6 +465,7 @@ impl UpkeepService {
             )
             && self.verifying.is_none()
             && self.jobs == 0
+            && self.move_verify != MoveVerify::Asking
     }
 
     /// How many sessions are deleted for good now: not those allowed again since.

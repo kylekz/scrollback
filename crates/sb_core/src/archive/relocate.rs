@@ -30,9 +30,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Read, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::PoisonError;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{PoisonError, mpsc};
+use std::thread;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -71,6 +73,29 @@ const MADE: [&str; 5] = [
 
 /// How much is read and written at a time.
 const BUFFER: usize = 256 * 1024;
+
+/**
+ * How many files a move copies at once ([`Move::copy_files`]). A copy waits on the drive more
+ * than on the processor: on Windows on each file's flush and on the antivirus that scans each
+ * file written, which several copies overlap well (robocopy copies 8 at once for the same
+ * reason). APFS puts each file's creation and rename one after another, so on macOS more than
+ * 4 only contend: a move of thousands of generated files ran faster with 4 than with 8.
+ */
+const COPIERS: usize = if cfg!(windows) { 8 } else { 4 };
+
+/// How many copied files can wait for the thread that keeps them ([`Move::copy_files`]):
+/// enough that the copies seldom wait for it.
+const COPIED_WAITING: usize = 64;
+
+/**
+ * What copying a file costs besides its bytes, counted in bytes: opening it, flushing it and
+ * moving it into place take about as long as copying this much does. A move's progress
+ * ([`MoveProgress::fraction`]) weighs its files and their bytes together so: by bytes alone,
+ * the catalogue's backups, a few large files copied first, would fill most of the bar in the
+ * first moments of a copy of thousands of small segments, and by files alone a few large
+ * transcripts would hold it still.
+ */
+const FILE_COST: u64 = 256 * 1024;
 
 /// Why a folder can't take the archive (PLAN §4.4). The app says each in its own words.
 #[derive(Debug, Error)]
@@ -184,8 +209,8 @@ pub struct MovePlan {
     /// What the move needs on the folder's volume: those files, the catalogue and the search
     /// index as big as they are here, and a twentieth more for what syncs add meanwhile.
     pub needed: u64,
-    /// The volume's free space, when it could be told, and the folder it was asked of: the
-    /// nearest there is of the folder and those it is in.
+    /// The free space of the folder's volume, when it could be told, and the volume as the
+    /// owner knows it ([`volume_of`]).
     pub free: Option<u64>,
     pub volume: PathBuf,
 }
@@ -210,6 +235,19 @@ pub struct MoveProgress {
     pub files: usize,
     pub bytes_done: u64,
     pub bytes: u64,
+}
+
+impl MoveProgress {
+    /// How much of its copy is done, from 0 to 1: its files and their bytes weighed together,
+    /// each file as [`FILE_COST`] bytes besides its own.
+    pub fn fraction(&self) -> f64 {
+        let weight = |files: usize, bytes: u64| files as u64 * FILE_COST + bytes;
+        let all = weight(self.files, self.bytes);
+        if all == 0 {
+            return 0.;
+        }
+        weight(self.files_done, self.bytes_done) as f64 / all as f64
+    }
 }
 
 /// What became of a partial copy ([`Move::abandon`], [`clear_move`]).
@@ -310,15 +348,13 @@ impl Archive {
             .map(|metadata| metadata.len())
             .sum::<u64>();
         let needed = (bytes + databases).saturating_add((bytes + databases) / 20);
-        let volume = nearest(&target);
-        let free = disk::free_space(&volume)
+        let there = nearest(&target);
+        let free = disk::free_space(&there)
             .inspect_err(|error| {
-                log::warn!(
-                    "{}'s free space couldn't be read: {error}",
-                    volume.display()
-                );
+                log::warn!("{}'s free space couldn't be read: {error}", there.display());
             })
             .ok();
+        let volume = volume_of(&there);
         room(&volume, free, needed)?;
         Ok(MovePlan {
             made: fs::symlink_metadata(&target).is_err(),
@@ -411,10 +447,10 @@ impl Move {
 
     /**
      * Copies every file of `archive` but the catalogue and `archive.json` into the new folder,
-     * while the archive is in use, telling `progress` after each, until `cancel` stops it
-     * ([`MoveError::Cancelled`]). Each copy is checked against what was read, and a segment's
-     * against the catalogue too. A file that goes before it is read (a delete for good) is
-     * passed over.
+     * while the archive is in use, several at once ([`Move::copy_files`]), telling `progress`
+     * after each, until `cancel` stops it ([`MoveError::Cancelled`]). Each copy is checked
+     * against what was read, and a segment's against the catalogue too. A file that goes before
+     * it is read (a delete for good) is passed over.
      */
     pub fn copy(
         &mut self,
@@ -431,20 +467,22 @@ impl Move {
             ..MoveProgress::default()
         };
         progress(&done);
-        for file in &files {
-            if cancel.is_cancelled() {
-                return Err(MoveError::Cancelled);
-            }
-            if self.copy_file(&archive.dir, file, cancel)?
-                && let Some(&(length, hash)) = recorded.get(&file.relative)
-            {
-                self.check(&file.relative, length, hash)?;
-            }
-            done.files_done += 1;
-            done.bytes_done += file.len;
-            progress(&done);
-            self.step(Step::Copying)?;
+        let (placed, copied) = self.copy_files(
+            &archive.dir,
+            &files.iter().collect::<Vec<_>>(),
+            &recorded,
+            cancel,
+            &mut |file| {
+                done.files_done += 1;
+                done.bytes_done += file.len;
+                progress(&done);
+                self.step(Step::Copying)
+            },
+        );
+        for (relative, placed) in placed {
+            self.keep(relative, placed);
         }
+        copied?;
         self.step(Step::Copied)
     }
 
@@ -526,15 +564,22 @@ impl Move {
             ..MoveProgress::default()
         };
         progress(&done);
-        for file in changed {
-            if cancel.is_cancelled() {
-                return Err(MoveError::Cancelled);
-            }
-            self.copy_file(&archive.dir, file, cancel)?;
-            done.files_done += 1;
-            done.bytes_done += file.len;
-            progress(&done);
+        let (placed, copied) = self.copy_files(
+            &archive.dir,
+            &changed,
+            &BTreeMap::new(),
+            cancel,
+            &mut |file| {
+                done.files_done += 1;
+                done.bytes_done += file.len;
+                progress(&done);
+                Ok(())
+            },
+        );
+        for (relative, placed) in placed {
+            self.keep(relative, placed);
         }
+        copied?;
         self.step(Step::Caught)?;
 
         let place = self.target.join(catalogue::DATABASE);
@@ -547,9 +592,12 @@ impl Move {
             len: metadata.len(),
             modified: metadata.modified().ok(),
         };
-        if !self.copy_file(&archive.dir, &listed, cancel)? {
+        let Some(copied) =
+            self.copy_file(&archive.dir, &listed, None, &|| cancel.is_cancelled())?
+        else {
             return Err(io_error("read", &manifest)(io::ErrorKind::NotFound.into()));
-        }
+        };
+        self.keep(listed.relative, copied);
         self.settle()?;
         self.step(Step::Placed)?;
 
@@ -583,18 +631,96 @@ impl Move {
     }
 
     /**
+     * Copies `files` of the archive's folder `from` into the new folder ([`Move::copy_file`]),
+     * a segment that `recorded` holds checked against it on the way, on [`COPIERS`] threads at
+     * once, and calls `each` on this thread as each is done, in the order they are done. The
+     * first failure (`each`'s among them) or `cancel` stops every thread at its next file, or
+     * at the next read of the file it copies; it is returned once all have stopped, so nothing
+     * is being written in the new folder when this returns and what the move made there can be
+     * removed. Returns what was put in place, which the move keeps ([`Move::keep`]) however it
+     * went, with how it went.
+     *
+     * Each file is flushed before it is moved into place, as one copied alone is. Flushing a
+     * batch of files after they are all in place would be as safe from a crash: nothing in
+     * the new folder is used until the settings name it, which comes after every folder's
+     * entries are flushed ([`Move::settle`]), and a crash before then has the next start
+     * remove the copy whole ([`clear_move`]). But it would flush as many files, and that is
+     * where the time goes on Windows, where each `FlushFileBuffers` waits on the drive; copying
+     * several files at once overlaps those waits instead.
+     */
+    fn copy_files(
+        &self,
+        from: &Path,
+        files: &[&Listed],
+        recorded: &BTreeMap<PathBuf, (u64, Hash)>,
+        cancel: &CancelToken,
+        each: &mut dyn FnMut(&Listed) -> Result<(), MoveError>,
+    ) -> (Vec<(PathBuf, Copied)>, Result<(), MoveError>) {
+        let (next, halted) = (AtomicUsize::new(0), AtomicBool::new(false));
+        let stopped = || cancel.is_cancelled() || halted.load(Ordering::Relaxed);
+        /* Bounded, so that `each` holding this thread (a test's pause) soon holds them all. */
+        let (sender, receiver) = mpsc::sync_channel(COPIED_WAITING);
+        let mut placed = Vec::new();
+        let copied = thread::scope(|scope| {
+            for _ in 0..COPIERS.min(files.len()) {
+                let (sender, next, stopped) = (sender.clone(), &next, &stopped);
+                scope.spawn(move || {
+                    while !stopped() {
+                        let Some(&file) = files.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                            break;
+                        };
+                        let copied = self.copy_file(
+                            from,
+                            file,
+                            recorded.get(&file.relative).copied(),
+                            stopped,
+                        );
+                        if sender.send((file, copied)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(sender);
+            let copied = receiver.iter().try_for_each(|(file, copied)| {
+                if cancel.is_cancelled() {
+                    return Err(MoveError::Cancelled);
+                }
+                if let Some(copied) = copied? {
+                    placed.push((file.relative.clone(), copied));
+                }
+                each(file)
+            });
+            halted.store(true, Ordering::Relaxed);
+            drop(receiver);
+            copied
+        });
+        let copied = copied.and_then(|()| {
+            if cancel.is_cancelled() {
+                Err(MoveError::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        (placed, copied)
+    }
+
+    /**
      * Copies the archive's file `listed`, in its folder `from`, into the new folder: read and
      * hashed into a file in the new folder's `tmp/`, flushed, read back and hashed again, then
-     * moved into its place, over a copy made of it before. Returns whether it was there to
-     * copy. An entry at the top that isn't among those the marker names is left where it is:
-     * the move would not know to remove it again.
+     * moved into its place, over a copy made of it before. A segment the catalogue records as
+     * `recorded` is checked against it as it is read back. Returns the copy, or `None` when the
+     * file wasn't there to copy. An entry at the top that isn't among those the marker names is
+     * left where it is: the move would not know to remove it again. Stops when `stopped` says
+     * so, at the next read ([`MoveError::Cancelled`]).
      */
     fn copy_file(
-        &mut self,
+        &self,
         from: &Path,
         listed: &Listed,
-        cancel: &CancelToken,
-    ) -> Result<bool, MoveError> {
+        recorded: Option<(u64, Hash)>,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<Option<Copied>, MoveError> {
         let top = listed.relative.iter().next().unwrap_or_default();
         if !self.marker.names.iter().any(|name| OsStr::new(name) == top) && top != layout::MANIFEST
         {
@@ -602,19 +728,19 @@ impl Move {
                 "{} appeared in the archive's folder during the move, and stays there",
                 from.join(top).display()
             );
-            return Ok(false);
+            return Ok(None);
         }
         let source = from.join(&listed.relative);
         let mut reader = match disk::retrying(|| File::open(&source)) {
             Ok(reader) => reader,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(io_error("read", &source)(error)),
         };
         let tmp = self.target.join(layout::TMP);
         let mut staged = NamedTempFile::new_in(&tmp).map_err(io_error("write", &tmp))?;
         let (mut hasher, mut buffer, mut len) = (Hasher::new(), vec![0; BUFFER], 0u64);
         loop {
-            if cancel.is_cancelled() {
+            if stopped() {
                 return Err(MoveError::Cancelled);
             }
             let read = match reader.read(&mut buffer) {
@@ -631,45 +757,40 @@ impl Move {
         }
         drop(reader);
         disk::push(staged.as_file()).map_err(io_error("flush", staged.path()))?;
-        let staged = staged.into_temp_path();
+        let (back, checked) =
+            read_back(staged.as_file_mut(), recorded).map_err(io_error("read", staged.path()))?;
         let to = self.target.join(&listed.relative);
-        if hash_file(&staged)? != (len, hasher.finish()) {
+        if back != (len, hasher.finish()) {
             return Err(MoveError::Mismatch(to));
         }
-        if let Some(parent) = listed.relative.parent() {
-            self.make_folders(parent)?;
+        let staged = staged.into_temp_path();
+        if let Some(folder) = to.parent() {
+            disk::retrying(|| fs::create_dir_all(folder)).map_err(io_error("create", folder))?;
         }
         /* A copy there already is the move's own, of the file as it was. */
         if self.copied.contains_key(&listed.relative) {
             remove_file(&to)?;
         }
         disk::place_retrying(staged, &to).map_err(|(error, _)| io_error("store", &to)(error))?;
-        self.copied.insert(
-            listed.relative.clone(),
-            Copied {
-                len: listed.len,
-                modified: listed.modified,
-                checked: None,
-            },
-        );
-        Ok(true)
+        Ok(Some(Copied {
+            len: listed.len,
+            modified: listed.modified,
+            checked,
+        }))
     }
 
-    /// Makes the folder `relative` (to the new folder) and those it is in, keeping each to be
+    /// Keeps `copied` as the copy of the file `relative`, and the folders it is in to be
     /// flushed ([`Move::settle`]).
-    fn make_folders(&mut self, relative: &Path) -> Result<(), MoveError> {
-        let dir = self.target.join(relative);
-        if self.folders.contains(&dir) {
-            return Ok(());
+    fn keep(&mut self, relative: PathBuf, copied: Copied) {
+        if let Some(folder) = relative.parent() {
+            self.folders.extend(
+                folder
+                    .ancestors()
+                    .take_while(|folder| !folder.as_os_str().is_empty())
+                    .map(|folder| self.target.join(folder)),
+            );
         }
-        disk::retrying(|| fs::create_dir_all(&dir)).map_err(io_error("create", &dir))?;
-        self.folders.extend(
-            relative
-                .ancestors()
-                .take_while(|folder| !folder.as_os_str().is_empty())
-                .map(|folder| self.target.join(folder)),
-        );
-        Ok(())
+        self.copied.insert(relative, copied);
     }
 
     /// Makes what was copied durable: the entries of every folder made, and the new folder's.
@@ -969,6 +1090,41 @@ fn nearest(path: &Path) -> PathBuf {
         .to_path_buf()
 }
 
+/// The volume `path` is on, as the owner knows it: its drive (`D:\`), or the share's root.
+#[cfg(windows)]
+pub fn volume_of(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => {
+            PathBuf::from(format!(r"{}\", prefix.as_os_str().to_string_lossy()))
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// The volume `path` is on, as the owner knows it: where it is mounted (`/`, or
+/// `/Volumes/Backup`), the highest folder of `path` on the same device as the nearest of them
+/// there is.
+#[cfg(unix)]
+pub fn volume_of(path: &Path) -> PathBuf {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let device = |folder: &Path| fs::metadata(folder).ok().map(|it| it.dev());
+    let Some((there, on)) = path
+        .ancestors()
+        .find_map(|folder| Some((folder, device(folder)?)))
+    else {
+        return path.to_path_buf();
+    };
+    there
+        .ancestors()
+        .take_while(|folder| device(folder) == Some(on))
+        .last()
+        .unwrap_or(there)
+        .to_path_buf()
+}
+
 /// `database`'s file with `journal`'s suffix (`-wal`, or none).
 fn name_of(database: &str, journal: &str) -> String {
     format!("{database}{journal}")
@@ -1072,21 +1228,53 @@ fn holds(path: &Path, length: u64, hash: Hash) -> Result<bool, MoveError> {
     }
 }
 
-/// How long the file at `path` is, and the hash of its bytes.
-fn hash_file(path: &Path) -> Result<(u64, Hash), MoveError> {
-    let mut file = disk::retrying(|| File::open(path)).map_err(io_error("read", path))?;
-    let (mut hasher, mut buffer, mut len) = (Hasher::new(), vec![0; BUFFER], 0u64);
+/**
+ * Reads `file` back from its start: how long it is and the hash of its bytes, and when it is a
+ * segment the catalogue records as `recorded`, that hash if it holds those bytes. It is read
+ * through the handle it was written with, and once: on Windows each open of a file just
+ * written has an antivirus scan it again.
+ */
+fn read_back(
+    file: &mut File,
+    recorded: Option<(u64, Hash)>,
+) -> io::Result<((u64, Hash), Option<Hash>)> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut back = Hashing {
+        inner: file,
+        hasher: Hasher::new(),
+        len: 0,
+    };
+    let checked = match recorded {
+        Some((length, hash)) => segment::holds_in(&mut back, length, hash)?.then_some(hash),
+        None => None,
+    };
+    /* What the check didn't read, or all of it. */
+    let mut buffer = vec![0; BUFFER];
     loop {
-        let read = match file.read(&mut buffer) {
+        match back.read(&mut buffer) {
             Ok(0) => break,
-            Ok(read) => read,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(io_error("read", path)(error)),
-        };
-        hasher.update(&buffer[..read]);
-        len += read as u64;
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
     }
-    Ok((len, hasher.finish()))
+    Ok(((back.len, back.hasher.finish()), checked))
+}
+
+/// A reader that hashes what is read through it, and counts it.
+struct Hashing<R> {
+    inner: R,
+    hasher: Hasher,
+    len: u64,
+}
+
+impl<R: Read> Read for Hashing<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..read]);
+        self.len += read as u64;
+        Ok(read)
+    }
 }
 
 /// Fails unless every table of the catalogue `copy` has as many rows as the archive's at

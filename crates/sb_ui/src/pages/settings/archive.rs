@@ -22,7 +22,7 @@ use super::{Chosen, SettingsPage, section_head};
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
     ButtonKind, Tone, button, card, chip, copy_tag, icon, info_banner, kv, location_tag,
-    progress_bar, tag, with_numbers,
+    paths_tooltip, progress_bar, tag, with_numbers,
 };
 use crate::format;
 use crate::hostile;
@@ -113,6 +113,7 @@ impl SettingsPage {
                     .child(icon(SbIcon::Archive, theme.sizes.icon_sm, c.fg3))
                     .child(
                         div()
+                            .id("settings-archive-folder")
                             .min_w_0()
                             .text_spec(&theme.text.path)
                             .text_color(c.fg)
@@ -120,6 +121,10 @@ impl SettingsPage {
                             .text_ellipsis_middle()
                             .whitespace_nowrap()
                             .child(dir.display().to_string())
+                            .tooltip(paths_tooltip(
+                                "settings-archive-folder",
+                                std::slice::from_ref(&dir),
+                            ))
                             .automation_target("settings/archive/folder"),
                     )
                     .when(default, |this| {

@@ -728,7 +728,7 @@ fn move_state(state: &MoveState) -> Value {
         MoveState::Refused { folder, why } => json!({
             "state": "refused",
             "to": folder.display().to_string(),
-            "why": why,
+            "why": why.text,
         }),
         MoveState::Asking(plan) => json!({
             "state": "asking",
@@ -771,7 +771,7 @@ fn move_state(state: &MoveState) -> Value {
             } => json!({
                 "state": "failed",
                 "to": to.display().to_string(),
-                "why": why,
+                "why": why.text,
                 "cleared": cleared(what),
             }),
             Ended::CutShort {

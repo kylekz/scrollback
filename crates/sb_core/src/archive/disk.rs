@@ -287,6 +287,52 @@ fn verbatim(path: &Path) -> std::borrow::Cow<'_, Path> {
 }
 
 /**
+ * `path` as the owner writes it, without the `\\?\` that Windows' folder picker gives a long
+ * path and that resolving a path gives any: `\\?\D:\…` is `D:\…`, and `\\?\UNC\server\share`
+ * is `\\server\share`. A path comes in so (the folder picker, Locate, the settings file) and
+ * is kept, shown and compared so; [`verbatim`] puts the prefix back where a call of Windows'
+ * own needs it, and std's calls do that themselves. Elsewhere `\\?\` means nothing, and a path
+ * is as it is.
+ */
+pub fn plain(path: &Path) -> std::borrow::Cow<'_, Path> {
+    #[cfg(windows)]
+    if let Some(plain) = path.to_str().and_then(plain_text) {
+        return std::borrow::Cow::Owned(plain.into());
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
+/**
+ * [`plain`] of the Windows path `text`, when it has a `\\?\` to take away: only from a path on
+ * a drive or a share, and only when taking it away doesn't change which file it names. A
+ * verbatim path is taken as it is, so `/`, `.` and `..`, and a name that ends in a dot or a
+ * space, mean something else without the prefix; such a path is kept verbatim.
+ */
+#[cfg_attr(not(any(windows, test)), expect(dead_code))]
+fn plain_text(text: &str) -> Option<String> {
+    let rest = text.strip_prefix(r"\\?\")?;
+    let plain = match rest.get(..4) {
+        Some(unc) if unc.eq_ignore_ascii_case(r"UNC\") => format!(r"\\{}", &rest[4..]),
+        _ => {
+            let drive = rest.as_bytes();
+            let on_a_drive = drive.len() >= 2
+                && drive[0].is_ascii_alphabetic()
+                && drive[1] == b':'
+                && drive.get(2).is_none_or(|&separator| separator == b'\\');
+            if !on_a_drive {
+                return None;
+            }
+            rest.to_string()
+        }
+    };
+    let names_the_same = !plain.contains('/')
+        && plain.split('\\').skip(1).all(|name| {
+            name != "." && name != ".." && !name.ends_with('.') && !name.ends_with(' ')
+        });
+    names_the_same.then_some(plain)
+}
+
+/**
  * Whether `error` is Windows saying another program has the file open in a way that keeps it
  * from being opened, replaced or removed: an antivirus scanning a file just written, an
  * indexer, a backup tool. It lets go after a moment, so what failed so is tried again
@@ -464,6 +510,49 @@ mod tests {
             let attributes = fs::metadata(&to).unwrap().file_attributes();
             assert_eq!(attributes & FILE_ATTRIBUTE_TEMPORARY, 0);
         }
+    }
+
+    #[test]
+    fn a_path_comes_in_without_its_verbatim_prefix() {
+        let cases = [
+            (r"\\?\D:\scrollback", Some(r"D:\scrollback")),
+            (r"\\?\d:\", Some(r"d:\")),
+            (r"\\?\D:", Some(r"D:")),
+            (
+                r"\\?\UNC\server\share\archive",
+                Some(r"\\server\share\archive"),
+            ),
+            (r"\\?\unc\server\share", Some(r"\\server\share")),
+            /* Without the prefix these name another file, or none. */
+            (r"\\?\D:\a\..\b", None),
+            (r"\\?\D:\a\.\b", None),
+            (r"\\?\D:\a/b", None),
+            (r"\\?\D:\trailing dot.", None),
+            (r"\\?\D:\trailing space ", None),
+            /* Not a drive or a share. */
+            (r"\\?\Volume{0b5c6d1e}\archive", None),
+            (r"\\?\GLOBALROOT\Device\HarddiskVolume1", None),
+            /* No prefix at all. */
+            (r"D:\scrollback", None),
+            (r"\\server\share", None),
+            ("/Users/user/scrollback", None),
+        ];
+        for (text, plain) in cases {
+            assert_eq!(plain_text(text).as_deref(), plain, "{text}");
+        }
+        /* A long one, as the picker gives it past 260 characters. */
+        let long = format!(r"D:\{}\archive", ["folder"; 60].join(r"\"));
+        assert_eq!(plain_text(&format!(r"\\?\{long}")), Some(long));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_plain_path_gets_its_prefix_back_only_where_windows_needs_it() {
+        let long = format!(r"D:\{}\archive", ["folder"; 60].join(r"\"));
+        let prefixed = verbatim(Path::new(&long)).into_owned();
+        assert_eq!(prefixed, Path::new(&format!(r"\\?\{long}")));
+        assert_eq!(plain(&prefixed), Path::new(&long));
+        assert_eq!(verbatim(Path::new(r"D:\short")), Path::new(r"D:\short"));
     }
 
     #[cfg(not(windows))]

@@ -29,7 +29,7 @@
 
 mod moving;
 
-pub use moving::{Ended, MoveState, Running, WAIT_FOR_THE_MOVE};
+pub use moving::{Ended, MoveState, Running, Said, WAIT_FOR_THE_MOVE};
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -178,9 +178,15 @@ pub struct Moved {
     pub at: i64,
 }
 
-/// `value`'s `"v"`, if it is this version's, and its folder `key` as a full path.
+/// `value`'s folder `key` as a full path, [`folder`].
 fn moving_folder(value: &Value, key: &str) -> Option<PathBuf> {
-    let path = PathBuf::from(value.get(key)?.as_str()?);
+    folder(value.get(key)?.as_str()?)
+}
+
+/// A folder the file names, as a full path: without the `\\?\` an earlier version kept from
+/// Windows' folder picker ([`archive::plain`]), so it is written back without it.
+fn folder(text: &str) -> Option<PathBuf> {
+    let path = archive::plain(Path::new(text)).into_owned();
     path.is_absolute().then_some(path)
 }
 
@@ -291,9 +297,9 @@ impl AppSettings {
         }
         if let Some(archive) = object.remove("archive") {
             /* A relative folder would be found from wherever the app was started. */
-            match archive.as_str().map(PathBuf::from) {
-                Some(path) if path.is_absolute() => settings.archive = Some(path),
-                _ => return Err(format!("its archive folder, {archive}, isn't a full path")),
+            match archive.as_str().and_then(folder) {
+                Some(path) => settings.archive = Some(path),
+                None => return Err(format!("its archive folder, {archive}, isn't a full path")),
             }
         }
         let mut read = |key: &str, ok: &mut dyn FnMut(&str) -> bool| {
@@ -976,6 +982,40 @@ mod tests {
         let (read, problems) =
             AppSettings::parse(&json!({"v": 1, "moved": {"v": 2}}).to_string()).unwrap();
         assert_eq!((read.moved, problems.len()), (None, 1));
+    }
+
+    /// A folder an earlier version kept as Windows' folder picker gave it, `\\?\` and all, is
+    /// read without the prefix, and written back so.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_kept_with_its_verbatim_prefix_is_read_without_it() {
+        let text = json!({
+            "v": 1,
+            "archive": r"\\?\D:\scrollback",
+            "move": {
+                "v": 1, "id": "4f1c", "from": r"\\?\C:\archive",
+                "to": r"\\?\UNC\server\share\scrollback", "made": true, "started": 1,
+            },
+            "moved": {"v": 1, "from": r"\\?\C:\archive", "to": r"\\?\D:\scrollback", "at": 1},
+        })
+        .to_string();
+        let (read, problems) = AppSettings::parse(&text).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(read.archive, Some(PathBuf::from(r"D:\scrollback")));
+        let moving = read.moving.as_ref().unwrap();
+        assert_eq!(
+            (moving.from.as_path(), moving.to.as_path()),
+            (
+                Path::new(r"C:\archive"),
+                Path::new(r"\\server\share\scrollback")
+            )
+        );
+        let moved = read.moved.as_ref().unwrap();
+        assert_eq!(
+            (moved.from.as_path(), moved.to.as_path()),
+            (Path::new(r"C:\archive"), Path::new(r"D:\scrollback"))
+        );
+        assert!(!read.to_json().contains(r"\\\\?\\"), "{}", read.to_json());
     }
 
     /// A write of an older snapshot that ends after a newer one (a background save after the

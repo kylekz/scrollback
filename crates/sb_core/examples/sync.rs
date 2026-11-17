@@ -4,8 +4,9 @@
 //! archive, listing what is under its `files/` that the catalogue doesn't record; or sets
 //! that aside; or brings the session index up to date as a start does; or empties it and
 //! builds it again from the archive, and says whether it came back the same; or searches it
-//! (PLAN §10) with the palette's syntax (DESIGN §4.9), printing the results. It prints
-//! totals, and of the archive's own files their paths in it.
+//! (PLAN §10) with the palette's syntax (DESIGN §4.9), printing the results; or moves it into
+//! another folder (PLAN §4.4), timing the copy. It prints totals, and of the archive's own
+//! files their paths in it.
 //!
 //! ```text
 //! cargo run --release -p sb_core --example sync -- <archive folder> [<location>]
@@ -17,11 +18,16 @@
 //! cargo run --release -p sb_core --example sync -- <archive folder> reindex
 //! cargo run --release -p sb_core --example sync -- <archive folder> search <query>
 //! cargo run --release -p sb_core --example sync -- <archive folder> copies
+//! cargo run --release -p sb_core --example sync -- <archive folder> move <empty folder>
 //! ```
 //!
 //! `copies` counts, of the indexed archive, the sessions the library shows, the copies of
 //! sessions that ran elsewhere shown alone, and the copies hidden behind their originals by
 //! how each compares with its original (PLAN §7.7). Counts only.
+//!
+//! `move` copies the archive into the folder and finishes the move there as Settings › Move…
+//! does, with no settings file to point at the copy: the old folder stays as it was, and the
+//! copy is an archive of its own. It prints how many files a second the copy ran at.
 //!
 //! A search prints how many matches it found in how many sessions and how long it took, on
 //! its first line, then each session it found and its first matches.
@@ -59,6 +65,7 @@ const USAGE: &str = "usage: sync <archive folder> [<location>]
        sync <archive folder> verify | set-aside | index | reindex
        sync <archive folder> search <query>
        sync <archive folder> copies
+       sync <archive folder> move <empty folder>
        sync test <location>
        sync distros
 <location>: --wsl <distro> [--home <folder>] | --ssh <host> | --loopback <home folder>";
@@ -339,6 +346,35 @@ fn find(archive: &Archive, input: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Moves `archive` into the folder `to`, timing the copy and the finish.
+fn move_to(archive: &Archive, to: &Path) -> Result<(), Box<dyn Error>> {
+    let plan = archive.plan_move(to)?;
+    println!("moving {} files, {} bytes", plan.files, plan.bytes);
+    let mut moving = archive.start_move(&plan)?;
+    let started = Instant::now();
+    if let Err(error) = moving.copy(archive, &CancelToken::new(), &mut |_| {}) {
+        moving.abandon();
+        return Err(error.into());
+    }
+    let copied = started.elapsed();
+    println!(
+        "copied in {copied:.1?}: {:.0} files a second",
+        plan.files as f64 / copied.as_secs_f64()
+    );
+    let started = Instant::now();
+    match moving.finish(archive, &CancelToken::new(), &mut |_| {}, |_| Ok(())) {
+        Ok(moved) => {
+            moved.wait_for_removals();
+            println!("finished in {:.1?}", started.elapsed());
+            Ok(())
+        }
+        Err(error) => {
+            moving.abandon();
+            Err(error.into())
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (dir, action, place) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
@@ -373,6 +409,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             (dir, action, Place::from(&[])?)
         }
         [dir, "copies"] => return copies(&Archive::open(Path::new(dir))?),
+        [dir, "move", to] => return move_to(&Archive::open(Path::new(dir))?, Path::new(to)),
         [dir, "search", ref query @ ..] => {
             let archive = Archive::open(Path::new(dir))?;
             return find(&archive, &query.join(" "));

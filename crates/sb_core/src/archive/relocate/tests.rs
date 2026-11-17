@@ -308,6 +308,162 @@ fn a_stop_or_a_failure_removes_what_the_move_made_and_nothing_else() {
     assert_whole(&target, totals);
 }
 
+/// [`archive_in`]'s archive with `more` sessions besides its three, closed: enough files that
+/// the copies run side by side.
+fn archive_with(dir: &Path, more: usize) -> PathBuf {
+    let (from, location) = archive_in(dir);
+    let archive = opened(&from);
+    for n in 3..3 + more {
+        let bytes = format!("{{\"more\": {n}}}\n").repeat(40);
+        store(
+            &archive,
+            &location,
+            &format!("projects/{n}.jsonl"),
+            &format!("s{n}"),
+            bytes.as_bytes(),
+        );
+    }
+    from
+}
+
+/// What is in the folder `dir`, by name.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A stop while several files are being copied stops every copy before `copy` returns: nothing
+/// is said or written in the new folder after it, and what was made there is removed whole.
+#[test]
+fn a_stop_while_files_are_copied_side_by_side_stops_them_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let from = archive_with(dir.path(), 60);
+    let before = tree(&from);
+    let archive = opened(&from);
+    let target = dir.path().join("chosen");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join(".DS_Store"), "Finder's").unwrap();
+    let stop = CancelToken::new();
+    let mut moving = moved_into(&archive, &target);
+    let mut told = 0;
+    let stopped = moving.copy(&archive, &stop, &mut |progress| {
+        told = progress.files_done;
+        if progress.files_done == 10 {
+            stop.cancel();
+        }
+    });
+    assert!(matches!(stopped, Err(MoveError::Cancelled)), "{stopped:?}");
+    assert_eq!(told, 10, "nothing is said once stopped");
+    let left = tree(&target);
+    assert!(left.len() < before.len(), "it stopped before the end");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(tree(&target) == left, "nothing is written after it returns");
+    assert_eq!(moving.abandon(), Cleared::Removed);
+    assert_eq!(names_in(&target), [".DS_Store"]);
+    drop(archive);
+    assert!(tree(&from) == before, "the old folder is as it was");
+}
+
+/// Keeps a move from reading the file it is made with until it is dropped: on Windows another
+/// program holds it, and elsewhere its permissions let nobody read it.
+struct Kept {
+    #[cfg(windows)]
+    _held: File,
+    #[cfg(unix)]
+    path: PathBuf,
+}
+
+impl Kept {
+    #[cfg(windows)]
+    fn from(path: &Path) -> Self {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        Self {
+            _held: File::options().read(true).share_mode(0).open(path).unwrap(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn from(path: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Kept {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(&self.path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+}
+
+/**
+ * A file that can't be read fails the copy, naming it, while the others are copied beside it:
+ * every copy stops, and what was made is removed. On Windows another program holds it, which
+ * the copy waits out for a moment first; elsewhere its permissions keep scrollback out.
+ */
+#[test]
+fn a_file_that_cant_be_read_fails_the_copies_side_by_side_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let from = archive_with(dir.path(), 60);
+    let before = tree(&from);
+    let archive = opened(&from);
+    let segments: Vec<PathBuf> = recorded(&archive.catalogue().stored().unwrap())
+        .into_keys()
+        .collect();
+    let held = from.join(&segments[segments.len() / 2]);
+    let target = dir.path().join("moved");
+    let mut moving = moved_into(&archive, &target);
+    let kept = Kept::from(&held);
+    let failed = moving.copy(&archive, &CancelToken::new(), &mut go);
+    drop(kept);
+    assert!(
+        matches!(&failed, Err(MoveError::Held(path) | MoveError::Io { path, .. }) if *path == held),
+        "{failed:?}"
+    );
+    assert_eq!(moving.abandon(), Cleared::Removed);
+    assert!(!target.exists());
+    drop(archive);
+    assert!(tree(&from) == before, "the old folder is as it was");
+}
+
+/// A move's progress weighs files and their bytes together: a few large files copied first
+/// don't fill the bar while thousands of small ones wait.
+#[test]
+fn progress_weighs_the_files_and_their_bytes_together() {
+    let at = |files_done, files, bytes_done, bytes| {
+        MoveProgress {
+            files_done,
+            files,
+            bytes_done,
+            bytes,
+            ..MoveProgress::default()
+        }
+        .fraction()
+    };
+    assert_eq!(at(0, 0, 0, 0), 0.);
+    assert_eq!(at(10, 10, 5_000, 5_000), 1.);
+    /* The catalogue's backups first, 12 of 18 MB, then 393 of 21,263 small segments. */
+    let early = at(393, 21_263, 12_000_000, 18_000_000);
+    assert!(early < 0.03, "{early}");
+    /* Files of a size: the bar follows them, by count or by bytes. */
+    assert!((at(500, 1_000, 500_000, 1_000_000) - 0.5).abs() < 1e-9);
+    /* A large transcript among small ones moves the bar further than one of them does. */
+    assert!(at(1, 100, 50_000_000, 50_100_000) > 0.5);
+    assert!(at(1, 100, 1_000, 50_100_000) < 0.01);
+}
+
 /// What the archive is given while its files are copied is in the copy, and what it lets go
 /// of isn't: the finish copies what changed since, and the catalogue as it is then.
 #[test]

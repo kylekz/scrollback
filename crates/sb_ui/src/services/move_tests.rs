@@ -39,7 +39,7 @@ fn standing(cx: &mut TestAppContext) -> (&'static str, Option<String>) {
     settings(cx).read_with(cx, |settings, _| match settings.move_state() {
         None => ("none", None),
         Some(MoveState::Checking(_)) => ("checking", None),
-        Some(MoveState::Refused { why, .. }) => ("refused", Some(why.clone())),
+        Some(MoveState::Refused { why, .. }) => ("refused", Some(why.text.clone())),
         Some(MoveState::Asking(_)) => ("asking", None),
         Some(MoveState::Running(_)) => ("running", None),
         Some(MoveState::Clearing(_)) => ("clearing", None),
@@ -49,7 +49,7 @@ fn standing(cx: &mut TestAppContext) -> (&'static str, Option<String>) {
                 Ended::Failed { .. } => "failed",
                 Ended::CutShort { .. } => "cut short",
             },
-            Some(ended.words()),
+            Some(ended.words().text),
         ),
     })
 }
@@ -355,4 +355,98 @@ fn a_marker_left_in_the_archive_in_use_is_taken_away_at_the_start(cx: &mut TestA
     settle(cx);
     assert!(!archive.join(sb_core::archive::MARKER).exists());
     cx.update(|cx| assert!(cx.services().archive.read(cx).archive().is_some()));
+}
+
+/**
+ * An archive moved into `to` from the data dir's archive, whole, with the settings file of a
+ * move whose last steps ran: they name `to` and say where the archive was moved from, and the
+ * move ended `ago` milliseconds back. With `verified`, a verify of the copy ended after it.
+ */
+fn moved_before_the_start(data: &Path, to: &Path, ago: i64, verified: bool) {
+    let from = data.join(settings::ARCHIVE_FOLDER);
+    let archive = Archive::create(&from).unwrap();
+    archive
+        .catalogue()
+        .add_location(LocationKind::Local, "This machine")
+        .unwrap();
+    let plan = archive.plan_move(to).unwrap();
+    let mut moving = archive.start_move(&plan).unwrap();
+    moving
+        .copy(&archive, &CancelToken::new(), &mut |_| {})
+        .unwrap();
+    let moved = moving
+        .finish(&archive, &CancelToken::new(), &mut |_| {}, |_| Ok(()))
+        .unwrap();
+    if verified {
+        moved.verify(&CancelToken::new()).unwrap();
+    }
+    std::fs::write(
+        data.join(settings::SETTINGS_FILE),
+        serde_json::json!({
+            "v": 1,
+            "archive": to.display().to_string(),
+            "moved": {
+                "v": 1,
+                "from": from.display().to_string(),
+                "to": to.display().to_string(),
+                "at": crate::format::now() - ago,
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// When the last verify of the archive in use ended, read from its catalogue.
+fn last_verified(cx: &mut TestAppContext) -> Option<i64> {
+    cx.update(|cx| {
+        let archive = cx.services().archive.read(cx).archive().cloned().unwrap();
+        let last = archive.catalogue().last_verify().unwrap();
+        last.map(|last| last.at)
+    })
+}
+
+/// A move quit during its finish quits before the verify of the copy it starts can end: the
+/// next start runs that verify in the background, and keeps it as any other.
+#[gpui::test]
+fn a_move_quit_during_its_finish_is_verified_at_the_next_start(cx: &mut TestAppContext) {
+    let data = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let to = elsewhere.path().join("archive");
+    moved_before_the_start(data.path(), &to, 1_000, false);
+    init_in(data, machine(), cx);
+    settle(cx);
+
+    cx.update(|cx| {
+        let services = cx.services();
+        assert_eq!(services.archive.read(cx).dir(), to);
+        assert!(services.settings.read(cx).moved_here(&to).is_some());
+        let last = services
+            .upkeep
+            .read(cx)
+            .last()
+            .expect("the move's verify ran");
+        assert_eq!((last.damaged_total, last.uncatalogued), (0, 0));
+    });
+    assert!(last_verified(cx).is_some());
+}
+
+/// A start after a move whose verify ended runs none: the move owes nothing.
+#[gpui::test]
+fn a_move_whose_verify_ended_is_not_verified_again(cx: &mut TestAppContext) {
+    let data = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let to = elsewhere.path().join("archive");
+    moved_before_the_start(data.path(), &to, 60_000, true);
+    let verified = Archive::open(&to)
+        .unwrap()
+        .catalogue()
+        .last_verify()
+        .unwrap()
+        .map(|last| last.at);
+    assert!(verified.is_some());
+    init_in(data, machine(), cx);
+    settle(cx);
+    cx.update(|cx| assert_eq!(cx.services().archive.read(cx).dir(), to));
+    assert_eq!(last_verified(cx), verified);
 }

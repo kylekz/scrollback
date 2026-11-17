@@ -25,10 +25,11 @@ use gpui::{AppContext as _, Context, Task};
 use sb_core::CancelToken;
 use sb_core::archive::{
     Archive, ArchiveError, Cleared, Move, MoveError, MovePlan, MoveProgress, MoveStage, Refusal,
-    clear_move, forget_marker, resolved,
+    clear_move, forget_marker, resolved, volume_of,
 };
 
 use super::{AppSettings, Moved, Moving, SettingsService, write_newer};
+use crate::components::path_in_words;
 use crate::format;
 #[cfg(any(test, feature = "automation"))]
 use crate::services::sync::Held;
@@ -37,6 +38,35 @@ use crate::services::{ActiveServices as _, switch};
 /// How often a running move's progress is read.
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
 
+/**
+ * Words that name paths, each as a sentence names it ([`path_in_words`]): a path of hundreds
+ * of characters would fill lines of its own. Where the words are drawn, a tooltip shows the
+ * paths whole, in the order they are named.
+ */
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Said {
+    pub text: String,
+    pub paths: Vec<PathBuf>,
+}
+
+impl Said {
+    /// Words that name no path.
+    fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            paths: Vec::new(),
+        }
+    }
+
+    /// `path` as the words name it, kept whole for the tooltip once however often it is named.
+    fn name(&mut self, path: &Path) -> String {
+        if !self.paths.iter().any(|named| named == path) {
+            self.paths.push(path.to_path_buf());
+        }
+        path_in_words(path)
+    }
+}
+
 /// Where Move… stands.
 pub enum MoveState {
     /// The folder is being looked at and the archive measured.
@@ -44,7 +74,7 @@ pub enum MoveState {
     /// The folder can't take the archive: why, in words.
     Refused {
         folder: PathBuf,
-        why: String,
+        why: Said,
     },
     /// What the move copies and needs, until the owner says yes or no.
     Asking(MovePlan),
@@ -91,7 +121,7 @@ pub enum Ended {
     Failed {
         from: PathBuf,
         to: PathBuf,
-        why: String,
+        why: Said,
         cleared: Cleared,
     },
     /// The app was closed, or the machine stopped, before its last step.
@@ -104,52 +134,53 @@ pub enum Ended {
 
 impl Ended {
     /// How it ended, in a sentence or two (DESIGN §4.13).
-    pub fn words(&self) -> String {
-        let cleared = |cleared: &Cleared, to: &Path| match cleared {
-            Cleared::Removed => format!("what had been copied to {} was removed.", to.display()),
-            Cleared::Partly(_) => format!(
-                "some of what had been copied is still in {}; delete it yourself.",
-                to.display()
-            ),
-            Cleared::Left => format!(
-                "what had been copied was left in {}; delete it yourself.",
-                to.display()
-            ),
-            Cleared::Nothing => "nothing had been copied yet.".to_string(),
-        };
-        match self {
-            Self::Stopped {
-                from,
-                to,
-                cleared: what,
-            } => format!(
+    pub fn words(&self) -> Said {
+        let mut said = Said::default();
+        said.text = match self {
+            Self::Stopped { from, to, cleared } => format!(
                 "The move was stopped. The archive is still in {}, and {}",
-                from.display(),
-                cleared(what, to)
+                said.name(from),
+                what_became(cleared, to, &mut said)
             ),
             Self::Failed {
                 from,
                 to,
                 why,
-                cleared: what,
-            } => format!(
-                "The move didn't finish: {}. The archive is still in {}, as it was, and {}",
-                why.trim_end_matches('.'),
-                from.display(),
-                cleared(what, to)
-            ),
-            Self::CutShort {
-                from,
-                to,
-                cleared: what,
-            } => format!(
+                cleared,
+            } => {
+                said.paths.extend(why.paths.iter().cloned());
+                format!(
+                    "The move didn't finish: {}. The archive is still in {}, as it was, and {}",
+                    why.text.trim_end_matches('.'),
+                    said.name(from),
+                    what_became(cleared, to, &mut said)
+                )
+            }
+            Self::CutShort { from, to, cleared } => format!(
                 "The move to {} didn't finish: scrollback closed before it was done. The \
                  archive stayed in {}, as it was, and {}",
-                to.display(),
-                from.display(),
-                cleared(what, to)
+                said.name(to),
+                said.name(from),
+                what_became(cleared, to, &mut said)
             ),
-        }
+        };
+        said
+    }
+}
+
+/// What became of what a move had copied to `to`, `cleared`, as [`Ended::words`] end.
+fn what_became(cleared: &Cleared, to: &Path, said: &mut Said) -> String {
+    match cleared {
+        Cleared::Removed => format!("what had been copied to {} was removed.", said.name(to)),
+        Cleared::Partly(_) => format!(
+            "some of what had been copied is still in {}; delete it yourself.",
+            said.name(to)
+        ),
+        Cleared::Left => format!(
+            "what had been copied was left in {}; delete it yourself.",
+            said.name(to)
+        ),
+        Cleared::Nothing => "nothing had been copied yet.".to_string(),
     }
 }
 
@@ -190,7 +221,7 @@ impl SettingsService {
         if let Some(why) = self.inside_install(&folder) {
             self.move_state = Some(MoveState::Refused {
                 folder,
-                why: why.to_string(),
+                why: Said::plain(why),
             });
             cx.notify();
             return;
@@ -582,8 +613,9 @@ fn names(path: &Path, folder: &Path) -> bool {
 
 /// Why the archive can't be moved, in the owner's words: never the system's, which stay in the
 /// log.
-fn why_not(error: &MoveError) -> String {
-    match error {
+fn why_not(error: &MoveError) -> Said {
+    let mut said = Said::default();
+    said.text = match error {
         MoveError::Refused(refusal) => match refusal {
             Refusal::Same => "That is the archive's own folder.".to_string(),
             Refusal::Inside => {
@@ -595,7 +627,7 @@ fn why_not(error: &MoveError) -> String {
             }
             Refusal::Nested(other) => format!(
                 "That folder is inside the archive in {}, or holds one.",
-                other.display()
+                said.name(other)
             ),
             Refusal::NotEmpty => {
                 "That folder isn't empty. Choose an empty folder, or make a new one.".to_string()
@@ -611,7 +643,7 @@ fn why_not(error: &MoveError) -> String {
             } => format!(
                 "{} has {} free, and the archive needs about {}. Free some space there, or \
                  choose another drive.",
-                volume_name(volume),
+                said.name(volume),
                 format::size(*free),
                 format::size(*needed)
             ),
@@ -619,17 +651,21 @@ fn why_not(error: &MoveError) -> String {
         MoveError::Held(path) => format!(
             "{} can't be read or written: its permissions don't let scrollback in, or another \
              program holds it (an antivirus scan, perhaps); try again in a moment",
-            path.display()
+            said.name(path)
         ),
-        MoveError::Io { source, path, .. } if source.kind() == io::ErrorKind::StorageFull => {
-            format!("{} is full", volume_name(path))
+        MoveError::Io { source, path, .. }
+        | MoveError::Archive(ArchiveError::Io { source, path, .. })
+            if source.kind() == io::ErrorKind::StorageFull =>
+        {
+            format!("{} is full", said.name(&volume_of(path)))
         }
-        MoveError::Io { action, path, .. } => {
-            format!("scrollback couldn't {action} {}", path.display())
+        MoveError::Io { action, path, .. }
+        | MoveError::Archive(ArchiveError::Io { action, path, .. }) => {
+            format!("scrollback couldn't {action} {}", said.name(path))
         }
         MoveError::Mismatch(path) => format!(
             "the copy of {} didn't hold what was read; the drive may be failing",
-            path.display()
+            said.name(path)
         ),
         MoveError::CatalogueMismatch(_) => "the catalogue's copy didn't match it".to_string(),
         MoveError::Commit(_) => "scrollback's settings couldn't be saved".to_string(),
@@ -637,7 +673,8 @@ fn why_not(error: &MoveError) -> String {
             "another scrollback has that folder open".to_string()
         }
         error => format!("{error}"),
-    }
+    };
+    said
 }
 
 /// Why a change to the archive is refused while it is being moved (DESIGN §4.13): it would be
@@ -648,41 +685,6 @@ pub const WAIT_FOR_THE_MOVE: &str = "Wait for the move to finish.";
 pub const ON_NETWORK: &str = "That folder is on a network drive, where the archive's catalogue \
                               can't be kept safely. Choose a folder on this computer, or on a \
                               drive plugged into it.";
-
-/// The volume `path` is on, as the owner knows it: its drive (`D:\`) on Windows.
-#[cfg(windows)]
-fn volume_name(path: &Path) -> String {
-    use std::path::Component;
-
-    match path.components().next() {
-        Some(Component::Prefix(prefix)) => {
-            format!(r"{}\", prefix.as_os_str().to_string_lossy())
-        }
-        _ => path.display().to_string(),
-    }
-}
-
-/// The volume `path` is on, as the owner knows it: where it is mounted (`/`, or
-/// `/Volumes/Backup`), the highest folder of `path` on the same device as the nearest of them
-/// there is.
-#[cfg(unix)]
-fn volume_name(path: &Path) -> String {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let device = |folder: &Path| std::fs::metadata(folder).ok().map(|it| it.dev());
-    let Some((there, on)) = path
-        .ancestors()
-        .find_map(|folder| Some((folder, device(folder)?)))
-    else {
-        return path.display().to_string();
-    };
-    let mount = there
-        .ancestors()
-        .take_while(|folder| device(folder) == Some(on))
-        .last()
-        .unwrap_or(there);
-    mount.display().to_string()
-}
 
 #[cfg(any(test, feature = "automation"))]
 #[derive(Default)]
@@ -732,5 +734,84 @@ impl Hold {
         state.waiting = false;
         state.releases += 1;
         self.0.1.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+    use crate::components::PATH_IN_WORDS;
+
+    /// A folder past `characters` long.
+    fn deep(characters: usize) -> PathBuf {
+        let mut path = PathBuf::from("/Volumes/Backup/Projects");
+        while path.as_os_str().len() < characters {
+            path.push("a folder");
+        }
+        path
+    }
+
+    /// No path in what a move says runs past [`PATH_IN_WORDS`], each keeps its start and its
+    /// last part, and the paths are kept whole, in order, for the tooltip.
+    #[test]
+    fn what_a_move_says_cuts_each_path_and_keeps_it_whole() {
+        let file = deep(330).join("files/local/agent/ab/0f0f0f0f/v0001/0000000000000000.zst");
+        let (from, to) = (deep(200), deep(278).join("scrollback"));
+        let why = why_not(&MoveError::Held(file.clone()));
+        assert_eq!(why.paths, std::slice::from_ref(&file));
+        assert!(
+            why.text.starts_with("/Volumes/Backup/Projects")
+                && why
+                    .text
+                    .contains("\u{2026}/0000000000000000.zst can't be read"),
+            "{}",
+            why.text
+        );
+        let failed = Ended::Failed {
+            from: from.clone(),
+            to: to.clone(),
+            why,
+            cleared: Cleared::Removed,
+        }
+        .words();
+        assert_eq!(failed.paths, [file, from.clone(), to.clone()]);
+        for path in &failed.paths {
+            assert!(
+                failed.text.contains(&path_in_words(path))
+                    && !failed.text.contains(&path.display().to_string()),
+                "{}",
+                failed.text
+            );
+        }
+        assert!(failed.text.contains("\u{2026}/scrollback was removed."));
+
+        let io = why_not(&MoveError::Io {
+            action: "store",
+            path: deep(300),
+            source: io::ErrorKind::PermissionDenied.into(),
+        });
+        assert!(
+            io.text.starts_with("scrollback couldn't store /Volumes/")
+                && io.text.chars().count() <= "scrollback couldn't store ".len() + PATH_IN_WORDS,
+            "{}",
+            io.text
+        );
+        let nested = why_not(&MoveError::Refused(Refusal::Nested(to.clone())));
+        assert_eq!(nested.paths, [to]);
+        let stopped = Ended::Stopped {
+            from,
+            to: PathBuf::from("/Volumes/Backup/scrollback"),
+            cleared: Cleared::Removed,
+        }
+        .words();
+        assert!(
+            stopped
+                .text
+                .ends_with("copied to /Volumes/Backup/scrollback was removed."),
+            "{}",
+            stopped.text
+        );
     }
 }

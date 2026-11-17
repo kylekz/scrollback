@@ -2,6 +2,7 @@
 //! (`design/project/sb.css` names each in parentheses).
 
 use std::cell::Cell;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -627,12 +628,12 @@ pub fn middle_cut(text: &str, most: usize) -> String {
 }
 
 /**
- * `text`, one line, cut to `room` as `width` measures it: whole where it fits; else its last
- * segment of a path (after the last `/` or `\`) kept whole after an ellipsis, with as much of
- * its start before as fits; else as much of each end as fits either side. It is cut between
- * grapheme clusters, so no character is split.
+ * `text`, one line, cut to `room` as `width` measures it (in pixels, or in characters): whole
+ * where it fits; else its last segment of a path (after the last `/` or `\`) kept whole after
+ * an ellipsis, with as much of its start before as fits; else as much of each end as fits
+ * either side. It is cut between grapheme clusters, so no character is split.
  */
-pub fn fit_path(text: &str, room: Pixels, width: impl Fn(&str) -> Pixels) -> String {
+pub fn fit_path<W: PartialOrd>(text: &str, room: W, width: impl Fn(&str) -> W) -> String {
     if width(text) <= room {
         return text.to_string();
     }
@@ -699,8 +700,39 @@ pub fn whole_tooltip(
     }
 }
 
+/**
+ * What builds a tooltip that shows `paths` whole, one a line ([`whole_tooltip`]): over words
+ * that name them cut ([`path_in_words`]), or over a path cut in its middle. `name` is its debug
+ * selector.
+ */
+pub fn paths_tooltip(
+    name: &'static str,
+    paths: &[PathBuf],
+) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    let whole = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    whole_tooltip(name, move |_| Some(whole.clone()))
+}
+
 /// The widest a tooltip that shows a value whole is ([`whole_tooltip`]).
 pub const WHOLE_TOOLTIP_WIDTH: f32 = 480.;
+
+/// The most characters a path takes in a sentence ([`path_in_words`]).
+pub const PATH_IN_WORDS: usize = 64;
+
+/**
+ * `path` as a sentence names it: at most [`PATH_IN_WORDS`] characters, keeping its start and
+ * its last part, the file or folder it names ([`fit_path`]). A path of hundreds of characters
+ * would otherwise fill lines of its own; where the sentence is drawn, a tooltip has it whole.
+ */
+pub fn path_in_words(path: &Path) -> String {
+    fit_path(&path.display().to_string(), PATH_IN_WORDS, |text| {
+        text.graphemes(true).count()
+    })
+}
 
 /// `text` at most `most` characters long, cut at its end where it is longer: for a name in
 /// a sentence.
@@ -940,6 +972,23 @@ mod tests {
         /* Exactly `most` is whole; past it, as many characters as `most`. */
         assert_eq!(middle_cut("abcdefg", 7), "abcdefg");
         assert_eq!(middle_cut("abcdefgh", 7).chars().count(), 7);
+    }
+
+    /// A path in a sentence keeps its start and the file it names, within [`PATH_IN_WORDS`].
+    #[test]
+    fn a_path_in_words_keeps_its_start_and_its_file() {
+        let short = Path::new(r"D:\scrollback");
+        assert_eq!(path_in_words(short), r"D:\scrollback");
+        let deep = format!(
+            r"D:\Projects\{}\files\local\agent\ab\{}\v0001\0000000000000000.zst",
+            [r"a folder"; 40].join(r"\"),
+            "0f".repeat(16)
+        );
+        assert!(deep.len() > 390);
+        let cut = path_in_words(Path::new(&deep));
+        assert_eq!(cut.chars().count(), PATH_IN_WORDS);
+        assert!(cut.starts_with(r"D:\Projects\a folder"), "{cut}");
+        assert!(cut.ends_with("\u{2026}\\0000000000000000.zst"), "{cut}");
     }
 
     /// A width of 7 a grapheme cluster, as a mono face draws one.

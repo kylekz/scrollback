@@ -28,10 +28,13 @@ use crate::hash::{Hash, Hasher};
  * file that is not a frame, or holds other bytes, does not; one that can't be read is an error.
  */
 pub(super) fn holds(path: &Path, length: u64, hash: Hash) -> io::Result<bool> {
+    holds_in(File::open(path)?, length, hash)
+}
+
+/// [`holds`], of the segment's file that `file` reads from where it is.
+pub(super) fn holds_in(file: impl Read, length: u64, hash: Hash) -> io::Result<bool> {
     let mut bytes = Vec::with_capacity(length.min(SEGMENT_BYTES) as usize + 1);
-    let read = Decoder::new(File::open(path)?)?
-        .take(length + 1)
-        .read_to_end(&mut bytes);
+    let read = Decoder::new(file)?.take(length + 1).read_to_end(&mut bytes);
     match read {
         Ok(_) => Ok(bytes.len() as u64 == length && Hash::of(&bytes) == hash),
         Err(error) if error.raw_os_error().is_some() => Err(error),

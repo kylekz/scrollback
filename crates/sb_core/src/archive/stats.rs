@@ -131,26 +131,14 @@ pub fn resolved(path: &Path) -> PathBuf {
     absolute
         .ancestors()
         .find_map(|there| {
-            let found = plain(fs::canonicalize(there).ok()?);
+            let found = fs::canonicalize(there).ok()?;
+            let found = super::disk::plain(&found).into_owned();
             Some(match absolute.strip_prefix(there) {
                 Ok(rest) if !rest.as_os_str().is_empty() => found.join(rest),
                 _ => found,
             })
         })
         .unwrap_or(absolute)
-}
-
-/// `path` without the `\\?\` that resolving a path with a drive letter gives it on Windows.
-fn plain(path: PathBuf) -> PathBuf {
-    #[cfg(windows)]
-    if let Some(rest) = path
-        .to_str()
-        .and_then(|text| text.strip_prefix(r"\\?\"))
-        .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
-    {
-        return PathBuf::from(rest);
-    }
-    path
 }
 
 /**

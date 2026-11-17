@@ -135,19 +135,24 @@ pub fn reveal(path: &Path, cx: &mut App) {
     }
 }
 
-/// The folder picker: the folder chosen, `None` when cancelled.
+/**
+ * The folder picker: the folder chosen, `None` when cancelled. It comes without the `\\?\`
+ * Windows' picker gives a long path ([`sb_core::archive::plain`]), as the owner would write it
+ * and as everything else keeps paths.
+ */
 pub fn pick_folder(
     prompt: impl Into<SharedString>,
     cx: &mut App,
 ) -> Task<anyhow::Result<Option<PathBuf>>> {
     let prompt = prompt.into();
+    let plain = |folder: PathBuf| sb_core::archive::plain(&folder).into_owned();
     if let Some(answer) = scripted(
         SystemRequest::PickFolder {
             prompt: prompt.clone(),
         },
         cx,
     ) {
-        return Task::ready(Ok(answer));
+        return Task::ready(Ok(answer.map(plain)));
     }
     let chosen = cx.prompt_for_paths(PathPromptOptions {
         files: false,
@@ -155,9 +160,11 @@ pub fn pick_folder(
         multiple: false,
         prompt: Some(prompt),
     });
-    cx.background_spawn(
-        async move { Ok(chosen.await??.and_then(|paths| paths.into_iter().next())) },
-    )
+    cx.background_spawn(async move {
+        Ok(chosen
+            .await??
+            .and_then(|paths| paths.into_iter().next().map(plain)))
+    })
 }
 
 /// Opens a web address in the person's browser. Anything else (`file:`, a custom scheme, a

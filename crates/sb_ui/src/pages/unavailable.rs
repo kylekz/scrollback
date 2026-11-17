@@ -35,7 +35,7 @@ use sb_core::archive::{self, Holds};
 
 use super::states::{alert_tile, state, with_path};
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{ButtonKind, button, icon, kv, with_numbers};
+use crate::components::{ButtonKind, button, icon, kv, path_in_words, paths_tooltip, with_numbers};
 use crate::format;
 use crate::icons::SbIcon;
 use crate::overlay::{self, Layer};
@@ -566,11 +566,13 @@ impl Render for UnavailablePage {
                         )
                     })
                     .child(paragraph(said))
-                    .children(moved.map(|moved| {
+                    .children(moved.map(|(words, path)| {
                         div()
+                            .id("archive-moved")
                             .text_spec(&theme.text.secondary)
                             .text_color(c.fg2)
-                            .child(moved)
+                            .child(words)
+                            .tooltip(paths_tooltip("archive-moved", &[path]))
                             .automation_target("archive/moved")
                     }))
                     .child(buttons)
@@ -594,22 +596,28 @@ impl Render for UnavailablePage {
  * that the archive was moved here, and where the old copy may still be; or that a move from
  * here didn't finish, so the app stayed here.
  */
-fn moved_line(dir: &Path, settings: &SettingsService) -> Option<String> {
+fn moved_line(dir: &Path, settings: &SettingsService) -> Option<(String, PathBuf)> {
     if let Some(moved) = settings.moved_here(dir) {
-        return Some(format!(
-            "Moved here from {} on {}. If you haven't deleted that folder, Use a different \
-             folder… opens the archive there as it was before the move.",
-            moved.from.display(),
-            format::day(moved.at, format::now())
+        return Some((
+            format!(
+                "Moved here from {} on {}. If you haven't deleted that folder, Use a different \
+                 folder… opens the archive there as it was before the move.",
+                path_in_words(&moved.from),
+                format::day(moved.at, format::now())
+            ),
+            moved.from.clone(),
         ));
     }
     match settings.move_state() {
         Some(MoveState::Ended(Ended::CutShort { from, to, .. }))
             if archive::resolved(from) == archive::resolved(dir) =>
         {
-            Some(format!(
-                "A move to {} didn't finish; scrollback stayed on this folder.",
-                to.display()
+            Some((
+                format!(
+                    "A move to {} didn't finish; scrollback stayed on this folder.",
+                    path_in_words(to)
+                ),
+                to.clone(),
             ))
         }
         _ => None,
