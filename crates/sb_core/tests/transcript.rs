@@ -245,7 +245,7 @@ fn an_agent_of_another_shape_parses_into_the_same_model() {
         },
     ];
     assert_eq!(
-        filing::file(&project, &bench.location, &attached).map(|path| path.folder),
+        filing::file(&project, Some(&bench.location), &attached).map(|path| path.folder),
         Some(FolderId(2))
     );
 }

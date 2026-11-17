@@ -295,6 +295,8 @@ fn a_session_says_where_it_started_and_what_it_is_called() {
             project_path: Some(PROJECT.to_string()),
             branch: Some("main".to_string()),
             entrypoint: Some("cli".to_string()),
+            conversation: Some(session.id.clone()),
+            copy: None,
         }
     );
     let conversation = own(&transcript);

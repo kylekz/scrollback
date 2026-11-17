@@ -119,6 +119,69 @@ pub fn locations(tree: &mut ProjectsTree, archive_dir: &Path, scratch: &Path) ->
     Ok(())
 }
 
+/**
+ * Copies of sessions that ran elsewhere (docs/PLAN.md §7.7, DESIGN §4.2.8): an archive in
+ * `archive_dir` with this machine and the distro `Ubuntu-24.04`, each synced from a tree of its
+ * own under `scratch` (removed again). The distro ran a session of which this machine's desktop
+ * app keeps a copy that is further along than the distro's, which synced before it; a Mac that
+ * is no location ran one of which this machine keeps the only copy; and this machine ran one
+ * of its own.
+ */
+pub fn copies(archive_dir: &Path, scratch: &Path) -> Result<()> {
+    let outline = |project, title, prompt, day| Outline {
+        project,
+        title,
+        prompt,
+        model: "claude-opus-5-5",
+        day: (2026, 11, day),
+        calls: 3,
+    };
+    let mut here = ProjectsTree::in_home(&scratch.join("here"));
+    here.outlined(&outline(
+        "/home/user/notes",
+        "Summarise this week's notes",
+        "Read the notes from this week and write a summary for Friday.",
+        6,
+    ));
+    let mut distro = ProjectsTree::in_home(&scratch.join("distro"));
+    let ran = distro.outline(&outline(
+        "/home/user/code/server",
+        "Add retries to the fetcher",
+        "Retry a failed fetch three times with backoff before giving up.",
+        12,
+    ));
+    let mut copy = here.desktop_copy(&ran);
+    copy.transcript.set_time("2026-11-12T13:00:00.000Z");
+    copy.transcript.prompt("And log each retry with its delay.");
+    copy.transcript.reply("Each retry is logged now.");
+    let mut mac = ProjectsTree::in_home(&scratch.join("mac"));
+    let lone = mac.outline(&outline(
+        "/Users/user/code/blog",
+        "Rework the blog's header",
+        "Make the header sticky and shrink it on scroll.",
+        9,
+    ));
+    here.desktop_copy(&lone);
+
+    let archive = Archive::create(archive_dir)?;
+    for (kind, name, tree) in [
+        (LocationKind::Local, "This PC", &here),
+        (
+            LocationKind::Wsl {
+                distro: "Ubuntu-24.04".to_string(),
+            },
+            "Ubuntu-24.04",
+            &distro,
+        ),
+    ] {
+        let location = archive.catalogue().add_location(kind, name)?;
+        synced(&archive, &location.id, &tree.transport())?;
+    }
+    drop(archive);
+    std::fs::remove_dir_all(scratch)?;
+    Ok(())
+}
+
 /// The catalogue's file in an archive's folder (PLAN §4.1).
 const CATALOGUE: &str = "scrollback.db";
 

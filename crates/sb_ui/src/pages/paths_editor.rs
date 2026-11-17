@@ -28,7 +28,7 @@ use sb_core::location::LocationId;
 
 use crate::actions::sessions::{CancelPaths, SavePaths};
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{ButtonKind, Tone, button, icon, icon_button, location_tag, tag};
+use crate::components::{ButtonKind, Tone, button, copy_tag, icon, icon_button, location_tag, tag};
 use crate::format;
 use crate::icons::SbIcon;
 use crate::keymap;
@@ -368,7 +368,7 @@ impl PathsEditor {
         let moved: Vec<&Fileable> = (read.fileable.iter())
             .filter(|session| session.folder != Some(self.folder))
             .filter(|session| {
-                filing::file(&session.project, &session.location, &after) == Some(&added)
+                filing::file(&session.project, session.location.as_ref(), &after) == Some(&added)
             })
             .collect();
         let unsorted = moved
@@ -391,10 +391,11 @@ impl PathsEditor {
         let path = &self.kept[at].path.attached;
         let freed: Vec<Option<FolderId>> = (read.fileable.iter())
             .filter(|session| {
-                filing::file(&session.project, &session.location, &before) == Some(path)
+                filing::file(&session.project, session.location.as_ref(), &before) == Some(path)
             })
             .map(|session| {
-                filing::file(&session.project, &session.location, &after).map(|it| it.folder)
+                filing::file(&session.project, session.location.as_ref(), &after)
+                    .map(|it| it.folder)
             })
             .filter(|to| *to != Some(self.folder))
             .collect();
@@ -417,9 +418,10 @@ impl PathsEditor {
         let after = self.after(cx);
         let (mut into, mut from_unsorted, mut out, mut to_unsorted) = (0, 0, 0, 0);
         for session in &read.fileable {
-            let to = filing::file(&session.project, &session.location, &after).map(|it| it.folder);
-            let was =
-                filing::file(&session.project, &session.location, &before).map(|it| it.folder);
+            let to = filing::file(&session.project, session.location.as_ref(), &after)
+                .map(|it| it.folder);
+            let was = filing::file(&session.project, session.location.as_ref(), &before)
+                .map(|it| it.folder);
             if to == Some(self.folder) && was != Some(self.folder) {
                 into += 1;
                 from_unsorted += usize::from(was.is_none());
@@ -517,6 +519,15 @@ impl PathsEditor {
         .collect()
     }
 
+    /// The tag of a path sessions recorded: its location's, or for copies of sessions that ran
+    /// elsewhere, what they are copies as (PLAN §7.7).
+    fn seen_tag(&self, seen: &ProjectPath, theme: &SbTheme, cx: &App) -> AnyElement {
+        match &seen.copy {
+            Some(copy) => copy_tag(copy, false, theme).into_any_element(),
+            None => self.scope_tag(seen.location.as_ref(), theme, cx),
+        }
+    }
+
     /// A path's scope as a tag: its location's, or "any location".
     fn scope_tag(&self, location: Option<&LocationId>, theme: &SbTheme, cx: &App) -> AnyElement {
         match location.and_then(|it| self.sync.read(cx).location(it)) {
@@ -566,7 +577,7 @@ impl PathsEditor {
                         .any(|kept| kept.path.attached.path.contains(&seen.project))
             })
             .filter(|seen| {
-                self.refusal(&(seen.recorded.clone(), Some(seen.location.clone())), cx)
+                self.refusal(&(seen.recorded.clone(), seen.location.clone()), cx)
                     .is_none()
             })
             .take(SUGGESTIONS)
@@ -583,11 +594,14 @@ impl PathsEditor {
                     && filing::as_typed(&seen.recorded) != kept.path.typed
             })
             .max_by_key(|seen| seen.sessions)?;
-        let location = self.sync.read(cx).location(&other.location)?;
+        let from = match (&other.location, &other.copy) {
+            (Some(location), _) => &self.sync.read(cx).location(location)?.name,
+            (None, copy) => copy.as_ref()?,
+        };
         Some(format!(
             "{} of them from {} as {}",
             format::count(other.sessions as u64),
-            location.name,
+            from,
             other.recorded
         ))
     }
@@ -784,7 +798,7 @@ impl Render for PathsEditor {
                                     .rounded(theme.radii.control)
                                     .cursor_pointer()
                                     .hover(|style| style.bg(c.s3))
-                                    .child(self.scope_tag(Some(&seen.location), &theme, cx))
+                                    .child(self.seen_tag(&seen, &theme, cx))
                                     .child(
                                         div()
                                             .flex_1()
@@ -861,7 +875,7 @@ impl Render for PathsEditor {
                         .take(3)
                         .enumerate()
                         .map(|(at, seen)| {
-                            let path = (seen.recorded.clone(), Some(seen.location.clone()));
+                            let path = (seen.recorded.clone(), seen.location.clone());
                             div()
                                 .flex()
                                 .items_center()
@@ -877,7 +891,7 @@ impl Render for PathsEditor {
                                         .font_weight(theme.text.control.weight)
                                         .child("Suggested from Unsorted"),
                                 )
-                                .child(self.scope_tag(Some(&seen.location), &theme, cx))
+                                .child(self.seen_tag(&seen, &theme, cx))
                                 .child(
                                     div()
                                         .flex_1()
@@ -1130,7 +1144,7 @@ impl Render for PathsEditor {
                             crate::components::overline("Suggested from Unsorted", &theme),
                         ))
                         .children(suggestions.into_iter().enumerate().map(|(at, seen)| {
-                            let path = (seen.recorded.clone(), Some(seen.location.clone()));
+                            let path = (seen.recorded.clone(), seen.location.clone());
                             div()
                                 .flex()
                                 .items_center()
@@ -1152,7 +1166,7 @@ impl Render for PathsEditor {
                                     }))
                                     .automation_target(format!("paths/suggested/{at}")),
                                 )
-                                .child(self.scope_tag(Some(&seen.location), &theme, cx))
+                                .child(self.seen_tag(&seen, &theme, cx))
                                 .child(
                                     div()
                                         .flex_1()

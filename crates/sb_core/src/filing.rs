@@ -200,7 +200,9 @@ pub struct AttachedPath {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fileable {
     pub project: NormalPath,
-    pub location: LocationId,
+    /// The location it ran at; `None` for a copy of a session that ran elsewhere (PLAN §7.7),
+    /// which only a path attached for every location claims.
+    pub location: Option<LocationId>,
     /// The folder the rules have it in; `None` in Unsorted.
     pub folder: Option<FolderId>,
 }
@@ -210,10 +212,12 @@ pub struct Fileable {
  * (PLAN §8). The candidates are the attached paths that contain the project path and are for
  * this location or for all; the longest wins, so a subfolder's more specific path claims a
  * session before its parent's. Of the same path attached twice, the one for this location wins.
+ * A session with no location (a copy of one that ran elsewhere, PLAN §7.7) is claimed only by
+ * paths attached for all.
  */
 pub fn file<'a>(
     project: &NormalPath,
-    location: &LocationId,
+    location: Option<&LocationId>,
     attached: &'a [AttachedPath],
 ) -> Option<&'a AttachedPath> {
     attached
@@ -223,7 +227,7 @@ pub fn file<'a>(
                 && candidate
                     .location
                     .as_ref()
-                    .is_none_or(|only| only == location)
+                    .is_none_or(|only| Some(only) == location)
         })
         /* Every candidate is a prefix of the one project path, so the longest text has the
         most components. */
@@ -450,11 +454,11 @@ mod tests {
             (plain(r"D:\Projects\apple"), &pc, None),
         ] {
             assert_eq!(
-                file(&project, location, &attached).map(|path| path.folder),
+                file(&project, Some(location), &attached).map(|path| path.folder),
                 folder.map(FolderId),
                 "{project:?}"
             );
         }
-        assert_eq!(file(&plain("/home/user/code/app"), &pc, &[]), None);
+        assert_eq!(file(&plain("/home/user/code/app"), Some(&pc), &[]), None);
     }
 }

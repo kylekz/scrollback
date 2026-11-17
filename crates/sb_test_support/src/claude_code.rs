@@ -169,9 +169,50 @@ impl ProjectsTree {
         self.set_modified(key, SystemTime::now() - ago);
     }
 
+    /**
+     * Copies `session`, of another tree, into this one as the Claude desktop app keeps a
+     * session it ran on that tree's machine over SSH (PLAN §7.3): in a project folder of its
+     * own, `ssh-<id>`, its transcript under the session's id and its subagents' transcripts
+     * loose beside it, without their metadata. The copy can be written on after, as when the
+     * original's location has not synced since.
+     */
+    pub fn desktop_copy(&mut self, session: &Session) -> DesktopCopy {
+        self.sessions += 1;
+        let folder = format!("ssh-00000000-0000-4000-9000-{:012x}", self.sessions);
+        let key = format!("projects/{folder}/{}.jsonl", session.id);
+        let transcript = session.transcript.copied_to(self.path(&key));
+        let mut subagents = Vec::new();
+        let mut within = vec![session.root.join(&session.dir).join("subagents")];
+        while let Some(dir) = within.pop() {
+            for entry in fs::read_dir(&dir).into_iter().flatten() {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                if path.is_dir() {
+                    within.push(path);
+                } else if name.starts_with("agent-") && name.ends_with(".jsonl") {
+                    let key = format!("projects/{folder}/{name}");
+                    write(&self.path(&key), &fs::read(&path).unwrap());
+                    subagents.push(key);
+                }
+            }
+        }
+        subagents.sort();
+        DesktopCopy {
+            folder,
+            key,
+            transcript,
+            subagents,
+        }
+    }
+
     /// Writes the session `outline` describes: its prompt, one reply with its tool calls, and
     /// its title. Returns the provider's id for the session.
     pub fn outlined(&mut self, outline: &Outline) -> String {
+        self.outline(outline).session_key().to_string()
+    }
+
+    /// [`ProjectsTree::outlined`], returning the session, to be written on.
+    pub fn outline(&mut self, outline: &Outline) -> Session {
         let mut session = self.session(outline.project, 0);
         let (year, month, day) = outline.day;
         let at = |hour: u32| format!("{year:04}-{month:02}-{day:02}T{hour:02}:00:00.000Z");
@@ -196,8 +237,20 @@ impl ProjectsTree {
             json!({ "timestamp": at(12) }),
         );
         session.transcript.title(outline.title);
-        session.session_key().to_string()
+        session
     }
+}
+
+/// The desktop app's copy of a session ([`ProjectsTree::desktop_copy`]).
+pub struct DesktopCopy {
+    /// Its folder under `projects/`, which is the provider's id for it.
+    pub folder: String,
+    /// Its transcript's key.
+    pub key: String,
+    /// Its transcript, to write on as the original would have been.
+    pub transcript: Records,
+    /// Its subagents' transcripts' keys.
+    pub subagents: Vec<String>,
 }
 
 /// A session as the library shows one: where it started, what it is called and asked, the
@@ -573,6 +626,23 @@ impl Records {
             parent: None,
             unanswered: None,
             clock: None,
+        }
+    }
+
+    /// The transcript copied to `path` as it is now, to be written on as this one would be.
+    fn copied_to(&self, path: PathBuf) -> Self {
+        write(&path, &fs::read(&self.path).unwrap());
+        Self {
+            path,
+            session: self.session.clone(),
+            project: self.project.clone(),
+            agent: self.agent.clone(),
+            prefix: self.prefix,
+            written: self.written,
+            filled: self.filled,
+            parent: self.parent.clone(),
+            unanswered: self.unanswered.clone(),
+            clock: self.clock.clone(),
         }
     }
 

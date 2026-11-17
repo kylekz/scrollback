@@ -190,6 +190,21 @@ pub struct Facts {
     pub branch: Option<String>,
     /// How the agent was started (its command line, a desktop app), in its own word.
     pub entrypoint: Option<String>,
+    /// The agent's own id for the conversation, which every copy of it shares wherever it is
+    /// kept (PLAN §7.7); `None` when the session's items don't say.
+    pub conversation: Option<String>,
+    /// The session is a copy of one that ran on another machine, kept by another app.
+    pub copy: Option<CopyOf>,
+}
+
+/// What the provider says of a copy of a session that ran elsewhere (PLAN §7.7), in words the
+/// library shows as they are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyOf {
+    /// What the copy is, shown where a location would be: "Some App's copy".
+    pub label: String,
+    /// Where the session ran, as far as the copy says: "Ran over SSH; …".
+    pub origin: String,
 }
 
 /// A block's place in its conversation's [`Conversation::blocks`].

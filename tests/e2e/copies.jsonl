@@ -1,0 +1,55 @@
+{"scenario": {"window_size": "1440x900", "fixture": "copies", "description": "Copies of sessions that ran elsewhere (DESIGN §4.2.8, PLAN §7.7): a lone copy's card, Unsorted group and facts carry the copy tag and never This PC's; an original whose copy is further along says so in its facts and opens the copy, whose facts link back; dark and light at 1440x900"}}
+{"cmd": "wait_ready", "timeout_ms": 60000}
+{"cmd": "settle", "timeout_ms": 60000, "expect": [{"pointer": "/library/counts/all", "equals": 3}, {"pointer": "/library/counts/unsorted", "equals": 3}]}
+{"cmd": "set_appearance", "material": "opaque", "expect_result": {"pointer": "/resolved/material", "equals": "opaque"}}
+{"cmd": "pin_appearance", "appearance": "dark", "expect_result": {"pointer": "/resolved/appearance", "equals": "dark"}}
+
+// Three sessions, each once: the distro's, the Mac's copy, and this machine's own.
+{"cmd": "click", "target": "sidebar/all-sessions"}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 3}}
+{"cmd": "screenshot", "name": "copies-cards-1440-dark"}
+{"cmd": "click", "target": "sidebar/unsorted"}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "unsorted"}, {"pointer": "/library/groups", "equals": 3}]}
+{"cmd": "screenshot", "name": "copies-unsorted-1440-dark"}
+
+// The original, whose copy is longer: flagged, with Read the copy.
+{"cmd": "click", "target": "sidebar/all-sessions"}
+{"cmd": "settle", "expect": {"pointer": "/library/sessions", "equals": 3}}
+{"cmd": "click", "target": "card/0/title"}
+{"cmd": "settle", "expect": {"pointer": "/library/open", "equals": "Add retries to the fetcher"}}
+{"cmd": "bounds", "target": "reader/facts/copy/0", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "bounds", "target": "reader/facts/read-copy/0", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "copies-original-1440-dark"}
+
+// The copy, read from there: its facts say whose copy it is and link back.
+{"cmd": "click", "target": "reader/facts/read-copy/0"}
+{"cmd": "settle", "expect": {"pointer": "/library/open", "equals": "Add retries to the fetcher"}}
+{"cmd": "bounds", "target": "reader/facts/original", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "copies-copy-read-1440-dark"}
+{"cmd": "click", "target": "reader/facts/original"}
+{"cmd": "settle"}
+{"cmd": "bounds", "target": "reader/facts/read-copy/0", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "key", "keystroke": "alt-left"}
+{"cmd": "settle", "expect": {"pointer": "/page", "equals": "sessions"}}
+
+// The lone copy: from no location, kept on This PC.
+{"cmd": "click", "target": "card/1/title"}
+{"cmd": "settle", "expect": {"pointer": "/library/open", "equals": "Rework the blog's header"}}
+{"cmd": "bounds", "target": "reader/facts/copy", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "copies-lone-1440-dark"}
+
+// Light.
+{"cmd": "pin_appearance", "appearance": "light", "expect_result": {"pointer": "/resolved/appearance", "equals": "light"}}
+{"cmd": "settle"}
+{"cmd": "screenshot", "name": "copies-lone-1440-light"}
+{"cmd": "key", "keystroke": "alt-left"}
+{"cmd": "settle", "expect": {"pointer": "/page", "equals": "sessions"}}
+{"cmd": "screenshot", "name": "copies-cards-1440-light"}
+{"cmd": "click", "target": "card/0/title"}
+{"cmd": "settle", "expect": {"pointer": "/library/open", "equals": "Add retries to the fetcher"}}
+{"cmd": "bounds", "target": "reader/facts/read-copy/0", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "copies-original-1440-light"}
+{"cmd": "key", "keystroke": "alt-left"}
+{"cmd": "click", "target": "sidebar/unsorted"}
+{"cmd": "settle", "expect": [{"pointer": "/page", "equals": "unsorted"}, {"pointer": "/library/groups", "equals": 3}]}
+{"cmd": "screenshot", "name": "copies-unsorted-1440-light"}

@@ -50,6 +50,27 @@ pub struct Deletion {
     /// Some item of it is still at its location, as far as the last sync there saw: when none
     /// is, this is the last copy.
     pub at_location: bool,
+    /// The copies of it kept elsewhere that go with it (PLAN §4.5, §7.7), which would
+    /// otherwise be shown in its place.
+    pub copies: Vec<CopyDeletion>,
+}
+
+/// A copy of a session that is deleted for good with it ([`Deletion::copies`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyDeletion {
+    pub session: SessionId,
+    /// What it is a copy as, in the provider's words.
+    pub label: String,
+    /// Its items, and what is archived of them, every version, uncompressed.
+    pub files: usize,
+    pub bytes: u64,
+}
+
+impl Deletion {
+    /// The sessions it deletes: the one asked, then its copies.
+    pub fn sessions(&self) -> impl Iterator<Item = &SessionId> {
+        std::iter::once(&self.session).chain(self.copies.iter().map(|copy| &copy.session))
+    }
 }
 
 /// A session deleted for good, which sync does not archive again until this is removed.
@@ -230,85 +251,12 @@ impl Catalogue {
      * [`CatalogueError::DeletionChanged`], and nothing is deleted.
      */
     pub(crate) fn delete_for_good(&self, shown: &Deletion) -> Result<()> {
-        let id = &shown.session;
         self.db.write(|tx| {
-            if deletion(tx, id)? != *shown {
-                return Err(CatalogueError::DeletionChanged(id.clone()));
+            if deletion(tx, &shown.session)? != *shown {
+                return Err(CatalogueError::DeletionChanged(shown.session.clone()));
             }
-            let identity = params![id.location, id.provider, id.key];
-            let items: Vec<(i64, String, String)> = tx
-                .prepare(
-                    "SELECT id, key, item_id FROM item
-                     WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
-                )?
-                .query_map(identity, |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            let (project_path, started, ended): (Option<String>, Option<i64>, Option<i64>) = tx
-                .query_row(
-                    "SELECT project_path, started_at, ended_at FROM session
-                     WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
-                    identity,
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?
-                .unwrap_or_default();
-            tx.execute(
-                "INSERT INTO tombstone (location_id, provider, session, deleted_at, project_path,
-                                        started_at, ended_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT (location_id, provider, session) DO UPDATE SET
-                     deleted_at = excluded.deleted_at, project_path = excluded.project_path,
-                     started_at = excluded.started_at, ended_at = excluded.ended_at",
-                params![
-                    id.location,
-                    id.provider,
-                    id.key,
-                    now_ms(),
-                    project_path,
-                    started,
-                    ended
-                ],
-            )?;
-            tx.execute(
-                "INSERT OR IGNORE INTO text_gone (location_id, provider, session)
-                 VALUES (?1, ?2, ?3)",
-                identity,
-            )?;
-            for forget in [
-                "DELETE FROM session WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
-                "DELETE FROM session_state
-                 WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
-            ] {
-                tx.execute(forget, identity)?;
-            }
-            for (item, key, folder) in &items {
-                tx.execute(
-                    "INSERT INTO removal (location_id, provider, folder, version, offset, length,
-                                          hash)
-                     SELECT ?1, ?2, ?3, NULL, NULL, NULL, NULL
-                     UNION ALL
-                     SELECT ?1, ?2, ?3, v.number, s.offset, s.length, s.hash FROM version v
-                     JOIN segment s ON s.version_id = v.id WHERE v.item_id = ?4",
-                    params![id.location, id.provider, folder, item],
-                )?;
-                tx.execute(
-                    "INSERT OR REPLACE INTO tombstone_item (location_id, provider, key, session)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![id.location, id.provider, key, id.key],
-                )?;
-                for forget in [
-                    "DELETE FROM reading_choice WHERE item_id = ?1",
-                    "DELETE FROM segment
-                     WHERE version_id IN (SELECT id FROM version WHERE item_id = ?1)",
-                    "DELETE FROM version WHERE item_id = ?1",
-                    "DELETE FROM item WHERE id = ?1",
-                ] {
-                    tx.execute(forget, [item])?;
-                }
-                tx.execute(
-                    "DELETE FROM waiting WHERE location_id = ?1 AND provider = ?2 AND key = ?3",
-                    params![id.location, id.provider, key],
-                )?;
+            for id in shown.sessions() {
+                forget(tx, id)?;
             }
             Ok(())
         })
@@ -563,6 +511,90 @@ impl Catalogue {
     }
 }
 
+/**
+ * Deletes the session `id` for good in the transaction `tx`: its items' rows and its own, and
+ * what the owner decided about it; a tombstone in their place; and the removal of its files,
+ * recorded as pending.
+ */
+fn forget(tx: &rusqlite::Connection, id: &SessionId) -> Result<()> {
+    let identity = params![id.location, id.provider, id.key];
+    let items: Vec<(i64, String, String)> = tx
+        .prepare(
+            "SELECT id, key, item_id FROM item
+             WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+        )?
+        .query_map(identity, |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let (project_path, started, ended): (Option<String>, Option<i64>, Option<i64>) = tx
+        .query_row(
+            "SELECT project_path, started_at, ended_at FROM session
+             WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+            identity,
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?
+        .unwrap_or_default();
+    tx.execute(
+        "INSERT INTO tombstone (location_id, provider, session, deleted_at, project_path,
+                                started_at, ended_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT (location_id, provider, session) DO UPDATE SET
+             deleted_at = excluded.deleted_at, project_path = excluded.project_path,
+             started_at = excluded.started_at, ended_at = excluded.ended_at",
+        params![
+            id.location,
+            id.provider,
+            id.key,
+            now_ms(),
+            project_path,
+            started,
+            ended
+        ],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO text_gone (location_id, provider, session)
+         VALUES (?1, ?2, ?3)",
+        identity,
+    )?;
+    for forget in [
+        "DELETE FROM session WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+        "DELETE FROM session_state
+         WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+    ] {
+        tx.execute(forget, identity)?;
+    }
+    for (item, key, folder) in &items {
+        tx.execute(
+            "INSERT INTO removal (location_id, provider, folder, version, offset, length,
+                                  hash)
+             SELECT ?1, ?2, ?3, NULL, NULL, NULL, NULL
+             UNION ALL
+             SELECT ?1, ?2, ?3, v.number, s.offset, s.length, s.hash FROM version v
+             JOIN segment s ON s.version_id = v.id WHERE v.item_id = ?4",
+            params![id.location, id.provider, folder, item],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO tombstone_item (location_id, provider, key, session)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id.location, id.provider, key, id.key],
+        )?;
+        for forget in [
+            "DELETE FROM reading_choice WHERE item_id = ?1",
+            "DELETE FROM segment
+             WHERE version_id IN (SELECT id FROM version WHERE item_id = ?1)",
+            "DELETE FROM version WHERE item_id = ?1",
+            "DELETE FROM item WHERE id = ?1",
+        ] {
+            tx.execute(forget, [item])?;
+        }
+        tx.execute(
+            "DELETE FROM waiting WHERE location_id = ?1 AND provider = ?2 AND key = ?3",
+            params![id.location, id.provider, key],
+        )?;
+    }
+    Ok(())
+}
+
 /// When the session went to Trash, if it is there.
 pub(super) fn trashed_at(connection: &rusqlite::Connection, id: &SessionId) -> Result<Option<i64>> {
     Ok(connection
@@ -595,12 +627,50 @@ fn deletion(connection: &rusqlite::Connection, id: &SessionId) -> Result<Deletio
     if files == 0 {
         return Err(CatalogueError::NoSession(id.clone()));
     }
+    /* The copies of its conversation, when no other original of it is left to be shown in
+    their place (PLAN §4.5). */
+    let copies = connection
+        .prepare(
+            "SELECT o.location_id, o.provider, o.session, o.copy_label,
+                    (SELECT count(*) FROM item i
+                     WHERE i.location_id = o.location_id AND i.provider = o.provider
+                       AND i.session = o.session),
+                    (SELECT COALESCE(sum(v.length), 0) FROM item i JOIN version v ON v.item_id = i.id
+                     WHERE i.location_id = o.location_id AND i.provider = o.provider
+                       AND i.session = o.session)
+             FROM session s
+             JOIN session o
+               ON o.provider = s.provider AND o.conversation = s.conversation
+              AND o.project_path IS s.project_path AND o.id <> s.id
+              AND o.copy_label IS NOT NULL
+             WHERE s.location_id = ?1 AND s.provider = ?2 AND s.session = ?3
+               AND NOT EXISTS (
+                   SELECT 1 FROM session x
+                   WHERE x.provider = s.provider AND x.conversation = s.conversation
+                     AND x.project_path IS s.project_path AND x.id <> s.id
+                     AND x.copy_label IS NULL)
+             ORDER BY o.location_id, o.session",
+        )?
+        .query_map(params![id.location, id.provider, id.key], |row| {
+            Ok(CopyDeletion {
+                session: SessionId {
+                    location: row.get(0)?,
+                    provider: row.get(1)?,
+                    key: row.get(2)?,
+                },
+                label: row.get(3)?,
+                files: row.get(4)?,
+                bytes: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
     Ok(Deletion {
         session: id.clone(),
         files,
         versions,
         bytes,
         at_location,
+        copies,
     })
 }
 

@@ -1,12 +1,13 @@
 //! What the library reads (PLAN §8, DESIGN §4.1, §4.4–§4.6): the counts beside the sidebar's
 //! rows, and the sessions of a page. Only indexed sessions are counted and listed; one whose
-//! row is missing appears once it is indexed.
+//! row is missing appears once it is indexed. A conversation archived more than once (an
+//! original and copies of it kept elsewhere) is counted and listed once ([`SHOWN`], PLAN §7.7).
 
 use std::collections::HashMap;
 
 use toolbox_store::rusqlite::{self, ToSql, params_from_iter};
 
-use super::session::{BY_ACTIVITY, SESSION, session_from};
+use super::session::{BY_ACTIVITY, RAN_AT, SESSION, SHOWN, session_from};
 use super::{Catalogue, Result, Session, SessionId};
 use crate::filing::{self, FolderId, NormalPath};
 use crate::location::LocationId;
@@ -48,8 +49,11 @@ pub struct PathGroup {
     /// The path, as filing compares paths; `None` for the sessions that recorded none, or one
     /// that names no directory, which no folder can claim.
     pub project: Option<NormalPath>,
-    /// The locations its sessions are from: one, unless the path is a drive's.
+    /// The locations its sessions are from: one, unless the path is a drive's; none for
+    /// copies of sessions that ran elsewhere, which are a place of their own (PLAN §7.7).
     pub locations: Vec<LocationId>,
+    /// What the group's sessions are copies as, when they are copies.
+    pub copy: Option<String>,
     /// The path as its sessions recorded it, each spelling once.
     pub spellings: Vec<String>,
     /**
@@ -65,20 +69,23 @@ impl Catalogue {
     pub fn library_counts(&self) -> Result<LibraryCounts> {
         self.db.read(|c| {
             let (all, starred, unsorted, trash) = c.query_row(
-                "SELECT COALESCE(sum(st.trashed_at IS NULL), 0),
-                        COALESCE(sum(st.trashed_at IS NULL AND COALESCE(st.starred, 0)), 0),
-                        COALESCE(sum(st.trashed_at IS NULL AND st.folder_id IS NULL), 0),
-                        COALESCE(sum(st.trashed_at IS NOT NULL), 0)
-                 FROM session s
-                 LEFT JOIN session_state st
-                   ON st.location_id = s.location_id AND st.provider = s.provider
-                  AND st.session = s.session",
+                &format!(
+                    "SELECT COALESCE(sum(st.trashed_at IS NULL), 0),
+                            COALESCE(sum(st.trashed_at IS NULL AND COALESCE(st.starred, 0)), 0),
+                            COALESCE(sum(st.trashed_at IS NULL AND st.folder_id IS NULL), 0),
+                            COALESCE(sum(st.trashed_at IS NOT NULL), 0)
+                     FROM session s
+                     LEFT JOIN session_state st
+                       ON st.location_id = s.location_id AND st.provider = s.provider
+                      AND st.session = s.session
+                     WHERE {SHOWN}"
+                ),
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
             /* `inside` pairs each folder with itself and with every folder inside it. */
             let folders = c
-                .prepare(
+                .prepare(&format!(
                     "WITH RECURSIVE inside (folder, id) AS (
                          SELECT id, id FROM folder
                          UNION ALL
@@ -90,9 +97,9 @@ impl Catalogue {
                        ON st.folder_id = inside.id AND st.trashed_at IS NULL
                      LEFT JOIN session s
                        ON s.location_id = st.location_id AND s.provider = st.provider
-                      AND s.session = st.session
-                     GROUP BY inside.folder",
-                )?
+                      AND s.session = st.session AND {SHOWN}
+                     GROUP BY inside.folder"
+                ))?
                 .query_map([], |row| Ok((FolderId(row.get(0)?), row.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?;
             Ok(LibraryCounts {
@@ -109,9 +116,11 @@ impl Catalogue {
     pub fn sessions(&self, shelf: Shelf) -> Result<Vec<Session>> {
         let (of, folder) = on_shelf(shelf, "?1");
         self.db.read(|c| {
-            Ok(c.prepare(&format!("{SESSION} WHERE {of} {BY_ACTIVITY}"))?
-                .query_map(params_from_iter(folder), session_from)?
-                .collect::<rusqlite::Result<_>>()?)
+            Ok(
+                c.prepare(&format!("{SESSION} WHERE {of} AND {SHOWN} {BY_ACTIVITY}"))?
+                    .query_map(params_from_iter(folder), session_from)?
+                    .collect::<rusqlite::Result<_>>()?,
+            )
         })
     }
 
@@ -123,6 +132,7 @@ impl Catalogue {
         const LIVE: &str = "FROM session s LEFT JOIN session_state st
                               ON st.location_id = s.location_id AND st.provider = s.provider
                              AND st.session = s.session";
+        let live = format!("st.trashed_at IS NULL AND {SHOWN}");
         self.db.read(|c| {
             let values = |sql: String| -> Result<Vec<String>> {
                 Ok(c.prepare(&sql)?
@@ -131,11 +141,11 @@ impl Catalogue {
             };
             Ok((
                 values(format!(
-                    "SELECT m.value {LIVE}, json_each(s.models) m WHERE st.trashed_at IS NULL
+                    "SELECT m.value {LIVE}, json_each(s.models) m WHERE {live}
                      GROUP BY m.value ORDER BY count(*) DESC, m.value"
                 ))?,
                 values(format!(
-                    "SELECT s.branch {LIVE} WHERE st.trashed_at IS NULL AND s.branch IS NOT NULL
+                    "SELECT s.branch {LIVE} WHERE {live} AND s.branch IS NOT NULL
                      GROUP BY s.branch ORDER BY count(*) DESC, s.branch"
                 ))?,
             ))
@@ -164,8 +174,8 @@ impl Catalogue {
                  LEFT JOIN session_state st
                    ON st.location_id = s.location_id AND st.provider = s.provider
                   AND st.session = s.session
-                 WHERE {shelf}
-                   AND (:location IS NULL OR s.location_id = :location)
+                 WHERE {shelf} AND {SHOWN}
+                   AND (:location IS NULL OR {RAN_AT} = :location)
                    AND (:agent IS NULL OR s.provider = :agent)
                    AND (:model IS NULL OR EXISTS (
                        SELECT 1 FROM json_each(s.models)
@@ -192,8 +202,14 @@ impl Catalogue {
         let mut groups: Vec<PathGroup> = Vec::new();
         /* Where each place's group is: a place is a path, and its location unless the path is
         a drive's. A path filing can't compare is a place by how it was recorded, so that the
-        sessions with no path are not taken for those at `/`. */
-        type Place = (Option<NormalPath>, Option<LocationId>, Option<String>);
+        sessions with no path are not taken for those at `/`. Copies of sessions that ran
+        elsewhere are a place apart, by path alone (PLAN §7.7). */
+        type Place = (
+            Option<NormalPath>,
+            Option<LocationId>,
+            Option<String>,
+            Option<String>,
+        );
         let mut places: HashMap<Place, usize> = HashMap::new();
         let mounts: HashMap<LocationId, Option<String>> = self
             .locations()?
@@ -201,18 +217,21 @@ impl Catalogue {
             .map(|location| (location.id, location.drive_mount))
             .collect();
         for session in self.sessions(Shelf::Unsorted)? {
-            let on_drive = session.project.as_ref().is_some_and(NormalPath::is_drive);
-            let location = (!on_drive).then(|| session.id.location.clone());
+            let copy = session.copy.as_ref().map(|copy| copy.label.clone());
+            let on_drive =
+                copy.is_none() && session.project.as_ref().is_some_and(NormalPath::is_drive);
+            let location = session.ran_at().filter(|_| !on_drive).cloned();
             let recorded = match session.project {
                 Some(_) => None,
                 None => session.project_path.clone(),
             };
             let at = *places
-                .entry((session.project.clone(), location, recorded))
+                .entry((session.project.clone(), location, recorded, copy.clone()))
                 .or_insert_with(|| {
                     groups.push(PathGroup {
                         project: session.project.clone(),
                         locations: Vec::new(),
+                        copy,
                         spellings: Vec::new(),
                         drive: None,
                         sessions: Vec::new(),
@@ -220,8 +239,10 @@ impl Catalogue {
                     groups.len() - 1
                 });
             let group = &mut groups[at];
-            if !group.locations.contains(&session.id.location) {
-                group.locations.push(session.id.location.clone());
+            if let Some(location) = session.ran_at()
+                && !group.locations.contains(location)
+            {
+                group.locations.push(location.clone());
             }
             if let Some(spelling) = &session.project_path
                 && !group.spellings.contains(spelling)

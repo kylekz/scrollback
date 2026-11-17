@@ -3,9 +3,9 @@
 
 use gpui::{Entity, TestAppContext, VisualTestContext, px, size};
 use pretty_assertions::assert_eq;
-use sb_core::catalogue::Session;
+use sb_core::catalogue::{Compared, Session};
 use sb_core::transcript::Content;
-use sb_test_support::reader;
+use sb_test_support::{Outline, reader};
 
 use super::ReaderSnapshot;
 use super::rows::{BodyPart, RowKind, rows};
@@ -520,6 +520,62 @@ fn a_session_opened_at_a_search_match_fills_find_at_that_match(cx: &mut TestAppC
     assert!(count.is_some());
     /* The current match is the one flashed, not the first. */
     assert!(current.unwrap().starts_with(&flashed), "{flashed}");
+}
+
+/**
+ * An original whose copy kept elsewhere is longer (PLAN §7.7): its kin is the copy, flagged
+ * longer, and reading that opens the copy, whose kin is the original to go back to.
+ */
+#[gpui::test]
+fn an_original_with_a_longer_copy_reads_the_copy_and_back(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_shell(cx);
+    synced(
+        |tree| {
+            let session = tree.outline(&Outline {
+                project: "/home/user/code/app",
+                title: "Copied over SSH",
+                prompt: "Add a retry to the upload.",
+                model: "model-a",
+                day: (2026, 11, 14),
+                calls: 1,
+            });
+            let mut copy = tree.desktop_copy(&session);
+            copy.transcript.prompt("And log each retry.");
+        },
+        cx,
+    );
+    open("Copied over SSH", cx);
+    let kin = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            let reader = cx.services().reader.read(cx);
+            let open = reader.open_session().expect("a session is open");
+            (open.id.clone(), open.kin().to_vec())
+        })
+    };
+    let (original, copies) = kin(cx);
+    assert_eq!(copies.len(), 1);
+    assert!(copies[0].copy.is_some());
+    assert_eq!(copies[0].compared, Compared::Longer);
+
+    let library = cx.update(|_, cx| cx.services().library.clone());
+    library.update(cx, |library, cx| {
+        library.open_kin(copies[0].id.clone(), cx);
+    });
+    cx.run_until_parked();
+    draw(cx);
+    let (copy, originals) = kin(cx);
+    assert_eq!(copy, copies[0].id);
+    assert_eq!(originals.len(), 1);
+    assert_eq!((&originals[0].id, &originals[0].copy), (&original, &None));
+    assert_eq!(originals[0].compared, Compared::Shorter);
+    /* It is no session of the page's: the page lists the original alone. */
+    cx.update(|_, cx| {
+        let library = cx.services().library.read(cx);
+        let titled = (library.sessions().unwrap().sessions.iter())
+            .filter(|session| session.title.as_deref() == Some("Copied over SSH"))
+            .count();
+        assert_eq!(titled, 1);
+    });
 }
 
 /// How long Find takes over the reader's budget session (PLAN §14), in release:

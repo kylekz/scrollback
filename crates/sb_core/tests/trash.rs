@@ -319,6 +319,7 @@ fn deleting_for_good_removes_the_sessions_files_and_rows_and_nothing_else<A: Age
                     .sum::<u64>())
                 .sum(),
             at_location: true,
+            copies: Vec::new(),
         }
     );
     let files_before = snapshot(&bench.dir().join("files"));

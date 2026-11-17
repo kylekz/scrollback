@@ -11,6 +11,7 @@
 //! newest version. Only a transcript's version is ever a loss worth keeping from the reader:
 //! of anything else an agent keeps, the newest is what it meant.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use toolbox_store::rusqlite::types::Type;
@@ -23,7 +24,7 @@ use crate::filing::{FolderId, NormalPath};
 use crate::hash::{Hash, Hasher};
 use crate::location::LocationId;
 use crate::provider::ItemKind;
-use crate::transcript::{Ending, INDEX_VERSION, SessionIndex, Tokens, Totals};
+use crate::transcript::{CopyOf, Ending, INDEX_VERSION, SessionIndex, Tokens, Totals};
 
 /// A session's identity (PLAN §2.1): the location it was pulled from, its agent's provider,
 /// and that provider's id for it.
@@ -96,6 +97,39 @@ pub struct Session {
     pub starred: bool,
     /// When the owner moved the session to Trash, while it is there (PLAN §4.5).
     pub trashed: Option<i64>,
+    /// The session is a copy of one that ran on another machine (PLAN §7.7).
+    pub copy: Option<CopyOf>,
+}
+
+impl Session {
+    /**
+     * The location the session ran at, as the library attributes it (PLAN §7.7): where it was
+     * pulled from, unless it is a copy, which ran on a machine the copy doesn't name. It is
+     * what every view that names a session's location shows, filters and files by.
+     */
+    pub fn ran_at(&self) -> Option<&LocationId> {
+        self.copy.is_none().then_some(&self.id.location)
+    }
+}
+
+/// How a session's main transcript compares with another's, by the versions of each that are
+/// read: the same bytes, fewer, more, or as many but others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compared {
+    Same,
+    Shorter,
+    Longer,
+    Differs,
+}
+
+/// Another session of a session's conversation (PLAN §7.7): its original, or a copy of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Kin {
+    pub id: SessionId,
+    /// What it is a copy as; `None` for an original.
+    pub copy: Option<CopyOf>,
+    /// How its main transcript compares with the session's.
+    pub compared: Compared,
 }
 
 /// One item of a session with the version of it that is read (the module docs).
@@ -253,7 +287,7 @@ pub(super) const SESSION: &str = "
            s.all_calls, s.all_input, s.all_output, s.all_cache_read, s.all_cache_write,
            s.ending, s.unreadable, s.unread, s.held_back, s.failure, s.parser_version,
            s.index_version, st.folder_id, COALESCE(st.by_hand, 0), COALESCE(st.starred, 0),
-           st.trashed_at
+           st.trashed_at, s.copy_label, s.copy_origin
     FROM session s
     LEFT JOIN session_state st
       ON st.location_id = s.location_id AND st.provider = s.provider AND st.session = s.session";
@@ -261,12 +295,28 @@ pub(super) const SESSION: &str = "
 /// What a row was made from, in one word ([`Catalogue::made`]).
 const MADE_FROM: &str = "s.indexed_from || ' ' || s.parser_version || ' ' || s.index_version";
 
+/**
+ * The condition that the session `s` is one the library shows (PLAN §7.7): an original, or a
+ * copy of a conversation none of whose originals is archived, and of several such copies the
+ * one that did something last (then the greatest identity). The others are hidden everywhere.
+ */
+pub(super) const SHOWN: &str = "NOT (s.copy_label IS NOT NULL AND EXISTS (
+    SELECT 1 FROM session o
+    WHERE o.provider = s.provider AND o.conversation = s.conversation
+      AND o.project_path IS s.project_path AND o.id <> s.id
+      AND (o.copy_label IS NULL
+           OR (COALESCE(o.ended_at, -9223372036854775808), o.location_id, o.session)
+              > (COALESCE(s.ended_at, -9223372036854775808), s.location_id, s.session))))";
+
+/// The location `s` is attributed to (PLAN §7.7, [`Session::ran_at`]), as SQL: NULL for a copy.
+pub(super) const RAN_AT: &str = "CASE WHEN s.copy_label IS NULL THEN s.location_id END";
+
 /// The session that did something last comes first; those with no time come last.
 pub(super) const BY_ACTIVITY: &str =
     "ORDER BY s.ended_at DESC NULLS LAST, s.location_id, s.provider, s.session";
 
 /// What a row says of the session itself, in the order [`Catalogue::record_session`] gives it.
-const DERIVED: [&str; 26] = [
+const DERIVED: [&str; 29] = [
     "main_item",
     "reading_version",
     "newest_version",
@@ -293,6 +343,9 @@ const DERIVED: [&str; 26] = [
     "unreadable",
     "unread",
     "held_back",
+    "conversation",
+    "copy_label",
+    "copy_origin",
 ];
 
 /// What a row says of the index that made it, after [`DERIVED`]. These are all that an index
@@ -592,8 +645,12 @@ impl Catalogue {
         };
         let index = derived.as_ref().map_or(&nothing, |derived| derived.index);
         let main = derived.as_ref().and_then(|derived| derived.main);
-        /* Under the location's own drive mount, where it has one (PLAN §6.3). */
-        let mount = self.drive_mount(&id.location)?;
+        /* Under the location's own drive mount, where it has one (PLAN §6.3); a copy ran
+        elsewhere, and is read under none (PLAN §8). */
+        let mount = match index.copy {
+            None => self.drive_mount(&id.location)?,
+            Some(_) => None,
+        };
         let project = index
             .project_path
             .as_deref()
@@ -655,6 +712,9 @@ impl Catalogue {
                     unreadable,
                     index.unread,
                     derived.as_ref().is_some_and(|derived| derived.held_back),
+                    index.conversation,
+                    index.copy.as_ref().map(|copy| &copy.label),
+                    index.copy.as_ref().map(|copy| &copy.origin),
                     failure,
                     retry,
                     parser_version,
@@ -668,7 +728,54 @@ impl Catalogue {
                 "DELETE FROM text_gone WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
                 params![id.location, id.provider, id.key],
             )?;
-            Ok(derived.is_some() && folder::file_by_rule(tx, id, project.as_ref())?)
+            if derived.is_none() {
+                return Ok(false);
+            }
+            if index.copy.is_none() && index.conversation.is_some() {
+                inherit(tx, id, index)?;
+            }
+            let ran_at = index.copy.is_none().then_some(&id.location);
+            Ok(folder::file_by_rule(tx, id, project.as_ref(), ran_at)?)
+        })
+    }
+
+    /**
+     * The other sessions of the session `id`'s conversation (PLAN §7.7), originals first, each
+     * with how its main transcript compares with `id`'s.
+     */
+    pub fn kin(&self, id: &SessionId) -> Result<Vec<Kin>> {
+        self.db.read(|c| {
+            Ok(c.prepare(
+                "SELECT o.location_id, o.provider, o.session, o.copy_label, o.copy_origin,
+                        COALESCE(ov.length, 0), ov.hash, COALESCE(sv.length, 0), sv.hash
+                 FROM session s
+                 JOIN session o
+                   ON o.provider = s.provider AND o.conversation = s.conversation
+                  AND o.project_path IS s.project_path AND o.id <> s.id
+                 LEFT JOIN version sv ON sv.item_id = s.main_item AND sv.number = s.reading_version
+                 LEFT JOIN version ov ON ov.item_id = o.main_item AND ov.number = o.reading_version
+                 WHERE s.location_id = ?1 AND s.provider = ?2 AND s.session = ?3
+                 ORDER BY o.copy_label IS NOT NULL, o.location_id, o.session",
+            )?
+            .query_map(params![id.location, id.provider, id.key], |row| {
+                let theirs: (u64, Option<String>) = (row.get(5)?, row.get(6)?);
+                let ours: (u64, Option<String>) = (row.get(7)?, row.get(8)?);
+                Ok(Kin {
+                    id: SessionId {
+                        location: row.get(0)?,
+                        provider: row.get(1)?,
+                        key: row.get(2)?,
+                    },
+                    copy: copy_from(row, 3)?,
+                    compared: match theirs.0.cmp(&ours.0) {
+                        Ordering::Less => Compared::Shorter,
+                        Ordering::Greater => Compared::Longer,
+                        Ordering::Equal if theirs.1 == ours.1 => Compared::Same,
+                        Ordering::Equal => Compared::Differs,
+                    },
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
         })
     }
 
@@ -977,6 +1084,35 @@ pub(super) fn classify(
     Ok(())
 }
 
+/**
+ * Gives the original `id`, of the conversation `index` names, what the owner decided about the
+ * copy of it that was shown (its folder, star and Trash), when it has no state of its own
+ * (PLAN §7.7): a session starred or filed as a copy stays so once its original is archived.
+ */
+fn inherit(connection: &Connection, id: &SessionId, index: &SessionIndex) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT OR IGNORE INTO session_state
+             (location_id, provider, session, folder_id, by_hand, starred, trashed_at)
+         SELECT ?1, ?2, ?3, st.folder_id, st.by_hand, st.starred, st.trashed_at
+         FROM session s
+         JOIN session_state st
+           ON st.location_id = s.location_id AND st.provider = s.provider
+          AND st.session = s.session
+         WHERE s.provider = ?2 AND s.conversation = ?4 AND s.project_path IS ?5
+           AND s.copy_label IS NOT NULL
+         ORDER BY s.ended_at DESC NULLS LAST, s.location_id DESC, s.session DESC
+         LIMIT 1",
+        params![
+            id.location,
+            id.provider,
+            id.key,
+            index.conversation,
+            index.project_path
+        ],
+    )?;
+    Ok(())
+}
+
 /// The items of one session, by key: after [`reading`].
 const OF_SESSION: &str =
     "WHERE i.location_id = ?1 AND i.provider = ?2 AND i.session = ?3 ORDER BY i.key";
@@ -1129,6 +1265,15 @@ pub(super) fn session_from(row: &Row<'_>) -> rusqlite::Result<Session> {
         },
         starred: row.get(34)?,
         trashed: row.get(35)?,
+        copy: copy_from(row, 36)?,
+    })
+}
+
+/// A copy's words from the columns `copy_label` and `copy_origin`, at `at` and after it.
+fn copy_from(row: &Row<'_>, at: usize) -> rusqlite::Result<Option<CopyOf>> {
+    Ok(match (row.get(at)?, row.get(at + 1)?) {
+        (Some(label), Some(origin)) => Some(CopyOf { label, origin }),
+        _ => None,
     })
 }
 
@@ -1153,6 +1298,26 @@ mod tests {
         (1..=4).fold(sql.to_string(), |sql, at| {
             sql.replace(&format!("?{at}"), "'x'")
         })
+    }
+
+    /// Whether a copy is shown asks for its conversation's other sessions by their index, not
+    /// by going through every row once for each row a page lists.
+    #[test]
+    fn a_copys_conversation_is_found_by_its_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = Archive::create(dir.path()).unwrap();
+        let plan = archive
+            .catalogue()
+            .db
+            .read(|c| {
+                Ok::<_, CatalogueError>(plan(c, &format!("SELECT 1 FROM session s WHERE {SHOWN}")))
+            })
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("SEARCH o USING INDEX session_conversation")),
+            "{plan:#?}"
+        );
     }
 
     /// An index that parsed a session the owner then deleted for good leaves no row of it.

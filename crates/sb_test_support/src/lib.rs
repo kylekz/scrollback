@@ -37,8 +37,8 @@ use toolbox_store::rusqlite::Connection;
 use toolbox_store::rusqlite::types::ValueRef;
 
 pub use claude_code::{
-    Call, FileAgent, NestedSubagents, Outline, ProjectsTree, Records, Session, WithSubagents,
-    image_block, nested_subagents, with_subagents,
+    Call, DesktopCopy, FileAgent, NestedSubagents, Outline, ProjectsTree, Records, Session,
+    WithSubagents, image_block, nested_subagents, with_subagents,
 };
 pub use db_agent::{DbAgent, DbProvider};
 

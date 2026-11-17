@@ -10,11 +10,11 @@
 
 use toolbox_store::rusqlite::{Connection, OptionalExtension as _, params};
 
-use super::folder::{create, file_by_rule, folder_exists, free_name, named, parent_of};
+use super::folder::{create, file_by_rule, filing_of, folder_exists, free_name, named, parent_of};
 use super::session::{archived, set_state};
 use super::trash::trashed_at;
 use super::{Catalogue, CatalogueError, Filed, Result, SessionId, now_ms};
-use crate::filing::{FolderId, NormalPath};
+use crate::filing::FolderId;
 
 /// How a session was filed before a change.
 pub type Before = (SessionId, Filed);
@@ -75,7 +75,7 @@ impl Catalogue {
                     archived(tx, id)?;
                     let before = filed(tx, id)?;
                     set_state(tx, id, &[("by_hand", &false)])?;
-                    file_by_rule(tx, id, project(tx, id)?.as_ref())?;
+                    refile(tx, id)?;
                     let now = match filed(tx, id)? {
                         Filed::ByRule(folder) | Filed::ByHand(folder) => Some(folder),
                         Filed::Unsorted => None,
@@ -109,11 +109,11 @@ impl Catalogue {
                     Filed::ByHand(_) => {
                         undone.refiled += 1;
                         set_state(tx, id, &[("by_hand", &false)])?;
-                        file_by_rule(tx, id, project(tx, id)?.as_ref())?;
+                        refile(tx, id)?;
                     }
                     Filed::ByRule(_) | Filed::Unsorted => {
                         set_state(tx, id, &[("by_hand", &false)])?;
-                        file_by_rule(tx, id, project(tx, id)?.as_ref())?;
+                        refile(tx, id)?;
                     }
                 }
             }
@@ -206,7 +206,7 @@ impl Catalogue {
  */
 pub(super) fn restore(connection: &Connection, id: &SessionId) -> Result<()> {
     set_state(connection, id, &[("trashed_at", &None::<i64>)])?;
-    file_by_rule(connection, id, project(connection, id)?.as_ref())?;
+    refile(connection, id)?;
     Ok(())
 }
 
@@ -228,15 +228,9 @@ fn filed(connection: &Connection, id: &SessionId) -> Result<Filed> {
     })
 }
 
-/// The project path the session `id`'s row has, as filing compares paths.
-fn project(connection: &Connection, id: &SessionId) -> Result<Option<NormalPath>> {
-    Ok(connection
-        .query_row(
-            "SELECT project FROM session
-             WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
-            params![id.location, id.provider, id.key],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten())
+/// Runs the rules on the session `id`, by the project path and location its row has.
+fn refile(connection: &Connection, id: &SessionId) -> Result<()> {
+    let (project, ran_at) = filing_of(connection, id)?;
+    file_by_rule(connection, id, project.as_ref(), ran_at.as_ref())?;
+    Ok(())
 }

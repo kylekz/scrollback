@@ -54,13 +54,13 @@ use chrono::DateTime;
 use serde::de::DeserializeOwned;
 use serde_json::value::RawValue;
 
-use super::ID;
 use super::record::{
     self, ApiError, Attachment, CompactMetadata, Head, Launched, Line, Message, Origin, Record,
     Shape, Source, SubagentMeta, Text, TitleFile, Usage, shape, string, typed,
 };
 use super::said::{Said, said};
 use super::tools::{self, WORKFLOW};
+use super::{ID, copy_of, session_of};
 use crate::provider::{ItemKind, SessionItem, SessionItems};
 use crate::transcript::{
     BlockId, Builder, Content, Conversation, Encoding, Ending, Facts, Image, Output, Stored,
@@ -157,16 +157,18 @@ fn saved(list: &[SessionItem]) -> Saved<'_> {
 
 pub(super) fn parse(items: &dyn SessionItems) -> Transcript {
     let list = items.list();
-    let read = list
-        .iter()
-        .find(|item| item.kind == ItemKind::Transcript)
-        .map(|item| Reading::of(items, &item.key, &saved(list), true).finish(items));
+    let main = list.iter().find(|item| item.kind == ItemKind::Transcript);
+    let read = main.map(|item| Reading::of(items, &item.key, &saved(list), true).finish(items));
     let mut facts = Facts {
         agent: ID,
         title: None,
         project_path: None,
         branch: None,
         entrypoint: None,
+        conversation: main
+            .and_then(|main| session_of(file_name(&main.key)))
+            .map(str::to_string),
+        copy: list.first().and_then(|item| copy_of(&item.key)),
     };
     let mut claimed = HashSet::new();
     let mut inline = Vec::new();

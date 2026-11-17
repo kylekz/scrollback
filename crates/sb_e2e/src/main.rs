@@ -35,6 +35,10 @@
 //! - `"locations"`: an archive in the data dir with one location of each kind, the host's
 //!   last good sync twelve days ago, and this machine's agent in the home
 //!   ([`fixture::locations`]): the locations sheet's states (docs/DESIGN.md §4.11).
+//! - `"copies"`: an archive in the data dir with this machine and a distro, where this
+//!   machine's desktop app keeps a copy of a distro's session further along than the distro's,
+//!   and the only copy of a session from a Mac that is no location ([`fixture::copies`]): how
+//!   a copy is marked (docs/DESIGN.md §4.2.8).
 //! - `"archive-remains"`: what is left of an archive in the data dir, its files without its
 //!   `archive.json`: the app must say it can't open it, and make no new one in its place
 //!   (docs/PLAN.md §4.4).
@@ -91,6 +95,7 @@ enum Library {
     ReaderLarge,
     ReaderVersions,
     Locations,
+    Copies,
     ArchiveRemains,
     Settings,
     ArchiveGone,
@@ -304,6 +309,10 @@ impl RunnerApp for Scrollback {
                 &cx.data_dir.join("archive"),
                 &cx.out_dir.join("locations"),
             )?,
+            Library::Copies => {
+                std::fs::remove_dir_all(&home)?;
+                fixture::copies(&cx.data_dir.join("archive"), &cx.out_dir.join("locations"))?;
+            }
             Library::ArchiveRemains => {
                 std::fs::remove_dir_all(&home)?;
                 std::fs::create_dir_all(cx.data_dir.join("archive/files/location"))?;

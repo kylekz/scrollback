@@ -744,6 +744,7 @@ fn a_drives_group_is_written_in_its_drive_form() {
     let group = |project: &str, spellings: &[&str], drive: Option<&str>| PathGroup {
         project: NormalPath::new(project, Some(WSL_DRIVE_MOUNT)),
         locations: Vec::new(),
+        copy: None,
         spellings: spellings.iter().map(|it| it.to_string()).collect(),
         drive: drive.map(str::to_string),
         sessions: Vec::new(),

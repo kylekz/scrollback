@@ -55,8 +55,8 @@ use super::paths_editor::{PathsEditor, PathsEditorEvent};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
-    ButtonKind, Tone, button, end_cut, focus_ring, icon, icon_button, location_tag, overline, tag,
-    tag_width, text_width, warn_chip,
+    ButtonKind, Place, Tone, button, end_cut, focus_ring, icon, icon_button, location_tag,
+    overline, tag, tag_width, text_width, warn_chip,
 };
 use crate::drag;
 use crate::format;
@@ -163,6 +163,9 @@ fn line_width(pieces: &[Pixels], theme: &SbTheme) -> Pixels {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct PageLine {
     locations: Vec<LocationId>,
+    /// What the copies of sessions that ran elsewhere are called, which tag them in place of
+    /// a location (PLAN §7.7).
+    copies: Vec<String>,
     subfolders: Vec<FolderId>,
     held: bool,
     by_hand: bool,
@@ -178,8 +181,14 @@ impl PageLine {
             ..Self::default()
         };
         for session in &page.sessions {
-            if !line.locations.contains(&session.id.location) {
-                line.locations.push(session.id.location.clone());
+            match (&session.copy, session.ran_at()) {
+                (Some(copy), _) if !line.copies.contains(&copy.label) => {
+                    line.copies.push(copy.label.clone());
+                }
+                (None, Some(location)) if !line.locations.contains(location) => {
+                    line.locations.push(location.clone());
+                }
+                _ => {}
             }
             if let Some(folder) = subfolder_of(session, shelf)
                 && !line.subfolders.contains(&folder)
@@ -513,19 +522,27 @@ impl SessionsView {
         let (sync, library) = (self.sync.read(cx), self.library.read(cx));
         self.tag_widths.clear();
         let mut tags = Vec::new();
-        let mut measure = |name: &str, cap: Pixels| {
-            let width = tag_width(name, theme, window);
+        let mut measure = |name: &str, width: Pixels, cap: Pixels| {
             self.tag_widths.insert(name.to_string(), width);
             tags.push((name.to_string(), width, width.min(cap)));
             width
         };
-        let locations = (self.line.locations.iter())
+        let places = (self.line.locations.iter())
             .filter_map(|id| sync.location(id))
-            .map(|location| measure(&location.name, theme.sizes.location_tag_max_width))
+            .map(Place::Location)
+            .chain(self.line.copies.iter().map(|label| Place::Copy(label)));
+        let locations = places
+            .map(|place| {
+                let width = place.width(theme, window);
+                measure(place.name(), width, theme.sizes.location_tag_max_width)
+            })
             .collect();
         let subfolders = (self.line.subfolders.iter())
             .filter_map(|id| library.folder(*id))
-            .map(|folder| measure(&folder.name, theme.sizes.tag_max_width))
+            .map(|folder| {
+                let width = tag_width(&folder.name, theme, window);
+                measure(&folder.name, width, theme.sizes.tag_max_width)
+            })
             .collect();
         self.held_width = text_width(HELD_BACK, &theme.text.small, window) + theme.spacing.sm * 2.;
         let calls = format::count(u64::from(self.line.most_calls));
@@ -1117,7 +1134,8 @@ impl SessionsView {
             .join(" · ");
         // On a folder's page a tag names the folder of a session from one inside it.
         let subfolder = subfolder_of(session, library.shelf()).and_then(|it| library.folder(it));
-        let location = self.sync.read(cx).location(&session.id.location);
+        let sync = self.sync.read(cx);
+        let location = Place::of(session, |id| sync.location(id));
         let by_hand = matches!(session.filed, Filed::ByHand(_));
         /* The day always shows, and the calls on a page whose cards have room for them, but
         none where there were none. */
@@ -1135,7 +1153,7 @@ impl SessionsView {
                 let own: Vec<Pixels> = [
                     Some(theme.sizes.icon_xs),
                     Some(MODEL_MIN),
-                    location.map(|it| capped(&it.name, theme.sizes.location_tag_max_width)),
+                    location.map(|it| capped(it.name(), theme.sizes.location_tag_max_width)),
                     subfolder.map(|it| capped(&it.name, theme.sizes.tag_max_width)),
                     session.held_back.then_some(self.held_width),
                     Some(text_width(&self.line.day, &theme.text.count, window)),
@@ -1161,7 +1179,7 @@ impl SessionsView {
         for them; then they give way, down to their least. */
         let natural = |name: &str| self.tag_widths.get(name).copied().unwrap_or_default();
         let tags: Vec<(Pixels, Pixels)> = (location.map(|it| {
-            let natural = natural(&it.name);
+            let natural = natural(it.name());
             (
                 natural,
                 self.least(natural, theme.sizes.location_tag_max_width),
@@ -1425,8 +1443,8 @@ impl SessionsView {
                     .children(location.map(|location| {
                         self.line_tag(
                             ("card-location", index).into(),
-                            location_tag(location.name.clone(), &location.kind, true, theme),
-                            &location.name,
+                            location.tag(true, theme),
+                            location.name(),
                             tags[0].1,
                             cut(tags[0]),
                         )

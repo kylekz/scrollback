@@ -45,8 +45,11 @@ cargo run --release -p sb_core --example sync -- <archive folder> verify | set-a
 cargo run --release -p sb_core --example sync -- <archive folder> search <query…>
 cargo run --release -p sb_core --example sync -- test --wsl <distro> | --ssh <host>
                              # the connection test; `sync -- distros` lists WSL distros
-cargo run --release -p sb_core --example check [-- <home folder>]
-                             # parses every session under a home folder and prints aggregates only
+cargo run --release -p sb_core --example check [-- <home folder>] [--with <home folder>]
+                             # parses every session under a home folder and prints aggregates only;
+                             # --with matches its copies of sessions that ran elsewhere (PLAN §7.7)
+cargo run --release -p sb_core --example sync -- <archive folder> copies
+                             # counts the archive's copies as the library shows them
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p scrollback --no-default-features --all-targets -- -D warnings   # the shipped app
 

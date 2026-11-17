@@ -57,6 +57,8 @@ impl Provider for Unreachable {
                 project_path: None,
                 branch: None,
                 entrypoint: None,
+                conversation: None,
+                copy: None,
             },
             conversation: None,
             unattached: Vec::new(),

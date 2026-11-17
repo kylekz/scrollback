@@ -11,7 +11,8 @@ use gpui::{
     Stateful, StatefulInteractiveElement as _, Styled as _, StyledText, TextRun, Transformation,
     Window, canvas, div, font, percentage, point, prelude::FluentBuilder as _, px, relative, svg,
 };
-use sb_core::location::LocationKind;
+use sb_core::catalogue::Session;
+use sb_core::location::{Location, LocationId, LocationKind};
 
 use crate::format;
 use crate::icons::SbIcon;
@@ -205,6 +206,89 @@ pub fn tag(label: impl Into<SharedString>, tone: Tone, small: bool, theme: &SbTh
 /// How wide [`tag`] draws `label`.
 pub fn tag_width(label: &str, theme: &SbTheme, window: &Window) -> Pixels {
     text_width(label, &theme.text.tag, window) + theme.spacing.sm * 2.
+}
+
+/**
+ * The tag a copy of a session that ran elsewhere carries where a location's would be (DESIGN
+ * §4.2.8, PLAN §7.7): the copy glyph and what the provider calls the copy, never the location
+ * that kept it.
+ */
+pub fn copy_tag(label: &str, small: bool, theme: &SbTheme) -> Div {
+    let (fill, text) = Tone::Neutral.colors(theme);
+    let height = if small {
+        theme.sizes.tag_small_height
+    } else {
+        theme.sizes.tag_height
+    };
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(theme.spacing.xs)
+        .h(height)
+        .px(theme.spacing.sm)
+        .rounded(theme.radii.small)
+        .bg(fill)
+        .text_color(text)
+        .text_spec(&theme.text.tag)
+        .line_height(height)
+        .whitespace_nowrap()
+        .overflow_hidden()
+        .child(icon(SbIcon::Copy, theme.sizes.icon_xs, text))
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(crate::hostile::label(label)),
+        )
+}
+
+/// Where a session ran, as the tag that names it shows it (PLAN §7.7).
+#[derive(Clone, Copy, Debug)]
+pub enum Place<'a> {
+    Location(&'a Location),
+    /// A copy of a session that ran elsewhere, by what the provider calls the copy.
+    Copy(&'a str),
+}
+
+impl<'a> Place<'a> {
+    /// Where `session` ran: its location, which `location` finds, unless it is a copy.
+    pub fn of(
+        session: &'a Session,
+        location: impl FnOnce(&LocationId) -> Option<&'a Location>,
+    ) -> Option<Self> {
+        match &session.copy {
+            Some(copy) => Some(Self::Copy(&copy.label)),
+            None => location(&session.id.location).map(Self::Location),
+        }
+    }
+
+    /// What its tag says.
+    pub fn name(&self) -> &'a str {
+        match self {
+            Self::Location(location) => &location.name,
+            Self::Copy(label) => label,
+        }
+    }
+
+    pub fn tag(&self, small: bool, theme: &SbTheme) -> Div {
+        match self {
+            Self::Location(location) => {
+                location_tag(location.name.clone(), &location.kind, small, theme)
+            }
+            Self::Copy(label) => copy_tag(label, small, theme),
+        }
+    }
+
+    /// How wide its tag is drawn.
+    pub fn width(&self, theme: &SbTheme, window: &Window) -> Pixels {
+        let glyph = match self {
+            Self::Location(_) => px(0.),
+            Self::Copy(_) => theme.sizes.icon_xs + theme.spacing.xs,
+        };
+        tag_width(self.name(), theme, window) + glyph
+    }
 }
 
 /// The tag that names a location, in its kind's colours (DESIGN §1: `.tag.win` for this

@@ -110,7 +110,7 @@ impl PageView {
             && self
                 .location
                 .as_ref()
-                .is_none_or(|location| session.id.location == *location)
+                .is_none_or(|location| session.ran_at() == Some(location))
             && self
                 .date
                 .is_none_or(|date| date.holds(session.ended.or(session.started), now))
@@ -202,7 +202,9 @@ impl Facets {
                 Clone::clone,
             ),
             locations: by_count(
-                sessions.iter().map(|session| session.id.location.clone()),
+                sessions
+                    .iter()
+                    .filter_map(|session| session.ran_at().cloned()),
                 |location| location.as_str().to_string(),
             ),
             years,
@@ -270,7 +272,7 @@ pub fn shown_groups(groups: &[PathGroup], view: &UnsortedView) -> Vec<(usize, Ve
                         && view
                             .location
                             .as_ref()
-                            .is_none_or(|location| session.id.location == *location)
+                            .is_none_or(|location| session.ran_at() == Some(location))
                 })
                 .filter(|(_, session)| {
                     let holds = |text: &Option<String>| {

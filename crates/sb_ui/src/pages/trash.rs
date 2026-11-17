@@ -31,7 +31,7 @@ use sb_core::catalogue::{Filed, Session, SessionId};
 
 use super::header::{Under, header};
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{ButtonKind, button, focus_ring, icon, location_tag};
+use crate::components::{ButtonKind, Place, button, focus_ring, icon};
 use crate::format;
 use crate::hostile;
 use crate::icons::SbIcon;
@@ -277,7 +277,8 @@ impl TrashView {
             .and_then(|page| page.sizes.get(&session.id))
             .copied()
             .unwrap_or(0);
-        let location = self.sync.read(cx).location(&session.id.location);
+        let sync = self.sync.read(cx);
+        let location = Place::of(session, |id| sync.location(id));
         let id = session.id.clone();
         div()
             .id(("trash-row", row))
@@ -356,11 +357,10 @@ impl TrashView {
                     .w(LOCATION_WIDTH)
                     .flex()
                     .overflow_hidden()
-                    .children(location.map(|location| {
-                        location_tag(location.name.clone(), &location.kind, false, theme)
-                            .flex_shrink(1.)
-                            .min_w_0()
-                    })),
+                    .children(
+                        location
+                            .map(|location| location.tag(false, theme).flex_shrink(1.).min_w_0()),
+                    ),
             )
             .child(
                 div()

@@ -41,7 +41,9 @@ use super::header::{Under, header};
 use super::menus::{self, MOVE_MENU_WIDTH, SESSION_MENU_WIDTH};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{ButtonKind, button, focus_ring, icon, icon_button, location_tag};
+use crate::components::{
+    ButtonKind, button, copy_tag, focus_ring, icon, icon_button, location_tag,
+};
 use crate::drag;
 use crate::format;
 use crate::icons::SbIcon;
@@ -686,6 +688,12 @@ impl UnsortedView {
                                         theme,
                                     )
                                 }),
+                        )
+                        .children(
+                            group
+                                .copy
+                                .as_deref()
+                                .map(|copy| copy_tag(copy, false, theme)),
                         )
                         .child(
                             div()

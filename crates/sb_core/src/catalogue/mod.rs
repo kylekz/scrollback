@@ -39,9 +39,9 @@ use crate::transport::Probe;
 pub use batch::{Before, Restored, Undone};
 pub use folder::{Folder, FolderPath, ProjectPath};
 pub use library::{LibraryCounts, PathGroup, Shelf};
+pub use session::{Compared, Filed, History, Kin, Session, SessionId, Usage};
 pub(crate) use session::{Derived, Indexed, Reading, fingerprint};
-pub use session::{Filed, History, Session, SessionId, Usage};
-pub use trash::{AllowedAgain, Deletion, Tombstone};
+pub use trash::{AllowedAgain, CopyDeletion, Deletion, Tombstone};
 pub(crate) use trash::{ItemFile, Removal};
 
 #[derive(Debug, Error)]
@@ -376,7 +376,8 @@ impl LastCheck {
 pub struct Holding {
     pub location: LocationId,
     pub provider: String,
-    /// Its sessions in the index, those in Trash among them.
+    /// Its sessions in the index, those in Trash among them. Copies kept here of sessions that
+    /// ran elsewhere are not its sessions (PLAN §7.7), and are not counted.
     pub sessions: usize,
     /// Of those, the sessions in Trash.
     pub trashed: usize,
@@ -722,6 +723,7 @@ impl Catalogue {
                 "SELECT s.location_id, s.provider, COUNT(*), COUNT(st.trashed_at) FROM session s
                  LEFT JOIN session_state st ON st.location_id = s.location_id
                      AND st.provider = s.provider AND st.session = s.session
+                 WHERE s.copy_label IS NULL
                  GROUP BY s.location_id, s.provider",
             )?;
             for counted in counts.query_map([], |row| {

@@ -23,7 +23,7 @@ use sb_core::filing::FolderId;
 use super::Shell;
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{ButtonKind, button, focus_ring, icon, location_tag};
+use crate::components::{ButtonKind, button, copy_tag, focus_ring, icon, location_tag};
 use crate::format;
 use crate::icons::SbIcon;
 use crate::keymap;
@@ -268,8 +268,9 @@ impl Shell {
 
     /**
      * Delete for good… (DESIGN §4.8, `E-Trash`): the session's title, what deleting it
-     * removes (its files, versions and size) and whether its location still has it, then its
-     * project path, model, date and calls. Cancel has the keyboard first; Delete for good is
+     * removes (its files, versions and size) and whether its location still has it, the
+     * copies of it kept elsewhere that go with it (PLAN §4.5, §7.7), then its project path,
+     * model, date and calls. Cancel has the keyboard first; Delete for good is
      * the app's only filled red, and waits until what it removes is read.
      */
     fn delete_for_good(
@@ -285,12 +286,41 @@ impl Shell {
             deletion,
             refused,
         } = cx.services().library.read(cx).for_good()?.clone();
-        let location = cx
-            .services()
-            .sync
-            .read(cx)
-            .location(&session.id.location)
-            .cloned();
+        let sync = cx.services().sync.read(cx);
+        let location = sync.location(&session.id.location).cloned();
+        /* Each copy that goes with it: what it is, where it is kept, and what it holds. */
+        let copies: Vec<AnyElement> = (deletion.iter())
+            .flat_map(|deletion| &deletion.copies)
+            .map(|copy| {
+                let kept = sync.location(&copy.session.location);
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(theme.spacing.xs)
+                    .child(copy_tag(&copy.label, false, theme))
+                    .children(kept.map(|kept| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(theme.spacing.xs)
+                            .child("on")
+                            .child(location_tag(kept.name.clone(), &kept.kind, false, theme))
+                    }))
+                    .child(format!(
+                        "goes with it: {} and {}. Nothing is deleted there either.",
+                        format::plural(copy.files, "file"),
+                        format::fine_size(copy.bytes)
+                    ))
+                    .automation_target("for-good/copy")
+                    .into_any_element()
+            })
+            .collect();
+        /* A copy shown alone is the app's copy, kept where it was found (PLAN §7.7). */
+        let subject = session
+            .copy
+            .as_ref()
+            .map_or_else(|| "The session".to_string(), |copy| copy.label.clone());
         let answer = |delete: bool| {
             move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
                 let library = cx.services().library.clone();
@@ -345,7 +375,7 @@ impl Shell {
                         .flex()
                         .items_center()
                         .gap(theme.spacing.xs)
-                        .child("The session still exists on")
+                        .child(format!("{subject} still exists on"))
                         .child(div().flex().items_center().child(tag).child(".")),
                     None => div().child("The session still exists at its location."),
                 };
@@ -432,6 +462,7 @@ impl Shell {
                                 .children(
                                     elsewhere.map(|it| it.automation_target("for-good/elsewhere")),
                                 )
+                                .children(copies)
                                 .children(refused.map(|why| {
                                     div()
                                         .text_color(c.yellow)

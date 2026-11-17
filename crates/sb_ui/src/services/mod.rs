@@ -23,6 +23,8 @@
 //! changes when a job's result comes back.
 
 pub mod archive;
+#[cfg(test)]
+mod copy_tests;
 pub mod drag;
 pub mod library;
 #[cfg(test)]

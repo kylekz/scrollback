@@ -24,13 +24,13 @@ use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 
 use super::{Archive, ArchiveError, Result, accounted, layout, open_search, segment};
-use crate::catalogue::{AllowedAgain, Catalogue, Deletion, ItemFile, Removal, Stored};
+use crate::catalogue::{AllowedAgain, Catalogue, Deletion, ItemFile, Removal, SessionId, Stored};
+use crate::location::LocationId;
 use crate::search::SearchIndex;
 
 /// What deleting a session for good did.
@@ -92,31 +92,36 @@ struct Remover {
 
 impl Archive {
     /**
-     * Deletes a session in Trash for good (PLAN §4.5): `shown` is what the confirmation showed
-     * the owner, and only that is deleted ([`crate::catalogue::CatalogueError::DeletionChanged`]
-     * otherwise). Its rows go and a tombstone takes their place, in one transaction; its text
-     * leaves the search index and both databases' logs are emptied; and the files the catalogue
-     * had for its items, and any of them set aside in `orphans/`, are removed in the background
-     * (the module docs). Its location is not being synced when it is committed. Nothing at a
+     * Deletes a session in Trash for good (PLAN §4.5), with the copies of it that go with it
+     * (PLAN §7.7): `shown` is what the confirmation showed the owner, and only that is deleted
+     * ([`crate::catalogue::CatalogueError::DeletionChanged`] otherwise). Their rows go and a
+     * tombstone takes the place of each, in one transaction; their text leaves the search
+     * index and both databases' logs are emptied; and the files the catalogue had for their
+     * items, and any of them set aside in `orphans/`, are removed in the background (the module
+     * docs). None of their locations is being synced when it is committed. Nothing at a
      * location is touched: the archive has no way to.
      *
      * Once the delete is committed this returns `Ok`, whatever is left to do: what is still to
      * be removed is counted in [`Deleted::pending`], and what went wrong is said in the log.
      */
     pub fn delete_for_good(&self, shown: &Deletion) -> Result<Deleted> {
-        let id = &shown.session;
+        let ids: Vec<SessionId> = shown.sessions().cloned().collect();
         {
-            let _syncing = self
-                .begin_sync(&id.location)
-                .ok_or_else(|| ArchiveError::Syncing(id.location.clone()))?;
+            /* Its copies are kept at other locations (PLAN §7.7): none of them is syncing. */
+            let _syncing = (ids.iter().map(|id| &id.location))
+                .collect::<HashSet<&LocationId>>()
+                .into_iter()
+                .map(|location| {
+                    self.begin_sync(location)
+                        .ok_or_else(|| ArchiveError::Syncing(location.clone()))
+                })
+                .collect::<Result<Vec<_>>>()?;
             self.catalogue.delete_for_good(shown)?;
         }
-        let forgotten = self
-            .search_index()
-            .and_then(|search| search.forget(slice::from_ref(id)));
+        let forgotten = self.search_index().and_then(|search| search.forget(&ids));
         match forgotten {
             Ok(()) => {
-                if let Err(error) = self.catalogue.text_forgotten(slice::from_ref(id)) {
+                if let Err(error) = self.catalogue.text_forgotten(&ids) {
                     log::warn!("{error}");
                 }
             }

@@ -20,7 +20,7 @@ use sb_core::filing::FolderId;
 use super::{LIFTED_OPACITY, SessionsView, month_name, subfolder_of};
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
-use crate::components::{focus_ring, icon, location_tag, overline, warn_chip};
+use crate::components::{Place, focus_ring, icon, overline, warn_chip};
 use crate::drag;
 use crate::format;
 use crate::icons::SbIcon;
@@ -322,7 +322,9 @@ impl SessionsView {
         }
         .and_then(|it| library.folder(it))
         .map(|it| it.name.clone());
-        let location = self.sync.read(cx).location(&session.id.location);
+        let sync = self.sync.read(cx);
+        let location = Place::of(session, |id| sync.location(id))
+            .map(|place| place.tag(false, theme).flex_shrink(1.).min_w_0());
         let drawn = self.drawn.clone();
         let row = part
             .id(("list-row", place))
@@ -465,11 +467,7 @@ impl SessionsView {
                         .w(LOCATION_WIDTH)
                         .flex()
                         .overflow_hidden()
-                        .children(location.map(|location| {
-                            location_tag(location.name.clone(), &location.kind, false, theme)
-                                .flex_shrink(1.)
-                                .min_w_0()
-                        })),
+                        .children(location),
                 )
             })
             .when(columns.branch, |this| {

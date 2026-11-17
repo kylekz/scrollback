@@ -14,6 +14,7 @@ pub(super) const SCHEMA: Schema = Schema {
         REMOVED,
         CHECKS,
         SETTINGS,
+        COPIES,
     ],
 };
 
@@ -332,6 +333,21 @@ CREATE TABLE kv (
 ) STRICT, WITHOUT ROWID;
 ";
 
+/// Copies of a session kept elsewhere (PLAN §7.7): what the library matches them to their
+/// originals by, and what it shows a copy as.
+const COPIES: &str = "
+-- Derived: the agent's own id for the conversation, which its copies share; NULL when the
+-- session's items don't say. copy_label and copy_origin are the provider's words for a copy of
+-- a session that ran elsewhere, NULL for an original.
+ALTER TABLE session ADD COLUMN conversation TEXT;
+ALTER TABLE session ADD COLUMN copy_label TEXT;
+ALTER TABLE session ADD COLUMN copy_origin TEXT CHECK ((copy_label IS NULL) = (copy_origin IS NULL));
+
+-- The sessions of one conversation, which the library shows once.
+CREATE INDEX session_conversation ON session (provider, conversation)
+    WHERE conversation IS NOT NULL;
+";
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -427,6 +443,49 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /**
+     * A catalogue from before copies (PLAN §7.7) keeps its sessions as originals, until the
+     * next index makes their rows again (its index version is older).
+     */
+    #[test]
+    fn a_catalogue_from_before_copies_keeps_its_sessions_as_originals() {
+        const BEFORE: Schema = Schema {
+            domain: SCHEMA.domain,
+            steps: &[
+                SYNC,
+                LIBRARY,
+                LOCATIONS,
+                SEARCH_AND_DELETING,
+                REMOVED,
+                CHECKS,
+                SETTINGS,
+            ],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        Database::open(&dir.path().join(DATABASE), &OpenOptions::new(&BEFORE))
+            .unwrap()
+            .write(|tx| {
+                tx.execute_batch(
+                    "INSERT INTO location (id, kind, name, created_at) VALUES ('a1', 'local', 'here', 1);
+                     INSERT INTO session (location_id, provider, session, models, own_calls,
+                         own_input, own_output, own_cache_read, own_cache_write, all_calls,
+                         all_input, all_output, all_cache_read, all_cache_write, unread,
+                         held_back, retry, parser_version, index_version, indexed_from)
+                     VALUES ('a1', 'fixture', 's', '[]', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             1, 2, '');",
+                )?;
+                Ok::<_, toolbox_store::Error>(())
+            })
+            .unwrap();
+
+        let catalogue = Catalogue::open(dir.path()).unwrap();
+        let sessions = catalogue.sessions(crate::catalogue::Shelf::All).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].copy, None);
+        assert_eq!(sessions[0].ran_at(), Some(&sessions[0].id.location));
+        assert!(catalogue.kin(&sessions[0].id).unwrap().is_empty());
     }
 
     /// A catalogue from before the archive's own settings keeps what it holds, and takes them.

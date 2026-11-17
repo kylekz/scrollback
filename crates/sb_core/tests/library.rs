@@ -1535,7 +1535,7 @@ fn the_paths_editor_reads_every_path_and_the_sessions_a_change_would_move() {
         .unwrap()
         .into_iter()
         .map(|it| {
-            let here = it.location == bench.location;
+            let here = it.location.as_ref() == Some(&bench.location);
             (it.project.as_str().to_string(), here, it.folder)
         })
         .collect();
@@ -1557,7 +1557,7 @@ fn the_paths_editor_reads_every_path_and_the_sessions_a_change_would_move() {
         .unwrap()
         .into_iter()
         .map(|path| {
-            let here = path.location == bench.location;
+            let here = path.location.as_ref() == Some(&bench.location);
             (here, path.recorded, path.sessions, path.unsorted)
         })
         .collect();

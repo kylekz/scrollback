@@ -69,7 +69,7 @@ use std::time::Instant;
 
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription};
 use sb_core::archive::{Archive, ArchivedSession, Pinned, SegmentCache};
-use sb_core::catalogue::{History, SessionId};
+use sb_core::catalogue::{History, Kin, SessionId};
 use sb_core::provider::{ItemKind, Provider, SessionItems};
 use sb_core::transcript::{
     BlockId, Content, Conversation, Outline, Output, Stored, Subagent, ToolCall, ToolKind, place,
@@ -447,6 +447,9 @@ pub struct OpenSession {
     gone: Option<Gone>,
     /// The versions of the session's own transcript, and which is read (DESIGN §4.3).
     history: Option<Arc<History>>,
+    /// The other sessions of its conversation: its copies kept elsewhere, or the original it
+    /// is a copy of (PLAN §7.7).
+    kin: Vec<Kin>,
     /// When verify found the version of it that is read damaged, if it did and said when.
     damaged_on: Option<i64>,
     /// Those of the item read for a look, when it is another.
@@ -564,6 +567,10 @@ impl OpenSession {
     /// The versions of the session's own transcript, when it has one.
     pub fn history(&self) -> Option<&Arc<History>> {
         self.history.as_ref()
+    }
+
+    pub fn kin(&self) -> &[Kin] {
+        &self.kin
     }
 
     /// When verify found the version read of the session's own transcript damaged, if it is.
@@ -2016,10 +2023,15 @@ fn parse(
                 })
                 .then_some(verify.at)
         });
+    let kin = catalogue.kin(id).unwrap_or_else(|error| {
+        log::warn!("the copies of a session could not be read: {error}");
+        Vec::new()
+    });
     let mut open = OpenSession {
         id: id.clone(),
         provider,
         history,
+        kin,
         damaged_on,
         viewed_history,
         found: find::Read::default(),

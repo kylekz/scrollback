@@ -15,12 +15,19 @@
 //! | anything else (`memory/…`, an index file) | a sidecar of no session |
 //!
 //! A file or folder belongs to a session when its name is the id or starts with it and a `.`.
+//!
+//! **The desktop app's copies** (PLAN §7.3, §7.7). A project folder named `ssh-<id>` is not a
+//! project's: it is where the Claude desktop app keeps its copy of one session it ran over SSH
+//! on another machine. The folder is the session: its `<session>.jsonl` is the transcript,
+//! under the original's id, and `agent-<id>.jsonl` beside it are its subagents' transcripts,
+//! loose rather than under `<session>/subagents/`. The session is marked a copy, so that the
+//! library shows its original in its place once that is archived.
 //! A session's folder can be there without its transcript, and the transcript without the
 //! folder. `<project>` is the starting directory with its punctuation replaced by `-`, so it
 //! can't be turned back into a path and is not read here. Every `.jsonl` file is appended to
 //! line by line.
 //!
-//! This provider's id for a session is `<project>/<session>`. The id alone is not enough: the
+//! This provider's id for a session is `<project>/<session>`, or for a copy its folder. The id alone is not enough: the
 //! same one is found under two projects' folders, and those are two transcripts, each with
 //! what goes with it.
 //!
@@ -47,16 +54,23 @@ use super::{
     Display, FileClass, FileTree, Hashed, ItemKind, ItemPrefix, ItemRange, Mark, Provider,
     ProviderError, ProviderId, RangeFailure, Scan, SessionItems, Source,
 };
-use crate::transcript::{Outline, Subagent, Transcript};
+use crate::transcript::{CopyOf, Outline, Subagent, Transcript};
 use crate::transport::{Env, RangeSink, Transport};
 
 pub(super) const ID: ProviderId = ProviderId::new("claude-code");
 
 /// The version of [`parse`].
-const PARSER_VERSION: u32 = 1;
+const PARSER_VERSION: u32 = 2;
 
 /// Where the items are, under the root.
 const SUBTREE: &str = "projects";
+
+/// What a project folder's name starts with when it holds the desktop app's copy of a session.
+const COPY_FOLDER: &str = "ssh-";
+
+/// How the desktop app's copies are shown (PLAN §7.7).
+const COPY_LABEL: &str = "Claude Desktop's copy";
+const COPY_ORIGIN: &str = "Ran over SSH; the copy doesn't record which machine.";
 
 /// How long transcripts are kept when `settings.json` doesn't say (Claude Code's documented
 /// default).
@@ -239,24 +253,45 @@ fn retention_days(settings: Option<&[u8]>) -> Option<u32> {
 /// What the file at `key` is (the module docs).
 fn classify(key: &str) -> FileClass {
     /* `projects/<project>/` and then the path inside the project. */
-    let inside: Vec<&str> = key.split('/').skip(2).collect();
-    let session = inside.first().and_then(|name| session_of(name));
-    let kind = match (session, &inside[..]) {
+    let mut parts = key.split('/').skip(1);
+    let project = parts.next().unwrap_or_default();
+    let inside: Vec<&str> = parts.collect();
+    let copy = is_copy(project);
+    let led = inside.first().and_then(|name| session_of(name));
+    let subagent = |file: &str| file.starts_with("agent-") && file.ends_with(".jsonl");
+    let kind = match (led, &inside[..]) {
         (Some(session), [file]) if &file[session.len()..] == ".jsonl" => ItemKind::Transcript,
-        (Some(_), [_, "subagents", .., file])
-            if file.starts_with("agent-") && file.ends_with(".jsonl") =>
-        {
-            ItemKind::Subagent
-        }
+        (Some(_), [_, "subagents", .., file]) if subagent(file) => ItemKind::Subagent,
         (Some(_), [_, "tool-results", _, ..]) => ItemKind::ToolResult,
+        (None, [file]) if copy && subagent(file) => ItemKind::Subagent,
         _ => ItemKind::Sidecar,
+    };
+    let session = if copy {
+        (!inside.is_empty()).then(|| project.to_string())
+    } else {
+        /* The id alone is not the session: the same one can be in two projects' folders. */
+        led.map(|id| format!("{project}/{id}"))
     };
     FileClass {
         kind,
-        /* The id alone is not the session: the same one can be in two projects' folders. */
-        session: session.map(|id| format!("{}/{id}", key.split('/').nth(1).unwrap_or_default())),
+        session,
         lines: key.ends_with(".jsonl"),
     }
+}
+
+/// Whether the project folder `name` holds the desktop app's copy of a session (the module
+/// docs).
+fn is_copy(name: &str) -> bool {
+    name.strip_prefix(COPY_FOLDER)
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+/// What the session that has the item `key` is a copy of, if it is the desktop app's copy.
+fn copy_of(key: &str) -> Option<CopyOf> {
+    is_copy(key.split('/').nth(1)?).then(|| CopyOf {
+        label: COPY_LABEL.to_string(),
+        origin: COPY_ORIGIN.to_string(),
+    })
 }
 
 /// The session id that leads `name`, the name of a file or folder in a project: a UUID, alone
@@ -375,6 +410,37 @@ mod source_tests {
             );
         }
         assert_eq!(classify("projects/stray.txt"), class(Sidecar, None, false));
+    }
+
+    /// The desktop app's copy is a folder that is one session: its transcript, its loose
+    /// subagents and whatever else is in it.
+    #[test]
+    fn a_copy_folder_is_one_session_with_its_loose_subagents() {
+        use ItemKind::{Sidecar, Subagent, ToolResult, Transcript};
+        const ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+        const FOLDER: &str = "ssh-89abcdef-0123-4567-89ab-cdef01234567";
+        for (inside, kind, lines) in [
+            (format!("{ID}.jsonl"), Transcript, true),
+            ("agent-a1.jsonl".to_string(), Subagent, true),
+            ("agent-a1.meta.json".to_string(), Sidecar, false),
+            (format!("{ID}/subagents/agent-a2.jsonl"), Subagent, true),
+            (format!("{ID}/tool-results/r1.txt"), ToolResult, false),
+            ("notes.txt".to_string(), Sidecar, false),
+        ] {
+            assert_eq!(
+                classify(&format!("projects/{FOLDER}/{inside}")),
+                class(kind, Some(FOLDER), lines),
+                "{inside}"
+            );
+        }
+        /* Only under a copy's folder is a loose subagent a session's. */
+        assert_eq!(
+            classify("projects/-home-user-code-app/agent-a1.jsonl"),
+            class(Sidecar, None, true)
+        );
+        assert_eq!(classify("projects/ssh-"), class(Sidecar, None, false));
+        assert!(copy_of(&format!("projects/{FOLDER}/{ID}.jsonl")).is_some());
+        assert!(copy_of(&format!("projects/-home-user-code-app/{ID}.jsonl")).is_none());
     }
 
     #[test]

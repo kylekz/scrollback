@@ -13,7 +13,8 @@ use gpui::{
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, div,
     prelude::FluentBuilder as _, px, uniform_list,
 };
-use sb_core::catalogue::{Held, History, Reason};
+use sb_core::catalogue::{Compared, Held, History, Reason, SessionId};
+use sb_core::location::LocationId;
 use sb_core::transcript::ToolKind;
 
 use super::ReaderView;
@@ -22,7 +23,7 @@ use super::rows::RowKind;
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
-    ButtonKind, Tone, button, icon, icon_button, kv, location_tag, low_chip, overline, warn_chip,
+    ButtonKind, Place, Tone, button, copy_tag, icon, icon_button, kv, low_chip, overline, warn_chip,
 };
 use crate::format;
 use crate::hostile;
@@ -128,18 +129,111 @@ impl ReaderView {
             return div().into_any_element();
         };
         let provider = session.id.provider.clone();
-        let location = sync
-            .locations()
-            .unwrap_or_default()
-            .iter()
-            .find(|location| location.id == session.id.location)
-            .map(|location| location_tag(location.name.clone(), &location.kind, false, &theme));
+        let location = Place::of(session, |id| sync.location(id)).map(|it| it.tag(false, &theme));
         let value = |text: String| div().child(text);
         let numbers = |text: String| div().text_spec(&theme.text.number).child(text);
         let mut facts: Vec<AnyElement> = Vec::new();
         facts.extend(
             location.map(|tag| kv("From", div().flex().child(tag), &theme).into_any_element()),
         );
+        /* Its copies kept elsewhere, or the original it is a copy of (DESIGN §4.2.8). */
+        let kept = |id: &LocationId| {
+            sync.location(id)
+                .map_or_else(|| "another location".to_string(), |it| it.name.clone())
+        };
+        let read = |label: &'static str, id: SessionId, target: String| {
+            div()
+                .id(SharedString::from(target.clone()))
+                .flex()
+                .items_center()
+                .gap(theme.spacing.xs)
+                .text_color(c.accent_text)
+                .cursor_pointer()
+                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                    let library = cx.services().library.clone();
+                    library.update(cx, |library, cx| library.open_kin(id.clone(), cx));
+                }))
+                .child(icon(SbIcon::Copy, theme.sizes.icon_xs, c.accent_text))
+                .child(label)
+                .automation_target(target)
+        };
+        match &session.copy {
+            Some(copy) => {
+                let original = (open.kin().iter()).find(|kin| kin.copy.is_none());
+                facts.push(
+                    kv(
+                        "Copy",
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(theme.spacing.xs)
+                            .child(format!(
+                                "Kept on {}. {}",
+                                kept(&session.id.location),
+                                hostile::label(&copy.origin)
+                            ))
+                            .children(original.map(|original| {
+                                read(
+                                    "Read the original",
+                                    original.id.clone(),
+                                    "reader/facts/original".to_string(),
+                                )
+                            })),
+                        &theme,
+                    )
+                    .automation_target("reader/facts/copy"),
+                );
+            }
+            None => {
+                for (at, (kin, copy)) in (open.kin().iter())
+                    .filter_map(|kin| Some((kin, kin.copy.as_ref()?)))
+                    .enumerate()
+                {
+                    let (said, flagged) = match kin.compared {
+                        Compared::Same => ("the same", false),
+                        Compared::Shorter => ("shorter", false),
+                        Compared::Longer => ("longer", true),
+                        Compared::Differs => ("differs", true),
+                    };
+                    facts.push(
+                        kv(
+                            "Copy",
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap(theme.spacing.xs)
+                                .child(copy_tag(&copy.label, true, &theme))
+                                .child(format!("on {}", kept(&kin.id.location)))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(theme.spacing.xs)
+                                        .text_color(if flagged { c.yellow } else { c.fg3 })
+                                        .when(flagged, |this| {
+                                            this.child(icon(
+                                                SbIcon::TriangleAlert,
+                                                theme.sizes.icon_xs,
+                                                c.yellow,
+                                            ))
+                                        })
+                                        .child(said),
+                                )
+                                .when(flagged, |this| {
+                                    this.child(read(
+                                        "Read the copy",
+                                        kin.id.clone(),
+                                        format!("reader/facts/read-copy/{at}"),
+                                    ))
+                                }),
+                            &theme,
+                        )
+                        .automation_target(format!("reader/facts/copy/{at}")),
+                    );
+                }
+            }
+        }
         if let Some(path) = &session.project_path {
             facts.push(
                 kv(

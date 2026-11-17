@@ -110,7 +110,7 @@ impl SessionsPage {
                 }),
             }
             stats.calls += u64::from(session.all.calls);
-            locations.insert(&session.id.location);
+            locations.extend(session.ran_at());
             for time in session.started.into_iter().chain(session.ended) {
                 stats.span = Some(match stats.span {
                     Some((from, to)) => (from.min(time), to.max(time)),
@@ -148,11 +148,13 @@ pub enum Page {
 }
 
 /// What tells one group of Unsorted from another across loads: its path, as filing compares
-/// it or as it was recorded when filing can't, and its location unless it is a drive's.
+/// it or as it was recorded when filing can't, and its location unless it is a drive's, or
+/// what its sessions are copies as.
 pub fn group_key(group: &PathGroup) -> String {
     let project = group.project.as_ref();
     format!(
-        "{}\n{}\n{}",
+        "{}\n{}\n{}\n{}",
+        group.copy.as_deref().unwrap_or_default(),
         project.map_or("", NormalPath::as_str),
         match project {
             Some(_) => "",
@@ -231,7 +233,7 @@ pub(super) fn load(archive: &Archive, shelf: Shelf) -> Result<Loaded, CatalogueE
                     for session in &sessions {
                         if session.filed == Filed::ByRule(folder)
                             && let Some(project) = &session.project
-                            && let Some(by) = filing::file(project, &session.id.location, &attached)
+                            && let Some(by) = filing::file(project, session.ran_at(), &attached)
                             && let Some(at) = attached.iter().position(|path| path == by)
                         {
                             filed[at] += 1;
@@ -1173,6 +1175,31 @@ impl LibraryService {
             });
         }
         cx.notify();
+    }
+
+    /**
+     * Opens the session `id`, another of the open session's conversation (PLAN §7.7): a copy
+     * the reader's facts offer to read, or the original a copy names. It is read off the UI
+     * thread, and opened unless another was opened meanwhile.
+     */
+    pub fn open_kin(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(archive) = self.archive.read(cx).archive().cloned() else {
+            return;
+        };
+        let from = self.open.as_ref().map(|open| open.id.clone());
+        let job = cx.background_spawn(async move { archive.catalogue().session(&id) });
+        cx.spawn(async move |this, cx| {
+            let read = job.await;
+            this.update(cx, |this, cx| match read {
+                Ok(Some(session)) if this.open.as_ref().map(|open| &open.id) == from.as_ref() => {
+                    this.open(session, cx);
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("a copy of the session could not be read: {error}"),
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The request to open the open session at a match, until the reader takes it (the docs

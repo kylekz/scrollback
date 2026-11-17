@@ -63,7 +63,7 @@ use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::commands::{self, Command, Run};
 use crate::components::{
-    ButtonKind, below, bounds_of, button, chip_base, icon, info_banner, kbd, kind_icon,
+    ButtonKind, below, bounds_of, button, chip_base, copy_tag, icon, info_banner, kbd, kind_icon,
     location_tag, overline,
 };
 use crate::format;
@@ -1075,7 +1075,11 @@ impl Palette {
             ),
             Filed::Unsorted => (SbIcon::Inbox, "Unsorted".to_string()),
         };
-        let location = self.sync.read(cx).location(&session.id.location).cloned();
+        let location = match &session.copy {
+            Some(copy) => Some(copy_tag(&copy.label, false, theme)),
+            None => (self.sync.read(cx).location(&session.id.location))
+                .map(|location| location_tag(location.name.clone(), &location.kind, false, theme)),
+        };
         let now = format::now();
         self.row_base(id, row, theme, cx)
             .flex()
@@ -1104,11 +1108,7 @@ impl Palette {
                     .child(icon(glyph, theme.sizes.icon_xs, c.fg3))
                     .child(place),
             )
-            .children(
-                location.map(|location| {
-                    location_tag(location.name.clone(), &location.kind, false, theme)
-                }),
-            )
+            .children(location)
             .child(
                 div()
                     .flex_none()

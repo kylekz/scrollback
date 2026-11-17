@@ -16,7 +16,12 @@
 //! cargo run --release -p sb_core --example sync -- <archive folder> index
 //! cargo run --release -p sb_core --example sync -- <archive folder> reindex
 //! cargo run --release -p sb_core --example sync -- <archive folder> search <query>
+//! cargo run --release -p sb_core --example sync -- <archive folder> copies
 //! ```
+//!
+//! `copies` counts, of the indexed archive, the sessions the library shows, the copies of
+//! sessions that ran elsewhere shown alone, and the copies hidden behind their originals by
+//! how each compares with its original (PLAN §7.7). Counts only.
 //!
 //! A search prints how many matches it found in how many sessions and how long it took, on
 //! its first line, then each session it found and its first matches.
@@ -35,13 +40,14 @@
 //! of the user's own data. `test` is the connection test of a location that is reached through
 //! a shell; `distros` lists the WSL distros without starting any.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::Path;
 use std::time::Instant;
 
 use sb_core::CancelToken;
 use sb_core::archive::{Archive, ArchiveError};
-use sb_core::catalogue::{Catalogue, Session, Shelf};
+use sb_core::catalogue::{Catalogue, Compared, Session, Shelf};
 use sb_core::location::LocationKind;
 use sb_core::provider;
 use sb_core::search::{self, Calendar, Limit, Names, Searched};
@@ -52,6 +58,7 @@ use sb_core::transport::{Launcher, ShellTransport, Transport, wsl};
 const USAGE: &str = "usage: sync <archive folder> [<location>]
        sync <archive folder> verify | set-aside | index | reindex
        sync <archive folder> search <query>
+       sync <archive folder> copies
        sync test <location>
        sync distros
 <location>: --wsl <distro> [--home <folder>] | --ssh <host> | --loopback <home folder>";
@@ -221,6 +228,36 @@ fn print_index(catalogue: &Catalogue) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Counts the archive's copies of sessions that ran elsewhere, as the library shows them.
+fn copies(archive: &Archive) -> Result<(), Box<dyn Error>> {
+    let catalogue = archive.catalogue();
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for shelf in [Shelf::All, Shelf::Trash] {
+        for session in catalogue.sessions(shelf)? {
+            *counts.entry("sessions shown").or_default() += 1;
+            if session.copy.is_some() {
+                *counts
+                    .entry("copies shown alone, with no original")
+                    .or_default() += 1;
+            }
+            for kin in catalogue.kin(&session.id)? {
+                let what = match (kin.copy.is_some(), kin.compared) {
+                    (false, _) => "originals beside the one shown",
+                    (true, Compared::Same) => "copies hidden: the same as the session shown",
+                    (true, Compared::Shorter) => "copies hidden: behind the session shown",
+                    (true, Compared::Longer) => "copies hidden: ahead of the session shown",
+                    (true, Compared::Differs) => "copies hidden: as long, other bytes",
+                };
+                *counts.entry(what).or_default() += 1;
+            }
+        }
+    }
+    for (what, count) in counts {
+        println!("{what}: {count}");
+    }
+    Ok(())
+}
+
 /// Searches the archive as the palette does, and prints what it found.
 fn find(archive: &Archive, input: &str) -> Result<(), Box<dyn Error>> {
     let catalogue = archive.catalogue();
@@ -330,6 +367,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         [dir, action @ ("verify" | "set-aside" | "index" | "reindex")] => {
             (dir, action, Place::from(&[])?)
         }
+        [dir, "copies"] => return copies(&Archive::open(Path::new(dir))?),
         [dir, "search", ref query @ ..] => {
             let archive = Archive::open(Path::new(dir))?;
             return find(&archive, &query.join(" "));

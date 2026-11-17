@@ -10,7 +10,7 @@
 
 use toolbox_store::rusqlite::{self, Connection, OptionalExtension as _, params};
 
-use super::session::{archived, set_state};
+use super::session::{RAN_AT, SHOWN, archived, set_state};
 use super::{Catalogue, CatalogueError, FOLDER_NAME_CHARS, Result, SessionId};
 use crate::filing::{self, AttachedPath, Fileable, FolderId, NormalPath};
 use crate::location::LocationId;
@@ -32,10 +32,14 @@ pub struct FolderPath {
 }
 
 /// A project path sessions at one location recorded, as they recorded it: what the folder
-/// paths editor completes from (DESIGN §4.7). Sessions in Trash are not counted.
+/// paths editor completes from (DESIGN §4.7). Sessions in Trash are not counted, nor those the
+/// library doesn't show (PLAN §7.7).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectPath {
-    pub location: LocationId,
+    /// Where the sessions ran; `None` for copies of sessions that ran elsewhere, which say
+    /// what they are as `copy`.
+    pub location: Option<LocationId>,
+    pub copy: Option<String>,
     pub recorded: String,
     pub project: NormalPath,
     pub sessions: usize,
@@ -333,14 +337,14 @@ impl Catalogue {
     /// The sessions out of Trash that the rules may move: what a change of paths refiles.
     pub fn fileable(&self) -> Result<Vec<Fileable>> {
         self.db.read(|c| {
-            Ok(c.prepare(
-                "SELECT s.project, s.location_id, st.folder_id FROM session s
-                 LEFT JOIN session_state st
-                   ON st.location_id = s.location_id AND st.provider = s.provider
-                  AND st.session = s.session
-                 WHERE s.project IS NOT NULL AND COALESCE(st.by_hand, 0) = 0
-                   AND st.trashed_at IS NULL",
-            )?
+            Ok(c.prepare(&format!(
+                "SELECT s.project, {RAN_AT}, st.folder_id FROM session s
+                     LEFT JOIN session_state st
+                       ON st.location_id = s.location_id AND st.provider = s.provider
+                      AND st.session = s.session
+                     WHERE s.project IS NOT NULL AND COALESCE(st.by_hand, 0) = 0
+                       AND st.trashed_at IS NULL"
+            ))?
             .query_map([], |row| {
                 Ok(Fileable {
                     project: row.get(0)?,
@@ -356,25 +360,26 @@ impl Catalogue {
     /// many sessions recorded it and how many of those are in Unsorted, the most first.
     pub fn project_paths(&self) -> Result<Vec<ProjectPath>> {
         let paths: Vec<ProjectPath> = self.db.read(|c| -> Result<_> {
-            Ok(c.prepare(
-                "SELECT s.location_id, s.project_path, s.project, count(*),
-                        COALESCE(sum(st.folder_id IS NULL), 0)
+            Ok(c.prepare(&format!(
+                "SELECT {RAN_AT} AS ran_at, min(s.copy_label), s.project_path, s.project,
+                        count(*), COALESCE(sum(st.folder_id IS NULL), 0)
                  FROM session s
                  LEFT JOIN session_state st
                    ON st.location_id = s.location_id AND st.provider = s.provider
                   AND st.session = s.session
                  WHERE s.project IS NOT NULL AND s.project_path IS NOT NULL
-                   AND st.trashed_at IS NULL
-                 GROUP BY s.location_id, s.project_path
-                 ORDER BY count(*) DESC, s.project_path",
-            )?
+                   AND st.trashed_at IS NULL AND {SHOWN}
+                 GROUP BY ran_at, s.project_path
+                 ORDER BY count(*) DESC, s.project_path"
+            ))?
             .query_map([], |row| {
                 Ok(ProjectPath {
                     location: row.get(0)?,
-                    recorded: row.get(1)?,
-                    project: row.get(2)?,
-                    sessions: row.get(3)?,
-                    unsorted: row.get(4)?,
+                    copy: row.get(1)?,
+                    recorded: row.get(2)?,
+                    project: row.get(3)?,
+                    sessions: row.get(4)?,
+                    unsorted: row.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?)
@@ -400,16 +405,8 @@ impl Catalogue {
     pub fn file_automatically(&self, session: &SessionId) -> Result<Option<FolderId>> {
         self.db.write(|tx| {
             archived(tx, session)?;
-            let project: Option<NormalPath> = tx
-                .query_row(
-                    "SELECT project FROM session
-                     WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
-                    params![session.location, session.provider, session.key],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .flatten();
-            let folder = claimed(project.as_ref(), &session.location, &attached(tx)?);
+            let (project, ran_at) = filing_of(tx, session)?;
+            let folder = claimed(project.as_ref(), ran_at.as_ref(), &attached(tx)?);
             set_state(tx, session, &[("folder_id", &folder), ("by_hand", &false)])?;
             Ok(folder.map(FolderId))
         })
@@ -641,12 +638,13 @@ pub(super) fn parent_of(connection: &Connection, folder: FolderId) -> Result<Opt
         .ok_or(CatalogueError::NoFolder(folder))
 }
 
-/// Runs the rules on the session `id`, started in `project`, unless the owner filed it by
-/// hand. Returns whether they moved it into a folder.
+/// Runs the rules on the session `id`, started in `project` at `ran_at` ([`super::Session::ran_at`]),
+/// unless the owner filed it by hand. Returns whether they moved it into a folder.
 pub(super) fn file_by_rule(
     connection: &Connection,
     id: &SessionId,
     project: Option<&NormalPath>,
+    ran_at: Option<&LocationId>,
 ) -> rusqlite::Result<bool> {
     let (current, by_hand): (Option<i64>, bool) = connection
         .query_row(
@@ -660,7 +658,7 @@ pub(super) fn file_by_rule(
     if by_hand {
         return Ok(false);
     }
-    let folder = claimed(project, &id.location, &attached(connection)?);
+    let folder = claimed(project, ran_at, &attached(connection)?);
     if folder == current {
         return Ok(false);
     }
@@ -674,26 +672,32 @@ pub(super) fn file_by_rule(
  */
 fn refile(connection: &Connection) -> rusqlite::Result<()> {
     let attached = attached(connection)?;
-    let filed: Vec<(SessionId, Option<NormalPath>, Option<i64>)> = connection
-        .prepare(
-            "SELECT s.location_id, s.provider, s.session, s.project, st.folder_id
+    type Filed = (
+        SessionId,
+        Option<NormalPath>,
+        Option<LocationId>,
+        Option<i64>,
+    );
+    let filed: Vec<Filed> = connection
+        .prepare(&format!(
+            "SELECT s.location_id, s.provider, s.session, s.project, {RAN_AT}, st.folder_id
              FROM session s
              LEFT JOIN session_state st
                ON st.location_id = s.location_id AND st.provider = s.provider
               AND st.session = s.session
-             WHERE COALESCE(st.by_hand, 0) = 0 AND st.trashed_at IS NULL",
-        )?
+             WHERE COALESCE(st.by_hand, 0) = 0 AND st.trashed_at IS NULL"
+        ))?
         .query_map([], |row| {
             let id = SessionId {
                 location: row.get(0)?,
                 provider: row.get(1)?,
                 key: row.get(2)?,
             };
-            Ok((id, row.get(3)?, row.get(4)?))
+            Ok((id, row.get(3)?, row.get(4)?, row.get(5)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    for (id, project, current) in filed {
-        let folder = claimed(project.as_ref(), &id.location, &attached);
+    for (id, project, ran_at, current) in filed {
+        let folder = claimed(project.as_ref(), ran_at.as_ref(), &attached);
         if folder != current {
             set_state(connection, &id, &[("folder_id", &folder)])?;
         }
@@ -714,7 +718,7 @@ pub(super) fn remount(
     let sessions: Vec<(i64, String)> = connection
         .prepare(
             "SELECT id, project_path FROM session
-             WHERE location_id = ?1 AND project_path IS NOT NULL",
+             WHERE location_id = ?1 AND project_path IS NOT NULL AND copy_label IS NULL",
         )?
         .query_map([location], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
@@ -744,10 +748,30 @@ pub(super) fn remount(
 /// The folder whose attached path claims a session started in `project` at `location`.
 fn claimed(
     project: Option<&NormalPath>,
-    location: &LocationId,
+    location: Option<&LocationId>,
     attached: &[AttachedPath],
 ) -> Option<i64> {
     filing::file(project?, location, attached).map(|path| path.folder.0)
+}
+
+/// The project path the session `id`'s row has, as filing compares paths, and the location it
+/// ran at ([`super::Session::ran_at`]): what the rules file it by.
+pub(super) fn filing_of(
+    connection: &Connection,
+    id: &SessionId,
+) -> rusqlite::Result<(Option<NormalPath>, Option<LocationId>)> {
+    Ok(connection
+        .query_row(
+            "SELECT project, copy_label IS NULL FROM session
+             WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+            params![id.location, id.provider, id.key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .map_or(
+            (None, Some(id.location.clone())),
+            |(project, original): (_, bool)| (project, original.then(|| id.location.clone())),
+        ))
 }
 
 /// Every attached path.

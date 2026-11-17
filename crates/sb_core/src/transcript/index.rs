@@ -4,13 +4,14 @@
 use std::collections::BTreeMap;
 
 use super::{
-    BlockId, Content, Conversation, Ending, Subagent, Tokens, ToolInput, ToolKind, Transcript,
+    BlockId, Content, Conversation, CopyOf, Ending, Subagent, Tokens, ToolInput, ToolKind,
+    Transcript,
 };
 
 /// The version of what the index holds of a session: of [`index`], and of how the catalogue
 /// derives and keeps a session's row from it. Rows made by another version are made again
 /// (PLAN §7.5), so it goes up whenever either would give an archived session another row.
-pub const INDEX_VERSION: u32 = 2;
+pub const INDEX_VERSION: u32 = 3;
 
 /// How much of the first prompt stands in for a title the agent didn't store.
 const TITLE_CHARS: usize = 80;
@@ -30,6 +31,10 @@ pub struct SessionIndex {
     pub project_path: Option<String>,
     pub branch: Option<String>,
     pub entrypoint: Option<String>,
+    /// The agent's id for the conversation, and whether the session is a copy kept elsewhere
+    /// (PLAN §7.7).
+    pub conversation: Option<String>,
+    pub copy: Option<CopyOf>,
     /// The session's items hold no main transcript: what is here is of its subagents alone.
     pub transcript_missing: bool,
     /// Some part of the session could not be read: one of its conversations to its end, or
@@ -131,6 +136,8 @@ pub fn index(transcript: &Transcript) -> SessionIndex {
         project_path: transcript.facts.project_path.clone(),
         branch: transcript.facts.branch.clone(),
         entrypoint: transcript.facts.entrypoint.clone(),
+        conversation: transcript.facts.conversation.clone(),
+        copy: transcript.facts.copy.clone(),
         transcript_missing: own.is_none(),
         unread: false,
         started: None,
