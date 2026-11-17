@@ -565,20 +565,37 @@ impl Catalogue {
     }
 }
 
-/// The key in `kv` of how many deletes for good the files are still to be scrubbed of.
-const TO_SCRUB: &str = "deleted_to_scrub";
+/**
+ * A file a delete for good is to be scrubbed out of (PLAN §4.5), each on its own: one that
+ * can't be yet doesn't have the other done again.
+ */
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Scrub {
+    /// The search index: its entries of the text, which it marked deleted, and its pages.
+    Search,
+    /// The catalogue: its pages, and its log.
+    Catalogue,
+}
+
+impl Scrub {
+    /// The key in `kv` of how many deletes for good the file is still to be scrubbed of.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Search => "deleted_to_scrub",
+            Self::Catalogue => "deleted_to_scrub_catalogue",
+        }
+    }
+}
 
 impl Catalogue {
     /**
-     * Whether a delete for good was committed that the archive's files are still to be
-     * scrubbed of (PLAN §4.5): the search index's entries of its text, which it marked
-     * deleted, and the catalogue's log, if a read held it when the delete was to empty it. A
-     * mark that grows with each delete for good, for [`Catalogue::scrubbed`].
+     * Whether a delete for good was committed that the file `part` is still to be scrubbed of
+     * (PLAN §4.5). A mark that grows with each delete for good, for [`Catalogue::scrubbed`].
      */
-    pub(crate) fn to_scrub(&self) -> Result<Option<String>> {
+    pub(crate) fn to_scrub(&self, part: Scrub) -> Result<Option<String>> {
         self.db.read(|c| {
             Ok(
-                c.query_row("SELECT value FROM kv WHERE key = ?1", [TO_SCRUB], |row| {
+                c.query_row("SELECT value FROM kv WHERE key = ?1", [part.key()], |row| {
                     row.get(0)
                 })
                 .optional()?,
@@ -586,13 +603,13 @@ impl Catalogue {
         })
     }
 
-    /// The files were scrubbed of the deletes for good up to `mark` ([`Catalogue::to_scrub`]):
-    /// one committed since is still to be.
-    pub(crate) fn scrubbed(&self, mark: &str) -> Result<()> {
+    /// The file `part` was scrubbed of the deletes for good up to `mark`
+    /// ([`Catalogue::to_scrub`]): one committed since is still to be.
+    pub(crate) fn scrubbed(&self, part: Scrub, mark: &str) -> Result<()> {
         self.db.write(|tx| {
             tx.execute(
                 "DELETE FROM kv WHERE key = ?1 AND value = ?2",
-                [TO_SCRUB, mark],
+                [part.key(), mark],
             )?;
             Ok(())
         })
@@ -608,11 +625,13 @@ pub(super) fn forget(tx: &rusqlite::Connection, id: &SessionId) -> Result<()> {
     let identity = params![id.location, id.provider, id.key];
     /* What the files still hold of it is scrubbed out of them in the background
     ([`Catalogue::to_scrub`]). */
-    tx.execute(
-        "INSERT INTO kv (key, value) VALUES (?1, '1')
-         ON CONFLICT (key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
-        [TO_SCRUB],
-    )?;
+    for part in [Scrub::Search, Scrub::Catalogue] {
+        tx.execute(
+            "INSERT INTO kv (key, value) VALUES (?1, '1')
+             ON CONFLICT (key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+            [part.key()],
+        )?;
+    }
     let mut items: Vec<(i64, String, String)> = tx
         .prepare(
             "SELECT id, key, item_id FROM item

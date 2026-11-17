@@ -46,6 +46,7 @@ use crate::location::LocationId;
 use crate::search::{SearchError, SearchIndex};
 
 pub use delete::{Deleted, Unscrubbed};
+pub use disk::{Disk, Lack};
 pub use disk::{plain, write_durably};
 pub use items::{ArchivedSession, Pinned};
 pub use kin::KinMemo;
@@ -1571,6 +1572,46 @@ mod tests {
                 .collect::<Vec<_>>(),
             [sessions[0].clone()]
         );
+    }
+
+    /**
+     * A catalogue too large to write anew here leaves its part of erasing a delete for good
+     * for the next start, said as such, and not tried again meanwhile; the search index's part
+     * is done all the same, and not done again for it.
+     */
+    #[test]
+    fn a_catalogue_too_large_to_scrub_waits_for_the_next_start_alone() {
+        use std::sync::atomic::Ordering;
+
+        use crate::catalogue::Scrub;
+        let (dir, archive, sessions) = two_with_text();
+        archive
+            .removals
+            .catalogue_too_large
+            .store(true, Ordering::Relaxed);
+        let catalogue = archive.catalogue();
+        catalogue.trash(&sessions[0]).unwrap();
+        let shown = catalogue.deletion(&sessions[0]).unwrap();
+        archive.delete_for_good(&shown).unwrap();
+        archive.wait_for_removals();
+        assert!(catalogue.to_scrub(Scrub::Search).unwrap().is_none());
+        assert!(catalogue.to_scrub(Scrub::Catalogue).unwrap().is_some());
+        assert!(!archive.scrub_wanted().unwrap());
+        assert_eq!(
+            archive.unscrubbed().unwrap(),
+            Some(Unscrubbed {
+                lacks: None,
+                catalogue_too_large: true
+            })
+        );
+        drop(archive);
+
+        /* The next start tries again, and the catalogue, not too large after all, is done. */
+        let archive = Archive::open(dir.path()).unwrap();
+        archive.wait_for_removals();
+        let catalogue = archive.catalogue();
+        assert!(catalogue.to_scrub(Scrub::Catalogue).unwrap().is_none());
+        assert_eq!(archive.unscrubbed().unwrap(), None);
     }
 
     /// What an index says a row is made of is what the catalogue says it is.

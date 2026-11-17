@@ -289,7 +289,7 @@ fn run(
     /* What the index deleted for good (PLAN §4.5): sessions of conversations the owner
     deleted, and what they left that is no session's; and deleted text still to be erased from
     the files, which the background removal tries again. */
-    if catalogue.pending_removals()? > 0 || catalogue.to_scrub()?.is_some() {
+    if catalogue.pending_removals()? > 0 || archive.scrub_wanted()? {
         archive.start_removals(false);
     }
     /* A log a read held when a delete for good was to empty it is emptied now. */
@@ -417,7 +417,6 @@ impl Batch {
         self.texts.len() >= TEXTS || self.bytes >= TEXT_BYTES
     }
 
-    /// Writes what was added ([`record`]) and empties it. Returns how many texts were written.
     /// Writes what was added ([`record`]), waiting for a compaction, and empties it. Returns
     /// how many texts were written.
     fn write(&mut self, archive: &Archive, search: &SearchIndex) -> Result<usize, SyncError> {

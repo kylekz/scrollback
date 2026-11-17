@@ -28,8 +28,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 
+use toolbox_store::rusqlite;
+
+use super::disk::{Lack, Room};
 use super::{Archive, ArchiveError, Result, accounted, disk, layout, open_search, segment};
-use crate::catalogue::{AllowedAgain, Catalogue, Deletion, ItemFile, Removal, SessionId, Stored};
+use crate::catalogue::{
+    AllowedAgain, Catalogue, Deletion, ItemFile, Removal, Scrub, SessionId, Stored,
+};
 use crate::location::LocationId;
 use crate::search::{SearchError, SearchIndex};
 
@@ -45,19 +50,15 @@ pub struct Deleted {
 }
 
 /// What is still to be erased of what was deleted for good ([`Archive::unscrubbed`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Unscrubbed {
-    /// About how much room on its disk erasing it takes, when the search index is open.
-    pub needs: Option<u64>,
-    /// How much room there is, if it could be read.
-    pub free: Option<u64>,
-}
-
-impl Unscrubbed {
-    /// Whether the room it takes is what it waits for.
-    pub fn wants_room(&self) -> bool {
-        matches!((self.needs, self.free), (Some(needs), Some(free)) if free < needs)
-    }
+    /// The room a disk lacks for it, when that is what it waits for.
+    #[serde(default)]
+    pub lacks: Option<Lack>,
+    /// The catalogue is too large to be written anew here (PLAN §4.5): that part waits for
+    /// the next start, and is never done while it is.
+    #[serde(default)]
+    pub catalogue_too_large: bool,
 }
 
 /// The largest catalogue [`vacuum_catalogue`] writes anew: one written in about a second, so
@@ -70,94 +71,168 @@ const VACUUM_MOST: u64 = 128 * 1024 * 1024;
 const VACUUM_TRIES: u32 = 100;
 const VACUUM_APART: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// What became of [`vacuum_catalogue`].
+enum Vacuumed {
+    Done,
+    /// The catalogue is larger than [`VACUUM_MOST`]: left as it is.
+    TooLarge,
+}
+
+/// The room [`vacuum_catalogue`] takes, for the catalogue in `dir`: the file once more, in
+/// its log; its copy is made in memory.
+fn catalogue_room(dir: &Path) -> Room {
+    let size = fs::metadata(dir.join(crate::catalogue::DATABASE)).map_or(0, |it| it.len());
+    Room {
+        archive: size,
+        temp: 0,
+    }
+}
+
 /**
- * Writes the catalogue's file anew (`VACUUM`), on a connection of its own, so no page of
- * it keeps a copy of a cell a delete's rebalance left there, which `secure_delete`
- * doesn't overwrite (PLAN §4.5). It never waits on a write: while one holds the database
- * it tries again a moment later, and gives up after a while; and a write never waits on it
- * long, as it is done only for a catalogue that is written anew in about a second
- * ([`VACUUM_MOST`]), the larger one said in the log and left. Its disk is to have room for
- * the file twice over. `stop` ends it between tries.
+ * Writes the catalogue's file anew (`VACUUM`), on a connection of its own, so no page of it
+ * keeps a copy of a cell a delete's rebalance left there, which `secure_delete` doesn't
+ * overwrite (PLAN §4.5). Its copy is made in memory (`temp_store = MEMORY`), as the catalogue
+ * is small, and its pages go through its log, on the archive's disk, which is to have the room.
+ *
+ * It never waits on a write: while one holds the database it tries again a moment later, and
+ * gives up after a while. And a write never waits on it long: it is done only for a catalogue
+ * that is written anew in about a second ([`VACUUM_MOST`]). `stop` ends it between tries, and
+ * interrupts the `VACUUM` under way, with nothing changed.
  */
-fn vacuum_catalogue(dir: &Path, stop: &(dyn Fn() -> bool + Sync)) -> Result<(), SearchError> {
+fn vacuum_catalogue(dir: &Path, stop: &(dyn Fn() -> bool + Sync)) -> Result<Vacuumed> {
     let path = dir.join(crate::catalogue::DATABASE);
-    let size = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
-    if size > VACUUM_MOST {
-        log::warn!(
-            "the catalogue is {} MB: too large to write anew without holding writes up",
-            size >> 20
-        );
-        return Ok(());
+    if fs::metadata(&path).map_or(0, |it| it.len()) > VACUUM_MOST {
+        return Ok(Vacuumed::TooLarge);
     }
-    if let Ok(free) = disk::free_space(dir)
-        && free < size.saturating_mul(2)
-    {
+    if let Some(lack) = disk::lacking(dir, catalogue_room(dir)) {
         return Err(SearchError::Unavailable(format!(
-            "writing the catalogue anew takes about {} MB free, and there are {} MB",
-            size.saturating_mul(2) >> 20,
-            free >> 20
-        )));
+            "writing the catalogue anew needs about {} MB free on the archive's disk",
+            lack.needs >> 20
+        ))
+        .into());
     }
-    let connection =
-        toolbox_store::rusqlite::Connection::open(disk::for_sqlite(&path, disk::SQLITE_FILE))?;
-    connection.busy_timeout(std::time::Duration::ZERO)?;
+    let connection = rusqlite::Connection::open(disk::for_sqlite(&path, disk::SQLITE_FILE))
+        .map_err(SearchError::from)?;
+    let ready = connection
+        .busy_timeout(std::time::Duration::ZERO)
+        .and_then(|()| connection.pragma_update(None, "temp_store", "MEMORY"));
+    ready.map_err(SearchError::from)?;
     for _ in 0..VACUUM_TRIES {
         if stop() {
-            break;
+            return Err(SearchError::Cancelled.into());
         }
-        match connection.execute_batch("VACUUM") {
+        match watched(&connection, stop, || connection.execute_batch("VACUUM")) {
             Err(error)
                 if matches!(
                     error.sqlite_error_code(),
-                    Some(
-                        toolbox_store::rusqlite::ErrorCode::DatabaseBusy
-                            | toolbox_store::rusqlite::ErrorCode::DatabaseLocked
-                    )
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
                 ) =>
             {
-                std::thread::sleep(VACUUM_APART);
+                thread::sleep(VACUUM_APART);
             }
-            vacuumed => return Ok(vacuumed?),
+            Err(error)
+                if error.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted) =>
+            {
+                return Err(SearchError::Cancelled.into());
+            }
+            vacuumed => {
+                vacuumed.map_err(SearchError::from)?;
+                return Ok(Vacuumed::Done);
+            }
         }
     }
     Err(SearchError::Unavailable(
         "the catalogue was written to all along, and is written anew later".to_string(),
-    ))
+    )
+    .into())
+}
+
+/// Runs `statement` on `connection` while a thread asks `stop` every few tens of milliseconds
+/// and interrupts it when it says to. With no thread to be had, it just runs.
+fn watched(
+    connection: &rusqlite::Connection,
+    stop: &(dyn Fn() -> bool + Sync),
+    statement: impl FnOnce() -> rusqlite::Result<()>,
+) -> rusqlite::Result<()> {
+    let (handle, ended) = (connection.get_interrupt_handle(), AtomicBool::new(false));
+    thread::scope(|scope| {
+        let watching = thread::Builder::new()
+            .name("catalogue-vacuum".to_string())
+            .spawn_scoped(scope, || {
+                while !ended.load(Ordering::Relaxed) {
+                    if stop() {
+                        handle.interrupt();
+                    }
+                    thread::sleep(std::time::Duration::from_millis(25));
+                }
+            });
+        if let Err(error) = watching {
+            log::warn!("the catalogue's VACUUM can't be stopped once it begins: {error}");
+        }
+        let ran = statement();
+        ended.store(true, Ordering::Relaxed);
+        ran
+    })
 }
 
 /**
  * Erases what is left in the archive's files of the sessions deleted for good since this last
- * did (PLAN §4.5), if any were: a delete for good marks the catalogue in its own transaction
- * ([`Catalogue::to_scrub`]), and the mark is taken off only once both files are erased, so a
- * crash or a failure leaves it for the next try. The catalogue's part (its file written anew,
- * [`vacuum_catalogue`], and its log emptied) is done whatever becomes of the search index's:
- * the index compacted without the entries it marked deleted and written anew
- * ([`SearchIndex::compact`]), when its disk has the room, until `stop` says.
+ * did (PLAN §4.5), if any were. A delete for good marks the catalogue in its own transaction
+ * ([`Catalogue::to_scrub`]), once for each file, and each mark is taken off only once its file
+ * is erased: a crash or a failure leaves it for the next try, and the other file is not done
+ * again for it.
+ *
+ * - The catalogue's part: its file written anew ([`vacuum_catalogue`]) and its log emptied. A
+ *   catalogue too large for it is left until the next start: `too_large` says so meanwhile.
+ * - The search index's: the index made again without the entries it marked deleted, and its
+ *   file written anew ([`SearchIndex::compact`]), when its disks have the room.
+ *
+ * `stop` ends either at once.
  */
 fn scrub(
     dir: &Path,
     search: &Mutex<Option<Arc<SearchIndex>>>,
     catalogue: &Catalogue,
+    too_large: &AtomicBool,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<()> {
     if stop() {
         return Ok(());
     }
-    let Some(mark) = catalogue.to_scrub()? else {
-        return Ok(());
-    };
-    let vacuumed = vacuum_catalogue(dir, stop);
-    let logged = catalogue.empty_log();
-    if !catalogue.text_gone()?.is_empty() {
-        return Err(SearchError::Unavailable("deleted text is still in the index".into()).into());
+    let mut failed = None;
+    if let Some(mark) = catalogue.to_scrub(Scrub::Catalogue)?
+        && !too_large.load(Ordering::Relaxed)
+    {
+        match vacuum_catalogue(dir, stop) {
+            Ok(Vacuumed::Done) if catalogue.empty_log() => {
+                catalogue.scrubbed(Scrub::Catalogue, &mark)?;
+            }
+            Ok(Vacuumed::Done) => {
+                failed = Some(SearchError::Unavailable(
+                    "a read held the catalogue's log".to_string(),
+                ));
+            }
+            Ok(Vacuumed::TooLarge) => {
+                log::warn!(
+                    "the catalogue is too large to write anew without holding writes up: \
+                     deleted text may stay in its pages until it is"
+                );
+                too_large.store(true, Ordering::Relaxed);
+            }
+            Err(error) => failed = Some(SearchError::Unavailable(error.to_string())),
+        }
     }
-    let search = open_search(dir, search, catalogue)?;
-    search.compact(true, stop)?;
-    vacuumed?;
-    if !logged {
-        return Err(SearchError::Unavailable("a read held the catalogue's log".to_string()).into());
+    if let Some(mark) = catalogue.to_scrub(Scrub::Search)? {
+        if !catalogue.text_gone()?.is_empty() {
+            return Err(
+                SearchError::Unavailable("deleted text is still in the index".into()).into(),
+            );
+        }
+        let search = open_search(dir, search, catalogue)?;
+        search.compact(true, stop)?;
+        catalogue.scrubbed(Scrub::Search, &mark)?;
     }
-    Ok(catalogue.scrubbed(&mark)?)
+    failed.map_or(Ok(()), |error| Err(error.into()))
 }
 
 /// The archive's background removal of deleted items' files.
@@ -166,6 +241,9 @@ pub(super) struct Removals {
     job: Mutex<Job>,
     /// The archive is closing: the removal stops before its next item.
     stop: AtomicBool,
+    /// The catalogue was found too large to write anew since the archive was opened: that
+    /// part of erasing what was deleted for good waits for the next start ([`scrub`]).
+    pub(super) catalogue_too_large: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -278,7 +356,18 @@ impl Archive {
      * move does before it copies.
      */
     pub(crate) fn scrub_deleted(&self, stop: &(dyn Fn() -> bool + Sync)) -> Result<()> {
-        scrub(&self.dir, &self.search, &self.catalogue, stop)
+        let too_large = &self.removals.catalogue_too_large;
+        scrub(&self.dir, &self.search, &self.catalogue, too_large, stop)
+    }
+
+    /**
+     * Whether there is erasing of what was deleted for good ([`scrub`]) to try: of the search
+     * index, or of a catalogue not found too large since the archive was opened.
+     */
+    pub(crate) fn scrub_wanted(&self) -> Result<bool> {
+        let catalogue = self.catalogue.to_scrub(Scrub::Catalogue)?.is_some()
+            && !self.removals.catalogue_too_large.load(Ordering::Relaxed);
+        Ok(catalogue || self.catalogue.to_scrub(Scrub::Search)?.is_some())
     }
 
     /**
@@ -286,7 +375,9 @@ impl Archive {
      * removal has tried and is not trying now: `None` when nothing is, or it is under way.
      */
     pub fn unscrubbed(&self) -> Result<Option<Unscrubbed>> {
-        if self.catalogue.to_scrub()?.is_none() {
+        let search = self.catalogue.to_scrub(Scrub::Search)?.is_some();
+        let catalogue = self.catalogue.to_scrub(Scrub::Catalogue)?.is_some();
+        if !search && !catalogue {
             return Ok(None);
         }
         let job = self
@@ -298,12 +389,22 @@ impl Archive {
             return Ok(None);
         }
         drop(job);
-        let needs = self
-            .search_index_if_open()
-            .and_then(|search| search.compaction_room(true).ok());
+        let too_large = catalogue
+            && (self.removals.catalogue_too_large.load(Ordering::Relaxed)
+                || fs::metadata(self.dir.join(crate::catalogue::DATABASE))
+                    .is_ok_and(|it| it.len() > VACUUM_MOST));
+        let mut room = Room::default();
+        if search && let Some(index) = self.search_index_if_open() {
+            room = index.compaction_room(true).unwrap_or_default();
+        }
+        if catalogue && !too_large {
+            room.archive = room
+                .archive
+                .saturating_add(catalogue_room(&self.dir).archive);
+        }
         Ok(Some(Unscrubbed {
-            needs,
-            free: disk::free_space(&self.dir).ok(),
+            lacks: disk::lacking(&self.dir, room),
+            catalogue_too_large: too_large,
         }))
     }
 
@@ -411,7 +512,8 @@ impl Remover {
                 log::warn!("the text of deleted sessions is left for later: {error}");
             }
             let stop = || self.removals.stop.load(Ordering::Relaxed);
-            if let Err(error) = scrub(&self.dir, &self.search, &self.catalogue, &stop) {
+            let too_large = &self.removals.catalogue_too_large;
+            if let Err(error) = scrub(&self.dir, &self.search, &self.catalogue, too_large, &stop) {
                 log::warn!("deleted text is erased from the archive's files later: {error}");
             }
             if backup && !self.removals.stop.load(Ordering::Relaxed) {

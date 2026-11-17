@@ -27,7 +27,7 @@ use gpui::{
 };
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
-use sb_core::archive::Unscrubbed;
+use sb_core::archive::{Disk, Lack, Unscrubbed};
 use sb_core::catalogue::{Filed, Session, SessionId};
 
 use super::header::{Under, header};
@@ -50,17 +50,24 @@ const EMPTY: &str = "Trash is empty.";
 
 /**
  * What a note says of text deleted for good that is not yet erased from the archive's files
- * (PLAN §4.5, DESIGN §4.8): what it waits for, room on the disk, when that is it.
+ * (PLAN §4.5, DESIGN §4.8): what it waits for, room on a disk, or a catalogue too large to
+ * compact here, when that is it.
  */
 pub(crate) fn unscrubbed_note(unscrubbed: &Unscrubbed) -> String {
-    match unscrubbed.needs.filter(|_| unscrubbed.wants_room()) {
-        Some(needs) => format!(
-            "Deleted text isn't erased from the archive's files yet: that needs about {} free.",
-            format::fine_size(needs)
+    const NOT_YET: &str = "Deleted text isn't erased from the archive's files yet";
+    match unscrubbed.lacks {
+        Some(Lack { needs, disk }) => format!(
+            "{NOT_YET}: that needs about {} free on {}.",
+            format::fine_size(needs),
+            match disk {
+                Disk::Archive => "the archive's disk",
+                Disk::System => "the system disk",
+            }
         ),
-        None => "Deleted text isn't erased from the archive's files yet; it is tried again \
-                 after the next sync."
-            .to_string(),
+        None if unscrubbed.catalogue_too_large => {
+            format!("{NOT_YET}: the catalogue is too large to compact here.")
+        }
+        None => format!("{NOT_YET}; it is tried again after the next sync."),
     }
 }
 

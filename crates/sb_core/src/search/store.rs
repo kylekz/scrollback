@@ -562,12 +562,13 @@ impl SearchIndex {
     }
 
     /**
-     * How much room on its disk a compaction takes at most ([`SearchIndex::compact`]): the
-     * index's entries three times over (a new copy of them, in the log and then in the
-     * database, and the pages of the old one overwritten, as `secure_delete` does, in the log);
-     * and with `vacuum`, the file twice more (a copy made aside, and its pages in the log).
+     * How much room a compaction takes at most ([`SearchIndex::compact`]). On the archive's
+     * disk, the index's entries three times over (a new copy of them, in the log and then in
+     * the database, and the pages of the old one overwritten, as `secure_delete` does, in the
+     * log); and with `vacuum`, the file once more, its pages in the log. With `vacuum`, the
+     * file again in SQLite's temporary folder, where `VACUUM` writes its copy.
      */
-    pub(crate) fn compaction_room(&self, vacuum: bool) -> Result<u64, SearchError> {
+    pub(crate) fn compaction_room(&self, vacuum: bool) -> Result<disk::Room, SearchError> {
         self.db.read(|c| {
             let entries: i64 = c.query_row(
                 "SELECT coalesce(sum(length(block)), 0) FROM span_text_data",
@@ -580,8 +581,11 @@ impl SearchIndex {
                 |row| row.get(0),
             )?;
             let (entries, file) = (as_bytes(entries), as_bytes(file));
-            let vacuumed = if vacuum { file.saturating_mul(2) } else { 0 };
-            Ok(entries.saturating_mul(3).saturating_add(vacuumed))
+            let file = if vacuum { file } else { 0 };
+            Ok(disk::Room {
+                archive: entries.saturating_mul(3).saturating_add(file),
+                temp: file,
+            })
         })
     }
 
@@ -592,7 +596,9 @@ impl SearchIndex {
      * few thousand sessions and left nearly three times the entries for the same text.) With
      * `vacuum` (a delete for good's, PLAN §4.5), it then writes the file anew (`VACUUM`), so
      * no page keeps a copy of a cell a rebalance left in it, which `secure_delete` doesn't
-     * reach. Then empties the log, so what was taken out is in no file. Searches go on
+     * reach; `VACUUM` makes its copy in SQLite's temporary folder, the system's
+     * ([`disk::sqlite_temp_dir`]), so the index's live text is there while it runs. Then
+     * empties the log, so what was taken out is in no file. Searches go on
      * meanwhile, of the index as it was; text being written is left to the backlog, or waits,
      * as its writer asks ([`SearchIndex::record`]); a forget waits. One compaction runs at a
      * time.
@@ -612,14 +618,15 @@ impl SearchIndex {
             .compaction
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let needs = self.compaction_room(vacuum)?;
-        if let Ok(free) = disk::free_space(self.log.path.parent().unwrap_or(Path::new(".")))
-            && free < needs
-        {
+        let dir = self.log.path.parent().unwrap_or(Path::new("."));
+        if let Some(lack) = disk::lacking(dir, self.compaction_room(vacuum)?) {
+            let disk = match lack.disk {
+                disk::Disk::Archive => "the archive's disk",
+                disk::Disk::System => "the system disk, where SQLite keeps its temporary files",
+            };
             return Err(SearchError::Unavailable(format!(
-                "compacting the search index takes about {} MB free, and there are {} MB",
-                needs >> 20,
-                free >> 20
+                "compacting the search index needs about {} MB free on {disk}",
+                lack.needs >> 20
             )));
         }
         self.compacting.store(true, Ordering::Relaxed);

@@ -469,6 +469,75 @@ pub(super) fn place_retrying(file: TempPath, to: &Path) -> Result<(), (io::Error
     }
 }
 
+/**
+ * The folder SQLite writes its temporary files in, as it chooses it: a `VACUUM`'s copy of the
+ * database goes there, not beside the database (the bundled build keeps temporary files on
+ * disk). On Windows, the system's temporary folder; elsewhere the first folder there is of
+ * `SQLITE_TMPDIR`, `TMPDIR`, `/var/tmp`, `/usr/tmp` and `/tmp`.
+ */
+pub(crate) fn sqlite_temp_dir() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::temp_dir()
+    }
+    #[cfg(not(windows))]
+    {
+        let set = ["SQLITE_TMPDIR", "TMPDIR"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .map(std::path::PathBuf::from);
+        let usual = ["/var/tmp", "/usr/tmp", "/tmp"]
+            .into_iter()
+            .map(std::path::PathBuf::from);
+        set.chain(usual)
+            .find(|dir| {
+                fs::metadata(dir).is_ok_and(|it| it.is_dir() && !it.permissions().readonly())
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    }
+}
+
+/// A disk a write needs room on ([`Room`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Disk {
+    /// The one the archive is on.
+    Archive,
+    /// The one SQLite's temporary folder is on ([`sqlite_temp_dir`]), the system's.
+    System,
+}
+
+/// The room a write needs: on the archive's disk, and in SQLite's temporary folder, which
+/// may be on the same disk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Room {
+    pub archive: u64,
+    pub temp: u64,
+}
+
+/// Room a write needs and a disk doesn't have: how much it needs there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Lack {
+    pub needs: u64,
+    pub disk: Disk,
+}
+
+/**
+ * The room of `room` that is not there, for an archive in `dir`: none when both disks have
+ * theirs (one disk, both of it, when the temporary folder is on the archive's), or when the
+ * free space can't be read.
+ */
+pub(crate) fn lacking(dir: &Path, room: Room) -> Option<Lack> {
+    let temp = sqlite_temp_dir();
+    let short = |at: &Path, needs: u64, disk: Disk| {
+        let free = free_space(at).ok()?;
+        (free < needs).then_some(Lack { needs, disk })
+    };
+    if super::relocate::volume_of(dir) == super::relocate::volume_of(&temp) {
+        return short(dir, room.archive.saturating_add(room.temp), Disk::Archive);
+    }
+    short(dir, room.archive, Disk::Archive).or_else(|| short(&temp, room.temp, Disk::System))
+}
+
 /// How many bytes the volume `dir`, an existing folder, has free for this user.
 #[cfg(unix)]
 pub(crate) fn free_space(dir: &Path) -> io::Result<u64> {

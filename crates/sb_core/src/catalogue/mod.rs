@@ -45,7 +45,7 @@ pub use library::{LibraryCounts, PathGroup, Shelf};
 pub use session::{Compared, CopyOf, Filed, History, Kin, Origin, Session, SessionId, Usage};
 pub(crate) use session::{Derived, Indexed, Reading, RowMade, fingerprint, made};
 pub use trash::{AllowedAgain, AlsoDeleted, Deletion, Tombstone};
-pub(crate) use trash::{ItemFile, Removal};
+pub(crate) use trash::{ItemFile, Removal, Scrub};
 
 #[derive(Debug, Error)]
 pub enum CatalogueError {
