@@ -1092,13 +1092,17 @@ impl SyncService {
     }
 
     /// Runs `work`, which blocks on the archive or on this machine's files, on the background
-    /// executor, counted as a job in flight, then `done` with its result.
+    /// executor, counted as a job in flight, then `done` with its result. Nothing runs once the
+    /// service is closed: the archive is being left, or moved, and isn't to be written.
     fn run<T: Send + 'static>(
         &mut self,
         cx: &mut Context<Self>,
         work: impl FnOnce() -> T + Send + 'static,
         done: impl FnOnce(&mut Self, T, &mut Context<Self>) + 'static,
     ) {
+        if self.closed {
+            return;
+        }
         self.jobs += 1;
         let job = cx.background_spawn(async move { work() });
         cx.spawn(async move |this, cx| {

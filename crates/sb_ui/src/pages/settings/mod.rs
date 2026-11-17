@@ -22,6 +22,7 @@
 
 mod appearance;
 mod archive;
+mod moving;
 mod shortcuts;
 mod sync;
 #[cfg(test)]
@@ -186,10 +187,10 @@ impl SettingsPage {
         cx.notify();
     }
 
-    /// Whether the confirmation of another folder is open: a dialog over the window, which
-    /// keeps the keyboard while it is (`crate::overlay`).
-    pub fn is_confirming(&self) -> bool {
-        self.chosen.is_some()
+    /// Whether the confirmation of another folder, or of a move, is open: a dialog over the
+    /// window, which keeps the keyboard while it is (`crate::overlay`).
+    pub fn is_confirming(&self, cx: &App) -> bool {
+        self.chosen.is_some() || asking_to_move(cx)
     }
 
     /**
@@ -198,7 +199,7 @@ impl SettingsPage {
      * keyboard is drawn in the same frame.
      */
     fn follow_confirmation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match (self.chosen.is_some(), self.confirm_back.is_some()) {
+        match (self.is_confirming(cx), self.confirm_back.is_some()) {
             (true, false) => {
                 self.confirm_back = Some(window.focused(cx));
                 self.cancel_focus.focus(window, cx);
@@ -217,6 +218,11 @@ impl SettingsPage {
     pub fn dismiss(&mut self, cx: &mut Context<Self>) -> bool {
         if self.chosen.take().is_some() {
             cx.notify();
+            return true;
+        }
+        if asking_to_move(cx) {
+            let settings = cx.services().settings.clone();
+            settings.update(cx, |settings, cx| settings.cancel_move(cx));
             return true;
         }
         if std::mem::take(&mut self.menu) {
@@ -381,6 +387,14 @@ impl SettingsPage {
             }))
             .into_any_element()
     }
+}
+
+/// Whether the service asks whether to move the archive (DESIGN §4.13: Move…).
+fn asking_to_move(cx: &App) -> bool {
+    matches!(
+        cx.services().settings.read(cx).move_state(),
+        Some(crate::services::settings::MoveState::Asking(_))
+    )
 }
 
 /// What Back says it goes back to: the session open under Settings, or the page.
@@ -614,6 +628,7 @@ impl Render for SettingsPage {
                     ),
             )
             .children(self.confirmation(window, &theme, cx))
+            .children(self.move_confirmation(window, &theme, cx))
             .automation_target("settings")
     }
 }

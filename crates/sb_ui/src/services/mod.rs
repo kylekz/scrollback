@@ -16,7 +16,8 @@
 //! - [`UpdatesService`]: scrollback's own updates, in an installed copy.
 //!
 //! **Another archive** ([`reopen`]): the services over an archive are made anew over the
-//! other one, once nothing runs on the first, and the views follow the new [`Services`].
+//! other one, once nothing runs on the first, and the views follow the new [`Services`]. A
+//! move of the archive ([`settings`]'s Move…) finishes in that same pause ([`switch`]).
 //!
 //! Nothing here blocks the UI thread: the archive is opened, synced and read in
 //! `background_spawn` jobs (in tests, gpui's deterministic scheduler), and a service's state
@@ -27,6 +28,8 @@ pub mod drag;
 pub mod library;
 #[cfg(test)]
 mod location_tests;
+#[cfg(test)]
+mod move_tests;
 #[cfg(test)]
 mod owner_tests;
 pub mod read_at;
@@ -44,6 +47,7 @@ pub mod updates;
 pub mod upkeep;
 pub mod view;
 
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -241,6 +245,27 @@ const QUIET_TICK: Duration = Duration::from_millis(20);
  * The task ends once it is closed.
  */
 pub fn reopen(archive: Arc<Archive>, cx: &mut App) -> Task<()> {
+    let switching = switch(false, cx, move |_| (archive, Ok::<(), Infallible>(())));
+    cx.spawn(async move |_| {
+        let Ok(()) = switching.await;
+    })
+}
+
+/**
+ * What [`reopen`] does, with the archive to move onto decided off the UI thread, once nothing
+ * runs on the archive open now: `onto` is given it (if one is open) and returns the archive to
+ * make the services over and how it went. A move (Settings › Move…) copies the archive then,
+ * and returns the copy, or the archive it left when it failed or was stopped; the switch's
+ * outcome is then the move's. With `carry`, the owner's changes made meanwhile wait in the
+ * library and are written to whichever archive the services come back over: the archive open
+ * now is not to be written once it has been copied. Without, they are written to it before the
+ * switch, as it is left behind.
+ */
+pub(crate) fn switch<E: Send + 'static>(
+    carry: bool,
+    cx: &mut App,
+    onto: impl FnOnce(Option<Arc<Archive>>) -> (Arc<Archive>, Result<(), E>) + Send + 'static,
+) -> Task<Result<(), E>> {
     let services = cx.services();
     let (settings, updates, providers, reach) = (
         services.settings.clone(),
@@ -248,35 +273,47 @@ pub fn reopen(archive: Arc<Archive>, cx: &mut App) -> Task<()> {
         services.providers.clone(),
         services.reach.clone(),
     );
-    let (sync, upkeep, search) = (
+    let (sync, upkeep, search, library) = (
         services.sync.clone(),
         services.upkeep.clone(),
         services.search.clone(),
+        services.library.clone(),
     );
     let left = services.archive.clone();
     sync.update(cx, |sync, cx| sync.close(cx));
     upkeep.update(cx, |upkeep, cx| upkeep.close(cx));
     search.update(cx, |search, cx| search.close(cx));
+    if carry {
+        library.update(cx, |library, _| library.hold_changes());
+    }
     cx.spawn(async move |cx| {
         while !cx.update(|cx| cx.services().is_quiet(cx)) {
             cx.background_executor().timer(QUIET_TICK).await;
         }
+        let open = cx.update(|cx| left.read(cx).archive().cloned());
+        let (archive, outcome) = cx.background_spawn(async move { onto(open) }).await;
         /* The service left gives up its archive as the new ones take over, so that nothing
         on the UI thread holds it: its last handle, and the wait for its removals that
         dropping it is, go to a background job. That ends before the switch does, so the
         folder is free to be opened again. */
         let given_up = cx.update(|cx| {
+            let carried = carry.then(|| library.update(cx, |library, _| library.take_held()));
             let given_up = left.update(cx, |left, _| left.give_up());
             let archive = cx.new(|cx| ArchiveService::opened(archive, cx));
             let services = build(settings, updates, archive.clone(), providers, reach, cx);
+            let library = services.library.clone();
             cx.set_global(services);
             /* The new services start as they do on an archive that has just opened. */
             archive.update(cx, |_, cx| cx.notify());
+            if let Some(carried) = carried {
+                library.update(cx, |library, cx| library.adopt(carried, cx));
+            }
             given_up
         });
         if let Some(given_up) = given_up {
             cx.background_spawn(async move { drop(given_up) }).await;
         }
+        outcome
     })
 }
 

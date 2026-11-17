@@ -717,6 +717,9 @@ pub struct LibraryService {
     queue: VecDeque<(Change, Option<Toast>, u64)>,
     /// What the change being written is, while one is.
     writing: Option<String>,
+    /// The owner's changes wait in the queue, none written: the archive is being moved, and
+    /// whichever archive the app comes back over takes them ([`LibraryService::hold_changes`]).
+    held: bool,
     /// The change handed to a job to write, until the job takes it. Whoever writes holds the
     /// lock while it does: the job, or at quit the one job for all that is left, which so
     /// writes the change in hand before the rest, itself if the job has not started.
@@ -815,6 +818,7 @@ impl LibraryService {
             for_good: None,
             queue: VecDeque::new(),
             writing: None,
+            held: false,
             in_hand: Arc::default(),
             write_failure: None,
             created: None,
@@ -944,9 +948,34 @@ impl LibraryService {
                 .is_writing_at(location)
     }
 
-    /// Nothing is being read or written.
+    /// Nothing is being read or written, and nothing waits to be but what is held.
     pub fn is_settled(&self) -> bool {
-        !self.loading && self.writing.is_none() && self.queue.is_empty()
+        !self.loading && self.writing.is_none() && (self.queue.is_empty() || self.held)
+    }
+
+    /**
+     * Holds the owner's changes from here on: the one being written is finished, and the rest
+     * wait in the queue (`super::switch`, for a move of the archive). They are handed on with
+     * [`Self::take_held`] to the library over the archive the app comes back over.
+     */
+    pub(super) fn hold_changes(&mut self) {
+        self.held = true;
+    }
+
+    /// The changes held, in their order, each with its toast.
+    pub(super) fn take_held(&mut self) -> Vec<(Change, Option<Toast>)> {
+        self.queue
+            .drain(..)
+            .map(|(change, toast, _)| (change, toast))
+            .collect()
+    }
+
+    /// Writes `changes`, held by the library over the archive the app was on, as if they were
+    /// made here.
+    pub(super) fn adopt(&mut self, changes: Vec<(Change, Option<Toast>)>, cx: &mut Context<Self>) {
+        for (change, toast) in changes {
+            self.write(change, toast, cx);
+        }
     }
 
     /// Shows the page of `shelf`.
@@ -1998,7 +2027,7 @@ impl LibraryService {
     /// Writes the next queued change, unless one is being written; with none left, reads the
     /// page again.
     fn write_next(&mut self, cx: &mut Context<Self>) {
-        if self.writing.is_some() {
+        if self.writing.is_some() || self.held {
             return;
         }
         let Some(archive) = self.archive.read(cx).archive().cloned() else {
@@ -2319,7 +2348,10 @@ impl LibraryService {
     /// At quit: writes what is still queued, in its order, after the change in hand, for as
     /// long as gpui waits (the module docs).
     fn write_what_is_queued(&mut self, cx: &mut Context<Self>) -> impl Future<Output = ()> + use<> {
-        let archive = self.archive.read(cx).archive().cloned();
+        /* Held, the archive is being moved: it is not written once it has been copied. */
+        let archive = (!self.held)
+            .then(|| self.archive.read(cx).archive().cloned())
+            .flatten();
         /* Changes the paths editor holds are deliberate edits: a quit that asked nothing, from
         the Dock or at logout, saves them rather than dropping them. */
         if let Some((folder, change)) = self.hold.take() {

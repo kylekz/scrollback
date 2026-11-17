@@ -45,6 +45,7 @@ use crate::location::LocationId;
 use crate::search::{SearchError, SearchIndex};
 
 pub use delete::Deleted;
+pub use disk::write_durably;
 pub use items::{ArchivedSession, Pinned};
 pub(crate) use layout::item_folder;
 pub use relocate::{

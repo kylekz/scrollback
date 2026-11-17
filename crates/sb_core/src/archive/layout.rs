@@ -29,6 +29,8 @@ pub(super) const LOCK: &str = "lock";
 pub(super) const TMP: &str = "tmp";
 pub(super) const FILES: &str = "files";
 pub(super) const ORPHANS: &str = "orphans";
+/// The catalogue's own, which `crate::catalogue` makes there.
+pub(super) const BACKUPS: &str = "backups";
 pub(super) const SOURCE: &str = "source.json";
 
 /// An item's folder name: the first 32 hex digits of the SHA-256 of its key.

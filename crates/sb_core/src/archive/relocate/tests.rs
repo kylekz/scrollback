@@ -318,6 +318,8 @@ fn a_stop_or_a_failure_removes_what_the_move_made_and_nothing_else() {
 fn what_the_archive_stores_and_removes_during_the_copy_is_carried() {
     let dir = tempfile::tempdir().unwrap();
     let (from, location) = archive_in(dir.path());
+    /* Nothing set aside yet: its folder appears during the copy. */
+    fs::remove_dir_all(from.join(layout::ORPHANS)).unwrap();
     let archive = opened(&from);
     let target = dir.path().join("moved");
     let mut moving = moved_into(&archive, &target);
@@ -342,6 +344,9 @@ fn what_the_archive_stores_and_removes_during_the_copy_is_carried() {
                 let shown = archive.catalogue().deletion(&deleted).unwrap();
                 archive.delete_for_good(&shown).unwrap();
                 archive.wait_for_removals();
+                let aside = from.join(layout::ORPHANS).join("files/later.zst");
+                fs::create_dir_all(aside.parent().unwrap()).unwrap();
+                fs::write(aside, "set aside later").unwrap();
             }
         })
         .unwrap();
@@ -354,6 +359,10 @@ fn what_the_archive_stores_and_removes_during_the_copy_is_carried() {
     );
     drop(archive);
     assert_whole(&target, totals);
+    assert_eq!(
+        fs::read_to_string(target.join(layout::ORPHANS).join("files/later.zst")).unwrap(),
+        "set aside later"
+    );
 }
 
 /// A segment's copy that doesn't hold what the catalogue records fails the move; one the

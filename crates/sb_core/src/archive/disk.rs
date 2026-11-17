@@ -132,7 +132,42 @@ fn copy_new(from: &Path, to: &Path) -> io::Result<()> {
  * temporary attribute `tempfile` creates its files with.
  */
 #[cfg(windows)]
-pub(super) fn place(mut file: TempPath, to: &Path) -> Result<(), (io::Error, TempPath)> {
+pub(super) fn place(file: TempPath, to: &Path) -> Result<(), (io::Error, TempPath)> {
+    move_through(file, to, 0)
+}
+
+/// Moves the written, pushed `file` over `to`, and makes the move durable.
+#[cfg(not(windows))]
+fn replace(file: TempPath, to: &Path) -> io::Result<()> {
+    file.persist(to).map_err(|error| error.error)?;
+    let dir = to.parent().unwrap_or(Path::new("."));
+    push_dir(dir).and_then(|()| settle(dir))
+}
+
+/// Moves the written, flushed `file` over `to`, returning once the move is on disk
+/// ([`place`]).
+#[cfg(windows)]
+fn replace(file: TempPath, to: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
+
+    move_through(file, to, MOVEFILE_REPLACE_EXISTING).map_err(|(error, _)| error)
+}
+
+/**
+ * Writes `bytes` to `path` through a file beside it that is moved over it, so a reader finds
+ * the old bytes or the new, never part of them, and returns once the new ones and the move are
+ * on disk: a power cut after it never brings the old file back. The app's settings are written
+ * so, since which archive they name decides which folder a start opens (PLAN §4.4).
+ */
+pub fn write_durably(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir)?;
+    replace(new_file(dir, bytes)?, path)
+}
+
+/// `MoveFileExW` of `file` to `to` with `MOVEFILE_WRITE_THROUGH` and `flags` ([`place`]).
+#[cfg(windows)]
+fn move_through(mut file: TempPath, to: &Path, flags: u32) -> Result<(), (io::Error, TempPath)> {
     use std::os::windows::ffi::OsStrExt as _;
 
     use windows_sys::Win32::Storage::FileSystem::{
@@ -154,7 +189,12 @@ pub(super) fn place(mut file: TempPath, to: &Path) -> Result<(), (io::Error, Tem
             return Err((io::Error::last_os_error(), file));
         }
         /* Without `MOVEFILE_REPLACE_EXISTING` a file at `to` fails the move. */
-        if MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), MOVEFILE_WRITE_THROUGH) == 0 {
+        if MoveFileExW(
+            from_wide.as_ptr(),
+            to_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH | flags,
+        ) == 0
+        {
             let error = io::Error::last_os_error();
             SetFileAttributesW(from_wide.as_ptr(), FILE_ATTRIBUTE_TEMPORARY);
             return Err((error, file));
@@ -270,11 +310,12 @@ pub(super) fn free_space(dir: &Path) -> io::Result<u64> {
 
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
-    let wide: Vec<u16> = verbatim(dir)
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    /* A share's root is taken only with a separator after it; any folder is with one. */
+    let mut wide: Vec<u16> = verbatim(dir).as_os_str().encode_wide().collect();
+    if wide.last() != Some(&u16::from(b'\\')) {
+        wide.push(u16::from(b'\\'));
+    }
+    wide.push(0);
     let mut free = 0u64;
     // SAFETY: `wide` is a NUL-terminated UTF-16 string, and `free` outlives the call; the
     // totals it doesn't need are null, which the call allows.

@@ -57,6 +57,16 @@ const MARKER_VERSION: u32 = 1;
 /// A database file's name and its journals'.
 const JOURNALS: [&str; 4] = ["", "-wal", "-shm", "-journal"];
 
+/// What an archive holds besides its databases and its `lock`: a move copies what of it
+/// appears while it runs, and removes all of it when it is abandoned.
+const MADE: [&str; 5] = [
+    layout::MANIFEST,
+    layout::TMP,
+    layout::FILES,
+    layout::ORPHANS,
+    layout::BACKUPS,
+];
+
 /// How much is read and written at a time.
 const BUFFER: usize = 256 * 1024;
 
@@ -174,6 +184,8 @@ pub enum MoveStage {
     Copying,
     /// Copying what changed since, the catalogue and `archive.json`, and checking.
     Finishing,
+    /// Pointing the app's settings at the new folder: it can't be stopped now.
+    Switching,
 }
 
 /// How far a move is: the files, and their bytes, done of those it has to copy now.
@@ -328,35 +340,36 @@ impl Archive {
             }
             return Err(Refusal::NotEmpty.into());
         }
-        let tmp = target.join(layout::TMP);
-        fs::create_dir(&tmp).map_err(io_error("create", &tmp))?;
+        /* The archive's own entries, and those an archive makes, which may appear meanwhile. */
         let names = fs::read_dir(&self.dir)
             .map_err(io_error("list", &self.dir))?
             .flatten()
             .filter(|entry| entry.file_type().is_ok_and(|kind| !kind.is_symlink()))
             .filter_map(|entry| entry.file_name().into_string().ok())
+            .chain(MADE.map(str::to_string))
             .filter(|name| !left_out(name))
-            .collect();
-        let marker = Marker {
-            v: MARKER_VERSION,
-            id: plan.id.clone(),
-            names,
-            made,
-        };
-        let json = serde_json::to_vec_pretty(&marker).expect("a struct of text always serializes");
-        let path = target.join(MARKER);
-        disk::write_new(&tmp, &path, &json)
-            .and_then(|()| disk::push_dir(&target))
-            .map_err(io_error("write", &path))?;
-        Ok(Move {
+            .collect::<BTreeSet<_>>();
+        let started = Move {
             target,
-            marker,
+            marker: Marker {
+                v: MARKER_VERSION,
+                id: plan.id.clone(),
+                names: names.into_iter().collect(),
+                made,
+            },
             lock: Some(lock),
             copied: HashMap::new(),
             folders: BTreeSet::new(),
             #[cfg(test)]
             crash: None,
-        })
+        };
+        match started.mark() {
+            Ok(()) => Ok(started),
+            Err(error) => {
+                started.abandon();
+                Err(error)
+            }
+        }
     }
 }
 
@@ -364,6 +377,18 @@ impl Move {
     /// The folder the archive is moving into, absolute.
     pub fn target(&self) -> &Path {
         &self.target
+    }
+
+    /// Makes the new folder's `tmp/`, where every copy is written first, and its marker.
+    fn mark(&self) -> Result<(), MoveError> {
+        let tmp = self.target.join(layout::TMP);
+        fs::create_dir(&tmp).map_err(io_error("create", &tmp))?;
+        let json =
+            serde_json::to_vec_pretty(&self.marker).expect("a struct of text always serializes");
+        let path = self.target.join(MARKER);
+        disk::write_new(&tmp, &path, &json)
+            .and_then(|()| disk::push_dir(&self.target))
+            .map_err(io_error("write", &path))
     }
 
     /**
@@ -458,13 +483,7 @@ impl Move {
             .cloned()
             .collect();
         for relative in gone {
-            let path = self.target.join(&relative);
-            disk::retrying(|| fs::remove_file(&path))
-                .or_else(|error| match error.kind() {
-                    io::ErrorKind::NotFound => Ok(()),
-                    _ => Err(error),
-                })
-                .map_err(io_error("remove", &path))?;
+            remove_file(&self.target.join(&relative))?;
             self.copied.remove(&relative);
         }
         let changed: Vec<&Listed> = files
@@ -525,6 +544,10 @@ impl Move {
             .and_then(|()| disk::settle(&self.target))
             .map_err(io_error("remove", &marker))?;
         self.step(Step::Unmarked)?;
+        progress(&MoveProgress {
+            stage: MoveStage::Switching,
+            ..done
+        });
         commit(&self.target).map_err(MoveError::Commit)?;
         self.step(Step::Committed)?;
         Ok(moved)
@@ -599,7 +622,7 @@ impl Move {
         }
         /* A copy there already is the move's own, of the file as it was. */
         if self.copied.contains_key(&listed.relative) {
-            disk::retrying(|| fs::remove_file(&to)).map_err(io_error("replace", &to))?;
+            remove_file(&to)?;
         }
         disk::place_retrying(staged, &to).map_err(|(error, _)| io_error("store", &to)(error))?;
         self.copied.insert(
@@ -737,13 +760,7 @@ fn clear(target: &Path, marker: &Marker, lock: Option<File>) -> Cleared {
         .names
         .iter()
         .map(String::as_str)
-        .chain([
-            layout::MANIFEST,
-            layout::TMP,
-            layout::FILES,
-            layout::ORPHANS,
-            "backups",
-        ])
+        .chain(MADE)
         .map(str::to_string)
         .chain(
             [catalogue::DATABASE, SEARCH_DATABASE]
@@ -768,6 +785,16 @@ fn clear(target: &Path, marker: &Marker, lock: Option<File>) -> Cleared {
         Cleared::Removed
     } else {
         Cleared::Partly(left)
+    }
+}
+
+/// Removes the move's own copy at `path`, unless it is gone already.
+fn remove_file(path: &Path) -> Result<(), MoveError> {
+    match disk::retrying(|| fs::remove_file(path)) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            Err(io_error("remove", path)(error))
+        }
+        _ => Ok(()),
     }
 }
 

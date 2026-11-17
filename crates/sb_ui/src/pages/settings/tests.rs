@@ -189,6 +189,109 @@ fn a_different_folder_is_confirmed_before_the_app_moves_onto_it(cx: &mut TestApp
     assert_eq!(showing(cx), Showing::Settings);
 }
 
+/// Settles the services and what waits on a timer, as a switch and a move do.
+fn settle(cx: &mut VisualTestContext) {
+    for _ in 0..20 {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+    }
+}
+
+/// Move…: the picker, then the question, which Cancel and Esc close; confirmed, the app moves
+/// onto the copy while a sync runs, and the card says where the old copy is, with Show in the
+/// file manager for it and no way to delete it.
+#[gpui::test]
+fn move_asks_first_then_moves_and_says_where_the_old_copy_is(cx: &mut TestAppContext) {
+    let (shell, cx) = open_settings(cx);
+    let from = archive_dir(cx);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let to = elsewhere.path().join("archive");
+    let asking = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            matches!(
+                cx.services().settings.read(cx).move_state(),
+                Some(crate::services::settings::MoveState::Asking(_))
+            )
+        })
+    };
+
+    cx.update(|_, cx| system::queue_answer(Some(to.clone()), cx).unwrap());
+    click(cx, "settings-move");
+    settle(cx);
+    assert!(asking(cx));
+    assert!(page(&shell, cx).read_with(cx, |page, cx| page.is_confirming(cx)));
+    click(cx, "settings-move-cancel");
+    assert!(!asking(cx));
+    assert!(!to.exists(), "asking makes nothing");
+
+    cx.update(|_, cx| system::queue_answer(Some(to.clone()), cx).unwrap());
+    click(cx, "settings-move");
+    settle(cx);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!asking(cx));
+    assert_eq!(showing(cx), Showing::Settings);
+
+    cx.update(|_, cx| system::queue_answer(Some(to.clone()), cx).unwrap());
+    click(cx, "settings-move");
+    settle(cx);
+    click(cx, "settings-move-ok");
+    cx.update(|_, cx| {
+        let sync = cx.services().sync.clone();
+        sync.update(cx, |sync, cx| sync.sync_all(cx));
+    });
+    settle(cx);
+    assert_eq!(showing(cx), Showing::Settings);
+    cx.update(|_, cx| assert_eq!(cx.services().archive.read(cx).dir(), to));
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    assert!(bounds(cx, "settings-moved-reveal").is_some());
+    click(cx, "settings-moved-reveal");
+    cx.update(|_, cx| {
+        assert_eq!(
+            system::requests(cx).last(),
+            Some(&SystemRequest::Reveal(from.clone()))
+        );
+    });
+    click(cx, "settings-moved-dismiss");
+    assert!(bounds(cx, "settings-moved-reveal").is_none());
+    assert!(from.join("archive.json").is_file(), "the old copy stays");
+}
+
+/// Stop, while the files are copied: the archive stays where it was, and the card says so.
+#[gpui::test]
+fn stop_leaves_the_archive_where_it_was(cx: &mut TestAppContext) {
+    let (_shell, cx) = open_settings(cx);
+    let from = archive_dir(cx);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let to = elsewhere.path().join("archive");
+    cx.update(|_, cx| {
+        system::queue_answer(Some(to.clone()), cx).unwrap();
+        let settings = cx.services().settings.clone();
+        settings.update(cx, |settings, _| {
+            settings.hold_move_after(1, crate::services::Held::Stop)
+        });
+    });
+    click(cx, "settings-move");
+    settle(cx);
+    click(cx, "settings-move-ok");
+    settle(cx);
+    cx.update(|_, cx| {
+        let services = cx.services();
+        assert_eq!(services.archive.read(cx).dir(), from);
+        assert!(matches!(
+            services.settings.read(cx).move_state(),
+            Some(crate::services::settings::MoveState::Ended(
+                crate::services::settings::Ended::Stopped { .. }
+            ))
+        ));
+    });
+    assert!(!to.exists());
+    click(cx, "settings-move-ended-dismiss");
+    cx.update(|_, cx| assert!(cx.services().settings.read(cx).move_state().is_none()));
+}
+
 /// Another folder chosen while a sync and a verify run on the archive open: both are stopped,
 /// the window's pages and sidebar move onto the new archive, and nothing keeps the one left
 /// open.

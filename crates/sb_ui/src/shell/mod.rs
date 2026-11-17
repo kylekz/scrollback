@@ -295,7 +295,7 @@ impl Shell {
     fn asking(&self, cx: &App) -> bool {
         let main = self.main.read(cx);
         self.dialog.is_some()
-            || main.settings_page().read(cx).is_confirming()
+            || main.settings_page().read(cx).is_confirming(cx)
             || main.unavailable_page().read(cx).is_asking()
     }
 
@@ -581,9 +581,11 @@ impl Render for Shell {
             .update(cx, |sidebar, cx| sidebar.keep_name_left_behind(window, cx));
         self.follow_dialogs(window, cx);
         /* Settings show over a library page or a first run only: one that leaves (the archive
-        is lost) takes them with it, so they don't come back when a library does. */
+        is lost) takes them with it, so they don't come back when a library does. Services
+        made anew over an archive (after a move) read its locations first: Settings wait. */
         let settings = cx.services().settings.clone();
-        if settings.read(cx).is_shown() && !Showing::now(cx).is_library() {
+        let showing = Showing::now(cx);
+        if settings.read(cx).is_shown() && !showing.is_library() && showing != Showing::Starting {
             settings.update(cx, |settings, cx| settings.show(false, cx));
         }
         // A sidebar that isn't shown can't keep the keyboard.
