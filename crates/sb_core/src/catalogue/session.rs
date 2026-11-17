@@ -434,6 +434,12 @@ pub(super) const SESSION: &str = concat!(
 /// What a row was made from, in one word ([`Catalogue::made`]).
 const MADE_FROM: &str = "s.indexed_from || ' ' || s.parser_version || ' ' || s.index_version";
 
+/// What [`MADE_FROM`] says of a row made from the items whose [`fingerprint`] is `from`, by
+/// the parser of version `parser_version` and this index.
+pub(crate) fn made(from: Hash, parser_version: u32) -> String {
+    format!("{} {parser_version} {INDEX_VERSION}", from.to_hex())
+}
+
 /**
  * The condition, as SQL, that the session `$x` is a copy its parser never read: no project
  * path to match by, its conversation the one its provider gives from its key.

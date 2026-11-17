@@ -191,13 +191,20 @@ impl PassProgress {
                     done: 0,
                 });
             }
-            Progress::Indexed { sessions, .. } => {
+            Progress::Indexed {
+                sessions,
+                searchable,
+                ..
+            } => {
                 self.sessions_done = self.sessions_before + sessions;
+                self.searchable_done = self.searchable_before + searchable;
                 if let Some(AgentIndex::Rows { done, .. }) = &mut self.index {
                     *done = sessions;
                 }
             }
             Progress::Searching { sessions } => {
+                /* The first step's text is counted; the second's counts from its start. */
+                self.searchable_before = self.searchable_done;
                 let rows = match self.index {
                     Some(AgentIndex::Rows { of, .. }) => of,
                     _ => 0,

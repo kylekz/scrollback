@@ -1411,6 +1411,7 @@ mod tests {
         progress.apply(&Progress::Indexed {
             sessions: 12,
             bytes: 0,
+            searchable: 0,
         });
         // The second step counts again, of what it makes searchable.
         progress.apply(&Progress::Searching { sessions: 12 });

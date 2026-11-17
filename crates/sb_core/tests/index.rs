@@ -37,6 +37,9 @@ for_both_agents!(
     a_classifier_that_changes_reaches_what_is_gone_from_its_source,
     a_pass_before_the_index_of_a_start_moves_what_the_owner_decided,
     what_the_owner_decided_goes_with_a_session_that_is_split_merged_or_gone,
+    sessions_parsed_at_once_are_indexed_as_one_at_a_time,
+    an_index_stopped_while_it_parses_keeps_what_it_recorded_in_order,
+    a_parser_that_stops_on_one_of_many_sessions_stops_on_that_one_alone,
 );
 
 /// A bench whose agent has three sessions of different sizes.
@@ -237,11 +240,11 @@ fn index_steps<A: Agent>(bench: &Bench<A>, provider: Box<dyn Provider + '_>) -> 
 }
 
 fn a_start_says_what_it_reads_again_and_what_it_makes_searchable<A: Agent + Default>() {
-    let (bench, _) = bench::<A>();
+    let (mut bench, _) = bench::<A>();
     bench.sync();
 
-    /* Rows an older parser made: each is read again, then made searchable again, one at a
-    time, the text written with the last. */
+    /* Rows an older parser made: each is read again once, its row and its text made of the
+    same parse, the text written with the last; the second step has nothing left. */
     let newer = |bench: &Bench<A>| {
         bench.meddling(Meddle::ParserVersion(
             bench.agent.provider().parser_version() + 1,
@@ -256,13 +259,33 @@ fn a_start_says_what_it_reads_again_and_what_it_makes_searchable<A: Agent + Defa
             ..
         }
     ));
-    assert!(matches!(steps[3], Progress::Indexed { sessions: 3, .. }));
+    let (searching, indexed) = steps[1..].split_last().unwrap();
+    assert_eq!(*searching, Progress::Searching { sessions: 0 });
+    let indexed: Vec<_> = (indexed.iter())
+        .map(|progress| match progress {
+            Progress::Indexed {
+                sessions,
+                searchable,
+                ..
+            } => (*sessions, *searchable),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(indexed, [(1, 0), (2, 0), (3, 3)]);
+
+    /* Text the first step could not make (the search index was made anew since, say) is the
+    second step's: each session read again for it, the text written with the last. */
+    bench.close();
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(bench.dir().join(format!("search.db{suffix}")));
+    }
+    bench.reopen();
     let searched = |sessions, searchable| Progress::Searched {
         sessions,
         searchable,
     };
     assert_eq!(
-        steps[4..],
+        index_steps(&bench, newer(&bench))[1..],
         [
             Progress::Searching { sessions: 3 },
             searched(1, 0),
@@ -673,6 +696,115 @@ fn what_the_owner_decided_goes_with_a_session_that_is_split_merged_or_gone<A: Ag
     bench.synced_with(none);
     assert!(bench.sessions().is_empty());
     assert_eq!(decided(&bench), Vec::<String>::new());
+}
+
+/// A bench whose agent has sessions enough to keep every thread an index parses on busy, each
+/// of another size.
+fn many<A: Agent + Default>() -> (Bench<A>, Vec<String>) {
+    let mut agent = A::default();
+    let keys = (0..48)
+        .map(|n| agent.add_session(1 + n * 37 % 60))
+        .collect();
+    (Bench::new(agent), keys)
+}
+
+/// Every span of search text: the session it is of, its place there and what it holds.
+fn search_text<A: Agent>(bench: &Bench<A>) -> Vec<String> {
+    let connection =
+        toolbox_store::rusqlite::Connection::open(bench.dir().join("search.db")).unwrap();
+    let mut select = connection
+        .prepare(
+            "SELECT d.session || ' ' || (s.id - d.id * 16777216) || ' ' ||
+                    s.kind || ' ' || coalesce(s.subagent, '') || ' ' || coalesce(s.turn, '') ||
+                    ' ' || coalesce(s.block, '') || ' ' || s.text
+             FROM doc d JOIN span s ON s.id BETWEEN d.id * 16777216 AND d.id * 16777216 + 16777215
+             ORDER BY d.session, s.id",
+        )
+        .unwrap();
+    select
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+fn sessions_parsed_at_once_are_indexed_as_one_at_a_time<A: Agent + Default>() {
+    let (mut bench, keys) = many::<A>();
+    let report = bench.sync();
+    assert_eq!(
+        (
+            report.index.sessions,
+            report.index.searchable,
+            report.index.failed.len()
+        ),
+        (48, 48, 0)
+    );
+    for key in &keys {
+        assert_indexed_as(&bench.session(key), &derived(&bench.agent, key));
+    }
+    let (rows, text) = (bench.sessions(), search_text(&bench));
+
+    /* Made again from nothing, one session at a time: the same rows, and the same text. */
+    bench.close();
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(bench.dir().join(format!("search.db{suffix}")));
+    }
+    bench.reopen();
+    bench.archive().catalogue().drop_index().unwrap();
+    for key in &keys {
+        assert_eq!(bench.index_session(key).searchable, 1);
+    }
+    assert_eq!(bench.sessions(), rows);
+    assert_eq!(search_text(&bench), text);
+    bench.assert_verifies();
+}
+
+fn an_index_stopped_while_it_parses_keeps_what_it_recorded_in_order<A: Agent + Default>() {
+    let (bench, _) = many::<A>();
+    bench.sync();
+    let (rows, text) = (bench.sessions(), search_text(&bench));
+    let parser = bench.agent.provider().parser_version();
+    let newer = |bench: &Bench<A>| bench.meddling(Meddle::ParserVersion(parser + 1));
+
+    /* Stopped while later sessions are being parsed: the rows of the twenty that did
+    something last are made again, and no other; what was parsed after them is dropped. */
+    let stopped = index_until(&bench, newer(&bench), 20);
+    assert!(matches!(stopped, Err(SyncError::Cancelled)), "{stopped:?}");
+    let by_newer: Vec<bool> = (bench.sessions().iter())
+        .map(|session| session.parser_version == parser + 1)
+        .collect();
+    assert_eq!(by_newer, [vec![true; 20], vec![false; 28]].concat());
+
+    /* The next index makes the rest, and then all is as one index makes it. */
+    let report = bench.index_with(newer(&bench));
+    assert_eq!((report.sessions, report.searchable), (28, 48));
+    let made: Vec<Session> = (bench.sessions().into_iter())
+        .map(|session| Session {
+            parser_version: parser,
+            ..session
+        })
+        .collect();
+    assert_eq!(made, rows);
+    assert_eq!(search_text(&bench), text);
+    assert_eq!(bench.archive().unsearchable().unwrap(), 0);
+    assert_eq!(bench.index_with(newer(&bench)), IndexReport::default());
+    bench.assert_verifies();
+}
+
+fn a_parser_that_stops_on_one_of_many_sessions_stops_on_that_one_alone<A: Agent + Default>() {
+    let (bench, keys) = many::<A>();
+    let faulty = bench.meddling(Meddle::FaultyParser(keys[17].clone()));
+    let report = bench.synced_with(faulty);
+    let failed: Vec<_> = (report.index.failed.iter())
+        .map(|(id, _)| id.clone())
+        .collect();
+    assert_eq!(failed, [bench.session_id(&keys[17])]);
+    /* Each of the others is indexed, and every one has text: that one its title alone. */
+    assert_eq!((report.index.sessions, report.index.searchable), (48, 48));
+    for key in keys.iter().filter(|key| **key != keys[17]) {
+        assert_indexed_as(&bench.session(key), &derived(&bench.agent, key));
+    }
+    assert_eq!(bench.archive().unsearchable().unwrap(), 0);
 }
 
 /// A bench on a file tree with nothing in it yet.

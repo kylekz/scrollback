@@ -13,6 +13,13 @@
 //! Deleting is meant to leave nothing: FTS5's `secure-delete` takes a span's entries out of the
 //! index instead of marking them deleted, SQLite's `secure_delete` overwrites what is freed, and
 //! the write-ahead log is emptied after a session is forgotten ([`SearchIndex::forget`]).
+//!
+//! Taking a span out that way costs a search of the index for each of its trigrams, far more
+//! than writing it, so a session's text written again replaces only the spans that differ from
+//! those at the same places ([`SearchIndex::record`]): a session that grew adds its new spans
+//! alone, and text made the same again changes nothing. An index that is to make most of the
+//! text again, of rows another version of the parser or of the index made, empties it first
+//! ([`SearchIndex::clear`]) and writes it all anew.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -193,6 +200,18 @@ impl SearchIndex {
         })
     }
 
+    /// What the row of the session `id` was made from when its text was, if it has text.
+    pub(crate) fn made_of(&self, id: &SessionId) -> Result<Option<String>, SearchError> {
+        self.db.read(|c| {
+            Ok(c.query_row(
+                "SELECT made FROM doc WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+                params![id.location, id.provider, id.key],
+                |row| row.get(0),
+            )
+            .optional()?)
+        })
+    }
+
     /**
      * Replaces the text of each of `texts`' sessions with its own, in one transaction: of each
      * that `still` says, once nothing else writes or forgets, the catalogue still has the row
@@ -235,13 +254,26 @@ impl SearchIndex {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             let mut index = tx.prepare("INSERT INTO span_text (rowid, text) VALUES (?1, ?2)")?;
+            let mut same = tx.prepare(
+                "SELECT kind = ?2 AND subagent IS ?3 AND sub_turn IS ?4 AND sub_block IS ?5
+                        AND turn IS ?6 AND block IS ?7 AND unattached IS ?8 AND cut = ?9
+                        AND text = ?10
+                 FROM span WHERE id = ?1",
+            )?;
             for text in &kept {
                 let id = &text.id;
                 let doc: i64 = doc.query_row(
                     params![id.location, id.provider, id.key, text.made],
                     |row| row.get(0),
                 )?;
-                forget_spans(tx, doc)?;
+                /* The places the text has no span at any more: the title's, when it has none,
+                and those after its last span. */
+                let first = doc * SPANS;
+                if text.title.is_none() {
+                    forget_range(tx, first, first)?;
+                }
+                let places = i64::try_from(text.spans.len()).map_or(SPANS, |spans| spans + 1);
+                forget_range(tx, first + places.min(SPANS), first + SPANS - 1)?;
                 let title = text
                     .title
                     .as_deref()
@@ -262,8 +294,8 @@ impl SearchIndex {
                         Some(At::Unattached(place)) => (None, None, Some(place)),
                     };
                     let kept = start(body, SPAN_BYTES);
-                    let id = doc * SPANS + place;
-                    span.execute(params![
+                    let id = first + place;
+                    let row = params![
                         id,
                         kind.as_str(),
                         subagent.map(|it| &it.item),
@@ -274,7 +306,15 @@ impl SearchIndex {
                         unattached,
                         kept.len() < body.len(),
                         kept
-                    ])?;
+                    ];
+                    /* A span as it was is left: taking it out costs far more than writing
+                    it (the module docs). */
+                    match same.query_row(row, |row| row.get(0)).optional()? {
+                        Some(true) => continue,
+                        Some(false) => forget_range(tx, id, id)?,
+                        None => {}
+                    }
+                    span.execute(row)?;
                     index.execute(params![id, kept])?;
                 }
             }
@@ -292,10 +332,7 @@ impl SearchIndex {
             return Ok(());
         }
         /* Every session's, as when the index was emptied: all of it at once. */
-        let docs: usize = self.db.read(|c| {
-            Ok::<_, SearchError>(c.query_row("SELECT count(*) FROM doc", [], |row| row.get(0))?)
-        })?;
-        if sessions.len() >= docs {
+        if sessions.len() >= self.texts()? {
             return self.clear();
         }
         {
@@ -320,8 +357,14 @@ impl SearchIndex {
         Ok(())
     }
 
+    /// How many sessions have text.
+    pub(crate) fn texts(&self) -> Result<usize, SearchError> {
+        self.db
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM doc", [], |row| row.get(0))?))
+    }
+
     /// Takes out every session's text.
-    fn clear(&self) -> Result<(), SearchError> {
+    pub(crate) fn clear(&self) -> Result<(), SearchError> {
         {
             let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
             self.db.write(|tx| {
@@ -408,13 +451,28 @@ fn in_use(path: &Path) -> Result<(), SearchError> {
 
 /// Takes out the spans of the doc `doc`, from the index and from `span`.
 fn forget_spans(connection: &Connection, doc: i64) -> rusqlite::Result<()> {
-    let range = [doc * SPANS, doc * SPANS + SPANS - 1];
-    connection.execute(
-        "INSERT INTO span_text (span_text, rowid, text)
-         SELECT 'delete', id, text FROM span WHERE id BETWEEN ?1 AND ?2",
-        range,
-    )?;
-    connection.execute("DELETE FROM span WHERE id BETWEEN ?1 AND ?2", range)?;
+    forget_range(connection, doc * SPANS, doc * SPANS + SPANS - 1)
+}
+
+/// Takes out the spans whose ids are from `first` to `last`, from the index and from `span`.
+fn forget_range(connection: &Connection, first: i64, last: i64) -> rusqlite::Result<()> {
+    /* Any statement on the index has it write out what it holds in memory first, so one with
+    nothing to take out is not made. */
+    let none: bool = connection
+        .prepare_cached("SELECT NOT EXISTS (SELECT 1 FROM span WHERE id BETWEEN ?1 AND ?2)")?
+        .query_row([first, last], |row| row.get(0))?;
+    if none {
+        return Ok(());
+    }
+    connection
+        .prepare_cached(
+            "INSERT INTO span_text (span_text, rowid, text)
+             SELECT 'delete', id, text FROM span WHERE id BETWEEN ?1 AND ?2",
+        )?
+        .execute([first, last])?;
+    connection
+        .prepare_cached("DELETE FROM span WHERE id BETWEEN ?1 AND ?2")?
+        .execute([first, last])?;
     Ok(())
 }
 

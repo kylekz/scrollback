@@ -91,11 +91,17 @@ pub enum Progress {
         bytes: u64,
         outdated: usize,
     },
-    /// So many of those sessions are gone through, and so many of those bytes read.
-    Indexed { sessions: usize, bytes: u64 },
+    /// So many of those sessions are gone through, and so many of those bytes read; and so
+    /// many sessions' text is written so far, made from the same parse a batch at a time,
+    /// counted from the step's start.
+    Indexed {
+        sessions: usize,
+        bytes: u64,
+        searchable: usize,
+    },
     /// What the index's second step has to make searchable: this many sessions, whose text is
-    /// not of their rows as they are now. Said once the first step is over, with none when
-    /// search is not available.
+    /// not of their rows as they are now, the first step having made none of it. Said once the
+    /// first step is over, with none when search is not available.
     Searching { sessions: usize },
     /// So many of those sessions are done: read for their text, or found to have it already,
     /// which are done at once. And so many sessions' text is written so far, counted from the
