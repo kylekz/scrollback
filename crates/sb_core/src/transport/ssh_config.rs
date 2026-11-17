@@ -49,6 +49,21 @@ pub struct Resolved {
     pub proxy_command: Option<String>,
 }
 
+impl Resolved {
+    /**
+     * Whether it is this machine itself: a loopback address (`127.0.0.0/8`, `::1`) or
+     * `localhost`. An app's SSH into WSL reaches the distro's own sshd so (PLAN §7.7).
+     */
+    pub fn is_loopback(&self) -> bool {
+        let name = self.hostname.trim_start_matches('[').trim_end_matches(']');
+        name == "localhost"
+            || name.ends_with(".localhost")
+            || name
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    }
+}
+
 /// What resolving a host came to: an error when `ssh` could not be asked (missing, failing or
 /// slow), which says nothing of the host; `None` when it answered without all it is asked.
 pub type Resolution = Result<Option<Resolved>, String>;
@@ -248,6 +263,16 @@ mod tests {
             command.and_then(|it| it.proxy_command).as_deref(),
             Some("nc -X 5 %h %p")
         );
+    }
+
+    #[test]
+    fn loopback_is_this_machine() {
+        for name in ["localhost", "127.0.0.1", "127.8.9.10", "::1", "[::1]"] {
+            assert!(resolved(name, "u", 22).unwrap().is_loopback(), "{name}");
+        }
+        for name in ["10.0.0.5", "macbook", "128.0.0.1", "localhost.example"] {
+            assert!(!resolved(name, "u", 22).unwrap().is_loopback(), "{name}");
+        }
     }
 
     #[test]

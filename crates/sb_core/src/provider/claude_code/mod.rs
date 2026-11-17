@@ -37,10 +37,11 @@
 //! **The desktop app's records** ([`desktop`]). The app keeps a JSON file per session in its
 //! own data folder, outside the root: `Claude/claude-code-sessions/` under `$APPDATA` when
 //! that is set, else under the home's `Library/Application Support`. Wherever a location has
-//! that folder, the `.json` files directly in each of its session folders
-//! (`claude-code-sessions/<session>/<name>.json`) are items of no session, of kind register,
-//! keyed by their path relative to the app's data folder (which no key under the root starts
-//! with); nothing else of the folder is archived. [`Agent::copy_records`] reads them for the
+//! that folder, its `.json` files one or two folders down (`claude-code-sessions/<a>/<name>.json`
+//! and `claude-code-sessions/<a>/<b>/<name>.json`; on Windows the app keeps every session's
+//! record together in the second) are items of no session, of kind register, keyed by their
+//! path relative to the app's data folder (which no key under the root starts with); nothing
+//! else of the folder is archived, and the folders' names are not read. [`Agent::copy_records`] reads them for the
 //! host and the transcript's path each conversation had where it ran (PLAN §7.7).
 //!
 //! [`parse`] turns a session's archived files into the transcript model, [`tools`] maps
@@ -196,6 +197,13 @@ impl Provider for Agent {
 
     fn copy_records(&self, register: &dyn SessionItems) -> Vec<CopyRecord> {
         desktop::copy_records(register)
+    }
+
+    /// The home above the default root, `~/.claude`; none for a root set elsewhere.
+    fn home_of(&self, root: &str) -> Option<String> {
+        root.strip_suffix(&format!("/.claude/{SUBTREE}"))
+            .filter(|home| !home.is_empty())
+            .map(str::to_string)
     }
 
     /// The session id that names the transcript: the id its records carry (PLAN §7.3).

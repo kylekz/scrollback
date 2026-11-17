@@ -167,9 +167,25 @@ pub struct CopyRecord {
     /// The key the provider gives the transcript at `path` where it ran: what the original's
     /// item is keyed by, if it is archived from there.
     pub key: Option<String>,
+    /// The working directory the session started in there, as recorded.
+    pub cwd: Option<String>,
+    /// How the records were joined to the conversation.
+    pub joined: Joined,
     /// The keys of the register items that say this: the app's records of the session, which
     /// are deleted for good with it (PLAN §4.5).
     pub sources: Vec<String>,
+}
+
+/// How an app's records were joined to a conversation ([`CopyRecord`]), the first that has any
+/// taken alone (PLAN §7.7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Joined {
+    /// The conversation's own record: the app's record of that very session.
+    Own,
+    /// Records whose transcript path is the conversation's.
+    Path,
+    /// Records that name it among a session's earlier or last ids.
+    Mentioned,
 }
 
 /// What a check of one register item says (the `check` example, [`register_audit`]): counts'
@@ -178,6 +194,8 @@ pub struct CopyRecord {
 pub struct RegisterAudit {
     /// Whether it is JSON.
     pub json: bool,
+    /// The conversation it is the app's own record of.
+    pub own: Option<String>,
     /// Whether it is larger than the provider reads a record up to.
     pub too_large: bool,
     /// The agent's ids of the conversations it names.
@@ -331,6 +349,13 @@ pub trait Provider: Send + Sync {
      * known for one even then.
      */
     fn conversation_of(&self, _transcript: &str) -> Option<String> {
+        None
+    }
+
+    /// The home folder of the user at a location where the agent's data is at `root` (as
+    /// [`Source::root`] said it), when the root says it: where a copy that ran in that
+    /// location's WSL distro started tells which distro it was (PLAN §7.7).
+    fn home_of(&self, _root: &str) -> Option<String> {
         None
     }
 }

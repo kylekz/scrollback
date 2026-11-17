@@ -30,7 +30,12 @@
 //! a record's fields a copy folder's id is in (a field's name printed only as far as it is an
 //! identifier); the records too large to be read as one, and the records'
 //! `subagentsTruncatedFor` beside the copies' loose
-//! subagents left unattached. Of each copy with an original, it reads the subagents of both
+//! subagents left unattached. It also counts the copies joined to their record by each rule
+//! (their own `cliSessionId`, a transcript path, a session's earlier or last ids), those with
+//! more than one record by `cliSessionId`, the hosts and copies that resolve to loopback (the
+//! desktop app's SSH into WSL), and of those the copies a WSL distro would take, given the
+//! distros' homes with `--wsl-home` (as each distro names it, `/home/<user>`). Of each copy
+//! with an original, it reads the subagents of both
 //! and counts those attached in both, in the original only (by how the original's were found:
 //! in a workflow's folder, with a `.meta.json`, or by their call's id alone), in the copy only,
 //! and in neither.
@@ -39,7 +44,7 @@
 //! cargo run --release -p sb_core --example check                    this machine's user
 //! cargo run --release -p sb_core --example check -- <home folder>   a home folder elsewhere
 //! cargo run --release -p sb_core --example check -- [<home folder>] --with <home folder>
-//!     [--appdata <folder>] [--location <host>]…
+//!     [--appdata <folder>] [--location <host>]… [--wsl-home <path>]…
 //! ```
 
 use std::cell::RefCell;
@@ -49,8 +54,8 @@ use std::io::{self, Cursor, Read};
 use std::path::Path;
 
 use sb_core::provider::{
-    self, CopyRecord, ItemKind, ItemRange, Provider, ProviderId, RegisterAudit, SessionItem,
-    SessionItems, Source,
+    self, CopyRecord, ItemKind, ItemRange, Joined, Provider, ProviderId, RegisterAudit,
+    SessionItem, SessionItems, Source,
 };
 use sb_core::transcript::{
     BlockId, Content, Conversation, Ending, Subagent, ToolInput, ToolKind, Transcript,
@@ -484,12 +489,15 @@ struct Args {
     second: Option<String>,
     appdata: Option<String>,
     locations: Vec<String>,
+    /// The homes of the WSL distros that are locations, as each distro names it.
+    wsl_homes: Vec<String>,
 }
 
 impl Args {
     fn parse() -> Result<Self, Box<dyn Error>> {
         const USAGE: &str = "usage: check [<home folder>] [--with <home folder>] \
-                             [--appdata <folder>] [--location <host>]...";
+                             [--appdata <folder>] [--location <host>]... \
+                             [--wsl-home <path>]...";
         let mut args = Self::default();
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
@@ -498,6 +506,7 @@ impl Args {
                 "--with" => args.second = Some(value()?),
                 "--appdata" => args.appdata = Some(value()?),
                 "--location" => args.locations.push(value()?),
+                "--wsl-home" => args.wsl_homes.push(value()?),
                 _ if word.starts_with("--") || args.first.is_some() => return Err(USAGE.into()),
                 _ => args.first = Some(word),
             }
@@ -696,7 +705,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &copy.list,
         );
     }
-    let mut hosts = Hosts::new(&args.locations);
+    let mut hosts = Hosts::new(&args.locations, &args.wsl_homes);
     for provider in &providers {
         /* What the provider makes of the register as a whole, and of each file of it. */
         let mut records = Vec::new();
@@ -835,10 +844,12 @@ struct Hosts {
     locations: Vec<Resolved>,
     resolved: HashMap<String, Option<Resolved>>,
     ssh: SshConfig,
+    /// The homes given with `--wsl-home`.
+    wsl_homes: Vec<String>,
 }
 
 impl Hosts {
-    fn new(locations: &[String]) -> Self {
+    fn new(locations: &[String], wsl_homes: &[String]) -> Self {
         let mut counts = Counts::default();
         for what in [
             "copies",
@@ -867,6 +878,7 @@ impl Hosts {
             locations: resolved,
             resolved: HashMap::new(),
             ssh,
+            wsl_homes: wsl_homes.to_vec(),
         }
     }
 
@@ -895,6 +907,13 @@ impl Hosts {
         }
         if files.len() > 1 {
             self.counts.add("copies with more than one record", 1);
+        }
+        let own = (files.iter())
+            .filter(|(audit, _)| audit.own.as_deref() == Some(conversation))
+            .count();
+        if own > 1 {
+            self.counts
+                .add("copies with more than one record by cliSessionId", 1);
         }
         let truncated = files.iter().any(|(audit, _)| audit.truncated);
         let unattached = copy.unattached > 0;
@@ -935,6 +954,14 @@ impl Hosts {
         let Some(record) = records.iter().find(|it| it.conversation == conversation) else {
             return;
         };
+        self.counts.add(
+            match record.joined {
+                Joined::Own => "copies joined by their own record (cliSessionId)",
+                Joined::Path => "copies joined by a record's transcript path",
+                Joined::Mentioned => "copies joined by a record's earlier or last ids",
+            },
+            1,
+        );
         if let Some(path) = &record.path {
             self.counts.add("copies with a recorded transcript path", 1);
             self.counts.add(
@@ -970,6 +997,22 @@ impl Hosts {
             .or_insert_with(|| self.ssh.resolve(host).ok().flatten())
             .clone();
         match resolved {
+            Some(resolved) if resolved.is_loopback() => {
+                self.counts.add("copies whose host ssh -G resolves", 1);
+                self.counts.add("copies whose host resolves to loopback", 1);
+                /* As the app would attribute it: the only distro, else the one whose home
+                holds where it started. */
+                let cwd = record.cwd.as_deref().unwrap_or_default();
+                let holding = (self.wsl_homes.iter())
+                    .filter(|home| cwd == *home || cwd.starts_with(&format!("{home}/")))
+                    .count();
+                if self.wsl_homes.len() == 1 || holding == 1 {
+                    self.counts.add(
+                        "copies whose host resolves to loopback, attributed to a --wsl-home",
+                        1,
+                    );
+                }
+            }
             Some(resolved) => {
                 self.counts.add("copies whose host ssh -G resolves", 1);
                 if self.locations.contains(&resolved) {
@@ -985,6 +1028,12 @@ impl Hosts {
         self.counts
             .print("Where copies ran, as the app's records say");
         println!("  distinct hosts recorded: {}", self.resolved.len());
+        println!(
+            "  distinct hosts resolving to loopback: {}",
+            (self.resolved.values())
+                .filter(|it| it.as_ref().is_some_and(Resolved::is_loopback))
+                .count()
+        );
     }
 }
 

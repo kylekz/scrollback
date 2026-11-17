@@ -368,7 +368,9 @@ CREATE INDEX tombstone_conversation ON tombstone (provider, conversation)
 -- key the provider makes of that path (the original's item's key where it ran). resolved
 -- and ran_at are the last attribution's: whether this machine's ssh resolved the host, and
 -- the SSH location it is the same place as. sources: the keys of the register items that say
--- it, as JSON, which are deleted for good with the conversation.
+-- it, as JSON, which are deleted for good with the conversation. cwd is where the session
+-- started there, as recorded, and wsl the WSL location that makes it, when it ran in a distro
+-- reached over SSH at localhost: the only one, or the one whose home holds cwd.
 CREATE TABLE copy_record (
     location_id TEXT NOT NULL REFERENCES location (id),
     provider TEXT NOT NULL,
@@ -377,6 +379,8 @@ CREATE TABLE copy_record (
     path TEXT,
     key TEXT,
     sources TEXT NOT NULL DEFAULT '[]',
+    cwd TEXT,
+    wsl TEXT REFERENCES location (id),
     resolved INTEGER NOT NULL DEFAULT 0,
     ran_at TEXT REFERENCES location (id),
     PRIMARY KEY (location_id, provider, conversation)
