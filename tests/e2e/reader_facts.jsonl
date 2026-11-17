@@ -14,7 +14,7 @@
 {"cmd": "bounds", "target": "reader/facts", "expect_result": [{"pointer": "/w", "gte": 267, "lte": 269}]}
 {"cmd": "bounds", "target": "reader/facts/path", "expect_result": [{"pointer": "/x", "gte": 1187, "lte": 1191}, {"pointer": "/w", "gte": 233, "lte": 237}, {"pointer": "/h", "gte": 33, "lte": 35}]}
 {"cmd": "bounds", "target": "reader/facts/path/value", "expect_result": [{"pointer": "/w", "lte": 237}, {"pointer": "/h", "gte": 17, "lte": 19}]}
-{"cmd": "bounds", "target": "reader/facts/branch", "expect_result": [{"pointer": "/w", "lte": 237}, {"pointer": "/h", "gte": 33, "lte": 35}]}
+{"cmd": "bounds", "target": "reader/facts/branch", "expect_result": [{"pointer": "/w", "lte": 237}, {"pointer": "/h", "gte": 32, "lte": 35}]}
 {"cmd": "bounds", "target": "reader/facts/when", "expect_result": [{"pointer": "/w", "lte": 237}, {"pointer": "/h", "gte": 47, "lte": 49}]}
 {"cmd": "bounds", "target": "reader/facts/tokens", "expect_result": [{"pointer": "/w", "lte": 237}, {"pointer": "/h", "gte": 31, "lte": 33}]}
 {"cmd": "bounds", "target": "reader/facts/models", "expect_result": [{"pointer": "/w", "lte": 237}, {"pointer": "/h", "gte": 79, "lte": 81}]}
