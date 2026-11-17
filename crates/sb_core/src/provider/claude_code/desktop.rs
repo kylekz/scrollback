@@ -38,19 +38,30 @@ const RECORD_BYTES: u64 = 1024 * 1024;
 /// The variable that names Windows' roaming application data folder.
 pub(super) const APPDATA: &str = "APPDATA";
 
-/// Whether the file at `key` (under [`SUBTREE`]) is one of the app's records, which are all
-/// that is archived of its folder: a `.json` file directly in one session's folder,
-/// `claude-code-sessions/<session>/<name>.json`. Whatever else the app keeps there is its own.
+/**
+ * Whether the file at `key` (under [`SUBTREE`]) is one of the app's records, which are all
+ * that is archived of its folder: a `.json` file one or two folders down,
+ * `claude-code-sessions/<a>/<name>.json` or `claude-code-sessions/<a>/<b>/<name>.json`, as the
+ * app has kept them (on Windows, the second: what seem an account's and an organisation's
+ * folders, with every session's record in the inner one). The folders' names are not read: a
+ * record says whose it is in its fields. Nothing at the top or deeper, and nothing else the
+ * app keeps there, is a record.
+ */
 pub(super) fn is_record(key: &str) -> bool {
-    key.strip_prefix(SUBTREE)
+    let Some(inside) = key
+        .strip_prefix(SUBTREE)
         .and_then(|rest| rest.strip_prefix('/'))
-        .and_then(|rest| rest.split_once('/'))
-        .is_some_and(|(folder, name)| {
-            !folder.is_empty()
-                && !name.contains('/')
-                && name.len() > ".json".len()
-                && name.ends_with(".json")
-        })
+    else {
+        return false;
+    };
+    let parts: Vec<&str> = inside.split('/').collect();
+    let Some((name, folders)) = parts.split_last() else {
+        return false;
+    };
+    (1..=2).contains(&folders.len())
+        && folders.iter().all(|folder| !folder.is_empty())
+        && name.len() > ".json".len()
+        && name.ends_with(".json")
 }
 
 /// What a file under [`SUBTREE`] is: a record of the app's ([`is_record`]), else something

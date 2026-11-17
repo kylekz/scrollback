@@ -419,12 +419,22 @@ fn a_reindex_makes_the_attribution_again() {
 #[test]
 fn only_the_app_s_session_records_are_archived() {
     let machines = Machines::new();
-    let kept = machines
-        .pc
-        .desktop_record("a/local_a.json", b"{\"cliSessionId\": 1}");
+    /* Both layouts: a record one folder down, and records together two folders down. */
+    let mut kept = vec![
+        machines
+            .pc
+            .desktop_record("a/local_a.json", b"{\"cliSessionId\": 1}"),
+        machines
+            .pc
+            .desktop_record("u/o/local_b.json", b"{\"cliSessionId\": 2}"),
+        machines
+            .pc
+            .desktop_record("u/o/local_c.json", b"{\"cliSessionId\": 3}"),
+    ];
+    kept.sort();
     for other in [
         "a/notes.txt",
-        "a/deeper/local_b.json",
+        "u/o/deeper/local_d.json",
         "top.json",
         "a/log.jsonl",
     ] {
@@ -438,7 +448,35 @@ fn only_the_app_s_session_records_are_archived() {
         .map(|item| item.key)
         .filter(|key| !key.starts_with("projects/"))
         .collect();
-    assert_eq!(archived, [kept]);
+    assert_eq!(archived, kept);
+}
+
+/// The app's records together two folders down, as on Windows, join their copies by their
+/// fields alone: the folders are named by nothing of the session's.
+#[test]
+fn records_kept_together_two_folders_down_are_joined_by_their_fields() {
+    let mut machines = Machines::new();
+    let session = machines.remote.session(PROJECT, 2);
+    machines.pc.desktop_copy(&session);
+    let other = machines.remote.session(PROJECT, 2);
+    let path = machines.remote.location_path(&session.key);
+    for (name, id, host) in [
+        ("local_1.json", &session.id, "buildbox"),
+        ("local_2.json", &other.id, "elsewhere"),
+    ] {
+        machines.pc.desktop_record(
+            &format!("user-folder/org-folder/{name}"),
+            serde_json::json!({
+                "cliSessionId": id,
+                "sshConfig": { "sshHost": host },
+                "sshRemoteTranscriptPath": path,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+    }
+    machines.sync_here(&table());
+    assert_eq!(machines.origin().0, Some(machines.host.clone()));
 }
 
 /// `ssh` that can't be asked keeps what was said last, of a copy's host and of a location's;
