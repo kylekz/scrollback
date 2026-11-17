@@ -34,6 +34,10 @@ ignore = [
     { id = "RUSTSEC-2026-0546", reason = "zip via velopack, which never calls ZipArchive::extract" },
     { id = "RUSTSEC-2026-0547", reason = "zip via velopack, built without legacy-zip: no Shrink, Reduce or Implode decoder" },
     { id = "RUSTSEC-2026-0548", reason = "zip via velopack, which reads by the central directory (by_index), never ZipStreamReader" },
+    # chrono unmaintained (no vulnerability). sb_core and sb_ui name it directly, but can't drop
+    # it alone: toolbox_store's daily backup takes a `chrono::NaiveDate`, and gpui and
+    # gpui-component build on it. Goes when toolbox_store and then sb_core and sb_ui move to jiff.
+    { id = "RUSTSEC-2026-0543", reason = "chrono, required by toolbox_store's API and gpui; unmaintained, not vulnerable" },
 ]
 
 [licenses]
