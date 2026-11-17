@@ -798,7 +798,10 @@ impl SyncService {
                         hold.reached(progress, &cancel);
                     },
                 );
-                attributed(&archive, resolve.as_ref());
+                /* Not once the pass is stopped: the app may be moving onto another archive. */
+                if !cancel.is_cancelled() {
+                    attributed(&archive, resolve.as_ref());
+                }
                 (synced, archive.catalogue().location(&id))
             }
         });
@@ -947,7 +950,9 @@ impl SyncService {
                             .apply(progress);
                     },
                 );
-                attributed(&archive, resolve.as_ref());
+                if !stop.is_cancelled() {
+                    attributed(&archive, resolve.as_ref());
+                }
                 indexed
             }
         });

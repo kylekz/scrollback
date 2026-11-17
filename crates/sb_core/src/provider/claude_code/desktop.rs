@@ -195,7 +195,7 @@ mod tests {
                     .iter()
                     .map(|(key, bytes)| SessionItem {
                         key: format!("{SUBTREE}/{key}"),
-                        kind: classify(key).kind,
+                        kind: classify(&format!("{SUBTREE}/{key}")).kind,
                         length: bytes.len() as u64,
                     })
                     .collect(),
