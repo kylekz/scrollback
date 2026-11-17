@@ -64,7 +64,12 @@ impl Source for FileTree<'_> {
     }
 
     fn scan(&mut self) -> Result<Scan, ProviderError> {
-        let listing = self.transport.list(&self.path(self.subtree))?;
+        let mut listing = self.transport.list(&self.path(self.subtree))?;
+        /* In the order of their paths, not as the file system lists its folders (by name on
+        NTFS, otherwise on APFS and ext4): a pass archives in this order, and whatever ranks by
+        it (the copy shown of several that arrive together, verify's first problems) is then
+        the same at every location. */
+        listing.files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         let items = listing
             .files
             .into_iter()
