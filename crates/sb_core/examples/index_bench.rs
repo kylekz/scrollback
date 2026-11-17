@@ -12,42 +12,58 @@
 //!
 //! Each of `--runs` runs marks every row and every session's search text as made by an older
 //! parser, so the items are said again what they are and every session is parsed, indexed
-//! and made searchable again, and times it. With `--changed` every span of the text is first
-//! made to differ from what the parser makes of it, as when a new parser or index says each
-//! session's text otherwise. It prints the archive's shape and each run's times: aggregates
-//! only.
+//! and made searchable again, and times it; with `--outdated`, that percent of them alone, the
+//! rest as they were. With `--changed` every span of their text is first made to differ from
+//! what the parser makes of it, as when a new parser or index says each session's text
+//! otherwise. With `--passes`, passes of the location run one after another beside the index,
+//! as the app's do beside a start's, and it counts the sessions parsed more than once; the
+//! folder is to be made with it, which keeps the tree for the passes to read. It prints the
+//! archive's shape and each run's times and counts: aggregates only.
 //!
 //! ```text
 //! cargo run --release -p sb_core --example index_bench -- target/bench/index
 //! cargo run --release -p sb_core --example index_bench -- target/bench/index --sessions 3000 --runs 3
+//! cargo run --release -p sb_core --example index_bench -- target/bench/index --outdated 40 --changed
+//! cargo run --release -p sb_core --example index_bench -- target/bench/passes --sessions 600 --passes
 //! ```
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Instant;
 
 use sb_core::CancelToken;
 use sb_core::archive::Archive;
 use sb_core::location::{LocationId, LocationKind};
-use sb_core::provider::Provider;
-use sb_core::sync::{Progress, SyncError, index, sync_location};
-use sb_test_support::{
-    Agent as _, FileAgent, ProjectsTree, Records, Session, edit_catalogue, read_catalogue,
+use sb_core::provider::{
+    CopyRecord, ItemKind, Provider, ProviderError, ProviderId, SessionItems, Source,
 };
+use sb_core::sync::{Progress, SyncError, index, sync_location};
+use sb_core::transcript::{CopyWords, Subagent, Transcript};
+use sb_core::transport::Transport;
+use sb_test_support::{Agent as _, FileAgent, ProjectsTree, Records, Session, read_catalogue};
 use serde_json::json;
 use toolbox_store::rusqlite::Connection;
 
 const USAGE: &str = "usage: index_bench <folder under target/> [--sessions <n>] [--seed <n>] \
-                     [--runs <n>] [--changed]";
+                     [--runs <n>] [--outdated <percent>] [--changed] [--passes]";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let folder = args.next().ok_or(USAGE)?;
     let (mut sessions, mut seed, mut runs, mut changed) = (3000, 1, 1, false);
+    let (mut outdated, mut passes) = (100, false);
     while let Some(flag) = args.next() {
-        if flag == "--changed" {
-            changed = true;
+        match flag.as_str() {
+            "--changed" => changed = true,
+            "--passes" => passes = true,
+            _ => {}
+        }
+        if matches!(flag.as_str(), "--changed" | "--passes") {
             continue;
         }
         let value: u64 = args.next().ok_or(USAGE)?.parse()?;
@@ -55,6 +71,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--sessions" => sessions = usize::try_from(value)?,
             "--seed" => seed = value,
             "--runs" => runs = value,
+            "--outdated" if value <= 100 => outdated = value,
             _ => return Err(USAGE.into()),
         }
     }
@@ -64,8 +81,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         let started = Instant::now();
         let home = folder.join("home");
         generate(&home, &dir, sessions, seed)?;
-        std::fs::remove_dir_all(home)?;
+        /* Passes read the tree; without them it is let go of. */
+        if !passes {
+            std::fs::remove_dir_all(home)?;
+        }
         println!("generated and archived in {:.1?}", started.elapsed());
+    }
+    let home = folder.join("home");
+    if passes && !home.exists() {
+        return Err("--passes needs a folder generated with --passes".into());
     }
     let count = |sql: &str| read_catalogue(&dir, sql).remove(0);
     println!(
@@ -82,38 +106,108 @@ fn main() -> Result<(), Box<dyn Error>> {
     for run in 1..=runs {
         /* What a new parser finds at a start: rows and text it did not make, and items it has
         not classified. */
-        edit_catalogue(
-            &dir,
-            "UPDATE session SET parser_version = parser_version - 1;
-             UPDATE location_provider SET classified_by = NULL;",
-        );
+        let catalogue = Connection::open(dir.join("scrollback.db"))?;
         let search = Connection::open(dir.join("search.db"))?;
-        search.execute("UPDATE doc SET made = 'older'", [])?;
-        if changed {
-            /* Text the new parser says otherwise, every span of it: the most an index has to
-            take out of the search index and write again. */
-            search.execute_batch(
-                "INSERT INTO span_text (span_text) VALUES ('delete-all');
-                 UPDATE span SET text = text || ' (older)';
-                 INSERT INTO span_text (span_text) VALUES ('rebuild');",
+        catalogue.execute("UPDATE location_provider SET classified_by = NULL", [])?;
+        let keys: Vec<(String, String, String)> = catalogue
+            .prepare("SELECT location_id, provider, session FROM session ORDER BY session")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        /* Text the new parser says otherwise is all of it, the most an index has to take
+        out of the search index and write again: each span is replaced as an index replaces
+        it, so the search index is as a real one would be after it. */
+        search.execute_batch(
+            "BEGIN;
+             INSERT INTO span_text (span_text, rank) VALUES ('secure-delete', 0);",
+        )?;
+        for (n, key) in (0u64..).zip(&keys) {
+            if n * 37 % 100 >= outdated {
+                continue;
+            }
+            let (location, provider, session) = key;
+            catalogue.execute(
+                "UPDATE session SET parser_version = parser_version - 1
+                 WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+                [location, provider, session],
             )?;
+            search.execute(
+                "UPDATE doc SET made = 'older'
+                 WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+                [location, provider, session],
+            )?;
+            if changed {
+                let doc: i64 = search.query_row(
+                    "SELECT id FROM doc WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+                    [location, provider, session],
+                    |row| row.get(0),
+                )?;
+                search.execute_batch(&format!(
+                    "INSERT INTO span_text (span_text, rowid, text)
+                         SELECT 'delete', id, text FROM span WHERE id BETWEEN {first} AND {last};
+                     UPDATE span SET text = text || ' (older)'
+                         WHERE id BETWEEN {first} AND {last};
+                     INSERT INTO span_text (rowid, text)
+                         SELECT id, text FROM span WHERE id BETWEEN {first} AND {last};",
+                    first = doc << 24,
+                    last = (doc << 24) + (1 << 24) - 1,
+                ))?;
+            }
         }
-        drop(search);
+        search.execute_batch("COMMIT")?;
+        drop((catalogue, search));
         let archive = Archive::open(&dir)?;
         let started = Instant::now();
         let mut first = None;
-        let report = index(
-            &archive,
-            None,
-            &[provider()],
-            &CancelToken::new(),
-            &mut |progress| {
-                if let Progress::Searching { .. } = progress {
-                    first.get_or_insert(started.elapsed());
-                }
-            },
-        )?;
+        let parses = Mutex::default();
+        let (indexing, location) = (AtomicBool::new(true), archive.catalogue().locations()?);
+        let report = thread::scope(|scope| {
+            /* With `--passes`, passes of the location one after another while the index of a
+            start runs, as the app's do beside it, each with its index of what it changed. */
+            let beside = passes.then(|| {
+                scope.spawn(|| {
+                    let (mut ran, tree) = (0, ProjectsTree::in_home(&home));
+                    while indexing.load(Ordering::Relaxed) {
+                        let counted = Box::new(Counting(provider(), &parses));
+                        let cancel = CancelToken::new();
+                        sync_location(
+                            &archive,
+                            &location[0].id,
+                            &tree.transport(),
+                            &[counted],
+                            &cancel,
+                            &mut |_| {},
+                        )
+                        .ok();
+                        ran += 1;
+                    }
+                    ran
+                })
+            });
+            let report = index(
+                &archive,
+                None,
+                &[Box::new(Counting(provider(), &parses))],
+                &CancelToken::new(),
+                &mut |progress| {
+                    if let Progress::Searching { .. } = progress {
+                        first.get_or_insert(started.elapsed());
+                    }
+                },
+            );
+            indexing.store(false, Ordering::Relaxed);
+            if let Some(beside) = beside {
+                println!("  {} passes beside it", beside.join().unwrap_or_default());
+            }
+            report
+        })?;
         let total = started.elapsed();
+        let parses = parses.into_inner().unwrap_or_default();
+        let again: usize = parses.values().map(|times| times - 1).sum();
+        println!(
+            "  {} sessions parsed, {} of them more than once, {again} parses again",
+            parses.len(),
+            parses.values().filter(|times| **times > 1).count(),
+        );
         let first = first.unwrap_or(total);
         println!(
             "run {run}: {} sessions in {:.2?} (step 1 {:.2?}, step 2 {:.2?}); {} failed, {} \
@@ -131,6 +225,62 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn provider() -> Box<dyn Provider> {
     FileAgent::new().provider()
+}
+
+/// A provider that counts how many times it parses each session, by its first item's key.
+struct Counting<'a>(Box<dyn Provider>, &'a Mutex<HashMap<String, usize>>);
+
+impl Provider for Counting<'_> {
+    fn id(&self) -> ProviderId {
+        self.0.id()
+    }
+
+    fn detect<'s>(
+        &'s self,
+        transport: &'s dyn Transport,
+        scratch: &'s Path,
+    ) -> Result<Option<Box<dyn Source + 's>>, ProviderError> {
+        self.0.detect(transport, scratch)
+    }
+
+    fn parser_version(&self) -> u32 {
+        self.0.parser_version()
+    }
+
+    fn parse(&self, items: &dyn SessionItems) -> Transcript {
+        if let Some(first) = items.list().iter().map(|item| &item.key).min() {
+            let mut parses = self
+                .1
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *parses.entry(first.clone()).or_default() += 1;
+        }
+        self.0.parse(items)
+    }
+
+    fn subagent(&self, items: &dyn SessionItems, item: &str) -> Subagent {
+        self.0.subagent(items, item)
+    }
+
+    fn classify(&self, key: &str) -> (ItemKind, Option<String>) {
+        self.0.classify(key)
+    }
+
+    fn copy_of(&self, session: &str) -> Option<CopyWords> {
+        self.0.copy_of(session)
+    }
+
+    fn copy_records(&self, register: &dyn SessionItems) -> Vec<CopyRecord> {
+        self.0.copy_records(register)
+    }
+
+    fn conversation_of(&self, transcript: &str) -> Option<String> {
+        self.0.conversation_of(transcript)
+    }
+
+    fn home_of(&self, root: &str) -> Option<String> {
+        self.0.home_of(root)
+    }
 }
 
 /// How many bytes the files under `dir` hold.

@@ -48,9 +48,12 @@ cargo run --release -p sb_core --example sync -- test --wsl <distro> | --ssh <ho
 cargo run --release -p sb_core --example check [-- <home folder>] [--with <home folder>]
                              # parses every session under a home folder and prints aggregates only;
                              # --with matches its copies of sessions that ran elsewhere (PLAN §7.7)
-cargo run --release -p sb_core --example index_bench -- target/bench/index [--sessions 3000] [--runs 3] [--changed]
+cargo run --release -p sb_core --example index_bench -- target/bench/index [--sessions 3000] [--runs 3]
+        [--outdated <percent>] [--changed] [--passes]
                              # times a start's index of every session again on a generated archive
-                             # (made in that folder the first time); --changed: all its search text too
+                             # (made in that folder the first time); --outdated: of so many of them;
+                             # --changed: their search text too; --passes: passes run beside it, and
+                             # how many sessions are parsed twice (generate the folder with it)
 cargo run --release -p sb_core --example sync -- <archive folder> copies
                              # counts the archive's copies as the library shows them
 cargo clippy --workspace --all-targets -- -D warnings
