@@ -25,6 +25,15 @@ ignore = [
     { id = "RUSTSEC-2026-0368", reason = "zip via velopack, which never calls ZipArchive::extract or ZipStreamReader::extract" },
     { id = "RUSTSEC-2026-0369", reason = "zip via velopack, which never calls ZipArchive::extract or ZipStreamReader::extract" },
     { id = "RUSTSEC-2026-0429", reason = "zip via velopack, which never calls ZipArchive::extract or ZipStreamReader::extract" },
+    # Four more in zip 8, fixed only in zip 9, which velopack's `zip = "8.6"` rules out. velopack
+    # turns on `deflate` alone, so zip is built without `aes-crypto` and `legacy-zip`: it has no
+    # AES and no Shrink, Reduce or Implode decoder to reach. Reading, it calls only
+    # `ZipArchive::by_index`, never `ZipArchive::extract` or `ZipStreamReader`, so no symlink
+    # target is checked by zip and no local-header name is used.
+    { id = "RUSTSEC-2026-0545", reason = "zip via velopack, built without aes-crypto: no AES entry is ever read" },
+    { id = "RUSTSEC-2026-0546", reason = "zip via velopack, which never calls ZipArchive::extract" },
+    { id = "RUSTSEC-2026-0547", reason = "zip via velopack, built without legacy-zip: no Shrink, Reduce or Implode decoder" },
+    { id = "RUSTSEC-2026-0548", reason = "zip via velopack, which reads by the central directory (by_index), never ZipStreamReader" },
 ]
 
 [licenses]
