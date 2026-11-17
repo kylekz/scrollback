@@ -286,16 +286,22 @@ fn a_pass_cancelled_at_each_step_resumes<A: Agent + Default>() {
         ));
         let (searching, indexed) = all[7..].split_last().unwrap();
         assert_eq!(*searching, Progress::Searching { sessions: 0 });
-        let searchable: Vec<_> = (indexed.iter())
-            .map(|progress| match progress {
-                Progress::Indexed {
-                    sessions,
-                    searchable,
-                    ..
-                } => (*sessions, *searchable),
-                other => panic!("{other:?}"),
-            })
-            .collect();
+        /* The text, written beside the rows, may be said again once written. */
+        let mut searchable: Vec<(usize, usize)> = Vec::new();
+        for progress in indexed {
+            let Progress::Indexed {
+                sessions,
+                searchable: written,
+                ..
+            } = *progress
+            else {
+                panic!("{progress:?}");
+            };
+            match searchable.last_mut() {
+                Some(last) if last.0 == sessions => last.1 = written,
+                _ => searchable.push((sessions, written)),
+            }
+        }
         assert_eq!(searchable, [(1, 0), (2, 0), (3, 3)]);
 
         for stop_at in 0..all.len() {

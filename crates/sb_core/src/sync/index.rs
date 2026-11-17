@@ -45,8 +45,8 @@ use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock, PoisonError, mpsc};
 use std::thread;
 
 use toolbox_process::CancelToken;
@@ -158,7 +158,7 @@ pub fn index_session(
         });
     }
     let mut report = IndexReport::default();
-    let parsed = parse(archive, provider, id)?;
+    let parsed = parse(archive, provider, id, false)?;
     let text = match record_parse(archive, provider, id, parsed, &mut report)? {
         Some(text) => Some(text),
         /* Of a row made without a parse, the text is read as the second step reads it. */
@@ -213,41 +213,62 @@ fn run(
     /* Opened first: one made anew says no row's text is searchable before any is made. The
     library never waits on search: without it, the text is left to the second step, or to the
     next index. */
-    let mut search = archive.search_index().ok();
+    let search = archive.search_index().ok();
+    let texts = Texts::new(archive, search.as_deref());
     let sessions = stale.len();
     let (mut done, mut bytes, mut batch) = (0, 0, Batch::default());
-    let indexed = in_order(
-        stale,
-        cancel,
-        |(provider, stale)| {
-            let parsed = parse(archive, provider, &stale.id);
-            (provider, stale, parsed)
-        },
-        |(provider, stale, parsed)| {
-            let text = record_parse(archive, provider, &stale.id, parsed?, &mut report)?;
-            if let (Some(_), Some(text)) = (&search, text) {
-                batch.add(text);
-            }
-            done += 1;
-            if batch.is_full() || done == sessions {
-                report.searchable += batch.write_or_drop(archive, &mut search)?;
-            }
-            bytes += stale.bytes;
-            /* How far it is counts every session gone through, those found to be none any
-            more too. */
-            progress(&Progress::Indexed {
-                sessions: done,
-                bytes,
-                searchable: report.searchable,
-            });
-            Ok(())
-        },
-    );
-    /* What was made is written, the index stopped or not. */
-    if matches!(indexed, Ok(()) | Err(SyncError::Cancelled)) {
-        report.searchable += batch.write_or_drop(archive, &mut search)?;
+    let indexed = thread::scope(|scope| {
+        let writer = texts.writer(scope);
+        let indexed = in_order(
+            stale,
+            cancel,
+            |(provider, stale)| {
+                let parsed = parse(archive, provider, &stale.id, true);
+                (provider, stale, parsed)
+            },
+            |(provider, stale, parsed)| {
+                let text = record_parse(archive, provider, &stale.id, parsed?, &mut report)?;
+                if let (true, Some(text)) = (texts.wanted(), text) {
+                    batch.add(text);
+                }
+                done += 1;
+                if batch.is_full() || done == sessions {
+                    writer.write(std::mem::take(&mut batch))?;
+                }
+                bytes += stale.bytes;
+                /* How far it is counts every session gone through, those found to be none
+                any more too; the text written so far is as the writer says. */
+                progress(&Progress::Indexed {
+                    sessions: done,
+                    bytes,
+                    searchable: texts.written(),
+                });
+                Ok(())
+            },
+        );
+        /* What was made is written, the index stopped or not. */
+        if matches!(indexed, Ok(()) | Err(SyncError::Cancelled)) {
+            writer.write(std::mem::take(&mut batch))?;
+        }
+        writer.end()?;
+        indexed
+    });
+    report.searchable += texts.written();
+    /* The text written after the last session was, said once it is (unless it was stopped,
+    which is said next). */
+    if sessions > 0 && !cancel.is_cancelled() {
+        progress(&Progress::Indexed {
+            sessions: done,
+            bytes,
+            searchable: report.searchable,
+        });
     }
+    let searched = texts.wanted();
+    let search = search.filter(|_| searched);
     indexed?;
+    if cancel.is_cancelled() {
+        return Err(SyncError::Cancelled);
+    }
     let made = if backlog {
         searchable(archive, location, providers, cancel, progress, &mut report)
     } else {
@@ -370,9 +391,11 @@ fn distro_of(distros: &[(LocationId, Option<String>)], cwd: Option<&str>) -> Opt
 }
 
 /// How much text an index writes at a time: up to this many bytes of the sessions' text, or
-/// [`TEXTS`] sessions.
-const TEXT_BYTES: usize = 16 * 1024 * 1024;
-const TEXTS: usize = 256;
+/// [`TEXTS`] sessions. Small, so that what waits on a batch (rows, when text falls behind, and
+/// search finding it) waits briefly: on a few thousand sessions whose text all changed, the
+/// rows stood still for under a second at most, against nearly two with four times as much.
+const TEXT_BYTES: usize = 4 * 1024 * 1024;
+const TEXTS: usize = 64;
 
 /// The text an index made and has yet to write, of sessions whose rows are as it was made of.
 #[derive(Default)]
@@ -396,28 +419,125 @@ impl Batch {
         self.bytes = 0;
         record(archive, search, &std::mem::take(&mut self.texts))
     }
+}
 
-    /**
-     * [`Batch::write`] to `search`, if there is search. Search that fails is said in the log
-     * and let go of for the rest of the step, with what was added: the next step, or the next
-     * index, makes that text ([`without_search`]).
-     */
-    fn write_or_drop(
-        &mut self,
-        archive: &Archive,
-        search: &mut Option<Arc<SearchIndex>>,
-    ) -> Result<usize, SyncError> {
-        let Some(index) = search else {
-            *self = Self::default();
-            return Ok(0);
+/**
+ * Where the first step's text goes ([`Texts::writer`]): written off the index's own thread,
+ * so the rows never wait while a batch of text is, and the bar moves with the rows. Search
+ * that fails is said in the log and let go of for the rest of the step, with what was made:
+ * the backlog, or the next index, makes that text ([`without_search`]).
+ */
+struct Texts<'a> {
+    archive: &'a Archive,
+    search: Option<&'a SearchIndex>,
+    /// Search is in hand, and has not failed.
+    wanted: AtomicBool,
+    /// How many sessions' text was written.
+    written: AtomicUsize,
+}
+
+impl<'a> Texts<'a> {
+    fn new(archive: &'a Archive, search: Option<&'a SearchIndex>) -> Self {
+        Self {
+            archive,
+            search,
+            wanted: AtomicBool::new(search.is_some()),
+            written: AtomicUsize::new(0),
+        }
+    }
+
+    /// Whether text is still to be made: there is search, and it has not failed.
+    fn wanted(&self) -> bool {
+        self.wanted.load(Ordering::Relaxed)
+    }
+
+    fn written(&self) -> usize {
+        self.written.load(Ordering::Relaxed)
+    }
+
+    /// Writes `batch`, unless search failed: what is let go of then is said once, in the log.
+    fn write(&self, batch: Batch) -> Result<(), SyncError> {
+        let Some(search) = self.search.filter(|_| self.wanted()) else {
+            return Ok(());
         };
-        match self.write(archive, index) {
-            Ok(written) => Ok(written),
+        match record(self.archive, search, &batch.texts) {
+            Ok(written) => {
+                self.written.fetch_add(written, Ordering::Relaxed);
+                Ok(())
+            }
             Err(error) => {
                 without_search(error)?;
-                *search = None;
-                Ok(0)
+                self.wanted.store(false, Ordering::Relaxed);
+                Ok(())
             }
+        }
+    }
+
+    /**
+     * A thread of `scope` that writes what is handed to it, one batch at a time, with one
+     * more waiting at most: past that, handing one over waits, so text that falls behind
+     * holds no more than three batches. With no thread to be had, it is written where it is
+     * handed over.
+     */
+    fn writer<'scope>(&'scope self, scope: &'scope thread::Scope<'scope, '_>) -> Writer<'scope> {
+        let (send, receive) = mpsc::sync_channel::<Batch>(1);
+        let thread = thread::Builder::new()
+            .name("index-text".to_string())
+            .spawn_scoped(scope, move || {
+                for batch in receive {
+                    self.write(batch)?;
+                }
+                Ok(())
+            });
+        match thread {
+            Ok(thread) => Writer {
+                texts: self,
+                send: Some(send),
+                thread: Some(thread),
+            },
+            Err(error) => {
+                log::warn!("an index writes its text where it records: {error}");
+                Writer {
+                    texts: self,
+                    send: None,
+                    thread: None,
+                }
+            }
+        }
+    }
+}
+
+/// What hands the first step's text to its writer ([`Texts::writer`]).
+struct Writer<'scope> {
+    texts: &'scope Texts<'scope>,
+    send: Option<mpsc::SyncSender<Batch>>,
+    thread: Option<thread::ScopedJoinHandle<'scope, Result<(), SyncError>>>,
+}
+
+impl Writer<'_> {
+    /// Hands `batch` over to be written, or writes it, with no thread.
+    fn write(&self, batch: Batch) -> Result<(), SyncError> {
+        if batch.texts.is_empty() {
+            return Ok(());
+        }
+        match &self.send {
+            /* A writer that stopped says why when it is ended. */
+            Some(send) => {
+                let _ = send.send(batch);
+                Ok(())
+            }
+            None => self.texts.write(batch),
+        }
+    }
+
+    /// Waits for what was handed over to be written. Returns what stopped the writer, if
+    /// anything did; a panic in it is this thread's.
+    fn end(mut self) -> Result<(), SyncError> {
+        drop(self.send.take());
+        match self.thread.take().map(thread::ScopedJoinHandle::join) {
+            None => Ok(()),
+            Some(Ok(ended)) => ended,
+            Some(Err(fault)) => panic::resume_unwind(fault),
         }
     }
 }
@@ -874,20 +994,37 @@ enum Outcome {
     Unread(String),
     /// Its parser stopped, for the reason given.
     Faulted(String),
+    /// Its row was made of its items as they are, by this parser and index, since it was
+    /// found stale: it was not parsed, and there is nothing to record.
+    Current,
 }
 
-/// Parses and indexes the session `id`; `None` when its items hold no transcript: they are
-/// another session's now, or no conversation's. It writes nothing but the holds of its
-/// versions ([`hold`]), so sessions are parsed several at once and their rows made in order.
+/**
+ * Parses and indexes the session `id`; `None` when its items hold no transcript: they are
+ * another session's now, or no conversation's. With `if_stale`, a session whose row is
+ * already made of its items as they are, by this parser and index, is not parsed
+ * ([`Outcome::Current`]): another index made it since this one found it stale, a pass beside
+ * the index of a start, say. It writes nothing but the holds of its versions ([`hold`]), so
+ * sessions are parsed several at once and their rows made in order.
+ */
 fn parse(
     archive: &Archive,
     provider: &dyn Provider,
     id: &SessionId,
+    if_stale: bool,
 ) -> Result<Option<Parsed>, SyncError> {
     let catalogue = archive.catalogue();
     let mut readings = catalogue.session_items(id)?;
     if !readings.iter().any(|reading| reading.kind.is_transcript()) {
         return Ok(None);
+    }
+    let current = made(fingerprint(&readings), provider.parser_version());
+    if if_stale && catalogue.is_made_of(id, &current)? {
+        return Ok(Some(Parsed {
+            readings,
+            held_back: 0,
+            outcome: Outcome::Current,
+        }));
     }
     let mut held_back = 0;
     /* A provider's parser doesn't fail (PLAN §7.1), so what stops it on a session is a fault
@@ -959,8 +1096,11 @@ fn record_parse(
         catalogue.forget_sessions(std::slice::from_ref(id))?;
         return Ok(None);
     };
-    report.sessions += 1;
-    report.held_back += held_back;
+    /* One made since by another index is that index's to count. */
+    if !matches!(outcome, Outcome::Current) {
+        report.sessions += 1;
+        report.held_back += held_back;
+    }
     let from = fingerprint(&readings);
     let parser = provider.parser_version();
     let made = made(from, parser);
@@ -1013,6 +1153,7 @@ fn record_parse(
             report.failed.push((id.clone(), reason));
             Ok(None)
         }
+        Outcome::Current => Ok(None),
         Outcome::Faulted(reason) => {
             catalogue.record_session(id, parser, from, Indexed::Faulted(&reason), copy, known)?;
             report.failed.push((id.clone(), reason));

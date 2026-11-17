@@ -917,6 +917,26 @@ impl Catalogue {
         })
     }
 
+    /**
+     * Whether the row of the session `id` is made from what `made` says ([`Catalogue::made`])
+     * and is not to be read again: it is current, and an index has nothing to make of it.
+     */
+    pub(crate) fn is_made_of(&self, id: &SessionId, made: &str) -> Result<bool> {
+        self.db.read(|c| {
+            Ok(c.query_row(
+                &format!(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM session s
+                         WHERE s.location_id = ?1 AND s.provider = ?2 AND s.session = ?3
+                           AND {MADE_FROM} = ?4 AND s.retry = 0
+                     )"
+                ),
+                params![id.location, id.provider, id.key, made],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
     /// What the row of the session `id` was made from ([`Catalogue::made`]), if it has one.
     pub(crate) fn made_of(&self, id: &SessionId) -> Result<Option<String>> {
         self.db.read(|c| {

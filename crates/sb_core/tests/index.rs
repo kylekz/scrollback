@@ -166,18 +166,18 @@ fn a_session_that_grew_is_indexed_again_and_one_that_did_not_is_not<A: Agent + D
     let before = bench.sessions();
     bench.agent.append(&keys[0], 6);
 
-    /* Each index of a session is one `Indexed`: only the session that grew was parsed. */
+    /* Each index of a session is one `Indexed` (said again once its text is written): only
+    the session that grew was parsed. */
     let mut indexed = Vec::new();
     let passes = bench
-        .try_sync(&CancelToken::new(), &mut |progress| {
-            if let Progress::Indexing { sessions, .. } | Progress::Indexed { sessions, .. } =
-                progress
-            {
-                indexed.push(*sessions);
-            }
+        .try_sync(&CancelToken::new(), &mut |progress| match progress {
+            Progress::Indexing { sessions, .. } => indexed.push(("to index", *sessions)),
+            Progress::Indexed { sessions, .. } => indexed.push(("indexed", *sessions)),
+            _ => {}
         })
         .unwrap();
-    assert_eq!(indexed, [1, 1]);
+    indexed.dedup();
+    assert_eq!(indexed, [("to index", 1), ("indexed", 1)]);
     assert_eq!(passes[0].index.as_ref().unwrap().sessions, 1);
 
     assert_indexed_as(&bench.session(&keys[0]), &derived(&bench.agent, &keys[0]));
@@ -231,6 +231,29 @@ fn a_new_version_of_the_parser_or_of_the_index_is_for_a_start_to_take_to_everyth
     assert_eq!(bench.sessions(), before);
 }
 
+/**
+ * Of `indexed`, each session gone through and the text written by then, as the last event of
+ * it says: the text, written beside the rows, may be said again with the same count.
+ */
+fn last_of_each(indexed: &[Progress]) -> Vec<(usize, usize)> {
+    let mut last: Vec<(usize, usize)> = Vec::new();
+    for progress in indexed {
+        let Progress::Indexed {
+            sessions,
+            searchable,
+            ..
+        } = *progress
+        else {
+            panic!("{progress:?}");
+        };
+        match last.last_mut() {
+            Some(at) if at.0 == sessions => at.1 = searchable,
+            _ => last.push((sessions, searchable)),
+        }
+    }
+    last
+}
+
 /// Every progress event of an index of a start with `provider`.
 fn index_steps<A: Agent>(bench: &Bench<A>, provider: Box<dyn Provider + '_>) -> Vec<Progress> {
     let mut steps = Vec::new();
@@ -267,16 +290,7 @@ fn a_start_says_what_it_reads_again_and_what_it_makes_searchable<A: Agent + Defa
     ));
     let (searching, indexed) = steps[1..].split_last().unwrap();
     assert_eq!(*searching, Progress::Searching { sessions: 0 });
-    let indexed: Vec<_> = (indexed.iter())
-        .map(|progress| match progress {
-            Progress::Indexed {
-                sessions,
-                searchable,
-                ..
-            } => (*sessions, *searchable),
-            other => panic!("{other:?}"),
-        })
-        .collect();
+    let indexed = last_of_each(indexed);
     assert_eq!(indexed, [(1, 0), (2, 0), (3, 3)]);
 
     /* Text the first step could not make (the search index was made anew since, say) is the
@@ -994,6 +1008,56 @@ fn a_parser_that_stops_on_one_of_many_sessions_stops_on_that_one_alone<A: Agent 
 /// A bench on a file tree with nothing in it yet.
 fn files() -> Bench<FileAgent> {
     Bench::new(FileAgent::on(ProjectsTree::new()))
+}
+
+/**
+ * A session that grew while the index of a start runs after an update is made again by the
+ * pass that archived what it grew by. When the start's index comes to it, its row is already
+ * of its items as they are, by this parser: it is not parsed again.
+ */
+#[test]
+fn a_session_a_pass_made_beside_the_index_of_a_start_is_not_parsed_again_by_it() {
+    let mut bench = files();
+    let mut sessions: Vec<_> = (0..24)
+        .map(|n| {
+            let project = format!("/home/user/code/app{n}");
+            bench.agent.tree_mut().session(&project, 2 + n)
+        })
+        .collect();
+    bench.sync();
+    let parser = bench.agent.provider().parser_version();
+    let parses = Mutex::default();
+    let ((ready, readied), (passed, passes)) = (mpsc::channel(), mpsc::channel::<()>());
+    let archive = bench.archive();
+    let report = thread::scope(|scope| {
+        let provider = bench.meddling(Meddle::Counted(parser + 1, &parses));
+        let start = scope.spawn(move || {
+            index(
+                archive,
+                None,
+                &[provider],
+                &CancelToken::new(),
+                &mut |progress| {
+                    if let Progress::Indexed { sessions: 2, .. } = progress {
+                        ready.send(()).unwrap();
+                        let _ = passes.recv();
+                    }
+                },
+            )
+            .unwrap()
+        });
+        let passed = passed;
+        readied.recv().unwrap();
+        /* The session that did something last before is the start's last to index. */
+        sessions[0].append(3);
+        let pass = bench.synced_with(bench.meddling(Meddle::Counted(parser + 1, &parses)));
+        assert_eq!(pass.index.sessions, 1);
+        passed.send(()).unwrap();
+        start.join().unwrap()
+    });
+    parsed_once(&parses, 24);
+    assert_eq!(report.sessions, 23);
+    assert_eq!(bench.archive().unsearchable().unwrap(), 0);
 }
 
 #[test]

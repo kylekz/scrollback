@@ -518,12 +518,14 @@ impl SearchIndex {
                     mark(tx, marked)?;
                 }
                 Ok::<_, SearchError>(!docs.is_empty())
-            })?
+            })
         };
-        if forgot {
+        /* A write that failed (the disk full, say) is emptied out of the log too, so its
+        frames don't hold the room. */
+        if !matches!(forgot, Ok(false)) {
             self.log.empty();
         }
-        Ok(())
+        forgot.map(drop)
     }
 
     /// Whether the spans marked deleted have come to a share of those there are that the
@@ -606,6 +608,11 @@ impl SearchIndex {
             compacted
         });
         self.compacting.store(false, Ordering::Relaxed);
+        if compacted.is_err() {
+            /* What the failed write put in the log was rolled back, but still takes its room
+            on the disk (all of it, when the disk filled): the log is emptied all the same. */
+            self.log.empty();
+        }
         compacted?;
         if !self.log.empty() {
             return Err(SearchError::Unavailable(

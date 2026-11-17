@@ -158,6 +158,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         let archive = Archive::open(&dir)?;
         let started = Instant::now();
         let mut first = None;
+        /* The longest the rows stood still: between two sessions the first step went through. */
+        let (mut last_row, mut stood) = (None::<Instant>, std::time::Duration::ZERO);
         let parses = Mutex::default();
         let (indexing, location) = (AtomicBool::new(true), archive.catalogue().locations()?);
         let report = thread::scope(|scope| {
@@ -188,10 +190,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                 None,
                 &[Box::new(Counting(provider(), &parses))],
                 &CancelToken::new(),
-                &mut |progress| {
-                    if let Progress::Searching { .. } = progress {
+                &mut |progress| match progress {
+                    Progress::Searching { .. } => {
                         first.get_or_insert(started.elapsed());
                     }
+                    Progress::Indexed { .. } => {
+                        let now = Instant::now();
+                        if let Some(last) = last_row {
+                            stood = stood.max(now - last);
+                        }
+                        last_row = Some(now);
+                    }
+                    _ => {}
                 },
             );
             indexing.store(false, Ordering::Relaxed);
@@ -203,6 +213,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let total = started.elapsed();
         let parses = parses.into_inner().unwrap_or_default();
         let again: usize = parses.values().map(|times| times - 1).sum();
+        println!("  the rows stood still for {stood:.2?} at most");
         println!(
             "  {} sessions parsed, {} of them more than once, {again} parses again",
             parses.len(),

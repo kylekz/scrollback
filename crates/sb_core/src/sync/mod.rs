@@ -93,7 +93,8 @@ pub enum Progress {
     },
     /// So many of those sessions are gone through, and so many of those bytes read; and so
     /// many sessions' text is written so far, made from the same parse a batch at a time,
-    /// counted from the step's start.
+    /// counted from the step's start. The text is written beside the rows, so the step ends
+    /// by saying it again once the last batch is, with the same count of sessions.
     Indexed {
         sessions: usize,
         bytes: u64,
