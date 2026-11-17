@@ -8,7 +8,7 @@
 {"cmd": "bounds", "target": "settings/archive/move", "expect_result": {"pointer": "/visible", "not_equals": null}}
 
 // A folder that holds something is refused in words, before any question, and nothing is made there.
-{"cmd": "answer_picker", "folder": "${workspace}"}
+{"cmd": "answer_picker", "folder": "${workspace}/docs"}
 {"cmd": "click", "target": "settings/archive/move"}
 {"cmd": "settle", "expect": [{"pointer": "/settings/move/state", "equals": "refused"}, {"pointer": "/settings/move/why", "contains": "isn't empty"}]}
 {"cmd": "bounds", "target": "settings/move/refused", "expect_result": {"pointer": "/visible", "not_equals": null}}
