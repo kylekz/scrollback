@@ -487,12 +487,14 @@ mod tests {
         progress.apply(&Progress::Indexed {
             sessions: 362,
             bytes: 0,
+            searchable: 0,
         });
         assert_eq!(doing(&progress).as_deref(), Some("1,056 left"));
         assert_eq!(doing_line(local, &progress, false), "Local · indexing");
         progress.apply(&Progress::Indexed {
             sessions: 1418,
             bytes: 0,
+            searchable: 0,
         });
         progress.apply(&Progress::Searching { sessions: 1418 });
         progress.apply(&Progress::Searched {

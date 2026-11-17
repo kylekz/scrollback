@@ -17,14 +17,20 @@
 //!   read, say.
 //!
 //! An index is two steps. The first makes each session's row, so a first sync's sessions are
-//! in the library as soon as they can be; the second parses each again and makes its text
-//! searchable ([`crate::search`]), the sessions whose text is not of their row as it is now,
-//! the newest first. How many are left is [`crate::archive::Archive::unsearchable`].
+//! in the library as soon as they can be, and from the same parse its text, which is written
+//! to search ([`crate::search`]) some sessions at a time. The second makes searchable the
+//! sessions whose text is still not of their row as it is now, the newest first: those the
+//! first step had no text of (the search index made anew, or a row made by an index that
+//! stopped before it wrote the text), each parsed again. How many are left is
+//! [`crate::archive::Archive::unsearchable`].
 //!
-//! Sessions are indexed one at a time, each from its start with every subagent read, and each
-//! row is committed on its own. Nothing parsed is kept between two sessions, so the memory an
-//! index takes is that of its largest session's transcript model (PLAN §7.5), and no catalogue
-//! transaction is open while a session is parsed.
+//! Each step parses several sessions at once, on threads of its own ([`in_order`]), each
+//! session from its start with every subagent read; what came of each is recorded on the
+//! index's own thread in the order the sessions are taken in, each row committed on its own,
+//! so the library has it at once. A parse keeps nothing but what its row and its text are made
+//! of, and at most twice as many sessions as there are threads are parsed and not yet
+//! recorded: the memory an index takes is that of its [`workers`] largest sessions'
+//! transcript models (PLAN §7.5). No catalogue transaction is open while a session is parsed.
 //!
 //! This is also where a version is held back for how it parses (PLAN §4.2), since only here
 //! are transcripts parsed: [`parses_worse`].
@@ -32,16 +38,20 @@
 use std::any::Any;
 use std::borrow::Cow;
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError, mpsc};
+use std::thread;
 
 use toolbox_process::CancelToken;
 
 use super::{Progress, SyncError};
 use crate::archive::{Archive, ArchivedSession};
-use crate::catalogue::{Derived, Held, Indexed, Reading, RowMade, SessionId, fingerprint};
+use crate::catalogue::{Derived, Held, Indexed, Reading, RowMade, SessionId, fingerprint, made};
 use crate::location::LocationId;
 use crate::provider::{ItemKind, Provider};
-use crate::search::Text;
+use crate::search::{SearchIndex, Text};
 use crate::transcript::{self, Content, Conversation, Ending, SessionIndex, Subagent, Transcript};
 
 /// What an index did.
@@ -71,9 +81,9 @@ pub struct IndexReport {
  * of a parser or of the index to what is archived.
  *
  * `progress` hears how many sessions and bytes there are to index, and how far it is after
- * each session; then the same of the sessions its second step makes searchable. `cancel`
- * stops it before the next session, with [`SyncError::Cancelled`]; what was indexed stays,
- * and the rest is still out of date for the next run.
+ * each session; then the same of the sessions its second step makes searchable. `cancel` stops
+ * it before the next session, with [`SyncError::Cancelled`]: what was indexed stays, what was
+ * parsed and not yet recorded is dropped, and the rest is still out of date for the next run.
  *
  * Two indexes at once (this one beside a pass's) do no harm, only the same work twice: a row
  * says what it was made from, so one made from items that have changed since is out of date
@@ -122,13 +132,16 @@ pub fn index_session(
         });
     }
     let mut report = IndexReport::default();
-    session(archive, provider, id, &mut report)?;
-    if let Some(made) = archive.catalogue().made_of(id)? {
-        let texts: Vec<Text> = text(archive, provider, id.clone(), made)?
-            .into_iter()
-            .collect();
-        report.searchable += record(archive, &texts)?;
-    }
+    let parsed = parse(archive, provider, id)?;
+    let text = match record_parse(archive, provider, id, parsed, &mut report)? {
+        Some(text) => Some(text),
+        /* Of a row made without a parse, the text is read as the second step reads it. */
+        None => match archive.catalogue().made_of(id)? {
+            Some(made) => text(archive, provider, id.clone(), made)?,
+            None => None,
+        },
+    };
+    report.searchable += record(archive, &Vec::from_iter(text))?;
     /* A session of a conversation the owner deleted is deleted for good by its index. */
     if archive.catalogue().pending_removals()? > 0 {
         archive.start_removals(false);
@@ -162,25 +175,53 @@ fn run(
         stale.extend(sessions.into_iter().map(|stale| (*provider, stale)));
     }
     stale.sort_by_key(|(_, stale)| Reverse(stale.recency));
+    let outdated = stale.iter().filter(|(_, stale)| stale.outdated).count();
     progress(&Progress::Indexing {
         sessions: stale.len(),
         bytes: stale.iter().map(|(_, stale)| stale.bytes).sum(),
-        outdated: stale.iter().filter(|(_, stale)| stale.outdated).count(),
+        outdated,
     });
     let mut report = IndexReport::default();
-    let mut bytes = 0;
-    /* How far it is counts every session gone through, those found to be none any more too. */
-    for (done, (provider, stale)) in (1..).zip(stale) {
-        if cancel.is_cancelled() {
-            return Err(SyncError::Cancelled);
-        }
-        session(archive, provider, &stale.id, &mut report)?;
-        bytes += stale.bytes;
-        progress(&Progress::Indexed {
-            sessions: done,
-            bytes,
-        });
+    /* Opened first: one made anew says no row's text is searchable before any is made. */
+    let search = archive.search_index().ok();
+    /* Text that another version made of half the sessions or more is taken out whole, and
+    written anew: taking it out span by span costs far more (PLAN §10). */
+    if let Some(search) = &search
+        && outdated > 0
+        && 2 * outdated >= search.texts()?
+    {
+        search.clear()?;
+        catalogue.none_searchable()?;
     }
+    let sessions = stale.len();
+    let (mut done, mut bytes, mut batch) = (0, 0, Batch::default());
+    in_order(
+        stale,
+        cancel,
+        |(provider, stale)| {
+            let parsed = parse(archive, provider, &stale.id);
+            (provider, stale, parsed)
+        },
+        |(provider, stale, parsed)| {
+            let text = record_parse(archive, provider, &stale.id, parsed?, &mut report)?;
+            if let (Some(search), Some(text)) = (&search, text) {
+                batch.add_new(search, text)?;
+            }
+            done += 1;
+            if batch.is_full() || done == sessions {
+                report.searchable += batch.write(archive)?;
+            }
+            bytes += stale.bytes;
+            /* How far it is counts every session gone through, those found to be none any
+            more too. */
+            progress(&Progress::Indexed {
+                sessions: done,
+                bytes,
+                searchable: report.searchable,
+            });
+            Ok(())
+        },
+    )?;
     searchable(archive, location, providers, cancel, progress, &mut report)?;
     /* What the index deleted for good (PLAN §4.5): sessions of conversations the owner
     deleted, and what they left that is no session's. */
@@ -288,10 +329,49 @@ fn distro_of(distros: &[(LocationId, Option<String>)], cwd: Option<&str>) -> Opt
     }
 }
 
-/// How much text the second step of an index writes at a time: the sessions parsed for it,
-/// up to this many bytes of their text, or [`TEXTS`] sessions.
+/// How much text an index writes at a time: up to this many bytes of the sessions' text, or
+/// [`TEXTS`] sessions.
 const TEXT_BYTES: usize = 16 * 1024 * 1024;
 const TEXTS: usize = 256;
+
+/// The text an index made and has yet to write, of sessions whose rows are as it was made of.
+#[derive(Default)]
+struct Batch {
+    texts: Vec<Text>,
+    bytes: usize,
+    /// Rows whose text in the search index is already of them: only their flags are to say so.
+    kept: Vec<(SessionId, String)>,
+}
+
+impl Batch {
+    fn add(&mut self, text: Text) {
+        self.bytes += text.bytes();
+        self.texts.push(text);
+    }
+
+    /// Adds `text`, or the row it is of to `kept` when `search` holds that text already.
+    fn add_new(&mut self, search: &SearchIndex, text: Text) -> Result<(), SyncError> {
+        if search.made_of(&text.id)?.as_deref() == Some(&*text.made) {
+            self.kept.push((text.id, text.made));
+        } else {
+            self.add(text);
+        }
+        Ok(())
+    }
+
+    fn is_full(&self) -> bool {
+        self.texts.len() + self.kept.len() >= TEXTS || self.bytes >= TEXT_BYTES
+    }
+
+    /// Writes what was added ([`record`]) and empties it. Returns how many texts were written.
+    fn write(&mut self, archive: &Archive) -> Result<usize, SyncError> {
+        archive
+            .catalogue()
+            .set_searchable(&std::mem::take(&mut self.kept))?;
+        self.bytes = 0;
+        record(archive, &std::mem::take(&mut self.texts))
+    }
+}
 
 /**
  * The second step of an index (the module docs): makes the text of each session of
@@ -352,31 +432,166 @@ fn searchable(
         .into_iter()
         .partition(|(_, (id, made))| docs.get(id) == Some(made));
     let kept: Vec<_> = kept.into_iter().map(|(_, row)| row).collect();
+    /* What the first step wrote is not counted here: this step counts from its start. */
+    let (mut done, mut searchable) = (kept.len(), 0);
     if !kept.is_empty() {
         catalogue.set_searchable(&kept)?;
         progress(&Progress::Searched {
-            sessions: kept.len(),
-            searchable: report.searchable,
-        });
-    }
-    let mut batch: Vec<Text> = Vec::new();
-    for (done, (provider, (id, made))) in (kept.len() + 1..).zip(rows) {
-        if cancel.is_cancelled() {
-            return Err(SyncError::Cancelled);
-        }
-        batch.extend(text(archive, provider, id, made)?);
-        if done == sessions
-            || batch.len() >= TEXTS
-            || batch.iter().map(Text::bytes).sum::<usize>() >= TEXT_BYTES
-        {
-            report.searchable += record(archive, &std::mem::take(&mut batch))?;
-        }
-        progress(&Progress::Searched {
             sessions: done,
-            searchable: report.searchable,
+            searchable,
         });
     }
+    let mut batch = Batch::default();
+    in_order(
+        rows,
+        cancel,
+        |(provider, (id, made))| text(archive, provider, id, made),
+        |text| {
+            done += 1;
+            if let Some(text) = text? {
+                batch.add(text);
+            }
+            if batch.is_full() || done == sessions {
+                searchable += batch.write(archive)?;
+            }
+            progress(&Progress::Searched {
+                sessions: done,
+                searchable,
+            });
+            Ok(())
+        },
+    )?;
+    report.searchable += searchable;
     Ok(())
+}
+
+/// How many sessions an index parses at once at most: it is work in the background, beside
+/// the app and whatever else the owner runs.
+const MOST_WORKERS: usize = 4;
+
+/// How many sessions an index parses at once: one fewer than the processors there are, so one
+/// is left for the rest, and at most [`MOST_WORKERS`].
+fn workers() -> usize {
+    thread::available_parallelism()
+        .map_or(1, |processors| processors.get() - 1)
+        .clamp(1, MOST_WORKERS)
+}
+
+/**
+ * Runs `work` on each of `jobs` on [`workers`] threads (fewer for fewer jobs), and hands what
+ * came of each to `take` on this thread, in the order of `jobs`. At most twice as many jobs as
+ * there are threads are begun and not yet taken, so what was made waits for its turn without
+ * piling up.
+ *
+ * `cancel` stops it before it takes the next result, with [`SyncError::Cancelled`]; `take`
+ * failing stops it with its error. Either way no job is begun after, and what was begun and
+ * not taken is dropped once the threads have ended the jobs they were running.
+ */
+fn in_order<J: Send, R: Send>(
+    jobs: Vec<J>,
+    cancel: &CancelToken,
+    work: impl Fn(J) -> R + Sync,
+    take: impl FnMut(R) -> Result<(), SyncError>,
+) -> Result<(), SyncError> {
+    in_order_on(workers().min(jobs.len()), jobs, cancel, work, take)
+}
+
+/// What became of a job [`in_order`] began.
+enum Ended<R> {
+    Done(R),
+    /// It was not run: the work had stopped before its turn came.
+    Dropped,
+    /// The work panicked, with this.
+    Panicked(Box<dyn Any + Send>),
+}
+
+/// [`in_order`] on `workers` threads.
+fn in_order_on<J: Send, R: Send>(
+    workers: usize,
+    jobs: Vec<J>,
+    cancel: &CancelToken,
+    work: impl Fn(J) -> R + Sync,
+    mut take: impl FnMut(R) -> Result<(), SyncError>,
+) -> Result<(), SyncError> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let ahead = 2 * workers;
+    let stopped = AtomicBool::new(false);
+    let (begin, begun) = mpsc::channel::<(usize, J)>();
+    let begun = Mutex::new(begun);
+    let (end, ended) = mpsc::channel::<(usize, Ended<R>)>();
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            let (begun, end, work, stopped) = (&begun, end.clone(), &work, &stopped);
+            scope.spawn(move || {
+                loop {
+                    let next = begun.lock().unwrap_or_else(PoisonError::into_inner).recv();
+                    let Ok((at, job)) = next else {
+                        break;
+                    };
+                    let ended = if stopped.load(Ordering::Relaxed) || cancel.is_cancelled() {
+                        Ended::Dropped
+                    } else {
+                        match panic::catch_unwind(AssertUnwindSafe(|| work(job))) {
+                            Ok(done) => Ended::Done(done),
+                            Err(fault) => Ended::Panicked(fault),
+                        }
+                    };
+                    if end.send((at, ended)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(end);
+        let mut jobs = jobs.into_iter().enumerate();
+        let mut waiting = BTreeMap::new();
+        let (mut started, mut taken) = (0, 0);
+        let taking = loop {
+            while started < taken + ahead
+                && let Some(job) = jobs.next()
+            {
+                /* The workers hold the receiver until this scope ends. */
+                let _ = begin.send(job);
+                started += 1;
+            }
+            if taken == started {
+                break Ok(());
+            }
+            if cancel.is_cancelled() {
+                break Err(SyncError::Cancelled);
+            }
+            let ended = loop {
+                if let Some(ended) = waiting.remove(&taken) {
+                    break ended;
+                }
+                let (at, ended) = ended
+                    .recv()
+                    .expect("the workers hold the sender until each job begun has ended");
+                waiting.insert(at, ended);
+            };
+            taken += 1;
+            match ended {
+                Ended::Done(done) => {
+                    if let Err(error) = take(done) {
+                        break Err(error);
+                    }
+                }
+                /* Only a cancel drops a job before this thread stops taking. */
+                Ended::Dropped => break Err(SyncError::Cancelled),
+                /* As it would on this thread, once the other threads have stopped. */
+                Ended::Panicked(fault) => {
+                    stopped.store(true, Ordering::Relaxed);
+                    drop(begin);
+                    panic::resume_unwind(fault);
+                }
+            }
+        };
+        stopped.store(true, Ordering::Relaxed);
+        drop(begin);
+        taking
+    })
 }
 
 /// Writes `texts`, of those sessions whose rows are still what the texts were made of, and
@@ -436,20 +651,43 @@ fn text(
     }))
 }
 
-/// Parses and indexes one session, and records what came of it.
-fn session(
+/// What a parse of a session came to, for its row to be made of.
+struct Parsed {
+    /// Its items, as they were read.
+    readings: Vec<Reading>,
+    /// How many versions the parse newly held back for how they parse.
+    held_back: usize,
+    outcome: Outcome,
+}
+
+/// What came of reading a session's items.
+enum Outcome {
+    Read {
+        /// Which of the readings the session's own conversation was parsed from.
+        main: Option<usize>,
+        index: Box<SessionIndex>,
+        ending: Option<Ending>,
+    },
+    /// The archive could not be read, for the reason given.
+    Unread(String),
+    /// Its parser stopped, for the reason given.
+    Faulted(String),
+}
+
+/// Parses and indexes the session `id`; `None` when its items hold no transcript: they are
+/// another session's now, or no conversation's. It writes nothing but the holds of its
+/// versions ([`hold`]), so sessions are parsed several at once and their rows made in order.
+fn parse(
     archive: &Archive,
     provider: &dyn Provider,
     id: &SessionId,
-    report: &mut IndexReport,
-) -> Result<(), SyncError> {
+) -> Result<Option<Parsed>, SyncError> {
     let catalogue = archive.catalogue();
     let mut readings = catalogue.session_items(id)?;
     if !readings.iter().any(|reading| reading.kind.is_transcript()) {
-        /* Its items are another session's now, or no conversation's. */
-        return Ok(catalogue.forget_sessions(std::slice::from_ref(id))?);
+        return Ok(None);
     }
-    report.sessions += 1;
+    let mut held_back = 0;
     /* A provider's parser doesn't fail (PLAN §7.1), so what stops it on a session is a fault
     in it. That is caught here, for one session's fault to be that session's alone. */
     let parsed = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -459,7 +697,7 @@ fn session(
             let newly_held = hold(archive, provider, &readings, &transcript)?;
             if let Some(newly_held) = newly_held {
                 /* Some transcript is read at another version now. */
-                report.held_back += newly_held;
+                held_back += newly_held;
                 readings = catalogue.session_items(id)?;
                 items = ArchivedSession::of(archive, &readings);
                 transcript = provider.parse(&items);
@@ -468,20 +706,57 @@ fn session(
         transcript.read_subagents(provider, &items);
         let own = transcript.conversation.as_ref();
         Ok::<_, SyncError>(match items.fault() {
-            Some(fault) => Err(fault),
-            None => Ok((
-                own.and_then(|own| {
+            Some(fault) => Outcome::Unread(format!("the archive could not be read: {fault}")),
+            None => Outcome::Read {
+                main: own.and_then(|own| {
                     readings
                         .iter()
                         .position(|reading| *reading.key == *own.item)
                 }),
-                transcript::index(&transcript),
-                own.map(|own| own.ending.clone()),
-            )),
+                index: Box::new(transcript::index(&transcript)),
+                ending: own.map(|own| own.ending.clone()),
+            },
         })
     }));
+    let outcome = match parsed {
+        Ok(outcome) => outcome?,
+        Err(fault) => Outcome::Faulted(format!("its parser stopped: {}", said(fault.as_ref()))),
+    };
+    Ok(Some(Parsed {
+        readings,
+        held_back,
+        outcome,
+    }))
+}
+
+/**
+ * Records what came of a parse of the session `id`: its row, and in `report` what became of
+ * it. Returns the text of the row it made, when it made one: of what was parsed, or of a
+ * session its parser stopped on, its title alone.
+ */
+fn record_parse(
+    archive: &Archive,
+    provider: &dyn Provider,
+    id: &SessionId,
+    parsed: Option<Parsed>,
+    report: &mut IndexReport,
+) -> Result<Option<Text>, SyncError> {
+    let catalogue = archive.catalogue();
+    let Some(Parsed {
+        readings,
+        held_back,
+        outcome,
+    }) = parsed
+    else {
+        /* Its items are another session's now, or no conversation's. */
+        catalogue.forget_sessions(std::slice::from_ref(id))?;
+        return Ok(None);
+    };
+    report.sessions += 1;
+    report.held_back += held_back;
     let from = fingerprint(&readings);
     let parser = provider.parser_version();
+    let made = made(from, parser);
     /* What a parse would say of its conversation, for a session it can't be parsed for. */
     let known = (readings.iter())
         .find(|reading| reading.kind == ItemKind::Transcript)
@@ -489,51 +764,58 @@ fn session(
     let known = known.as_deref();
     let copy = provider.copy_of(&id.key);
     let copy = copy.as_ref();
-    let fault = match parsed {
-        Ok(read) => match read? {
-            Ok((main, index, ending)) => {
-                let derived = Derived {
-                    main: main.map(|main| &readings[main]),
-                    index: &index,
-                    ending: ending.as_ref(),
-                    held_back: readings.iter().any(|reading| {
-                        reading.kind.is_transcript() && reading.newest_held.is_some()
-                    }),
-                };
-                match catalogue.record_session(
-                    id,
-                    parser,
-                    from,
-                    Indexed::Parsed(derived),
-                    copy,
-                    None,
-                )? {
-                    RowMade::Made { filed } => report.filed += usize::from(filed),
-                    RowMade::Deleted => report.deleted.push(id.clone()),
+    match outcome {
+        Outcome::Read {
+            main,
+            index,
+            ending,
+        } => {
+            let derived = Derived {
+                main: main.map(|main| &readings[main]),
+                index: &index,
+                ending: ending.as_ref(),
+                held_back: readings
+                    .iter()
+                    .any(|reading| reading.kind.is_transcript() && reading.newest_held.is_some()),
+            };
+            match catalogue.record_session(
+                id,
+                parser,
+                from,
+                Indexed::Parsed(derived),
+                copy,
+                None,
+            )? {
+                RowMade::Made { filed } => report.filed += usize::from(filed),
+                RowMade::Deleted => {
+                    report.deleted.push(id.clone());
+                    return Ok(None);
                 }
-                return Ok(());
             }
-            Err(fault) => {
-                let reason = format!("the archive could not be read: {fault}");
-                catalogue.record_session(
-                    id,
-                    parser,
-                    from,
-                    Indexed::NotRead(&reason),
-                    copy,
-                    known,
-                )?;
-                reason
-            }
-        },
-        Err(fault) => {
-            let reason = format!("its parser stopped: {}", said(fault.as_ref()));
-            catalogue.record_session(id, parser, from, Indexed::Faulted(&reason), copy, known)?;
-            reason
+            Ok(Some(Text {
+                id: id.clone(),
+                made,
+                title: index.title,
+                spans: index.spans,
+            }))
         }
-    };
-    report.failed.push((id.clone(), fault));
-    Ok(())
+        /* Read again by the next index, which may find the text then. */
+        Outcome::Unread(reason) => {
+            catalogue.record_session(id, parser, from, Indexed::NotRead(&reason), copy, known)?;
+            report.failed.push((id.clone(), reason));
+            Ok(None)
+        }
+        Outcome::Faulted(reason) => {
+            catalogue.record_session(id, parser, from, Indexed::Faulted(&reason), copy, known)?;
+            report.failed.push((id.clone(), reason));
+            Ok(Some(Text {
+                id: id.clone(),
+                made,
+                title: catalogue.session(id)?.and_then(|session| session.title),
+                spans: Vec::new(),
+            }))
+        }
+    }
 }
 
 /// Whether reading a conversation's item failed part of the way.
@@ -637,6 +919,9 @@ fn parses_worse(newer: &Conversation, reading: &Conversation) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
     use super::*;
     use crate::transcript::{Builder, Encoding, Stored, Unrecognised};
 
@@ -713,5 +998,122 @@ mod tests {
         /* A version that ends inside a record is one still being written. */
         let unfinished = conversation(vec![reply(); 3], Vec::new(), Ending::MidRecord);
         assert!(!parses_worse(&unfinished, &of(3)));
+    }
+
+    /**
+     * Takes the jobs `0..jobs` through [`in_order_on`] on `workers` threads, each job taking a
+     * moment that differs from the next one's; `stop` says, of each job taken, whether to stop
+     * there, by a cancel or with an error. Returns what came of it, the jobs taken, and how
+     * many were begun.
+     */
+    fn run_in_order(
+        workers: usize,
+        jobs: usize,
+        stop: impl Fn(usize) -> Option<SyncError>,
+    ) -> (Result<(), SyncError>, Vec<usize>, usize) {
+        let cancel = CancelToken::new();
+        let (begun, made) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let mut taken = Vec::new();
+        let ended = in_order_on(
+            workers,
+            (0..jobs).collect(),
+            &cancel,
+            |job: usize| {
+                begun.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_micros((job as u64 * 7919) % 2000));
+                made.fetch_add(1, Ordering::SeqCst);
+                job
+            },
+            |job| {
+                /* What was made and not taken never runs further ahead than the bound. */
+                let waiting = made.load(Ordering::SeqCst) - taken.len();
+                assert!(waiting <= 2 * workers, "{waiting} made and not taken");
+                taken.push(job);
+                match stop(job) {
+                    Some(SyncError::Cancelled) => {
+                        cancel.cancel();
+                        Ok(())
+                    }
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            },
+        );
+        (ended, taken, begun.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn work_done_on_several_threads_is_taken_in_order_and_runs_only_so_far_ahead() {
+        for workers in [1, 2, 4] {
+            let (ended, taken, begun) = run_in_order(workers, 200, |_| None);
+            assert!(ended.is_ok(), "{ended:?}");
+            assert_eq!(taken, (0..200).collect::<Vec<_>>());
+            assert_eq!(begun, 200);
+        }
+        assert!(run_in_order(4, 0, |_| None).0.is_ok());
+    }
+
+    #[test]
+    fn a_cancel_or_an_error_begins_nothing_more_and_drops_what_was_begun() {
+        for workers in [1, 3] {
+            let (ended, taken, begun) = run_in_order(workers, 200, |job| {
+                (job == 9).then_some(SyncError::Cancelled)
+            });
+            assert!(matches!(ended, Err(SyncError::Cancelled)), "{ended:?}");
+            assert_eq!(taken, (0..10).collect::<Vec<_>>());
+            assert!(begun <= 10 + 2 * workers, "{begun} begun");
+
+            let (ended, taken, begun) = run_in_order(workers, 200, |job| {
+                (job == 4).then(|| SyncError::Protocol("stopped".to_string()))
+            });
+            assert!(matches!(ended, Err(SyncError::Protocol(_))), "{ended:?}");
+            assert_eq!(taken, (0..5).collect::<Vec<_>>());
+            assert!(begun <= 5 + 2 * workers, "{begun} begun");
+        }
+    }
+
+    #[test]
+    fn a_cancel_while_the_work_runs_ends_it_and_a_panic_in_the_work_is_this_threads() {
+        /* Cancelled by what one of the threads does, while this one waits for another. */
+        let cancel = CancelToken::new();
+        let mut taken = Vec::new();
+        let ended = in_order_on(
+            3,
+            (0..100).collect(),
+            &cancel,
+            |job: usize| {
+                if job == 20 {
+                    cancel.cancel();
+                }
+                thread::sleep(Duration::from_micros(200));
+                job
+            },
+            |job| {
+                taken.push(job);
+                Ok(())
+            },
+        );
+        assert!(matches!(ended, Err(SyncError::Cancelled)), "{ended:?}");
+        assert!(taken.len() <= 21 && taken.iter().copied().eq(0..taken.len()));
+
+        let mut taken = Vec::new();
+        let ended = panic::catch_unwind(AssertUnwindSafe(|| {
+            in_order_on(
+                3,
+                (0..100).collect(),
+                &CancelToken::new(),
+                |job: usize| {
+                    assert_ne!(job, 30, "the work stops");
+                    job
+                },
+                |job| {
+                    taken.push(job);
+                    Ok(())
+                },
+            )
+        }));
+        let fault = ended.expect_err("the panic reaches this thread");
+        assert!(said(fault.as_ref()).contains("the work stops"));
+        assert_eq!(taken, (0..30).collect::<Vec<_>>());
     }
 }

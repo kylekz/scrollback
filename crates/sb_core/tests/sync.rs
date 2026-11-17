@@ -270,8 +270,8 @@ fn a_pass_cancelled_at_each_step_resumes<A: Agent + Default>() {
             (bench, keys)
         };
         /* Scanned, planned, each of the three ranges fetched, and the batch stored; then what
-        there is to index and each of the three sessions indexed; then what there is to make
-        searchable and each of the three read for its text, written with the last. */
+        there is to index and each of the three sessions indexed, its text made from the same
+        parse and written with the last; then the second step, with nothing left to do. */
         let all = steps(&prepare().0);
         assert_eq!(all[0], Progress::Scanned { items: 3 });
         assert!(matches!(all[1], Progress::Planned { items: 3, .. }));
@@ -284,25 +284,19 @@ fn a_pass_cancelled_at_each_step_resumes<A: Agent + Default>() {
                 ..
             }
         ));
-        assert!(matches!(all[9], Progress::Indexed { sessions: 3, .. }));
-        assert_eq!(
-            all[10..],
-            [
-                Progress::Searching { sessions: 3 },
-                Progress::Searched {
-                    sessions: 1,
-                    searchable: 0
-                },
-                Progress::Searched {
-                    sessions: 2,
-                    searchable: 0
-                },
-                Progress::Searched {
-                    sessions: 3,
-                    searchable: 3
-                },
-            ]
-        );
+        let (searching, indexed) = all[7..].split_last().unwrap();
+        assert_eq!(*searching, Progress::Searching { sessions: 0 });
+        let searchable: Vec<_> = (indexed.iter())
+            .map(|progress| match progress {
+                Progress::Indexed {
+                    sessions,
+                    searchable,
+                    ..
+                } => (*sessions, *searchable),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(searchable, [(1, 0), (2, 0), (3, 3)]);
 
         for stop_at in 0..all.len() {
             let (bench, keys) = prepare();

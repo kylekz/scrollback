@@ -660,6 +660,67 @@ fn a_subagents_text_opens_its_session_at_the_call_and_a_title_comes_first() {
     bench.assert_verifies();
 }
 
+/**
+ * A session's text made again replaces only the spans that changed (PLAN §10): what it said
+ * before and still says is found, what it no longer says is not, and the index holds nothing
+ * else, as FTS5's own check says.
+ */
+#[test]
+fn text_made_again_is_the_text_as_it_is_now_and_nothing_else() {
+    let mut tree = ProjectsTree::new();
+    let mut session = tree.session("/home/user/code/app", 0);
+    session.transcript.prompt("Look for the marmalade.");
+    session.transcript.reply("It is in the pantry.");
+    let key = session.key.clone();
+    let bench = Bench::new(FileAgent::on(tree));
+    bench.sync();
+    let sessions = |bench: &Bench<FileAgent>, term: &str| find(bench, term).total_sessions;
+
+    /* It grows: what it said is found as before, and what it says now too. */
+    session.transcript.prompt("What about the kettle?");
+    bench.sync();
+    assert_eq!(
+        ["marmalade", "pantry", "kettle"].map(|term| sessions(&bench, term)),
+        [1; 3]
+    );
+
+    /* Its first prompt, which is its title too, is rewritten in place. */
+    let content = String::from_utf8(bench.agent.content(&key)).unwrap();
+    bench
+        .agent
+        .overwrite(&key, content.replace("marmalade", "quincejam").as_bytes());
+    assert_eq!(bench.sync().new_versions, 1);
+    assert_eq!(
+        ["marmalade", "quincejam", "pantry", "kettle"].map(|term| sessions(&bench, term)),
+        [0, 1, 1, 1]
+    );
+    bench.assert_search_index_intact();
+
+    /* Its last prompt is no longer one: the version is held back, and once the owner reads it
+    all the same, the prompt's text is gone from search. */
+    let content = String::from_utf8(bench.agent.content(&key)).unwrap();
+    let last = content.lines().last().unwrap();
+    let blank = json!({ "type": "mode", "pad": "" }).to_string();
+    let blank = json!({ "type": "mode", "pad": "x".repeat(last.len() - blank.len()) });
+    bench
+        .agent
+        .overwrite(&key, content.replace(last, &blank.to_string()).as_bytes());
+    assert_eq!(bench.sync().index.held_back, 1);
+    let id = bench.session_id(&key);
+    let newest = bench.versions(&key).pop().unwrap();
+    bench
+        .archive()
+        .catalogue()
+        .set_reading_version(&id, bench.item(&key).id, Some(newest.id))
+        .unwrap();
+    bench.index_session(&key);
+    assert_eq!(
+        ["quincejam", "pantry", "kettle"].map(|term| sessions(&bench, term)),
+        [1, 1, 0]
+    );
+    bench.assert_verifies();
+}
+
 /// What is pasted whole into a prompt is searched as far as its first tens of kilobytes, and
 /// the match says so.
 #[test]
