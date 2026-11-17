@@ -240,6 +240,8 @@ pub struct TypeScale {
     pub path: TextSpec,
     /// 11/14 JetBrains Mono: a path in a line of small text.
     pub path_small: TextSpec,
+    /// 11.5/16 JetBrains Mono: the facts margin's Path and Branch (DESIGN §4.2.8).
+    pub path_fact: TextSpec,
     /// 12.5/18 a list row (`design/project/sb.css`, `.lrow`).
     pub row: TextSpec,
     /// 12.5/18 a list row's title.
@@ -302,6 +304,7 @@ impl TypeScale {
             kbd: TextSpec::new(&fonts.numbers, 11., 14., regular),
             path: TextSpec::new(&fonts.mono, 12., 16., regular),
             path_small: TextSpec::new(&fonts.mono, 11., 14., regular),
+            path_fact: TextSpec::new(&fonts.mono, 11.5, 16., regular),
             row: TextSpec::new(&fonts.ui, 12.5, 18., regular),
             row_title: TextSpec::new(&fonts.ui, 12.5, 18., medium),
             page_title: TextSpec::new(&fonts.ui, 24., 30., semibold),

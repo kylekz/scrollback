@@ -6,17 +6,19 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Bounds, BoxShadow, Div, ElementId, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Role, SharedString,
-    Stateful, StatefulInteractiveElement as _, Styled as _, StyledText, TextRun, Transformation,
-    Window, canvas, div, font, percentage, point, prelude::FluentBuilder as _, px, relative, svg,
+    Animation, AnimationExt as _, AnyElement, AnyView, App, Bounds, BoxShadow, Div, ElementId,
+    Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Role,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, StyledText, TextRun,
+    Transformation, Window, canvas, div, font, percentage, point, prelude::FluentBuilder as _, px,
+    relative, svg,
 };
 use sb_core::catalogue::Session;
 use sb_core::location::{Location, LocationId, LocationKind};
+use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::format;
 use crate::icons::SbIcon;
-use crate::theme::{SbTheme, StyledText as _, TextSpec};
+use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _, TextSpec};
 
 /// How a control that can't be used yet is drawn (`.btn:disabled`).
 pub const DISABLED_OPACITY: f32 = 0.45;
@@ -605,18 +607,94 @@ pub fn page_tile(glyph: SbIcon, accent: bool, theme: &SbTheme) -> impl IntoEleme
 }
 
 /// `text` at most `most` characters long, cut in the middle where it is longer: for a path,
-/// whose two ends say the most.
+/// whose two ends say the most. It reads no more of `text` than it keeps, however long.
 pub fn middle_cut(text: &str, most: usize) -> String {
-    let count = text.chars().count();
-    if count <= most {
+    if text.char_indices().nth(most).is_none() {
         return text.to_string();
     }
     let head = most.saturating_sub(1) / 2;
     let tail = most.saturating_sub(1) - head;
     let start: String = text.chars().take(head).collect();
-    let end: String = text.chars().skip(count - tail).collect();
-    format!("{start}\u{2026}{end}")
+    let mut end: Vec<char> = text.chars().rev().take(tail).collect();
+    end.reverse();
+    format!("{start}\u{2026}{}", end.into_iter().collect::<String>())
 }
+
+/**
+ * `text`, one line, cut to `room` as `width` measures it: whole where it fits; else its last
+ * segment of a path (after the last `/` or `\`) kept whole after an ellipsis, with as much of
+ * its start before as fits; else as much of each end as fits either side. It is cut between
+ * grapheme clusters, so no character is split.
+ */
+pub fn fit_path(text: &str, room: Pixels, width: impl Fn(&str) -> Pixels) -> String {
+    if width(text) <= room {
+        return text.to_string();
+    }
+    let graphemes: Vec<&str> = text.graphemes(true).collect();
+    let count = graphemes.len();
+    let cut = |front: usize, back: usize| {
+        format!(
+            "{}\u{2026}{}",
+            graphemes[..front].concat(),
+            graphemes[count - back..].concat()
+        )
+    };
+    /* The most `n` in `0..=most` for which `fits(n)`, `fits` holding up to some `n` and no
+    further. */
+    let most_that = |most: usize, fits: &dyn Fn(usize) -> bool| {
+        let (mut low, mut high) = (0, most);
+        while low < high {
+            let mid = (low + high).div_ceil(2);
+            if fits(mid) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        low
+    };
+    let last = graphemes[..count.saturating_sub(1)]
+        .iter()
+        .rposition(|grapheme| matches!(*grapheme, "/" | "\\"));
+    if let Some(at) = last {
+        let back = count - at;
+        if width(&cut(0, back)) <= room {
+            let front = most_that(at, &|front| width(&cut(front, back)) <= room);
+            return cut(front, back);
+        }
+    }
+    let kept = most_that(count, &|kept| {
+        width(&cut(kept - kept / 2, kept / 2)) <= room
+    });
+    cut(kept - kept / 2, kept / 2)
+}
+
+/**
+ * What builds a tooltip that shows a long value whole (DESIGN §4.2.8): in mono, at most
+ * [`WHOLE_TOOLTIP_WIDTH`] wide, wrapping inside. `text` reads the value only when the tooltip
+ * shows, and gives it as [`crate::hostile::whole`] makes it, so drawing the element it is on
+ * costs nothing for the value's length. `name` is its debug selector, for tests.
+ */
+pub fn whole_tooltip(
+    name: &'static str,
+    text: impl Fn(&App) -> Option<String> + 'static,
+) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    move |window, cx| {
+        let shown = SharedString::from(text(cx).unwrap_or_default());
+        let spec = cx.sb_theme().text.path.clone();
+        gpui_component::tooltip::Tooltip::element(move |_, _| {
+            div()
+                .max_w(px(WHOLE_TOOLTIP_WIDTH))
+                .text_spec(&spec)
+                .child(shown.clone())
+                .debug_selector(move || name.to_string())
+        })
+        .build(window, cx)
+    }
+}
+
+/// The widest a tooltip that shows a value whole is ([`whole_tooltip`]).
+pub const WHOLE_TOOLTIP_WIDTH: f32 = 480.;
 
 /// `text` at most `most` characters long, cut at its end where it is longer: for a name in
 /// a sentence.
@@ -853,6 +931,47 @@ mod tests {
         assert_eq!(middle_cut("abcdefghij", 7), "abc\u{2026}hij");
         assert_eq!(end_cut("Ubuntu development", 7), "Ubuntu\u{2026}");
         assert_eq!(end_cut("short", 7), "short");
+        /* Exactly `most` is whole; past it, as many characters as `most`. */
+        assert_eq!(middle_cut("abcdefg", 7), "abcdefg");
+        assert_eq!(middle_cut("abcdefgh", 7).chars().count(), 7);
+    }
+
+    /// A width of 7 a grapheme cluster, as a mono face draws one.
+    fn mono(text: &str) -> Pixels {
+        px(7. * text.graphemes(true).count() as f32)
+    }
+
+    #[test]
+    fn a_path_cut_to_fit_keeps_its_last_folder_whole() {
+        let path = "/home/user/code/fc/crates/fc_downloads/src/importers/until-the-end";
+        /* Whole where it fits. */
+        assert_eq!(fit_path(path, mono(path), mono), path);
+        /* Its last segment whole, then as much of its start as fits. */
+        let cut = fit_path(path, px(7. * 30.), mono);
+        assert_eq!(cut, "/home/user/code\u{2026}/until-the-end");
+        assert!(mono(&cut) <= px(7. * 30.));
+        /* The same for a Windows path. */
+        assert_eq!(
+            fit_path(
+                r"C:\Users\user\Projects\app\src\main.rs",
+                px(7. * 20.),
+                mono
+            ),
+            "C:\\Users\\us\u{2026}\\main.rs"
+        );
+        /* A last segment longer than the room: as much of each end as fits. */
+        let branch = "feature/playlist-import-keeps-the-order-of-tracks";
+        let cut = fit_path(branch, px(7. * 21.), mono);
+        assert_eq!(cut, "feature/pl\u{2026}-of-tracks");
+        assert!(mono(&cut) <= px(7. * 21.));
+        /* A separator at its end isn't the last segment's start. */
+        assert_eq!(fit_path("abcdefghij/", px(7. * 6.), mono), "abc\u{2026}j/");
+        /* Never between the parts of one character. */
+        let flags = "🇳🇿🇳🇿🇳🇿🇳🇿🇳🇿🇳🇿";
+        let cut = fit_path(flags, px(7. * 4.), mono);
+        assert_eq!(cut, "🇳🇿🇳🇿\u{2026}🇳🇿");
+        /* Nothing fits but the ellipsis. */
+        assert_eq!(fit_path(path, px(7.), mono), "\u{2026}");
     }
 
     #[test]

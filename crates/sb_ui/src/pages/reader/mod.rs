@@ -35,6 +35,8 @@ pub(crate) mod blocks;
 mod calls;
 mod facts;
 #[cfg(test)]
+mod facts_tests;
+#[cfg(test)]
 mod features_tests;
 mod find;
 #[cfg(test)]
@@ -181,6 +183,9 @@ pub struct ReaderView {
     facts_turn: Option<usize>,
     /// Whether the facts show over the column, in a window too narrow for the margin.
     facts_open: bool,
+    /// The fact just copied, which says so for a moment, and what clears it.
+    facts_copied: Option<facts::Copyable>,
+    facts_copied_shown: gpui::Task<()>,
     /// The image a tool returned shown full size, over the column.
     full_image: Option<ImageKey>,
     /// Whether the margin showed last frame: the window was wide enough.
@@ -218,6 +223,8 @@ impl ReaderView {
             turns_scroll: UniformListScrollHandle::new(),
             facts_turn: None,
             facts_open: false,
+            facts_copied: None,
+            facts_copied_shown: gpui::Task::ready(()),
             full_image: None,
             wide: true,
             generation: 0,
@@ -1591,7 +1598,7 @@ impl Render for ReaderView {
         }
         let header = self.render_header(window, &theme, cx);
         let open = matches!(cx.services().reader.read(cx).state(), ReaderState::Open(_));
-        let facts = (open && (self.wide || self.facts_open)).then(|| self.render_facts(cx));
+        let facts = (open && (self.wide || self.facts_open)).then(|| self.render_facts(window, cx));
         let (margin, over) = if self.wide {
             (facts, None)
         } else {

@@ -251,6 +251,7 @@ pub fn searchable(content: &Content) -> Vec<(SpanKind, &str)> {
         Content::Thinking { .. }
         | Content::Compaction { .. }
         | Content::Note { .. }
+        | Content::ContextFile { .. }
         | Content::Unrecognised(_) => Vec::new(),
     }
 }

@@ -616,6 +616,9 @@ pub struct Records {
     unanswered: Option<Call>,
     /// The time the records written from now on carry, when one is set ([`Records::set_time`]).
     clock: Option<String>,
+    /// What the conversation's records written from now on carry in place of the usual
+    /// ([`Records::carry`]).
+    carried: Vec<(String, Value)>,
 }
 
 impl Records {
@@ -638,6 +641,7 @@ impl Records {
             parent: None,
             unanswered: None,
             clock: None,
+            carried: Vec::new(),
         }
     }
 
@@ -655,7 +659,15 @@ impl Records {
             parent: self.parent.clone(),
             unanswered: self.unanswered.clone(),
             clock: self.clock.clone(),
+            carried: self.carried.clone(),
         }
+    }
+
+    /// Makes the conversation's records written from now on carry `value` as their `field`
+    /// (`gitBranch`, `cwd`), in place of what they otherwise do.
+    pub fn carry(&mut self, field: &str, value: Value) {
+        self.carried.retain(|(name, _)| name != field);
+        self.carried.push((field.to_string(), value));
     }
 
     /// Makes the records written from now on carry the time `timestamp` (`2026-11-09T09:12:00Z`),
@@ -694,6 +706,9 @@ impl Records {
             self.written + 1
         );
         let record = fields.as_object_mut().unwrap();
+        for (name, value) in &self.carried {
+            record.entry(name).or_insert(value.clone());
+        }
         for (name, value) in [
             ("type", json!(kind)),
             ("uuid", json!(uuid)),
@@ -868,6 +883,28 @@ impl Records {
     /// The session's title, as a record.
     pub fn title(&mut self, title: &str) {
         self.bookkeeping("custom-title", json!({ "customTitle": title }));
+    }
+
+    /**
+     * A subfolder's memory file loaded as the agent started working in that subfolder: the
+     * file at `path`, shown as `shown`, whose text was `text`. `differs` says the text loaded
+     * isn't the file's text on disk. Returns its uuid.
+     */
+    pub fn nested_memory(&mut self, path: &str, shown: &str, text: &str, differs: bool) -> String {
+        self.record(
+            "attachment",
+            json!({ "attachment": {
+                "type": "nested_memory",
+                "path": path,
+                "displayPath": shown,
+                "content": {
+                    "path": path,
+                    "type": "Project",
+                    "content": text,
+                    "contentDiffersFromDisk": differs,
+                },
+            } }),
+        )
     }
 
     /// `records` records of filler, each with about `bytes` bytes of text: a prompt, a reply

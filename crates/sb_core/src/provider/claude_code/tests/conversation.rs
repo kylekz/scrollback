@@ -668,3 +668,72 @@ turn 9
 "#
     );
 }
+
+#[test]
+fn a_nested_memory_file_is_a_file_loaded_into_the_context() {
+    let mut tree = ProjectsTree::new();
+    let mut session = session(&mut tree);
+    let t = &mut session.transcript;
+    t.prompt("Fix the importer.");
+    /* Shown by its display path, its text kept where it was recorded. */
+    t.nested_memory(
+        "/home/user/code/app/crates/ui/CLAUDE.md",
+        "crates/ui/CLAUDE.md",
+        "# ui\n\nViews never hard-code a colour.",
+        false,
+    );
+    t.nested_memory(
+        "/home/user/code/app/crates/db/CLAUDE.md",
+        "crates/db/CLAUDE.md",
+        "Migrations only go forward.",
+        true,
+    );
+    /* Without a display path its path is shown. */
+    t.record(
+        "attachment",
+        json!({ "attachment": {
+            "type": "nested_memory", "path": "/home/user/code/app/docs/CLAUDE.md",
+            "content": { "content": "Docs are British English." },
+        } }),
+    );
+    /* A display path that isn't text gives way to the path; a flag that isn't `true` is
+    false, and costs the record nothing. */
+    t.record(
+        "attachment",
+        json!({ "attachment": {
+            "type": "nested_memory", "displayPath": 5, "path": "/home/user/code/app/lib/CLAUDE.md",
+            "content": { "content": "Lib.", "contentDiffersFromDisk": "yes" },
+        } }),
+    );
+    /* Without its text, or without a path, it is kept as recorded. */
+    t.record(
+        "attachment",
+        json!({ "attachment": {
+            "type": "nested_memory", "path": "/home/user/code/app/CLAUDE.md",
+            "content": { "content": 7 },
+        } }),
+    );
+    t.record(
+        "attachment",
+        json!({ "attachment": { "type": "nested_memory", "content": { "content": "Orphan." } } }),
+    );
+    t.reply("Fixed.");
+
+    let (transcript, files) = parse(&tree, &session);
+    let conversation = own(&transcript);
+    assert_eq!(
+        outline(conversation, &files),
+        r##"turn 1
+  prompt: "Fix the importer."
+  loaded crates/ui/CLAUDE.md: "# ui\n\nViews never hard-code a colour."
+  loaded crates/db/CLAUDE.md (differs on disk): "Migrations only go forward."
+  loaded /home/user/code/app/docs/CLAUDE.md: "Docs are British English."
+  loaded /home/user/code/app/lib/CLAUDE.md: "Lib."
+  "attachment/nested_memory" with an unreadable content
+  "attachment/nested_memory" with an unreadable path
+  reply by model-1: "Fixed."
+"##
+    );
+    /* A file in the context is no prompt: the turn it came in stands alone. */
+    assert_eq!(conversation.turns().len(), 1);
+}

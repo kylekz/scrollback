@@ -7,13 +7,15 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
-    AnyElement, ClickEvent, Context, InteractiveElement as _, IntoElement, ListOffset,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, div,
-    prelude::FluentBuilder as _, px, uniform_list,
+    AnyElement, AnyView, App, ClickEvent, Context, Div, InteractiveElement as _, IntoElement,
+    ListOffset, ParentElement as _, Role, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Window, div, prelude::FluentBuilder as _, px, uniform_list,
 };
-use sb_core::catalogue::{Compared, Held, History, Reason, SessionId};
+use gpui_component::tooltip::Tooltip;
+use sb_core::catalogue::{Compared, Held, History, Reason, Session, SessionId};
 use sb_core::location::LocationId;
 use sb_core::transcript::ToolKind;
 
@@ -23,14 +25,15 @@ use super::rows::RowKind;
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
-    ButtonKind, Place, Tone, button, copy_tag, icon, icon_button, kv, low_chip, overline, warn_chip,
+    ButtonKind, Place, Tone, button, copy_tag, fit_path, icon, icon_button, low_chip, middle_cut,
+    overline, tab_stop, text_width, warn_chip, whole_tooltip,
 };
 use crate::format;
 use crate::hostile;
 use crate::icons::SbIcon;
 use crate::services::ActiveServices as _;
 use crate::services::reader::OpenSession;
-use crate::theme::{ActiveTheme as _, StyledText as _};
+use crate::theme::{ActiveTheme as _, SbTheme, StyledText as _};
 
 /// The facts margin's width (DESIGN §1.4) and the History popover's.
 pub const FACTS_WIDTH: f32 = 268.;
@@ -42,6 +45,14 @@ pub const HISTORY_SHOWN: usize = 50;
 const TURN_ROW: f32 = 22.;
 /// The fewest turns the facts show, however short the window: past them the margin scrolls.
 const MIN_TURNS: usize = 4;
+/// The margin's padding either side.
+const FACTS_PADDING: f32 = 16.;
+/// How many models the facts list one a line, and how many their tooltip lists, before they
+/// say how many more there are: a hostile transcript can name any number.
+const MODELS_SHOWN: usize = 6;
+const MODELS_LISTED: usize = 40;
+/// How long "Copied" shows over a fact copied.
+const COPIED_FOR: Duration = Duration::from_millis(1500);
 
 /// The kinds of call the facts count, each under one label (DESIGN §4.2.8 "Calls").
 const CALL_KINDS: &[(&str, &[ToolKind])] = &[
@@ -62,6 +73,216 @@ pub struct HistoryOf {
     pub key: Arc<str>,
     pub history: Arc<History>,
     pub main: bool,
+}
+
+/// A fact of the session (DESIGN §4.2.8): its label, and under it its value across the margin.
+fn fact(label: &'static str, value: impl IntoElement, theme: &SbTheme) -> Div {
+    noted_fact(label, None, value, theme)
+}
+
+/// [`fact`], with `note` at the right of its label's line.
+fn noted_fact(
+    label: &'static str,
+    note: Option<AnyElement>,
+    value: impl IntoElement,
+    theme: &SbTheme,
+) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .text_color(theme.colors.fg3)
+                .text_spec(&theme.text.overline)
+                .child(label)
+                .children(note),
+        )
+        .child(
+            div()
+                .text_color(theme.colors.fg2)
+                .text_spec(&theme.text.secondary)
+                .child(value),
+        )
+}
+
+/// One line of a fact's value: never wrapped, and cut in its middle where it doesn't fit.
+fn line(text: impl IntoElement) -> Div {
+    div()
+        .min_w_0()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis_middle()
+        .child(text)
+}
+
+/**
+ * The tooltip over "and n more" models: the open session's models, one a line, at most
+ * [`MODELS_LISTED`] and then how many more. Read when it shows.
+ */
+fn models_tooltip(window: &mut Window, cx: &mut App) -> AnyView {
+    let listed = cx
+        .services()
+        .library
+        .read(cx)
+        .open_session()
+        .map(|session| {
+            let provider = &session.id.provider;
+            let mut lines: Vec<String> = session
+                .models
+                .iter()
+                .take(MODELS_LISTED)
+                .map(|model| hostile::label(&agents::model_name(provider, model, cx)))
+                .collect();
+            let more = session.models.len().saturating_sub(MODELS_LISTED);
+            if more > 0 {
+                lines.push(format!("\u{2026} {} more", format::count(more as u64)));
+            }
+            lines.join("\n")
+        })
+        .unwrap_or_default();
+    let listed = SharedString::from(listed);
+    Tooltip::element(move |_, _| {
+        div()
+            .child(listed.clone())
+            .debug_selector(|| "facts-models-all".into())
+    })
+    .build(window, cx)
+}
+
+/// The facts that copy their value on a click (DESIGN §4.2.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Copyable {
+    Path,
+    Branch,
+}
+
+impl Copyable {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::Branch => "branch",
+        }
+    }
+
+    fn of(self, session: &Session) -> Option<&str> {
+        match self {
+            Self::Path => session.project_path.as_deref(),
+            Self::Branch => session.branch.as_deref(),
+        }
+    }
+
+    /// What it reads `f` of in the session open now, when it has one.
+    fn read<T>(self, cx: &App, f: impl FnOnce(&str) -> T) -> Option<T> {
+        cx.services()
+            .library
+            .read(cx)
+            .open_session()
+            .and_then(|session| self.of(session))
+            .map(f)
+    }
+}
+
+impl ReaderView {
+    /**
+     * A value that may be long, a path or a branch, on one line in mono after `glyph`: cut to
+     * the margin's width, keeping its last folder ([`fit_path`]); whole in a tooltip on hover;
+     * copied as it reads ([`hostile::one_line`]) by a click, or by `Enter` once `Tab` is on it.
+     * What it draws is bounded however long `value` is: the tooltip and Copy read the value
+     * only when they are asked for.
+     */
+    fn copyable(
+        &self,
+        which: Copyable,
+        value: &str,
+        glyph: Option<SbIcon>,
+        theme: &SbTheme,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let c = &theme.colors;
+        let mut room = px(FACTS_WIDTH - 1. - 2. * FACTS_PADDING - 2.);
+        if glyph.is_some() {
+            room -= theme.sizes.icon_xs + theme.spacing.xs;
+        }
+        let shown = fit_path(
+            &hostile::label(&middle_cut(value, hostile::LABEL_CHARS)),
+            room,
+            |text| text_width(text, &theme.text.path_fact, window),
+        );
+        let name = which.name();
+        let value = tab_stop(
+            div()
+                .id(SharedString::from(format!("facts-{name}")))
+                .debug_selector(move || format!("facts-{name}"))
+                .role(Role::Button)
+                .aria_label(format!("Copy the {name}"))
+                .flex()
+                .items_center()
+                .gap(theme.spacing.xs)
+                .rounded(theme.radii.small)
+                .border_1()
+                .border_color(gpui::transparent_black())
+                .cursor_pointer(),
+            theme,
+        )
+        .children(glyph.map(|glyph| icon(glyph, theme.sizes.icon_xs, c.fg3)))
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_spec(&theme.text.path_fact)
+                .child(shown),
+        )
+        .tooltip(whole_tooltip(
+            match which {
+                Copyable::Path => "facts-path-whole",
+                Copyable::Branch => "facts-branch-whole",
+            },
+            move |cx| which.read(cx, hostile::whole),
+        ))
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            if let Some(text) = which.read(cx, hostile::one_line) {
+                crate::system::copy_text(text, cx);
+                this.copied(which, cx);
+            }
+        }))
+        .automation_target_with(move || format!("reader/facts/{name}/value").into());
+        let copied = (self.facts_copied == Some(which)).then(|| {
+            div()
+                .debug_selector(|| "facts-copied".into())
+                .text_color(c.accent_text)
+                .child("Copied")
+                .automation_target_with(move || format!("reader/facts/{name}/copied").into())
+        });
+        noted_fact(
+            match which {
+                Copyable::Path => "Path",
+                Copyable::Branch => "Branch",
+            },
+            copied,
+            value,
+            theme,
+        )
+        .automation_target_with(move || format!("reader/facts/{name}").into())
+    }
+
+    /// Says "Copied" over the fact `which` for a moment (DESIGN §4.2.8).
+    fn copied(&mut self, which: Copyable, cx: &mut Context<Self>) {
+        self.facts_copied = Some(which);
+        cx.notify();
+        self.facts_copied_shown = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COPIED_FOR).await;
+            this.update(cx, |this, cx| {
+                this.facts_copied = None;
+                cx.notify();
+            })
+            .ok();
+        });
+    }
 }
 
 /// The number of the version with id `id` in `history`.
@@ -116,7 +337,7 @@ impl ReaderView {
     }
 
     /// The facts margin (DESIGN §4.2.8): Session, Turns, Calls.
-    pub(super) fn render_facts(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_facts(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.sb_theme().clone();
         let c = &theme.colors;
         let services = cx.services();
@@ -130,16 +351,30 @@ impl ReaderView {
         };
         let provider = session.id.provider.clone();
         let location = Place::of(session, |id| sync.location(id)).map(|it| it.tag(false, &theme));
-        let value = |text: String| div().child(text);
-        let numbers = |text: String| div().text_spec(&theme.text.number).child(text);
+        let now = format::now();
         let mut facts: Vec<AnyElement> = Vec::new();
-        facts.extend(
-            location.map(|tag| kv("From", div().flex().child(tag), &theme).into_any_element()),
-        );
-        /* Its copies kept elsewhere, or the original it is a copy of (DESIGN §4.2.8). */
+        facts.extend(location.map(|tag| {
+            fact(
+                "From",
+                div()
+                    .flex()
+                    .child(tag.flex_shrink(1.).min_w_0().text_ellipsis_middle()),
+                &theme,
+            )
+            .into_any_element()
+        }));
+        /* Its copies kept elsewhere, or the original it is a copy of (DESIGN §4.2.8): each a
+        fact of lines, none of them wrapped. */
         let kept = |id: &LocationId| {
-            sync.location(id)
-                .map_or_else(|| "another location".to_string(), |it| it.name.clone())
+            sync.location(id).map_or_else(
+                || "another location".to_string(),
+                |it| hostile::label(&it.name),
+            )
+        };
+        let tag_line = |label: &str| {
+            div()
+                .flex()
+                .child(copy_tag(label, false, &theme).flex_shrink(1.).min_w_0())
         };
         let read = |label: &'static str, id: SessionId, target: String| {
             div()
@@ -154,24 +389,22 @@ impl ReaderView {
                     library.update(cx, |library, cx| library.open_kin(id.clone(), cx));
                 }))
                 .child(icon(SbIcon::Copy, theme.sizes.icon_xs, c.accent_text))
-                .child(label)
+                .child(line(label))
                 .automation_target(target)
         };
         match &session.copy {
             Some(copy) => {
                 let original = (open.kin().iter()).find(|kin| kin.copy.is_none());
                 facts.push(
-                    kv(
+                    fact(
                         "Copy",
                         div()
                             .flex()
                             .flex_col()
-                            .gap(theme.spacing.xs)
-                            .child(format!(
-                                "Kept on {}. {}",
-                                kept(&session.id.location),
-                                hostile::label(&copy.origin)
-                            ))
+                            .gap(px(2.))
+                            .child(tag_line(&copy.label))
+                            .child(line(format!("Kept on {}.", kept(&session.id.location))))
+                            .child(line(hostile::label(&copy.origin)))
                             .children(original.map(|original| {
                                 read(
                                     "Read the original",
@@ -190,21 +423,20 @@ impl ReaderView {
                     .enumerate()
                 {
                     let (said, flagged) = match kin.compared {
-                        Compared::Same => ("the same", false),
-                        Compared::Shorter => ("shorter", false),
-                        Compared::Longer => ("longer", true),
-                        Compared::Differs => ("differs", true),
+                        Compared::Same => ("the same as the original", false),
+                        Compared::Shorter => ("behind the original", false),
+                        Compared::Longer => ("longer than the original", true),
+                        Compared::Differs => ("differs from the original", true),
                     };
                     facts.push(
-                        kv(
+                        fact(
                             "Copy",
                             div()
                                 .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .gap(theme.spacing.xs)
-                                .child(copy_tag(&copy.label, true, &theme))
-                                .child(format!("on {}", kept(&kin.id.location)))
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(tag_line(&copy.label))
+                                .child(line(format!("Kept on {}.", kept(&kin.id.location))))
                                 .child(
                                     div()
                                         .flex()
@@ -218,7 +450,7 @@ impl ReaderView {
                                                 c.yellow,
                                             ))
                                         })
-                                        .child(said),
+                                        .child(line(said).flex_1()),
                                 )
                                 .when(flagged, |this| {
                                     this.child(read(
@@ -234,81 +466,105 @@ impl ReaderView {
                 }
             }
         }
-        if let Some(path) = &session.project_path {
-            facts.push(
-                kv(
-                    "Path",
-                    div()
-                        .font_family(theme.fonts.mono.clone())
-                        .text_size(px(11.5))
-                        .child(hostile::label(path)),
-                    &theme,
-                )
-                .into_any_element(),
-            );
-        }
-        if let Some(branch) = &session.branch {
-            facts.push(
-                kv(
-                    "Branch",
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(theme.spacing.xs)
-                        .child(icon(SbIcon::GitBranch, theme.sizes.icon_xs, c.fg3))
-                        .child(hostile::label(branch)),
-                    &theme,
-                )
-                .into_any_element(),
-            );
+        for (which, glyph) in [
+            (Copyable::Path, None),
+            (Copyable::Branch, Some(SbIcon::GitBranch)),
+        ] {
+            if let Some(value) = which.of(session) {
+                facts.push(self.copyable(which, value, glyph, &theme, window, cx));
+            }
         }
         if library.agents() > 1 {
             facts.push(
-                kv(
+                fact(
                     "Agent",
                     div()
                         .flex()
                         .items_center()
                         .gap(theme.spacing.xs)
                         .child(agents::mark(&provider, theme.sizes.icon_xs, cx))
-                        .child(agents::name(&provider, cx)),
+                        .child(line(agents::name(&provider, cx)).flex_1()),
                     &theme,
                 )
                 .into_any_element(),
             );
         }
         if !session.models.is_empty() {
-            let models: Vec<String> = session
+            /* The first few, one a line, then how many more, all of them listed on hover. */
+            let models: Vec<Div> = session
                 .models
                 .iter()
-                .map(|model| hostile::label(&agents::model_name(&provider, model, cx)))
+                .take(MODELS_SHOWN)
+                .map(|model| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(theme.spacing.xs)
+                        .child(agents::mark(&provider, theme.sizes.icon_xs, cx))
+                        .child(
+                            line(hostile::label(&agents::model_name(&provider, model, cx)))
+                                .flex_1(),
+                        )
+                })
                 .collect();
-            facts.push(kv("Models", value(models.join(", ")), &theme).into_any_element());
+            let more = session.models.len().saturating_sub(MODELS_SHOWN);
+            facts.push(
+                fact(
+                    "Models",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .debug_selector(|| "facts-models".into())
+                        .children(models)
+                        .when(more > 0, |this| {
+                            this.child(
+                                div()
+                                    .id("facts-models-more")
+                                    .debug_selector(|| "facts-models-more".into())
+                                    .text_color(c.fg3)
+                                    .child(format!("and {} more", format::count(more as u64)))
+                                    .tooltip(models_tooltip),
+                            )
+                        }),
+                    &theme,
+                )
+                .automation_target("reader/facts/models"),
+            );
         }
         if let Some(started) = session.started {
-            let mut when = format!(
-                "{} {}",
-                format::day(started, format::now()),
-                format::clock(started)
-            );
+            let mut time = format::clock(started);
             if let Some(ended) = session.ended {
-                when.push_str(&format!(" · {}", format::duration(ended - started)));
+                time.push_str(&format!(" · {}", format::duration(ended - started)));
             }
-            facts.push(kv("When", numbers(when), &theme).into_any_element());
+            facts.push(
+                fact(
+                    "When",
+                    div()
+                        .text_spec(&theme.text.number)
+                        .child(
+                            line(format::day(started, now)).debug_selector(|| "facts-day".into()),
+                        )
+                        .child(line(time).debug_selector(|| "facts-time".into())),
+                    &theme,
+                )
+                .automation_target("reader/facts/when"),
+            );
         }
         let tokens = session.all.tokens;
         if tokens.input + tokens.output > 0 {
             facts.push(
-                kv(
+                fact(
                     "Tokens",
-                    numbers(format!(
+                    line(format!(
                         "{} in · {} out",
                         format::tokens(tokens.input + tokens.cache_read + tokens.cache_write),
                         format::tokens(tokens.output)
-                    )),
+                    ))
+                    .text_spec(&theme.text.number)
+                    .debug_selector(|| "facts-tokens".into()),
                     &theme,
                 )
-                .into_any_element(),
+                .automation_target("reader/facts/tokens"),
             );
         }
         if let (Some(history), Some(key)) = (open.history(), open.main_key()) {
@@ -325,7 +581,7 @@ impl ReaderView {
                 main: true,
             };
             facts.push(
-                kv(
+                fact(
                     "Version",
                     /* History goes under the number when both don't fit ("v2 of 4 · older"). */
                     div()
@@ -334,13 +590,16 @@ impl ReaderView {
                         .items_center()
                         .gap_x(theme.spacing.md)
                         .child(
-                            div()
-                                .text_color(if older { c.yellow } else { c.fg2 })
-                                .child(if older {
-                                    format!("v{read} of {of} · older")
-                                } else {
-                                    format!("v{read} of {of}")
-                                }),
+                            line(if older {
+                                format!("v{read} of {of} · older")
+                            } else {
+                                format!("v{read} of {of}")
+                            })
+                            .text_color(if older {
+                                c.yellow
+                            } else {
+                                c.fg2
+                            }),
                         )
                         .child(
                             div()
@@ -348,6 +607,7 @@ impl ReaderView {
                                 .flex()
                                 .items_center()
                                 .gap(theme.spacing.xs)
+                                .whitespace_nowrap()
                                 .text_color(c.accent_text)
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -366,12 +626,9 @@ impl ReaderView {
         }
         if let Some(gone) = open.gone() {
             facts.push(
-                kv(
+                fact(
                     "Source",
-                    div().child(format!(
-                        "gone since {}",
-                        format::day(gone.since, format::now())
-                    )),
+                    line(format!("gone since {}", format::day(gone.since, now))),
                     &theme,
                 )
                 .automation_target("reader/facts/source"),
@@ -519,8 +776,8 @@ impl ReaderView {
             .h_full()
             .pt(px(18.))
             .pb(px(12.))
-            .pl(px(16.))
-            .pr(px(16.))
+            .pl(px(FACTS_PADDING))
+            .pr(px(FACTS_PADDING))
             .bg(c.bg_panel)
             .border_l_1()
             .border_color(c.line_subtle)
@@ -531,7 +788,7 @@ impl ReaderView {
                     .flex_none()
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
+                    .gap(px(10.))
                     .child(overline("Session", &theme))
                     .children(facts),
             )

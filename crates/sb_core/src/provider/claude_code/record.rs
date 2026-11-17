@@ -198,7 +198,8 @@ pub(super) struct Source<'a> {
     pub data: Option<&'a RawValue>,
 }
 
-/// An `attachment` record's `attachment`, as far as a queued prompt has it.
+/// An `attachment` record's `attachment`, as far as a queued prompt and a nested memory file
+/// have it.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Attachment<'a> {
@@ -209,6 +210,23 @@ pub(super) struct Attachment<'a> {
     pub is_meta: Option<bool>,
     #[serde(borrow)]
     pub origin: Option<&'a RawValue>,
+    #[serde(borrow)]
+    pub path: Option<&'a RawValue>,
+    #[serde(borrow)]
+    pub display_path: Option<&'a RawValue>,
+    #[serde(borrow)]
+    pub content: Option<&'a RawValue>,
+}
+
+/// A nested memory attachment's `content`: the file's text as it was loaded.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct MemoryFile<'a> {
+    #[serde(borrow)]
+    pub content: &'a RawValue,
+    /// Read as `true` or not: any other value isn't a reason to keep the record unread.
+    #[serde(borrow)]
+    pub content_differs_from_disk: Option<&'a RawValue>,
 }
 
 /// Who sent a prompt: `human`, or what stood in for one. A message from another session

@@ -107,6 +107,9 @@ imara-diff = "0.2"
 markdown = "1.0.0"
 # The general category of a character (`sb_ui::hostile`: combining marks). Already in the tree.
 unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
+# Grapheme clusters, so that a value cut to fit never splits a character (`sb_ui::components`).
+# Already in the tree.
+unicode-segmentation = "1.13"
 # A link's real destination, its host as the browser would read it (`sb_ui::markdown`). Already
 # in the tree.
 url = "2.5"

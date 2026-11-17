@@ -15,7 +15,10 @@ use crate::shell::Shell;
 use crate::test_support::{bounds, open_shell, open_shell_sized, write_with};
 
 /// Writes `write`'s sessions on this machine and syncs them.
-fn synced(write: impl FnOnce(&mut sb_test_support::ProjectsTree), cx: &mut VisualTestContext) {
+pub(super) fn synced(
+    write: impl FnOnce(&mut sb_test_support::ProjectsTree),
+    cx: &mut VisualTestContext,
+) {
     write_with(write, cx);
     let sync = cx.update(|_, cx| cx.services().sync.clone());
     sync.update(cx, |sync, cx| sync.sync_all(cx));
@@ -23,7 +26,7 @@ fn synced(write: impl FnOnce(&mut sb_test_support::ProjectsTree), cx: &mut Visua
 }
 
 /// Draws the window until what lands meanwhile is drawn.
-fn draw(cx: &mut VisualTestContext) {
+pub(super) fn draw(cx: &mut VisualTestContext) {
     for _ in 0..4 {
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
@@ -45,7 +48,7 @@ fn session(title: &str, cx: &mut VisualTestContext) -> Session {
     })
 }
 
-fn open(title: &str, cx: &mut VisualTestContext) {
+pub(super) fn open(title: &str, cx: &mut VisualTestContext) {
     let session = session(title, cx);
     let library = cx.update(|_, cx| cx.services().library.clone());
     library.update(cx, |library, cx| library.open(session, cx));
@@ -53,7 +56,7 @@ fn open(title: &str, cx: &mut VisualTestContext) {
     draw(cx);
 }
 
-fn snapshot(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> ReaderSnapshot {
+pub(super) fn snapshot(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> ReaderSnapshot {
     cx.update(|_, cx| shell.read(cx).reader(cx))
 }
 

@@ -372,6 +372,17 @@ pub enum Content {
         kind: String,
         text: String,
     },
+    /**
+     * A file the agent loaded into its context partway through the session, of its own accord.
+     * What it says can explain why the agent behaves differently from there. `path` is the
+     * file as the agent showed it; `differs` says the text it loaded isn't the file's text on
+     * disk.
+     */
+    ContextFile {
+        path: String,
+        text: Stored,
+        differs: bool,
+    },
     Unrecognised(Unrecognised),
 }
 

@@ -6081,6 +6081,7 @@ dependencies = [
  "tempfile",
  "tree-sitter",
  "unicode-properties",
+ "unicode-segmentation",
  "url",
 ]
 

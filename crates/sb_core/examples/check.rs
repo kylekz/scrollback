@@ -230,6 +230,14 @@ impl Totals {
                     self.notes.add("prompts from another sender", 1);
                 }
                 Content::Note { kind, .. } => self.notes.add(format!("notes: {kind}"), 1),
+                Content::ContextFile { differs, .. } => self.notes.add(
+                    if *differs {
+                        "files loaded into the context, differing on disk"
+                    } else {
+                        "files loaded into the context"
+                    },
+                    1,
+                ),
                 Content::Unrecognised(unknown) => self.unrecognised.add(
                     format!(
                         "among the blocks: {:?} ({})",

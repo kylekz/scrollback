@@ -14,9 +14,10 @@
 //! **Loading.** What the views draw is prepared when they first draw it, each on a background
 //! task ([`Load`]): a prompt's or a reply's prose ([`Prose`]: cut into pieces, sanitised), the
 //! highlights of a piece of fenced code ([`Code`]), a call's body when its row is open, a
-//! subagent's conversation when its call is, a compaction's summary, an image ([`Picture`]: one
-//! bounded frame). The first few prompts and replies are prepared with the parse, so the first
-//! turns paint with it, while the prose's budget lasts. Loads read the items at the versions the
+//! subagent's conversation when its call is, a compaction's summary or a file's text loaded
+//! into the context, an image ([`Picture`]: one bounded frame). The first few prompts and
+//! replies are prepared with the parse, so the first turns paint with it, while the prose's
+//! budget lasts. Loads read the items at the versions the
 //! parse read ([`Pinned`]) through a [`SegmentCache`] of the last segments decoded, so opening
 //! one row after another near the end of a long transcript decodes its last segment once.
 //! Which subagent started which ([`Placement`]) is worked out once the subagents no call of the
@@ -268,7 +269,8 @@ pub struct ImageKey {
 /// What the views can let go of ([`ReaderService::release`]).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Held {
-    /// A block's prose: a prompt's, a reply's, a thought's, a compaction's summary.
+    /// A block's prose: a prompt's, a reply's, a thought's, a compaction's summary, a loaded
+    /// file's text.
     Prose(BlockRef),
     Body(BlockRef),
     Image(ImageKey),
@@ -293,6 +295,8 @@ pub enum Toggle {
     Thought(BlockRef),
     /// A compaction's summary.
     Summary(BlockRef),
+    /// The text of a file the agent loaded into its context.
+    ContextFile(BlockRef),
     /// A record the agent's provider didn't know, as it was recorded.
     Raw(BlockRef),
     /// Every call of the subagent whose item this is, not only its first few.
@@ -1157,9 +1161,9 @@ impl ReaderService {
     }
 
     /**
-     * Prepares the prose of the block at `at`, a prompt, a reply, a thought or a compaction's
-     * summary, as a job (the module docs) for a row drawn at `rank`; one waiting already takes
-     * the rank.
+     * Prepares the prose of the block at `at`, a prompt, a reply, a thought, a compaction's
+     * summary or a loaded file's text, as a job (the module docs) for a row drawn at `rank`;
+     * one waiting already takes the rank.
      */
     pub fn want_prose(&mut self, at: &BlockRef, rank: Rank, cx: &mut Context<Self>) {
         let ReaderState::Open(open) = &mut self.state else {
@@ -1865,6 +1869,7 @@ fn source(open: &OpenSession, at: &BlockRef) -> Option<Source> {
             summary: Some(summary),
             ..
         } => Some(Source::Stored(summary.clone())),
+        Content::ContextFile { text, .. } => Some(Source::Stored(text.clone())),
         _ => None,
     }
 }

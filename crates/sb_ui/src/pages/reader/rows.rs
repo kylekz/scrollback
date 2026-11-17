@@ -223,6 +223,11 @@ pub enum RowKind {
         at: BlockRef,
         open: bool,
     },
+    /// A file the agent loaded into its context; open, its text follows as prose rows.
+    ContextFile {
+        at: BlockRef,
+        open: bool,
+    },
     Note(BlockRef),
     Unrecognised {
         at: BlockRef,
@@ -271,6 +276,7 @@ impl Row {
             | RowKind::Call { open, .. }
             | RowKind::CallIo { open, .. }
             | RowKind::Compaction { open, .. }
+            | RowKind::ContextFile { open, .. }
             | RowKind::Unrecognised { open, .. }
             | RowKind::Unattached { open, .. } => *open = false,
             RowKind::Raw { ready, .. } => *ready = false,
@@ -315,6 +321,7 @@ impl Row {
                 | RowKind::Call { .. }
                 | RowKind::CallIo { .. }
                 | RowKind::Compaction { .. }
+                | RowKind::ContextFile { .. }
                 | RowKind::Unrecognised { .. }
                 | RowKind::Unattached { .. }
                 | RowKind::Panel {
@@ -331,6 +338,7 @@ impl Row {
             RowKind::Call { at, .. } => Some(Toggle::Call(at.clone())),
             RowKind::CallIo { at, .. } => Some(Toggle::CallIo(at.clone())),
             RowKind::Compaction { at, .. } => Some(Toggle::Summary(at.clone())),
+            RowKind::ContextFile { at, .. } => Some(Toggle::ContextFile(at.clone())),
             RowKind::Unrecognised { at, .. } => Some(Toggle::Raw(at.clone())),
             RowKind::Unattached { item, .. } => Some(Toggle::Subagent(item.clone())),
             RowKind::Panel {
@@ -349,6 +357,7 @@ impl Row {
             | RowKind::Call { open, .. }
             | RowKind::CallIo { open, .. }
             | RowKind::Compaction { open, .. }
+            | RowKind::ContextFile { open, .. }
             | RowKind::Unrecognised { open, .. }
             | RowKind::Unattached { open, .. } => open,
             _ => false,
@@ -374,6 +383,7 @@ impl Row {
             | RowKind::CallIo { at, .. }
             | RowKind::Body { at, .. }
             | RowKind::Compaction { at, .. }
+            | RowKind::ContextFile { at, .. }
             | RowKind::Note(at)
             | RowKind::Unrecognised { at, .. }
             | RowKind::Raw { at, .. } => Some(at),
@@ -643,6 +653,19 @@ impl Rows<'_> {
                         open: opened,
                     },
                     Space::Block,
+                );
+                if opened {
+                    self.prose(&at, false, false);
+                }
+            }
+            Content::ContextFile { .. } => {
+                let opened = open.is_open(&Toggle::ContextFile(at.clone()), full_calls);
+                self.push(
+                    RowKind::ContextFile {
+                        at: at.clone(),
+                        open: opened,
+                    },
+                    space,
                 );
                 if opened {
                     self.prose(&at, false, false);

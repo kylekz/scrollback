@@ -247,6 +247,15 @@ fn write_block(
             summary.as_ref().map(text)
         ),
         Content::Note { kind, text } => format!("note ({kind}): {text:?}"),
+        Content::ContextFile {
+            path,
+            text: loaded,
+            differs,
+        } => format!(
+            "loaded {path}{}: {:?}",
+            if *differs { " (differs on disk)" } else { "" },
+            text(loaded)
+        ),
         Content::Unrecognised(record) => unrecognised(record),
         Content::ToolCall(call) => {
             let raw = text(&call.raw_input);
