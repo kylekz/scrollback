@@ -10,7 +10,6 @@ use gpui::{
     ObjectFit, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
     StyledImage as _, Window, div, img, prelude::FluentBuilder as _, px,
 };
-use gpui_component::tooltip::Tooltip;
 use sb_core::transcript::Content;
 
 use super::rows::{Ended, FIRST_LINES, PanelPart, ProsePart, Row, RowKind};
@@ -19,6 +18,7 @@ use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
     BANNER_GAP, Tone, bad_banner, focus_ring, icon, icon_button, middle_cut, overline, tag,
+    whole_tooltip,
 };
 use crate::format;
 use crate::hostile;
@@ -427,7 +427,7 @@ fn prose(
 ) -> AnyElement {
     let c = &theme.colors;
     let reader = cx.services().reader.clone();
-    let (prepared, thinking, of_reply, loaded, length, name) = {
+    let (prepared, thinking, of_reply, loaded, summary, length, name) = {
         let reader = reader.read(cx);
         let Some(open) = reader.open_session() else {
             return div().into_any_element();
@@ -441,6 +441,7 @@ fn prose(
             matches!(block, Some(Content::Thinking { .. })),
             matches!(block, Some(Content::Reply { .. })),
             matches!(block, Some(Content::ContextFile { .. })),
+            matches!(block, Some(Content::Compaction { .. })),
             match block {
                 Some(Content::Prompt { text, .. } | Content::Reply { text }) => text.len(),
                 _ => 0,
@@ -529,9 +530,13 @@ fn prose(
                             reader.read(cx).full_calls(),
                         )
                     });
-                /* A thought's is the text Find searched (`super::find`); a reply's piece is
-                only a part of what it searched. */
-                let finds = if thinking {
+                /* A thought's is the text Find searched (`super::find`), and so is a summary's or
+                a loaded file's when it is all one piece of plain text; a reply's piece, or one
+                of several, is only a part of what it searched. */
+                let whole = prepared
+                    .as_ref()
+                    .is_some_and(|prose| prose.pieces.len() == 1);
+                let finds = if thinking || ((summary || loaded) && whole) {
                     view.finds(&crate::services::reader::find::Spot::Prose(at.clone()))
                 } else {
                     Vec::new()
@@ -1069,6 +1074,10 @@ fn context_file(
     ringed(
         div()
             .id(("context-file", ix))
+            .debug_selector({
+                let block = at.block.0;
+                move || format!("context-file-{block}")
+            })
             .flex()
             .items_center()
             .gap(theme.spacing.md)
@@ -1093,8 +1102,21 @@ fn context_file(
             .text_ellipsis_middle()
             .text_color(c.fg2)
             .text_spec(&theme.text.path)
-            .child(path.clone())
-            .tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx)),
+            .child(path)
+            .tooltip(whole_tooltip("context-file-whole", {
+                let at = at.clone();
+                move |cx| match &cx
+                    .services()
+                    .reader
+                    .read(cx)
+                    .open_session()?
+                    .block(&at)?
+                    .content
+                {
+                    Content::ContextFile { path, .. } => Some(hostile::whole(path)),
+                    _ => None,
+                }
+            })),
     )
     .when(differs, |this| {
         this.child(div().flex_none().child("(differs from the file on disk)"))

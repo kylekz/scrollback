@@ -696,6 +696,15 @@ fn a_nested_memory_file_is_a_file_loaded_into_the_context() {
             "content": { "content": "Docs are British English." },
         } }),
     );
+    /* A display path that isn't text gives way to the path; a flag that isn't `true` is
+    false, and costs the record nothing. */
+    t.record(
+        "attachment",
+        json!({ "attachment": {
+            "type": "nested_memory", "displayPath": 5, "path": "/home/user/code/app/lib/CLAUDE.md",
+            "content": { "content": "Lib.", "contentDiffersFromDisk": "yes" },
+        } }),
+    );
     /* Without its text, or without a path, it is kept as recorded. */
     t.record(
         "attachment",
@@ -719,6 +728,7 @@ fn a_nested_memory_file_is_a_file_loaded_into_the_context() {
   loaded crates/ui/CLAUDE.md: "# ui\n\nViews never hard-code a colour."
   loaded crates/db/CLAUDE.md (differs on disk): "Migrations only go forward."
   loaded /home/user/code/app/docs/CLAUDE.md: "Docs are British English."
+  loaded /home/user/code/app/lib/CLAUDE.md: "Lib."
   "attachment/nested_memory" with an unreadable content
   "attachment/nested_memory" with an unreadable path
   reply by model-1: "Fixed."

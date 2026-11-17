@@ -10,11 +10,11 @@
 {"cmd": "click", "target": "card/5/title"}
 {"cmd": "settle", "expect": [{"pointer": "/library/open", "equals": "Reader fixture: facts as long as they come"}, {"pointer": "/reader/state", "equals": "open"}, {"pointer": "/reader/facts", "equals": true}]}
 
-// Each fact is its label over its value, inside the margin's 16 padding: a value is one line of 16 under a label of 14, When two lines, the models four.
+// Each fact is its label over its value, inside the margin's 16 padding: a value is one line of 16 under a label of 14 (Path and Branch with a border for the keyboard's ring), When two lines, the models four.
 {"cmd": "bounds", "target": "reader/facts", "expect_result": [{"pointer": "/w", "gte": 267, "lte": 269}]}
-{"cmd": "bounds", "target": "reader/facts/path", "expect_result": [{"pointer": "/x", "gte": 1187, "lte": 1191}, {"pointer": "/w", "gte": 233, "lte": 237}, {"pointer": "/h", "gte": 31, "lte": 33}]}
-{"cmd": "bounds", "target": "reader/facts/path/value", "expect_result": [{"pointer": "/w", "lte": 237}, {"pointer": "/h", "gte": 15, "lte": 17}]}
-{"cmd": "bounds", "target": "reader/facts/branch", "expect_result": [{"pointer": "/w", "lte": 237}, {"pointer": "/h", "gte": 31, "lte": 33}]}
+{"cmd": "bounds", "target": "reader/facts/path", "expect_result": [{"pointer": "/x", "gte": 1187, "lte": 1191}, {"pointer": "/w", "gte": 233, "lte": 237}, {"pointer": "/h", "gte": 33, "lte": 35}]}
+{"cmd": "bounds", "target": "reader/facts/path/value", "expect_result": [{"pointer": "/w", "lte": 237}, {"pointer": "/h", "gte": 17, "lte": 19}]}
+{"cmd": "bounds", "target": "reader/facts/branch", "expect_result": [{"pointer": "/w", "lte": 237}, {"pointer": "/h", "gte": 33, "lte": 35}]}
 {"cmd": "bounds", "target": "reader/facts/when", "expect_result": [{"pointer": "/w", "lte": 237}, {"pointer": "/h", "gte": 47, "lte": 49}]}
 {"cmd": "bounds", "target": "reader/facts/tokens", "expect_result": [{"pointer": "/w", "lte": 237}, {"pointer": "/h", "gte": 31, "lte": 33}]}
 {"cmd": "bounds", "target": "reader/facts/models", "expect_result": [{"pointer": "/w", "lte": 237}, {"pointer": "/h", "gte": 79, "lte": 81}]}
@@ -26,6 +26,8 @@
 {"cmd": "screenshot", "name": "facts-path-hover-1440-dark"}
 {"cmd": "click", "target": "reader/facts/path/value"}
 {"cmd": "settle", "expect": {"pointer": "/system", "contains": {"kind": "copy", "text": "/home/user/code/fc/crates/fc_downloads/src/importers/playlists/regression-fixtures/a-folder-name-long-enough-to-overflow-the-facts-margin/and-one-more-after-it/until-the-whole-path-is-two-hundred-long"}}}
+{"cmd": "bounds", "target": "reader/facts/path/copied", "expect_result": {"pointer": "/visible", "not_equals": null}}
+{"cmd": "screenshot", "name": "facts-path-copied-1440-dark"}
 {"cmd": "click", "target": "reader/facts/branch/value"}
 {"cmd": "settle", "expect": {"pointer": "/system", "contains": {"kind": "copy", "text": "feature/playlist-import-keeps-the-order-of-tracks-across-pages-and-retries"}}}
 
@@ -42,7 +44,7 @@
 {"cmd": "settle", "expect": {"pointer": "/reader/facts", "equals": false}}
 {"cmd": "click", "target": "reader/facts-toggle"}
 {"cmd": "settle", "expect": {"pointer": "/reader/facts", "equals": true}}
-{"cmd": "bounds", "target": "reader/facts/path", "expect_result": [{"pointer": "/x", "gte": 707, "lte": 711}, {"pointer": "/w", "gte": 233, "lte": 237}, {"pointer": "/h", "gte": 31, "lte": 33}]}
+{"cmd": "bounds", "target": "reader/facts/path", "expect_result": [{"pointer": "/x", "gte": 707, "lte": 711}, {"pointer": "/w", "gte": 233, "lte": 237}, {"pointer": "/h", "gte": 33, "lte": 35}]}
 {"cmd": "bounds", "target": "reader/facts/when", "expect_result": {"pointer": "/h", "gte": 47, "lte": 49}}
 {"cmd": "screenshot", "name": "facts-long-overlay-960-dark"}
 {"cmd": "pin_appearance", "appearance": "light"}
@@ -56,7 +58,7 @@
 {"cmd": "resize", "w": 1440, "h": 900, "platforms": ["windows"]}
 {"cmd": "dpi_changed", "dpi": 144, "platforms": ["windows"], "expect_result": {"pointer": "/scale", "equals": 1.5}}
 {"cmd": "settle", "platforms": ["windows"], "expect": {"pointer": "/reader/facts", "equals": true}}
-{"cmd": "bounds", "target": "reader/facts/path", "platforms": ["windows"], "expect_result": [{"pointer": "/w", "gte": 233, "lte": 237}, {"pointer": "/h", "gte": 31, "lte": 33}]}
+{"cmd": "bounds", "target": "reader/facts/path", "platforms": ["windows"], "expect_result": [{"pointer": "/w", "gte": 233, "lte": 237}, {"pointer": "/h", "gte": 33, "lte": 35}]}
 {"cmd": "bounds", "target": "reader/facts/when", "platforms": ["windows"], "expect_result": {"pointer": "/h", "gte": 47, "lte": 49}}
 {"cmd": "screenshot", "name": "facts-long-1440-dark-150", "platforms": ["windows"]}
 {"cmd": "resize", "w": 960, "h": 600, "platforms": ["windows"]}

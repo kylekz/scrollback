@@ -360,10 +360,10 @@ pub enum Content {
         text: String,
     },
     /**
-     * A file of instructions the agent loaded into its context partway through, of its own
-     * accord: a folder's, when it started working in that folder. It explains why the agent's
-     * behaviour changes from there. `path` is the file as the agent showed it; `differs` says
-     * the text it loaded isn't the file's text on disk.
+     * A file the agent loaded into its context partway through the session, of its own accord.
+     * What it says can explain why the agent behaves differently from there. `path` is the
+     * file as the agent showed it; `differs` says the text it loaded isn't the file's text on
+     * disk.
      */
     ContextFile {
         path: String,

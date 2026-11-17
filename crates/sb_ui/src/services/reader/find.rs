@@ -227,7 +227,10 @@ impl Search<'_> {
                         ..
                     }
                     | Content::ContextFile { text: stored, .. } => {
-                        self.stored(Spot::Prose(at), stored, |text| text)?
+                        /* As a piece of it shown as plain text draws it. */
+                        self.stored(Spot::Prose(at), stored, |text| {
+                            crate::hostile::bidi(&text).into_owned()
+                        })?
                     }
                     Content::ToolCall(call) => self.call(at, call)?,
                     _ => {}

@@ -455,6 +455,14 @@ fn the_type_scale_matches_design() {
             14.,
             regular,
         ),
+        (
+            "path_fact",
+            &scale.path_fact,
+            &fonts.mono,
+            11.5,
+            16.,
+            regular,
+        ),
         ("row", &scale.row, &fonts.ui, 12.5, 18., regular),
         ("row_title", &scale.row_title, &fonts.ui, 12.5, 18., medium),
         // Page titles 24/30, first-run and edge-state titles 22/28, both at 600.

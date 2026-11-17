@@ -905,7 +905,8 @@ impl<'a> Reading<'a> {
         };
         match attachment.kind.as_str() {
             NESTED_MEMORY => {
-                let path = attachment.display_path.or(attachment.path).and_then(string);
+                let path = (attachment.display_path.and_then(string))
+                    .or_else(|| attachment.path.and_then(string));
                 let file = attachment
                     .content
                     .and_then(typed::<record::MemoryFile>)
@@ -915,7 +916,9 @@ impl<'a> Reading<'a> {
                         self.push(Content::ContextFile {
                             path,
                             text: line.text(file.content),
-                            differs: file.content_differs_from_disk == Some(true),
+                            differs: file
+                                .content_differs_from_disk
+                                .is_some_and(|differs| differs.get() == "true"),
                         });
                     }
                     (None, _) => self.misfit("attachment/nested_memory", "path", line.whole()),

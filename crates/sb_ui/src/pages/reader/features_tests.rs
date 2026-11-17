@@ -8,14 +8,17 @@ use sb_core::transcript::Content;
 use sb_test_support::reader;
 
 use super::ReaderSnapshot;
-use super::rows::{BodyPart, ProsePart, RowKind, rows};
+use super::rows::{BodyPart, RowKind, rows};
 use crate::services::ActiveServices as _;
 use crate::services::reader::Load;
 use crate::shell::Shell;
 use crate::test_support::{bounds, open_shell, open_shell_sized, write_with};
 
 /// Writes `write`'s sessions on this machine and syncs them.
-fn synced(write: impl FnOnce(&mut sb_test_support::ProjectsTree), cx: &mut VisualTestContext) {
+pub(super) fn synced(
+    write: impl FnOnce(&mut sb_test_support::ProjectsTree),
+    cx: &mut VisualTestContext,
+) {
     write_with(write, cx);
     let sync = cx.update(|_, cx| cx.services().sync.clone());
     sync.update(cx, |sync, cx| sync.sync_all(cx));
@@ -23,7 +26,7 @@ fn synced(write: impl FnOnce(&mut sb_test_support::ProjectsTree), cx: &mut Visua
 }
 
 /// Draws the window until what lands meanwhile is drawn.
-fn draw(cx: &mut VisualTestContext) {
+pub(super) fn draw(cx: &mut VisualTestContext) {
     for _ in 0..4 {
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
@@ -45,7 +48,7 @@ fn session(title: &str, cx: &mut VisualTestContext) -> Session {
     })
 }
 
-fn open(title: &str, cx: &mut VisualTestContext) {
+pub(super) fn open(title: &str, cx: &mut VisualTestContext) {
     let session = session(title, cx);
     let library = cx.update(|_, cx| cx.services().library.clone());
     library.update(cx, |library, cx| library.open(session, cx));
@@ -53,7 +56,7 @@ fn open(title: &str, cx: &mut VisualTestContext) {
     draw(cx);
 }
 
-fn snapshot(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> ReaderSnapshot {
+pub(super) fn snapshot(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> ReaderSnapshot {
     cx.update(|_, cx| shell.read(cx).reader(cx))
 }
 
@@ -520,214 +523,6 @@ fn a_session_opened_at_a_search_match_fills_find_at_that_match(cx: &mut TestAppC
     assert!(count.is_some());
     /* The current match is the one flashed, not the first. */
     assert!(current.unwrap().starts_with(&flashed), "{flashed}");
-}
-
-/// The facts margin's column, inside its 16 padding at the window's right edge.
-fn facts_column(window_width: f32) -> (f32, f32) {
-    (
-        window_width - super::facts::FACTS_WIDTH + 16.,
-        window_width - 16.,
-    )
-}
-
-/**
- * Each of the facts' values is one line inside the margin's column (DESIGN §4.2.8), however
- * long: When is two, and each model one. Its bounds, by debug selector.
- */
-fn assert_facts_on_their_lines(window_width: f32, cx: &mut VisualTestContext) {
-    let (left, right) = facts_column(window_width);
-    let line = |name: &'static str, lines: f32, cx: &mut VisualTestContext| {
-        let at = bounds(cx, name).unwrap_or_else(|| panic!("{name} is drawn"));
-        let (x, width, height) = (
-            f32::from(at.origin.x),
-            f32::from(at.size.width),
-            f32::from(at.size.height),
-        );
-        assert!(
-            x >= left - 1. && x + width <= right + 1.,
-            "{name} from {x} to {} is inside {left}..{right}",
-            x + width
-        );
-        assert!(
-            (height - 16. * lines).abs() < 1.,
-            "{name} is {lines} lines of 16, not {height} high"
-        );
-        at
-    };
-    line("facts-path", 1., cx);
-    line("facts-branch", 1., cx);
-    line("facts-day", 1., cx);
-    line("facts-time", 1., cx);
-    line("facts-tokens", 1., cx);
-    line("facts-models", 4., cx);
-}
-
-/**
- * The facts of a session whose values are as long as they come keep each value on its line:
- * a 200-character path and a long branch are cut, not wrapped; each shows whole on hover and
- * copies whole on a click.
- */
-#[gpui::test]
-fn the_facts_cut_long_values_and_show_and_copy_them_whole(cx: &mut TestAppContext) {
-    assert_eq!(reader::LONG_PATH.len(), 200);
-    let (shell, cx) = open_shell(cx);
-    cx.update(|_, cx| crate::system::install(crate::system::SystemShell::scripted(), cx));
-    synced(
-        |tree| {
-            reader::facts(tree);
-        },
-        cx,
-    );
-    open("Reader fixture: facts as long as they come", cx);
-    assert_facts_on_their_lines(1440., cx);
-    /* The path is far wider than the column, so it was cut to fit. */
-    let path = bounds(cx, "facts-path").unwrap();
-    let whole = cx.update(|window, cx| {
-        let theme = crate::theme::ActiveTheme::sb_theme(cx).clone();
-        crate::components::text_width(reader::LONG_PATH, &theme.text.path_small, window)
-    });
-    assert!(
-        whole > path.size.width * 3.,
-        "{whole:?} against {:?}",
-        path.size.width
-    );
-    /* Each is cut in its middle: it keeps its start and its end. */
-    let view = cx.update(|_, cx| shell.read(cx).reader_view(cx));
-    let drawn: Vec<String> = cx.update(|_, cx| {
-        view.read(cx)
-            .facts_cut
-            .iter()
-            .map(|layout| layout.text())
-            .collect()
-    });
-    assert_eq!(drawn.len(), 2);
-    for (drawn, value) in drawn.iter().zip([reader::LONG_PATH, reader::LONG_BRANCH]) {
-        let (start, end) = drawn
-            .split_once('\u{2026}')
-            .unwrap_or_else(|| panic!("{drawn:?} is cut"));
-        assert!(
-            start.len() > 4 && value.starts_with(start),
-            "{drawn:?} keeps the start of {value:?}"
-        );
-        assert!(
-            end.len() > 4 && value.ends_with(end),
-            "{drawn:?} keeps the end of {value:?}"
-        );
-    }
-    for (name, whole, value) in [
-        ("facts-path", "facts-path-whole", reader::LONG_PATH),
-        ("facts-branch", "facts-branch-whole", reader::LONG_BRANCH),
-    ] {
-        let at = bounds(cx, name).unwrap();
-        cx.simulate_mouse_move(at.center(), None, gpui::Modifiers::default());
-        cx.executor()
-            .advance_clock(std::time::Duration::from_secs(2));
-        draw(cx);
-        assert!(bounds(cx, whole).is_some(), "{name} shows whole on hover");
-        cx.simulate_click(at.center(), gpui::Modifiers::default());
-        cx.run_until_parked();
-        let copied = cx.update(|_, cx| crate::system::requests(cx).last().cloned());
-        assert_eq!(
-            copied,
-            Some(crate::system::SystemRequest::Copy(value.to_string()))
-        );
-    }
-}
-
-/// Over the column of a narrow window, the facts keep their values on their lines too.
-#[gpui::test]
-fn the_facts_over_a_narrow_column_keep_their_values_on_their_lines(cx: &mut TestAppContext) {
-    let (shell, cx) = open_shell_sized(size(px(960.), px(600.)), cx);
-    synced(
-        |tree| {
-            reader::facts(tree);
-        },
-        cx,
-    );
-    open("Reader fixture: facts as long as they come", cx);
-    let toggle = bounds(cx, "facts-toggle").expect("the Facts toggle shows");
-    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
-    draw(cx);
-    assert!(snapshot(&shell, cx).facts);
-    assert_facts_on_their_lines(960., cx);
-}
-
-/**
- * A memory file the agent loaded on its way is one quiet row, closed even with Full calls on;
- * opened, its text follows as Markdown, through the prose rows (DESIGN §4.2.11).
- */
-#[gpui::test]
-fn a_file_loaded_into_the_context_opens_to_its_text(cx: &mut TestAppContext) {
-    let (_, cx) = open_shell(cx);
-    synced(
-        |tree| {
-            reader::facts(tree);
-        },
-        cx,
-    );
-    open("Reader fixture: facts as long as they come", cx);
-    cx.simulate_keystrokes("e");
-    draw(cx);
-    let laid = |cx: &mut VisualTestContext| {
-        cx.update(|_, cx| {
-            let reader = cx.services().reader.read(cx);
-            rows(reader.open_session().unwrap(), reader.full_calls(), None)
-        })
-    };
-    let files: Vec<_> = laid(cx)
-        .into_iter()
-        .filter_map(|row| match row.kind {
-            RowKind::ContextFile { at, open } => Some((at, open)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(files.len(), 2);
-    assert!(files.iter().all(|(_, open)| !open), "Full calls opens none");
-    let loaded: Vec<(String, bool)> = cx.update(|_, cx| {
-        let reader = cx.services().reader.read(cx);
-        let open = reader.open_session().unwrap();
-        files
-            .iter()
-            .map(|(at, _)| match &open.block(at).unwrap().content {
-                Content::ContextFile { path, differs, .. } => (path.clone(), *differs),
-                other => panic!("{other:?}"),
-            })
-            .collect()
-    });
-    assert_eq!(
-        loaded,
-        [
-            (reader::MEMORY_FILES[0].to_string(), false),
-            (reader::MEMORY_FILES[1].to_string(), true)
-        ]
-    );
-    /* No record of the session is one scrollback doesn't know. */
-    assert!(
-        !laid(cx)
-            .iter()
-            .any(|row| matches!(row.kind, RowKind::Unrecognised { .. }))
-    );
-    let first = files[0].0.clone();
-    let service = cx.update(|_, cx| cx.services().reader.clone());
-    service.update(cx, |reader, cx| {
-        reader.toggle(
-            crate::services::reader::Toggle::ContextFile(first.clone()),
-            cx,
-        )
-    });
-    cx.run_until_parked();
-    draw(cx);
-    let prose: Vec<ProsePart> = laid(cx)
-        .into_iter()
-        .filter_map(|row| match row.kind {
-            RowKind::Prose { at, part, .. } if at == first => Some(part),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        prose.contains(&ProsePart::Markdown(0)),
-        "its text is Markdown: {prose:?}"
-    );
 }
 
 /// How long Find takes over the reader's budget session (PLAN §14), in release:

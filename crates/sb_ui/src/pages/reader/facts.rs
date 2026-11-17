@@ -7,14 +7,15 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, InteractiveElement as _, IntoElement, ListOffset,
-    ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _,
-    StyledText, TextLayout, div, prelude::FluentBuilder as _, px, uniform_list,
+    AnyElement, AnyView, App, ClickEvent, Context, Div, InteractiveElement as _, IntoElement,
+    ListOffset, ParentElement as _, Role, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Window, div, prelude::FluentBuilder as _, px, uniform_list,
 };
 use gpui_component::tooltip::Tooltip;
-use sb_core::catalogue::{Held, History, Reason};
+use sb_core::catalogue::{Held, History, Reason, Session};
 use sb_core::transcript::ToolKind;
 
 use super::ReaderView;
@@ -23,8 +24,8 @@ use super::rows::RowKind;
 use crate::agents;
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
-    ButtonKind, Tone, button, icon, icon_button, location_tag, low_chip, middle_cut, overline,
-    warn_chip,
+    ButtonKind, Tone, button, fit_path, icon, icon_button, location_tag, low_chip, middle_cut,
+    overline, tab_stop, text_width, warn_chip, whole_tooltip,
 };
 use crate::format;
 use crate::hostile;
@@ -43,8 +44,14 @@ pub const HISTORY_SHOWN: usize = 50;
 const TURN_ROW: f32 = 22.;
 /// The fewest turns the facts show, however short the window: past them the margin scrolls.
 const MIN_TURNS: usize = 4;
-/// The widest the tooltip of a path or a branch is: a longer one wraps in it.
-const TOOLTIP_WIDTH: f32 = 480.;
+/// The margin's padding either side.
+const FACTS_PADDING: f32 = 16.;
+/// How many models the facts list one a line, and how many their tooltip lists, before they
+/// say how many more there are: a hostile transcript can name any number.
+const MODELS_SHOWN: usize = 6;
+const MODELS_LISTED: usize = 40;
+/// How long "Copied" shows over a fact copied.
+const COPIED_FOR: Duration = Duration::from_millis(1500);
 
 /// The kinds of call the facts count, each under one label (DESIGN §4.2.8 "Calls").
 const CALL_KINDS: &[(&str, &[ToolKind])] = &[
@@ -69,15 +76,28 @@ pub struct HistoryOf {
 
 /// A fact of the session (DESIGN §4.2.8): its label, and under it its value across the margin.
 fn fact(label: &'static str, value: impl IntoElement, theme: &SbTheme) -> Div {
+    noted_fact(label, None, value, theme)
+}
+
+/// [`fact`], with `note` at the right of its label's line.
+fn noted_fact(
+    label: &'static str,
+    note: Option<AnyElement>,
+    value: impl IntoElement,
+    theme: &SbTheme,
+) -> Div {
     div()
         .flex()
         .flex_col()
         .gap(px(2.))
         .child(
             div()
+                .flex()
+                .justify_between()
                 .text_color(theme.colors.fg3)
                 .text_spec(&theme.text.overline)
-                .child(label),
+                .child(label)
+                .children(note),
         )
         .child(
             div()
@@ -98,49 +118,170 @@ fn line(text: impl IntoElement) -> Div {
 }
 
 /**
- * A value that may be long, a path or a branch, on one line in mono after `glyph`: cut in its
- * middle where it doesn't fit, so its end shows; whole in a tooltip on hover, and copied whole
- * by a click. A value longer than any label is cut in its middle before it is drawn. With the
- * layout of its text, which holds the text as drawn, cut, once it is laid out.
+ * The tooltip over "and n more" models: the open session's models, one a line, at most
+ * [`MODELS_LISTED`] and then how many more. Read when it shows.
  */
-fn whole(
-    id: &'static str,
-    value: &str,
-    glyph: Option<SbIcon>,
-    theme: &SbTheme,
-) -> (Stateful<Div>, TextLayout) {
-    let shown = SharedString::from(hostile::label(&middle_cut(value, hostile::LABEL_CHARS)));
-    let copied = hostile::bidi(value).into_owned();
-    let text = StyledText::new(shown.clone());
-    let layout = text.layout().clone();
-    let mono = theme.fonts.mono.clone();
-    let element = div()
-        .id(id)
-        .debug_selector(move || id.to_string())
-        .flex()
-        .items_center()
-        .gap(theme.spacing.xs)
-        .cursor_pointer()
-        .children(glyph.map(|glyph| icon(glyph, theme.sizes.icon_xs, theme.colors.fg3)))
-        .child(
-            line(text)
-                .flex_1()
-                .font_family(mono.clone())
-                .text_size(px(11.5)),
-        )
-        .tooltip(move |window, cx| {
-            let (shown, mono) = (shown.clone(), mono.clone());
-            Tooltip::element(move |_, _| {
-                div()
-                    .max_w(px(TOOLTIP_WIDTH))
-                    .font_family(mono.clone())
-                    .child(shown.clone())
-                    .debug_selector(|| format!("{id}-whole"))
-            })
-            .build(window, cx)
+fn models_tooltip(window: &mut Window, cx: &mut App) -> AnyView {
+    let listed = cx
+        .services()
+        .library
+        .read(cx)
+        .open_session()
+        .map(|session| {
+            let provider = &session.id.provider;
+            let mut lines: Vec<String> = session
+                .models
+                .iter()
+                .take(MODELS_LISTED)
+                .map(|model| hostile::label(&agents::model_name(provider, model, cx)))
+                .collect();
+            let more = session.models.len().saturating_sub(MODELS_LISTED);
+            if more > 0 {
+                lines.push(format!("\u{2026} {} more", format::count(more as u64)));
+            }
+            lines.join("\n")
         })
-        .on_click(move |_, _, cx| crate::system::copy_text(copied.clone(), cx));
-    (element, layout)
+        .unwrap_or_default();
+    let listed = SharedString::from(listed);
+    Tooltip::element(move |_, _| {
+        div()
+            .child(listed.clone())
+            .debug_selector(|| "facts-models-all".into())
+    })
+    .build(window, cx)
+}
+
+/// The facts that copy their value on a click (DESIGN §4.2.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Copyable {
+    Path,
+    Branch,
+}
+
+impl Copyable {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::Branch => "branch",
+        }
+    }
+
+    fn of(self, session: &Session) -> Option<&str> {
+        match self {
+            Self::Path => session.project_path.as_deref(),
+            Self::Branch => session.branch.as_deref(),
+        }
+    }
+
+    /// What it reads `f` of in the session open now, when it has one.
+    fn read<T>(self, cx: &App, f: impl FnOnce(&str) -> T) -> Option<T> {
+        cx.services()
+            .library
+            .read(cx)
+            .open_session()
+            .and_then(|session| self.of(session))
+            .map(f)
+    }
+}
+
+impl ReaderView {
+    /**
+     * A value that may be long, a path or a branch, on one line in mono after `glyph`: cut to
+     * the margin's width, keeping its last folder ([`fit_path`]); whole in a tooltip on hover;
+     * copied as it reads ([`hostile::one_line`]) by a click, or by `Enter` once `Tab` is on it.
+     * What it draws is bounded however long `value` is: the tooltip and Copy read the value
+     * only when they are asked for.
+     */
+    fn copyable(
+        &self,
+        which: Copyable,
+        value: &str,
+        glyph: Option<SbIcon>,
+        theme: &SbTheme,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let c = &theme.colors;
+        let mut room = px(FACTS_WIDTH - 1. - 2. * FACTS_PADDING - 2.);
+        if glyph.is_some() {
+            room -= theme.sizes.icon_xs + theme.spacing.xs;
+        }
+        let shown = fit_path(
+            &hostile::label(&middle_cut(value, hostile::LABEL_CHARS)),
+            room,
+            |text| text_width(text, &theme.text.path_fact, window),
+        );
+        let name = which.name();
+        let value = tab_stop(
+            div()
+                .id(SharedString::from(format!("facts-{name}")))
+                .debug_selector(move || format!("facts-{name}"))
+                .role(Role::Button)
+                .aria_label(format!("Copy the {name}"))
+                .flex()
+                .items_center()
+                .gap(theme.spacing.xs)
+                .rounded(theme.radii.small)
+                .border_1()
+                .border_color(gpui::transparent_black())
+                .cursor_pointer(),
+            theme,
+        )
+        .children(glyph.map(|glyph| icon(glyph, theme.sizes.icon_xs, c.fg3)))
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_spec(&theme.text.path_fact)
+                .child(shown),
+        )
+        .tooltip(whole_tooltip(
+            match which {
+                Copyable::Path => "facts-path-whole",
+                Copyable::Branch => "facts-branch-whole",
+            },
+            move |cx| which.read(cx, hostile::whole),
+        ))
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            if let Some(text) = which.read(cx, hostile::one_line) {
+                crate::system::copy_text(text, cx);
+                this.copied(which, cx);
+            }
+        }))
+        .automation_target_with(move || format!("reader/facts/{name}/value").into());
+        let copied = (self.facts_copied == Some(which)).then(|| {
+            div()
+                .debug_selector(|| "facts-copied".into())
+                .text_color(c.accent_text)
+                .child("Copied")
+                .automation_target_with(move || format!("reader/facts/{name}/copied").into())
+        });
+        noted_fact(
+            match which {
+                Copyable::Path => "Path",
+                Copyable::Branch => "Branch",
+            },
+            copied,
+            value,
+            theme,
+        )
+        .automation_target_with(move || format!("reader/facts/{name}").into())
+    }
+
+    /// Says "Copied" over the fact `which` for a moment (DESIGN §4.2.8).
+    fn copied(&mut self, which: Copyable, cx: &mut Context<Self>) {
+        self.facts_copied = Some(which);
+        cx.notify();
+        self.facts_copied_shown = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COPIED_FOR).await;
+            this.update(cx, |this, cx| {
+                this.facts_copied = None;
+                cx.notify();
+            })
+            .ok();
+        });
+    }
 }
 
 /// The number of the version with id `id` in `history`.
@@ -195,7 +336,7 @@ impl ReaderView {
     }
 
     /// The facts margin (DESIGN §4.2.8): Session, Turns, Calls.
-    pub(super) fn render_facts(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_facts(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.sb_theme().clone();
         let c = &theme.colors;
         let services = cx.services();
@@ -226,34 +367,13 @@ impl ReaderView {
             )
             .into_any_element()
         }));
-        let mut cut = Vec::new();
-        if let Some(path) = &session.project_path {
-            let (value, layout) = whole("facts-path", path, None, &theme);
-            cut.push(layout);
-            facts.push(
-                fact(
-                    "Path",
-                    value.automation_target("reader/facts/path/value"),
-                    &theme,
-                )
-                .automation_target("reader/facts/path"),
-            );
-        }
-        if let Some(branch) = &session.branch {
-            let (value, layout) = whole("facts-branch", branch, Some(SbIcon::GitBranch), &theme);
-            cut.push(layout);
-            facts.push(
-                fact(
-                    "Branch",
-                    value.automation_target("reader/facts/branch/value"),
-                    &theme,
-                )
-                .automation_target("reader/facts/branch"),
-            );
-        }
-        #[cfg(test)]
-        {
-            self.facts_cut = cut;
+        for (which, glyph) in [
+            (Copyable::Path, None),
+            (Copyable::Branch, Some(SbIcon::GitBranch)),
+        ] {
+            if let Some(value) = which.of(session) {
+                facts.push(self.copyable(which, value, glyph, &theme, window, cx));
+            }
         }
         if library.agents() > 1 {
             facts.push(
@@ -271,9 +391,11 @@ impl ReaderView {
             );
         }
         if !session.models.is_empty() {
+            /* The first few, one a line, then how many more, all of them listed on hover. */
             let models: Vec<Div> = session
                 .models
                 .iter()
+                .take(MODELS_SHOWN)
                 .map(|model| {
                     div()
                         .flex()
@@ -286,6 +408,7 @@ impl ReaderView {
                         )
                 })
                 .collect();
+            let more = session.models.len().saturating_sub(MODELS_SHOWN);
             facts.push(
                 fact(
                     "Models",
@@ -293,7 +416,17 @@ impl ReaderView {
                         .flex()
                         .flex_col()
                         .debug_selector(|| "facts-models".into())
-                        .children(models),
+                        .children(models)
+                        .when(more > 0, |this| {
+                            this.child(
+                                div()
+                                    .id("facts-models-more")
+                                    .debug_selector(|| "facts-models-more".into())
+                                    .text_color(c.fg3)
+                                    .child(format!("and {} more", format::count(more as u64)))
+                                    .tooltip(models_tooltip),
+                            )
+                        }),
                     &theme,
                 )
                 .automation_target("reader/facts/models"),
@@ -544,8 +677,8 @@ impl ReaderView {
             .h_full()
             .pt(px(18.))
             .pb(px(12.))
-            .pl(px(16.))
-            .pr(px(16.))
+            .pl(px(FACTS_PADDING))
+            .pr(px(FACTS_PADDING))
             .bg(c.bg_panel)
             .border_l_1()
             .border_color(c.line_subtle)

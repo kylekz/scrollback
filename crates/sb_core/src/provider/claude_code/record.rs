@@ -224,7 +224,9 @@ pub(super) struct Attachment<'a> {
 pub(super) struct MemoryFile<'a> {
     #[serde(borrow)]
     pub content: &'a RawValue,
-    pub content_differs_from_disk: Option<bool>,
+    /// Read as `true` or not: any other value isn't a reason to keep the record unread.
+    #[serde(borrow)]
+    pub content_differs_from_disk: Option<&'a RawValue>,
 }
 
 /// Who sent a prompt: `human`, or what stood in for one. A message from another session
