@@ -94,7 +94,7 @@ pub enum Holds {
 /// Whether `name` is a file an operating system leaves in any folder it has shown (Finder's,
 /// with the AppleDouble `._` files of a drive formatted for Windows, and Explorer's), which
 /// doesn't make a folder hold something.
-fn is_system_file(name: &str) -> bool {
+pub(super) fn is_system_file(name: &str) -> bool {
     matches!(name, ".DS_Store" | "Thumbs.db" | "desktop.ini") || name.starts_with("._")
 }
 

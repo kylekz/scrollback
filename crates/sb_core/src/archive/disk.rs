@@ -147,7 +147,7 @@ pub(super) fn place(mut file: TempPath, to: &Path) -> Result<(), (io::Error, Tem
             .collect()
     };
     /* The file is closed already; dropping `file` removes it unless the move succeeds. */
-    let (from_wide, to_wide) = (wide(&file), wide(to));
+    let (from_wide, to_wide) = (wide(&verbatim(&file)), wide(&verbatim(to)));
     // SAFETY: both are NUL-terminated UTF-16 strings that outlive the calls.
     unsafe {
         if SetFileAttributesW(from_wide.as_ptr(), FILE_ATTRIBUTE_NORMAL) == 0 {
@@ -162,6 +162,134 @@ pub(super) fn place(mut file: TempPath, to: &Path) -> Result<(), (io::Error, Tem
     }
     file.disable_cleanup(true);
     Ok(())
+}
+
+/**
+ * `path` as Windows' own calls take it past 260 characters: with `\\?\` (or `\\?\UNC\` for a
+ * share) when it is that long. std's calls do this themselves; [`place`] calls `MoveFileExW`
+ * directly. A verbatim path is taken as it is, so only an absolute one, which the archive's
+ * paths are (`std::path::absolute` has already put its separators right and taken out `.`
+ * and `..`), is given one.
+ */
+#[cfg(windows)]
+fn verbatim(path: &Path) -> std::borrow::Cow<'_, Path> {
+    use std::borrow::Cow;
+    use std::path::{Component, PathBuf, Prefix};
+
+    const LONGEST: usize = 259;
+    if path.as_os_str().len() <= LONGEST {
+        return Cow::Borrowed(path);
+    }
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return Cow::Borrowed(path);
+    };
+    let text = path.as_os_str().to_string_lossy();
+    match prefix.kind() {
+        Prefix::Disk(_) => Cow::Owned(PathBuf::from(format!(r"\\?\{text}"))),
+        Prefix::UNC(..) => Cow::Owned(PathBuf::from(format!(
+            r"\\?\UNC\{}",
+            text.trim_start_matches(r"\\")
+        ))),
+        _ => Cow::Borrowed(path),
+    }
+}
+
+/**
+ * Whether `error` is Windows saying another program has the file open in a way that keeps it
+ * from being opened, replaced or removed: an antivirus scanning a file just written, an
+ * indexer, a backup tool. It lets go after a moment, so what failed so is tried again
+ * ([`retrying`]). Nothing else is ever retried.
+ */
+#[cfg(windows)]
+pub(super) fn is_held(error: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+    };
+    matches!(
+        error
+            .raw_os_error()
+            .and_then(|code| u32::try_from(code).ok()),
+        Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+    )
+}
+
+/// Elsewhere a program holding a file open keeps no other from it.
+#[cfg(not(windows))]
+pub(super) fn is_held(_error: &io::Error) -> bool {
+    false
+}
+
+/// How many times, and how far apart, what another program holds is tried ([`retrying`]).
+const TRIES: u32 = 20;
+const APART: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// `op`, tried again for a moment while it fails because another program holds the file
+/// ([`is_held`]); then its last error.
+pub(super) fn retrying<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut tried = 1;
+    loop {
+        match op() {
+            Err(error) if is_held(&error) && tried < TRIES => {
+                tried += 1;
+                std::thread::sleep(APART);
+            }
+            done => return done,
+        }
+    }
+}
+
+/// [`place`], tried again for a moment while another program holds a file it needs
+/// ([`retrying`]).
+pub(super) fn place_retrying(file: TempPath, to: &Path) -> Result<(), (io::Error, TempPath)> {
+    let (mut file, mut tried) = (file, 1);
+    loop {
+        match place(file, to) {
+            Err((error, unplaced)) if is_held(&error) && tried < TRIES => {
+                tried += 1;
+                file = unplaced;
+                std::thread::sleep(APART);
+            }
+            done => return done,
+        }
+    }
+}
+
+/// How many bytes the volume `dir`, an existing folder, has free for this user.
+#[cfg(unix)]
+pub(super) fn free_space(dir: &Path) -> io::Result<u64> {
+    let stats = rustix::fs::statvfs(dir)?;
+    Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
+}
+
+/// How many bytes the volume `dir`, an existing folder, has free for this user (a quota
+/// counts), from `GetDiskFreeSpaceExW`, which follows a folder that is another volume's
+/// mount point.
+#[cfg(windows)]
+pub(super) fn free_space(dir: &Path) -> io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let wide: Vec<u16> = verbatim(dir)
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free = 0u64;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 string, and `free` outlives the call; the
+    // totals it doesn't need are null, which the call allows.
+    let done = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if done == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(free)
 }
 
 #[cfg(test)]

@@ -23,6 +23,7 @@ mod delete;
 mod disk;
 mod items;
 mod layout;
+mod relocate;
 mod segment;
 mod stats;
 mod verify;
@@ -46,6 +47,9 @@ use crate::search::{SearchError, SearchIndex};
 pub use delete::Deleted;
 pub use items::{ArchivedSession, Pinned};
 pub(crate) use layout::item_folder;
+pub use relocate::{
+    Cleared, MARKER, Move, MoveError, MovePlan, MoveProgress, MoveStage, Refusal, clear_move,
+};
 pub use segment::{Problem, SEGMENT_BYTES, SegmentCache, VersionReader};
 pub(crate) use segment::{RangeWriter, Sealed};
 pub use stats::{ArchiveStats, Holds, id_in, open_or_make, resolved, what_is_in};
@@ -280,7 +284,18 @@ impl Archive {
             }
             Err(error) => return Err(io_error("read", &manifest_path)(error)),
         }
-        let lock = lock(dir)?;
+        let archive = Self::open_locked(dir, lock(dir)?)?;
+        /* What a delete for good left to remove, and then today's backup, which so holds no
+        removal still to do; in the background, as nothing else waits for them. */
+        archive.start_removals(true);
+        Ok(archive)
+    }
+
+    /// Opens the archive in `dir`, absolute and holding an `archive.json`, whose `lock` is
+    /// held already, and starts nothing in the background: [`Archive::open`], and a move
+    /// opening its copy (`relocate`).
+    fn open_locked(dir: &Path, lock: File) -> Result<Self> {
+        let manifest_path = dir.join(layout::MANIFEST);
         if !dir.join(catalogue::DATABASE).is_file() {
             return Err(ArchiveError::CatalogueMissing {
                 dir: dir.to_path_buf(),
@@ -313,9 +328,6 @@ impl Archive {
         if !dir.join(crate::search::SEARCH_DATABASE).exists() {
             archive.catalogue.none_searchable()?;
         }
-        /* What a delete for good left to remove, and then today's backup, which so holds no
-        removal still to do; in the background, as nothing else waits for them. */
-        archive.start_removals(true);
         Ok(archive)
     }
 
