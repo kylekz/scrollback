@@ -35,17 +35,32 @@ pub(super) const MAC_SUPPORT: &str = "Library/Application Support";
 /// The variable that names Windows' roaming application data folder.
 pub(super) const APPDATA: &str = "APPDATA";
 
-/// What a file under [`SUBTREE`] is: a record of the app's when it is JSON, else something
-/// else it keeps there. Neither is any session's.
+/// Whether the file at `key` (under [`SUBTREE`]) is one of the app's records, which are all
+/// that is archived of its folder: a `.json` file directly in one session's folder,
+/// `claude-code-sessions/<session>/<name>.json`. Whatever else the app keeps there is its own.
+pub(super) fn is_record(key: &str) -> bool {
+    key.strip_prefix(SUBTREE)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(folder, name)| {
+            !folder.is_empty()
+                && !name.contains('/')
+                && name.len() > ".json".len()
+                && name.ends_with(".json")
+        })
+}
+
+/// What a file under [`SUBTREE`] is: a record of the app's ([`is_record`]), else something
+/// else it keeps there, which is not archived. Neither is any session's.
 pub(super) fn classify(key: &str) -> FileClass {
     FileClass {
-        kind: if key.ends_with(".json") {
+        kind: if is_record(key) {
             ItemKind::Register
         } else {
             ItemKind::Sidecar
         },
         session: None,
-        lines: key.ends_with(".jsonl"),
+        lines: false,
     }
 }
 

@@ -2,7 +2,9 @@
 //! facts say of each.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::io::Read as _;
+use std::sync::{Mutex, PoisonError};
 
 use super::{Archive, Result};
 use crate::catalogue::{Compared, Kin, SessionId};
@@ -10,6 +12,17 @@ use crate::hash::{Hash, Hasher};
 
 /// A main transcript's version that is read: its id, length and hash.
 type Read = (Option<i64>, u64, Option<String>);
+
+/// How many comparisons a [`KinMemo`] keeps before it starts again.
+const REMEMBERED: usize = 4096;
+
+/**
+ * The comparisons [`Archive::kin_remembered`] made, by the two versions compared as they were
+ * read (each its id, length and hash): a version's bytes up to a length never change, so a
+ * session parsed again while it grows hashes only what it has not compared before.
+ */
+#[derive(Debug, Default)]
+pub struct KinMemo(Mutex<HashMap<(Read, Read), Compared>>);
 
 impl Archive {
     /**
@@ -19,14 +32,34 @@ impl Archive {
      * that far is compared by its length.
      */
     pub fn kin(&self, id: &SessionId) -> Result<Vec<Kin>> {
+        self.kin_remembered(id, &KinMemo::default())
+    }
+
+    /// [`Archive::kin`], with each comparison asked of `memo` first and kept in it after.
+    pub fn kin_remembered(&self, id: &SessionId, memo: &KinMemo) -> Result<Vec<Kin>> {
         Ok(self
             .catalogue
             .kin_read(id)?
             .into_iter()
-            .map(|read| Kin {
-                compared: self.compare(&read.theirs, &read.ours),
-                id: read.id,
-                copy: read.copy,
+            .map(|read| {
+                let pair = (read.theirs, read.ours);
+                let known = (memo.0.lock().unwrap_or_else(PoisonError::into_inner))
+                    .get(&pair)
+                    .copied();
+                let compared = known.unwrap_or_else(|| {
+                    let compared = self.compare(&pair.0, &pair.1);
+                    let mut memo = memo.0.lock().unwrap_or_else(PoisonError::into_inner);
+                    if memo.len() >= REMEMBERED {
+                        memo.clear();
+                    }
+                    memo.insert(pair.clone(), compared);
+                    compared
+                });
+                Kin {
+                    compared,
+                    id: read.id,
+                    copy: read.copy,
+                }
             })
             .collect())
     }

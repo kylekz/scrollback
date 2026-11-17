@@ -396,6 +396,24 @@ pub(super) const SESSION: &str = concat!(
 const MADE_FROM: &str = "s.indexed_from || ' ' || s.parser_version || ' ' || s.index_version";
 
 /**
+ * The condition, as SQL, that the session `$x` is a copy its parser never read: no project
+ * path to match by, its conversation the one its provider gives from its key.
+ */
+macro_rules! unparsed_copy {
+    ($x:literal) => {
+        concat!(
+            "(",
+            $x,
+            ".copy_label IS NOT NULL AND ",
+            $x,
+            ".project_path IS NULL AND ",
+            $x,
+            ".failure IS NOT NULL)"
+        )
+    };
+}
+
+/**
  * The condition, as SQL, that the sessions `$o` and `$s` are two of one conversation (PLAN
  * §7.7): of one provider, with the agent's one id for the conversation, and either started in
  * one project path as it was recorded, or one a copy whose record names the other's transcript
@@ -415,7 +433,11 @@ macro_rules! same_conversation {
             $o,
             ".project_path IS ",
             $s,
-            ".project_path OR (",
+            ".project_path OR ",
+            unparsed_copy!($s),
+            " OR ",
+            unparsed_copy!($o),
+            " OR (",
             $s,
             ".copy_label IS NOT NULL AND ",
             names_transcript!($s, concat!($o, ".main_item")),
@@ -432,7 +454,7 @@ macro_rules! same_conversation {
     };
 }
 
-pub(super) use {names_transcript, same_conversation};
+pub(super) use {names_transcript, same_conversation, unparsed_copy};
 
 /**
  * Where the session `$x` stands among the copies of its conversation shown alone, as an SQL
@@ -838,6 +860,11 @@ impl Catalogue {
      * any location, is deleted for good in the same transaction, as its key would have been
      * skipped. An original whose row is new takes over what the owner decided about the copy
      * shown in its place until now ([`take_over`]). Returns what became of the row.
+     *
+     * `known` is the agent's id for the conversation as its provider tells it without a parse
+     * ([`crate::provider::Provider::conversation_of`]): a row that could not be parsed keeps
+     * the one a parse said, else takes it, so that a session its parser stops on is still of
+     * its conversation ([`unparsed_row`]).
      */
     pub(crate) fn record_session(
         &self,
@@ -846,6 +873,7 @@ impl Catalogue {
         from: Hash,
         indexed: Indexed<'_>,
         copy: Option<&CopyOf>,
+        known: Option<&str>,
     ) -> Result<RowMade> {
         let nothing = SessionIndex::default();
         let (derived, failure, retry) = match indexed {
@@ -970,7 +998,7 @@ impl Catalogue {
                 params![id.location, id.provider, id.key],
             )?;
             if derived.is_none() {
-                return Ok(RowMade::Made { filed: false });
+                return unparsed_row(tx, id, copy.is_some(), known);
             }
             if let Some(conversation) = &index.conversation
                 && tombstoned(tx, id, conversation, index.project_path.as_deref())?
@@ -1486,6 +1514,54 @@ fn tombstoned(
     )
 }
 
+/**
+ * What becomes of the row of the session `id` its index could not parse, made or kept as it
+ * was: it takes `known` for its conversation when no parse said one. A copy that never parsed
+ * has no project path to match its conversation's by, so a tombstone of its conversation of
+ * any path takes it (PLAN §4.5): a copy deleted with its conversation is not archived again
+ * because its parser stops on it.
+ */
+fn unparsed_row(
+    tx: &Connection,
+    id: &SessionId,
+    copy: bool,
+    known: Option<&str>,
+) -> Result<RowMade> {
+    let identity = params![id.location, id.provider, id.key, known];
+    tx.execute(
+        "UPDATE session SET conversation = COALESCE(conversation, ?4)
+         WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+        identity,
+    )?;
+    let (conversation, project): (Option<String>, Option<String>) = tx.query_row(
+        "SELECT conversation, project_path FROM session
+         WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+        params![id.location, id.provider, id.key],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let Some(conversation) = conversation else {
+        return Ok(RowMade::Made { filed: false });
+    };
+    let deleted = match project.as_deref() {
+        Some(project) => tombstoned(tx, id, &conversation, Some(project))?,
+        None if copy => tx.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM tombstone
+                 WHERE provider = ?2 AND conversation = ?4
+                   AND NOT (location_id = ?1 AND session = ?3)
+             )",
+            params![id.location, id.provider, id.key, conversation],
+            |row| row.get(0),
+        )?,
+        None => false,
+    };
+    if deleted {
+        super::trash::forget(tx, id)?;
+        return Ok(RowMade::Deleted);
+    }
+    Ok(RowMade::Made { filed: false })
+}
+
 /// The items of one session, by key: after [`reading`].
 const OF_SESSION: &str =
     "WHERE i.location_id = ?1 AND i.provider = ?2 AND i.session = ?3 ORDER BY i.key";
@@ -1744,7 +1820,14 @@ mod tests {
             origin: Origin::Unsaid("Ran elsewhere.".to_string()),
         };
         catalogue
-            .record_session(&id, 1, Hash::of(b""), Indexed::Faulted("no"), Some(&copy))
+            .record_session(
+                &id,
+                1,
+                Hash::of(b""),
+                Indexed::Faulted("no"),
+                Some(&copy),
+                None,
+            )
             .unwrap();
         let row = catalogue.session(&id).unwrap().unwrap();
         assert_eq!((row.ran_at(), &row.copy), (None, &Some(copy)));
@@ -1776,7 +1859,7 @@ mod tests {
         };
         assert_eq!(
             catalogue
-                .record_session(&id, 1, Hash::of(b""), Indexed::Parsed(derived), None)
+                .record_session(&id, 1, Hash::of(b""), Indexed::Parsed(derived), None, None)
                 .unwrap(),
             RowMade::Made { filed: false }
         );

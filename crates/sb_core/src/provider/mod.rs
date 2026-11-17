@@ -305,6 +305,16 @@ pub trait Provider: Send + Sync {
     fn copy_records(&self, _register: &dyn SessionItems) -> Vec<CopyRecord> {
         Vec::new()
     }
+
+    /**
+     * The agent's id for the conversation of the session whose own transcript is the item
+     * `transcript`, when its key says it: what a parse would say, for a session its parser
+     * could not read (PLAN §4.5), so that a session of a conversation deleted for good is
+     * known for one even then.
+     */
+    fn conversation_of(&self, _transcript: &str) -> Option<String> {
+        None
+    }
 }
 
 /// [`Provider::outlines`] of every subagent of `items`, each read whole with

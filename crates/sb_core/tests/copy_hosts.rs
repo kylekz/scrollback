@@ -371,3 +371,30 @@ fn a_reindex_makes_the_attribution_again() {
     attribute(&machines.archive, &table()).unwrap();
     assert_eq!(machines.origin().0, Some(machines.host.clone()));
 }
+
+/// Of the app's folder, only the `.json` files directly in each session's folder are archived:
+/// whatever else it keeps there is left alone.
+#[test]
+fn only_the_app_s_session_records_are_archived() {
+    let machines = Machines::new();
+    let kept = machines
+        .pc
+        .desktop_record("a/local_a.json", b"{\"cliSessionId\": 1}");
+    for other in [
+        "a/notes.txt",
+        "a/deeper/local_b.json",
+        "top.json",
+        "a/log.jsonl",
+    ] {
+        machines.pc.desktop_record(other, b"{}");
+    }
+    machines.sync_here(&table());
+    let archived: Vec<String> = (machines.catalogue())
+        .items(&machines.here, provider::builtin()[0].id().as_str())
+        .unwrap()
+        .into_iter()
+        .map(|item| item.key)
+        .filter(|key| !key.starts_with("projects/"))
+        .collect();
+    assert_eq!(archived, [kept]);
+}

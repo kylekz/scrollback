@@ -411,6 +411,11 @@ fn session(
     }));
     let from = fingerprint(&readings);
     let parser = provider.parser_version();
+    /* What a parse would say of its conversation, for a session it can't be parsed for. */
+    let known = (readings.iter())
+        .find(|reading| reading.kind == ItemKind::Transcript)
+        .and_then(|reading| provider.conversation_of(&reading.key));
+    let known = known.as_deref();
     let copy = provider.copy_of(&id.key);
     let copy = copy.as_ref();
     let fault = match parsed {
@@ -424,7 +429,14 @@ fn session(
                         reading.kind.is_transcript() && reading.newest_held.is_some()
                     }),
                 };
-                match catalogue.record_session(id, parser, from, Indexed::Parsed(derived), copy)? {
+                match catalogue.record_session(
+                    id,
+                    parser,
+                    from,
+                    Indexed::Parsed(derived),
+                    copy,
+                    None,
+                )? {
                     RowMade::Made { filed } => report.filed += usize::from(filed),
                     RowMade::Deleted => report.deleted.push(id.clone()),
                 }
@@ -432,13 +444,20 @@ fn session(
             }
             Err(fault) => {
                 let reason = format!("the archive could not be read: {fault}");
-                catalogue.record_session(id, parser, from, Indexed::NotRead(&reason), copy)?;
+                catalogue.record_session(
+                    id,
+                    parser,
+                    from,
+                    Indexed::NotRead(&reason),
+                    copy,
+                    known,
+                )?;
                 reason
             }
         },
         Err(fault) => {
             let reason = format!("its parser stopped: {}", said(fault.as_ref()));
-            catalogue.record_session(id, parser, from, Indexed::Faulted(&reason), copy)?;
+            catalogue.record_session(id, parser, from, Indexed::Faulted(&reason), copy, known)?;
             reason
         }
     };

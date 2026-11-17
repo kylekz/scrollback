@@ -46,6 +46,7 @@ use crate::search::{SearchError, SearchIndex};
 
 pub use delete::Deleted;
 pub use items::{ArchivedSession, Pinned};
+pub use kin::KinMemo;
 pub(crate) use layout::item_folder;
 pub use segment::{Problem, SEGMENT_BYTES, SegmentCache, VersionReader};
 pub(crate) use segment::{RangeWriter, Sealed};
@@ -1425,7 +1426,14 @@ mod tests {
             .unwrap();
         for id in &sessions {
             catalogue
-                .record_session(id, 1, Hash::of(b""), Indexed::Faulted("no parser"), None)
+                .record_session(
+                    id,
+                    1,
+                    Hash::of(b""),
+                    Indexed::Faulted("no parser"),
+                    None,
+                    None,
+                )
                 .unwrap();
         }
         let texts: Vec<Text> = catalogue

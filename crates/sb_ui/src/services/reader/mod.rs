@@ -69,7 +69,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription};
-use sb_core::archive::{Archive, ArchivedSession, Pinned, SegmentCache};
+use sb_core::archive::{Archive, ArchivedSession, KinMemo, Pinned, SegmentCache};
 use sb_core::catalogue::{History, Kin, SessionId};
 use sb_core::provider::{ItemKind, Provider, SessionItems};
 use sb_core::transcript::{
@@ -761,6 +761,9 @@ pub struct ReaderService {
      * (One already running runs on: every read and parse is bounded.)
      */
     alive: Arc<AtomicBool>,
+    /// How copies compared with the sessions opened (PLAN §7.7), so that a session parsed
+    /// again as it grows hashes no copy's start it hashed before.
+    kin: Arc<KinMemo>,
     /// The images being decoded ([`Decoding`]): at most [`DECODES`].
     decoding: Arc<AtomicUsize>,
     /// The jobs asked for and not started, with their rows' ranks (the module docs).
@@ -813,6 +816,7 @@ impl ReaderService {
             loading: 0,
             reads: 0,
             alive: Arc::new(AtomicBool::new(true)),
+            kin: Arc::default(),
             decoding: Arc::default(),
             queued: HashMap::new(),
             running: HashMap::new(),
@@ -1071,6 +1075,7 @@ impl ReaderService {
         closed, its flag cleared, before its turn on the background comes. */
         let alive = self.alive.clone();
         let viewing = self.viewing.clone();
+        let kin = self.kin.clone();
         self.reads += 1;
         let job = cx.background_spawn({
             let id = id.clone();
@@ -1078,7 +1083,8 @@ impl ReaderService {
                 if !alive.load(Ordering::Relaxed) {
                     return Err("passed over".to_string());
                 }
-                guarded(|| parse(&archive, &providers, &id, viewing, &alive)).and_then(|it| it)
+                guarded(|| parse(&archive, &providers, &id, viewing, &kin, &alive))
+                    .and_then(|it| it)
             }
         });
         cx.spawn(async move |this, cx| {
@@ -1960,6 +1966,7 @@ fn parse(
     providers: &Providers,
     id: &SessionId,
     viewing: Option<(Arc<str>, i64)>,
+    kin: &KinMemo,
     alive: &AtomicBool,
 ) -> Result<OpenSession, String> {
     let provider = providers
@@ -2028,7 +2035,7 @@ fn parse(
                 })
                 .then_some(verify.at)
         });
-    let kin = archive.kin(id).unwrap_or_else(|error| {
+    let kin = archive.kin_remembered(id, kin).unwrap_or_else(|error| {
         log::warn!("the copies of a session could not be read: {error}");
         Vec::new()
     });

@@ -910,3 +910,208 @@ fn delete_for_good_waits_for_rows_an_older_parser_made() {
         Err(CatalogueError::StillIndexing(_))
     ));
 }
+
+/**
+ * Puts a folder in the place of every stored segment of the item `key` in the archive in
+ * `dir`: the operating system then fails to read it, which an index takes for a read to try
+ * again, not for damage.
+ */
+fn unstore(dir: &Path, key: &str) {
+    let folder = &sb_core::hash::Hash::of(key.as_bytes()).to_hex()[..32];
+    let mut folders = vec![dir.join("files")];
+    let mut segments = Vec::new();
+    while let Some(at) = folders.pop() {
+        for entry in fs::read_dir(at).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                folders.push(path);
+            } else if path.extension().is_some_and(|it| it == "zst")
+                && path.iter().any(|part| part == folder)
+            {
+                segments.push(path);
+            }
+        }
+    }
+    for segment in segments {
+        fs::remove_file(&segment).unwrap();
+        fs::create_dir(&segment).unwrap();
+    }
+}
+
+/// Makes the copy `copy` one its index could not read: its bytes gone from the archive, and
+/// its row made again with nothing a parse said.
+fn unread(machines: &Machines, copy: &DesktopCopy) {
+    unstore(machines.dir(), &copy.key);
+    edit_catalogue(
+        machines.dir(),
+        &format!(
+            "UPDATE session SET conversation = NULL, project_path = NULL, project = NULL,
+                    indexed_from = hex(zeroblob(32))
+             WHERE session = '{}'",
+            copy.folder
+        ),
+    );
+    machines.index();
+}
+
+/// A copy whose parser never read it is still of its conversation, by its transcript's name:
+/// hidden behind its original, and named when that is deleted for good.
+#[test]
+fn a_copy_never_read_is_of_its_conversation_by_its_name() {
+    let mut machines = Machines::new();
+    let session = machines.ran_remotely("upload");
+    let copy = machines.pc.desktop_copy(&session);
+    machines.sync(true);
+    unread(&machines, &copy);
+    let copy_id = machines.copy(&copy);
+    let row = machines.catalogue().session(&copy_id).unwrap().unwrap();
+    assert!(row.failure.is_some() && row.project_path.is_none());
+    let original = machines.original(&session);
+    assert_eq!(machines.the_one().id, original);
+
+    machines.catalogue().trash(&original).unwrap();
+    let deletion = machines.catalogue().deletion(&original).unwrap();
+    assert_eq!(
+        deletion
+            .also
+            .iter()
+            .map(|also| &also.session)
+            .collect::<Vec<_>>(),
+        [&copy_id]
+    );
+}
+
+/// A copy never read, of a conversation deleted for good: its index deletes it for good too.
+#[test]
+fn a_copy_never_read_of_a_deleted_conversation_is_deleted_too() {
+    let mut machines = Machines::new();
+    let session = machines.ran_remotely("upload");
+    let copy = machines.pc.desktop_copy(&session);
+    machines.sync(false);
+    /* As a tombstone of its original, deleted for good from where it ran. */
+    edit_catalogue(
+        machines.dir(),
+        &format!(
+            "INSERT INTO tombstone (location_id, provider, session, deleted_at, project_path,
+                                    conversation)
+             VALUES ('{}', '{}', 'deleted', 1, '{PROJECT}', '{}')",
+            machines.distro.as_str(),
+            machines.copy(&copy).provider,
+            session.id
+        ),
+    );
+    unread(&machines, &copy);
+    assert_eq!(
+        machines.catalogue().session(&machines.copy(&copy)).unwrap(),
+        None
+    );
+    assert!(machines.shown(Shelf::All).is_empty());
+}
+
+/**
+ * The upgrade from 0.1.0 where the owner trashed the original and kept the duplicate the
+ * desktop app made: the duplicate is a copy now, hidden behind its original in Trash, and
+ * deleting the original for good names the copy it takes.
+ */
+#[test]
+fn an_original_trashed_before_copies_were_known_takes_its_copy_with_it() {
+    let mut machines = Machines::new();
+    let session = machines.ran_remotely("upload");
+    let copy = machines.pc.desktop_copy(&session);
+    machines.sync(true);
+    let (original, copy_id) = (machines.original(&session), machines.copy(&copy));
+    edit_catalogue(
+        machines.dir(),
+        &format!(
+            "UPDATE session SET copy_label = NULL, copy_origin = NULL WHERE session = '{0}';
+             INSERT INTO session_state (location_id, provider, session, trashed_at)
+             VALUES ('{1}', '{2}', '{3}', 1);
+             UPDATE session SET index_version = 2;",
+            copy_id.key,
+            original.location.as_str(),
+            original.provider,
+            original.key
+        ),
+    );
+    machines.index();
+    assert!(machines.shown(Shelf::All).is_empty());
+    let trashed = machines.shown(Shelf::Trash);
+    assert_eq!(
+        trashed.iter().map(|it| &it.id).collect::<Vec<_>>(),
+        [&original]
+    );
+    let deletion = machines.catalogue().deletion(&original).unwrap();
+    assert_eq!(
+        (
+            deletion.also.len(),
+            &deletion.also[0].session,
+            deletion.also[0].copy.is_some()
+        ),
+        (1, &copy_id, true)
+    );
+}
+
+/// A delete for good waits while the location of a copy that goes with it is syncing.
+#[test]
+fn deleting_for_good_waits_for_the_sync_of_a_copy_s_location() {
+    let mut machines = Machines::new();
+    let session = machines.ran_remotely("upload");
+    machines.pc.desktop_copy(&session);
+    machines.sync(true);
+    let original = machines.original(&session);
+    machines.catalogue().trash(&original).unwrap();
+    let deletion = machines.catalogue().deletion(&original).unwrap();
+    let mut refused = None;
+    sync_location(
+        &machines.archive,
+        &machines.here,
+        &machines.pc.transport(),
+        &provider::builtin(),
+        &CancelToken::new(),
+        &mut |_| {
+            refused.get_or_insert_with(|| machines.archive.delete_for_good(&deletion).err());
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        refused,
+        Some(Some(ArchiveError::Syncing(at))) if at == machines.here
+    ));
+}
+
+/**
+ * What is decided of a copy hidden behind its original is not marked as decided of a copy
+ * shown alone, so another original arriving takes none of it.
+ */
+#[test]
+fn a_hidden_copy_s_state_is_taken_over_by_no_original() {
+    let mut machines = Machines::new();
+    let session = machines.ran_remotely("upload");
+    let copy = machines.pc.desktop_copy(&session);
+    machines.sync(true);
+    let copy_id = machines.copy(&copy);
+    machines.catalogue().set_starred(&copy_id, true).unwrap();
+    let as_copy = read_catalogue(
+        machines.dir(),
+        &format!(
+            "SELECT as_copy FROM session_state WHERE session = '{}'",
+            copy_id.key
+        ),
+    );
+    assert_eq!(as_copy, ["0"]);
+
+    /* The same session from a host added since: a new original, which takes nothing. */
+    let host = machines.add_host();
+    machines.sync_at(&host, &machines.remote.transport());
+    let from_host = machines.id(&host, session.session_key());
+    let row = machines.catalogue().session(&from_host).unwrap().unwrap();
+    assert!(!row.starred);
+    assert!(
+        machines
+            .catalogue()
+            .session(&copy_id)
+            .unwrap()
+            .unwrap()
+            .starred
+    );
+}
