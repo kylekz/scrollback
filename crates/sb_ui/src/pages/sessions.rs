@@ -397,8 +397,9 @@ pub struct SessionsView {
     /// Whether a card's tags may give way past their caps: the page's lines fit not even
     /// without counts ([`line_fits`]).
     tags_past_caps: bool,
-    /// How wide the tag of each location and folder the cards name is, whole.
-    tag_widths: HashMap<String, Pixels>,
+    /// How wide the tag of each location and folder the cards name is, whole, by whether it is
+    /// a copy's tag ([`Place::Copy`], which has a glyph besides) and by what it says.
+    tag_widths: HashMap<(bool, String), Pixels>,
     /// How wide the "held back" chip is.
     held_width: Pixels,
     measure: LineMeasure,
@@ -522,8 +523,8 @@ impl SessionsView {
         let (sync, library) = (self.sync.read(cx), self.library.read(cx));
         self.tag_widths.clear();
         let mut tags = Vec::new();
-        let mut measure = |name: &str, width: Pixels, cap: Pixels| {
-            self.tag_widths.insert(name.to_string(), width);
+        let mut measure = |copy: bool, name: &str, width: Pixels, cap: Pixels| {
+            self.tag_widths.insert((copy, name.to_string()), width);
             tags.push((name.to_string(), width, width.min(cap)));
             width
         };
@@ -534,14 +535,20 @@ impl SessionsView {
         let locations = places
             .map(|place| {
                 let width = place.width(theme, window);
-                measure(place.name(), width, theme.sizes.location_tag_max_width)
+                let copy = matches!(place, Place::Copy(_));
+                measure(
+                    copy,
+                    place.name(),
+                    width,
+                    theme.sizes.location_tag_max_width,
+                )
             })
             .collect();
         let subfolders = (self.line.subfolders.iter())
             .filter_map(|id| library.folder(*id))
             .map(|folder| {
                 let width = tag_width(&folder.name, theme, window);
-                measure(&folder.name, width, theme.sizes.tag_max_width)
+                measure(false, &folder.name, width, theme.sizes.tag_max_width)
             })
             .collect();
         self.held_width = text_width(HELD_BACK, &theme.text.small, window) + theme.spacing.sm * 2.;
@@ -1143,9 +1150,9 @@ impl SessionsView {
             .then(|| format::count(u64::from(session.all.calls)))
             .filter(|calls| {
                 let extras = subfolder.is_some() || session.held_back || by_hand;
-                let capped = |name: &str, cap: Pixels| {
+                let capped = |copy: bool, name: &str, cap: Pixels| {
                     self.tag_widths
-                        .get(name)
+                        .get(&(copy, name.to_string()))
                         .copied()
                         .unwrap_or_default()
                         .min(cap)
@@ -1153,8 +1160,11 @@ impl SessionsView {
                 let own: Vec<Pixels> = [
                     Some(theme.sizes.icon_xs),
                     Some(MODEL_MIN),
-                    location.map(|it| capped(it.name(), theme.sizes.location_tag_max_width)),
-                    subfolder.map(|it| capped(&it.name, theme.sizes.tag_max_width)),
+                    location.map(|it| {
+                        let copy = matches!(it, Place::Copy(_));
+                        capped(copy, it.name(), theme.sizes.location_tag_max_width)
+                    }),
+                    subfolder.map(|it| capped(false, &it.name, theme.sizes.tag_max_width)),
                     session.held_back.then_some(self.held_width),
                     Some(text_width(&self.line.day, &theme.text.count, window)),
                     Some(
@@ -1177,9 +1187,13 @@ impl SessionsView {
             .map(|ended| format::day(ended, now));
         /* The tags are whole unless the line, with the model's name at its least, has no room
         for them; then they give way, down to their least. */
-        let natural = |name: &str| self.tag_widths.get(name).copied().unwrap_or_default();
+        let natural = |copy: bool, name: &str| {
+            (self.tag_widths.get(&(copy, name.to_string())))
+                .copied()
+                .unwrap_or_default()
+        };
         let tags: Vec<(Pixels, Pixels)> = (location.map(|it| {
-            let natural = natural(it.name());
+            let natural = natural(matches!(it, Place::Copy(_)), it.name());
             (
                 natural,
                 self.least(natural, theme.sizes.location_tag_max_width),
@@ -1187,7 +1201,7 @@ impl SessionsView {
         }))
         .into_iter()
         .chain(subfolder.map(|it| {
-            let natural = natural(&it.name);
+            let natural = natural(false, &it.name);
             (natural, self.least(natural, theme.sizes.tag_max_width))
         }))
         .collect();

@@ -48,7 +48,7 @@ pub(super) enum Asking {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Asked<'a> {
     Delete(FolderId),
-    DeleteForGood(&'a SessionId, Option<Refusal>),
+    DeleteForGood(&'a SessionId, Option<&'a Refusal>),
     Save,
 }
 
@@ -56,7 +56,7 @@ impl Asking {
     fn asked(&self) -> Asked<'_> {
         match self {
             Self::Delete(folder) => Asked::Delete(*folder),
-            Self::DeleteForGood(id, refused) => Asked::DeleteForGood(id, *refused),
+            Self::DeleteForGood(id, refused) => Asked::DeleteForGood(id, refused.as_ref()),
             Self::Save => Asked::Save,
         }
     }
@@ -66,7 +66,7 @@ impl Asked<'_> {
     fn asking(self) -> Asking {
         match self {
             Self::Delete(folder) => Asking::Delete(folder),
-            Self::DeleteForGood(id, refused) => Asking::DeleteForGood(id.clone(), refused),
+            Self::DeleteForGood(id, refused) => Asking::DeleteForGood(id.clone(), refused.cloned()),
             Self::Save => Asking::Save,
         }
     }
@@ -95,7 +95,10 @@ impl Shell {
         let library = cx.services().library.read(cx);
         let asked = match (library.deleting(), library.for_good(), library.asked()) {
             (Some(folder), ..) => Some(Asked::Delete(folder)),
-            (None, Some(asked), _) => Some(Asked::DeleteForGood(&asked.session.id, asked.refused)),
+            (None, Some(asked), _) => Some(Asked::DeleteForGood(
+                &asked.session.id,
+                asked.refused.as_ref(),
+            )),
             (None, None, Some(_)) => Some(Asked::Save),
             (None, None, None) => None,
         };
@@ -288,31 +291,43 @@ impl Shell {
         } = cx.services().library.read(cx).for_good()?.clone();
         let sync = cx.services().sync.read(cx);
         let location = sync.location(&session.id.location).cloned();
-        /* Each copy that goes with it: what it is, where it is kept, and what it holds. */
-        let copies: Vec<AnyElement> = (deletion.iter())
-            .flat_map(|deletion| &deletion.copies)
-            .map(|copy| {
-                let kept = sync.location(&copy.session.location);
+        /* Each other session of its conversation that goes with it (PLAN §4.5): a copy, or the
+        same session from another location; where it is kept, and what it holds. */
+        let also: Vec<AnyElement> = (deletion.iter())
+            .flat_map(|deletion| &deletion.also)
+            .map(|also| {
+                let kept = sync.location(&also.session.location);
+                let kept_tag = kept.map(|kept| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(theme.spacing.xs)
+                        .child(match also.copy {
+                            Some(_) => "on",
+                            None => "from",
+                        })
+                        .child(location_tag(kept.name.clone(), &kept.kind, false, theme))
+                });
                 div()
                     .flex()
                     .flex_wrap()
                     .items_center()
                     .gap(theme.spacing.xs)
-                    .child(copy_tag(&copy.label, false, theme))
-                    .children(kept.map(|kept| {
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(theme.spacing.xs)
-                            .child("on")
-                            .child(location_tag(kept.name.clone(), &kept.kind, false, theme))
-                    }))
+                    .child(match &also.copy {
+                        Some(copy) => copy_tag(copy, false, theme).into_any_element(),
+                        None => div().child("The same session").into_any_element(),
+                    })
+                    .children(kept_tag)
                     .child(format!(
-                        "goes with it: {} and {}. Nothing is deleted there either.",
-                        format::plural(copy.files, "file"),
-                        format::fine_size(copy.bytes)
+                        "goes with it: {}, {}. Nothing is deleted {} either.",
+                        format::plural(also.files, "file"),
+                        format::fine_size(also.bytes),
+                        kept.map_or_else(
+                            || "there".to_string(),
+                            |kept| format!("on {}", kept.name)
+                        )
                     ))
-                    .automation_target("for-good/copy")
+                    .automation_target("for-good/also")
                     .into_any_element()
             })
             .collect();
@@ -356,8 +371,9 @@ impl Shell {
                 .items_center()
                 .gap(theme.spacing.xs);
             if deletion.at_location {
-                let rest = "Nothing is deleted there. Later syncs will skip it, so it won't come \
-                            back; you can allow it again in Settings › Archive.";
+                let rest = "Nothing is deleted there. Later syncs will skip it and any copy of it, \
+                            from any location, so it won't come back; you can allow it again in \
+                            Settings › Archive.";
                 let bold = "Nothing is deleted there.".len();
                 let run = |len, weight, color| TextRun {
                     len,
@@ -385,6 +401,12 @@ impl Shell {
                         run(bold, FontWeight::SEMIBOLD, c.fg),
                         run(rest.len() - bold, FontWeight::NORMAL, c.fg2),
                     ])))
+            } else if deletion.also.iter().any(|also| also.at_location) {
+                /* Another of it is still where it was kept: this is not the last of it. */
+                match tag {
+                    Some(tag) => line.child("It is no longer on").child(tag).child("."),
+                    None => line.child("It is no longer at its location."),
+                }
             } else {
                 match tag {
                     Some(tag) => line
@@ -462,7 +484,7 @@ impl Shell {
                                 .children(
                                     elsewhere.map(|it| it.automation_target("for-good/elsewhere")),
                                 )
-                                .children(copies)
+                                .children(also)
                                 .children(refused.map(|why| {
                                     div()
                                         .text_color(c.yellow)

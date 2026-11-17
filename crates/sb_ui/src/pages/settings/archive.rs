@@ -20,8 +20,8 @@ use sb_core::catalogue::{Held, Tombstone};
 use super::{Chosen, SettingsPage, section_head};
 use crate::automation::AutomationTargetExt as _;
 use crate::components::{
-    ButtonKind, Tone, button, card, chip, icon, info_banner, kv, location_tag, progress_bar, tag,
-    with_numbers,
+    ButtonKind, Tone, button, card, chip, copy_tag, icon, info_banner, kv, location_tag,
+    progress_bar, tag, with_numbers,
 };
 use crate::format;
 use crate::hostile;
@@ -1153,6 +1153,28 @@ fn deleted_row(
                         })
                         .child(hostile::label(&line)),
                 )
+                /* The other sessions of its conversation deleted with it, under it (PLAN §4.5):
+                allowed again with it. */
+                .children(
+                    tombstone
+                        .with
+                        .iter()
+                        .zip(&row.with_kept)
+                        .map(|(with, kept)| {
+                            let kept = kept
+                                .as_ref()
+                                .map_or("another location", |it| it.name.as_str());
+                            div()
+                                .text_spec(&theme.text.small)
+                                .text_color(c.fg3)
+                                .child(match &with.copy {
+                                    Some(copy) => {
+                                        format!("With {} kept on {kept}", hostile::label(copy))
+                                    }
+                                    None => format!("With the same session from {kept}"),
+                                })
+                        }),
+                )
                 .children(row.refused.clone().map(|why| {
                     div()
                         .text_spec(&theme.text.small)
@@ -1160,7 +1182,12 @@ fn deleted_row(
                         .child(why)
                 })),
         )
-        .children(location.map(|it| location_tag(it.name.clone(), &it.kind, false, theme)))
+        /* A copy shown alone was no session of the location that kept it (PLAN §7.7). */
+        .children(match &tombstone.copy {
+            Some(copy) => Some(copy_tag(copy, false, theme).into_any_element()),
+            None => location
+                .map(|it| location_tag(it.name.clone(), &it.kind, false, theme).into_any_element()),
+        })
         .children(action)
         .automation_target(target("row"))
 }

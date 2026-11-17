@@ -171,6 +171,11 @@ fn run(
         });
     }
     searchable(archive, location, providers, cancel, progress, &mut report)?;
+    /* What the index deleted for good (PLAN §4.5): sessions of conversations the owner
+    deleted, and what they left that is no session's. */
+    if catalogue.pending_removals()? > 0 {
+        archive.start_removals(false);
+    }
     /* A log a read held when a delete for good was to empty it is emptied now. */
     catalogue.retry_empty_log();
     if let Some(search) = archive.search_index_if_open() {
@@ -359,6 +364,8 @@ fn session(
     }));
     let from = fingerprint(&readings);
     let parser = provider.parser_version();
+    let copy = provider.copy_of(&id.key);
+    let copy = copy.as_ref();
     let fault = match parsed {
         Ok(read) => match read? {
             Ok((main, index, ending)) => {
@@ -370,19 +377,20 @@ fn session(
                         reading.kind.is_transcript() && reading.newest_held.is_some()
                     }),
                 };
-                let filed = catalogue.record_session(id, parser, from, Indexed::Parsed(derived))?;
+                let filed =
+                    catalogue.record_session(id, parser, from, Indexed::Parsed(derived), copy)?;
                 report.filed += usize::from(filed);
                 return Ok(());
             }
             Err(fault) => {
                 let reason = format!("the archive could not be read: {fault}");
-                catalogue.record_session(id, parser, from, Indexed::NotRead(&reason))?;
+                catalogue.record_session(id, parser, from, Indexed::NotRead(&reason), copy)?;
                 reason
             }
         },
         Err(fault) => {
             let reason = format!("its parser stopped: {}", said(fault.as_ref()));
-            catalogue.record_session(id, parser, from, Indexed::Faulted(&reason))?;
+            catalogue.record_session(id, parser, from, Indexed::Faulted(&reason), copy)?;
             reason
         }
     };

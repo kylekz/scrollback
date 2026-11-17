@@ -4,8 +4,7 @@
 use std::collections::BTreeMap;
 
 use super::{
-    BlockId, Content, Conversation, CopyOf, Ending, Subagent, Tokens, ToolInput, ToolKind,
-    Transcript,
+    BlockId, Content, Conversation, Ending, Subagent, Tokens, ToolInput, ToolKind, Transcript,
 };
 
 /// The version of what the index holds of a session: of [`index`], and of how the catalogue
@@ -31,10 +30,8 @@ pub struct SessionIndex {
     pub project_path: Option<String>,
     pub branch: Option<String>,
     pub entrypoint: Option<String>,
-    /// The agent's id for the conversation, and whether the session is a copy kept elsewhere
-    /// (PLAN §7.7).
+    /// The agent's id for the conversation, which its copies kept elsewhere share (PLAN §7.7).
     pub conversation: Option<String>,
-    pub copy: Option<CopyOf>,
     /// The session's items hold no main transcript: what is here is of its subagents alone.
     pub transcript_missing: bool,
     /// Some part of the session could not be read: one of its conversations to its end, or
@@ -137,7 +134,6 @@ pub fn index(transcript: &Transcript) -> SessionIndex {
         branch: transcript.facts.branch.clone(),
         entrypoint: transcript.facts.entrypoint.clone(),
         conversation: transcript.facts.conversation.clone(),
-        copy: transcript.facts.copy.clone(),
         transcript_missing: own.is_none(),
         unread: false,
         started: None,

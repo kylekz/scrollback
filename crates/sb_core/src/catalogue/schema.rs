@@ -346,6 +346,19 @@ ALTER TABLE session ADD COLUMN copy_origin TEXT CHECK ((copy_label IS NULL) = (c
 -- The sessions of one conversation, which the library shows once.
 CREATE INDEX session_conversation ON session (provider, conversation)
     WHERE conversation IS NOT NULL;
+
+-- The owner decided this while the session was a copy shown alone: it goes to the copy's
+-- original when that is archived. What was decided of a session before it was known to be a
+-- copy stays with it.
+ALTER TABLE session_state ADD COLUMN as_copy INTEGER NOT NULL DEFAULT 0;
+
+-- The conversation a session deleted for good was of, and what it was a copy as when it was
+-- one: no session of that conversation is archived again, from any location. Its identity
+-- alone, as the rest of a tombstone.
+ALTER TABLE tombstone ADD COLUMN conversation TEXT;
+ALTER TABLE tombstone ADD COLUMN copy_label TEXT;
+CREATE INDEX tombstone_conversation ON tombstone (provider, conversation)
+    WHERE conversation IS NOT NULL;
 ";
 
 #[cfg(test)]
@@ -485,7 +498,7 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].copy, None);
         assert_eq!(sessions[0].ran_at(), Some(&sessions[0].id.location));
-        assert!(catalogue.kin(&sessions[0].id).unwrap().is_empty());
+        assert!(catalogue.kin_read(&sessions[0].id).unwrap().is_empty());
     }
 
     /// A catalogue from before the archive's own settings keeps what it holds, and takes them.

@@ -22,11 +22,12 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use toolbox_store::rusqlite::{self, OptionalExtension as _, params};
 
-use super::session::{archived, set_state};
+use super::session::{archived, same_conversation, set_state};
 use super::{Catalogue, CatalogueError, Result, SessionId, now_ms};
 use crate::hash::Hash;
 use crate::location::LocationId;
 use crate::provider::ScannedItem;
+use crate::transcript::INDEX_VERSION;
 
 /**
  * What deleting a session for good removes: what the confirmation names (DESIGN §4.8), and
@@ -50,26 +51,29 @@ pub struct Deletion {
     /// Some item of it is still at its location, as far as the last sync there saw: when none
     /// is, this is the last copy.
     pub at_location: bool,
-    /// The copies of it kept elsewhere that go with it (PLAN §4.5, §7.7), which would
-    /// otherwise be shown in its place.
-    pub copies: Vec<CopyDeletion>,
+    /// The other sessions of its conversation, which go with it (PLAN §4.5, §7.7): its copies
+    /// kept elsewhere, and the same session archived from another location.
+    pub also: Vec<AlsoDeleted>,
 }
 
-/// A copy of a session that is deleted for good with it ([`Deletion::copies`]).
+/// Another session of a conversation deleted for good ([`Deletion::also`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CopyDeletion {
+pub struct AlsoDeleted {
     pub session: SessionId,
-    /// What it is a copy as, in the provider's words.
-    pub label: String,
+    /// What it is a copy as, in the provider's words; `None` for the same session archived
+    /// from another location.
+    pub copy: Option<String>,
     /// Its items, and what is archived of them, every version, uncompressed.
     pub files: usize,
     pub bytes: u64,
+    /// Some item of it is still where it was kept, as far as the last sync there saw.
+    pub at_location: bool,
 }
 
 impl Deletion {
-    /// The sessions it deletes: the one asked, then its copies.
+    /// The sessions it deletes: the one asked, then the others of its conversation.
     pub fn sessions(&self) -> impl Iterator<Item = &SessionId> {
-        std::iter::once(&self.session).chain(self.copies.iter().map(|copy| &copy.session))
+        std::iter::once(&self.session).chain(self.also.iter().map(|also| &also.session))
     }
 }
 
@@ -83,14 +87,23 @@ pub struct Tombstone {
     pub project_path: Option<String>,
     pub started: Option<i64>,
     pub ended: Option<i64>,
+    /// What it was a copy as, when it was a copy of a session that ran elsewhere (PLAN §7.7):
+    /// then it is not a session of the location that kept it.
+    pub copy: Option<String>,
+    /// The other sessions of its conversation deleted with it (its copies, the same session
+    /// from another location), which are listed under it and allowed again with it.
+    pub with: Vec<Tombstone>,
+    /// The agent's id for its conversation, which no location archives again.
+    conversation: Option<String>,
 }
 
-/// A tombstone the owner removed, with the keys of the items it held, so that it can be put
-/// back ([`Catalogue::restore_tombstone`]).
+/// The tombstones of a conversation the owner removed, with the keys of the items each held,
+/// so that they can be put back ([`Catalogue::restore_tombstone`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AllowedAgain {
+    /// The one the owner allowed again, with its copies.
     pub tombstone: Tombstone,
-    keys: Vec<String>,
+    removed: Vec<(Tombstone, Vec<String>)>,
 }
 
 /// The files of one deleted item that are still to be removed, in its folder under `files/`.
@@ -263,71 +276,97 @@ impl Catalogue {
     }
 
     /// Every tombstone, the latest first: what Settings lists (FEATURES: Settings).
+    /**
+     * Every tombstone, the latest first: what Settings lists (FEATURES: Settings). The copies
+     * of a session that were deleted with it are under its tombstone, not beside it.
+     */
     pub fn tombstones(&self) -> Result<Vec<Tombstone>> {
-        self.db.read(|c| {
-            Ok(c.prepare(
-                "SELECT location_id, provider, session, deleted_at, project_path, started_at,
-                        ended_at
-                 FROM tombstone ORDER BY deleted_at DESC, location_id, provider, session",
-            )?
-            .query_map([], |row| {
-                Ok(Tombstone {
-                    session: SessionId {
-                        location: row.get(0)?,
-                        provider: row.get(1)?,
-                        key: row.get(2)?,
-                    },
-                    deleted: row.get(3)?,
-                    project_path: row.get(4)?,
-                    started: row.get(5)?,
-                    ended: row.get(6)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?)
-        })
+        let all: Vec<Tombstone> = self.db.read(|c| {
+            Ok::<_, CatalogueError>(
+                c.prepare(&format!(
+                    "SELECT {TOMBSTONE} FROM tombstone
+                     ORDER BY deleted_at DESC, location_id, provider, session"
+                ))?
+                .query_map([], tombstone_from)?
+                .collect::<rusqlite::Result<_>>()?,
+            )
+        })?;
+        /* Each conversation's under one: an original before its copies, then by identity. */
+        let mut all = all;
+        all.sort_by_key(|it| it.copy.is_some());
+        let mut listed: Vec<Tombstone> = Vec::new();
+        for tombstone in all {
+            match listed
+                .iter_mut()
+                .find(|it| same_conversation(it, &tombstone))
+            {
+                Some(first) => first.with.push(tombstone),
+                None => listed.push(tombstone),
+            }
+        }
+        listed.sort_by(|a, b| {
+            (
+                b.deleted,
+                a.session.location.as_str(),
+                &a.session.provider,
+                &a.session.key,
+            )
+                .cmp(&(
+                    a.deleted,
+                    b.session.location.as_str(),
+                    &b.session.provider,
+                    &b.session.key,
+                ))
+        });
+        Ok(listed)
     }
 
-    /// Removes a tombstone: the next sync of its location archives the session again, if the
-    /// location still has it. Returns what was removed, to be put back if the owner undoes it.
+    /**
+     * Removes the tombstone of the session `id`, and those of every other session of its
+     * conversation deleted with it (PLAN §4.5): the next sync of each one's location archives
+     * it again, if the location still has it. Returns what was removed, to be put back if the
+     * owner undoes it.
+     */
     pub fn remove_tombstone(&self, id: &SessionId) -> Result<AllowedAgain> {
+        let listed = self
+            .tombstones()?
+            .into_iter()
+            .find(|tombstone| tombstone.session == *id)
+            .ok_or_else(|| CatalogueError::NoTombstone(id.clone()))?;
         self.db.write(|tx| {
-            let identity = params![id.location, id.provider, id.key];
-            let Some(tombstone) = tx
-                .query_row(
-                    "SELECT deleted_at, project_path, started_at, ended_at FROM tombstone
+            let mut removed = Vec::new();
+            for tombstone in std::iter::once(&listed).chain(&listed.with) {
+                let id = &tombstone.session;
+                let identity = params![id.location, id.provider, id.key];
+                let keys = tx
+                    .prepare(
+                        "SELECT key FROM tombstone_item
+                         WHERE location_id = ?1 AND provider = ?2 AND session = ?3 ORDER BY key",
+                    )?
+                    .query_map(identity, |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                tx.execute(
+                    "DELETE FROM tombstone_item
                      WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
                     identity,
-                    |row| {
-                        Ok(Tombstone {
-                            session: id.clone(),
-                            deleted: row.get(0)?,
-                            project_path: row.get(1)?,
-                            started: row.get(2)?,
-                            ended: row.get(3)?,
-                        })
+                )?;
+                tx.execute(
+                    "DELETE FROM tombstone
+                     WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
+                    identity,
+                )?;
+                removed.push((
+                    Tombstone {
+                        with: Vec::new(),
+                        ..tombstone.clone()
                     },
-                )
-                .optional()?
-            else {
-                return Err(CatalogueError::NoTombstone(id.clone()));
-            };
-            let keys = tx
-                .prepare(
-                    "SELECT key FROM tombstone_item
-                     WHERE location_id = ?1 AND provider = ?2 AND session = ?3 ORDER BY key",
-                )?
-                .query_map(identity, |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            tx.execute(
-                "DELETE FROM tombstone_item
-                 WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
-                identity,
-            )?;
-            tx.execute(
-                "DELETE FROM tombstone WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
-                identity,
-            )?;
-            Ok(AllowedAgain { tombstone, keys })
+                    keys,
+                ));
+            }
+            Ok(AllowedAgain {
+                tombstone: listed.clone(),
+                removed,
+            })
         })
     }
 
@@ -337,43 +376,47 @@ impl Catalogue {
      * since it is then a live session of the archive.
      */
     pub fn restore_tombstone(&self, allowed: &AllowedAgain) -> Result<()> {
-        let tombstone = &allowed.tombstone;
-        let id = &tombstone.session;
         self.db.write(|tx| {
-            let again: bool = tx.query_row(
-                "SELECT EXISTS (SELECT 1 FROM item WHERE location_id = ?1 AND provider = ?2
-                                AND (session = ?3 OR key IN (SELECT value FROM json_each(?4))))",
-                params![
-                    id.location,
-                    id.provider,
-                    id.key,
-                    serde_json::to_string(&allowed.keys).expect("keys always serialize")
-                ],
-                |row| row.get(0),
-            )?;
-            if again {
-                return Err(CatalogueError::ArchivedAgain(id.clone()));
-            }
-            tx.execute(
-                "INSERT INTO tombstone (location_id, provider, session, deleted_at, project_path,
-                                        started_at, ended_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    id.location,
-                    id.provider,
-                    id.key,
-                    tombstone.deleted,
-                    tombstone.project_path,
-                    tombstone.started,
-                    tombstone.ended
-                ],
-            )?;
-            for key in &allowed.keys {
-                tx.execute(
-                    "INSERT INTO tombstone_item (location_id, provider, key, session)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![id.location, id.provider, key, id.key],
+            for (tombstone, keys) in &allowed.removed {
+                let id = &tombstone.session;
+                let again: bool = tx.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM item WHERE location_id = ?1 AND provider = ?2
+                                    AND (session = ?3 OR key IN (SELECT value FROM json_each(?4))))",
+                    params![
+                        id.location,
+                        id.provider,
+                        id.key,
+                        serde_json::to_string(keys).expect("keys always serialize")
+                    ],
+                    |row| row.get(0),
                 )?;
+                if again {
+                    return Err(CatalogueError::ArchivedAgain(id.clone()));
+                }
+                tx.execute(
+                    "INSERT INTO tombstone (location_id, provider, session, deleted_at,
+                                            project_path, started_at, ended_at, copy_label,
+                                            conversation)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        id.location,
+                        id.provider,
+                        id.key,
+                        tombstone.deleted,
+                        tombstone.project_path,
+                        tombstone.started,
+                        tombstone.ended,
+                        tombstone.copy,
+                        tombstone.conversation
+                    ],
+                )?;
+                for key in keys {
+                    tx.execute(
+                        "INSERT INTO tombstone_item (location_id, provider, key, session)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![id.location, id.provider, key, id.key],
+                    )?;
+                }
             }
             Ok(())
         })
@@ -516,7 +559,7 @@ impl Catalogue {
  * what the owner decided about it; a tombstone in their place; and the removal of its files,
  * recorded as pending.
  */
-fn forget(tx: &rusqlite::Connection, id: &SessionId) -> Result<()> {
+pub(super) fn forget(tx: &rusqlite::Connection, id: &SessionId) -> Result<()> {
     let identity = params![id.location, id.provider, id.key];
     let items: Vec<(i64, String, String)> = tx
         .prepare(
@@ -525,22 +568,38 @@ fn forget(tx: &rusqlite::Connection, id: &SessionId) -> Result<()> {
         )?
         .query_map(identity, |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let (project_path, started, ended): (Option<String>, Option<i64>, Option<i64>) = tx
+    type Ran = (
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    );
+    let (project_path, started, ended, copy, conversation): Ran = tx
         .query_row(
-            "SELECT project_path, started_at, ended_at FROM session
+            "SELECT project_path, started_at, ended_at, copy_label, conversation FROM session
              WHERE location_id = ?1 AND provider = ?2 AND session = ?3",
             identity,
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?
         .unwrap_or_default();
     tx.execute(
         "INSERT INTO tombstone (location_id, provider, session, deleted_at, project_path,
-                                started_at, ended_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                                started_at, ended_at, copy_label, conversation)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT (location_id, provider, session) DO UPDATE SET
              deleted_at = excluded.deleted_at, project_path = excluded.project_path,
-             started_at = excluded.started_at, ended_at = excluded.ended_at",
+             started_at = excluded.started_at, ended_at = excluded.ended_at,
+             copy_label = excluded.copy_label, conversation = excluded.conversation",
         params![
             id.location,
             id.provider,
@@ -548,7 +607,9 @@ fn forget(tx: &rusqlite::Connection, id: &SessionId) -> Result<()> {
             now_ms(),
             project_path,
             started,
-            ended
+            ended,
+            copy,
+            conversation
         ],
     )?;
     tx.execute(
@@ -563,7 +624,20 @@ fn forget(tx: &rusqlite::Connection, id: &SessionId) -> Result<()> {
     ] {
         tx.execute(forget, identity)?;
     }
-    for (item, key, folder) in &items {
+    bury(tx, id, &items)
+}
+
+/**
+ * Takes the items `items` (each its row, key and folder) out of the catalogue as items of the
+ * session `id` deleted for good: their keys go in its tombstone, and the removal of their
+ * files is recorded as pending.
+ */
+pub(super) fn bury(
+    tx: &rusqlite::Connection,
+    id: &SessionId,
+    items: &[(i64, String, String)],
+) -> Result<()> {
+    for (item, key, folder) in items {
         tx.execute(
             "INSERT INTO removal (location_id, provider, folder, version, offset, length,
                                   hash)
@@ -614,64 +688,136 @@ fn deletion(connection: &rusqlite::Connection, id: &SessionId) -> Result<Deletio
     if trashed_at(connection, id)?.is_none() {
         return Err(CatalogueError::NotInTrash(id.clone()));
     }
-    let (files, bytes, at_location, versions): (usize, u64, bool, usize) = connection.query_row(
-        "SELECT count(*),
-                COALESCE(sum((SELECT sum(length) FROM version WHERE item_id = i.id)), 0),
-                COALESCE(max(i.gone_since IS NULL), 0),
-                COALESCE(sum(CASE WHEN i.kind = 'transcript'
-                             THEN (SELECT count(*) FROM version WHERE item_id = i.id) END), 0)
-         FROM item i WHERE i.location_id = ?1 AND i.provider = ?2 AND i.session = ?3",
-        params![id.location, id.provider, id.key],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-    )?;
+    let held = held(connection, id)?;
+    let (files, bytes, at_location) = (held.files, held.bytes, held.at_location);
     if files == 0 {
         return Err(CatalogueError::NoSession(id.clone()));
     }
-    /* The copies of its conversation, when no other original of it is left to be shown in
-    their place (PLAN §4.5). */
-    let copies = connection
-        .prepare(
-            "SELECT o.location_id, o.provider, o.session, o.copy_label,
-                    (SELECT count(*) FROM item i
-                     WHERE i.location_id = o.location_id AND i.provider = o.provider
-                       AND i.session = o.session),
-                    (SELECT COALESCE(sum(v.length), 0) FROM item i JOIN version v ON v.item_id = i.id
-                     WHERE i.location_id = o.location_id AND i.provider = o.provider
-                       AND i.session = o.session)
-             FROM session s
-             JOIN session o
-               ON o.provider = s.provider AND o.conversation = s.conversation
-              AND o.project_path IS s.project_path AND o.id <> s.id
-              AND o.copy_label IS NOT NULL
+    /* Its conversation is deleted for good (PLAN §4.5), which needs every row of it to say
+    which it is: none made by an older index, which may not know. */
+    let stale: bool = connection.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM session x JOIN session s
+               ON x.provider = s.provider AND x.project_path IS s.project_path
              WHERE s.location_id = ?1 AND s.provider = ?2 AND s.session = ?3
-               AND NOT EXISTS (
-                   SELECT 1 FROM session x
-                   WHERE x.provider = s.provider AND x.conversation = s.conversation
-                     AND x.project_path IS s.project_path AND x.id <> s.id
-                     AND x.copy_label IS NULL)
-             ORDER BY o.location_id, o.session",
-        )?
+               AND x.index_version <> ?4
+         )",
+        params![id.location, id.provider, id.key, INDEX_VERSION],
+        |row| row.get(0),
+    )?;
+    if stale {
+        return Err(CatalogueError::StillIndexing(id.clone()));
+    }
+    /* Every other session of its conversation, wherever it is archived (PLAN §4.5). */
+    let also: Vec<(SessionId, Option<String>)> = connection
+        .prepare(concat!(
+            "SELECT o.location_id, o.provider, o.session, o.copy_label
+             FROM session s
+             JOIN session o ON ",
+            same_conversation!("o", "s"),
+            " WHERE s.location_id = ?1 AND s.provider = ?2 AND s.session = ?3
+             ORDER BY o.copy_label IS NOT NULL, o.location_id, o.session"
+        ))?
         .query_map(params![id.location, id.provider, id.key], |row| {
-            Ok(CopyDeletion {
-                session: SessionId {
-                    location: row.get(0)?,
-                    provider: row.get(1)?,
-                    key: row.get(2)?,
-                },
-                label: row.get(3)?,
-                files: row.get(4)?,
-                bytes: row.get(5)?,
-            })
+            let id = SessionId {
+                location: row.get(0)?,
+                provider: row.get(1)?,
+                key: row.get(2)?,
+            };
+            Ok((id, row.get(3)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
+    let also = also
+        .into_iter()
+        .map(|(session, copy)| {
+            let held = self::held(connection, &session)?;
+            if held.transcripts > 1 {
+                return Err(CatalogueError::SeveralTranscripts(session));
+            }
+            Ok(AlsoDeleted {
+                session,
+                copy,
+                files: held.files,
+                bytes: held.bytes,
+                at_location: held.at_location,
+            })
+        })
+        .collect::<Result<_>>()?;
+    if held.transcripts > 1 {
+        return Err(CatalogueError::SeveralTranscripts(id.clone()));
+    }
+    let versions = held.versions;
     Ok(Deletion {
         session: id.clone(),
         files,
         versions,
         bytes,
         at_location,
-        copies,
+        also,
     })
+}
+
+/// What the archive holds of one session: its items, and what is archived of them.
+struct Held {
+    files: usize,
+    bytes: u64,
+    /// Some item of it is still at its location, as far as the last sync there saw.
+    at_location: bool,
+    /// Its own transcripts.
+    transcripts: usize,
+    /// The versions of its own transcripts.
+    versions: usize,
+}
+
+fn held(connection: &rusqlite::Connection, id: &SessionId) -> rusqlite::Result<Held> {
+    connection.query_row(
+        "SELECT count(*),
+                COALESCE(sum((SELECT sum(length) FROM version WHERE item_id = i.id)), 0),
+                COALESCE(max(i.gone_since IS NULL), 0),
+                COALESCE(sum(i.kind = 'transcript'), 0),
+                COALESCE(sum(CASE WHEN i.kind = 'transcript'
+                             THEN (SELECT count(*) FROM version WHERE item_id = i.id) END), 0)
+         FROM item i WHERE i.location_id = ?1 AND i.provider = ?2 AND i.session = ?3",
+        params![id.location, id.provider, id.key],
+        |row| {
+            Ok(Held {
+                files: row.get(0)?,
+                bytes: row.get(1)?,
+                at_location: row.get(2)?,
+                transcripts: row.get(3)?,
+                versions: row.get(4)?,
+            })
+        },
+    )
+}
+
+/// The columns of a tombstone, as [`tombstone_from`] reads them.
+const TOMBSTONE: &str = "location_id, provider, session, deleted_at, project_path, started_at, \
+                         ended_at, copy_label, conversation";
+
+fn tombstone_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<Tombstone> {
+    Ok(Tombstone {
+        session: SessionId {
+            location: row.get(0)?,
+            provider: row.get(1)?,
+            key: row.get(2)?,
+        },
+        deleted: row.get(3)?,
+        project_path: row.get(4)?,
+        started: row.get(5)?,
+        ended: row.get(6)?,
+        copy: row.get(7)?,
+        with: Vec::new(),
+        conversation: row.get(8)?,
+    })
+}
+
+/// Whether the tombstones `a` and `b` are of one conversation (PLAN §7.7).
+fn same_conversation(a: &Tombstone, b: &Tombstone) -> bool {
+    a.session.provider == b.session.provider
+        && a.conversation.is_some()
+        && a.conversation == b.conversation
+        && a.project_path == b.project_path
 }
 
 #[cfg(test)]

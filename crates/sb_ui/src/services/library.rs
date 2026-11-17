@@ -523,19 +523,22 @@ pub struct ForGood {
 }
 
 /// Why a confirmation to delete for good was refused, and nothing deleted (PLAN §4.5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// The session changed since it was shown: the confirmation shows its numbers now.
     Changed,
-    /// Its location was being synced; the confirmation forgets this once no sync runs.
-    Syncing,
+    /// The location of it or of a copy of it that goes with it was being synced; the
+    /// confirmation forgets this once that location's sync is done.
+    Syncing(LocationId),
 }
 
 impl Refusal {
-    pub fn said(self) -> &'static str {
+    pub fn said(&self) -> &'static str {
         match self {
             Self::Changed => "It changed since this was shown. These are its numbers now.",
-            Self::Syncing => "Its location is being synced. Try again once the sync is done.",
+            Self::Syncing(_) => {
+                "Where it or its copy is kept is being synced. Try again once the sync is done."
+            }
         }
     }
 }
@@ -680,6 +683,8 @@ pub struct LibraryService {
     anchor: Option<SessionId>,
     /// The session whose reader is open, and where it opened when it opened at a match.
     open: Option<Session>,
+    /// The original a copy that is open was read from, which it stands for (DESIGN §4.2.8).
+    copy_of: Option<Session>,
     read_at: Option<ReadAt>,
     /// How many requests to open at a match there were.
     read_requests: u64,
@@ -765,11 +770,12 @@ impl LibraryService {
                     this.seen.news += 1;
                     this.reload(cx);
                 }),
-                // A confirmation refused while its location synced forgets it once it doesn't.
+                // A confirmation refused while a location synced forgets it once it doesn't.
                 cx.observe(&sync, |this, _, cx| {
-                    let waited = (this.for_good.as_ref())
-                        .filter(|asked| asked.refused == Some(Refusal::Syncing))
-                        .map(|asked| asked.session.id.location.clone());
+                    let waited = (this.for_good.as_ref()).and_then(|asked| match &asked.refused {
+                        Some(Refusal::Syncing(location)) => Some(location.clone()),
+                        _ => None,
+                    });
                     if let Some(location) = waited
                         && !this.is_busy(&location, cx)
                         && let Some(asked) = this.for_good.as_mut()
@@ -797,6 +803,7 @@ impl LibraryService {
             selected: None,
             anchor: None,
             open: None,
+            copy_of: None,
             read_at: None,
             read_requests: 0,
             loading: false,
@@ -891,10 +898,19 @@ impl LibraryService {
         self.open.as_ref()
     }
 
+    /**
+     * The session the open reader acts on and stands for on its page: the open one, or, while
+     * a copy is read from its original ([`LibraryService::open_kin`]), that original. Star,
+     * Trash and Move act on it, and Back and J / K go from its place.
+     */
+    pub fn reading_for(&self) -> Option<&Session> {
+        self.copy_of.as_ref().or(self.open.as_ref())
+    }
+
     /// The sidebar's selected row (DESIGN §4.1): the page shown, or the folder of the session
     /// being read.
     pub fn highlighted(&self) -> Shelf {
-        match self.open.as_ref() {
+        match self.reading_for() {
             Some(session) if session.trashed.is_some() => Shelf::Trash,
             Some(Session {
                 filed: Filed::ByRule(folder) | Filed::ByHand(folder),
@@ -1165,6 +1181,7 @@ impl LibraryService {
         if self.hold.is_some() {
             self.asked = Some(Leave::Open(Box::new(session), at));
         } else {
+            self.copy_of = None;
             self.open = Some(session);
             self.read_at = at.map(|at| {
                 self.read_requests += 1;
@@ -1192,7 +1209,19 @@ impl LibraryService {
             let read = job.await;
             this.update(cx, |this, cx| match read {
                 Ok(Some(session)) if this.open.as_ref().map(|open| &open.id) == from.as_ref() => {
+                    /* A copy read from its original stands for it; the original read from its
+                    copy is itself again. */
+                    let original = this.copy_of.take().or_else(|| {
+                        this.open
+                            .clone()
+                            .filter(|open| open.copy.is_none() && session.copy.is_some())
+                    });
                     this.open(session, cx);
+                    this.copy_of = original.filter(|original| {
+                        this.open
+                            .as_ref()
+                            .is_some_and(|open| open.id != original.id)
+                    });
                 }
                 Ok(_) => {}
                 Err(error) => log::warn!("a copy of the session could not be read: {error}"),
@@ -1296,7 +1325,7 @@ impl LibraryService {
     /// Where the open session is among the sessions the page it was opened from shows, from 0,
     /// and how many that page shows (DESIGN §4.2.1: "4 of 488"), as filtered and sorted.
     pub fn open_place(&self) -> Option<(usize, usize)> {
-        let id = &self.open.as_ref()?.id;
+        let id = &self.reading_for()?.id;
         let shown = self.shown();
         let at = shown.iter().position(|(shown, _)| shown == id)?;
         Some((at, shown.len()))
@@ -1321,9 +1350,10 @@ impl LibraryService {
         self.open(session, cx);
     }
 
-    /// Stars the open session, or takes its star away.
+    /// Stars the open session, or takes its star away: the original, while a copy of it is
+    /// read ([`LibraryService::reading_for`]).
     pub fn toggle_open_star(&mut self, cx: &mut Context<Self>) {
-        let Some(open) = &mut self.open else {
+        let Some(open) = self.copy_of.as_mut().or(self.open.as_mut()) else {
             return;
         };
         open.starred = !open.starred;
@@ -1850,10 +1880,13 @@ impl LibraryService {
         );
     }
 
-    /// Goes back from the reader to the page it was opened from.
+    /// Goes back from the reader to the page it was opened from; from a copy read from its
+    /// original, back to the original (DESIGN §4.2.8).
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.read_at = None;
-        if self.open.take().is_some() {
+        if let Some(original) = self.copy_of.take() {
+            self.open(original, cx);
+        } else if self.open.take().is_some() {
             cx.notify();
         }
     }
@@ -2092,17 +2125,19 @@ impl LibraryService {
                 .as_ref()
                 .is_none_or(|open| open.session.id == session.id) =>
             {
-                /* Refused as its location was busy, the confirmation says so only while it still
-                is; otherwise it shows its numbers read again, Cancel taking the keyboard back,
-                as for a session that changed. */
-                let busy = self.is_busy(&session.id.location, cx);
+                /* Refused as a location was busy (its own, or one where a copy of it is kept), the
+                confirmation says so only while it still is; otherwise it shows its numbers read
+                again, Cancel taking the keyboard back, as for a session that changed. */
+                let refused = match error {
+                    ArchiveError::Syncing(location) if self.is_busy(&location, cx) => {
+                        Refusal::Syncing(location.clone())
+                    }
+                    _ => Refusal::Changed,
+                };
                 self.for_good = Some(ForGood {
                     session: (**session).clone(),
                     deletion: None,
-                    refused: Some(match error {
-                        ArchiveError::Syncing(_) if busy => Refusal::Syncing,
-                        _ => Refusal::Changed,
-                    }),
+                    refused: Some(refused),
                 });
                 self.read_deletion(cx);
                 return;
@@ -2302,6 +2337,14 @@ impl LibraryService {
             ArchiveError::Catalogue(CatalogueError::DeletionChanged(_)) => format!(
                 "“{title}” wasn't deleted: it changed since it was shown. Ask again to see what \
                  it holds now"
+            ),
+            ArchiveError::Catalogue(CatalogueError::StillIndexing(_)) => format!(
+                "“{title}” wasn't deleted: its copies elsewhere are still being indexed. Try \
+                 again once the index is done"
+            ),
+            ArchiveError::Catalogue(CatalogueError::SeveralTranscripts(_)) => format!(
+                "“{title}” wasn't deleted: it, or a copy of it, holds more than one transcript, \
+                 and only the first can be read"
             ),
             error => format!(
                 "“{title}” couldn't be deleted for good: {}",

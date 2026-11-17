@@ -880,7 +880,8 @@ impl ReaderView {
             .and_then(|session| session.title.as_deref().map(crate::hostile::label))
             .unwrap_or_else(|| "Untitled session".to_string())
             .into();
-        let starred = session.is_some_and(|session| session.starred);
+        /* A copy read from its original stars the original (DESIGN §4.2.8). */
+        let starred = library.reading_for().is_some_and(|session| session.starred);
         let place = library.open_place();
         let full_calls = reader.full_calls();
         let segment = |id: &'static str, label: &'static str, on: bool, full: bool| {

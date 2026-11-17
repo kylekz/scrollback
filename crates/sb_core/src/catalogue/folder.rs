@@ -334,7 +334,9 @@ impl Catalogue {
         })
     }
 
-    /// The sessions out of Trash that the rules may move: what a change of paths refiles.
+    /// The sessions out of Trash that the rules may move and the library shows: what a change
+    /// of paths refiles, as the paths editor counts it. Hidden copies are refiled too
+    /// ([`refile`]), and count for nothing there.
     pub fn fileable(&self) -> Result<Vec<Fileable>> {
         self.db.read(|c| {
             Ok(c.prepare(&format!(
@@ -343,7 +345,7 @@ impl Catalogue {
                        ON st.location_id = s.location_id AND st.provider = s.provider
                       AND st.session = s.session
                      WHERE s.project IS NOT NULL AND COALESCE(st.by_hand, 0) = 0
-                       AND st.trashed_at IS NULL"
+                       AND st.trashed_at IS NULL AND {SHOWN}"
             ))?
             .query_map([], |row| {
                 Ok(Fileable {
@@ -361,7 +363,7 @@ impl Catalogue {
     pub fn project_paths(&self) -> Result<Vec<ProjectPath>> {
         let paths: Vec<ProjectPath> = self.db.read(|c| -> Result<_> {
             Ok(c.prepare(&format!(
-                "SELECT {RAN_AT} AS ran_at, min(s.copy_label), s.project_path, s.project,
+                "SELECT {RAN_AT} AS ran_at, s.copy_label, s.project_path, s.project,
                         count(*), COALESCE(sum(st.folder_id IS NULL), 0)
                  FROM session s
                  LEFT JOIN session_state st
@@ -369,7 +371,7 @@ impl Catalogue {
                   AND st.session = s.session
                  WHERE s.project IS NOT NULL AND s.project_path IS NOT NULL
                    AND st.trashed_at IS NULL AND {SHOWN}
-                 GROUP BY ran_at, s.project_path
+                 GROUP BY ran_at, s.copy_label, s.project_path
                  ORDER BY count(*) DESC, s.project_path"
             ))?
             .query_map([], |row| {

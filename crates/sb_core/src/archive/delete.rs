@@ -167,7 +167,7 @@ impl Archive {
      * as a start does, it then takes the day's backup of the catalogue, once nothing is left to
      * remove.
      */
-    pub(super) fn start_removals(&self, backup: bool) {
+    pub(crate) fn start_removals(&self, backup: bool) {
         let mut job = self
             .removals
             .job

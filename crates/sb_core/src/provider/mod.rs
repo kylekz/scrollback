@@ -23,7 +23,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use toolbox_store::rusqlite;
 
-use crate::transcript::{Outline, Subagent, Transcript};
+use crate::transcript::{CopyOf, Outline, Subagent, Transcript};
 use crate::transport::{Halt, RangeSink, Transport, TransportError};
 
 pub use crate::transport::{Hashed, RangeFailure, Unlisted};
@@ -265,6 +265,16 @@ pub trait Provider: Send + Sync {
      * location too.
      */
     fn classify(&self, key: &str) -> (ItemKind, Option<String>);
+
+    /**
+     * Whether the session `session` (the provider's id for it) is a copy another app keeps of
+     * a session that ran on another machine (PLAN §7.7), and if so, the words it is shown with.
+     * Like [`Provider::classify`], it is said from the id alone, so a copy is known for one
+     * whether or not its transcript can be read.
+     */
+    fn copy_of(&self, _session: &str) -> Option<CopyOf> {
+        None
+    }
 }
 
 /// [`Provider::outlines`] of every subagent of `items`, each read whole with

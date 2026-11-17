@@ -88,9 +88,10 @@ impl SearchService {
     ) -> Self {
         Self {
             _observers: [
-                // Every session opened, from the palette or a page, is a recent one.
+                /* Every session opened, from the palette or a page, is a recent one; a copy read
+                from its original is the original (PLAN §7.7). */
                 cx.observe(&library, |this, library, cx| {
-                    let Some(open) = library.read(cx).open_session() else {
+                    let Some(open) = library.read(cx).reading_for() else {
                         return;
                     };
                     if this.recent_sessions.front().map(|it| &it.id) != Some(&open.id) {
@@ -213,7 +214,7 @@ impl SearchService {
         let job = cx.background_spawn(async move {
             let catalogue = archive.catalogue();
             let sessions: Result<HashMap<SessionId, Option<Session>>, _> = (recent.into_iter())
-                .map(|id| catalogue.session(&id).map(|read| (id, read)))
+                .map(|id| catalogue.shown_session(&id).map(|read| (id, read)))
                 .collect();
             (
                 catalogue.models_and_branches(),
@@ -236,7 +237,8 @@ impl SearchService {
                     this.unsearchable = unsearchable;
                 }
                 /* Merged into the list as it is now, which a session opened meanwhile has joined:
-                each read is as it is now, or leaves the list when it is gone or in Trash. */
+                each read is as it is now, or leaves the list when it is gone, in Trash, or a copy
+                its original now stands in for. */
                 match sessions {
                     Ok(read) => this
                         .recent_sessions

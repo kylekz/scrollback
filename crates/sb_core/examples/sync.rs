@@ -40,7 +40,7 @@
 //! of the user's own data. `test` is the connection test of a location that is reached through
 //! a shell; `distros` lists the WSL distros without starting any.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::path::Path;
 use std::time::Instant;
@@ -232,6 +232,7 @@ fn print_index(catalogue: &Catalogue) -> Result<(), Box<dyn Error>> {
 fn copies(archive: &Archive) -> Result<(), Box<dyn Error>> {
     let catalogue = archive.catalogue();
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut counted = HashSet::new();
     for shelf in [Shelf::All, Shelf::Trash] {
         for session in catalogue.sessions(shelf)? {
             *counts.entry("sessions shown").or_default() += 1;
@@ -240,13 +241,16 @@ fn copies(archive: &Archive) -> Result<(), Box<dyn Error>> {
                     .entry("copies shown alone, with no original")
                     .or_default() += 1;
             }
-            for kin in catalogue.kin(&session.id)? {
-                let what = match (kin.copy.is_some(), kin.compared) {
-                    (false, _) => "originals beside the one shown",
-                    (true, Compared::Same) => "copies hidden: the same as the session shown",
-                    (true, Compared::Shorter) => "copies hidden: behind the session shown",
-                    (true, Compared::Longer) => "copies hidden: ahead of the session shown",
-                    (true, Compared::Differs) => "copies hidden: as long, other bytes",
+            /* A copy behind two originals is counted once. */
+            for kin in archive.kin(&session.id)? {
+                if kin.copy.is_none() || !counted.insert(kin.id) {
+                    continue;
+                }
+                let what = match kin.compared {
+                    Compared::Same => "copies hidden: the same as the session shown",
+                    Compared::Shorter => "copies hidden: behind the session shown",
+                    Compared::Longer => "copies hidden: ahead of the session shown",
+                    Compared::Differs => "copies hidden: neither holds the other",
                 };
                 *counts.entry(what).or_default() += 1;
             }

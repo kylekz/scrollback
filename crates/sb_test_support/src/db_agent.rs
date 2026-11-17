@@ -127,7 +127,6 @@ impl Provider for DbProvider {
             branch: None,
             entrypoint: None,
             conversation: None,
-            copy: None,
         };
         let export = items
             .list()

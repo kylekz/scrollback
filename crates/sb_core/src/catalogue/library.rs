@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use toolbox_store::rusqlite::{self, ToSql, params_from_iter};
+use toolbox_store::rusqlite::{self, OptionalExtension as _, ToSql, params_from_iter};
 
 use super::session::{BY_ACTIVITY, RAN_AT, SESSION, SHOWN, session_from};
 use super::{Catalogue, Result, Session, SessionId};
@@ -109,6 +109,22 @@ impl Catalogue {
                 trash,
                 folders,
             })
+        })
+    }
+
+    /// The session `id`, while the library shows it: not a copy hidden behind its original or
+    /// another copy (PLAN §7.7).
+    pub fn shown_session(&self, id: &SessionId) -> Result<Option<Session>> {
+        self.db.read(|c| {
+            Ok(c.query_row(
+                &format!(
+                    "{SESSION} WHERE s.location_id = ?1 AND s.provider = ?2 AND s.session = ?3
+                       AND {SHOWN}"
+                ),
+                rusqlite::params![id.location, id.provider, id.key],
+                session_from,
+            )
+            .optional()?)
         })
     }
 

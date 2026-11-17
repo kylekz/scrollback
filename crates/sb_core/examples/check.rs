@@ -10,10 +10,12 @@
 //! It also counts the copies an agent's app keeps of sessions that ran elsewhere (PLAN §7.7)
 //! and how each compares with its original, looked for under the home folder itself and under
 //! a second one given with `--with` (a WSL distro's home, through `\\wsl.localhost\…`): the
-//! same, behind it, ahead of it, or different; the copies with no original; the loose subagent
-//! transcripts of copies and how many were attached under a call; and the names of the record
-//! fields seen in copies and in none of their originals, which is where the name of the
-//! machine a copy ran on would be. The second home's sessions are only parsed, to be matched,
+//! same, behind it, ahead of it, or different; the copies with no original, and those the
+//! matching may have missed (an original under the same id started elsewhere, or no project
+//! path); the loose subagent transcripts of copies, how many were attached under a call, and of
+//! those left unattached, how their copies compare; and the names of the record fields seen in
+//! copies and in none of their originals, which is where the name of the machine a copy ran on
+//! would be. The second home's sessions are only parsed, to be matched,
 //! and not counted with the rest.
 //!
 //! ```text
@@ -292,6 +294,8 @@ struct Parsed {
     conversation: Option<String>,
     project_path: Option<String>,
     copy: bool,
+    /// Of a copy, its loose subagent transcripts that no call was found to have started.
+    unattached: u64,
 }
 
 /// What a copy and its original share (PLAN §7.7).
@@ -329,6 +333,8 @@ impl Copies {
             "copies behind their original",
             "copies ahead of their original",
             "copies that differ from their original",
+            "copies with no project path",
+            "copies with no original of their path, but one of their id with another path",
             "loose subagent transcripts of copies",
             "loose subagent transcripts attached under a call",
         ] {
@@ -340,10 +346,15 @@ impl Copies {
         }
     }
 
-    /// Counts the copy whose items are `items` and whose transcript, its subagents read, is
-    /// `transcript`.
-    fn copy(&mut self, items: &[SessionItem], transcript: &Transcript) {
+    /**
+     * Counts the copy whose items are `items` and whose transcript, its subagents read, is
+     * `transcript`. Returns how many of its loose subagent transcripts were left unattached.
+     */
+    fn copy(&mut self, items: &[SessionItem], transcript: &Transcript) -> u64 {
         self.counts.add("copies", 1);
+        if transcript.facts.project_path.is_none() {
+            self.counts.add("copies with no project path", 1);
+        }
         if (items.iter())
             .filter(|item| item.kind == ItemKind::Transcript)
             .count()
@@ -361,28 +372,40 @@ impl Copies {
             .collect();
         self.counts
             .add("loose subagent transcripts of copies", loose.len() as u64);
-        self.counts.add(
-            "loose subagent transcripts attached under a call",
-            loose.difference(&unattached).count() as u64,
-        );
+        let attached = loose.difference(&unattached).count() as u64;
+        self.counts
+            .add("loose subagent transcripts attached under a call", attached);
+        loose.len() as u64 - attached
     }
 
-    /// Counts how the copy's main transcript `copy` compares with its original's, `original`.
-    fn compare(&mut self, copy: &[u8], original: &[u8]) {
-        self.counts.add(
-            if copy == original {
-                "copies the same as their original"
-            } else if original.starts_with(copy) {
-                "copies behind their original"
-            } else if copy.starts_with(original) {
-                "copies ahead of their original"
-            } else {
-                "copies that differ from their original"
-            },
-            1,
-        );
+    /**
+     * Counts how the copy's main transcript `copy` compares with its original's, `original`.
+     * Returns how it compares, as the copies are counted.
+     */
+    fn compare(&mut self, copy: &[u8], original: &[u8]) -> &'static str {
+        let what = if copy == original {
+            "the same as their original"
+        } else if original.starts_with(copy) {
+            "behind their original"
+        } else if copy.starts_with(original) {
+            "ahead of their original"
+        } else {
+            "that differ from their original"
+        };
+        self.counts.add(format!("copies {what}"), 1);
         for field in fields(copy).difference(&fields(original)) {
             self.fields.add(field.as_str(), 1);
+        }
+        what
+    }
+
+    /// Counts `unattached` loose subagent transcripts left unattached of a copy `what` says.
+    fn unattached(&mut self, unattached: u64, what: &str) {
+        if unattached > 0 {
+            self.counts.add(
+                format!("loose subagent transcripts left unattached, of copies {what}"),
+                unattached,
+            );
         }
     }
 
@@ -455,7 +478,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     length: item.length,
                 });
             }
-            for mut list in sessions.into_values() {
+            for (key, mut list) in sessions {
                 /* A session's sidecars alone are no session. */
                 if !list
                     .iter()
@@ -466,6 +489,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 list.sort_by(|a, b| a.key.cmp(&b.key));
                 let items = Session { source, list };
                 let mut transcript = provider.parse(&items);
+                let copy = provider.copy_of(&key).is_some();
+                let mut unattached = 0;
+                if home == 0 {
+                    transcript.read_subagents(provider.as_ref(), &items);
+                    totals.session(&transcript);
+                    if copy {
+                        unattached = copies.copy(&items.list, &transcript);
+                    }
+                }
                 parsed.push(Parsed {
                     home,
                     source: at,
@@ -473,15 +505,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     list: items.list.clone(),
                     conversation: transcript.facts.conversation.clone(),
                     project_path: transcript.facts.project_path.clone(),
-                    copy: transcript.facts.copy.is_some(),
+                    copy,
+                    unattached,
                 });
                 if home > 0 {
                     continue;
-                }
-                transcript.read_subagents(provider.as_ref(), &items);
-                totals.session(&transcript);
-                if transcript.facts.copy.is_some() {
-                    copies.copy(&items.list, &transcript);
                 }
                 let Some(audit) = provider::audit(provider.id(), &items, &transcript) else {
                     continue;
@@ -515,14 +543,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         Ok(bytes)
     };
     let mut originals: HashMap<Shared<'_>, Vec<&Parsed>> = HashMap::new();
+    let mut ids: HashSet<(ProviderId, &str)> = HashSet::new();
     for session in parsed.iter().filter(|session| !session.copy) {
         if let Some(conversation) = session.conversation() {
             originals.entry(conversation).or_default().push(session);
+            ids.insert((conversation.0, conversation.1));
         }
     }
     for copy in (parsed.iter()).filter(|session| session.copy && session.home == 0) {
         let Some(found) = (copy.conversation()).and_then(|it| originals.get(&it)) else {
             copies.counts.add("copies with no original", 1);
+            copies.unattached(copy.unattached, "with no original");
+            /* A likely miss of the matching: an original under the same id, started elsewhere. */
+            if (copy.conversation()).is_some_and(|it| ids.contains(&(it.0, it.1))) {
+                copies.counts.add(
+                    "copies with no original of their path, but one of their id with another path",
+                    1,
+                );
+            }
             continue;
         };
         if found.len() > 1 {
@@ -536,7 +574,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             },
             1,
         );
-        copies.compare(&read(copy)?, &read(found[0])?);
+        let what = copies.compare(&read(copy)?, &read(found[0])?);
+        copies.unattached(copy.unattached, what);
     }
     totals.print();
     copies.print();

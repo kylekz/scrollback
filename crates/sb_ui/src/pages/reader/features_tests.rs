@@ -568,14 +568,38 @@ fn an_original_with_a_longer_copy_reads_the_copy_and_back(cx: &mut TestAppContex
     assert_eq!(originals.len(), 1);
     assert_eq!((&originals[0].id, &originals[0].copy), (&original, &None));
     assert_eq!(originals[0].compared, Compared::Shorter);
-    /* It is no session of the page's: the page lists the original alone. */
-    cx.update(|_, cx| {
+    /* It is no session of the page's: the page lists the original alone, and the reader
+    stands in the original's place there, J and K going on from it. */
+    let place = cx.update(|_, cx| {
         let library = cx.services().library.read(cx);
         let titled = (library.sessions().unwrap().sessions.iter())
             .filter(|session| session.title.as_deref() == Some("Copied over SSH"))
             .count();
         assert_eq!(titled, 1);
+        assert_eq!(library.reading_for().map(|it| &it.id), Some(&original));
+        library.open_place()
     });
+    assert!(place.is_some());
+    /* Star acts on the original. */
+    library.update(cx, |library, cx| library.toggle_open_star(cx));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let library = cx.services().library.read(cx);
+        let page = library.sessions().unwrap();
+        let listed = (page.sessions.iter())
+            .find(|session| session.id == original)
+            .unwrap();
+        assert!(listed.starred);
+        assert!(!library.open_session().unwrap().starred);
+    });
+    /* Back goes to the original, and from there to the page. */
+    library.update(cx, |library, cx| library.close(cx));
+    cx.run_until_parked();
+    draw(cx);
+    assert_eq!(kin(cx).0, original);
+    library.update(cx, |library, cx| library.close(cx));
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| cx.services().library.read(cx).open_session().is_none()));
 }
 
 /// How long Find takes over the reader's budget session (PLAN §14), in release:

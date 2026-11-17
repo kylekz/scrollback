@@ -2023,7 +2023,7 @@ fn parse(
                 })
                 .then_some(verify.at)
         });
-    let kin = catalogue.kin(id).unwrap_or_else(|error| {
+    let kin = archive.kin(id).unwrap_or_else(|error| {
         log::warn!("the copies of a session could not be read: {error}");
         Vec::new()
     });

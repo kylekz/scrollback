@@ -181,28 +181,40 @@ impl ProjectsTree {
         let folder = format!("ssh-00000000-0000-4000-9000-{:012x}", self.sessions);
         let key = format!("projects/{folder}/{}.jsonl", session.id);
         let transcript = session.transcript.copied_to(self.path(&key));
-        let mut subagents = Vec::new();
+        let mut copy = DesktopCopy {
+            folder,
+            key,
+            transcript,
+            subagents: Vec::new(),
+        };
+        self.copy_subagents(&mut copy, session);
+        copy
+    }
+
+    /**
+     * Copies into `copy` the subagent transcripts `session` has that it lacks, loose, as the
+     * desktop app keeps them apart from the transcript: a subagent started after the copy's
+     * transcript stops is there all the same.
+     */
+    pub fn copy_subagents(&self, copy: &mut DesktopCopy, session: &Session) {
         let mut within = vec![session.root.join(&session.dir).join("subagents")];
         while let Some(dir) = within.pop() {
             for entry in fs::read_dir(&dir).into_iter().flatten() {
                 let path = entry.unwrap().path();
                 let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                let key = format!("projects/{}/{name}", copy.folder);
                 if path.is_dir() {
                     within.push(path);
-                } else if name.starts_with("agent-") && name.ends_with(".jsonl") {
-                    let key = format!("projects/{folder}/{name}");
+                } else if name.starts_with("agent-")
+                    && name.ends_with(".jsonl")
+                    && !copy.subagents.contains(&key)
+                {
                     write(&self.path(&key), &fs::read(&path).unwrap());
-                    subagents.push(key);
+                    copy.subagents.push(key);
                 }
             }
         }
-        subagents.sort();
-        DesktopCopy {
-            folder,
-            key,
-            transcript,
-            subagents,
-        }
+        copy.subagents.sort();
     }
 
     /// Writes the session `outline` describes: its prompt, one reply with its tool calls, and
@@ -1066,6 +1078,12 @@ impl Agent for FileAgent {
         lines[0] = first.to_string() + "\n";
         self.overwrite(key, lines.concat().as_bytes());
         self.session(key).append(1);
+    }
+
+    fn started_elsewhere(&mut self, key: &str) {
+        let text = String::from_utf8(self.content(key)).unwrap();
+        let moved = text.replace(PROJECT, &format!("{PROJECT}-elsewhere"));
+        self.overwrite(key, moved.as_bytes());
     }
 
     fn rewrite_same_size(&mut self, key: &str) {

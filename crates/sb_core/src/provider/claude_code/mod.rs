@@ -15,21 +15,24 @@
 //! | anything else (`memory/…`, an index file) | a sidecar of no session |
 //!
 //! A file or folder belongs to a session when its name is the id or starts with it and a `.`.
-//!
-//! **The desktop app's copies** (PLAN §7.3, §7.7). A project folder named `ssh-<id>` is not a
-//! project's: it is where the Claude desktop app keeps its copy of one session it ran over SSH
-//! on another machine. The folder is the session: its `<session>.jsonl` is the transcript,
-//! under the original's id, and `agent-<id>.jsonl` beside it are its subagents' transcripts,
-//! loose rather than under `<session>/subagents/`. The session is marked a copy, so that the
-//! library shows its original in its place once that is archived.
 //! A session's folder can be there without its transcript, and the transcript without the
 //! folder. `<project>` is the starting directory with its punctuation replaced by `-`, so it
 //! can't be turned back into a path and is not read here. Every `.jsonl` file is appended to
 //! line by line.
 //!
-//! This provider's id for a session is `<project>/<session>`, or for a copy its folder. The id alone is not enough: the
+//! This provider's id for a session is `<project>/<session>`. The id alone is not enough: the
 //! same one is found under two projects' folders, and those are two transcripts, each with
 //! what goes with it.
+//!
+//! **The desktop app's copies** (PLAN §7.3, §7.7). A project folder named `ssh-<id>` is not a
+//! project's: it is where the Claude desktop app keeps its copy of one session it ran over SSH
+//! on another machine, and the folder is that session, its id the folder's name. Its
+//! `<session>.jsonl` is the transcript, under the original's id, and the `agent-<id>.jsonl`
+//! beside it are its subagents' transcripts, loose rather than under `<session>/subagents/`;
+//! the rest is as in a project's folder. Only the first transcript of a folder is read, as of
+//! any session; a folder with more has not been seen. [`Agent::copy_of`] says from the id alone
+//! that the session is a copy, so the library shows its original in its place once that is
+//! archived.
 //!
 //! [`parse`] turns a session's archived files into the transcript model, [`tools`] maps
 //! Claude Code's tools onto the common kinds, and [`audit`] counts a session's records another
@@ -142,6 +145,13 @@ impl Provider for Agent {
     fn classify(&self, key: &str) -> (ItemKind, Option<String>) {
         let class = classify(key);
         (class.kind, class.session)
+    }
+
+    fn copy_of(&self, session: &str) -> Option<CopyOf> {
+        is_copy(session).then(|| CopyOf {
+            label: COPY_LABEL.to_string(),
+            origin: COPY_ORIGIN.to_string(),
+        })
     }
 }
 
@@ -284,14 +294,6 @@ fn classify(key: &str) -> FileClass {
 fn is_copy(name: &str) -> bool {
     name.strip_prefix(COPY_FOLDER)
         .is_some_and(|rest| !rest.is_empty())
-}
-
-/// What the session that has the item `key` is a copy of, if it is the desktop app's copy.
-fn copy_of(key: &str) -> Option<CopyOf> {
-    is_copy(key.split('/').nth(1)?).then(|| CopyOf {
-        label: COPY_LABEL.to_string(),
-        origin: COPY_ORIGIN.to_string(),
-    })
 }
 
 /// The session id that leads `name`, the name of a file or folder in a project: a UUID, alone
@@ -439,8 +441,13 @@ mod source_tests {
             class(Sidecar, None, true)
         );
         assert_eq!(classify("projects/ssh-"), class(Sidecar, None, false));
-        assert!(copy_of(&format!("projects/{FOLDER}/{ID}.jsonl")).is_some());
-        assert!(copy_of(&format!("projects/-home-user-code-app/{ID}.jsonl")).is_none());
+        assert!(Agent.copy_of(FOLDER).is_some());
+        assert!(
+            Agent
+                .copy_of(&format!("-home-user-code-app/{ID}"))
+                .is_none()
+        );
+        assert!(Agent.copy_of("ssh-").is_none());
     }
 
     #[test]

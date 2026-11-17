@@ -4,6 +4,7 @@
 //! kept it. The copies here are the first provider's desktop app's (PLAN §7.3), generated.
 
 use std::fs;
+use std::path::Path;
 use std::slice;
 use std::time::{Duration, SystemTime};
 
@@ -11,15 +12,18 @@ use pretty_assertions::assert_eq;
 use sb_core::CancelToken;
 use sb_core::archive::Archive;
 use sb_core::catalogue::{
-    Catalogue, Compared, Filed, Kin, LibraryCounts, Session, SessionId, Shelf,
+    Catalogue, CatalogueError, Compared, Filed, Kin, LibraryCounts, Session, SessionId, Shelf,
 };
 use sb_core::filing::FolderId;
 use sb_core::location::{LocationId, LocationKind};
 use sb_core::provider;
 use sb_core::search::{Filters, Limit, Query, Searched};
-use sb_core::sync::sync_location;
+use sb_core::sync::{index, sync_location};
 use sb_core::transcript::Subagent;
-use sb_test_support::{DesktopCopy, ProjectsTree, Session as Written};
+use sb_core::transport::Transport;
+use sb_test_support::{
+    DesktopCopy, ProjectsTree, Session as Written, edit_catalogue, read_catalogue,
+};
 use tempfile::TempDir;
 
 const PROJECT: &str = "/home/user/code/app";
@@ -79,28 +83,68 @@ impl Machines {
         session
     }
 
+    /// The archive's folder.
+    fn dir(&self) -> &Path {
+        self._dir.path()
+    }
+
     /// Syncs this machine, and with `distro` the distro too, each with every provider.
     fn sync(&self, distro: bool) {
-        let mut places = vec![(&self.here, self.pc.transport())];
+        self.sync_at(&self.here, &self.pc.transport());
         if distro {
-            places.push((&self.distro, self.remote.transport()));
+            self.sync_at(&self.distro, &self.remote.transport());
         }
-        for (location, transport) in places {
-            for pass in sync_location(
-                &self.archive,
-                location,
-                &transport,
-                &provider::builtin(),
-                &CancelToken::new(),
-                &mut |_| {},
+    }
+
+    /// Syncs `location` through `transport` with every provider.
+    fn sync_at(&self, location: &LocationId, transport: &dyn Transport) {
+        for pass in sync_location(
+            &self.archive,
+            location,
+            transport,
+            &provider::builtin(),
+            &CancelToken::new(),
+            &mut |_| {},
+        )
+        .unwrap()
+        {
+            let report = pass.outcome.unwrap();
+            assert!(report.failed.is_empty(), "{:?}", report.failed);
+            pass.index.unwrap();
+        }
+    }
+
+    /// Indexes what is out of date, as a start does.
+    fn index(&self) {
+        index(
+            &self.archive,
+            None,
+            &provider::builtin(),
+            &CancelToken::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+    }
+
+    /// A host over SSH, as a third location.
+    fn add_host(&self) -> LocationId {
+        self.catalogue()
+            .add_location(
+                LocationKind::Ssh {
+                    host: "user@macbook".to_string(),
+                },
+                "user@macbook",
             )
             .unwrap()
-            {
-                let report = pass.outcome.unwrap();
-                assert!(report.failed.is_empty(), "{:?}", report.failed);
-                pass.index.unwrap();
-            }
-        }
+            .id
+    }
+
+    /// Moves the session `id` to Trash and deletes it for good, with what goes with it.
+    fn delete(&self, id: &SessionId) {
+        self.catalogue().trash(id).unwrap();
+        let deletion = self.catalogue().deletion(id).unwrap();
+        self.archive.delete_for_good(&deletion).unwrap();
+        self.archive.wait_for_removals();
     }
 
     fn shown(&self, shelf: Shelf) -> Vec<Session> {
@@ -191,7 +235,7 @@ fn an_identical_copy_is_shown_once_as_its_original() {
     let hidden = machines.catalogue().session(&copy_id).unwrap().unwrap();
     assert!(hidden.copy.is_some() && hidden.ran_at().is_none());
     assert_eq!(
-        machines.catalogue().kin(&shown.id).unwrap(),
+        machines.archive.kin(&shown.id).unwrap(),
         [Kin {
             id: copy_id.clone(),
             copy: hidden.copy.clone(),
@@ -199,7 +243,7 @@ fn an_identical_copy_is_shown_once_as_its_original() {
         }]
     );
     assert_eq!(
-        machines.catalogue().kin(&copy_id).unwrap(),
+        machines.archive.kin(&copy_id).unwrap(),
         [Kin {
             id: shown.id.clone(),
             copy: None,
@@ -238,10 +282,7 @@ fn a_copy_behind_or_ahead_of_its_original_is_compared_and_hidden() {
     assert_eq!(shown.len(), 2);
     assert!(shown.iter().all(|session| session.copy.is_none()));
     let compared = |session: &Written| {
-        let kin = machines
-            .catalogue()
-            .kin(&machines.original(session))
-            .unwrap();
+        let kin = machines.archive.kin(&machines.original(session)).unwrap();
         assert_eq!(kin.len(), 1);
         kin[0].compared
     };
@@ -389,15 +430,29 @@ fn trash_hides_the_session_and_its_copy_and_delete_for_good_takes_both() {
     assert_eq!((counts.all, counts.trash), (0, 1));
 
     let deletion = catalogue.deletion(&original).unwrap();
-    assert_eq!(deletion.copies.len(), 1);
-    assert_eq!(deletion.copies[0].session, copy_id);
-    assert!(deletion.copies[0].files >= 2);
+    assert_eq!(deletion.also.len(), 1);
+    assert_eq!(deletion.also[0].session, copy_id);
+    assert!(deletion.also[0].copy.is_some() && deletion.also[0].at_location);
+    assert!(deletion.also[0].files >= 2);
     machines.archive.delete_for_good(&deletion).unwrap();
     machines.archive.wait_for_removals();
     for id in [&original, &copy_id] {
         assert_eq!(catalogue.session(id).unwrap(), None);
     }
-    assert_eq!(catalogue.tombstones().unwrap().len(), 2);
+    /* Settings lists the copy under its original, and allows both again at once. */
+    let tombstones = catalogue.tombstones().unwrap();
+    assert_eq!(tombstones.len(), 1);
+    assert_eq!(
+        (&tombstones[0].session, tombstones[0].copy.as_deref()),
+        (&original, None)
+    );
+    assert_eq!(tombstones[0].with.len(), 1);
+    assert_eq!(tombstones[0].with[0].session, copy_id);
+    assert!(tombstones[0].with[0].copy.is_some());
+    let allowed = catalogue.remove_tombstone(&original).unwrap();
+    assert_eq!(catalogue.tombstones().unwrap(), []);
+    machines.archive.restore_tombstone(&allowed).unwrap();
+    assert_eq!(catalogue.tombstones().unwrap(), tombstones);
     assert!(machines.shown(Shelf::All).is_empty() && machines.shown(Shelf::Trash).is_empty());
     /* Neither comes back with the next syncs. */
     machines.sync(true);
@@ -406,35 +461,24 @@ fn trash_hides_the_session_and_its_copy_and_delete_for_good_takes_both() {
 }
 
 #[test]
-fn deleting_one_of_two_originals_leaves_the_copy_hidden_behind_the_other() {
+fn deleting_the_original_also_takes_the_same_session_from_another_location() {
     let mut machines = Machines::new();
     let session = machines.ran_remotely("upload");
     machines.pc.desktop_copy(&session);
     /* The same session archived from a second location: the same distro reached over SSH. */
-    let host = machines
-        .catalogue()
-        .add_location(
-            LocationKind::Ssh {
-                host: "user@macbook".to_string(),
-            },
-            "user@macbook",
-        )
-        .unwrap()
-        .id;
+    let host = machines.add_host();
     machines.sync(true);
-    sync_location(
-        &machines.archive,
-        &host,
-        &machines.remote.transport(),
-        &provider::builtin(),
-        &CancelToken::new(),
-        &mut |_| {},
-    )
-    .unwrap();
+    machines.sync_at(&host, &machines.remote.transport());
     assert_eq!(machines.shown(Shelf::All).len(), 2);
     let original = machines.original(&session);
     machines.catalogue().trash(&original).unwrap();
-    assert_eq!(machines.catalogue().deletion(&original).unwrap().copies, []);
+    let deletion = machines.catalogue().deletion(&original).unwrap();
+    let also: Vec<(&LocationId, bool)> = (deletion.also.iter())
+        .map(|also| (&also.session.location, also.copy.is_some()))
+        .collect();
+    assert_eq!(also, [(&host, false), (&machines.here, true)]);
+    machines.archive.delete_for_good(&deletion).unwrap();
+    assert!(machines.shown(Shelf::All).is_empty());
 }
 
 #[test]
@@ -450,7 +494,7 @@ fn a_copy_of_another_conversation_under_the_same_id_is_not_merged() {
     assert_eq!(shown.len(), 2, "{shown:#?}");
     assert!(
         machines
-            .catalogue()
+            .archive
             .kin(&machines.original(&session))
             .unwrap()
             .is_empty()
@@ -458,15 +502,297 @@ fn a_copy_of_another_conversation_under_the_same_id_is_not_merged() {
     assert_eq!(machines.counts().all, 2);
 }
 
+/// Of two lone copies the one archived first is shown, and stays shown as the other grows.
 #[test]
-fn of_two_copies_with_no_original_the_one_active_last_is_shown() {
+fn of_two_copies_with_no_original_the_one_shown_stays_shown() {
     let mut machines = Machines::new();
     let session = machines.ran_remotely("upload");
-    machines.pc.desktop_copy(&session);
+    let first = machines.pc.desktop_copy(&session);
     let mut later = machines.pc.desktop_copy(&session);
     later.transcript.prompt("One more thing");
     machines.sync(false);
-
-    assert_eq!(machines.the_one().id, machines.copy(&later));
+    assert_eq!(machines.the_one().id, machines.copy(&first));
     assert_eq!(machines.counts().all, 1);
+
+    later.transcript.prompt("And another");
+    machines.sync(false);
+    assert_eq!(machines.the_one().id, machines.copy(&first));
+
+    /* What the owner decides of the one shown keeps it shown, in Trash too. */
+    machines.catalogue().trash(&machines.copy(&first)).unwrap();
+    later.transcript.prompt("And a third");
+    machines.sync(false);
+    assert!(machines.shown(Shelf::All).is_empty());
+    assert_eq!(machines.shown(Shelf::Trash)[0].id, machines.copy(&first));
+}
+
+/// A copy in Trash whose original arrives: the original is in Trash, and the copy has nothing
+/// decided of it left.
+#[test]
+fn an_original_takes_a_shown_copys_trash_and_the_copy_keeps_none() {
+    let mut machines = Machines::new();
+    let session = machines.ran_remotely("upload");
+    let copy = machines.pc.desktop_copy(&session);
+    machines.sync(false);
+    let copy_id = machines.copy(&copy);
+    machines.catalogue().trash(&copy_id).unwrap();
+
+    machines.sync(true);
+    let original = machines.original(&session);
+    let trash = machines.shown(Shelf::Trash);
+    assert_eq!(trash.len(), 1);
+    assert_eq!(trash[0].id, original);
+    assert!(machines.shown(Shelf::All).is_empty());
+    let left = read_catalogue(
+        machines.dir(),
+        &format!(
+            "SELECT count(*) FROM session_state WHERE session = '{}'",
+            copy_id.key
+        ),
+    );
+    assert_eq!(left, ["0"]);
+}
+
+/**
+ * An archive from before copies were known: the owner trashed the duplicate a desktop copy made
+ * and kept its original. Neither the index that knows copies now nor a rebuild of the index
+ * moves that Trash onto the original.
+ */
+#[test]
+fn a_duplicate_trashed_before_copies_were_known_leaves_its_original_alone() {
+    let mut machines = Machines::new();
+    let session = machines.ran_remotely("upload");
+    let copy = machines.pc.desktop_copy(&session);
+    machines.sync(true);
+    let (original, copy_id) = (machines.original(&session), machines.copy(&copy));
+    /* As 0.1.0 left it: the copy a session of this machine, in Trash; nothing decided of its
+    original. */
+    edit_catalogue(
+        machines.dir(),
+        &format!(
+            "UPDATE session SET copy_label = NULL, copy_origin = NULL WHERE session = '{0}';
+             INSERT INTO session_state (location_id, provider, session, trashed_at)
+             VALUES ('{1}', '{2}', '{0}', 1);",
+            copy_id.key,
+            copy_id.location.as_str(),
+            copy_id.provider
+        ),
+    );
+    machines.index();
+    assert_eq!(machines.the_one().id, original);
+    machines.catalogue().drop_index().unwrap();
+    machines.index();
+    let shown = machines.the_one();
+    assert_eq!((&shown.id, shown.trashed), (&original, None));
+}
+
+/// A session deleted for good before its copy was archived: the copy is not archived after.
+#[test]
+fn a_copy_arriving_after_its_original_was_deleted_for_good_is_deleted_too() {
+    let mut machines = Machines::new();
+    let session = machines.ran_remotely("upload");
+    machines.sync(true);
+    let original = machines.original(&session);
+    machines.delete(&original);
+
+    let copy = machines.pc.desktop_copy(&session);
+    machines.sync(false);
+    machines.archive.wait_for_removals();
+    assert!(machines.shown(Shelf::All).is_empty() && machines.shown(Shelf::Trash).is_empty());
+    assert_eq!(
+        machines.catalogue().session(&machines.copy(&copy)).unwrap(),
+        None
+    );
+    assert_eq!(machines.found("upload", Filters::default()), []);
+    /* Its keys are tombstoned: the next sync takes nothing of it. */
+    machines.sync(false);
+    assert!(
+        (machines
+            .catalogue()
+            .items(&machines.here, &original.provider)
+            .unwrap())
+        .iter()
+        .all(|item| !item.key.contains(&copy.folder))
+    );
+}
+
+/// A lone copy deleted for good, then its machine added: the original is not archived.
+#[test]
+fn an_original_arriving_after_its_copy_was_deleted_for_good_is_deleted_too() {
+    let mut machines = Machines::new();
+    let session = machines.ran_remotely("upload");
+    let copy = machines.pc.desktop_copy(&session);
+    machines.sync(false);
+    machines.delete(&machines.copy(&copy));
+
+    machines.sync(true);
+    machines.archive.wait_for_removals();
+    assert!(machines.shown(Shelf::All).is_empty());
+    assert_eq!(
+        machines
+            .catalogue()
+            .session(&machines.original(&session))
+            .unwrap(),
+        None
+    );
+}
+
+/// While the index of an upgrade has not reached a session's copies, they don't say what they
+/// are copies of: deleting the session for good waits for it.
+#[test]
+fn delete_for_good_waits_for_the_conversation_to_be_indexed() {
+    let mut machines = Machines::new();
+    let session = machines.ran_remotely("upload");
+    let copy = machines.pc.desktop_copy(&session);
+    machines.sync(true);
+    let original = machines.original(&session);
+    machines.catalogue().trash(&original).unwrap();
+    /* As an older index left the copy's row. */
+    edit_catalogue(
+        machines.dir(),
+        &format!(
+            "UPDATE session SET conversation = NULL, copy_label = NULL, copy_origin = NULL,
+                 index_version = 2
+             WHERE session = '{}'",
+            machines.copy(&copy).key
+        ),
+    );
+    assert!(matches!(
+        machines.catalogue().deletion(&original),
+        Err(CatalogueError::StillIndexing(_))
+    ));
+    machines.index();
+    assert_eq!(
+        machines.catalogue().deletion(&original).unwrap().also.len(),
+        1
+    );
+}
+
+/// A copy folder holding two transcripts, of which only the first is read, is not deleted.
+#[test]
+fn a_copy_with_two_transcripts_is_not_deleted_for_good() {
+    let mut machines = Machines::new();
+    let session = machines.ran_remotely("upload");
+    let copy = machines.pc.desktop_copy(&session);
+    let other = machines.remote.session(PROJECT, 2);
+    let second = format!("projects/{}/{}.jsonl", copy.folder, other.id);
+    fs::copy(machines.remote.path(&other.key), machines.pc.path(&second)).unwrap();
+    machines
+        .pc
+        .set_modified(&second, SystemTime::now() - Duration::from_secs(3600));
+    machines.sync(false);
+    let copy_id = machines.copy(&copy);
+    machines.catalogue().trash(&copy_id).unwrap();
+    assert!(matches!(
+        machines.catalogue().deletion(&copy_id),
+        Err(CatalogueError::SeveralTranscripts(_))
+    ));
+}
+
+/**
+ * A subagent started after where a copy that is behind its original stops: the desktop app
+ * keeps its transcript all the same, and no call of the copy's started it. It is the copy's,
+ * unattached, read on its own.
+ */
+#[test]
+fn a_loose_subagent_past_where_a_copy_stops_is_unattached() {
+    let mut machines = Machines::new();
+    let mut session = machines.ran_remotely("upload");
+    let mut copy = machines.pc.desktop_copy(&session);
+    let later = session.subagent(2);
+    machines.pc.copy_subagents(&mut copy, &session);
+    machines.sync(false);
+
+    let id = machines.copy(&copy);
+    let items = machines.archive.session(&id).unwrap();
+    let provider = &provider::builtin()[0];
+    let mut transcript = provider.parse(&items);
+    transcript.read_subagents(provider.as_ref(), &items);
+    let unattached: Vec<&str> = (transcript.unattached.iter())
+        .map(|subagent| &**subagent.item())
+        .collect();
+    let name = later.rsplit('/').next().unwrap();
+    assert_eq!(unattached.len(), 1);
+    assert!(unattached[0].ends_with(name), "{unattached:?}");
+    assert!(matches!(transcript.unattached[0], Subagent::Read { .. }));
+}
+
+/// A copy as long as it is shorter than its original, but not its start: it differs.
+#[test]
+fn a_shorter_copy_that_is_not_the_originals_start_differs() {
+    let mut machines = Machines::new();
+    let mut session = machines.ran_remotely("upload");
+    let copy = machines.pc.desktop_copy(&session);
+    rewrite(&machines.pc, &copy.key, "Looking.", "Lookin'.");
+    session.append(2);
+    machines.sync(true);
+    let kin = machines.archive.kin(&machines.original(&session)).unwrap();
+    assert_eq!(kin[0].compared, Compared::Differs);
+}
+
+/// A copy's hidden twin counts nowhere: not in the paths editor's preview, nor in Settings.
+#[test]
+fn hidden_copies_are_counted_nowhere() {
+    let mut machines = Machines::new();
+    let session = machines.ran_remotely("upload");
+    machines.pc.desktop_copy(&session);
+    machines.sync(true);
+    let catalogue = machines.catalogue();
+    assert_eq!(catalogue.fileable().unwrap().len(), 1);
+    assert_eq!(catalogue.totals().unwrap().sessions, 1);
+    let original = machines.original(&session);
+    assert!(catalogue.shown_session(&original).unwrap().is_some());
+    let copy = &machines.archive.kin(&original).unwrap()[0].id;
+    assert_eq!(catalogue.shown_session(copy).unwrap(), None);
+}
+
+/**
+ * An archive from before copies were classified, whose desktop copy the owner deleted for
+ * good then (its transcript under the session `ssh-…/<id>`), and whose loose subagent
+ * transcripts, then no session's, stayed: classified again, they are not a session brought
+ * back, and a sync brings back none of it.
+ */
+#[test]
+fn a_copy_deleted_before_copies_were_known_is_not_brought_back_by_its_subagents() {
+    let mut machines = Machines::new();
+    let session = machines.ran_remotely("upload");
+    let copy = machines.pc.desktop_copy(&session);
+    machines.sync(false);
+    let provider = provider::builtin()[0].id().as_str();
+    let old = format!("{}/{}", copy.folder, session.id);
+    let location = machines.here.as_str().to_string();
+    /* As the first classification and a delete for good of 0.1.0 left it. */
+    edit_catalogue(
+        machines.dir(),
+        &format!(
+            "DELETE FROM session;
+             DELETE FROM session_state;
+             UPDATE item SET kind = 'sidecar', session = NULL
+                 WHERE key LIKE 'projects/{folder}/agent-%';
+             DELETE FROM segment WHERE version_id IN (
+                 SELECT v.id FROM version v JOIN item i ON i.id = v.item_id WHERE i.key = '{key}');
+             DELETE FROM version WHERE item_id IN (SELECT id FROM item WHERE key = '{key}');
+             DELETE FROM item WHERE key = '{key}';
+             INSERT INTO tombstone (location_id, provider, session, deleted_at)
+                 VALUES ('{location}', '{provider}', '{old}', 1);
+             INSERT INTO tombstone_item (location_id, provider, key, session)
+                 VALUES ('{location}', '{provider}', '{key}', '{old}');
+             UPDATE location_provider SET classified_by = 1;",
+            folder = copy.folder,
+            key = copy.key,
+        ),
+    );
+    machines.index();
+    machines.archive.wait_for_removals();
+    assert!(machines.shown(Shelf::All).is_empty());
+    assert!(
+        (machines
+            .catalogue()
+            .items(&machines.here, provider)
+            .unwrap())
+        .iter()
+        .all(|item| !item.key.contains(&copy.folder))
+    );
+    machines.sync(false);
+    assert!(machines.shown(Shelf::All).is_empty());
 }

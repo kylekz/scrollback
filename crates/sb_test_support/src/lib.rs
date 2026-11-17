@@ -234,6 +234,13 @@ pub trait Agent {
     /// A session of `records` records appears under the key of one that was deleted.
     fn recreate(&mut self, key: &str, records: usize);
 
+    /**
+     * The session's records say it started in another directory: under the same key, another
+     * conversation than a session of this key elsewhere (PLAN §7.7). An agent whose provider
+     * names no conversation has nothing to change.
+     */
+    fn started_elsewhere(&mut self, _key: &str) {}
+
     /// The bytes the item `key` holds at the source now.
     fn content(&self, key: &str) -> Vec<u8>;
 

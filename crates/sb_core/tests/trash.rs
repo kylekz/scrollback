@@ -319,7 +319,7 @@ fn deleting_for_good_removes_the_sessions_files_and_rows_and_nothing_else<A: Age
                     .sum::<u64>())
                 .sum(),
             at_location: true,
-            copies: Vec::new(),
+            also: Vec::new(),
         }
     );
     let files_before = snapshot(&bench.dir().join("files"));
@@ -938,8 +938,9 @@ fn a_session_that_changed_since_it_was_shown_is_not_deleted<A: Agent + Default>(
 
 /**
  * Another location can hold a session of the same key: the same agent's session ids at two
- * machines. Deleting one leaves the other's rows and files as they were, and the other's
- * syncs go on.
+ * machines, of two conversations (one of the same conversation goes with it, PLAN §4.5, and is
+ * tested with copies). Deleting one leaves the other's rows and files as they were, and the
+ * other's syncs go on.
  */
 fn a_session_of_the_same_key_at_another_location_is_left_alone<A: Agent + Default>() {
     let mut agent = A::default();
@@ -947,6 +948,7 @@ fn a_session_of_the_same_key_at_another_location_is_left_alone<A: Agent + Defaul
     let bench = Bench::new(agent);
     let mut there = A::default();
     assert_eq!(there.add_session(3), key);
+    there.started_elsewhere(&key);
     let elsewhere = bench
         .archive()
         .catalogue()

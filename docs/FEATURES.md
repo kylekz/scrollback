@@ -73,7 +73,8 @@ The layout is concept E on the design canvas (`design/project/E-Reader.dc.html`,
 - **Copies of a session kept on another machine are shown once.** An agent's app can keep its own copy of a session it ran on another machine: the Claude desktop app, running Claude Code over SSH (into a WSL distro or a Mac), keeps a copy on the PC it runs on. Both are archived (a copy may outlive its original), and the library shows the session once:
   - **as the original,** from the location it ran at, whenever that is archived. Where the copy holds more than the original (the location hasn't synced since), the reader says so and can open the copy.
   - **as the copy** while no original is archived (its machine isn't a location yet), marked as the app's copy and never attributed to the machine that kept it: it is from an unknown machine in every place that names a location (cards, filters, Unsorted, the paths editor, filing, counts).
-  - Star, Trash and folder belong to the session shown; when an original arrives for a copy that was shown, it takes them over. Deleting a session for good deletes the copies of it as well, and the confirmation says so.
+  - Star, Trash and folder belong to the session shown; when an original arrives for a copy that was shown, it takes them over. A copy read from its original stands for it: Back returns to the original, and Star acts on it.
+  - **Deleting a session for good deletes its conversation**: its copies and the same session archived from another location go with it, the confirmation says so, and no location archives any of it again.
 
 ## Reader
 

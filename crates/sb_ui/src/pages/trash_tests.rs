@@ -255,7 +255,7 @@ fn asked(cx: &mut VisualTestContext) -> Option<(String, Option<Deletion>, Option
             (
                 asked.session.title.clone().unwrap_or_default(),
                 asked.deletion.clone(),
-                asked.refused,
+                asked.refused.clone(),
             )
         })
     })
@@ -388,7 +388,10 @@ fn a_refusal_while_its_location_syncs_shows_again_or_says_so_over_another(cx: &m
     refuse(cx);
     sync.update(cx, |_, cx| cx.notify());
     let (_, _, refused) = asked(cx).expect("asked again");
-    assert_eq!(refused, Some(Refusal::Syncing));
+    assert_eq!(
+        refused,
+        Some(Refusal::Syncing(deletion.session.location.clone()))
+    );
     // Once no sync runs, it forgets why and reads what it removes again.
     cx.run_until_parked();
     assert!(!sync.read_with(cx, |sync, _| sync.is_syncing()));

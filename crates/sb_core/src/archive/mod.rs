@@ -22,6 +22,7 @@
 mod delete;
 mod disk;
 mod items;
+mod kin;
 mod layout;
 mod segment;
 mod stats;
@@ -1424,7 +1425,7 @@ mod tests {
             .unwrap();
         for id in &sessions {
             catalogue
-                .record_session(id, 1, Hash::of(b""), Indexed::Faulted("no parser"))
+                .record_session(id, 1, Hash::of(b""), Indexed::Faulted("no parser"), None)
                 .unwrap();
         }
         let texts: Vec<Text> = catalogue

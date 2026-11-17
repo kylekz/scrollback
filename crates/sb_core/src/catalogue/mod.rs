@@ -41,7 +41,7 @@ pub use folder::{Folder, FolderPath, ProjectPath};
 pub use library::{LibraryCounts, PathGroup, Shelf};
 pub use session::{Compared, Filed, History, Kin, Session, SessionId, Usage};
 pub(crate) use session::{Derived, Indexed, Reading, fingerprint};
-pub use trash::{AllowedAgain, CopyDeletion, Deletion, Tombstone};
+pub use trash::{AllowedAgain, AlsoDeleted, Deletion, Tombstone};
 pub(crate) use trash::{ItemFile, Removal};
 
 #[derive(Debug, Error)]
@@ -105,6 +105,14 @@ pub enum CatalogueError {
     /// again: the session is live in the archive.
     #[error("the session {} of {} at location {} is archived again", .0.key, .0.provider, .0.location)]
     ArchivedAgain(SessionId),
+    /// A session is deleted for good with its conversation (PLAN §4.5), which is known of every
+    /// session of it once the index has made each one's row again: not yet.
+    #[error("the sessions like {} of {} at location {} are still being indexed", .0.key, .0.provider, .0.location)]
+    StillIndexing(SessionId),
+    /// The session holds more than one transcript of its own, of which only the first is read:
+    /// it is not deleted for good, as the owner could not see what that removes.
+    #[error("the session {} of {} at location {} holds more than one transcript", .0.key, .0.provider, .0.location)]
+    SeveralTranscripts(SessionId),
 }
 
 /// The most characters a folder's name has.
@@ -747,14 +755,17 @@ impl Catalogue {
         })
     }
 
-    /// How much the catalogue records (DESIGN §4.13): its sessions, items and versions, and
-    /// what the versions hold uncompressed.
+    /// How much the catalogue records (DESIGN §4.13): its sessions as the library shows them
+    /// (PLAN §7.7), items and versions, and what the versions hold uncompressed.
     pub fn totals(&self) -> Result<Totals> {
         self.db.read(|c| {
             Ok(c.query_row(
-                "SELECT (SELECT COUNT(*) FROM session), (SELECT COUNT(*) FROM item),
-                        COUNT(*), COALESCE(SUM(length), 0)
-                 FROM version",
+                &format!(
+                    "SELECT (SELECT COUNT(*) FROM session s WHERE {}), (SELECT COUNT(*) FROM item),
+                            COUNT(*), COALESCE(SUM(length), 0)
+                     FROM version",
+                    session::SHOWN
+                ),
                 [],
                 |row| {
                     Ok(Totals {

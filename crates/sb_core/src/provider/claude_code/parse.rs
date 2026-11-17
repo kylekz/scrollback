@@ -60,7 +60,7 @@ use super::record::{
 };
 use super::said::{Said, said};
 use super::tools::{self, WORKFLOW};
-use super::{ID, copy_of, session_of};
+use super::{ID, session_of};
 use crate::provider::{ItemKind, SessionItem, SessionItems};
 use crate::transcript::{
     BlockId, Builder, Content, Conversation, Encoding, Ending, Facts, Image, Output, Stored,
@@ -168,7 +168,6 @@ pub(super) fn parse(items: &dyn SessionItems) -> Transcript {
         conversation: main
             .and_then(|main| session_of(file_name(&main.key)))
             .map(str::to_string),
-        copy: list.first().and_then(|item| copy_of(&item.key)),
     };
     let mut claimed = HashSet::new();
     let mut inline = Vec::new();

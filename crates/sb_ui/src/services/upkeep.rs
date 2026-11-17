@@ -116,7 +116,7 @@ pub enum Standing {
     /// Deleted for good: syncs skip it.
     Deleted,
     /// The owner allowed it to be archived again: what to put back on Undo.
-    Allowed(AllowedAgain),
+    Allowed(Box<AllowedAgain>),
     /// A sync has archived it again, at `at` (Unix milliseconds) once that is read.
     ArchivedAgain { at: Option<i64> },
 }
@@ -125,7 +125,11 @@ pub enum Standing {
 #[derive(Clone, Debug)]
 pub struct Deleted {
     pub tombstone: Tombstone,
+    /// Where it was archived from: the location it ran at, or for a copy of a session that ran
+    /// elsewhere, where the copy was kept.
     pub location: Option<Location>,
+    /// Where each of the other sessions deleted with it was archived from ([`Tombstone::with`]).
+    pub with_kept: Vec<Option<Location>>,
     pub standing: Standing,
     /// A change to it is being written: it takes no other until then.
     pub writing: bool,
@@ -231,8 +235,12 @@ fn load(archive: &Archive, shown: usize, allowed: Vec<SessionId>) -> Result<Load
             .collect::<Result<Vec<_>, _>>()?;
         let mut deleted = Vec::new();
         for tombstone in catalogue.tombstones()? {
+            let with_kept = (tombstone.with.iter())
+                .map(|copy| catalogue.location(&copy.session.location))
+                .collect::<Result<_, _>>()?;
             deleted.push(Deleted {
                 location: catalogue.location(&tombstone.session.location)?,
+                with_kept,
                 tombstone,
                 standing: Standing::Deleted,
                 writing: false,
@@ -659,7 +667,7 @@ impl UpkeepService {
             archive
                 .catalogue()
                 .remove_tombstone(&deleted.tombstone.session)
-                .map(Standing::Allowed)
+                .map(|allowed| Standing::Allowed(Box::new(allowed)))
                 .map_err(ArchiveError::from)
         });
     }
