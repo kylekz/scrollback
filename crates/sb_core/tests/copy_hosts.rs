@@ -59,6 +59,8 @@ fn table() -> Table {
         ("buildbox-alt-port", ("build.example", "user", 2222, None)),
         ("elsewhere", ("elsewhere.example", "user", 22, None)),
         ("behind-a", ("build.example", "user", 22, Some("bastion-a"))),
+        ("localhost", ("localhost", "user", 22, None)),
+        ("wsl-alias", ("127.0.0.1", "user", 2222, None)),
     ]))
 }
 
@@ -593,4 +595,66 @@ fn deleting_a_copy_takes_its_record() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// A WSL distro, as a location, synced from `tree` when one is given.
+fn add_distro(machines: &Machines, name: &str, tree: Option<&ProjectsTree>) -> LocationId {
+    let id = machines
+        .catalogue()
+        .add_location(
+            LocationKind::Wsl {
+                distro: name.to_string(),
+            },
+            name,
+        )
+        .unwrap()
+        .id;
+    if let Some(tree) = tree {
+        machines.sync_at(&id, &tree.transport());
+    }
+    id
+}
+
+/// A copy the desktop app ran over SSH at localhost (its "SSH into WSL") ran in a WSL distro:
+/// the only one there is, never an SSH location, whatever ssh says of the host.
+#[test]
+fn a_copy_that_ran_at_localhost_is_the_wsl_distro_s() {
+    for host in ["localhost", "wsl-alias"] {
+        let mut machines = Machines::new();
+        machines.copied(1, host);
+        let distro = add_distro(&machines, "Ubuntu-24.04", None);
+        machines.sync_here(&table());
+        assert_eq!(machines.origin().0, Some(distro), "{host}");
+    }
+}
+
+/// Of several distros, the one whose home holds where the session started; of none or of
+/// several, no distro, and no host either: "localhost" says nothing.
+#[test]
+fn of_several_distros_the_one_whose_home_holds_the_cwd() {
+    let mut machines = Machines::new();
+    let session = machines.remote.session(PROJECT, 2);
+    machines.pc.desktop_copy(&session);
+    let (first, second) = (ProjectsTree::new(), ProjectsTree::new());
+    let cwd = format!("{}/code/app", second.home().display());
+    machines.pc.desktop_record(
+        "w/local_w.json",
+        serde_json::json!({
+            "cliSessionId": session.id,
+            "cwd": cwd,
+            "sshConfig": { "sshHost": "localhost" },
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    add_distro(&machines, "Debian", Some(&first));
+    let wanted = add_distro(&machines, "Ubuntu-24.04", Some(&second));
+    machines.sync_here(&table());
+    assert_eq!(machines.origin().0, Some(wanted));
+
+    /* Without any distro it is the app's copy, with no host. */
+    let mut machines = Machines::new();
+    machines.copied(1, "localhost");
+    machines.sync_here(&table());
+    assert_eq!(machines.origin(), (None, unsaid()));
 }

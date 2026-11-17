@@ -213,11 +213,22 @@ fn copy_records(
             .collect(),
     };
     let id = provider.id();
+    /* The WSL locations a copy that ran at localhost over SSH may be of, each with the home
+    its provider's root there says. */
+    let distros: Vec<(LocationId, Option<String>)> = catalogue
+        .wsl_roots(id.as_str())?
+        .into_iter()
+        .map(|(location, root)| {
+            let home = root.and_then(|root| provider.home_of(&root));
+            (location, home)
+        })
+        .collect();
     for location in locations {
         let readings = catalogue.register_items(&location, id.as_str())?;
-        /* Records read whole from these very versions are not read again. */
+        /* Records read whole from these very versions, with these distros, are not read
+        again. */
         let made = format!(
-            "{} {}",
+            "{} {} {distros:?}",
             fingerprint(&readings).to_hex(),
             provider.parser_version()
         );
@@ -240,7 +251,10 @@ fn copy_records(
                 if !whole {
                     log::warn!("some of {id}'s records of copies could not be read");
                 }
-                catalogue.record_copies(&location, id.as_str(), &records, whole, &made)?;
+                let wsl: Vec<Option<LocationId>> = (records.iter())
+                    .map(|record| distro_of(&distros, record.cwd.as_deref()))
+                    .collect();
+                catalogue.record_copies(&location, id.as_str(), &records, &wsl, whole, &made)?;
             }
             Err(fault) => log::warn!(
                 "{id} stopped on its records of copies: {}",
@@ -249,6 +263,26 @@ fn copy_records(
         }
     }
     Ok(())
+}
+
+/**
+ * The WSL location of `distros` (each with its home) a copy that started in `cwd` ran in, if
+ * it ran in one over SSH at localhost (PLAN §7.7): the only one there is, else the one whose
+ * home holds `cwd`, and none when none or several do.
+ */
+fn distro_of(distros: &[(LocationId, Option<String>)], cwd: Option<&str>) -> Option<LocationId> {
+    if let [(only, _)] = distros {
+        return Some(only.clone());
+    }
+    let cwd = cwd?;
+    let mut holding = distros.iter().filter(|(_, home)| {
+        home.as_deref()
+            .is_some_and(|home| cwd == home || cwd.starts_with(&format!("{home}/")))
+    });
+    match (holding.next(), holding.next()) {
+        (Some((location, _)), None) => Some(location.clone()),
+        _ => None,
+    }
 }
 
 /// How much text the second step of an index writes at a time: the sessions parsed for it,

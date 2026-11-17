@@ -12,6 +12,8 @@
 
 mod batch;
 mod copy_record;
+
+pub(crate) use copy_record::Place;
 mod folder;
 mod kv;
 mod library;

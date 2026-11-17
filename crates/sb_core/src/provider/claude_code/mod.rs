@@ -198,6 +198,13 @@ impl Provider for Agent {
         desktop::copy_records(register)
     }
 
+    /// The home above the default root, `~/.claude`; none for a root set elsewhere.
+    fn home_of(&self, root: &str) -> Option<String> {
+        root.strip_suffix(&format!("/.claude/{SUBTREE}"))
+            .filter(|home| !home.is_empty())
+            .map(str::to_string)
+    }
+
     /// The session id that names the transcript: the id its records carry (PLAN §7.3).
     fn conversation_of(&self, transcript: &str) -> Option<String> {
         let name = transcript.rsplit('/').next()?;

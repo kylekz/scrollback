@@ -9,7 +9,8 @@ use toolbox_process::CancelToken;
 
 use super::SyncError;
 use crate::archive::Archive;
-use crate::location::{LocationId, LocationKind};
+use crate::catalogue::Place;
+use crate::location::LocationKind;
 use crate::transport::ResolveHost;
 use crate::transport::ssh_config::Resolution;
 
@@ -39,10 +40,9 @@ pub fn attribute(
     let catalogue = archive.catalogue();
     let hosts = catalogue.copy_hosts()?;
     let recorded = resolve_all(resolve, &hosts.recorded);
-    let locations = if recorded.iter().any(|it| matches!(it, Ok(Some(_)))) {
-        let of: Vec<String> = hosts
-            .locations
-            .iter()
+    let elsewhere = |it: &Resolution| matches!(it, Ok(Some(it)) if !it.is_loopback());
+    let locations = if recorded.iter().any(elsewhere) {
+        let of: Vec<String> = (hosts.locations.iter())
             .map(|(_, host)| host.clone())
             .collect();
         resolve_all(resolve, &of)
@@ -50,27 +50,28 @@ pub fn attribute(
         Vec::new()
     };
     let unasked = locations.iter().any(Result::is_err);
-    let mut places: HashMap<String, Option<Option<LocationId>>> = HashMap::new();
+    let mut places: HashMap<String, Place> = HashMap::new();
     for (host, resolution) in hosts.recorded.iter().zip(recorded) {
         let named = LocationKind::Ssh { host: host.clone() };
         let same = (hosts.locations.iter())
             .find(|(_, at)| LocationKind::Ssh { host: at.clone() }.same_place(&named))
             .map(|(id, _)| id.clone());
-        /* `None` keeps what was said last; else, as `attribute_copies` takes it: resolved or
-        not, and the location it is. */
+        /* `None` keeps what was said last. */
         let place = match resolution {
+            /* This machine's own sshd: a WSL distro, never an SSH location. */
+            Ok(Some(resolved)) if resolved.is_loopback() => Some(Place::ThisMachine),
             Ok(Some(resolved)) => {
                 let found = (hosts.locations.iter().zip(&locations))
                     .find(|(_, at)| matches!(at, Ok(Some(at)) if *at == resolved))
                     .map(|((id, _), _)| id.clone());
                 match (found.or(same), unasked) {
-                    (Some(id), _) => Some(Some(Some(id))),
+                    (Some(id), _) => Some(Place::Machine(Some(id))),
                     (None, true) => None,
-                    (None, false) => Some(Some(None)),
+                    (None, false) => Some(Place::Machine(None)),
                 }
             }
-            Ok(None) => Some(same.map(Some)),
-            Err(_) => same.map(|same| Some(Some(same))),
+            Ok(None) => Some(same.map_or(Place::Unresolved, |id| Place::Machine(Some(id)))),
+            Err(_) => same.map(|id| Place::Machine(Some(id))),
         };
         if let Some(place) = place {
             places.insert(host.clone(), place);
