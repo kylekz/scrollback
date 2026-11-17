@@ -109,7 +109,7 @@ The layout is concept E on the design canvas (`design/project/E-Reader.dc.html`,
 ## Settings
 
 - Settings open inside the main window, not a separate window.
-- **Archive:** where it is and its size. **Use a different folder** opens the archive there or creates one; it moves nothing. **Verify**, and for anything it finds damaged, fetching it again from its location when it still exists there. The sessions deleted for good, each with a way to let it be archived again.
+- **Archive:** where it is and its size. Two ways to put it elsewhere: **Move…** copies the archive into an empty folder, checks every file, and switches to the copy, with progress and Stop; the old folder is left as it was, for the owner to delete by hand once satisfied. **Use a different folder** opens the archive there or creates one; it moves nothing. **Verify**, and for anything it finds damaged, fetching it again from its location when it still exists there. The sessions deleted for good, each with a way to let it be archived again.
 - **Sync:** the interval, the staleness warning's threshold.
 - **Appearance:** System, Light or Dark, and the window material, as the sibling apps do.
 - **Shortcuts:** a read-only table in v1.
